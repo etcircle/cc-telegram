@@ -17,7 +17,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ccbot.handlers import attention
-from ccbot.handlers.message_queue import ActivityDigestState, _render_activity_digest
+from ccbot.handlers.message_queue import (
+    ActivityDigestState,
+    _activity_msg_info,
+    _finalize_activity_digest,
+    _refresh_activity_digest_if_present,
+    _render_activity_digest,
+)
 from ccbot.handlers.message_sender import TopicSendOutcome
 
 
@@ -67,6 +73,100 @@ def test_render_activity_digest_done_when_not_waiting():
     state = ActivityDigestState(message_id=0, window_id="@0", done=True)
     rendered = _render_activity_digest(state, waiting=False)
     assert rendered.startswith("✅ Done")
+
+
+@pytest.mark.asyncio
+async def test_finalize_activity_digest_skips_done_for_attention_text():
+    bot = AsyncMock()
+    key = (1, 10)
+    state = ActivityDigestState(message_id=123, window_id="@0")
+    _activity_msg_info[key] = state
+    try:
+        with patch(
+            "ccbot.handlers.message_queue._upsert_activity_digest",
+            new_callable=AsyncMock,
+        ) as mock_upsert:
+            await _finalize_activity_digest(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                final_text="Please confirm before I proceed.",
+            )
+
+            assert state.done is False
+            mock_upsert.assert_not_called()
+    finally:
+        _activity_msg_info.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_finalize_activity_digest_marks_done_for_non_attention_text():
+    bot = AsyncMock()
+    key = (1, 10)
+    state = ActivityDigestState(message_id=123, window_id="@0")
+    _activity_msg_info[key] = state
+    try:
+        with patch(
+            "ccbot.handlers.message_queue._upsert_activity_digest",
+            new_callable=AsyncMock,
+        ) as mock_upsert:
+            await _finalize_activity_digest(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                final_text="All tests pass.",
+            )
+
+            assert state.done is True
+            mock_upsert.assert_awaited_once_with(bot, 1, 10, state)
+    finally:
+        _activity_msg_info.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_refresh_activity_digest_renders_waiting_after_attention_state_changes(
+    _reset_attention, mock_session_manager
+):
+    bot = AsyncMock()
+    key = (1, 10)
+    state = ActivityDigestState(message_id=123, window_id="@0")
+    state.lines = ["⚙️ Read foo.py"]
+    state.tool_count = 1
+    _activity_msg_info[key] = state
+    try:
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "ccbot.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "ccbot.handlers.message_queue.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+            patch("ccbot.handlers.message_queue.session_manager") as mq_session,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+            mock_edit.return_value = TopicSendOutcome.OK
+            mq_session.resolve_chat_id.return_value = -100123
+            mq_session.get_display_name.return_value = "ccbot"
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Do you want me to proceed?",
+                kind="assistant_text",
+            )
+            await _refresh_activity_digest_if_present(bot, 1, 10, "@0")
+
+            mock_edit.assert_awaited_once()
+            assert mock_edit.await_args.kwargs["text"].startswith("🔔 Waiting on you")
+    finally:
+        _activity_msg_info.pop(key, None)
 
 
 # ── State machine ──────────────────────────────────────────────────────────

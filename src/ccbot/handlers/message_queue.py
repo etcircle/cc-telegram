@@ -99,10 +99,6 @@ ACTIVITY_DIGEST_MAX_LINE_LENGTH = 180
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
 
-# DM fallback dedupe: avoid spamming the user every polling tick if a topic is broken.
-_dm_fallback_seen: dict[tuple[int, int | None, str, int], float] = {}
-DM_FALLBACK_COOLDOWN_SECONDS = 60
-
 # Cross-module emergency DM cooldown is owned by ``handlers.attention``
 # (``attention.should_emit_emergency_dm``). Both this module and
 # ``handlers.interactive_ui`` route through that fence so the same waiting
@@ -366,10 +362,7 @@ async def _emergency_dm(
     """
     _mark_bad_topic(user_id, thread_id)
     display = session_manager.get_display_name(window_id) if window_id else "unknown"
-    dedupe_key = (user_id, thread_id, window_id, hash((kind, text[:500])))
-    now = time.monotonic()
-    last = _dm_fallback_seen.get(dedupe_key)
-    if last is not None and now - last < DM_FALLBACK_COOLDOWN_SECONDS:
+    if not attention.should_emit_emergency_dm(user_id, thread_id, window_id):
         logger.debug(
             "Skipping duplicate emergency DM for user=%d thread=%s window=%s kind=%s",
             user_id,
@@ -378,7 +371,6 @@ async def _emergency_dm(
             kind,
         )
         return
-    _dm_fallback_seen[dedupe_key] = now
 
     reason = outcome.value if outcome is not None else "topic delivery failed"
     prefix = (
@@ -600,13 +592,36 @@ async def _finalize_activity_digest(
     user_id: int,
     thread_id: int | None,
     window_id: str,
+    *,
+    final_text: str = "",
 ) -> None:
-    """Mark activity digest done before the final assistant text lands."""
+    """Mark activity digest done before final assistant text unless it asks for input.
+
+    Attention-worthy final text is surfaced by the attention card. Do not flip
+    the digest to ``✅ Done`` first; Stage 4 wants the digest to remain a
+    waiting indicator once the attention state is set.
+    """
     tid = thread_id or 0
     state = _activity_msg_info.get((user_id, tid))
     if not state or state.window_id != window_id or state.done:
         return
+    if final_text and attention.is_attention_request(final_text):
+        return
     state.done = True
+    await _upsert_activity_digest(bot, user_id, thread_id, state)
+
+
+async def _refresh_activity_digest_if_present(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+) -> None:
+    """Re-render an existing activity digest after attention state changes."""
+    tid = thread_id or 0
+    state = _activity_msg_info.get((user_id, tid))
+    if not state or state.window_id != window_id:
+        return
     await _upsert_activity_digest(bot, user_id, thread_id, state)
 
 
@@ -722,8 +737,15 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     tid = task.thread_id or 0
     chat_id, effective_thread_id = _delivery_target(user_id, task.thread_id)
 
+    logical_text = "\n\n".join(task.parts)
     if task.content_type == "text":
-        await _finalize_activity_digest(bot, user_id, task.thread_id, wid)
+        await _finalize_activity_digest(
+            bot,
+            user_id,
+            task.thread_id,
+            wid,
+            final_text=logical_text,
+        )
 
     # 1. Handle tool_result editing (merged parts are edited together)
     if task.content_type == "tool_result" and task.tool_use_id:
@@ -799,11 +821,12 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # cue gets dismissed by a later neutral part (or vice versa), and the user
     # sees an attention card flap to acknowledged within the same logical
     # message.
-    if task.parts:
-        joined = "\n\n".join(task.parts)
+    if logical_text:
         await _maybe_attention_or_dismiss(
-            bot, user_id, task.thread_id, wid, joined, task.content_type
+            bot, user_id, task.thread_id, wid, logical_text, task.content_type
         )
+        if task.content_type == "text" and attention.is_attention_request(logical_text):
+            await _refresh_activity_digest_if_present(bot, user_id, task.thread_id, wid)
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
