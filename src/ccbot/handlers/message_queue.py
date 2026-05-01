@@ -106,6 +106,10 @@ _flood_until: dict[int, float] = {}
 _dm_fallback_seen: dict[tuple[int, int | None, str, int], float] = {}
 DM_FALLBACK_COOLDOWN_SECONDS = 60
 
+# Direct attention DM dedupe for normal assistant text that asks the user to decide/confirm.
+_attention_dm_seen: dict[tuple[int, int | None, str, int], float] = {}
+ATTENTION_DM_COOLDOWN_SECONDS = 300
+
 # Topic ids that Telegram rejected during this process lifetime. Keep the binding
 # for routing inbound replies to the tmux window, but deliver outbound updates by DM.
 _bad_topic_threads: set[tuple[int, int]] = set()
@@ -541,6 +545,102 @@ async def _finalize_activity_digest(
     await _upsert_activity_digest(bot, user_id, thread_id, state)
 
 
+def _looks_like_attention_request(text: str) -> bool:
+    """Heuristic: final assistant text that is probably waiting for user input."""
+    cleaned = strip_sentinels(text or "").strip()
+    if not cleaned:
+        return False
+    lower = " ".join(cleaned.lower().split())
+    cues = (
+        "tell me which",
+        "tell me your pick",
+        "tell me your picks",
+        "tell me your choice",
+        "which option",
+        "which approach",
+        "which one",
+        "do you want me to",
+        "want me to proceed",
+        "want me to continue",
+        "ok to proceed",
+        "okay to proceed",
+        "ok unless you",
+        "unless you object",
+        "please confirm",
+        "confirm before",
+        "before i write",
+        "before i proceed",
+        "owner decision",
+        "owner decisions",
+        "your recommendation",
+        "go with recommendations",
+        "go with your recommendations",
+        "tell me your picks",
+    )
+    if any(cue in lower for cue in cues):
+        return True
+    # A direct final question is usually attention-worthy; avoid tiny greetings.
+    return cleaned.endswith("?") and len(cleaned) > 80
+
+
+async def _attention_dm_if_needed(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    text: str,
+) -> None:
+    """Send a direct DM when normal assistant text is actually waiting for the user."""
+    if not _looks_like_attention_request(text):
+        return
+    display = session_manager.get_display_name(window_id) if window_id else "unknown"
+    cleaned = strip_sentinels(text).strip()
+    dedupe_key = (user_id, thread_id, window_id, hash(cleaned[:1000]))
+    now = time.monotonic()
+    last = _attention_dm_seen.get(dedupe_key)
+    if last is not None and now - last < ATTENTION_DM_COOLDOWN_SECONDS:
+        logger.debug(
+            "Skipping duplicate attention DM for user=%d thread=%s window=%s",
+            user_id,
+            thread_id,
+            window_id,
+        )
+        return
+    _attention_dm_seen[dedupe_key] = now
+
+    prefix = f"🔔 Claude needs your input in {display}"
+    if thread_id is not None:
+        prefix += f" (topic {thread_id})"
+    prefix += ":\n\n"
+    body = cleaned
+    if len(prefix) + len(body) > 3800:
+        body = body[: 3800 - len(prefix) - 20] + "\n… [truncated]"
+    try:
+        sent = await send_with_fallback(bot, user_id, prefix + body)
+        if sent:
+            logger.info(
+                "Attention DM sent for user=%d thread=%s window=%s",
+                user_id,
+                thread_id,
+                window_id,
+            )
+        else:
+            logger.warning(
+                "Attention DM send returned None for user=%d thread=%s window=%s",
+                user_id,
+                thread_id,
+                window_id,
+            )
+    except Exception as e:
+        logger.warning(
+            "Failed attention DM for user=%d thread=%s window=%s: %s",
+            user_id,
+            thread_id,
+            window_id,
+            e,
+        )
+
+
 async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask, effective_thread_id: int | None = None) -> None:
     """Send images attached to a task, if any."""
     if not task.image_data:
@@ -626,6 +726,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
+                await _attention_dm_if_needed(bot, user_id, task.thread_id, wid, part)
                 continue
 
         sent = await send_with_fallback(
@@ -639,6 +740,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             last_msg_id = sent.message_id
         elif task.thread_id is not None:
             await _dm_fallback(bot, user_id, task.thread_id, wid, part)
+        await _attention_dm_if_needed(bot, user_id, task.thread_id, wid, part)
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
