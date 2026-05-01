@@ -11,6 +11,7 @@ from typing import Any
 
 from telegram import Bot
 
+from . import attention
 from .interactive_ui import clear_interactive_msg
 from .message_queue import clear_status_msg_info, clear_tool_msg_ids_for_topic
 
@@ -41,6 +42,9 @@ async def clear_topic_state(
 
     # Clear interactive UI state (also deletes message from chat)
     await clear_interactive_msg(user_id, bot, thread_id)
+
+    # Drop any live attention card state — fresh topic gets a fresh episode.
+    attention.clear(user_id, thread_id)
 
     # Clear pending thread state from user_data
     if user_data is not None:

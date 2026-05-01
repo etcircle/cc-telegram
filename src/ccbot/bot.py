@@ -101,6 +101,7 @@ from .handlers.directory_browser import (
     clear_session_picker_state,
     clear_window_picker_state,
 )
+from .handlers import attention
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
@@ -972,6 +973,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_reply(update.message, f"❌ {message}")
         return
 
+    # User just replied → Claude is no longer waiting. Flip the topic-first
+    # attention card back to idle so the next idle→waiting transition fires
+    # a fresh notification.
+    await attention.dismiss(context.bot, user_id=user.id, thread_id=thread_id)
+
     # Start background capture for ! bash command output
     if text.startswith("!") and len(text) > 1:
         bash_cmd = text[1:]  # strip leading "!"
@@ -1092,7 +1098,7 @@ async def _create_and_bind_window(
                     logger.warning("Failed to forward pending text: %s", send_msg)
                     await safe_send(
                         context.bot,
-                        resolved_chat,
+                        session_manager.resolve_chat_id(user.id, pending_thread_id),
                         f"❌ Failed to send pending message: {send_msg}",
                         message_thread_id=pending_thread_id,
                     )
@@ -1470,7 +1476,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 logger.warning("Failed to forward pending text: %s", send_msg)
                 await safe_send(
                     context.bot,
-                    resolved_chat,
+                    session_manager.resolve_chat_id(user.id, thread_id),
                     f"❌ Failed to send pending message: {send_msg}",
                     message_thread_id=thread_id,
                 )

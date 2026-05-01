@@ -24,6 +24,7 @@ from telegram.error import BadRequest
 from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
 from ..tmux_manager import tmux_manager
+from . import attention
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -35,7 +36,13 @@ from .callback_data import (
     CB_ASK_TAB,
     CB_ASK_UP,
 )
-from .message_sender import NO_LINK_PREVIEW
+from .message_sender import (
+    NO_LINK_PREVIEW,
+    TopicSendOutcome,
+    topic_delete,
+    topic_edit,
+    topic_send,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +111,12 @@ async def _notify_waiting_dm(
     thread_id: int | None,
     prompt_text: str,
 ) -> None:
-    """Send a one-shot DM when Claude is waiting for input/approval."""
+    """Emergency-only DM fallback when the topic-first attention card fails.
+
+    The normal path is ``attention.notify_waiting`` (in-topic card). This DM
+    is reached only when the topic itself cannot be written to (deleted,
+    closed, forbidden) so the user still gets a signal that Claude is blocked.
+    """
     ikey = (user_id, thread_id or 0)
     fingerprint = hashlib.sha1(
         f"{window_id}\0{thread_id or 0}\0{prompt_text}".encode("utf-8", "replace")
@@ -256,76 +268,111 @@ async def handle_interactive_ui(
     # Send as plain text (no markdown conversion)
     text = content.content
 
-    # Build thread kwargs for send_message
-    thread_kwargs: dict[str, int] = {}
-    if thread_id is not None:
-        thread_kwargs["message_thread_id"] = thread_id
-
     # Check if we have an existing interactive message to edit
     existing_msg_id = _interactive_msgs.get(ikey)
     if existing_msg_id:
         try:
-            await bot.edit_message_text(
+            edit_outcome = await topic_edit(
+                bot,
+                op="interactive",
+                user_id=user_id,
                 chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=window_id,
                 message_id=existing_msg_id,
                 text=text,
+                plain=True,
                 reply_markup=keyboard,
-                link_preview_options=NO_LINK_PREVIEW,
             )
-            _interactive_mode[ikey] = window_id
-            await _notify_waiting_dm(bot, user_id, window_id, thread_id, text)
-            return True
         except BadRequest as e:
             if "Message is not modified" in str(e):
-                # Content unchanged — keep existing message as-is
                 _interactive_mode[ikey] = window_id
+                await attention.notify_waiting(
+                    bot,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    window_id=window_id,
+                    prompt_text=text,
+                    kind="interactive_ui",
+                )
                 return True
-            # Other edit failure — fall through to send new message,
-            # but keep old message until replacement succeeds
+            edit_outcome = TopicSendOutcome.OTHER
             logger.debug(
                 "Edit failed for interactive msg %s: %s, sending new",
                 existing_msg_id,
                 e,
             )
-        except Exception as e:
-            logger.debug(
-                "Edit failed for interactive msg %s: %s, sending new",
-                existing_msg_id,
-                e,
+        if edit_outcome is TopicSendOutcome.OK:
+            _interactive_mode[ikey] = window_id
+            await attention.notify_waiting(
+                bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                prompt_text=text,
+                kind="interactive_ui",
             )
+            return True
+        # Edit failed — fall through to fresh send while keeping the old id
+        # so we can delete it after a new one lands.
 
     # Send new message (plain text — terminal content is not markdown)
     logger.info(
         "Sending interactive UI to user %d for window_id %s", user_id, window_id
     )
-    try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            link_preview_options=NO_LINK_PREVIEW,
-            **thread_kwargs,  # type: ignore[arg-type]
+    sent, send_outcome = await topic_send(
+        bot,
+        op="interactive",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        text=text,
+        plain=True,
+        reply_markup=keyboard,
+    )
+    if sent is None:
+        # Topic send failed — still mark interactive mode (prevents per-poll
+        # retry spam) and try the topic-first attention card. If that also
+        # cannot reach the topic, emergency-fall back to a direct DM.
+        _interactive_mode[ikey] = window_id
+        outcome = await attention.notify_waiting(
+            bot,
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            prompt_text=text,
+            kind="interactive_ui",
         )
-    except Exception as e:
-        logger.error("Failed to send interactive UI: %s", e)
-        # Still mark interactive mode and DM the user. A stale/deleted forum
-        # topic is exactly when the user otherwise gets no signal that Claude is
-        # blocked; marking mode also prevents retry/log spam every poll tick.
-        _interactive_mode[ikey] = window_id
-        await _notify_waiting_dm(bot, user_id, window_id, thread_id, text)
+        if outcome is not TopicSendOutcome.OK and send_outcome in (
+            TopicSendOutcome.TOPIC_NOT_FOUND,
+            TopicSendOutcome.TOPIC_CLOSED,
+            TopicSendOutcome.FORBIDDEN,
+        ):
+            await _notify_waiting_dm(bot, user_id, window_id, thread_id, text)
         return False
-    if sent:
-        _interactive_msgs[ikey] = sent.message_id
-        _interactive_mode[ikey] = window_id
-        await _notify_waiting_dm(bot, user_id, window_id, thread_id, text)
-        # New message sent successfully — now safe to delete the old one
-        if existing_msg_id:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=existing_msg_id)
-            except Exception:
-                pass  # Old message may already be gone
-        return True
-    return False
+    _interactive_msgs[ikey] = sent.message_id
+    _interactive_mode[ikey] = window_id
+    await attention.notify_waiting(
+        bot,
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        prompt_text=text,
+        kind="interactive_ui",
+    )
+    # New message sent successfully — now safe to delete the old one
+    if existing_msg_id:
+        await topic_delete(
+            bot,
+            op="interactive",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            message_id=existing_msg_id,
+        )
+    return True
 
 
 async def clear_interactive_msg(
@@ -346,7 +393,14 @@ async def clear_interactive_msg(
     )
     if bot and msg_id:
         chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception:
-            pass  # Message may already be deleted or too old
+        await topic_delete(
+            bot,
+            op="interactive",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=None,
+            message_id=msg_id,
+        )
+    if bot:
+        await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)

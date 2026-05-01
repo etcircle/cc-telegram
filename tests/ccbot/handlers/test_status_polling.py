@@ -115,27 +115,41 @@ class TestStatusPollerSettingsDetection:
         mock_window = MagicMock()
         mock_window.window_id = window_id
 
+        from ccbot.handlers import attention
+
+        attention.reset_for_tests()
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux_poll,
             patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux_ui,
             patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+            patch("ccbot.handlers.attention.session_manager") as mock_sm_att,
         ):
             mock_tmux_poll.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux_poll.capture_pane = AsyncMock(return_value=sample_pane_settings)
             mock_tmux_ui.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux_ui.capture_pane = AsyncMock(return_value=sample_pane_settings)
             mock_sm.resolve_chat_id.return_value = 100
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "etcircle-dev"
 
             await update_status_message(
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
 
-            # Verify bot.send_message was called with keyboard
-            mock_bot.send_message.assert_called_once()
-            call_kwargs = mock_bot.send_message.call_args.kwargs
-            assert call_kwargs["chat_id"] == 100
-            assert call_kwargs["message_thread_id"] == 42
-            keyboard = call_kwargs["reply_markup"]
-            assert keyboard is not None
-            # Verify the message text contains model picker content
-            assert "Select model" in call_kwargs["text"]
+            # The interactive keyboard send goes to the topic.
+            keyboard_calls = [
+                c
+                for c in mock_bot.send_message.call_args_list
+                if c.kwargs.get("reply_markup") is not None
+            ]
+            assert len(keyboard_calls) == 1
+            kw = keyboard_calls[0].kwargs
+            assert kw["chat_id"] == 100
+            assert kw["message_thread_id"] == 42
+            assert "Select model" in kw["text"]
+            # Topic-first attention card lands in the same topic, not a DM.
+            for call in mock_bot.send_message.call_args_list:
+                assert call.kwargs["chat_id"] == 100, (
+                    f"unexpected DM-shaped send_message: {call.kwargs}"
+                )
+        attention.reset_for_tests()

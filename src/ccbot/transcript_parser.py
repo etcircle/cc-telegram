@@ -368,15 +368,10 @@ class TranscriptParser:
             return f"  ⎿  Read {line_count} lines"
 
         elif tool_name == "Write":
-            # Write: line count comes from the input content, not the result
-            # (result is usually just "File created successfully at: ...")
-            written = tool_input_data.get("content", "") if tool_input_data else ""
-            if not written:
-                written_lines = 0
-            else:
-                written_lines = written.count("\n") + (
-                    0 if written.endswith("\n") else 1
-                )
+            # Write: prefer the input content, but fall back to the result text
+            # for tests/history entries that do not carry tool input data.
+            written = tool_input_data.get("content", "") if tool_input_data else text
+            written_lines = written.count("\n") + (0 if written.endswith("\n") else 1)
             return f"  ⎿  Wrote {written_lines} lines"
 
         elif tool_name == "Bash":

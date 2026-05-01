@@ -32,13 +32,16 @@ def mock_bot():
 @pytest.fixture
 def _clear_interactive_state():
     """Ensure interactive state is clean before and after each test."""
+    from ccbot.handlers import attention
     from ccbot.handlers.interactive_ui import _interactive_mode, _interactive_msgs
 
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    attention.reset_for_tests()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    attention.reset_for_tests()
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
@@ -47,29 +50,48 @@ class TestHandleInteractiveUI:
     async def test_handle_settings_ui_sends_keyboard(
         self, mock_bot: AsyncMock, sample_pane_settings: str
     ):
-        """handle_interactive_ui captures Settings pane, sends message with keyboard."""
+        """handle_interactive_ui captures Settings pane, sends message with keyboard.
+
+        Topic-first attention card also fires (in the same chat/thread, not as
+        a DM). We assert: (a) the keyboard message lands in the topic with the
+        nav keyboard, and (b) no send goes to the user_id-as-chat (i.e. no DM).
+        """
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
 
         with (
             patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux,
-            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm,
+            patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm_iu,
+            patch("ccbot.handlers.attention.session_manager") as mock_sm_att,
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
-            mock_sm.resolve_chat_id.return_value = 100
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "etcircle-dev"
 
             result = await handle_interactive_ui(
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
 
         assert result is True
-        mock_bot.send_message.assert_called_once()
-        call_kwargs = mock_bot.send_message.call_args
-        assert call_kwargs.kwargs["chat_id"] == 100
-        assert call_kwargs.kwargs["message_thread_id"] == 42
-        assert call_kwargs.kwargs["reply_markup"] is not None
+
+        keyboard_calls = [
+            c
+            for c in mock_bot.send_message.call_args_list
+            if c.kwargs.get("reply_markup") is not None
+        ]
+        assert len(keyboard_calls) == 1
+        kw = keyboard_calls[0].kwargs
+        assert kw["chat_id"] == 100
+        assert kw["message_thread_id"] == 42
+
+        # No DM: every send_message went to chat_id=100 (the topic).
+        for call in mock_bot.send_message.call_args_list:
+            assert call.kwargs["chat_id"] == 100, (
+                f"unexpected DM-shaped send_message: {call.kwargs}"
+            )
 
     @pytest.mark.asyncio
     async def test_handle_no_ui_returns_false(self, mock_bot: AsyncMock):

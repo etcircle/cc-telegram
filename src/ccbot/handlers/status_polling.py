@@ -33,6 +33,7 @@ from .interactive_ui import (
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
+from .message_sender import TopicSendOutcome, _classify_bad_request
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +139,8 @@ async def status_poll_loop(bot: Bot) -> None:
                             message_thread_id=thread_id,
                         )
                     except BadRequest as e:
-                        if "Topic_id_invalid" in str(e):
+                        outcome = _classify_bad_request(e)
+                        if outcome is TopicSendOutcome.TOPIC_NOT_FOUND:
                             # Topic deleted — kill window, unbind, and clean up state
                             w = await tmux_manager.find_window_by_id(wid)
                             if w:
@@ -146,17 +148,21 @@ async def status_poll_loop(bot: Bot) -> None:
                             session_manager.unbind_thread(user_id, thread_id)
                             await clear_topic_state(user_id, thread_id, bot)
                             logger.info(
-                                "Topic deleted: killed window_id '%s' and "
-                                "unbound thread %d for user %d",
-                                wid,
-                                thread_id,
+                                "topic_probe op=probe user=%d thread=%d window=%s "
+                                "outcome=%s — killed window and unbound thread",
                                 user_id,
+                                thread_id,
+                                wid,
+                                outcome.value,
                             )
                         else:
                             logger.debug(
-                                "Topic probe error for %s: %s",
+                                "topic_probe op=probe user=%d thread=%d window=%s outcome=%s err=%r",
+                                user_id,
+                                thread_id,
                                 wid,
-                                e,
+                                outcome.value,
+                                str(e),
                             )
                     except Exception as e:
                         logger.debug(

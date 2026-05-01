@@ -27,24 +27,21 @@ from telegram import Bot
 from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
-from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
 from ..tmux_manager import tmux_manager
+from . import attention
 from .message_sender import (
-    NO_LINK_PREVIEW,
-    PARSE_MODE,
+    TopicSendOutcome,
     send_photo,
     send_with_fallback,
     strip_sentinels,
+    topic_delete,
+    topic_edit,
+    topic_send,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _ensure_formatted(text: str) -> str:
-    """Convert markdown to MarkdownV2."""
-    return convert_markdown(text)
 
 
 # Merge limit for content messages
@@ -112,7 +109,19 @@ ATTENTION_DM_COOLDOWN_SECONDS = 300
 
 # Topic ids that Telegram rejected during this process lifetime. Keep the binding
 # for routing inbound replies to the tmux window, but deliver outbound updates by DM.
+# (Stage 3 will replace this with the throttled topic_repair pipeline.)
 _bad_topic_threads: set[tuple[int, int]] = set()
+
+# Topic outcomes that should trigger emergency DM fallback (after Stage 3
+# repair, if/when wired). These are the cases where retrying the same topic
+# is futile within the current process.
+_TOPIC_BROKEN_OUTCOMES: frozenset[TopicSendOutcome] = frozenset(
+    {
+        TopicSendOutcome.TOPIC_NOT_FOUND,
+        TopicSendOutcome.TOPIC_CLOSED,
+        TopicSendOutcome.FORBIDDEN,
+    }
+)
 
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
@@ -327,15 +336,24 @@ def _mark_bad_topic(user_id: int, thread_id: int | None) -> None:
         _bad_topic_threads.add((user_id, thread_id))
 
 
-async def _dm_fallback(
+async def _emergency_dm(
     bot: Bot,
     user_id: int,
     thread_id: int | None,
     window_id: str,
     text: str,
     kind: str = "content",
+    outcome: TopicSendOutcome | None = None,
 ) -> None:
-    """DM content/status when topic delivery fails so messages don't disappear."""
+    """STRICT EMERGENCY ONLY: DM when the topic itself is unreachable.
+
+    Reached after a topic_send/topic_edit returned a topic-shaped failure
+    (TOPIC_NOT_FOUND/TOPIC_CLOSED/FORBIDDEN). The topic-first attention card
+    and content/status sends are the normal surface; this exists so that
+    Claude output and "needs your input" cues do not silently vanish when the
+    topic is truly broken. Stage 3 (topic_repair) will reopen/recreate before
+    we land here.
+    """
     _mark_bad_topic(user_id, thread_id)
     display = session_manager.get_display_name(window_id) if window_id else "unknown"
     dedupe_key = (user_id, thread_id, window_id, hash((kind, text[:500])))
@@ -343,7 +361,7 @@ async def _dm_fallback(
     last = _dm_fallback_seen.get(dedupe_key)
     if last is not None and now - last < DM_FALLBACK_COOLDOWN_SECONDS:
         logger.debug(
-            "Skipping duplicate DM fallback for user=%d thread=%s window=%s kind=%s",
+            "Skipping duplicate emergency DM for user=%d thread=%s window=%s kind=%s",
             user_id,
             thread_id,
             window_id,
@@ -352,7 +370,11 @@ async def _dm_fallback(
         return
     _dm_fallback_seen[dedupe_key] = now
 
-    prefix = f"⚠️ CCBot could not post this {kind} in topic {thread_id} ({display}); DM fallback:\n\n"
+    reason = outcome.value if outcome is not None else "topic delivery failed"
+    prefix = (
+        f"⚠️ CCBot could not post this {kind} in topic {thread_id} ({display}) "
+        f"[{reason}]; emergency DM:\n\n"
+    )
     body = text
     # Telegram hard limit is 4096; keep room for markdown escaping/fallback.
     if len(prefix) + len(body) > 3800:
@@ -361,17 +383,30 @@ async def _dm_fallback(
         sent = await send_with_fallback(bot, user_id, prefix + body)
         if sent:
             logger.info(
-                "DM fallback sent for user=%d thread=%s window=%s kind=%s",
+                "emergency_dm op=%s user=%d thread=%s window=%s outcome=%s sent",
+                kind,
                 user_id,
                 thread_id,
                 window_id,
-                kind,
+                reason,
             )
         else:
-            logger.error("DM fallback send returned None for user=%d thread=%s kind=%s", user_id, thread_id, kind)
+            logger.error(
+                "emergency_dm op=%s user=%d thread=%s outcome=%s send returned None",
+                kind,
+                user_id,
+                thread_id,
+                reason,
+            )
     except Exception as e:
-        logger.error("Failed DM fallback for user=%d thread=%s kind=%s: %s", user_id, thread_id, kind, e)
-
+        logger.error(
+            "emergency_dm op=%s user=%d thread=%s outcome=%s failed: %s",
+            kind,
+            user_id,
+            thread_id,
+            reason,
+            e,
+        )
 
 
 def _display_name(window_id: str) -> str:
@@ -415,13 +450,22 @@ def _compact_activity_line(task: MessageTask) -> str:
     return f"⚙️ {raw}"
 
 
-def _render_activity_digest(state: ActivityDigestState) -> str:
+def _render_activity_digest(
+    state: ActivityDigestState, *, waiting: bool = False
+) -> str:
     """Render the editable activity digest card."""
     display = _display_name(state.window_id)
-    status = "✅ Done" if state.done else "🟡 Busy"
+    if waiting:
+        status = "🔔 Waiting on you"
+    elif state.done:
+        status = "✅ Done"
+    else:
+        status = "🟡 Busy"
     lines = [f"{status} — {display}"]
     if state.tool_count or state.completed_count:
-        lines.append(f"Activity: {state.completed_count}/{state.tool_count} tool calls complete")
+        lines.append(
+            f"Activity: {state.completed_count}/{state.tool_count} tool calls complete"
+        )
     else:
         lines.append("Activity: thinking")
 
@@ -442,53 +486,55 @@ async def _upsert_activity_digest(
     """Send or edit the per-topic activity digest."""
     tid = thread_id or 0
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
-    text = _render_activity_digest(state)
+    text = _render_activity_digest(
+        state, waiting=attention.is_waiting(user_id, thread_id)
+    )
     if text == state.last_text:
         return
 
     if state.message_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=state.message_id,
-                text=_ensure_formatted(text),
-                parse_mode=PARSE_MODE,
-                link_preview_options=NO_LINK_PREVIEW,
-            )
+        outcome = await topic_edit(
+            bot,
+            op="activity",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=effective_thread_id,
+            window_id=state.window_id,
+            message_id=state.message_id,
+            text=text,
+        )
+        if outcome is TopicSendOutcome.OK:
             state.last_text = text
             _activity_msg_info[(user_id, tid)] = state
             return
-        except RetryAfter:
-            raise
-        except Exception:
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=state.message_id,
-                    text=strip_sentinels(text),
-                    link_preview_options=NO_LINK_PREVIEW,
-                )
-                state.last_text = text
-                _activity_msg_info[(user_id, tid)] = state
-                return
-            except RetryAfter:
-                raise
-            except Exception as e:
-                logger.debug("Failed to edit activity digest: %s", e)
-                state.message_id = 0
+        # Edit failed (message gone, topic gone, etc). Drop the id and retry as
+        # a fresh send below; topic-shaped failures cascade into emergency DM.
+        state.message_id = 0
 
-    sent = await send_with_fallback(
+    sent, outcome = await topic_send(
         bot,
-        chat_id,
-        text,
-        **_send_kwargs(effective_thread_id),  # type: ignore[arg-type]
+        op="activity",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=effective_thread_id,
+        window_id=state.window_id,
+        text=text,
     )
-    if sent:
+    if sent is not None:
         state.message_id = sent.message_id
         state.last_text = text
         _activity_msg_info[(user_id, tid)] = state
-    elif thread_id is not None:
-        await _dm_fallback(bot, user_id, thread_id, state.window_id, text, kind="activity")
+        return
+    if thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
+        await _emergency_dm(
+            bot,
+            user_id,
+            thread_id,
+            state.window_id,
+            text,
+            kind="activity",
+            outcome=outcome,
+        )
 
 
 async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> None:
@@ -504,10 +550,15 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
         state.tool_count += 1
         state.lines.append(line)
         if task.tool_use_id:
-            _tool_activity_indices[(task.tool_use_id, user_id, tid)] = len(state.lines) - 1
+            _tool_activity_indices[(task.tool_use_id, user_id, tid)] = (
+                len(state.lines) - 1
+            )
     elif task.content_type == "tool_result":
         state.completed_count += 1
-        if task.tool_use_id and (task.tool_use_id, user_id, tid) in _tool_activity_indices:
+        if (
+            task.tool_use_id
+            and (task.tool_use_id, user_id, tid) in _tool_activity_indices
+        ):
             idx = _tool_activity_indices.pop((task.tool_use_id, user_id, tid))
             if 0 <= idx < len(state.lines):
                 state.lines[idx] = line
@@ -522,6 +573,10 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
             state.lines.append(line)
 
     state.done = False
+    # New tool work means Claude is no longer waiting on the user. Dismiss the
+    # attention card so the topic can flip back to "in progress" cleanly.
+    if task.content_type == "tool_use":
+        await attention.dismiss(bot, user_id=user_id, thread_id=task.thread_id)
     await _upsert_activity_digest(bot, user_id, task.thread_id, state)
 
     # Images are real output, not noise. Keep delivering them.
@@ -546,41 +601,8 @@ async def _finalize_activity_digest(
 
 
 def _looks_like_attention_request(text: str) -> bool:
-    """Heuristic: final assistant text that is probably waiting for user input."""
-    cleaned = strip_sentinels(text or "").strip()
-    if not cleaned:
-        return False
-    lower = " ".join(cleaned.lower().split())
-    cues = (
-        "tell me which",
-        "tell me your pick",
-        "tell me your picks",
-        "tell me your choice",
-        "which option",
-        "which approach",
-        "which one",
-        "do you want me to",
-        "want me to proceed",
-        "want me to continue",
-        "ok to proceed",
-        "okay to proceed",
-        "ok unless you",
-        "unless you object",
-        "please confirm",
-        "confirm before",
-        "before i write",
-        "before i proceed",
-        "owner decision",
-        "owner decisions",
-        "your recommendation",
-        "go with recommendations",
-        "go with your recommendations",
-        "tell me your picks",
-    )
-    if any(cue in lower for cue in cues):
-        return True
-    # A direct final question is usually attention-worthy; avoid tiny greetings.
-    return cleaned.endswith("?") and len(cleaned) > 80
+    """Backwards-compatible alias for ``attention.is_attention_request``."""
+    return attention.is_attention_request(text)
 
 
 async def _attention_dm_if_needed(
@@ -590,9 +612,33 @@ async def _attention_dm_if_needed(
     window_id: str,
     text: str,
 ) -> None:
-    """Send a direct DM when normal assistant text is actually waiting for the user."""
-    if not _looks_like_attention_request(text):
+    """Surface assistant text that is waiting on the user.
+
+    Primary surface is the in-topic attention card maintained by
+    ``handlers.attention``. Only when the topic send/edit fails (topic
+    deleted, closed, forbidden, …) do we fall back to a direct DM so the
+    notification never silently disappears.
+    """
+    if not attention.is_attention_request(text):
         return
+
+    outcome = await attention.notify_waiting(
+        bot,
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        prompt_text=text,
+        kind="assistant_text",
+    )
+    if outcome is TopicSendOutcome.OK:
+        return
+    if outcome not in _TOPIC_BROKEN_OUTCOMES:
+        # Transient/unclassified failure: leave it for the next attention
+        # opportunity rather than burning a DM. Logged in topic_send already.
+        return
+
+    # Strict emergency: topic itself is gone/closed/forbidden — DM so the
+    # user does not lose the "Claude is waiting" signal entirely.
     display = session_manager.get_display_name(window_id) if window_id else "unknown"
     cleaned = strip_sentinels(text).strip()
     dedupe_key = (user_id, thread_id, window_id, hash(cleaned[:1000]))
@@ -600,7 +646,7 @@ async def _attention_dm_if_needed(
     last = _attention_dm_seen.get(dedupe_key)
     if last is not None and now - last < ATTENTION_DM_COOLDOWN_SECONDS:
         logger.debug(
-            "Skipping duplicate attention DM for user=%d thread=%s window=%s",
+            "Skipping duplicate attention emergency DM for user=%d thread=%s window=%s",
             user_id,
             thread_id,
             window_id,
@@ -611,7 +657,7 @@ async def _attention_dm_if_needed(
     prefix = f"🔔 Claude needs your input in {display}"
     if thread_id is not None:
         prefix += f" (topic {thread_id})"
-    prefix += ":\n\n"
+    prefix += f" — topic delivery failed ({outcome.value}):\n\n"
     body = cleaned
     if len(prefix) + len(body) > 3800:
         body = body[: 3800 - len(prefix) - 20] + "\n… [truncated]"
@@ -619,29 +665,35 @@ async def _attention_dm_if_needed(
         sent = await send_with_fallback(bot, user_id, prefix + body)
         if sent:
             logger.info(
-                "Attention DM sent for user=%d thread=%s window=%s",
+                "emergency_dm op=attention user=%d thread=%s window=%s outcome=%s sent",
                 user_id,
                 thread_id,
                 window_id,
+                outcome.value,
             )
         else:
             logger.warning(
-                "Attention DM send returned None for user=%d thread=%s window=%s",
+                "emergency_dm op=attention user=%d thread=%s window=%s outcome=%s "
+                "send returned None",
                 user_id,
                 thread_id,
                 window_id,
+                outcome.value,
             )
     except Exception as e:
         logger.warning(
-            "Failed attention DM for user=%d thread=%s window=%s: %s",
+            "emergency_dm op=attention user=%d thread=%s window=%s outcome=%s failed: %s",
             user_id,
             thread_id,
             window_id,
+            outcome.value,
             e,
         )
 
 
-async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask, effective_thread_id: int | None = None) -> None:
+async def _send_task_images(
+    bot: Bot, chat_id: int, task: MessageTask, effective_thread_id: int | None = None
+) -> None:
     """Send images attached to a task, if any."""
     if not task.image_data:
         return
@@ -676,37 +728,28 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             await _do_clear_status_message(bot, user_id, tid)
             # Join all parts for editing (merged content goes together)
             full_text = "\n\n".join(task.parts)
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=edit_msg_id,
-                    text=_ensure_formatted(full_text),
-                    parse_mode=PARSE_MODE,
-                    link_preview_options=NO_LINK_PREVIEW,
-                )
+            outcome = await topic_edit(
+                bot,
+                op="tool_result",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=effective_thread_id,
+                window_id=wid,
+                message_id=edit_msg_id,
+                text=full_text,
+            )
+            if outcome is TopicSendOutcome.OK:
+                # Tool work resumed → user no longer "needed".
+                await attention.dismiss(bot, user_id=user_id, thread_id=task.thread_id)
                 await _send_task_images(bot, chat_id, task, effective_thread_id)
                 await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
-            except RetryAfter:
-                raise
-            except Exception:
-                try:
-                    # Fallback: plain text with sentinels stripped
-                    plain_text = strip_sentinels(task.text or full_text)
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=edit_msg_id,
-                        text=plain_text,
-                        link_preview_options=NO_LINK_PREVIEW,
-                    )
-                    await _send_task_images(bot, chat_id, task, effective_thread_id)
-                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
-                    return
-                except RetryAfter:
-                    raise
-                except Exception:
-                    logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
-                    # Fall through to send as new message
+            logger.debug(
+                "tool_result edit non-OK msg=%s outcome=%s — sending new",
+                edit_msg_id,
+                outcome.value,
+            )
+            # Fall through to send as new message
 
     # 2. Send content messages, converting status message to first content part
     first_part = True
@@ -726,21 +769,30 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
-                await _attention_dm_if_needed(bot, user_id, task.thread_id, wid, part)
+                await _maybe_attention_or_dismiss(
+                    bot, user_id, task.thread_id, wid, part, task.content_type
+                )
                 continue
 
-        sent = await send_with_fallback(
+        sent, outcome = await topic_send(
             bot,
-            chat_id,
-            part,
-            **_send_kwargs(effective_thread_id),  # type: ignore[arg-type]
+            op="content",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=effective_thread_id,
+            window_id=wid,
+            text=part,
         )
 
-        if sent:
+        if sent is not None:
             last_msg_id = sent.message_id
-        elif task.thread_id is not None:
-            await _dm_fallback(bot, user_id, task.thread_id, wid, part)
-        await _attention_dm_if_needed(bot, user_id, task.thread_id, wid, part)
+        elif task.thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
+            await _emergency_dm(
+                bot, user_id, task.thread_id, wid, part, kind="content", outcome=outcome
+            )
+        await _maybe_attention_or_dismiss(
+            bot, user_id, task.thread_id, wid, part, task.content_type
+        )
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
@@ -751,6 +803,30 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
     # 5. After content, check and send status
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
+
+
+async def _maybe_attention_or_dismiss(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    text: str,
+    content_type: str,
+) -> None:
+    """Route content text to either the attention card or attention dismissal.
+
+    Attention card is the topic-first surface. If the assistant text doesn't
+    look attention-worthy, the user is no longer being prompted, so any
+    standing card is dismissed back to idle.
+    """
+    if content_type != "text":
+        # tool_use / tool_result text continues active work; clear the card.
+        await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)
+        return
+    if attention.is_attention_request(text):
+        await _attention_dm_if_needed(bot, user_id, thread_id, window_id, text)
+    else:
+        await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)
 
 
 async def _convert_status_to_content(
@@ -770,44 +846,36 @@ async def _convert_status_to_content(
         return None
 
     msg_id, stored_wid, _ = info
-    chat_id, effective_thread_id = _delivery_target(user_id, thread_id_or_0 or None)
+    thread_id = thread_id_or_0 if thread_id_or_0 != 0 else None
+    chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
     if stored_wid != window_id:
         # Different window, just delete the old status
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception:
-            pass
+        await topic_delete(
+            bot,
+            op="status",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=effective_thread_id,
+            window_id=stored_wid,
+            message_id=msg_id,
+        )
         return None
 
-    # Edit status message to show content
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg_id,
-            text=_ensure_formatted(content_text),
-            parse_mode=PARSE_MODE,
-            link_preview_options=NO_LINK_PREVIEW,
-        )
+    # Edit status message to show content (op=content because the message is
+    # being repurposed as the first content message).
+    outcome = await topic_edit(
+        bot,
+        op="content",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=effective_thread_id,
+        window_id=window_id,
+        message_id=msg_id,
+        text=content_text,
+    )
+    if outcome is TopicSendOutcome.OK:
         return msg_id
-    except RetryAfter:
-        raise
-    except Exception:
-        try:
-            # Fallback to plain text with sentinels stripped
-            plain = strip_sentinels(content_text)
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=plain,
-                link_preview_options=NO_LINK_PREVIEW,
-            )
-            return msg_id
-        except RetryAfter:
-            raise
-        except Exception as e:
-            logger.debug(f"Failed to convert status to content: {e}")
-            # Message might be deleted or too old, caller will send new message
-            return None
+    return None
 
 
 async def _process_status_update_task(
@@ -849,32 +917,21 @@ async def _process_status_update_task(
                     raise
                 except Exception:
                     pass
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=_ensure_formatted(_status_display_text(wid, status_text)),
-                    parse_mode=PARSE_MODE,
-                    link_preview_options=NO_LINK_PREVIEW,
-                )
+            outcome = await topic_edit(
+                bot,
+                op="status",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=effective_thread_id,
+                window_id=wid,
+                message_id=msg_id,
+                text=_status_display_text(wid, status_text),
+            )
+            if outcome is TopicSendOutcome.OK:
                 _status_msg_info[skey] = (msg_id, wid, status_text)
-            except RetryAfter:
-                raise
-            except Exception:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=_status_display_text(wid, status_text),
-                        link_preview_options=NO_LINK_PREVIEW,
-                    )
-                    _status_msg_info[skey] = (msg_id, wid, status_text)
-                except RetryAfter:
-                    raise
-                except Exception as e:
-                    logger.debug(f"Failed to edit status message: {e}")
-                    _status_msg_info.pop(skey, None)
-                    await _do_send_status_message(bot, user_id, tid, wid, status_text)
+            else:
+                _status_msg_info.pop(skey, None)
+                await _do_send_status_message(bot, user_id, tid, wid, status_text)
     else:
         # No existing status message, send new
         await _do_send_status_message(bot, user_id, tid, wid, status_text)
@@ -895,10 +952,15 @@ async def _do_send_status_message(
     # This catches edge cases where tracking was cleared without deleting the message.
     old = _status_msg_info.pop(skey, None)
     if old:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=old[0])
-        except Exception:
-            pass
+        await topic_delete(
+            bot,
+            op="status",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=effective_thread_id,
+            window_id=old[1],
+            message_id=old[0],
+        )
     # Send typing indicator when Claude is working
     if "esc to interrupt" in text.lower():
         try:
@@ -907,16 +969,29 @@ async def _do_send_status_message(
             raise
         except Exception:
             pass
-    sent = await send_with_fallback(
+    rendered = _status_display_text(window_id, text)
+    sent, outcome = await topic_send(
         bot,
-        chat_id,
-        _status_display_text(window_id, text),
-        **_send_kwargs(effective_thread_id),  # type: ignore[arg-type]
+        op="status",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=effective_thread_id,
+        window_id=window_id,
+        text=rendered,
     )
-    if sent:
+    if sent is not None:
         _status_msg_info[skey] = (sent.message_id, window_id, text)
-    elif thread_id is not None:
-        await _dm_fallback(bot, user_id, thread_id, window_id, _status_display_text(window_id, text), kind="status")
+        return
+    if thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
+        await _emergency_dm(
+            bot,
+            user_id,
+            thread_id,
+            window_id,
+            rendered,
+            kind="status",
+            outcome=outcome,
+        )
 
 
 async def _do_clear_status_message(
@@ -928,12 +1003,18 @@ async def _do_clear_status_message(
     skey = (user_id, thread_id_or_0)
     info = _status_msg_info.pop(skey, None)
     if info:
-        msg_id = info[0]
-        chat_id, effective_thread_id = _delivery_target(user_id, thread_id_or_0 or None)
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception as e:
-            logger.debug(f"Failed to delete status message {msg_id}: {e}")
+        msg_id, stored_wid, _ = info
+        thread_id = thread_id_or_0 if thread_id_or_0 != 0 else None
+        chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
+        await topic_delete(
+            bot,
+            op="status",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=effective_thread_id,
+            window_id=stored_wid,
+            message_id=msg_id,
+        )
 
 
 async def _check_and_send_status(
