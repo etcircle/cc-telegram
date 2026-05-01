@@ -14,7 +14,9 @@ Provides:
 State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
+import hashlib
 import logging
+import time
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -46,6 +48,13 @@ _interactive_msgs: dict[tuple[int, int], int] = {}
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
 
+# Track direct-message notifications for interactive prompts. Telegram does not
+# reliably push notifications for edited topic/status messages, so prompts also
+# get a DM, but cooldown prevents spam while Claude redraws/updates the same UI.
+_interactive_dm_fingerprints: dict[tuple[int, int], str] = {}
+_interactive_dm_last_sent: dict[tuple[int, int], float] = {}
+INTERACTIVE_DM_COOLDOWN_SECONDS = 60
+
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
     """Get the window_id for user's interactive mode."""
@@ -76,6 +85,68 @@ def clear_interactive_mode(user_id: int, thread_id: int | None = None) -> None:
 def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | None:
     """Get the interactive message ID for a user."""
     return _interactive_msgs.get((user_id, thread_id or 0))
+
+
+def _topic_link(chat_id: int, thread_id: int | None) -> str | None:
+    """Build a best-effort Telegram private supergroup topic link."""
+    if thread_id is None:
+        return None
+    chat = str(chat_id)
+    if not chat.startswith("-100"):
+        return None
+    return f"https://t.me/c/{chat[4:]}/{thread_id}"
+
+
+async def _notify_waiting_dm(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None,
+    prompt_text: str,
+) -> None:
+    """Send a one-shot DM when Claude is waiting for input/approval."""
+    ikey = (user_id, thread_id or 0)
+    fingerprint = hashlib.sha1(
+        f"{window_id}\0{thread_id or 0}\0{prompt_text}".encode("utf-8", "replace")
+    ).hexdigest()
+    now = time.monotonic()
+    last = _interactive_dm_last_sent.get(ikey)
+    if _interactive_dm_fingerprints.get(ikey) == fingerprint:
+        return
+    if last is not None and now - last < INTERACTIVE_DM_COOLDOWN_SECONDS:
+        logger.debug(
+            "Skipping interactive waiting DM due cooldown user=%d thread=%s window=%s",
+            user_id,
+            thread_id,
+            window_id,
+        )
+        _interactive_dm_fingerprints[ikey] = fingerprint
+        return
+    _interactive_dm_fingerprints[ikey] = fingerprint
+    _interactive_dm_last_sent[ikey] = now
+
+    display = session_manager.get_display_name(window_id) or window_id
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    link = _topic_link(chat_id, thread_id)
+    message = f"🔔 Claude is waiting for input in {display}"
+    if link:
+        message += f"\n{link}"
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=message,
+            link_preview_options=NO_LINK_PREVIEW,
+        )
+        logger.info(
+            "Interactive waiting DM sent to user=%d thread=%s window=%s",
+            user_id,
+            thread_id,
+            window_id,
+        )
+    except Exception as e:
+        # Non-fatal: the in-topic interactive UI still exists. This commonly
+        # fails if the user has not opened a DM with the bot.
+        logger.debug("Failed to send interactive waiting DM to %d: %s", user_id, e)
 
 
 def _build_interactive_keyboard(
@@ -202,6 +273,7 @@ async def handle_interactive_ui(
                 link_preview_options=NO_LINK_PREVIEW,
             )
             _interactive_mode[ikey] = window_id
+            await _notify_waiting_dm(bot, user_id, window_id, thread_id, text)
             return True
         except BadRequest as e:
             if "Message is not modified" in str(e):
@@ -236,10 +308,16 @@ async def handle_interactive_ui(
         )
     except Exception as e:
         logger.error("Failed to send interactive UI: %s", e)
+        # Still mark interactive mode and DM the user. A stale/deleted forum
+        # topic is exactly when the user otherwise gets no signal that Claude is
+        # blocked; marking mode also prevents retry/log spam every poll tick.
+        _interactive_mode[ikey] = window_id
+        await _notify_waiting_dm(bot, user_id, window_id, thread_id, text)
         return False
     if sent:
         _interactive_msgs[ikey] = sent.message_id
         _interactive_mode[ikey] = window_id
+        await _notify_waiting_dm(bot, user_id, window_id, thread_id, text)
         # New message sent successfully — now safe to delete the old one
         if existing_msg_id:
             try:
@@ -259,6 +337,7 @@ async def clear_interactive_msg(
     ikey = (user_id, thread_id or 0)
     msg_id = _interactive_msgs.pop(ikey, None)
     _interactive_mode.pop(ikey, None)
+    _interactive_dm_fingerprints.pop(ikey, None)
     logger.debug(
         "Clear interactive msg: user=%d, thread=%s, msg_id=%s",
         user_id,

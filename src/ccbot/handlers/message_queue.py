@@ -66,6 +66,19 @@ class MessageTask:
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
 
 
+@dataclass
+class ActivityDigestState:
+    """Single editable per-topic activity digest for noisy tool/thinking events."""
+
+    message_id: int
+    window_id: str
+    lines: list[str] = field(default_factory=list)
+    tool_count: int = 0
+    completed_count: int = 0
+    last_text: str = ""
+    done: bool = False
+
+
 # Per-user message queues and worker tasks
 _message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
 _queue_workers: dict[int, asyncio.Task[None]] = {}
@@ -78,8 +91,24 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
+# Activity digest tracking: one editable message per user/topic that collapses
+# tool calls, tool results, and thinking into a Hermes-style activity card.
+_activity_msg_info: dict[tuple[int, int], ActivityDigestState] = {}
+_tool_activity_indices: dict[tuple[str, int, int], int] = {}
+ACTIVITY_DIGEST_CONTENT_TYPES = {"tool_use", "tool_result", "thinking"}
+ACTIVITY_DIGEST_MAX_LINES = 10
+ACTIVITY_DIGEST_MAX_LINE_LENGTH = 180
+
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
+
+# DM fallback dedupe: avoid spamming the user every polling tick if a topic is broken.
+_dm_fallback_seen: dict[tuple[int, int | None, str, int], float] = {}
+DM_FALLBACK_COOLDOWN_SECONDS = 60
+
+# Topic ids that Telegram rejected during this process lifetime. Keep the binding
+# for routing inbound replies to the tmux window, but deliver outbound updates by DM.
+_bad_topic_threads: set[tuple[int, int]] = set()
 
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
@@ -123,12 +152,11 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
         return False
     if candidate.task_type != "content":
         return False
-    # tool_use/tool_result break merge chain
-    # - tool_use: will be edited later by tool_result
-    # - tool_result: edits previous message, merging would cause order issues
-    if base.content_type in ("tool_use", "tool_result"):
+    # Activity events are handled by the editable activity digest, not merged
+    # into final assistant text.
+    if base.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
         return False
-    if candidate.content_type in ("tool_use", "tool_result"):
+    if candidate.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
         return False
     return True
 
@@ -227,6 +255,9 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     logger.info("Flood control lifted for user %d", user_id)
 
                 if task.task_type == "content":
+                    if task.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
+                        await _process_activity_task(bot, user_id, task)
+                        continue
                     # Try to merge consecutive content tasks
                     merged_task, merge_count = await _merge_content_tasks(
                         queue, task, lock
@@ -280,7 +311,237 @@ def _send_kwargs(thread_id: int | None) -> dict[str, int]:
     return {}
 
 
-async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
+def _delivery_target(user_id: int, thread_id: int | None) -> tuple[int, int | None]:
+    """Return (chat_id, effective_thread_id), falling back to DM for known-bad topics."""
+    if thread_id is not None and (user_id, thread_id) in _bad_topic_threads:
+        return user_id, None
+    return session_manager.resolve_chat_id(user_id, thread_id), thread_id
+
+
+def _mark_bad_topic(user_id: int, thread_id: int | None) -> None:
+    if thread_id is not None:
+        _bad_topic_threads.add((user_id, thread_id))
+
+
+async def _dm_fallback(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    text: str,
+    kind: str = "content",
+) -> None:
+    """DM content/status when topic delivery fails so messages don't disappear."""
+    _mark_bad_topic(user_id, thread_id)
+    display = session_manager.get_display_name(window_id) if window_id else "unknown"
+    dedupe_key = (user_id, thread_id, window_id, hash((kind, text[:500])))
+    now = time.monotonic()
+    last = _dm_fallback_seen.get(dedupe_key)
+    if last is not None and now - last < DM_FALLBACK_COOLDOWN_SECONDS:
+        logger.debug(
+            "Skipping duplicate DM fallback for user=%d thread=%s window=%s kind=%s",
+            user_id,
+            thread_id,
+            window_id,
+            kind,
+        )
+        return
+    _dm_fallback_seen[dedupe_key] = now
+
+    prefix = f"⚠️ CCBot could not post this {kind} in topic {thread_id} ({display}); DM fallback:\n\n"
+    body = text
+    # Telegram hard limit is 4096; keep room for markdown escaping/fallback.
+    if len(prefix) + len(body) > 3800:
+        body = body[: 3800 - len(prefix) - 20] + "\n… [truncated]"
+    try:
+        sent = await send_with_fallback(bot, user_id, prefix + body)
+        if sent:
+            logger.info(
+                "DM fallback sent for user=%d thread=%s window=%s kind=%s",
+                user_id,
+                thread_id,
+                window_id,
+                kind,
+            )
+        else:
+            logger.error("DM fallback send returned None for user=%d thread=%s kind=%s", user_id, thread_id, kind)
+    except Exception as e:
+        logger.error("Failed DM fallback for user=%d thread=%s kind=%s: %s", user_id, thread_id, kind, e)
+
+
+
+def _display_name(window_id: str) -> str:
+    """Best-effort human name for a tmux window/topic."""
+    return session_manager.get_display_name(window_id) or window_id or "Claude"
+
+
+def _status_display_text(window_id: str, text: str) -> str:
+    """Format busy status with the window/topic identity visible."""
+    display = _display_name(window_id)
+    return f"🟡 Busy — {display}\n{text}"
+
+
+def _compact_activity_line(task: MessageTask) -> str:
+    """Render a compact single-line activity entry."""
+    if task.content_type == "thinking":
+        return "💭 Thinking"
+
+    raw = " ".join(part.strip() for part in task.parts if part and part.strip())
+    raw = strip_sentinels(raw).replace("\n", " ")
+    raw = " ".join(raw.split())
+    if not raw:
+        raw = task.content_type
+
+    if "  ⎿  " in raw:
+        left, rest = raw.split("  ⎿  ", 1)
+        # Keep the useful stats line, drop expandable/raw output noise.
+        stat = rest.split(" ", 18)
+        stat_text = " ".join(stat[:18]).strip()
+        raw = f"{left} — {stat_text}" if stat_text else left
+
+    if len(raw) > ACTIVITY_DIGEST_MAX_LINE_LENGTH:
+        raw = raw[: ACTIVITY_DIGEST_MAX_LINE_LENGTH - 1].rstrip() + "…"
+
+    if task.content_type == "tool_result":
+        if "error" in raw.lower():
+            return f"❌ {raw}"
+        if "interrupted" in raw.lower():
+            return f"⏹ {raw}"
+        return f"✅ {raw}"
+    return f"⚙️ {raw}"
+
+
+def _render_activity_digest(state: ActivityDigestState) -> str:
+    """Render the editable activity digest card."""
+    display = _display_name(state.window_id)
+    status = "✅ Done" if state.done else "🟡 Busy"
+    lines = [f"{status} — {display}"]
+    if state.tool_count or state.completed_count:
+        lines.append(f"Activity: {state.completed_count}/{state.tool_count} tool calls complete")
+    else:
+        lines.append("Activity: thinking")
+
+    shown = state.lines[-ACTIVITY_DIGEST_MAX_LINES:]
+    hidden = max(0, len(state.lines) - len(shown))
+    if hidden:
+        lines.append(f"• … {hidden} earlier event(s)")
+    lines.extend(f"• {line}" for line in shown)
+    return "\n".join(lines)
+
+
+async def _upsert_activity_digest(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    state: ActivityDigestState,
+) -> None:
+    """Send or edit the per-topic activity digest."""
+    tid = thread_id or 0
+    chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
+    text = _render_activity_digest(state)
+    if text == state.last_text:
+        return
+
+    if state.message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state.message_id,
+                text=_ensure_formatted(text),
+                parse_mode=PARSE_MODE,
+                link_preview_options=NO_LINK_PREVIEW,
+            )
+            state.last_text = text
+            _activity_msg_info[(user_id, tid)] = state
+            return
+        except RetryAfter:
+            raise
+        except Exception:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=state.message_id,
+                    text=strip_sentinels(text),
+                    link_preview_options=NO_LINK_PREVIEW,
+                )
+                state.last_text = text
+                _activity_msg_info[(user_id, tid)] = state
+                return
+            except RetryAfter:
+                raise
+            except Exception as e:
+                logger.debug("Failed to edit activity digest: %s", e)
+                state.message_id = 0
+
+    sent = await send_with_fallback(
+        bot,
+        chat_id,
+        text,
+        **_send_kwargs(effective_thread_id),  # type: ignore[arg-type]
+    )
+    if sent:
+        state.message_id = sent.message_id
+        state.last_text = text
+        _activity_msg_info[(user_id, tid)] = state
+    elif thread_id is not None:
+        await _dm_fallback(bot, user_id, thread_id, state.window_id, text, kind="activity")
+
+
+async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Collapse noisy thinking/tool events into one editable activity message."""
+    wid = task.window_id or ""
+    tid = task.thread_id or 0
+    state = _activity_msg_info.get((user_id, tid))
+    if state is None or state.window_id != wid or state.done:
+        state = ActivityDigestState(message_id=0, window_id=wid)
+
+    line = _compact_activity_line(task)
+    if task.content_type == "tool_use":
+        state.tool_count += 1
+        state.lines.append(line)
+        if task.tool_use_id:
+            _tool_activity_indices[(task.tool_use_id, user_id, tid)] = len(state.lines) - 1
+    elif task.content_type == "tool_result":
+        state.completed_count += 1
+        if task.tool_use_id and (task.tool_use_id, user_id, tid) in _tool_activity_indices:
+            idx = _tool_activity_indices.pop((task.tool_use_id, user_id, tid))
+            if 0 <= idx < len(state.lines):
+                state.lines[idx] = line
+            else:
+                state.lines.append(line)
+        else:
+            state.lines.append(line)
+    else:
+        # Thinking should show that the topic is alive without sending the full
+        # reasoning blob to Telegram.
+        if not state.lines or state.lines[-1] != line:
+            state.lines.append(line)
+
+    state.done = False
+    await _upsert_activity_digest(bot, user_id, task.thread_id, state)
+
+    # Images are real output, not noise. Keep delivering them.
+    if task.image_data:
+        chat_id, effective_thread_id = _delivery_target(user_id, task.thread_id)
+        await _send_task_images(bot, chat_id, task, effective_thread_id)
+
+
+async def _finalize_activity_digest(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+) -> None:
+    """Mark activity digest done before the final assistant text lands."""
+    tid = thread_id or 0
+    state = _activity_msg_info.get((user_id, tid))
+    if not state or state.window_id != window_id or state.done:
+        return
+    state.done = True
+    await _upsert_activity_digest(bot, user_id, thread_id, state)
+
+
+async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask, effective_thread_id: int | None = None) -> None:
     """Send images attached to a task, if any."""
     if not task.image_data:
         return
@@ -293,7 +554,7 @@ async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
         bot,
         chat_id,
         task.image_data,
-        **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+        **_send_kwargs(effective_thread_id),  # type: ignore[arg-type]
     )
 
 
@@ -301,7 +562,10 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     """Process a content message task."""
     wid = task.window_id or ""
     tid = task.thread_id or 0
-    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    chat_id, effective_thread_id = _delivery_target(user_id, task.thread_id)
+
+    if task.content_type == "text":
+        await _finalize_activity_digest(bot, user_id, task.thread_id, wid)
 
     # 1. Handle tool_result editing (merged parts are edited together)
     if task.content_type == "tool_result" and task.tool_use_id:
@@ -320,7 +584,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     parse_mode=PARSE_MODE,
                     link_preview_options=NO_LINK_PREVIEW,
                 )
-                await _send_task_images(bot, chat_id, task)
+                await _send_task_images(bot, chat_id, task, effective_thread_id)
                 await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
             except RetryAfter:
@@ -335,7 +599,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         text=plain_text,
                         link_preview_options=NO_LINK_PREVIEW,
                     )
-                    await _send_task_images(bot, chat_id, task)
+                    await _send_task_images(bot, chat_id, task, effective_thread_id)
                     await _check_and_send_status(bot, user_id, wid, task.thread_id)
                     return
                 except RetryAfter:
@@ -368,18 +632,20 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             bot,
             chat_id,
             part,
-            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+            **_send_kwargs(effective_thread_id),  # type: ignore[arg-type]
         )
 
         if sent:
             last_msg_id = sent.message_id
+        elif task.thread_id is not None:
+            await _dm_fallback(bot, user_id, task.thread_id, wid, part)
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
 
     # 4. Send images if present (from tool_result with base64 image blocks)
-    await _send_task_images(bot, chat_id, task)
+    await _send_task_images(bot, chat_id, task, effective_thread_id)
 
     # 5. After content, check and send status
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
@@ -402,7 +668,7 @@ async def _convert_status_to_content(
         return None
 
     msg_id, stored_wid, _ = info
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
+    chat_id, effective_thread_id = _delivery_target(user_id, thread_id_or_0 or None)
     if stored_wid != window_id:
         # Different window, just delete the old status
         try:
@@ -448,7 +714,7 @@ async def _process_status_update_task(
     """Process a status update task."""
     wid = task.window_id or ""
     tid = task.thread_id or 0
-    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    chat_id, effective_thread_id = _delivery_target(user_id, task.thread_id)
     skey = (user_id, tid)
     status_text = task.text or ""
 
@@ -485,7 +751,7 @@ async def _process_status_update_task(
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=msg_id,
-                    text=_ensure_formatted(status_text),
+                    text=_ensure_formatted(_status_display_text(wid, status_text)),
                     parse_mode=PARSE_MODE,
                     link_preview_options=NO_LINK_PREVIEW,
                 )
@@ -497,7 +763,7 @@ async def _process_status_update_task(
                     await bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=msg_id,
-                        text=status_text,
+                        text=_status_display_text(wid, status_text),
                         link_preview_options=NO_LINK_PREVIEW,
                     )
                     _status_msg_info[skey] = (msg_id, wid, status_text)
@@ -522,7 +788,7 @@ async def _do_send_status_message(
     """Send a new status message and track it (internal, called from worker)."""
     skey = (user_id, thread_id_or_0)
     thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
     # Safety net: delete any orphaned status message before sending a new one.
     # This catches edge cases where tracking was cleared without deleting the message.
     old = _status_msg_info.pop(skey, None)
@@ -542,11 +808,13 @@ async def _do_send_status_message(
     sent = await send_with_fallback(
         bot,
         chat_id,
-        text,
-        **_send_kwargs(thread_id),  # type: ignore[arg-type]
+        _status_display_text(window_id, text),
+        **_send_kwargs(effective_thread_id),  # type: ignore[arg-type]
     )
     if sent:
         _status_msg_info[skey] = (sent.message_id, window_id, text)
+    elif thread_id is not None:
+        await _dm_fallback(bot, user_id, thread_id, window_id, _status_display_text(window_id, text), kind="status")
 
 
 async def _do_clear_status_message(
@@ -559,7 +827,7 @@ async def _do_clear_status_message(
     info = _status_msg_info.pop(skey, None)
     if info:
         msg_id = info[0]
-        chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
+        chat_id, effective_thread_id = _delivery_target(user_id, thread_id_or_0 or None)
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
