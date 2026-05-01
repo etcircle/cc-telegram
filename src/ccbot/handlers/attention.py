@@ -76,6 +76,38 @@ class AttentionState:
 _attention_state: dict[tuple[int, int], AttentionState] = {}
 
 
+# Cross-module fence for emergency "Claude is waiting" DMs. When the topic
+# itself is broken, both message_queue (assistant text) and interactive_ui
+# (interactive UI prompts) can decide to DM the user. Without a shared
+# cooldown, the same waiting episode produced two DMs (one per call site).
+# This map is keyed by ``(user_id, thread_id_or_0, window_id)`` so a single
+# stuck topic episode collapses to one DM regardless of which surface tripped.
+EMERGENCY_DM_COOLDOWN_SECONDS = 300
+_emergency_dm_last_sent: dict[tuple[int, int, str], float] = {}
+
+
+def should_emit_emergency_dm(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+) -> bool:
+    """Return True iff an emergency waiting-DM may be sent for this episode.
+
+    Marks the slot as recently-sent on a True return so subsequent calls
+    inside ``EMERGENCY_DM_COOLDOWN_SECONDS`` are denied. Both
+    ``message_queue._attention_dm_if_needed`` and
+    ``interactive_ui._notify_waiting_dm`` route through this fence so a single
+    waiting episode never produces two DMs.
+    """
+    fence_key = (user_id, thread_id or 0, window_id or "")
+    now = time.monotonic()
+    last = _emergency_dm_last_sent.get(fence_key)
+    if last is not None and now - last < EMERGENCY_DM_COOLDOWN_SECONDS:
+        return False
+    _emergency_dm_last_sent[fence_key] = now
+    return True
+
+
 # ── Heuristic ──────────────────────────────────────────────────────────────
 
 
@@ -211,6 +243,11 @@ async def notify_waiting(
     fingerprint = _fingerprint(window_id, kind, prompt_text)
     now = time.monotonic()
     existing = _attention_state.get(key)
+    within_dwell = (
+        existing is not None
+        and existing.window_id == window_id
+        and (now - existing.last_send_at) < ATTENTION_REPEAT_DWELL_SECONDS
+    )
 
     # WAITING + same fingerprint within dwell: silent no-op.
     if (
@@ -230,6 +267,44 @@ async def notify_waiting(
         )
         return TopicSendOutcome.OK
 
+    # Anti-flap guard: if a card was sent very recently (within dwell) for
+    # this window — even if the state is now ``idle`` because the user
+    # already replied or the worker dismissed — prefer editing the existing
+    # message over emitting a fresh audible card. This catches the
+    # "user reply → dismiss → handle_interactive_ui re-fires notify_waiting"
+    # ping-pong that would otherwise push a duplicate notification.
+    if (
+        existing is not None
+        and existing.state == "idle"
+        and within_dwell
+        and existing.message_id
+    ):
+        outcome = await topic_edit(
+            bot,
+            op="attention",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            message_id=existing.message_id,
+            text=text,
+        )
+        if outcome in (TopicSendOutcome.OK, TopicSendOutcome.MESSAGE_NOT_MODIFIED):
+            existing.last_fingerprint = fingerprint
+            existing.kind = kind
+            existing.state = "waiting"
+            return TopicSendOutcome.OK
+        # Edit failed — drop slot and fall through to fresh send so the
+        # signal is not silently lost.
+        logger.debug(
+            "attention anti-flap edit failed user=%d thread=%s window=%s outcome=%s",
+            user_id,
+            thread_id,
+            window_id,
+            outcome.value,
+        )
+        _attention_state.pop(key, None)
+
     # WAITING (any fingerprint): edit the existing card silently.
     if (
         existing is not None
@@ -247,7 +322,11 @@ async def notify_waiting(
             message_id=existing.message_id,
             text=text,
         )
-        if outcome is TopicSendOutcome.OK:
+        # MESSAGE_NOT_MODIFIED means Telegram refused a no-op edit — the
+        # rendered card already matches what we wanted to write. Treat it as
+        # success so we do not "fall through to fresh send" and push an
+        # audible duplicate of a card the user is already looking at.
+        if outcome in (TopicSendOutcome.OK, TopicSendOutcome.MESSAGE_NOT_MODIFIED):
             existing.last_fingerprint = fingerprint
             existing.kind = kind
             return TopicSendOutcome.OK
@@ -345,3 +424,4 @@ def clear(user_id: int, thread_id: int | None) -> None:
 def reset_for_tests() -> None:
     """Test-only: drop all attention state."""
     _attention_state.clear()
+    _emergency_dm_last_sent.clear()

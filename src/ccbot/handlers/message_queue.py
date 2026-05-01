@@ -103,13 +103,23 @@ _flood_until: dict[int, float] = {}
 _dm_fallback_seen: dict[tuple[int, int | None, str, int], float] = {}
 DM_FALLBACK_COOLDOWN_SECONDS = 60
 
-# Direct attention DM dedupe for normal assistant text that asks the user to decide/confirm.
-_attention_dm_seen: dict[tuple[int, int | None, str, int], float] = {}
-ATTENTION_DM_COOLDOWN_SECONDS = 300
+# Cross-module emergency DM cooldown is owned by ``handlers.attention``
+# (``attention.should_emit_emergency_dm``). Both this module and
+# ``handlers.interactive_ui`` route through that fence so the same waiting
+# episode cannot fire two DMs from two surfaces.
 
 # Topic ids that Telegram rejected during this process lifetime. Keep the binding
 # for routing inbound replies to the tmux window, but deliver outbound updates by DM.
-# (Stage 3 will replace this with the throttled topic_repair pipeline.)
+#
+# KNOWN LIMITATION (intentionally not fixed in this pass): the set is sticky
+# for the life of the process. A topic that fails once is treated as broken
+# until the bot restarts even if the topic is later reopened/recreated by the
+# user. The status_polling probe (``unpin_all_forum_topic_messages``) will
+# kill the binding+window when the topic is gone for good, but it will not
+# re-enable a recovered topic — only a restart does. Stage 3 (``topic_repair``)
+# will own automatic recovery; until then, the trade-off is "noisy DMs > silent
+# data loss when a topic is genuinely unreachable". Do NOT add automatic
+# create/reopen here; that belongs in the gated repair pipeline.
 _bad_topic_threads: set[tuple[int, int]] = set()
 
 # Topic outcomes that should trigger emergency DM fallback (after Stage 3
@@ -641,10 +651,7 @@ async def _attention_dm_if_needed(
     # user does not lose the "Claude is waiting" signal entirely.
     display = session_manager.get_display_name(window_id) if window_id else "unknown"
     cleaned = strip_sentinels(text).strip()
-    dedupe_key = (user_id, thread_id, window_id, hash(cleaned[:1000]))
-    now = time.monotonic()
-    last = _attention_dm_seen.get(dedupe_key)
-    if last is not None and now - last < ATTENTION_DM_COOLDOWN_SECONDS:
+    if not attention.should_emit_emergency_dm(user_id, thread_id, window_id):
         logger.debug(
             "Skipping duplicate attention emergency DM for user=%d thread=%s window=%s",
             user_id,
@@ -652,7 +659,6 @@ async def _attention_dm_if_needed(
             window_id,
         )
         return
-    _attention_dm_seen[dedupe_key] = now
 
     prefix = f"🔔 Claude needs your input in {display}"
     if thread_id is not None:
@@ -769,9 +775,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
-                await _maybe_attention_or_dismiss(
-                    bot, user_id, task.thread_id, wid, part, task.content_type
-                )
                 continue
 
         sent, outcome = await topic_send(
@@ -790,8 +793,16 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             await _emergency_dm(
                 bot, user_id, task.thread_id, wid, part, kind="content", outcome=outcome
             )
+
+    # The attention/dismiss heuristic must run on the logical final text once,
+    # not per multipart segment. Otherwise an early part containing a question
+    # cue gets dismissed by a later neutral part (or vice versa), and the user
+    # sees an attention card flap to acknowledged within the same logical
+    # message.
+    if task.parts:
+        joined = "\n\n".join(task.parts)
         await _maybe_attention_or_dismiss(
-            bot, user_id, task.thread_id, wid, part, task.content_type
+            bot, user_id, task.thread_id, wid, joined, task.content_type
         )
 
     # 3. Record tool_use message ID for later editing

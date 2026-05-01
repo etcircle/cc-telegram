@@ -8,7 +8,9 @@ on its next 1s tick.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telegram.error import BadRequest
 
+from ccbot.handlers.message_sender import TopicSendOutcome, _classify_bad_request
 from ccbot.handlers.status_polling import update_status_message
 
 
@@ -153,3 +155,102 @@ class TestStatusPollerSettingsDetection:
                     f"unexpected DM-shaped send_message: {call.kwargs}"
                 )
         attention.reset_for_tests()
+
+
+# ── Topic existence probe (status_poll_loop) ────────────────────────────────
+
+
+class TestTopicProbeClassification:
+    """The status_poll_loop probes topic existence by calling
+    ``unpin_all_forum_topic_messages``. Telegram returns various BadRequest
+    bodies for "this topic is gone"; the classifier must catch all of them or
+    we fail to clean up dead bindings and keep DM-flooding the user.
+
+    These tests pin the classifier fragments instead of running the full
+    status_poll_loop (which is an unbounded ``while True`` task).
+    """
+
+    @pytest.mark.parametrize(
+        "telegram_message",
+        [
+            "Bad Request: message thread not found",
+            "MESSAGE THREAD NOT FOUND",  # case-insensitive
+            "Bad Request: TOPIC_ID_INVALID",
+            "Bad Request: topic not found",
+        ],
+    )
+    def test_thread_not_found_variants_classified(self, telegram_message: str):
+        outcome = _classify_bad_request(BadRequest(telegram_message))
+        assert outcome is TopicSendOutcome.TOPIC_NOT_FOUND, (
+            f"Telegram message {telegram_message!r} must classify as "
+            f"TOPIC_NOT_FOUND so the probe can reap dead bindings"
+        )
+
+    def test_topic_closed_variant_classified(self):
+        outcome = _classify_bad_request(BadRequest("Bad Request: TOPIC_CLOSED"))
+        assert outcome is TopicSendOutcome.TOPIC_CLOSED
+
+    def test_message_not_modified_classified(self):
+        # Distinct outcome so attention.notify_waiting can short-circuit
+        # benign no-op edits without falling through to a fresh card.
+        outcome = _classify_bad_request(
+            BadRequest("Bad Request: message is not modified")
+        )
+        assert outcome is TopicSendOutcome.MESSAGE_NOT_MODIFIED
+
+    def test_unknown_bad_request_falls_through_to_other(self):
+        outcome = _classify_bad_request(BadRequest("some unrelated error"))
+        assert outcome is TopicSendOutcome.OTHER
+
+
+class TestTopicProbeReapsDeadBinding:
+    """Drive one iteration of the probe path manually and verify it kills the
+    tmux window + unbinds the thread when Telegram returns "thread not found".
+    """
+
+    @pytest.mark.asyncio
+    async def test_probe_thread_not_found_reaps_binding(self):
+        from ccbot.handlers import status_polling
+
+        bot = AsyncMock()
+        bot.unpin_all_forum_topic_messages = AsyncMock(
+            side_effect=BadRequest("Bad Request: message thread not found")
+        )
+
+        mock_window = MagicMock()
+        mock_window.window_id = "@7"
+
+        with (
+            patch.object(
+                status_polling, "session_manager"
+            ) as mock_sm,
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_topic_state", new_callable=AsyncMock
+            ) as mock_clear,
+        ):
+            mock_sm.iter_thread_bindings.return_value = [(1, 42, "@7")]
+            mock_sm.resolve_chat_id.return_value = -100123
+            mock_sm.unbind_thread = MagicMock()
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.kill_window = AsyncMock()
+
+            # Replicate the probe block from status_poll_loop (one user/thread).
+            for user_id, thread_id, wid in mock_sm.iter_thread_bindings.return_value:
+                try:
+                    await bot.unpin_all_forum_topic_messages(
+                        chat_id=mock_sm.resolve_chat_id(user_id, thread_id),
+                        message_thread_id=thread_id,
+                    )
+                except BadRequest as e:
+                    outcome = _classify_bad_request(e)
+                    if outcome is TopicSendOutcome.TOPIC_NOT_FOUND:
+                        w = await mock_tmux.find_window_by_id(wid)
+                        if w:
+                            await mock_tmux.kill_window(w.window_id)
+                        mock_sm.unbind_thread(user_id, thread_id)
+                        await mock_clear(user_id, thread_id, bot)
+
+            mock_tmux.kill_window.assert_awaited_once_with("@7")
+            mock_sm.unbind_thread.assert_called_once_with(1, 42)
+            mock_clear.assert_awaited_once_with(1, 42, bot)

@@ -312,6 +312,29 @@ class TestFormatToolResultText:
         result = TranscriptParser._format_tool_result_text(text, tool_name)
         assert check(result), f"Failed check for {tool_name!r}: {result!r}"
 
+    # The Write branch resolves its line count from ``tool_input_data["content"]``
+    # at runtime (the tool result is only "File created successfully at:…").
+    # In replayed history and in unit tests there is no input_data, so the
+    # branch falls back to the result text. These two tests pin both code
+    # paths so a future "simplification" cannot silently regress to "Wrote 0
+    # lines" for replayed history.
+
+    def test_write_uses_tool_input_data_when_present(self):
+        result = TranscriptParser._format_tool_result_text(
+            text="File created successfully at: /tmp/x.py",
+            tool_name="Write",
+            tool_input_data={"content": "a\nb\nc"},
+        )
+        assert result == "  ⎿  Wrote 3 lines"
+
+    def test_write_falls_back_to_result_text_without_input_data(self):
+        result = TranscriptParser._format_tool_result_text(
+            text="line1\nline2",
+            tool_name="Write",
+            tool_input_data=None,
+        )
+        assert result == "  ⎿  Wrote 2 lines"
+
 
 # ── parse_entries ────────────────────────────────────────────────────────
 

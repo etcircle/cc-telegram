@@ -38,6 +38,12 @@ class TopicSendOutcome(enum.Enum):
     """Classification of a single topic-targeted Telegram operation."""
 
     OK = "OK"
+    # The edit reached Telegram but the message body was already identical, so
+    # Telegram refused to apply the (no-op) update. From the caller's
+    # perspective this is success — the rendered state matches intent — but it
+    # is distinguishable from OK so that loud-side-effect callers (e.g.
+    # attention.notify_waiting) can avoid re-sending a fresh card.
+    MESSAGE_NOT_MODIFIED = "MESSAGE_NOT_MODIFIED"
     TOPIC_NOT_FOUND = "TOPIC_NOT_FOUND"
     TOPIC_CLOSED = "TOPIC_CLOSED"
     FORBIDDEN = "FORBIDDEN"
@@ -56,6 +62,9 @@ _TOPIC_NOT_FOUND_FRAGMENTS = (
 _TOPIC_CLOSED_FRAGMENTS = (
     "topic_closed",
     "topic is closed",
+)
+_MESSAGE_NOT_MODIFIED_FRAGMENTS = (
+    "message is not modified",
 )
 
 
@@ -78,6 +87,9 @@ def _classify_bad_request(exc: BaseException) -> TopicSendOutcome:
         for fragment in _TOPIC_CLOSED_FRAGMENTS:
             if fragment in msg:
                 return TopicSendOutcome.TOPIC_CLOSED
+        for fragment in _MESSAGE_NOT_MODIFIED_FRAGMENTS:
+            if fragment in msg:
+                return TopicSendOutcome.MESSAGE_NOT_MODIFIED
         return TopicSendOutcome.OTHER
     return TopicSendOutcome.OTHER
 
@@ -430,10 +442,14 @@ async def topic_edit(
         raise
     except Exception as exc:
         outcome = _classify_bad_request(exc)
+        # Topic-shaped failures and the benign "no-op edit" branch must not
+        # retry as plain text — the second attempt would surface the same
+        # error and we would log a misleading OTHER classification.
         if outcome in (
             TopicSendOutcome.TOPIC_NOT_FOUND,
             TopicSendOutcome.TOPIC_CLOSED,
             TopicSendOutcome.FORBIDDEN,
+            TopicSendOutcome.MESSAGE_NOT_MODIFIED,
         ):
             _log_topic_outcome(
                 op, user_id, chat_id, thread_id, window_id, outcome, "edit", exc

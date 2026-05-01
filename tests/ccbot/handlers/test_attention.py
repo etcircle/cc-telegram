@@ -1,7 +1,24 @@
-"""Tests for handlers.attention — heuristic and digest waiting indicator."""
+"""Tests for handlers.attention — heuristic, state machine, and digest indicator.
+
+The state-machine tests pin the four corners of ``notify_waiting`` so the
+topic-first attention card stays predictable:
+
+  - idle → waiting fires a single fresh, audible ``topic_send``.
+  - waiting → waiting (same fingerprint, dwell window) is a silent no-op.
+  - waiting → waiting (different fingerprint) edits the live card silently.
+  - dismiss flips state back to idle and edits the ack trailer.
+  - the anti-flap guard prevents a second fresh send when a user reply has
+    just dismissed the card and a follow-up notify_waiting fires inside the
+    dwell window (the regression in the architect review).
+"""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from ccbot.handlers import attention
 from ccbot.handlers.message_queue import ActivityDigestState, _render_activity_digest
+from ccbot.handlers.message_sender import TopicSendOutcome
 
 
 def test_is_attention_request_empty():
@@ -50,3 +67,298 @@ def test_render_activity_digest_done_when_not_waiting():
     state = ActivityDigestState(message_id=0, window_id="@0", done=True)
     rendered = _render_activity_digest(state, waiting=False)
     assert rendered.startswith("✅ Done")
+
+
+# ── State machine ──────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def _reset_attention():
+    attention.reset_for_tests()
+    yield
+    attention.reset_for_tests()
+
+
+@pytest.fixture
+def mock_session_manager():
+    """Patch session_manager used by attention.notify_waiting/dismiss."""
+    with patch("ccbot.handlers.attention.session_manager") as sm:
+        sm.resolve_chat_id.return_value = -100123
+        sm.get_display_name.return_value = "ccbot"
+        yield sm
+
+
+def _make_sent_message(message_id: int = 555) -> MagicMock:
+    sent = MagicMock()
+    sent.message_id = message_id
+    return sent
+
+
+@pytest.mark.usefixtures("_reset_attention", "mock_session_manager")
+class TestAttentionStateMachine:
+    @pytest.mark.asyncio
+    async def test_idle_to_waiting_sends_fresh_audible_card(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "ccbot.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "ccbot.handlers.attention.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+
+            outcome = await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Do you want me to proceed?",
+                kind="assistant_text",
+            )
+
+            assert outcome is TopicSendOutcome.OK
+            mock_send.assert_awaited_once()
+            mock_edit.assert_not_called()
+            # Audible: notification must NOT be silenced for fresh sends.
+            assert (
+                mock_send.await_args.kwargs.get("disable_notification") is False
+            )
+            assert attention.is_waiting(1, 10) is True
+
+    @pytest.mark.asyncio
+    async def test_waiting_same_fingerprint_is_silent_noop(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "ccbot.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "ccbot.handlers.attention.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Do you want me to proceed?",
+                kind="assistant_text",
+            )
+            assert mock_send.await_count == 1
+
+            # Identical follow-up inside the dwell window: zero Telegram I/O.
+            outcome = await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Do you want me to proceed?",
+                kind="assistant_text",
+            )
+            assert outcome is TopicSendOutcome.OK
+            assert mock_send.await_count == 1
+            mock_edit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_waiting_different_fingerprint_edits_silently(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "ccbot.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "ccbot.handlers.attention.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+            mock_edit.return_value = TopicSendOutcome.OK
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Do you want me to proceed?",
+                kind="assistant_text",
+            )
+            outcome = await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Different question — confirm before I write?",
+                kind="assistant_text",
+            )
+
+            assert outcome is TopicSendOutcome.OK
+            # Exactly one fresh send (the original idle→waiting) and one edit.
+            assert mock_send.await_count == 1
+            mock_edit.assert_awaited_once()
+            assert mock_edit.await_args.kwargs["message_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_waiting_edit_returning_message_not_modified_is_treated_as_ok(self):
+        """Telegram says "no-op" when the body is already identical; no fresh card."""
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "ccbot.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "ccbot.handlers.attention.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+            mock_edit.return_value = TopicSendOutcome.MESSAGE_NOT_MODIFIED
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Do you want me to proceed?",
+                kind="assistant_text",
+            )
+            # Different fingerprint to force the edit branch.
+            outcome = await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Slightly different question?",
+                kind="assistant_text",
+            )
+
+            assert outcome is TopicSendOutcome.OK
+            mock_edit.assert_awaited_once()
+            # Critical: must NOT fall through to a second fresh topic_send.
+            assert mock_send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_dismiss_edits_ack_trailer_and_flips_to_idle(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "ccbot.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "ccbot.handlers.attention.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+            mock_edit.return_value = TopicSendOutcome.OK
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Do you want me to proceed?",
+                kind="assistant_text",
+            )
+            assert attention.is_waiting(1, 10) is True
+
+            await attention.dismiss(bot, user_id=1, thread_id=10)
+
+            assert attention.is_waiting(1, 10) is False
+            mock_edit.assert_awaited_once()
+            assert mock_edit.await_args.kwargs["message_id"] == 42
+            assert (
+                attention.DISMISS_TRAILER in mock_edit.await_args.kwargs["text"]
+            )
+
+    @pytest.mark.asyncio
+    async def test_anti_flap_after_user_reply_dismiss(self):
+        """User replies → dismiss → another notify_waiting must NOT push fresh card.
+
+        This is the exact ping-pong path called out in the architect review:
+        ``bot.py`` dismisses on user reply, then ``handle_interactive_ui`` runs
+        and calls ``attention.notify_waiting`` again. Without the anti-flap
+        guard the second call sees state=idle and would emit a fresh audible
+        notification.
+        """
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "ccbot.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "ccbot.handlers.attention.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+            mock_edit.return_value = TopicSendOutcome.OK
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Do you want me to proceed?",
+                kind="assistant_text",
+            )
+            await attention.dismiss(bot, user_id=1, thread_id=10)
+
+            # Reset call counters so we can isolate the anti-flap behaviour.
+            mock_send.reset_mock()
+            mock_edit.reset_mock()
+
+            outcome = await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="A new but rapidly-following prompt?",
+                kind="interactive_ui",
+            )
+
+            assert outcome is TopicSendOutcome.OK
+            mock_send.assert_not_called()
+            mock_edit.assert_awaited_once()
+            assert mock_edit.await_args.kwargs["message_id"] == 42
+            assert attention.is_waiting(1, 10) is True
+
+
+# ── Shared emergency-DM fence ──────────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("_reset_attention")
+def test_should_emit_emergency_dm_first_call_allowed():
+    assert attention.should_emit_emergency_dm(1, 10, "@0") is True
+
+
+@pytest.mark.usefixtures("_reset_attention")
+def test_should_emit_emergency_dm_second_call_blocked():
+    assert attention.should_emit_emergency_dm(1, 10, "@0") is True
+    # Second call inside the cooldown window must be blocked, regardless of
+    # whether the message_queue or interactive_ui surface tripped it.
+    assert attention.should_emit_emergency_dm(1, 10, "@0") is False
+
+
+@pytest.mark.usefixtures("_reset_attention")
+def test_should_emit_emergency_dm_distinct_routes_independent():
+    assert attention.should_emit_emergency_dm(1, 10, "@0") is True
+    # Different thread/window forms a distinct waiting episode.
+    assert attention.should_emit_emergency_dm(1, 11, "@0") is True
+    assert attention.should_emit_emergency_dm(1, 10, "@1") is True

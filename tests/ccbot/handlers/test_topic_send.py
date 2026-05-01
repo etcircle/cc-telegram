@@ -59,7 +59,6 @@ def test_classify_rate_limited() -> None:
     "message",
     [
         "Bad Request: chat not found",
-        "Bad Request: message is not modified",
         "Bad Request: message to edit not found",
         "Bad Request: can't parse entities",
         "completely unknown error string",
@@ -67,6 +66,16 @@ def test_classify_rate_limited() -> None:
 )
 def test_classify_other_bad_request(message: str) -> None:
     assert _classify_bad_request(BadRequest(message)) is TopicSendOutcome.OTHER
+
+
+def test_classify_message_not_modified() -> None:
+    # ``message is not modified`` is a benign no-op edit response — pinned to
+    # its own outcome so attention.notify_waiting can short-circuit instead of
+    # falling through to a fresh, audible card.
+    assert (
+        _classify_bad_request(BadRequest("Bad Request: message is not modified"))
+        is TopicSendOutcome.MESSAGE_NOT_MODIFIED
+    )
 
 
 def test_classify_random_exception() -> None:

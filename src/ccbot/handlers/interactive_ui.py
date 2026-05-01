@@ -14,12 +14,9 @@ Provides:
 State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
-import hashlib
 import logging
-import time
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
 
 from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
@@ -55,12 +52,10 @@ _interactive_msgs: dict[tuple[int, int], int] = {}
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
 
-# Track direct-message notifications for interactive prompts. Telegram does not
-# reliably push notifications for edited topic/status messages, so prompts also
-# get a DM, but cooldown prevents spam while Claude redraws/updates the same UI.
-_interactive_dm_fingerprints: dict[tuple[int, int], str] = {}
-_interactive_dm_last_sent: dict[tuple[int, int], float] = {}
-INTERACTIVE_DM_COOLDOWN_SECONDS = 60
+# Cross-module emergency DM cooldown lives in ``handlers.attention``
+# (``attention.should_emit_emergency_dm``). The interactive-UI surface and
+# the assistant-text surface in ``handlers.message_queue`` share that fence
+# so a single broken-topic episode cannot fire two DMs from two surfaces.
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
@@ -116,26 +111,20 @@ async def _notify_waiting_dm(
     The normal path is ``attention.notify_waiting`` (in-topic card). This DM
     is reached only when the topic itself cannot be written to (deleted,
     closed, forbidden) so the user still gets a signal that Claude is blocked.
+
+    Cooldown is owned by ``attention.should_emit_emergency_dm`` so this DM
+    cannot stack with the assistant-text emergency DM in
+    ``message_queue._attention_dm_if_needed`` for the same waiting episode.
     """
-    ikey = (user_id, thread_id or 0)
-    fingerprint = hashlib.sha1(
-        f"{window_id}\0{thread_id or 0}\0{prompt_text}".encode("utf-8", "replace")
-    ).hexdigest()
-    now = time.monotonic()
-    last = _interactive_dm_last_sent.get(ikey)
-    if _interactive_dm_fingerprints.get(ikey) == fingerprint:
-        return
-    if last is not None and now - last < INTERACTIVE_DM_COOLDOWN_SECONDS:
+    if not attention.should_emit_emergency_dm(user_id, thread_id, window_id):
         logger.debug(
-            "Skipping interactive waiting DM due cooldown user=%d thread=%s window=%s",
+            "Skipping interactive waiting DM due to shared cooldown "
+            "user=%d thread=%s window=%s",
             user_id,
             thread_id,
             window_id,
         )
-        _interactive_dm_fingerprints[ikey] = fingerprint
         return
-    _interactive_dm_fingerprints[ikey] = fingerprint
-    _interactive_dm_last_sent[ikey] = now
 
     display = session_manager.get_display_name(window_id) or window_id
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
@@ -271,38 +260,25 @@ async def handle_interactive_ui(
     # Check if we have an existing interactive message to edit
     existing_msg_id = _interactive_msgs.get(ikey)
     if existing_msg_id:
-        try:
-            edit_outcome = await topic_edit(
-                bot,
-                op="interactive",
-                user_id=user_id,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                window_id=window_id,
-                message_id=existing_msg_id,
-                text=text,
-                plain=True,
-                reply_markup=keyboard,
-            )
-        except BadRequest as e:
-            if "Message is not modified" in str(e):
-                _interactive_mode[ikey] = window_id
-                await attention.notify_waiting(
-                    bot,
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    window_id=window_id,
-                    prompt_text=text,
-                    kind="interactive_ui",
-                )
-                return True
-            edit_outcome = TopicSendOutcome.OTHER
-            logger.debug(
-                "Edit failed for interactive msg %s: %s, sending new",
-                existing_msg_id,
-                e,
-            )
-        if edit_outcome is TopicSendOutcome.OK:
+        edit_outcome = await topic_edit(
+            bot,
+            op="interactive",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            message_id=existing_msg_id,
+            text=text,
+            plain=True,
+            reply_markup=keyboard,
+        )
+        # MESSAGE_NOT_MODIFIED means Claude redrew an identical UI; treating it
+        # as success keeps the same Telegram message in place (no fresh card,
+        # no delete-then-resend churn).
+        if edit_outcome in (
+            TopicSendOutcome.OK,
+            TopicSendOutcome.MESSAGE_NOT_MODIFIED,
+        ):
             _interactive_mode[ikey] = window_id
             await attention.notify_waiting(
                 bot,
@@ -384,7 +360,6 @@ async def clear_interactive_msg(
     ikey = (user_id, thread_id or 0)
     msg_id = _interactive_msgs.pop(ikey, None)
     _interactive_mode.pop(ikey, None)
-    _interactive_dm_fingerprints.pop(ikey, None)
     logger.debug(
         "Clear interactive msg: user=%d, thread=%s, msg_id=%s",
         user_id,
