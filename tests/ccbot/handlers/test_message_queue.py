@@ -49,6 +49,11 @@ def _reset_state() -> None:
     message_queue._agent_tool_ids.clear()
     message_queue._activity_msg_info.clear()
     message_queue._tool_activity_indices.clear()
+    for _, flush in list(message_queue._activity_flush_tasks.items()):
+        if not flush.done():
+            flush.cancel()
+    message_queue._activity_flush_tasks.clear()
+    message_queue._activity_locks.clear()
     message_queue._flood_until.clear()
 
 
@@ -1728,8 +1733,12 @@ class TestAgentToolProminence:
     async def test_agent_tool_counter_still_tracks(
         self, mock_bot: AsyncMock, _agent_test_patches
     ):
-        await message_queue._process_agent_task(mock_bot, 1, self._agent_use())
-        await message_queue._process_agent_task(mock_bot, 1, self._agent_result())
+        # _bump_agent_activity_counter now routes through the debounce, so
+        # collapse the window for the test and let the scheduled flush fire.
+        with patch.object(message_queue, "ACTIVITY_FLUSH_DEBOUNCE_SECONDS", 0.0):
+            await message_queue._process_agent_task(mock_bot, 1, self._agent_use())
+            await message_queue._process_agent_task(mock_bot, 1, self._agent_result())
+            await asyncio.sleep(0.1)
         upserts = _agent_test_patches["upsert_calls"]
         assert upserts, "activity digest was never upserted"
         last = upserts[-1]
@@ -2467,3 +2476,338 @@ class TestProbeTopicLiveness:
         # Probed first OK, second raised RetryAfter; third never reached.
         assert call_count["n"] == 2
         kill_window.assert_not_awaited()
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestActivityDigestDebounce:
+    """Activity-card edits coalesce within ACTIVITY_FLUSH_DEBOUNCE_SECONDS.
+
+    Without this, every tool_use / tool_result / thinking event triggered an
+    immediate topic_edit. With several active topics in the same supergroup
+    that easily blew past Telegram's 20 msg/min/group flood limit and starved
+    text replies behind a backlog of activity edits.
+    """
+
+    async def _drain(self, n: int = 5) -> None:
+        for _ in range(n):
+            await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_burst_of_events_collapses_to_single_flush(self, mock_bot: AsyncMock):
+        """5 activity events in rapid succession → 1 flush after the debounce."""
+        upsert_calls = 0
+
+        async def fake_upsert(bot, user_id, thread_id, state):
+            nonlocal upsert_calls
+            upsert_calls += 1
+
+        # Force the debounce delay to ~0 so the timer fires within the test.
+        with (
+            patch.object(
+                message_queue, "_upsert_activity_digest", side_effect=fake_upsert
+            ),
+            patch.object(message_queue, "ACTIVITY_FLUSH_DEBOUNCE_SECONDS", 0.1),
+            patch.object(
+                message_queue.attention,
+                "dismiss",
+                new_callable=AsyncMock,
+            ),
+        ):
+            for i in range(5):
+                await message_queue._process_activity_task(
+                    mock_bot,
+                    user_id=1,
+                    task=message_queue.MessageTask(
+                        task_type="content",
+                        window_id="@0",
+                        parts=[],
+                        content_type="tool_use",
+                        tool_use_id=f"tu-{i}",
+                        thread_id=42,
+                    ),
+                )
+            # State is updated synchronously, no flush yet.
+            assert upsert_calls == 0
+            assert (1, 42) in message_queue._activity_msg_info
+            # Wait past the debounce window (3x to be CI-safe).
+            await asyncio.sleep(0.3)
+            # Exactly one flush despite 5 events.
+            assert upsert_calls == 1, f"expected 1 flush, got {upsert_calls}"
+
+    @pytest.mark.asyncio
+    async def test_finalize_cancels_pending_debounce_and_flushes_now(
+        self, mock_bot: AsyncMock
+    ):
+        """Assistant text arriving forces an immediate flush + cancels the debounce."""
+        upsert_calls = 0
+
+        async def fake_upsert(bot, user_id, thread_id, state):
+            nonlocal upsert_calls
+            upsert_calls += 1
+
+        with (
+            patch.object(
+                message_queue, "_upsert_activity_digest", side_effect=fake_upsert
+            ),
+            # Debounce intentionally long so the test proves we're flushing
+            # via the synchronous path, not waiting for the timer.
+            patch.object(message_queue, "ACTIVITY_FLUSH_DEBOUNCE_SECONDS", 30.0),
+            patch.object(
+                message_queue.attention,
+                "dismiss",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await message_queue._process_activity_task(
+                mock_bot,
+                user_id=1,
+                task=message_queue.MessageTask(
+                    task_type="content",
+                    window_id="@0",
+                    parts=[],
+                    content_type="tool_use",
+                    tool_use_id="tu-1",
+                    thread_id=42,
+                ),
+            )
+            assert upsert_calls == 0
+            assert (1, 42) in message_queue._activity_flush_tasks
+
+            await message_queue._finalize_activity_digest(
+                mock_bot, user_id=1, thread_id=42, window_id="@0"
+            )
+            # Synchronous flush: 1 call. Pending debounce cancelled.
+            assert upsert_calls == 1
+            assert (1, 42) not in message_queue._activity_flush_tasks
+            # Sanity: even if we wait, the cancelled debounce never fires a
+            # second flush.
+            await asyncio.sleep(0.2)
+            assert upsert_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_teardown_route_cancels_pending_flush(self, mock_bot: AsyncMock):
+        """teardown_route must cancel any pending activity-digest flush."""
+        upsert_calls = 0
+
+        async def fake_upsert(bot, user_id, thread_id, state):
+            nonlocal upsert_calls
+            upsert_calls += 1
+
+        with (
+            patch.object(
+                message_queue, "_upsert_activity_digest", side_effect=fake_upsert
+            ),
+            patch.object(message_queue, "ACTIVITY_FLUSH_DEBOUNCE_SECONDS", 0.1),
+            patch.object(
+                message_queue.attention,
+                "dismiss",
+                new_callable=AsyncMock,
+            ),
+        ):
+            route = (1, 42, "@0")
+            # Stand up a route worker so teardown_route has something to dismantle.
+            message_queue._get_or_create_route(mock_bot, route)
+            await message_queue._process_activity_task(
+                mock_bot,
+                user_id=1,
+                task=message_queue.MessageTask(
+                    task_type="content",
+                    window_id="@0",
+                    parts=[],
+                    content_type="tool_use",
+                    tool_use_id="tu-1",
+                    thread_id=42,
+                ),
+            )
+            assert (1, 42) in message_queue._activity_flush_tasks
+
+            await message_queue.teardown_route(route, drop_pending=True)
+            assert (1, 42) not in message_queue._activity_flush_tasks
+            # Even after 3x the would-be debounce window, no flush fires.
+            await asyncio.sleep(0.3)
+            assert upsert_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_event_during_in_flight_flush_serializes_via_lock(
+        self, mock_bot: AsyncMock
+    ):
+        """Concurrent upserts MUST serialize — not race state.message_id."""
+        upsert_states: list[tuple[int, int]] = []  # (message_id_seen, lines_count)
+        in_flight = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_upsert(bot, user_id, thread_id, state):
+            # Snapshot what THIS upsert sees on entry, then await before
+            # mutating message_id — exactly what the real code does around
+            # the awaited topic_send call.
+            seen_msg_id = state.message_id
+            seen_lines = len(state.lines)
+            in_flight.set()
+            await release.wait()
+            # Simulate topic_send assigning a fresh message_id on first send.
+            if state.message_id == 0:
+                state.message_id = 1234
+            state.last_text = "rendered"
+            upsert_states.append((seen_msg_id, seen_lines))
+
+        with (
+            patch.object(
+                message_queue, "_upsert_activity_digest", side_effect=fake_upsert
+            ),
+            patch.object(message_queue, "ACTIVITY_FLUSH_DEBOUNCE_SECONDS", 0.05),
+            patch.object(
+                message_queue.attention,
+                "dismiss",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await message_queue._process_activity_task(
+                mock_bot,
+                user_id=1,
+                task=message_queue.MessageTask(
+                    task_type="content",
+                    window_id="@0",
+                    parts=[],
+                    content_type="tool_use",
+                    tool_use_id="tu-1",
+                    thread_id=42,
+                ),
+            )
+            # Wait for the debounce timer to expire and the upsert to start.
+            await asyncio.wait_for(in_flight.wait(), timeout=1.0)
+
+            # While the debounced upsert is awaiting (holding the lock),
+            # finalize fires _flush_activity_digest_now in parallel.
+            sync_flush = asyncio.create_task(
+                message_queue._flush_activity_digest_now(
+                    mock_bot, user_id=1, thread_id=42
+                )
+            )
+            # Give sync_flush a chance to start and try to acquire the lock.
+            await asyncio.sleep(0.05)
+            # The lock must keep sync_flush blocked until release fires.
+            assert not sync_flush.done(), (
+                "sync flush ran concurrently with debounced upsert — lock failed"
+            )
+
+            # Release the in-flight upsert; both should now complete.
+            release.set()
+            await sync_flush
+
+            # Wait for the debounced task to finish too.
+            for _ in range(20):
+                if len(upsert_states) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+
+            # Two upserts ran — but in serialized order. The second one saw
+            # the message_id assigned by the first (proving they did not
+            # both observe message_id == 0 and double-send).
+            assert len(upsert_states) == 2
+            assert upsert_states[0][0] == 0  # debounced upsert saw fresh state
+            assert upsert_states[1][0] == 1234  # sync flush saw assigned id
+
+    @pytest.mark.asyncio
+    async def test_status_digest_chronological_order_after_debounce(
+        self, mock_bot: AsyncMock
+    ):
+        """Regression for MAJOR #2 review concern.
+
+        Sequence: tool_use → status sends (msg_id=N) → text content arrives.
+        Finalize must flush the digest synchronously so its message_id is
+        ABOVE the status (N+1), and _convert_status_to_content's ordering
+        guard then sees ``digest_state.message_id > status_msg_id`` and
+        deletes the status instead of editing it (which would put text
+        above the digest in chat order).
+        """
+        # Track upsert order to confirm the synchronous flush ran before
+        # the convert path read state.message_id.
+        flush_order: list[str] = []
+
+        async def fake_upsert(bot, user_id, thread_id, state):
+            # Simulate digest send assigning message_id higher than status.
+            if state.message_id == 0:
+                state.message_id = 200  # higher than the status at 100
+            state.last_text = "rendered"
+            flush_order.append("digest_flush")
+
+        with (
+            patch.object(
+                message_queue, "_upsert_activity_digest", side_effect=fake_upsert
+            ),
+            # Long debounce — only the synchronous finalize path should fire
+            # the upsert; the timer must NOT have fired by test end.
+            patch.object(message_queue, "ACTIVITY_FLUSH_DEBOUNCE_SECONDS", 30.0),
+            patch.object(
+                message_queue.attention,
+                "dismiss",
+                new_callable=AsyncMock,
+            ),
+        ):
+            # Step 1: tool_use processed → state stored, debounce scheduled,
+            # no upsert yet.
+            await message_queue._process_activity_task(
+                mock_bot,
+                user_id=1,
+                task=message_queue.MessageTask(
+                    task_type="content",
+                    window_id="@0",
+                    parts=[],
+                    content_type="tool_use",
+                    tool_use_id="tu-1",
+                    thread_id=42,
+                ),
+            )
+            assert flush_order == []
+            state = message_queue._activity_msg_info.get((1, 42))
+            assert state is not None
+            assert state.message_id == 0  # not flushed yet
+
+            # Step 2: status would have sent at msg_id=100 here in the
+            # real code path (we don't model it — _convert_status_to_content
+            # reads digest_state.message_id, which is what matters).
+
+            # Step 3: text content arrives → finalize flushes synchronously.
+            await message_queue._finalize_activity_digest(
+                mock_bot, user_id=1, thread_id=42, window_id="@0"
+            )
+            # After finalize, digest message_id must be set so the convert
+            # ordering guard at message_queue.py:~1729 sees it.
+            assert state.message_id == 200, (
+                f"finalize did not flush digest synchronously; "
+                f"message_id is still {state.message_id}"
+            )
+            assert flush_order == ["digest_flush"]
+            # And the guard's comparison `digest > status` (200 > 100) holds,
+            # so a real _convert_status_to_content would correctly delete
+            # the status and let fresh content land below the digest.
+
+    @pytest.mark.asyncio
+    async def test_flush_now_skipped_for_tearing_down_route(self, mock_bot: AsyncMock):
+        """_flush_activity_digest_now must short-circuit during route teardown."""
+        upsert_calls = 0
+
+        async def fake_upsert(bot, user_id, thread_id, state):
+            nonlocal upsert_calls
+            upsert_calls += 1
+
+        with (
+            patch.object(
+                message_queue, "_upsert_activity_digest", side_effect=fake_upsert
+            ),
+        ):
+            # Pre-stage state so the function gets past the early-return.
+            message_queue._activity_msg_info[(1, 42)] = (
+                message_queue.ActivityDigestState(message_id=0, window_id="@0")
+            )
+            # Mark the route as tearing down.
+            message_queue._route_tearing_down.add((1, 42, "@0"))
+            try:
+                await message_queue._flush_activity_digest_now(
+                    mock_bot, user_id=1, thread_id=42
+                )
+            finally:
+                message_queue._route_tearing_down.discard((1, 42, "@0"))
+
+            # No upsert because the route is being torn down.
+            assert upsert_calls == 0

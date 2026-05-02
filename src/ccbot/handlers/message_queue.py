@@ -139,6 +139,24 @@ _route_last_user_message: dict[Route, int] = {}
 # tool calls, tool results, and thinking into a Hermes-style activity card.
 _activity_msg_info: dict[tuple[int, int], ActivityDigestState] = {}
 _tool_activity_indices: dict[tuple[str, int, int], int] = {}
+# Per-(user, thread) debounce timer for activity-digest flushes. Heavy tool
+# work emits 5-10 events / sec / topic — flushing each one inline blew through
+# Telegram's 20 msg/min/group flood limit when several topics were active at
+# once and starved text replies behind a backlog of activity edits. The
+# debounce coalesces a burst of state mutations into a single edit, dropping
+# typical activity-card traffic by 5-10x. Critical paths (terminal "done"
+# state before assistant text, attention-state changes) still flush
+# synchronously via _flush_activity_digest_now.
+_activity_flush_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+# Per-(user, thread) lock that serializes calls into ``_upsert_activity_digest``.
+# Without this, a debounced flush already inside the awaited Telegram API call
+# could race a synchronous ``_flush_activity_digest_now`` triggered by the next
+# content task — both reading ``state.message_id == 0`` and both ``topic_send``-ing,
+# producing two activity messages that fight for the slot. The lock closes that
+# window: the second caller waits, sees the freshly-updated ``state.message_id``,
+# and either edits or no-ops via the ``text == last_text`` check.
+_activity_locks: dict[tuple[int, int], asyncio.Lock] = {}
+ACTIVITY_FLUSH_DEBOUNCE_SECONDS = 5.0
 ACTIVITY_DIGEST_CONTENT_TYPES = {"tool_use", "tool_result", "thinking"}
 ACTIVITY_DIGEST_MAX_LINES = 10
 # Per-line cap inside the activity digest. The previous 180 was tight
@@ -1076,6 +1094,96 @@ async def _upsert_activity_digest(
         )
 
 
+def _get_activity_lock(user_id: int, tid: int) -> asyncio.Lock:
+    """Return (creating if needed) the per-(user, thread) upsert lock."""
+    key = (user_id, tid)
+    lock = _activity_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _activity_locks[key] = lock
+    return lock
+
+
+def _schedule_activity_flush(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+) -> None:
+    """Schedule a debounced flush of the activity digest for this (user, thread).
+
+    Cancels any existing pending flush so a burst of activity events within
+    ``ACTIVITY_FLUSH_DEBOUNCE_SECONDS`` collapses to a single edit. The state
+    itself is mutated synchronously by the caller; only the API call is
+    debounced. If the topic gets ``_finalize_activity_digest`` (or
+    ``_flush_activity_digest_now``) before the timer fires, the pending flush
+    is cancelled and the digest is sent immediately.
+    """
+    tid = thread_id or 0
+    key = (user_id, tid)
+    pending = _activity_flush_tasks.get(key)
+    if pending is not None and not pending.done():
+        pending.cancel()
+
+    async def _delayed() -> None:
+        try:
+            await asyncio.sleep(ACTIVITY_FLUSH_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        # Pop BEFORE the upsert so a state change during the in-flight edit
+        # starts a fresh debounce window rather than coalescing into the one
+        # currently being sent.
+        _activity_flush_tasks.pop(key, None)
+        state = _activity_msg_info.get(key)
+        if state is None:
+            return
+        try:
+            async with _get_activity_lock(user_id, tid):
+                await _upsert_activity_digest(bot, user_id, thread_id, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - background task safety
+            logger.warning(
+                "debounced activity flush failed user=%d thread=%s: %s",
+                user_id,
+                thread_id,
+                e,
+            )
+
+    _activity_flush_tasks[key] = asyncio.create_task(_delayed())
+
+
+async def _flush_activity_digest_now(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+) -> None:
+    """Cancel any pending debounce and flush the digest synchronously.
+
+    The lock is the real serialization primitive — cancellation just speeds
+    things up by stopping a pending debounce that's still sleeping. If a
+    debounced upsert is already past its sleep and inside ``topic_edit``,
+    the lock makes us wait for it to finish before our synchronous upsert
+    runs (which then sees the freshly-updated ``state.message_id`` /
+    ``state.last_text`` and either edits or no-ops).
+    """
+    tid = thread_id or 0
+    key = (user_id, tid)
+    # Drop the synchronous flush if the route is being torn down — firing
+    # an edit at a route mid-cleanup races with route teardown's state
+    # invalidation.
+    route_user, route_tid = key
+    if any(r[0] == route_user and r[1] == route_tid for r in _route_tearing_down):
+        return
+    pending = _activity_flush_tasks.pop(key, None)
+    if pending is not None and not pending.done():
+        pending.cancel()
+    state = _activity_msg_info.get(key)
+    if state is None:
+        return
+    async with _get_activity_lock(user_id, tid):
+        await _upsert_activity_digest(bot, user_id, thread_id, state)
+
+
 async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     """Collapse noisy thinking/tool events into one editable activity message."""
     wid = task.window_id or ""
@@ -1112,11 +1220,16 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
             state.lines.append(line)
 
     state.done = False
+    _activity_msg_info[(user_id, tid)] = state
     # New tool work means Claude is no longer waiting on the user. Dismiss the
     # attention card so the topic can flip back to "in progress" cleanly.
     if task.content_type == "tool_use":
         await attention.dismiss(bot, user_id=user_id, thread_id=task.thread_id)
-    await _upsert_activity_digest(bot, user_id, task.thread_id, state)
+    # Debounce the API call: state is already updated, the eventual flush
+    # renders whatever the latest state is. Critical paths (assistant text
+    # arriving, attention state changes) flush immediately via
+    # _flush_activity_digest_now / _finalize_activity_digest.
+    _schedule_activity_flush(bot, user_id, task.thread_id)
 
     # Images are real output, not noise. Keep delivering them.
     if task.image_data:
@@ -1232,7 +1345,10 @@ async def _bump_agent_activity_counter(
     # a successful send, and a stubbed upsert in tests would lose the
     # tool_count carry-over).
     _activity_msg_info[(user_id, tid)] = state
-    await _upsert_activity_digest(bot, user_id, task.thread_id, state)
+    # Same debounce as ``_process_activity_task``: subagent dispatches
+    # generate paired tool_use/tool_result events and were the largest
+    # source of inline edits leaking past the debounce.
+    _schedule_activity_flush(bot, user_id, task.thread_id)
 
 
 async def _process_agent_task(bot: Bot, user_id: int, task: MessageTask) -> None:
@@ -1310,7 +1426,10 @@ async def _finalize_activity_digest(
     if not state or state.window_id != window_id or state.done:
         return
     state.done = True
-    await _upsert_activity_digest(bot, user_id, thread_id, state)
+    # Synchronous flush: assistant text is about to land and the user must
+    # see the digest in its terminal "done" state before the reply, not 5s
+    # after. Cancels any pending debounce so we don't double-send.
+    await _flush_activity_digest_now(bot, user_id, thread_id)
 
 
 async def _refresh_activity_digest_if_present(
@@ -1324,7 +1443,10 @@ async def _refresh_activity_digest_if_present(
     state = _activity_msg_info.get((user_id, tid))
     if not state or state.window_id != window_id:
         return
-    await _upsert_activity_digest(bot, user_id, thread_id, state)
+    # Attention state flips (raised / dismissed) must reflect immediately —
+    # the user is being asked to look at this topic. Don't sit on it for the
+    # debounce window.
+    await _flush_activity_digest_now(bot, user_id, thread_id)
 
 
 def _looks_like_attention_request(text: str) -> bool:
@@ -2036,6 +2158,13 @@ async def teardown_route(route: Route, *, drop_pending: bool) -> None:
         # route can't reply-to a Telegram message_id from the old session.
         _route_last_user_message.pop(route, None)
         busy_indicator.clear_route(route)
+        # Cancel any pending activity-digest debounce so we don't fire an
+        # edit against a torn-down route. Also drop the upsert lock — a
+        # fresh route gets a fresh lock.
+        flush = _activity_flush_tasks.pop((route_user_id, route_tid), None)
+        if flush is not None and not flush.done():
+            flush.cancel()
+        _activity_locks.pop((route_user_id, route_tid), None)
     finally:
         _route_tearing_down.discard(route)
 
@@ -2056,6 +2185,13 @@ async def shutdown_workers() -> None:
             await worker
         except asyncio.CancelledError:
             pass
+    # Cancel any pending activity-digest debounces; the bot is going away,
+    # there is no value in firing one last edit during shutdown.
+    for _, flush in list(_activity_flush_tasks.items()):
+        if not flush.done():
+            flush.cancel()
+    _activity_flush_tasks.clear()
+    _activity_locks.clear()
     _route_workers.clear()
     _route_queues.clear()
     _route_locks.clear()
