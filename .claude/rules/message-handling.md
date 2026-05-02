@@ -2,10 +2,19 @@
 
 ## Message Queue Architecture
 
-Per-user message queues + worker pattern for all send tasks:
-- Messages are sent in receive order (FIFO)
-- Status messages always follow content messages
-- Multi-user concurrent processing without interference
+Per-route message queues + worker pattern for all send tasks. A route is `(user_id, thread_id_or_0, window_id)`:
+- Messages are sent in receive order (FIFO) **per route**
+- Each route has its own worker, content queue, and latest-wins ephemeral slot
+- Multi-user / multi-topic concurrent processing without interference
+
+**Per-route status semantics**: Per-route workers drain the ephemeral slot
+after every content task. Status updates are coalesced — only the latest
+text per route survives between drains. Across routes, no global ordering
+is enforced; each route's content-then-status order is independent of
+others. (Under the previous per-user FIFO, status-after-content was a
+global invariant; now it's a per-route invariant only, which is the
+intended Stage 2 trade-off so a backlog in one topic doesn't delay
+status / interactive prompts in another.)
 
 **Message merging**: The worker automatically merges consecutive mergeable content messages on dequeue:
 - Content messages for the same window can be merged (including text, thinking)

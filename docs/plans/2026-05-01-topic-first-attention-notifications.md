@@ -348,10 +348,14 @@ Files:
   - Drop the `_bad_topic_threads` permanent flag; rely on the throttled
     repair pipeline instead. A topic can recover after the user fixes it.
 - `src/ccbot/handlers/status_polling.py`:
-  - The 60s topic probe uses `topic_send` with `repair=False` against a
-    no-op (the existing `unpin_all_forum_topic_messages` call is fine);
-    but if it fails it now also enqueues a repair attempt instead of just
-    cleaning up.
+  - **No proactive Telegram probe.** The previous 60s
+    `unpin_all_forum_topic_messages` probe was destructive on success
+    (clears any user-pinned messages, not a no-op) and was removed.
+    Topic existence is detected reactively from real `topic_send` /
+    `topic_edit` failures classified into `_TOPIC_BROKEN_OUTCOMES`. If
+    a non-mutating liveness probe is ever introduced, it must be a
+    read-only Telegram method — never one whose successful result
+    mutates topic state.
 
 Tests / verification:
 
