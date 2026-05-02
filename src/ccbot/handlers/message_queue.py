@@ -781,10 +781,14 @@ def _compact_activity_line(task: MessageTask) -> str:
 _RUN_STATE_HEADER: dict[RunState, str] = {
     RunState.RUNNING: "🟡 Busy",
     RunState.RUNNING_TOOL: "🟡 Busy",
-    # IDLE_RECENT renders as Busy; the route is still inside the
-    # post-completion grace window. The header flips to Done only after the
-    # idle decay lands.
-    RunState.IDLE_RECENT: "🟡 Busy",
+    # IDLE_RECENT and IDLE_CLEARED both render as "Done" because the digest
+    # is finalized exactly once when the assistant's final text lands; nothing
+    # re-renders the digest on the IDLE_RECENT → IDLE_CLEARED decay 4s later.
+    # The grace window matters for the typing-action lifecycle and the visible
+    # Busy card removal (status_polling continues to read state() each tick),
+    # not for this header. A turn ending in stop_reason=end_turn means Claude
+    # is done with this exchange — surface that immediately.
+    RunState.IDLE_RECENT: "✅ Done",
     RunState.WAITING_ON_USER: "🔔 Waiting on you",
     RunState.IDLE_CLEARED: "✅ Done",
     RunState.BROKEN_TOPIC: "⚠️ Topic unreachable",

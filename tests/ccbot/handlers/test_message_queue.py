@@ -1236,6 +1236,26 @@ class TestActivityDigestHeader:
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         assert rendered.startswith("✅ Done — ")
 
+    def test_v2_idle_recent_renders_done(self, monkeypatch: pytest.MonkeyPatch):
+        """IDLE_RECENT must render as Done, not Busy.
+
+        Regression: the digest is finalized exactly once when the assistant's
+        final text lands; nothing re-renders it on the IDLE_RECENT →
+        IDLE_CLEARED decay 4s later. Mapping IDLE_RECENT → "🟡 Busy" produced
+        a stuck "Busy" header that never flipped to Done in production. The
+        decay grace window matters for typing-action / Busy-card lifecycles
+        (status_polling reads state() each tick), not for this header.
+        """
+        from ccbot.handlers import busy_indicator
+
+        self._enable_v2(monkeypatch)
+        busy_indicator.reset_for_tests()
+        route = (1, 42, "@7")
+        busy_indicator._run_state[route] = busy_indicator.RunState.IDLE_RECENT
+
+        rendered = message_queue._render_activity_digest(self._state(), route=route)
+        assert rendered.startswith("✅ Done — ")
+
     def test_v2_waiting_on_user(self, monkeypatch: pytest.MonkeyPatch):
         from ccbot.handlers import busy_indicator
 
