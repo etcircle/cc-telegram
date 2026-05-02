@@ -17,7 +17,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +35,11 @@ class ParsedMessage:
 class ParsedEntry:
     """A single parsed message entry ready for display."""
 
-    role: str  # "user" | "assistant"
+    role: Literal["user", "assistant"]
     text: str  # Already formatted text
-    content_type: (
-        str  # "text" | "thinking" | "tool_use" | "tool_result" | "local_command"
-    )
+    content_type: Literal[
+        "text", "thinking", "tool_use", "tool_result", "local_command"
+    ]
     tool_use_id: str | None = None
     timestamp: str | None = None  # ISO timestamp from JSONL
     tool_name: str | None = (
@@ -48,6 +48,15 @@ class ParsedEntry:
     image_data: list[tuple[str, bytes]] | None = (
         None  # For tool_result entries with images: (media_type, raw_bytes)
     )
+    # JSONL `message.stop_reason`, propagated from the raw assistant
+    # message to every entry derived from it. None for user-role entries
+    # (including tool_result-bearing ones) — JSONL doesn't carry it there.
+    stop_reason: str | None = None
+    # Raw tool_use input dict, populated for Edit/Write/Agent/Task so
+    # downstream renderers (e.g. §2.7 Agent prominence) can extract
+    # description / subagent_type / prompt without re-parsing JSONL.
+    tool_input: dict[str, Any] | None = None
+    uuid: str | None = None
 
 
 @dataclass
@@ -57,6 +66,7 @@ class PendingToolInfo:
     summary: str  # Formatted tool summary (e.g. "**Read**(file.py)")
     tool_name: str  # Tool name (e.g. "Read", "Edit")
     input_data: Any = None  # Tool input parameters (for Edit to generate diff)
+    uuid: str | None = None
 
 
 class TranscriptParser:
@@ -74,7 +84,14 @@ class TranscriptParser:
     # Magic string constants
     _NO_CONTENT_PLACEHOLDER = "(no content)"
     _INTERRUPTED_TEXT = "[Request interrupted by user for tool use]"
-    _MAX_SUMMARY_LENGTH = 200
+    # Max length of the per-tool input string surfaced in
+    # ``format_tool_use_summary`` (e.g. the bash command, file path, grep
+    # pattern). 200 was tight enough that long bash invocations got
+    # truncated mid-pipe — the activity-digest line then looked like
+    # "Bash(curl -sk -o /dev/null -w…)" with no useful suffix. 600 covers
+    # almost every real bash one-liner without bloating short summaries
+    # (file paths, search patterns, etc., are still well below the cap).
+    _MAX_SUMMARY_LENGTH = 600
 
     @staticmethod
     def parse_line(line: str) -> dict | None:
@@ -192,8 +209,13 @@ class TranscriptParser:
             summary = input_data.get("command", "")
         elif name == "Grep":
             summary = input_data.get("pattern", "")
-        elif name == "Task":
-            summary = input_data.get("description", "")
+        elif name in ("Agent", "Task"):
+            # Both legacy "Task" and current "Agent" are subagent invocations
+            # (Anthropic renamed it). Prefer the human-written description;
+            # fall back to the subagent_type slug if that's all we have.
+            summary = (
+                input_data.get("description") or input_data.get("subagent_type") or ""
+            )
         elif name == "WebFetch":
             summary = input_data.get("url", "")
         elif name == "WebSearch":
@@ -452,6 +474,8 @@ class TranscriptParser:
 
             # Extract timestamp for this entry
             entry_timestamp = cls.get_timestamp(data)
+            raw_uuid = data.get("uuid")
+            entry_uuid = raw_uuid if isinstance(raw_uuid, str) else None
 
             message = data.get("message")
             if not isinstance(message, dict):
@@ -459,6 +483,13 @@ class TranscriptParser:
             content = message.get("content", "")
             if not isinstance(content, list):
                 content = [{"type": "text", "text": str(content)}] if content else []
+
+            # `stop_reason` lives at message level on assistant turns only;
+            # user-role messages (including tool_result carriers) have no
+            # stop_reason in JSONL.
+            entry_stop_reason = (
+                message.get("stop_reason") if msg_type == "assistant" else None
+            )
 
             parsed = cls.parse_message(data)
 
@@ -486,6 +517,7 @@ class TranscriptParser:
                             text=formatted,
                             content_type="local_command",
                             timestamp=entry_timestamp,
+                            uuid=entry_uuid,
                         )
                     )
                     last_cmd_name = None
@@ -509,6 +541,8 @@ class TranscriptParser:
                                     text=t,
                                     content_type="text",
                                     timestamp=entry_timestamp,
+                                    stop_reason=entry_stop_reason,
+                                    uuid=entry_uuid,
                                 )
                             )
                             has_text = True
@@ -529,20 +563,26 @@ class TranscriptParser:
                                         text=plan,
                                         content_type="text",
                                         timestamp=entry_timestamp,
+                                        stop_reason=entry_stop_reason,
+                                        uuid=entry_uuid,
                                     )
                                 )
                         if tool_id:
-                            # Store tool info for later tool_result formatting
-                            # Edit tool needs input_data to generate diff in tool_result stage
+                            # Store tool info for later tool_result formatting.
+                            # Edit needs input_data for diff generation;
+                            # Agent/Task carry it so §2.7's top-level render
+                            # can show description / subagent_type / prompt.
                             input_data = (
                                 inp
-                                if name in ("Edit", "NotebookEdit", "Write")
+                                if name
+                                in ("Edit", "NotebookEdit", "Write", "Agent", "Task")
                                 else None
                             )
                             pending_tools[tool_id] = PendingToolInfo(
                                 summary=summary,
                                 tool_name=name,
                                 input_data=input_data,
+                                uuid=entry_uuid,
                             )
                             # Also emit tool_use entry with tool_name for immediate handling
                             result.append(
@@ -553,6 +593,9 @@ class TranscriptParser:
                                     tool_use_id=tool_id,
                                     timestamp=entry_timestamp,
                                     tool_name=name,
+                                    stop_reason=entry_stop_reason,
+                                    tool_input=inp if isinstance(inp, dict) else None,
+                                    uuid=entry_uuid,
                                 )
                             )
                         else:
@@ -564,6 +607,8 @@ class TranscriptParser:
                                     tool_use_id=tool_id or None,
                                     timestamp=entry_timestamp,
                                     tool_name=name,
+                                    stop_reason=entry_stop_reason,
+                                    uuid=entry_uuid,
                                 )
                             )
 
@@ -577,6 +622,8 @@ class TranscriptParser:
                                     text=quoted,
                                     content_type="thinking",
                                     timestamp=entry_timestamp,
+                                    stop_reason=entry_stop_reason,
+                                    uuid=entry_uuid,
                                 )
                             )
                         elif not has_text:
@@ -586,6 +633,8 @@ class TranscriptParser:
                                     text="(thinking)",
                                     content_type="thinking",
                                     timestamp=entry_timestamp,
+                                    stop_reason=entry_stop_reason,
+                                    uuid=entry_uuid,
                                 )
                             )
 
@@ -634,6 +683,10 @@ class TranscriptParser:
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
                                     timestamp=entry_timestamp,
+                                    tool_input=tool_input_data
+                                    if isinstance(tool_input_data, dict)
+                                    else None,
+                                    uuid=entry_uuid,
                                 )
                             )
                         elif is_error:
@@ -664,6 +717,10 @@ class TranscriptParser:
                                     tool_use_id=_tuid,
                                     timestamp=entry_timestamp,
                                     image_data=result_images,
+                                    tool_input=tool_input_data
+                                    if isinstance(tool_input_data, dict)
+                                    else None,
+                                    uuid=entry_uuid,
                                 )
                             )
                         elif tool_summary:
@@ -710,6 +767,10 @@ class TranscriptParser:
                                     tool_use_id=_tuid,
                                     timestamp=entry_timestamp,
                                     image_data=result_images,
+                                    tool_input=tool_input_data
+                                    if isinstance(tool_input_data, dict)
+                                    else None,
+                                    uuid=entry_uuid,
                                 )
                             )
                         elif result_text or result_images:
@@ -725,6 +786,10 @@ class TranscriptParser:
                                     tool_use_id=_tuid,
                                     timestamp=entry_timestamp,
                                     image_data=result_images,
+                                    tool_input=tool_input_data
+                                    if isinstance(tool_input_data, dict)
+                                    else None,
+                                    uuid=entry_uuid,
                                 )
                             )
 
@@ -746,6 +811,7 @@ class TranscriptParser:
                                 text=combined,
                                 content_type="text",
                                 timestamp=entry_timestamp,
+                                uuid=entry_uuid,
                             )
                         )
 
@@ -761,6 +827,7 @@ class TranscriptParser:
                         text=tool_info.summary,
                         content_type="tool_use",
                         tool_use_id=tool_id,
+                        uuid=tool_info.uuid,
                     )
                 )
 

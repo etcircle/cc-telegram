@@ -20,6 +20,7 @@ Rate limiting is handled globally by AIORateLimiter on the Application.
 RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
 """
 
+import asyncio
 import enum
 import io
 import logging
@@ -28,6 +29,7 @@ from typing import Any
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
 from telegram.error import BadRequest, Forbidden, RetryAfter
 
+from .. import message_refs
 from ..markdown_v2 import convert_markdown
 from ..transcript_parser import TranscriptParser
 
@@ -63,9 +65,7 @@ _TOPIC_CLOSED_FRAGMENTS = (
     "topic_closed",
     "topic is closed",
 )
-_MESSAGE_NOT_MODIFIED_FRAGMENTS = (
-    "message is not modified",
-)
+_MESSAGE_NOT_MODIFIED_FRAGMENTS = ("message is not modified",)
 
 
 def _classify_bad_request(exc: BaseException) -> TopicSendOutcome:
@@ -302,6 +302,100 @@ def _log_topic_outcome(
     )
 
 
+def _spawn_ref_insert(
+    *,
+    chat_id: int,
+    thread_id: int | None,
+    message_id: int,
+    user_id: int,
+    window_id: str | None,
+    session_id: str | None,
+    transcript_uuid: str | None,
+    role: str,
+    content_type: str,
+    part_index: int,
+    text: str,
+) -> None:
+    """Fire-and-forget a provenance row insert.
+
+    Wrapped in ``asyncio.create_task`` so a SQLite stall never blocks the
+    Telegram send hot path. The ``init_db``-not-called case (e.g. early
+    test paths that bypass ``post_init``) is handled silently inside
+    ``message_refs.insert``.
+    """
+    ref = message_refs.MessageRef(
+        chat_id=chat_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        user_id=user_id,
+        window_id=window_id,
+        session_id=session_id,
+        transcript_uuid=transcript_uuid,
+        transcript_byte_start=None,
+        transcript_byte_end=None,
+        role=role,
+        content_type=content_type,
+        part_index=part_index,
+        text=text,
+        text_sha256=None,
+        created_at=message_refs.now_iso(),
+    )
+
+    async def _runner() -> None:
+        # Broad except: the spawn path is fire-and-forget; we never want a
+        # shutdown-race exception (e.g. connection closed under us during
+        # asyncio teardown) to surface as an unawaited-task warning. Real
+        # bugs still log via ``message_refs.insert``'s own warning path.
+        try:
+            await message_refs.insert(ref)
+        except Exception as e:  # pragma: no cover - shutdown-race guard
+            logger.debug("message_refs.insert task swallowed: %s", e)
+
+    try:
+        asyncio.create_task(_runner())
+    except RuntimeError as e:
+        # No running loop (sync-call site, e.g. unit tests). Drop silently —
+        # the caller's send already succeeded; the missing row is non-fatal.
+        logger.debug("create_task for ref insert dropped: no running loop (%s)", e)
+
+
+def _spawn_ref_update(
+    chat_id: int,
+    message_id: int,
+    role: str,
+    content_type: str,
+) -> None:
+    """Fire-and-forget the role/content_type update for status→content edits."""
+
+    async def _runner() -> None:
+        try:
+            await message_refs.update_role_and_content_type(
+                chat_id, message_id, role, content_type
+            )
+        except Exception as e:  # pragma: no cover - shutdown-race guard
+            logger.debug("message_refs.update task swallowed: %s", e)
+
+    try:
+        asyncio.create_task(_runner())
+    except RuntimeError as e:
+        logger.debug("create_task for ref update dropped: no running loop (%s)", e)
+
+
+def _spawn_ref_delete(chat_id: int, message_id: int) -> None:
+    """Fire-and-forget the row delete on topic_delete success."""
+
+    async def _runner() -> None:
+        try:
+            await message_refs.delete(chat_id, message_id)
+        except Exception as e:  # pragma: no cover - shutdown-race guard
+            logger.debug("message_refs.delete task swallowed: %s", e)
+
+    try:
+        asyncio.create_task(_runner())
+    except RuntimeError as e:
+        logger.debug("create_task for ref delete dropped: no running loop (%s)", e)
+
+
 async def topic_send(
     bot: Bot,
     *,
@@ -312,6 +406,11 @@ async def topic_send(
     window_id: str | None,
     text: str,
     plain: bool = False,
+    role: str = "assistant",
+    content_type: str = "text",
+    part_index: int = 0,
+    transcript_uuid: str | None = None,
+    session_id: str | None = None,
     **kwargs: Any,
 ) -> tuple[Message | None, TopicSendOutcome]:
     """Send a message to a topic with structured outcome reporting.
@@ -325,8 +424,28 @@ async def topic_send(
     rate-limit handling.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
+    # ccbot is a high-volume content-and-status feed: silent by default.
+    # Attention cards (the only sends that should buzz the device) override
+    # this with ``disable_notification=False`` at the callsite.
+    kwargs.setdefault("disable_notification", True)
     if thread_id is not None:
         kwargs.setdefault("message_thread_id", thread_id)
+
+    def _record(sent_msg: Message) -> None:
+        _spawn_ref_insert(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=sent_msg.message_id,
+            user_id=user_id,
+            window_id=window_id,
+            session_id=session_id,
+            transcript_uuid=transcript_uuid,
+            role=role,
+            content_type=content_type,
+            part_index=part_index,
+            text=text,
+        )
+
     if plain:
         try:
             sent = await bot.send_message(
@@ -335,6 +454,7 @@ async def topic_send(
             _log_topic_outcome(
                 op, user_id, chat_id, thread_id, window_id, TopicSendOutcome.OK, "send"
             )
+            _record(sent)
             return sent, TopicSendOutcome.OK
         except RetryAfter:
             raise
@@ -354,6 +474,7 @@ async def topic_send(
         _log_topic_outcome(
             op, user_id, chat_id, thread_id, window_id, TopicSendOutcome.OK, "send"
         )
+        _record(sent)
         return sent, TopicSendOutcome.OK
     except RetryAfter:
         raise
@@ -376,6 +497,7 @@ async def topic_send(
         _log_topic_outcome(
             op, user_id, chat_id, thread_id, window_id, TopicSendOutcome.OK, "send"
         )
+        _record(sent)
         return sent, TopicSendOutcome.OK
     except RetryAfter:
         raise
@@ -398,14 +520,28 @@ async def topic_edit(
     message_id: int,
     text: str,
     plain: bool = False,
+    role: str | None = None,
+    content_type: str | None = None,
     **kwargs: Any,
 ) -> TopicSendOutcome:
     """Edit a message in a topic with structured outcome reporting.
 
     Set ``plain=True`` when the body is raw terminal capture or other
     content that should not run through MarkdownV2 conversion.
+
+    ``role`` / ``content_type`` are forwarded to ``message_refs`` only when
+    BOTH are supplied — that's how ``_convert_status_to_content`` repurposes
+    a status row into the first content part. Plain edits to an existing
+    message keep the row as-is.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
+    record_role_change = role is not None and content_type is not None
+
+    def _record_role_change() -> None:
+        if record_role_change:
+            assert role is not None and content_type is not None
+            _spawn_ref_update(chat_id, message_id, role, content_type)
+
     if plain:
         try:
             await bot.edit_message_text(
@@ -417,6 +553,7 @@ async def topic_edit(
             _log_topic_outcome(
                 op, user_id, chat_id, thread_id, window_id, TopicSendOutcome.OK, "edit"
             )
+            _record_role_change()
             return TopicSendOutcome.OK
         except RetryAfter:
             raise
@@ -437,6 +574,7 @@ async def topic_edit(
         _log_topic_outcome(
             op, user_id, chat_id, thread_id, window_id, TopicSendOutcome.OK, "edit"
         )
+        _record_role_change()
         return TopicSendOutcome.OK
     except RetryAfter:
         raise
@@ -465,6 +603,7 @@ async def topic_edit(
         _log_topic_outcome(
             op, user_id, chat_id, thread_id, window_id, TopicSendOutcome.OK, "edit"
         )
+        _record_role_change()
         return TopicSendOutcome.OK
     except RetryAfter:
         raise
@@ -486,9 +625,15 @@ async def topic_delete(
     window_id: str | None,
     message_id: int,
 ) -> TopicSendOutcome:
-    """Delete a message in a topic with structured outcome reporting."""
+    """Delete a message in a topic with structured outcome reporting.
+
+    On OK the matching ``message_refs`` row is dropped fire-and-forget so
+    a future reply to a deleted ``message_id`` does not enrich with stale
+    role / session metadata.
+    """
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        _spawn_ref_delete(chat_id, message_id)
         _log_topic_outcome(
             op, user_id, chat_id, thread_id, window_id, TopicSendOutcome.OK, "delete"
         )

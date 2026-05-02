@@ -94,6 +94,92 @@ class TestHandleInteractiveUI:
             )
 
     @pytest.mark.asyncio
+    async def test_interactive_ui_card_peeks_anchor_so_assistant_text_can_anchor(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """§2.5.2: the interactive-card send must not pop the anchor.
+
+        Both the interactive card AND the assistant text Claude emits after
+        the user resolves the card are responses to the same user prompt,
+        so they should anchor to the same Telegram message_id. The
+        canonical anchor consumer is ``_process_content_task``; the
+        interactive-UI surface only peeks.
+        """
+        from telegram import ReplyParameters
+
+        from ccbot.handlers import message_queue
+        from ccbot.handlers.message_sender import TopicSendOutcome
+
+        window_id = "@5"
+        user_id = 1
+        thread_id = 42
+        anchor_message_id = 7777
+
+        # Stash the anchor as if a prior text/photo offer recorded it.
+        message_queue.set_route_last_user_message(
+            user_id, thread_id, window_id, anchor_message_id
+        )
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 9999
+        send_calls: list[dict] = []
+
+        async def fake_topic_send(
+            bot, *, op, user_id, chat_id, thread_id, window_id, text, **kw
+        ):
+            send_calls.append({"op": op, "kw": kw})
+            return sent_msg, TopicSendOutcome.OK
+
+        async def fake_attention(*args, **kwargs):
+            return TopicSendOutcome.OK
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        try:
+            with (
+                patch("ccbot.handlers.interactive_ui.tmux_manager") as mock_tmux,
+                patch("ccbot.handlers.interactive_ui.session_manager") as mock_sm_iu,
+                patch(
+                    "ccbot.handlers.interactive_ui.topic_send",
+                    side_effect=fake_topic_send,
+                ),
+                patch(
+                    "ccbot.handlers.interactive_ui.attention.notify_waiting",
+                    side_effect=fake_attention,
+                ),
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+                mock_sm_iu.resolve_chat_id.return_value = 100
+                mock_sm_iu.get_display_name.return_value = "topic-name"
+
+                result = await handle_interactive_ui(
+                    mock_bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    thread_id=thread_id,
+                )
+            assert result is True
+            # The card send carried the anchor.
+            assert len(send_calls) == 1
+            rp = send_calls[0]["kw"].get("reply_parameters")
+            assert isinstance(rp, ReplyParameters)
+            assert rp.message_id == anchor_message_id
+            # CRITICAL: anchor still present after the card send (peek, not
+            # consume). A subsequent assistant-text first-part send is the
+            # canonical consumer.
+            anchor_route = (user_id, thread_id, window_id)
+            assert (
+                message_queue._route_last_user_message.get(anchor_route)
+                == anchor_message_id
+            )
+        finally:
+            message_queue._route_last_user_message.pop(
+                (user_id, thread_id, window_id), None
+            )
+
+    @pytest.mark.asyncio
     async def test_handle_no_ui_returns_false(self, mock_bot: AsyncMock):
         """Returns False when no interactive UI detected in pane."""
         window_id = "@5"

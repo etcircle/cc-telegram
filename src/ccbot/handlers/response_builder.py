@@ -20,7 +20,6 @@ from ..transcript_parser import TranscriptParser
 
 def build_response_parts(
     text: str,
-    is_complete: bool,
     content_type: str = "text",
     role: str = "assistant",
 ) -> list[str]:
@@ -42,7 +41,7 @@ def build_response_parts(
         return [f"{prefix}{text}"]
 
     # Truncate thinking content to keep it compact
-    if content_type == "thinking" and is_complete:
+    if content_type == "thinking":
         start_tag = TranscriptParser.EXPANDABLE_QUOTE_START
         end_tag = TranscriptParser.EXPANDABLE_QUOTE_END
         max_thinking = 500

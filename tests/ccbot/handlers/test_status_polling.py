@@ -5,6 +5,7 @@ model picker renders in the terminal, and the status poller detects it
 on its next 1s tick.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -68,6 +69,219 @@ class TestStatusPollerSettingsDetection:
             )
 
             mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
+
+    @pytest.mark.asyncio
+    async def test_idle_clears_stale_busy_after_delay(self, mock_bot: AsyncMock):
+        """Pane with no spinner: wait IDLE_CLEAR_DELAY_SECONDS, then clear once.
+
+        Regression: previously ``update_status_message`` simply skipped the
+        clear path when ``parse_status_line`` returned ``None``, so the
+        "🟡 Busy — … / Cooked for 2s" message hung around forever after Claude
+        finished and its post-completion summary line rolled off.
+        """
+        from ccbot.handlers import status_polling
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        idle_pane = (
+            "$ echo done\n"
+            "done\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  [Opus 4.6] Context: 50%\n"
+        )
+
+        status_polling.reset_idle_counter(1, 42)
+        fake_now = [1000.0]
+
+        def fake_monotonic() -> float:
+            return fake_now[0]
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(status_polling.time, "monotonic", side_effect=fake_monotonic),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=idle_pane)
+
+            # First idle observation just records the timestamp.
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 0
+
+            # Still inside the delay window — no clear yet.
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS - 0.5
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 0
+
+            # Past the delay — clears exactly once.
+            fake_now[0] += 1.0
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 1
+            args, kwargs = mock_enqueue.await_args
+            assert args[3] is None
+            assert kwargs.get("thread_id") == 42
+
+            # Further idle polls don't re-trigger.
+            fake_now[0] += 5.0
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 1
+
+        status_polling.reset_idle_counter(1, 42)
+
+    @pytest.mark.asyncio
+    async def test_busy_status_resets_idle_state(self, mock_bot: AsyncMock):
+        """A real active status resets the idle state, so a subsequent idle
+        stretch must wait the full delay again before clearing."""
+        from ccbot.handlers import status_polling
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        idle_pane = (
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+        # "esc to interrupt" in the bottom chrome bar = Claude actively running.
+        busy_pane = (
+            "✻ Cooking for 2s\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt\n"
+        )
+
+        status_polling.reset_idle_counter(1, 42)
+        fake_now = [1000.0]
+
+        def fake_monotonic() -> float:
+            return fake_now[0]
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(status_polling.time, "monotonic", side_effect=fake_monotonic),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+
+            # Idle for a while.
+            mock_tmux.capture_pane = AsyncMock(return_value=idle_pane)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            fake_now[0] += 2.0  # Below delay.
+
+            # Active poll arrives — drops idle state, enqueues real status.
+            mock_tmux.capture_pane = AsyncMock(return_value=busy_pane)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_args.args[3] == "Cooking for 2s"
+            enqueue_count_after_busy = mock_enqueue.await_count
+
+            # Idle again — must wait the FULL delay before clearing.
+            mock_tmux.capture_pane = AsyncMock(return_value=idle_pane)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS - 0.5
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == enqueue_count_after_busy
+
+            # Cross the delay — clear fires.
+            fake_now[0] += 1.0
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == enqueue_count_after_busy + 1
+            assert mock_enqueue.await_args.args[3] is None
+
+        status_polling.reset_idle_counter(1, 42)
+
+    @pytest.mark.asyncio
+    async def test_post_completion_summary_treated_as_idle(self, mock_bot: AsyncMock):
+        """A static "✻ Worked for 2s" line with a blank line above chrome
+        is a post-completion summary, NOT an active status. Must NOT be
+        re-enqueued as busy — Claude is actually idle.
+
+        Regression: this is the exact pane state captured in the wild when
+        "🟡 Busy — di-copilot-3 / Worked for 2s" hung around forever after
+        Claude finished responding.
+        """
+        from ccbot.handlers import status_polling
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        # Spinner line, then BLANK line, then chrome — Claude's idle summary.
+        post_completion_pane = (
+            "⏺ Doing well, ready to help.\n"
+            "\n"
+            "✻ Worked for 2s\n"
+            "\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+        )
+
+        status_polling.reset_idle_counter(1, 42)
+        fake_now = [1000.0]
+
+        def fake_monotonic() -> float:
+            return fake_now[0]
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(status_polling.time, "monotonic", side_effect=fake_monotonic),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=post_completion_pane)
+
+            # First idle observation just records the timestamp.
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 0
+
+            # Past the delay — clears.
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS + 0.1
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 1
+            assert mock_enqueue.await_args.args[3] is None
+
+        status_polling.reset_idle_counter(1, 42)
 
     @pytest.mark.asyncio
     async def test_normal_pane_no_interactive_ui(self, mock_bot: AsyncMock):
@@ -160,14 +374,12 @@ class TestStatusPollerSettingsDetection:
 # ── Topic existence probe (status_poll_loop) ────────────────────────────────
 
 
-class TestTopicProbeClassification:
-    """The status_poll_loop probes topic existence by calling
-    ``unpin_all_forum_topic_messages``. Telegram returns various BadRequest
-    bodies for "this topic is gone"; the classifier must catch all of them or
-    we fail to clean up dead bindings and keep DM-flooding the user.
-
-    These tests pin the classifier fragments instead of running the full
-    status_poll_loop (which is an unbounded ``while True`` task).
+class TestTopicErrorClassification:
+    """The classifier maps Telegram BadRequest bodies into structured outcomes
+    so reactive topic_send/topic_edit failures can route to emergency DMs and
+    unbinding. Telegram uses several wordings for the same logical error;
+    these tests pin the fragments so a Telegram-side rename can't silently
+    re-route everything to ``OTHER``.
     """
 
     @pytest.mark.parametrize(
@@ -183,7 +395,7 @@ class TestTopicProbeClassification:
         outcome = _classify_bad_request(BadRequest(telegram_message))
         assert outcome is TopicSendOutcome.TOPIC_NOT_FOUND, (
             f"Telegram message {telegram_message!r} must classify as "
-            f"TOPIC_NOT_FOUND so the probe can reap dead bindings"
+            f"TOPIC_NOT_FOUND so reactive failures route to emergency DMs"
         )
 
     def test_topic_closed_variant_classified(self):
@@ -203,54 +415,49 @@ class TestTopicProbeClassification:
         assert outcome is TopicSendOutcome.OTHER
 
 
-class TestTopicProbeReapsDeadBinding:
-    """Drive one iteration of the probe path manually and verify it kills the
-    tmux window + unbinds the thread when Telegram returns "thread not found".
+class TestStatusPollLoopDoesNotProbeTelegram:
+    """Regression: ``status_poll_loop`` must NOT call any Telegram API as a
+    proactive existence probe. The previous implementation ran
+    ``unpin_all_forum_topic_messages`` every 60s for every bound topic — but
+    that endpoint is destructive on success (it clears any pinned messages in
+    the topic), not a no-op. Topic existence is now detected reactively from
+    real ``topic_send``/``topic_edit`` failures.
     """
 
     @pytest.mark.asyncio
-    async def test_probe_thread_not_found_reaps_binding(self):
+    async def test_loop_iteration_does_not_call_unpin(self):
         from ccbot.handlers import status_polling
 
         bot = AsyncMock()
-        bot.unpin_all_forum_topic_messages = AsyncMock(
-            side_effect=BadRequest("Bad Request: message thread not found")
-        )
+        # If the test ever sees this called, the probe was reintroduced.
+        bot.unpin_all_forum_topic_messages = AsyncMock()
 
         mock_window = MagicMock()
         mock_window.window_id = "@7"
 
         with (
-            patch.object(
-                status_polling, "session_manager"
-            ) as mock_sm,
+            patch.object(status_polling, "session_manager") as mock_sm,
             patch.object(status_polling, "tmux_manager") as mock_tmux,
             patch.object(
-                status_polling, "clear_topic_state", new_callable=AsyncMock
-            ) as mock_clear,
+                status_polling, "update_status_message", new_callable=AsyncMock
+            ),
+            patch.object(status_polling, "clear_topic_state", new_callable=AsyncMock),
         ):
             mock_sm.iter_thread_bindings.return_value = [(1, 42, "@7")]
             mock_sm.resolve_chat_id.return_value = -100123
             mock_sm.unbind_thread = MagicMock()
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux.kill_window = AsyncMock()
 
-            # Replicate the probe block from status_poll_loop (one user/thread).
-            for user_id, thread_id, wid in mock_sm.iter_thread_bindings.return_value:
+            # Run one tick of the loop and cancel before the sleep returns.
+            # status_poll_loop is `while True:` so we need a timeout.
+            task = asyncio.create_task(status_polling.status_poll_loop(bot))
+            try:
+                await asyncio.wait_for(task, timeout=0.1)
+            except asyncio.TimeoutError:
+                task.cancel()
                 try:
-                    await bot.unpin_all_forum_topic_messages(
-                        chat_id=mock_sm.resolve_chat_id(user_id, thread_id),
-                        message_thread_id=thread_id,
-                    )
-                except BadRequest as e:
-                    outcome = _classify_bad_request(e)
-                    if outcome is TopicSendOutcome.TOPIC_NOT_FOUND:
-                        w = await mock_tmux.find_window_by_id(wid)
-                        if w:
-                            await mock_tmux.kill_window(w.window_id)
-                        mock_sm.unbind_thread(user_id, thread_id)
-                        await mock_clear(user_id, thread_id, bot)
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-            mock_tmux.kill_window.assert_awaited_once_with("@7")
-            mock_sm.unbind_thread.assert_called_once_with(1, 42)
-            mock_clear.assert_awaited_once_with(1, 42, bot)
+        bot.unpin_all_forum_topic_messages.assert_not_called()

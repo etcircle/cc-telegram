@@ -116,13 +116,14 @@ class TestFormatToolUseSummary:
             TranscriptParser.format_tool_use_summary("Read", "not a dict") == "**Read**"
         )
 
-    def test_truncation_at_200_chars(self):
-        long_value = "x" * 250
+    def test_truncation_at_max_summary_length(self):
+        cap = TranscriptParser._MAX_SUMMARY_LENGTH
+        long_value = "x" * (cap + 50)
         result = TranscriptParser.format_tool_use_summary(
             "Bash", {"command": long_value}
         )
-        assert len(long_value) > 200
-        assert result == f"**Bash**({'x' * 200}…)"
+        assert len(long_value) > cap
+        assert result == f"**Bash**({'x' * cap}…)"
 
 
 # ── extract_tool_result_text ─────────────────────────────────────────────
@@ -531,3 +532,147 @@ class TestParseEntries:
         result, pending = TranscriptParser.parse_entries(entries)
         user_entries = [e for e in result if e.role == "user"]
         assert len(user_entries) == 0
+
+
+# ── stop_reason propagation ──────────────────────────────────────────────
+
+
+class TestStopReasonPropagation:
+    """Verify message.stop_reason is plumbed onto every assistant entry."""
+
+    def _entry_with_stop_reason(
+        self, msg_type: str, content: list, stop_reason: str | None
+    ) -> dict:
+        entry: dict = {
+            "type": msg_type,
+            "message": {"content": content},
+            "sessionId": "sid",
+            "cwd": "/tmp",
+            "timestamp": "2026-05-02T00:00:00.000Z",
+        }
+        if stop_reason is not None:
+            entry["message"]["stop_reason"] = stop_reason
+        return entry
+
+    def test_assistant_text_carries_stop_reason(self, make_text_block):
+        entries = [
+            self._entry_with_stop_reason(
+                "assistant", [make_text_block("done!")], "end_turn"
+            ),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+        assert len(result) == 1
+        assert result[0].stop_reason == "end_turn"
+
+    def test_assistant_thinking_with_tool_use_carries_tool_use_stop_reason(
+        self, make_thinking_block, make_tool_use_block
+    ):
+        entries = [
+            self._entry_with_stop_reason(
+                "assistant",
+                [
+                    make_thinking_block("reasoning"),
+                    make_tool_use_block("t1", "Read", {"file_path": "x.py"}),
+                ],
+                "tool_use",
+            ),
+        ]
+        # Use carry-over mode to avoid the end-of-loop flush re-emitting
+        # an entry without stop_reason context.
+        result, _ = TranscriptParser.parse_entries(entries, pending_tools={})
+        thinking = [e for e in result if e.content_type == "thinking"]
+        tool_uses = [e for e in result if e.content_type == "tool_use"]
+        assert len(thinking) == 1
+        assert thinking[0].stop_reason == "tool_use"
+        assert len(tool_uses) == 1
+        assert tool_uses[0].stop_reason == "tool_use"
+
+    def test_assistant_no_stop_reason_field_stays_none(self, make_text_block):
+        entries = [
+            self._entry_with_stop_reason("assistant", [make_text_block("hi")], None),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+        assert len(result) == 1
+        assert result[0].stop_reason is None
+
+    def test_user_text_has_no_stop_reason(self, make_text_block):
+        entries = [
+            self._entry_with_stop_reason("user", [make_text_block("hi bot")], None),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+        user_entries = [e for e in result if e.role == "user"]
+        assert len(user_entries) == 1
+        assert user_entries[0].stop_reason is None
+
+    def test_tool_result_user_message_entries_have_no_stop_reason(
+        self, make_tool_use_block, make_tool_result_block
+    ):
+        # tool_result lives in user-role messages, which never carry
+        # stop_reason in JSONL. The recomputation rejected by the plan
+        # would have set is_complete=False here; the field should stay
+        # None instead.
+        entries = [
+            self._entry_with_stop_reason(
+                "assistant",
+                [make_tool_use_block("t1", "Read", {"file_path": "x.py"})],
+                "tool_use",
+            ),
+            self._entry_with_stop_reason(
+                "user", [make_tool_result_block("t1", "ok")], None
+            ),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+        tool_results = [e for e in result if e.content_type == "tool_result"]
+        assert len(tool_results) == 1
+        assert tool_results[0].stop_reason is None
+        tool_uses = [e for e in result if e.content_type == "tool_use"]
+        assert tool_uses[0].stop_reason == "tool_use"
+
+
+class TestUuidPropagation:
+    """Verify the JSONL entry-level uuid is plumbed onto every ParsedEntry."""
+
+    def test_uuid_round_trips_on_assistant_text(
+        self, make_jsonl_entry, make_text_block
+    ):
+        entry = make_jsonl_entry("assistant", [make_text_block("hello")])
+        entry["uuid"] = "abc-123"
+        result, _ = TranscriptParser.parse_entries([entry])
+        assert len(result) == 1
+        assert result[0].uuid == "abc-123"
+
+    def test_uuid_round_trips_on_user_tool_result(
+        self, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+    ):
+        assistant = make_jsonl_entry(
+            "assistant", [make_tool_use_block("t1", "Read", {"file_path": "x.py"})]
+        )
+        assistant["uuid"] = "assistant-uuid"
+        user = make_jsonl_entry("user", [make_tool_result_block("t1", "ok")])
+        user["uuid"] = "user-uuid"
+        result, _ = TranscriptParser.parse_entries([assistant, user])
+        tool_results = [e for e in result if e.content_type == "tool_result"]
+        assert len(tool_results) == 1
+        assert tool_results[0].uuid == "user-uuid"
+
+    def test_uuid_shared_across_multi_block_message(
+        self, make_jsonl_entry, make_thinking_block, make_tool_use_block
+    ):
+        entry = make_jsonl_entry(
+            "assistant",
+            [
+                make_thinking_block("reasoning"),
+                make_tool_use_block("t1", "Read", {"file_path": "x.py"}),
+            ],
+        )
+        entry["uuid"] = "shared-uuid"
+        result, _ = TranscriptParser.parse_entries([entry], pending_tools={})
+        assert len(result) >= 2
+        assert all(e.uuid == "shared-uuid" for e in result)
+
+    def test_uuid_missing_yields_none(self, make_jsonl_entry, make_text_block):
+        entry = make_jsonl_entry("assistant", [make_text_block("hello")])
+        entry.pop("uuid", None)
+        result, _ = TranscriptParser.parse_entries([entry])
+        assert len(result) == 1
+        assert result[0].uuid is None

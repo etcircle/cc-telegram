@@ -101,6 +101,117 @@ class Config:
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
 
+        # Stage-3 event-driven RunState. Gates two coupled changes together:
+        #   1. bot.py: whether monitor.set_event_callback is wired
+        #   2. activity-digest renderer + status_polling: whether they read
+        #      RunState / context_pct, or fall back to the legacy
+        #      state.done / is_status_active(pane) paths.
+        # Default false for one release; flip to true after Stage 4 lands.
+        self.busy_indicator_v2 = (
+            os.getenv("CCBOT_BUSY_INDICATOR_V2", "false").lower() == "true"
+        )
+
+        # Context-window indicator threshold (percent). The activity-digest
+        # header appends "· ctx NN%" when the cached value crosses this; at
+        # ≥95 it prepends a warning glyph. Below threshold or unknown: no
+        # suffix. Pure visual policy — does not affect RunState.
+        try:
+            self.context_pct_threshold = int(
+                os.getenv("CCBOT_CONTEXT_PCT_THRESHOLD", "80")
+            )
+        except ValueError:
+            self.context_pct_threshold = 80
+
+        # §2.6 narrow end-of-turn-question card preview length. The card
+        # excerpts the final paragraph of an end-of-turn assistant message
+        # so the user sees what's being asked without opening the topic.
+        try:
+            self.attention_question_preview_chars = int(
+                os.getenv("CCBOT_ATTENTION_QUESTION_PREVIEW_CHARS", "200")
+            )
+        except ValueError:
+            self.attention_question_preview_chars = 200
+
+        # §2.7 Agent (subagent) prompt excerpt length for the top-level
+        # "🤖 Subagent dispatched" message. Long prompts get truncated mid-line
+        # with a "…" marker; the full prompt is still in the JSONL transcript.
+        try:
+            self.agent_prompt_preview_chars = int(
+                os.getenv("CCBOT_AGENT_PROMPT_PREVIEW_CHARS", "400")
+            )
+        except ValueError:
+            self.agent_prompt_preview_chars = 400
+
+        # §2.5 Telegram reply-context bridge.
+        # Master kill-switch: when False, ``text_handler`` skips
+        # ``extract_reply_context`` and outbound sends drop ``reply_parameters``
+        # entirely. Lets us roll back the bridge without redeploying.
+        self.reply_context_enabled = (
+            os.getenv("CCBOT_REPLY_CONTEXT", "true").lower() != "false"
+        )
+
+        # Upper bound on the quoted-text excerpt injected into Claude's
+        # prompt. The full original text still lives in the Telegram message,
+        # and Stage 5.c will keep a SQLite copy for rehydration; this cap just
+        # keeps the per-turn injection proportional to the new user text.
+        try:
+            self.quote_injection_max_chars = int(
+                os.getenv("CCBOT_QUOTE_INJECTION_MAX_CHARS", "1600")
+            )
+        except ValueError:
+            self.quote_injection_max_chars = 1600
+
+        # §2.8 Inbound aggregator (caption + media-group + photo+text bundling).
+        # Debounce window for coalescing Telegram messages into a single
+        # Claude turn. Mirrors the debounce Telegram clients use to bundle
+        # media-group uploads.
+        try:
+            self.aggregator_debounce_seconds = float(
+                os.getenv("CCBOT_AGGREGATOR_DEBOUNCE_SECONDS", "1.5")
+            )
+        except ValueError:
+            self.aggregator_debounce_seconds = 1.5
+
+        # Hard cap on photos per aggregated bundle. Beyond this, the
+        # aggregator force-flushes immediately rather than waiting on the
+        # debounce — prevents an unbounded image dump from blocking flush.
+        try:
+            self.aggregator_max_photos = int(
+                os.getenv("CCBOT_AGGREGATOR_MAX_PHOTOS", "10")
+            )
+        except ValueError:
+            self.aggregator_max_photos = 10
+
+        # §2.5.3 Stage 5.c: Telegram message-refs SQLite. The DB file lives
+        # under the config dir by default so it follows the rest of ccbot's
+        # state files; CCBOT_MESSAGE_REFS_DB_PATH overrides for tests / split
+        # storage volumes.
+        message_refs_path = os.getenv("CCBOT_MESSAGE_REFS_DB_PATH")
+        if message_refs_path:
+            self.message_refs_db_path = Path(message_refs_path)
+        else:
+            self.message_refs_db_path = self.config_dir / "message_refs.db"
+
+        # Daily GC retention for the provenance table (§2.5.3). Older rows
+        # still resolve via Telegram's UI quote bubble; Claude just won't get
+        # transcript provenance for them.
+        try:
+            self.message_refs_retention_days = int(
+                os.getenv("CCBOT_MESSAGE_REFS_RETENTION_DAYS", "30")
+            )
+        except ValueError:
+            self.message_refs_retention_days = 30
+
+        # Bound on the ``text`` column in ``telegram_message_refs``. Long
+        # bodies are truncated with a ``… [truncated]`` marker; the sha256
+        # column still hashes the full original text for verification.
+        try:
+            self.message_ref_text_max_chars = int(
+                os.getenv("CCBOT_MESSAGE_REF_TEXT_MAX_CHARS", "4000")
+            )
+        except ValueError:
+            self.message_ref_text_max_chars = 4000
+
         # OpenAI API for voice message transcription (optional)
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(

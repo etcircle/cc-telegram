@@ -4,8 +4,10 @@ import pytest
 
 from ccbot.terminal_parser import (
     extract_bash_output,
+    extract_context_pct,
     extract_interactive_content,
     is_interactive_ui,
+    is_status_active,
     parse_status_line,
     strip_pane_chrome,
 )
@@ -61,6 +63,66 @@ class TestParseStatusLine:
 
     def test_uses_fixture(self, sample_pane_status_line: str):
         assert parse_status_line(sample_pane_status_line) == "Reading file src/main.py"
+
+
+# ── is_status_active ─────────────────────────────────────────────────────
+
+
+class TestIsStatusActive:
+    """is_status_active is True iff Claude is actively producing output.
+    The signal is "esc to interrupt" in the bottom chrome bar — that's
+    the only marker Claude renders consistently while a run is in flight,
+    and removes once the run completes.
+    """
+
+    def test_active_pane_with_esc_to_interrupt(self):
+        """Real captured-in-the-wild active pane (Brewing…)."""
+        pane = (
+            "✽ Brewing… (3s · thinking with high effort)\n"
+            "\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt"
+        )
+        assert is_status_active(pane) is True
+
+    def test_post_completion_summary_no_esc(self):
+        """Real captured-in-the-wild idle pane: same spinner+blank gap, but
+        bottom chrome has no "esc to interrupt"."""
+        pane = (
+            "✻ Cooked for 17s · 3 shells still running\n"
+            "\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  ⏵⏵ bypass permissions on · 3 shells · ↓ to manage"
+        )
+        assert is_status_active(pane) is False
+
+    def test_active_with_shells_and_esc(self):
+        """Active run while background shells exist (compound bottom chrome)."""
+        pane = (
+            "✽ Tempering… (26s · ↓ 125 tokens · thought for 13s)\n"
+            "\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  ⏵⏵ bypass permissions on · 2 shells · esc to interrupt · ↓ to manage"
+        )
+        assert is_status_active(pane) is True
+
+    def test_idle_pane_no_status(self, chrome: str):
+        pane = f"some output\n{chrome}"
+        assert is_status_active(pane) is False
+
+    def test_empty_is_idle(self):
+        assert is_status_active("") is False
+
+    def test_case_insensitive(self):
+        """Tolerate hypothetical capitalization changes in the marker."""
+        pane = "✻ Working\n──────\n  Esc To Interrupt\n"
+        assert is_status_active(pane) is True
 
 
 # ── extract_interactive_content ──────────────────────────────────────────
@@ -263,3 +325,50 @@ class TestExtractBashOutput:
         result = extract_bash_output(pane, "echo hi")
         assert result is not None
         assert not result.endswith("\n")
+
+
+# ── extract_context_pct ─────────────────────────────────────────────────
+
+
+class TestExtractContextPct:
+    def test_extracts_realistic_chrome(self):
+        pane = (
+            "some output\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  [Opus 4.6] Context: 89%\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+        assert extract_context_pct(pane) == 89
+
+    def test_extracts_low_value(self):
+        pane = "  [Sonnet 4.5] Context: 7%\n"
+        assert extract_context_pct(pane) == 7
+
+    def test_no_context_line_returns_none(self):
+        pane = (
+            "some output\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+        )
+        assert extract_context_pct(pane) is None
+
+    def test_empty_returns_none(self):
+        assert extract_context_pct("") is None
+
+    def test_only_searches_bottom_lines(self):
+        # Push a Context line to the top of a long pane — it's outside the
+        # last-10-line window so should not be picked up.
+        pane = (
+            "  [Opus 4.6] Context: 50%\n"
+            + "\n".join(f"line {i}" for i in range(30))
+            + "\n"
+        )
+        assert extract_context_pct(pane) is None
+
+    def test_out_of_range_value_ignored(self):
+        # Three-digit number that's out of range
+        pane = "  [Opus 4.6] Context: 250%\n"
+        assert extract_context_pct(pane) is None

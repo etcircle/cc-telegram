@@ -199,30 +199,35 @@ def is_interactive_ui(pane_text: str) -> bool:
 STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
 
 
+def _find_chrome_separator(lines: list[str]) -> int | None:
+    """Locate the topmost ``──`` chrome separator in the last 10 lines."""
+    search_start = max(0, len(lines) - 10)
+    for i in range(search_start, len(lines)):
+        stripped = lines[i].strip()
+        if len(stripped) >= 20 and all(c == "─" for c in stripped):
+            return i
+    return None
+
+
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 
-    The status line (spinner + working text) appears immediately above
-    the chrome separator (a full line of ``─`` characters).  We locate
-    the separator first, then check the line just above it — this avoids
-    false positives from ``·`` bullets in Claude's regular output.
+    The status line (spinner + working text) appears above the chrome
+    separator (a full line of ``─`` characters). We locate the separator
+    first, then check the lines just above it — this avoids false
+    positives from ``·`` bullets in Claude's regular output.
 
     Returns the text after the spinner, or None if no status line found.
+    Note: blank lines between the spinner and the chrome are tolerated
+    here (the post-completion summary case). To distinguish "Claude is
+    actively running" from "post-completion summary", use
+    ``is_status_active`` instead.
     """
     if not pane_text:
         return None
 
     lines = pane_text.split("\n")
-
-    # Find the chrome separator: topmost ──── line in the last 10 lines
-    chrome_idx: int | None = None
-    search_start = max(0, len(lines) - 10)
-    for i in range(search_start, len(lines)):
-        stripped = lines[i].strip()
-        if len(stripped) >= 20 and all(c == "─" for c in stripped):
-            chrome_idx = i
-            break
-
+    chrome_idx = _find_chrome_separator(lines)
     if chrome_idx is None:
         return None  # No chrome visible — can't determine status
 
@@ -235,6 +240,75 @@ def parse_status_line(pane_text: str) -> str | None:
             return line[1:].strip()
         # First non-empty line above separator isn't a spinner → no status
         return None
+    return None
+
+
+def is_status_active(pane_text: str) -> bool:
+    """Return True iff Claude is actively producing output.
+
+    The reliable signal is the literal ``esc to interrupt`` in the bottom
+    chrome bar — Claude only renders that hint while a run is in flight.
+    The spinner glyph and the spinner-line text are NOT reliable: Claude
+    keeps the spinner+summary line ("✻ Cooked for 2s") visible after a
+    run completes, and the gap above the top chrome is the same in both
+    active and idle states (Claude always inserts a blank line there).
+
+    Examples:
+
+        Actively running (returns True)::
+
+            ✽ Brewing… (3s · thinking with high effort)
+
+            ──────────────────────────────────
+            ❯
+            ──────────────────────────────────
+              ⏵⏵ bypass permissions on · esc to interrupt
+
+        Post-completion summary (returns False)::
+
+            ✻ Cooked for 2s
+
+            ──────────────────────────────────
+            ❯
+            ──────────────────────────────────
+              ⏵⏵ bypass permissions on (shift+tab to cycle)
+    """
+    if not pane_text:
+        return False
+
+    # Search the last 8 lines so we catch the bottom chrome bar without
+    # paying for a full pane scan on every poll.
+    last_lines = pane_text.split("\n")[-8:]
+    return any("esc to interrupt" in line.lower() for line in last_lines)
+
+
+# ── Context-window indicator ─────────────────────────────────────────────
+
+# Matches Claude Code's chrome footer line, e.g.
+#   "  [Opus 4.6] Context: 89%"
+#   "  [Sonnet 4.5] Context: 7%"
+_RE_CONTEXT_PCT = re.compile(r"\bContext:\s*(\d{1,3})%")
+
+
+def extract_context_pct(pane_text: str) -> int | None:
+    """Extract the Context-window percentage from Claude Code's chrome.
+
+    Scans the bottom 10 lines for a ``[<model>] Context: NN%`` pattern.
+    Returns the integer (0-100) or ``None`` if no match is found or the
+    parsed value is out of range. Pure parser — no I/O, no caching.
+    """
+    if not pane_text:
+        return None
+    lines = pane_text.split("\n")
+    for line in lines[-10:]:
+        match = _RE_CONTEXT_PCT.search(line)
+        if match:
+            try:
+                pct = int(match.group(1))
+            except ValueError:
+                continue
+            if 0 <= pct <= 100:
+                return pct
     return None
 
 

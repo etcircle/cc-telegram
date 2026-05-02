@@ -16,7 +16,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable, Awaitable, Literal
 
 import aiofiles
 
@@ -38,17 +38,44 @@ class SessionInfo:
 
 
 @dataclass
+class TranscriptEvent:
+    """A lifecycle event derived from one parsed JSONL block.
+
+    Lower-level than NewMessage — preserves raw JSONL provenance
+    (stop_reason, timestamp, tool_use_id) so consumers like the
+    BusyIndicator can drive run-state transitions without re-deriving
+    them from heuristics on the rendered text.
+    """
+
+    session_id: str
+    role: Literal["user", "assistant"]
+    block_type: Literal["text", "thinking", "tool_use", "tool_result"]
+    tool_use_id: str | None
+    tool_name: str | None
+    stop_reason: str | None
+    timestamp: str | None
+    text: str
+    image_data: list[tuple[str, bytes]] | None
+    tool_input: dict[str, Any] | None = None
+    transcript_uuid: str | None = None
+
+
+@dataclass
 class NewMessage:
     """A new message detected by the monitor."""
 
     session_id: str
     text: str
-    is_complete: bool  # True when stop_reason is set (final message)
     content_type: str = "text"  # "text" or "thinking"
     tool_use_id: str | None = None
     role: str = "assistant"  # "user" or "assistant"
     tool_name: str | None = None  # For tool_use messages, the tool name
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+    # Raw tool_use input dict for Edit/Write/Agent/Task — used by §2.7
+    # Agent prominence to pull description / subagent_type / prompt out of
+    # the JSONL block without a second pass over the file.
+    tool_input: dict[str, Any] | None = None
+    transcript_uuid: str | None = None
 
 
 class SessionMonitor:
@@ -77,6 +104,7 @@ class SessionMonitor:
         self._running = False
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
+        self._event_callback: Callable[[TranscriptEvent], Awaitable[None]] | None = None
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Track last known session_map for detecting changes
@@ -89,6 +117,45 @@ class SessionMonitor:
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
         self._message_callback = callback
+
+    def set_event_callback(
+        self, callback: Callable[[TranscriptEvent], Awaitable[None]]
+    ) -> None:
+        self._event_callback = callback
+
+    def register_session(
+        self, session_id: str, file_path: Path, offset: int = 0
+    ) -> bool:
+        """Pre-register a freshly created session at a known byte offset.
+
+        ``check_for_updates`` initializes a previously-unseen session at
+        end-of-file to avoid replaying historical conversations. That default
+        drops the first user/assistant exchange of a session created by the
+        bot itself: the JSONL has already been appended with the seed
+        message and Claude's reply by the time the monitor first observes
+        the file. Pre-registering at offset 0 forces the next poll to read
+        the whole file from the start.
+
+        No-op if the session is already tracked (preserves the live offset
+        across resume / bot-restart paths).
+        """
+        if self.state.get_session(session_id) is not None:
+            return False
+        self.state.update_session(
+            TrackedSession(
+                session_id=session_id,
+                file_path=str(file_path),
+                last_byte_offset=offset,
+            )
+        )
+        self.state.save_if_dirty()
+        logger.info(
+            "Pre-registered session %s at offset %d (file=%s)",
+            session_id,
+            offset,
+            file_path,
+        )
+        return True
 
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
@@ -345,23 +412,83 @@ class SessionMonitor:
                 else:
                     self._pending_tools.pop(session_info.session_id, None)
 
+                if new_entries:
+                    logger.info(
+                        "parse_diag session=%s raw_entries=%d parsed=%d types=%s",
+                        session_info.session_id[:8],
+                        len(new_entries),
+                        len(parsed_entries),
+                        [(p.role, p.content_type, p.text[:40]) for p in parsed_entries],
+                    )
+
                 for entry in parsed_entries:
                     if not entry.text and not entry.image_data:
                         continue
                     # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
                         continue
+                    # Suppress user-message echoes for text we just typed
+                    # into the pane via send_to_window — the user already
+                    # saw their own bubble in Telegram. Direct typing into
+                    # tmux (which never goes through send_to_window) still
+                    # falls through and gets surfaced.
+                    if entry.role == "user" and entry.text:
+                        from .session import consume_bot_sent_text
+
+                        if consume_bot_sent_text(session_info.session_id, entry.text):
+                            continue
+
+                    # Dispatch the lower-level event before queueing the
+                    # legacy NewMessage so consumers (BusyIndicator) see
+                    # raw lifecycle metadata in the same iteration.
+                    if self._event_callback is not None and entry.role in (
+                        "user",
+                        "assistant",
+                    ):
+                        if entry.content_type in (
+                            "text",
+                            "thinking",
+                            "tool_use",
+                            "tool_result",
+                        ):
+                            assert entry.role in ("user", "assistant")
+                            event = TranscriptEvent(
+                                session_id=session_info.session_id,
+                                role=entry.role,
+                                block_type=entry.content_type,
+                                tool_use_id=entry.tool_use_id,
+                                tool_name=entry.tool_name,
+                                stop_reason=entry.stop_reason,
+                                timestamp=entry.timestamp,
+                                text=entry.text,
+                                image_data=entry.image_data,
+                                tool_input=entry.tool_input,
+                                transcript_uuid=entry.uuid,
+                            )
+                            try:
+                                await self._event_callback(event)
+                            except Exception as e:
+                                logger.error(f"Event callback error: {e}")
+
                     new_messages.append(
                         NewMessage(
                             session_id=session_info.session_id,
                             text=entry.text,
-                            is_complete=True,
                             content_type=entry.content_type,
                             tool_use_id=entry.tool_use_id,
                             role=entry.role,
                             tool_name=entry.tool_name,
                             image_data=entry.image_data,
+                            tool_input=entry.tool_input,
+                            transcript_uuid=entry.uuid,
                         )
+                    )
+                    logger.info(
+                        "emit_diag session=%s role=%s type=%s text=%r",
+                        session_info.session_id[:8],
+                        entry.role,
+                        entry.content_type,
+                        entry.text[:60],
                     )
 
                 self.state.update_session(tracked)
@@ -494,9 +621,8 @@ class SessionMonitor:
                 new_messages = await self.check_for_updates(active_session_ids)
 
                 for msg in new_messages:
-                    status = "complete" if msg.is_complete else "streaming"
                     preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")
-                    logger.info("[%s] session=%s: %s", status, msg.session_id, preview)
+                    logger.info("session=%s: %s", msg.session_id, preview)
                     if self._message_callback:
                         try:
                             await self._message_callback(msg)

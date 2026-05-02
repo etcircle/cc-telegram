@@ -31,17 +31,21 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from telegram import Bot
 
-from ..session import session_manager
+from ..session import session_id_for_window, session_manager
 from .message_sender import (
     TopicSendOutcome,
     strip_sentinels,
     topic_edit,
     topic_send,
 )
+
+if TYPE_CHECKING:
+    from ..session_monitor import TranscriptEvent
+    from .busy_indicator import RunState
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,17 @@ ATTENTION_REPEAT_DWELL_SECONDS = 30
 
 # Cap the prompt preview embedded in the card body so we don't ship a 4K wall.
 PROMPT_PREVIEW_LIMIT = 600
+
+# §2.6 narrow trigger: characters of the final paragraph excerpt embedded in
+# the "Awaiting your reply" card. Kept short — the user is meant to scan the
+# question and tap into the topic for the full context.
+ATTENTION_QUESTION_PREVIEW_CHARS = 200
+
+# Markdown punctuation we strip from the right of the final paragraph before
+# checking for a trailing "?" — Claude often closes a question with bold or
+# italic emphasis ("**Want me to do X?**"), and trailing markup must not hide
+# the question mark from the predicate.
+_TRAILING_MARKDOWN_CHARS = ".!*_~`)]}>"
 
 # Ack trailer text on dismiss. Kept short: the user already saw the prompt.
 DISMISS_TRAILER = "✅ Acknowledged — Claude is no longer waiting."
@@ -76,12 +91,11 @@ class AttentionState:
 _attention_state: dict[tuple[int, int], AttentionState] = {}
 
 
-# Cross-module fence for emergency "Claude is waiting" DMs. When the topic
-# itself is broken, both message_queue (assistant text) and interactive_ui
-# (interactive UI prompts) can decide to DM the user. Without a shared
-# cooldown, the same waiting episode produced two DMs (one per call site).
-# This map is keyed by ``(user_id, thread_id_or_0, window_id)`` so a single
-# stuck topic episode collapses to one DM regardless of which surface tripped.
+# Cross-module fence for emergency "Claude is waiting" DMs. interactive_ui
+# can decide to DM the user when the topic itself is broken; the cooldown
+# stops a single waiting episode from producing repeated DMs. Keyed by
+# ``(user_id, thread_id_or_0, window_id)`` so unrelated routes don't share
+# a fence.
 EMERGENCY_DM_COOLDOWN_SECONDS = 300
 _emergency_dm_last_sent: dict[tuple[int, int, str], float] = {}
 
@@ -94,10 +108,9 @@ def should_emit_emergency_dm(
     """Return True iff an emergency waiting-DM may be sent for this episode.
 
     Marks the slot as recently-sent on a True return so subsequent calls
-    inside ``EMERGENCY_DM_COOLDOWN_SECONDS`` are denied. Both
-    ``message_queue._attention_dm_if_needed`` and
-    ``interactive_ui._notify_waiting_dm`` route through this fence so a single
-    waiting episode never produces two DMs.
+    inside ``EMERGENCY_DM_COOLDOWN_SECONDS`` are denied.
+    ``interactive_ui._notify_waiting_dm`` routes through this fence so a
+    single waiting episode never produces repeated DMs.
     """
     fence_key = (user_id, thread_id or 0, window_id or "")
     now = time.monotonic()
@@ -154,6 +167,63 @@ def is_attention_request(text: str) -> bool:
     return cleaned.endswith("?") and len(cleaned) > 80
 
 
+def final_paragraph_ends_with_question_mark(text: str) -> bool:
+    """True when the last paragraph of ``text`` ends with a "?".
+
+    "Paragraph" = blocks separated by a blank line. Trailing markdown emphasis
+    (``**...**``, ``*...*``, code ticks, bracketing punctuation) is stripped
+    before the check so questions that close with bold or italics aren't
+    silently rejected.
+    """
+    cleaned = strip_sentinels(text or "").rstrip()
+    if not cleaned:
+        return False
+    paragraphs = [p for p in cleaned.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return False
+    last = paragraphs[-1].rstrip()
+    last = last.rstrip(_TRAILING_MARKDOWN_CHARS).rstrip()
+    return last.endswith("?")
+
+
+def is_end_of_turn_question(
+    event: "TranscriptEvent",
+    run_state: "RunState",
+) -> bool:
+    """§2.6 narrow trigger: only end-of-turn final-act questions raise a card.
+
+    Returns True iff the assistant's text block ended its turn with a
+    final-paragraph question that also trips the broader attention heuristic,
+    AND the route isn't already showing an interactive-tool card. Mid-turn
+    questions and generic ``?``-bearing statements never trip this — the
+    surrounding stage gates filter them out before this point.
+    """
+    # Late import to break circularity (busy_indicator → attention via tests).
+    from .busy_indicator import RunState
+
+    if event.role != "assistant" or event.block_type != "text":
+        return False
+    if event.stop_reason not in {"end_turn", "stop_sequence"}:
+        return False
+    if run_state is RunState.WAITING_ON_USER:
+        return False
+    text = event.text or ""
+    if not final_paragraph_ends_with_question_mark(text):
+        return False
+    return is_attention_request(text)
+
+
+def final_paragraph(text: str) -> str:
+    """Return the last paragraph of ``text``, stripped, for card excerpts."""
+    cleaned = strip_sentinels(text or "").strip()
+    if not cleaned:
+        return ""
+    paragraphs = [p for p in cleaned.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return ""
+    return paragraphs[-1].strip()
+
+
 # ── Internals ──────────────────────────────────────────────────────────────
 
 
@@ -189,6 +259,15 @@ def _render_card(
 ) -> str:
     """Render the attention card body."""
     display = _display_name(window_id)
+    # The §2.6 end-of-turn trigger pre-formats its own prefix
+    # ('🔔 Awaiting your reply — <display>\n"<excerpt>"') so the body is
+    # passed through verbatim. Other kinds get the legacy header + preview.
+    if kind == "end_of_turn_question":
+        body = strip_sentinels(prompt_text or "").rstrip()
+        link = _topic_link(chat_id, thread_id)
+        if link:
+            body = f"{body}\n{link}"
+        return body
     preview = strip_sentinels(prompt_text or "").strip()
     if len(preview) > PROMPT_PREVIEW_LIMIT:
         preview = preview[: PROMPT_PREVIEW_LIMIT - 1].rstrip() + "…"
@@ -222,7 +301,7 @@ async def notify_waiting(
     thread_id: int | None,
     window_id: str,
     prompt_text: str,
-    kind: Literal["interactive_ui", "assistant_text"] = "assistant_text",
+    kind: Literal["interactive_ui", "end_of_turn_question"] = "interactive_ui",
 ) -> TopicSendOutcome:
     """Idle→waiting sends a fresh card; waiting→waiting edits in place.
 
@@ -352,6 +431,12 @@ async def notify_waiting(
         window_id=window_id,
         text=text,
         disable_notification=False,
+        # §2.5.5: attention cards are bot UI, not Claude output — write
+        # role="activity" so a quote-reply renders with the UI-noise header
+        # instead of being treated as load-bearing assistant conversation.
+        role="activity",
+        content_type="activity",
+        session_id=session_id_for_window(window_id),
     )
     if sent is None:
         # Don't mark waiting if the send failed — caller will route to repair

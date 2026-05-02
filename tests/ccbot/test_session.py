@@ -144,6 +144,134 @@ class TestDisplayNames:
         assert mgr.get_display_name("@1") == "@1"
 
 
+class TestFindUsersForSession:
+    """find_users_for_session must answer from in-memory window_states without
+    reading any JSONL files — that's the hot-path call from handle_new_message,
+    and file I/O there is what blew up to multi-minute Telegram-delivery delays.
+    """
+
+    @pytest.mark.asyncio
+    async def test_matches_window_with_same_session_id(
+        self, mgr: SessionManager
+    ) -> None:
+        from ccbot.session import WindowState
+
+        mgr.bind_thread(100, 1, "@1")
+        mgr.bind_thread(100, 2, "@2")
+        mgr.window_states["@1"] = WindowState(session_id="sid-A", cwd="/a")
+        mgr.window_states["@2"] = WindowState(session_id="sid-B", cwd="/b")
+
+        result = await mgr.find_users_for_session("sid-A")
+        assert result == [(100, "@1", 1)]
+
+    @pytest.mark.asyncio
+    async def test_skips_windows_without_session_id(self, mgr: SessionManager) -> None:
+        """A bound window with no session_id (hook hasn't fired yet) must not
+        spuriously match queries for the empty string."""
+        from ccbot.session import WindowState
+
+        mgr.bind_thread(100, 1, "@1")
+        mgr.window_states["@1"] = WindowState(session_id="", cwd="/a")
+
+        # Querying with empty string must not match.
+        assert await mgr.find_users_for_session("") == []
+
+    @pytest.mark.asyncio
+    async def test_multiple_users_same_session(self, mgr: SessionManager) -> None:
+        from ccbot.session import WindowState
+
+        mgr.bind_thread(100, 1, "@1")
+        mgr.bind_thread(200, 5, "@1")
+        mgr.window_states["@1"] = WindowState(session_id="sid-shared", cwd="/a")
+
+        result = sorted(await mgr.find_users_for_session("sid-shared"))
+        assert result == [(100, "@1", 1), (200, "@1", 5)]
+
+    @pytest.mark.asyncio
+    async def test_does_not_open_jsonl_files(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        """Regression: must NOT call resolve_session_for_window (which reads
+        the JSONL). The in-memory window_states is enough.
+        """
+        from ccbot.session import WindowState
+
+        mgr.bind_thread(100, 1, "@1")
+        mgr.window_states["@1"] = WindowState(session_id="sid-A", cwd="/a")
+
+        called = {"resolve": 0}
+
+        async def fake_resolve(self, window_id):  # pragma: no cover
+            called["resolve"] += 1
+            return None
+
+        monkeypatch.setattr(SessionManager, "resolve_session_for_window", fake_resolve)
+
+        await mgr.find_users_for_session("sid-A")
+        assert called["resolve"] == 0
+
+
+class TestBotSentTextDedup:
+    """Tracks bot-originated send_to_window text for user-message echo dedup."""
+
+    def setup_method(self) -> None:
+        from ccbot.session import reset_bot_send_tracking
+
+        reset_bot_send_tracking()
+
+    def teardown_method(self) -> None:
+        from ccbot.session import reset_bot_send_tracking
+
+        reset_bot_send_tracking()
+
+    def test_track_then_consume_matches(self) -> None:
+        from ccbot.session import _track_bot_sent_text, consume_bot_sent_text
+
+        _track_bot_sent_text("sid-1", "hello")
+        assert consume_bot_sent_text("sid-1", "hello") is True
+
+    def test_consume_is_one_shot(self) -> None:
+        """A single recorded send must not suppress two identical user messages."""
+        from ccbot.session import _track_bot_sent_text, consume_bot_sent_text
+
+        _track_bot_sent_text("sid-1", "hello")
+        assert consume_bot_sent_text("sid-1", "hello") is True
+        assert consume_bot_sent_text("sid-1", "hello") is False
+
+    def test_track_twice_consume_twice(self) -> None:
+        from ccbot.session import _track_bot_sent_text, consume_bot_sent_text
+
+        _track_bot_sent_text("sid-1", "hello")
+        _track_bot_sent_text("sid-1", "hello")
+        assert consume_bot_sent_text("sid-1", "hello") is True
+        assert consume_bot_sent_text("sid-1", "hello") is True
+        assert consume_bot_sent_text("sid-1", "hello") is False
+
+    def test_normalization_strips_whitespace(self) -> None:
+        from ccbot.session import _track_bot_sent_text, consume_bot_sent_text
+
+        _track_bot_sent_text("sid-1", "  hello  ")
+        assert consume_bot_sent_text("sid-1", "hello\n") is True
+
+    def test_session_isolation(self) -> None:
+        from ccbot.session import _track_bot_sent_text, consume_bot_sent_text
+
+        _track_bot_sent_text("sid-1", "hello")
+        assert consume_bot_sent_text("sid-2", "hello") is False
+        assert consume_bot_sent_text("sid-1", "hello") is True
+
+    def test_unknown_session_returns_false(self) -> None:
+        from ccbot.session import consume_bot_sent_text
+
+        assert consume_bot_sent_text("never-tracked", "anything") is False
+
+    def test_empty_text_no_op(self) -> None:
+        from ccbot.session import _track_bot_sent_text, consume_bot_sent_text
+
+        _track_bot_sent_text("sid-1", "   ")  # only whitespace
+        assert consume_bot_sent_text("sid-1", "") is False
+
+
 class TestIsWindowId:
     def test_valid_ids(self, mgr: SessionManager) -> None:
         assert mgr._is_window_id("@0") is True

@@ -16,9 +16,10 @@ State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 
 import logging
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
-from ..session import session_manager
+from ..config import config
+from ..session import session_id_for_window, session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
 from ..tmux_manager import tmux_manager
 from . import attention
@@ -112,9 +113,8 @@ async def _notify_waiting_dm(
     is reached only when the topic itself cannot be written to (deleted,
     closed, forbidden) so the user still gets a signal that Claude is blocked.
 
-    Cooldown is owned by ``attention.should_emit_emergency_dm`` so this DM
-    cannot stack with the assistant-text emergency DM in
-    ``message_queue._attention_dm_if_needed`` for the same waiting episode.
+    Cooldown is owned by ``attention.should_emit_emergency_dm`` so repeated
+    waiting episodes for the same route don't stack DMs.
     """
     if not attention.should_emit_emergency_dm(user_id, thread_id, window_id):
         logger.debug(
@@ -292,21 +292,56 @@ async def handle_interactive_ui(
         # Edit failed — fall through to fresh send while keeping the old id
         # so we can delete it after a new one lands.
 
-    # Send new message (plain text — terminal content is not markdown)
+    # Send new message (plain text — terminal content is not markdown).
+    # §2.5.2: anchor the interactive card to the user's prompt that triggered
+    # the tool, when we know it. ``peek`` (not consume) so the same anchor
+    # still applies when Claude follows up with assistant text after the
+    # user resolves the interactive card — both the card and the trailing
+    # text are responses to the same user prompt. The text-side
+    # ``_process_content_task`` is the canonical owner of the anchor's
+    # lifecycle (it pops on first-part send).
     logger.info(
         "Sending interactive UI to user %d for window_id %s", user_id, window_id
     )
-    sent, send_outcome = await topic_send(
-        bot,
-        op="interactive",
-        user_id=user_id,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        window_id=window_id,
-        text=text,
-        plain=True,
-        reply_markup=keyboard,
-    )
+    anchor: ReplyParameters | None = None
+    if config.reply_context_enabled:
+        from .message_queue import peek_route_last_user_message
+
+        anchor_id = peek_route_last_user_message(user_id, thread_id, window_id)
+        if anchor_id is not None:
+            anchor = ReplyParameters(message_id=anchor_id)
+    interactive_session_id = session_id_for_window(window_id)
+    if anchor is not None:
+        sent, send_outcome = await topic_send(
+            bot,
+            op="interactive",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            text=text,
+            plain=True,
+            reply_markup=keyboard,
+            reply_parameters=anchor,
+            role="tool",
+            content_type="tool_use",
+            session_id=interactive_session_id,
+        )
+    else:
+        sent, send_outcome = await topic_send(
+            bot,
+            op="interactive",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            text=text,
+            plain=True,
+            reply_markup=keyboard,
+            role="tool",
+            content_type="tool_use",
+            session_id=interactive_session_id,
+        )
     if sent is None:
         # Topic send failed — still mark interactive mode (prevents per-poll
         # retry spam) and try the topic-first attention card. If that also

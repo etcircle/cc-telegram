@@ -25,6 +25,8 @@ import asyncio
 import json
 import logging
 import re
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterator
@@ -38,6 +40,80 @@ from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
+
+
+# ── Bot-sent text tracking (for user-message dedup) ──────────────────────
+#
+# When the bot forwards a Telegram message into a tmux pane via
+# ``send_to_window``, Claude logs that text as a user-role JSONL entry. If
+# we then naively forward all user messages back to Telegram, every
+# Telegram-typed prompt is echoed as a "👤 …" bubble.
+#
+# We avoid that by recording each bot-originated send keyed by session_id
+# and consuming the entry when the matching JSONL line shows up. Direct
+# typing into the tmux pane (which never goes through ``send_to_window``)
+# is still surfaced — that's the whole point of CCBOT_SHOW_USER_MESSAGES.
+
+# How long a recorded send is allowed to remain unmatched before it expires.
+# Long enough to absorb monitor poll latency and JSONL flush delay; short
+# enough that an unrelated repeat of the same text minutes later still echoes.
+BOT_SEND_DEDUP_TTL_SECONDS = 60.0
+
+# Cap per-session deque length so a runaway logger doesn't grow without bound.
+BOT_SEND_DEDUP_MAX_PER_SESSION = 32
+
+# session_id -> deque[(monotonic_ts, normalized_text)]
+_bot_sent_by_session: dict[str, deque[tuple[float, str]]] = {}
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """Canonical form for comparing bot sends to JSONL user-message text."""
+    return text.strip()
+
+
+def _prune_expired_sends(buf: deque[tuple[float, str]], now: float) -> None:
+    while buf and (now - buf[0][0]) > BOT_SEND_DEDUP_TTL_SECONDS:
+        buf.popleft()
+
+
+def _track_bot_sent_text(session_id: str, text: str) -> None:
+    """Record a successful bot send for later user-message dedup."""
+    normalized = _normalize_for_dedup(text)
+    if not normalized:
+        return
+    buf = _bot_sent_by_session.setdefault(
+        session_id, deque(maxlen=BOT_SEND_DEDUP_MAX_PER_SESSION)
+    )
+    now = time.monotonic()
+    _prune_expired_sends(buf, now)
+    buf.append((now, normalized))
+
+
+def consume_bot_sent_text(session_id: str, text: str) -> bool:
+    """Return True iff this user-message text matches a recent bot send.
+
+    Consumes (removes) the matched entry so a *second* identical user
+    message doesn't get suppressed by a single recorded send. Used by
+    ``session_monitor`` to drop echoes the user already saw in Telegram.
+    """
+    buf = _bot_sent_by_session.get(session_id)
+    if not buf:
+        return False
+    now = time.monotonic()
+    _prune_expired_sends(buf, now)
+    target = _normalize_for_dedup(text)
+    if not target:
+        return False
+    for i, (_, recorded) in enumerate(buf):
+        if recorded == target:
+            del buf[i]
+            return True
+    return False
+
+
+def reset_bot_send_tracking() -> None:
+    """Test-only: drop all recorded bot sends."""
+    _bot_sent_by_session.clear()
 
 
 @dataclass
@@ -801,11 +877,21 @@ class SessionManager:
         """Find all users whose thread-bound window maps to the given session_id.
 
         Returns list of (user_id, window_id, thread_id) tuples.
+
+        Performance note: this used to call ``resolve_session_for_window``
+        per binding, which opens and reads each window's full JSONL file
+        just to get the session_id. With many bound windows and multi-MB
+        JSONLs, that turned every callback in the session-monitor →
+        handle_new_message hot path into seconds of file I/O — and the
+        per-user message queue backlog grew minutes deep, deferring real
+        Telegram delivery. ``window_states[wid].session_id`` is already
+        kept in sync with session_map.json by ``load_session_map``, so we
+        can answer this from the in-memory dict in microseconds.
         """
         result: list[tuple[int, str, int]] = []
         for user_id, thread_id, window_id in self.iter_thread_bindings():
-            resolved = await self.resolve_session_for_window(window_id)
-            if resolved and resolved.session_id == session_id:
+            ws = self.window_states.get(window_id)
+            if ws and ws.session_id and ws.session_id == session_id:
                 result.append((user_id, window_id, thread_id))
         return result
 
@@ -825,6 +911,13 @@ class SessionManager:
             return False, "Window not found (may have been closed)"
         success = await tmux_manager.send_keys(window.window_id, text)
         if success:
+            # Record the bot-originated send so the session_monitor can
+            # suppress the matching user-message echo from JSONL. Without
+            # this, every Telegram-typed message gets re-delivered as a
+            # "👤 …" bubble — pure duplication for our workflow.
+            state = self.window_states.get(window_id)
+            if state and state.session_id:
+                _track_bot_sent_text(state.session_id, text)
             return True, f"Sent to {display}"
         return False, "Failed to send keys"
 
@@ -891,3 +984,18 @@ class SessionManager:
 
 
 session_manager = SessionManager()
+
+
+def session_id_for_window(window_id: str | None) -> str | None:
+    """Best-effort sync session_id lookup for ``message_refs`` provenance.
+
+    Single source of truth for the ``WindowState.session_id or None`` dance
+    used by attention/interactive-UI/message-queue sends. Returns ``None``
+    when ``window_id`` is empty or the window has no recorded session yet
+    (the ref row is still inserted with a NULL session_id and the resolver
+    falls back to visible Telegram text).
+    """
+    if not window_id:
+        return None
+    state = session_manager.get_window_state(window_id)
+    return state.session_id or None

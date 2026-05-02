@@ -1,18 +1,23 @@
-"""Per-user message queue management for ordered message delivery.
+"""Per-route message queue management for ordered message delivery.
 
 Provides a queue-based message processing system that ensures:
-  - Messages are sent in receive order (FIFO)
-  - Status messages always follow content messages
+  - Content messages are sent in receive order (FIFO) per route
+  - Status updates coalesce into a per-route ephemeral slot drained after
+    every content tick (status-after-content invariant)
   - Consecutive content messages can be merged for efficiency
   - Thread-aware sending: each MessageTask carries an optional thread_id
     for Telegram topic support
 
+Routes are ``(user_id, thread_id_or_0, window_id)`` so a backlog in one
+topic cannot block status / interactive prompts in another.
+
 Rate limiting is handled globally by AIORateLimiter on the Application.
 
 Key components:
-  - MessageTask: Dataclass representing a queued message task (with thread_id)
-  - get_or_create_queue: Get or create queue and worker for a user
-  - Message queue worker: Background task processing user's queue
+  - MessageTask: Dataclass representing a queued message task
+  - Route: Per-route key for queues, workers, locks, ephemeral slots
+  - get_content_queue: Lookup the per-route content queue
+  - Message queue worker: One per route, processes content + drains ephemeral
   - Content task processing with tool_use/tool_result handling
   - Status message tracking and conversion (keyed by (user_id, thread_id))
 """
@@ -23,14 +28,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
-from telegram import Bot
-from telegram.constants import ChatAction
+from telegram import Bot, ReplyParameters
 from telegram.error import RetryAfter
 
-from ..session import session_manager
-from ..terminal_parser import parse_status_line
+from ..config import config
+from ..session import session_id_for_window, session_manager
+from ..terminal_parser import is_status_active, parse_status_line
 from ..tmux_manager import tmux_manager
-from . import attention
+from . import attention, busy_indicator
+from .busy_indicator import RunState
 from .message_sender import (
     TopicSendOutcome,
     send_photo,
@@ -40,6 +46,8 @@ from .message_sender import (
     topic_edit,
     topic_send,
 )
+
+Route = tuple[int, int, str]
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +69,13 @@ class MessageTask:
     content_type: str = "text"
     thread_id: int | None = None  # Telegram topic thread_id for targeted send
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+    # §2.7: surfaced for tool_use tasks so the dispatcher can promote
+    # Agent / Task subagent invocations to the top-level message surface.
+    tool_name: str | None = None
+    # §2.7: raw tool input dict, only carried for tool_use tasks. Used by
+    # _render_agent_tool_use to extract description / subagent_type / prompt.
+    tool_input: dict[str, object] | None = None
+    transcript_uuid: str | None = None
 
 
 @dataclass
@@ -76,17 +91,48 @@ class ActivityDigestState:
     done: bool = False
 
 
-# Per-user message queues and worker tasks
-_message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
-_queue_workers: dict[int, asyncio.Task[None]] = {}
-_queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
+# Per-route message queues, workers, locks, and ephemeral slots
+_route_queues: dict[Route, asyncio.Queue[MessageTask]] = {}
+_route_workers: dict[Route, asyncio.Task[None]] = {}
+_route_locks: dict[Route, asyncio.Lock] = {}  # Merge drain/refill + ephemeral slot
+_route_pending_ephemeral: dict[Route, MessageTask | None] = {}
+_route_ephemeral_kick: dict[Route, asyncio.Event] = {}
+# Set while the worker has a task in flight; teardown waits on this so it
+# never hard-cancels mid-`await topic_send` and leak _tool_msg_ids.
+_route_inflight: dict[Route, asyncio.Event] = {}
+# Routes currently in teardown. Enqueue paths consult this set BEFORE
+# touching any route maps; if a route is tearing down, new tasks are
+# dropped rather than racing with the teardown's worker-cancel step
+# (which would otherwise land mid-`await topic_send` and leak
+# `_tool_msg_ids` entries).
+_route_tearing_down: set[Route] = set()
 
 # Map (tool_use_id, user_id, thread_id_or_0) -> telegram message_id
 # for editing tool_use messages with results
 _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 
+# §2.7 Agent (subagent) prominence: tool_use_ids dispatched as Agent tools
+# are tracked here so the matching tool_result can be routed back to the
+# top-level promotion path instead of falling into the activity digest.
+# Keyed by (tool_use_id, user_id, thread_id_or_0) — same shape as
+# _tool_msg_ids so the tool_result edit machinery works identically.
+AGENT_TOOL_NAMES: frozenset[str] = frozenset({"Agent", "Task"})
+# Maps (tool_use_id, user_id, thread_id_or_0) -> the original tool_use
+# ``input_data`` dict (subagent_type / description / prompt). Stashing the
+# input here lets the matching tool_result render the same description and
+# subagent_type even though tool_result blocks don't carry the original
+# input themselves.
+_agent_tool_ids: dict[tuple[str, int, int], dict[str, object]] = {}
+
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+
+# §2.5.2: route → most recent inbound user message_id. Set at the inbound
+# handler offer site (text/photo/voice handlers in bot.py); consumed by the
+# first-part-only outbound anchor below and by interactive_ui's card sends.
+# Popped after use so an unrelated later assistant turn cannot anchor to a
+# stale message. Tearing down a route also drops the entry.
+_route_last_user_message: dict[Route, int] = {}
 
 # Activity digest tracking: one editable message per user/topic that collapses
 # tool calls, tool results, and thinking into a Hermes-style activity card.
@@ -94,9 +140,23 @@ _activity_msg_info: dict[tuple[int, int], ActivityDigestState] = {}
 _tool_activity_indices: dict[tuple[str, int, int], int] = {}
 ACTIVITY_DIGEST_CONTENT_TYPES = {"tool_use", "tool_result", "thinking"}
 ACTIVITY_DIGEST_MAX_LINES = 10
-ACTIVITY_DIGEST_MAX_LINE_LENGTH = 180
+# Per-line cap inside the activity digest. The previous 180 was tight
+# enough that most tool_use bash invocations got truncated mid-command and
+# tool_result outputs collapsed to "Output N lines" with no actual content
+# visible — leaving the user staring at "🟡 Busy" without knowing what
+# Claude was doing. 400 fits a typical bash command plus a sentence of
+# output without overflowing Telegram's compact-card visual budget.
+ACTIVITY_DIGEST_MAX_LINE_LENGTH = 400
+# Length cap for the first-line-of-output snippet appended after a tool
+# call's "  ⎿  " marker. Short enough that long log dumps don't blow up
+# the digest, long enough to surface useful messages (errors, paths,
+# stat lines) instead of just the word count.
+ACTIVITY_DIGEST_RESULT_SNIPPET_LENGTH = 240
 
-# Flood control: user_id -> monotonic time when ban expires
+# Flood control: user_id -> monotonic time when ban expires.
+# Intentionally per-user (NOT per-route): Telegram's flood-control limit is
+# global to the bot token, so a 429 on one route should pause that user's
+# other routes too. Per-route tracking would not buy real isolation.
 _flood_until: dict[int, float] = {}
 
 # Cross-module emergency DM cooldown is owned by ``handlers.attention``
@@ -110,12 +170,13 @@ _flood_until: dict[int, float] = {}
 # KNOWN LIMITATION (intentionally not fixed in this pass): the set is sticky
 # for the life of the process. A topic that fails once is treated as broken
 # until the bot restarts even if the topic is later reopened/recreated by the
-# user. The status_polling probe (``unpin_all_forum_topic_messages``) will
-# kill the binding+window when the topic is gone for good, but it will not
-# re-enable a recovered topic — only a restart does. Stage 3 (``topic_repair``)
-# will own automatic recovery; until then, the trade-off is "noisy DMs > silent
-# data loss when a topic is genuinely unreachable". Do NOT add automatic
-# create/reopen here; that belongs in the gated repair pipeline.
+# user. There is no proactive probe — the previous
+# ``unpin_all_forum_topic_messages`` polling probe was removed because it
+# silently cleared user-pinned messages on success, not a no-op. Stage 3
+# (``topic_repair``) will own automatic recovery; until then, the trade-off
+# is "noisy DMs > silent data loss when a topic is genuinely unreachable".
+# Do NOT add automatic create/reopen here; that belongs in the gated repair
+# pipeline.
 _bad_topic_threads: set[tuple[int, int]] = set()
 
 # Topic outcomes that should trigger emergency DM fallback (after Stage 3
@@ -133,21 +194,88 @@ _TOPIC_BROKEN_OUTCOMES: frozenset[TopicSendOutcome] = frozenset(
 FLOOD_CONTROL_MAX_WAIT = 10
 
 
-def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
-    """Get the message queue for a user (if exists)."""
-    return _message_queues.get(user_id)
+def _route_for(user_id: int, thread_id: int | None, window_id: str) -> Route:
+    return (user_id, thread_id or 0, window_id)
 
 
-def get_or_create_queue(bot: Bot, user_id: int) -> asyncio.Queue[MessageTask]:
-    """Get or create message queue and worker for a user."""
-    if user_id not in _message_queues:
-        _message_queues[user_id] = asyncio.Queue()
-        _queue_locks[user_id] = asyncio.Lock()
-        # Start worker task for this user
-        _queue_workers[user_id] = asyncio.create_task(
-            _message_queue_worker(bot, user_id)
-        )
-    return _message_queues[user_id]
+# ``_session_id_for_window`` lived here in Stage 5.c; it is now the canonical
+# ``session.session_id_for_window`` so attention/interactive-UI/message-queue
+# all share one implementation. Local alias kept so internal callers below
+# don't churn.
+_session_id_for_window = session_id_for_window
+
+
+def set_route_last_user_message(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    message_id: int,
+) -> None:
+    """Stash the latest inbound user ``message_id`` for outbound anchoring.
+
+    The first part of the next assistant-text response will set
+    ``reply_parameters=ReplyParameters(message_id=...)`` so the response
+    visually replies to the user's prompt. Per §2.5.2, only the first part
+    anchors; tool / activity / status sends never anchor.
+    """
+    route = _route_for(user_id, thread_id, window_id)
+    _route_last_user_message[route] = message_id
+
+
+def peek_route_last_user_message(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+) -> int | None:
+    """Read-only lookup for ``interactive_ui`` card anchoring.
+
+    The interactive-UI card surface anchors to the user's prompt that
+    triggered the interactive tool — same first-only rule as content sends.
+    Reading without popping lets the same anchor still apply when the
+    assistant's text response follows the interactive UI.
+    """
+    route = _route_for(user_id, thread_id, window_id)
+    return _route_last_user_message.get(route)
+
+
+def consume_route_last_user_message(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+) -> int | None:
+    """Pop helper for callers that own the anchor lifecycle (interactive UI)."""
+    route = _route_for(user_id, thread_id, window_id)
+    return _route_last_user_message.pop(route, None)
+
+
+def get_content_queue(route: Route) -> asyncio.Queue[MessageTask] | None:
+    """Get the content queue for a route (if exists)."""
+    return _route_queues.get(route)
+
+
+def _get_or_create_route(bot: Bot, route: Route) -> asyncio.Queue[MessageTask]:
+    """Ensure per-route queue/worker/lock/ephemeral state exists.
+
+    Race note: this function MUST NOT contain any ``await`` between the
+    ``route not in _route_queues`` check and the inserts below. asyncio's
+    cooperative scheduling guarantees that a single coroutine runs to its
+    next ``await`` without interleaving — so today, two concurrent
+    ``enqueue_*`` calls cannot both pass the check. Adding an ``await``
+    here would break that invariant and let two workers spawn for the
+    same route. If you need to await on something during route creation,
+    introduce an ``asyncio.Lock`` keyed on the route and double-check
+    membership after acquiring it.
+    """
+    if route not in _route_queues:
+        _route_queues[route] = asyncio.Queue()
+        _route_locks[route] = asyncio.Lock()
+        _route_pending_ephemeral[route] = None
+        _route_ephemeral_kick[route] = asyncio.Event()
+        idle = asyncio.Event()
+        idle.set()
+        _route_inflight[route] = idle
+        _route_workers[route] = asyncio.create_task(_message_queue_worker(bot, route))
+    return _route_queues[route]
 
 
 def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
@@ -244,83 +372,274 @@ async def _merge_content_tasks(
     )
 
 
-async def _message_queue_worker(bot: Bot, user_id: int) -> None:
-    """Process message tasks for a user sequentially."""
-    queue = _message_queues[user_id]
-    lock = _queue_locks[user_id]
-    logger.info(f"Message queue worker started for user {user_id}")
+CONTENT_RETRY_MAX_ATTEMPTS = 3
+
+
+def _retry_after_seconds(exc: RetryAfter) -> int:
+    """Coerce ``RetryAfter.retry_after`` (int or timedelta) into seconds."""
+    return (
+        exc.retry_after
+        if isinstance(exc.retry_after, int)
+        else int(exc.retry_after.total_seconds())
+    )
+
+
+def _is_agent_tool_use(task: MessageTask) -> bool:
+    return (
+        task.task_type == "content"
+        and task.content_type == "tool_use"
+        and task.tool_name in AGENT_TOOL_NAMES
+    )
+
+
+def _is_agent_tool_result(task: MessageTask, user_id: int) -> bool:
+    if (
+        task.task_type != "content"
+        or task.content_type != "tool_result"
+        or not task.tool_use_id
+    ):
+        return False
+    tid = task.thread_id or 0
+    return (task.tool_use_id, user_id, tid) in _agent_tool_ids
+
+
+async def _dispatch_task(
+    bot: Bot,
+    user_id: int,
+    queue: asyncio.Queue[MessageTask],
+    lock: asyncio.Lock,
+    task: MessageTask,
+) -> MessageTask:
+    """Run a single task. May raise RetryAfter; the caller decides whether to
+    retry (content) or drop (status).
+
+    Merge-side bookkeeping (drain queue, ``task_done`` for merged items)
+    runs exactly once here. The returned ``MessageTask`` is the actually
+    dispatched form (merged for content, original for everything else),
+    and ``_run_with_retry`` reuses it on subsequent attempts via
+    ``_dispatch_already_merged`` so retries never re-drain the queue.
+    """
+    if task.task_type == "content":
+        # §2.7: Agent (subagent) tool_use / tool_result get promoted to
+        # top-level messages BEFORE the digest short-circuit. The activity
+        # counter still tracks them so the digest header stays accurate
+        # (`_process_agent_task` updates the counter without appending to
+        # `lines`).
+        if _is_agent_tool_use(task) or _is_agent_tool_result(task, user_id):
+            await _process_agent_task(bot, user_id, task)
+            return task
+        if task.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
+            await _process_activity_task(bot, user_id, task)
+            return task
+        merged_task, merge_count = await _merge_content_tasks(queue, task, lock)
+        if merge_count > 0:
+            logger.debug("Merged %d tasks for user %d", merge_count, user_id)
+            for _ in range(merge_count):
+                queue.task_done()
+        await _process_content_task(bot, user_id, merged_task)
+        return merged_task
+    if task.task_type == "status_update":
+        await _process_status_update_task(bot, user_id, task)
+        return task
+    if task.task_type == "status_clear":
+        await _do_clear_status_message(bot, user_id, task.thread_id or 0)
+        return task
+    return task
+
+
+async def _dispatch_already_merged(
+    bot: Bot,
+    user_id: int,
+    task: MessageTask,
+) -> None:
+    """Dispatch a task whose merge bookkeeping already happened.
+
+    Used by ``_run_with_retry`` for second-and-later attempts so retries
+    do NOT re-enter ``_merge_content_tasks`` (which would re-drain the
+    live queue and double-count ``task_done``).
+    """
+    if task.task_type == "content":
+        if _is_agent_tool_use(task) or _is_agent_tool_result(task, user_id):
+            await _process_agent_task(bot, user_id, task)
+            return
+        if task.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
+            await _process_activity_task(bot, user_id, task)
+            return
+        await _process_content_task(bot, user_id, task)
+        return
+    if task.task_type == "status_update":
+        await _process_status_update_task(bot, user_id, task)
+        return
+    if task.task_type == "status_clear":
+        await _do_clear_status_message(bot, user_id, task.thread_id or 0)
+
+
+async def _run_with_retry(
+    bot: Bot,
+    user_id: int,
+    queue: asyncio.Queue[MessageTask],
+    lock: asyncio.Lock,
+    task: MessageTask,
+) -> None:
+    """Dispatch a task with the documented RetryAfter / flood-control policy."""
+    flood_end = _flood_until.get(user_id, 0)
+    if flood_end > 0:
+        remaining = flood_end - time.monotonic()
+        if remaining > 0:
+            if task.task_type != "content":
+                return
+            logger.debug(
+                "Flood controlled: waiting %.0fs for content (user %d)",
+                remaining,
+                user_id,
+            )
+            await asyncio.sleep(remaining)
+        _flood_until.pop(user_id, None)
+        logger.info("Flood control lifted for user %d", user_id)
+
+    attempts_remaining = (
+        CONTENT_RETRY_MAX_ATTEMPTS if task.task_type == "content" else 1
+    )
+    dispatched: MessageTask | None = None
+    while attempts_remaining > 0:
+        attempts_remaining -= 1
+        try:
+            if dispatched is None:
+                # First attempt: drain/merge bookkeeping happens here.
+                dispatched = await _dispatch_task(bot, user_id, queue, lock, task)
+            else:
+                # Retry: reuse the already-merged task; do NOT re-drain.
+                await _dispatch_already_merged(bot, user_id, dispatched)
+            return
+        except RetryAfter as e:
+            retry_secs = _retry_after_seconds(e)
+            if retry_secs > FLOOD_CONTROL_MAX_WAIT:
+                _flood_until[user_id] = time.monotonic() + retry_secs
+                logger.warning(
+                    "Flood control for user %d: retry_after=%ds, "
+                    "pausing queue until ban expires (task_type=%s)",
+                    user_id,
+                    retry_secs,
+                    task.task_type,
+                )
+            else:
+                logger.warning(
+                    "Flood control for user %d: waiting %ds (task_type=%s, attempts_left=%d)",
+                    user_id,
+                    retry_secs,
+                    task.task_type,
+                    attempts_remaining,
+                )
+
+            if task.task_type != "content":
+                return
+
+            if attempts_remaining <= 0:
+                logger.error(
+                    "Content task dropped for user %d after %d RetryAfter retries (window=%s)",
+                    user_id,
+                    CONTENT_RETRY_MAX_ATTEMPTS,
+                    task.window_id,
+                )
+                return
+
+            await asyncio.sleep(retry_secs)
+
+
+async def _drain_pending_ephemeral(
+    bot: Bot,
+    route: Route,
+    queue: asyncio.Queue[MessageTask],
+    lock: asyncio.Lock,
+) -> None:
+    """Send the latest coalesced ephemeral, if any. Always runs after a content
+    tick so the status-after-content invariant holds.
+
+    The slot snapshot AND the kick clear happen under the same lock so a
+    concurrent ``enqueue_status_update`` cannot land between drain-snapshot
+    and kick.clear() — that race would set the slot but then the worker
+    would clear the kick and park indefinitely until the next content
+    arrival.
+    """
+    user_id = route[0]
+    kick = _route_ephemeral_kick.get(route)
+    async with lock:
+        pending = _route_pending_ephemeral.get(route)
+        _route_pending_ephemeral[route] = None
+        # Clear kick UNDER the lock — paired with enqueue_status_update,
+        # which sets the slot and then sets the kick under the same lock.
+        if kick is not None:
+            kick.clear()
+    if pending is None:
+        return
+    try:
+        await _run_with_retry(bot, user_id, queue, lock, pending)
+    except Exception as e:
+        logger.error("Error processing ephemeral task for route %s: %s", route, e)
+
+
+async def _message_queue_worker(bot: Bot, route: Route) -> None:
+    """Process content + ephemeral tasks for a single route."""
+    user_id = route[0]
+    queue = _route_queues[route]
+    lock = _route_locks[route]
+    kick = _route_ephemeral_kick[route]
+    inflight = _route_inflight[route]
+    logger.info(f"Message queue worker started for route {route}")
 
     while True:
         try:
-            task = await queue.get()
+            content_get: asyncio.Task[MessageTask] = asyncio.create_task(queue.get())
+            kick_wait: asyncio.Task[bool] = asyncio.create_task(kick.wait())
             try:
-                # Flood control: drop status, wait for content
-                flood_end = _flood_until.get(user_id, 0)
-                if flood_end > 0:
-                    remaining = flood_end - time.monotonic()
-                    if remaining > 0:
-                        if task.task_type != "content":
-                            # Status is ephemeral — safe to drop
-                            continue
-                        # Content is actual Claude output — wait then send
-                        logger.debug(
-                            "Flood controlled: waiting %.0fs for content (user %d)",
-                            remaining,
-                            user_id,
-                        )
-                        await asyncio.sleep(remaining)
-                    # Ban expired
-                    _flood_until.pop(user_id, None)
-                    logger.info("Flood control lifted for user %d", user_id)
-
-                if task.task_type == "content":
-                    if task.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
-                        await _process_activity_task(bot, user_id, task)
-                        continue
-                    # Try to merge consecutive content tasks
-                    merged_task, merge_count = await _merge_content_tasks(
-                        queue, task, lock
-                    )
-                    if merge_count > 0:
-                        logger.debug(f"Merged {merge_count} tasks for user {user_id}")
-                        # Mark merged tasks as done
-                        for _ in range(merge_count):
-                            queue.task_done()
-                    await _process_content_task(bot, user_id, merged_task)
-                elif task.task_type == "status_update":
-                    await _process_status_update_task(bot, user_id, task)
-                elif task.task_type == "status_clear":
-                    await _do_clear_status_message(bot, user_id, task.thread_id or 0)
-            except RetryAfter as e:
-                retry_secs = (
-                    e.retry_after
-                    if isinstance(e.retry_after, int)
-                    else int(e.retry_after.total_seconds())
+                done, pending = await asyncio.wait(
+                    {content_get, kick_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                if retry_secs > FLOOD_CONTROL_MAX_WAIT:
-                    _flood_until[user_id] = time.monotonic() + retry_secs
-                    logger.warning(
-                        "Flood control for user %d: retry_after=%ds, "
-                        "pausing queue until ban expires",
-                        user_id,
-                        retry_secs,
-                    )
-                else:
-                    logger.warning(
-                        "Flood control for user %d: waiting %ds",
-                        user_id,
-                        retry_secs,
-                    )
-                    await asyncio.sleep(retry_secs)
-            except Exception as e:
-                logger.error(f"Error processing message task for user {user_id}: {e}")
+            except asyncio.CancelledError:
+                content_get.cancel()
+                kick_wait.cancel()
+                raise
+
+            for p in pending:
+                p.cancel()
+            for p in pending:
+                try:
+                    await p
+                except BaseException:
+                    pass
+
+            task: MessageTask | None = None
+            if content_get in done:
+                task = content_get.result()
+
+            inflight.clear()
+            try:
+                if task is not None:
+                    try:
+                        await _run_with_retry(bot, user_id, queue, lock, task)
+                    except Exception as e:
+                        logger.error(
+                            "Error processing message task for route %s: %s",
+                            route,
+                            e,
+                        )
+                    finally:
+                        queue.task_done()
+
+                await _drain_pending_ephemeral(bot, route, queue, lock)
             finally:
-                queue.task_done()
+                inflight.set()
         except asyncio.CancelledError:
-            logger.info(f"Message queue worker cancelled for user {user_id}")
+            logger.info(f"Message queue worker cancelled for route {route}")
             break
         except Exception as e:
-            logger.error(f"Unexpected error in queue worker for user {user_id}: {e}")
+            logger.error(f"Unexpected error in queue worker for route {route}: {e}")
+            # Avoid a tight error loop if the outer try keeps raising on
+            # the same condition. A small backoff lets transient issues
+            # (e.g. asyncio scheduling glitches) settle without us
+            # spinning the event loop.
+            await asyncio.sleep(0.1)
 
 
 def _send_kwargs(thread_id: int | None) -> dict[str, int]:
@@ -435,10 +754,17 @@ def _compact_activity_line(task: MessageTask) -> str:
 
     if "  ⎿  " in raw:
         left, rest = raw.split("  ⎿  ", 1)
-        # Keep the useful stats line, drop expandable/raw output noise.
-        stat = rest.split(" ", 18)
-        stat_text = " ".join(stat[:18]).strip()
-        raw = f"{left} — {stat_text}" if stat_text else left
+        # Surface the first line of output (where stats / first error /
+        # first useful sentence usually lives) rather than truncating to a
+        # fixed word count — that used to swallow long error messages and
+        # path lists. Subsequent lines are dropped to keep the digest
+        # compact; the user can still expand the topic for the full reply.
+        first_line = rest.split("\n", 1)[0].strip()
+        if len(first_line) > ACTIVITY_DIGEST_RESULT_SNIPPET_LENGTH:
+            first_line = (
+                first_line[: ACTIVITY_DIGEST_RESULT_SNIPPET_LENGTH - 1].rstrip() + "…"
+            )
+        raw = f"{left} — {first_line}" if first_line else left
 
     if len(raw) > ACTIVITY_DIGEST_MAX_LINE_LENGTH:
         raw = raw[: ACTIVITY_DIGEST_MAX_LINE_LENGTH - 1].rstrip() + "…"
@@ -452,18 +778,61 @@ def _compact_activity_line(task: MessageTask) -> str:
     return f"⚙️ {raw}"
 
 
+_RUN_STATE_HEADER: dict[RunState, str] = {
+    RunState.RUNNING: "🟡 Busy",
+    RunState.RUNNING_TOOL: "🟡 Busy",
+    # IDLE_RECENT renders as Busy; the route is still inside the
+    # post-completion grace window. The header flips to Done only after the
+    # idle decay lands.
+    RunState.IDLE_RECENT: "🟡 Busy",
+    RunState.WAITING_ON_USER: "🔔 Waiting on you",
+    RunState.IDLE_CLEARED: "✅ Done",
+    RunState.BROKEN_TOPIC: "⚠️ Topic unreachable",
+}
+
+
+def _context_pct_suffix(pct: int | None) -> str:
+    """Render the threshold-gated context-window suffix.
+
+    Below ``CCBOT_CONTEXT_PCT_THRESHOLD`` (or unknown): empty string.
+    At/above threshold: ``" · ctx NN%"``. At ≥95: ``" · ⚠️ ctx NN%"``.
+    """
+    if pct is None:
+        return ""
+    if pct < config.context_pct_threshold:
+        return ""
+    if pct >= 95:
+        return f" · ⚠️ ctx {pct}%"
+    return f" · ctx {pct}%"
+
+
 def _render_activity_digest(
-    state: ActivityDigestState, *, waiting: bool = False
+    state: ActivityDigestState,
+    *,
+    waiting: bool = False,
+    route: Route | None = None,
 ) -> str:
-    """Render the editable activity digest card."""
+    """Render the editable activity digest card.
+
+    With ``CCBOT_BUSY_INDICATOR_V2=true`` and a ``route``, the header is
+    driven by ``RunState`` rather than ``state.done`` + ``waiting``. The
+    legacy ``state.done`` field stays in sync via the activity bookkeeping
+    code below; the V2 path just consults RunState first.
+    """
     display = _display_name(state.window_id)
-    if waiting:
-        status = "🔔 Waiting on you"
-    elif state.done:
-        status = "✅ Done"
+    if config.busy_indicator_v2 and route is not None:
+        run = busy_indicator.state(route)
+        status = _RUN_STATE_HEADER.get(run, "🟡 Busy")
+        suffix = _context_pct_suffix(busy_indicator.context_pct(route))
     else:
-        status = "🟡 Busy"
-    lines = [f"{status} — {display}"]
+        if waiting:
+            status = "🔔 Waiting on you"
+        elif state.done:
+            status = "✅ Done"
+        else:
+            status = "🟡 Busy"
+        suffix = ""
+    lines = [f"{status} — {display}{suffix}"]
     if state.tool_count or state.completed_count:
         lines.append(
             f"Activity: {state.completed_count}/{state.tool_count} tool calls complete"
@@ -488,8 +857,11 @@ async def _upsert_activity_digest(
     """Send or edit the per-topic activity digest."""
     tid = thread_id or 0
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
+    route = _route_for(user_id, thread_id, state.window_id)
     text = _render_activity_digest(
-        state, waiting=attention.is_waiting(user_id, thread_id)
+        state,
+        waiting=attention.is_waiting(user_id, thread_id),
+        route=route,
     )
     if text == state.last_text:
         return
@@ -521,6 +893,10 @@ async def _upsert_activity_digest(
         thread_id=effective_thread_id,
         window_id=state.window_id,
         text=text,
+        disable_notification=True,
+        role="activity",
+        content_type="activity",
+        session_id=_session_id_for_window(state.window_id),
     )
     if sent is not None:
         state.message_id = sent.message_id
@@ -587,25 +963,190 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
         await _send_task_images(bot, chat_id, task, effective_thread_id)
 
 
+# ── §2.7 Agent (subagent) prominence ──────────────────────────────────────
+
+
+def _render_agent_tool_use(
+    input_data: dict[str, object] | None,
+    tool_name: str,
+) -> str:
+    """Render the top-level "Subagent dispatched" message body.
+
+    Returns a single rendered string. The caller wraps it in a list when the
+    surrounding ``MessageTask`` expects ``parts``; the send layer's
+    ``split_message`` already handles Telegram's 4096-char limit.
+    """
+    inp = input_data if isinstance(input_data, dict) else {}
+    subagent_type = str(inp.get("subagent_type") or "general-purpose")
+    description = str(inp.get("description") or "")
+    prompt_text = str(inp.get("prompt") or "")
+
+    cap = config.agent_prompt_preview_chars
+    excerpt = prompt_text.strip()
+    if len(excerpt) > cap:
+        excerpt = excerpt[: cap - 1].rstrip() + "…"
+
+    header = f"🤖 Subagent dispatched — {subagent_type}"
+    body_lines = [header]
+    if description:
+        body_lines.append(f"Description: {description}")
+    if excerpt:
+        body_lines.append("")
+        body_lines.append(f"▶ {excerpt}")
+    elif tool_name == "Task" and not description:
+        body_lines.append(f"(legacy {tool_name} invocation)")
+    return "\n".join(body_lines)
+
+
+def _agent_result_status(text: str) -> str:
+    """Mirror ``_compact_activity_line`` heuristics for Agent tool_result."""
+    lowered = (text or "").lower()
+    if "interrupted" in lowered:
+        return "interrupted"
+    if "error" in lowered:
+        return "error"
+    return "done"
+
+
+def _render_agent_tool_result(
+    text: str,
+    input_data: dict[str, object] | None,
+    status: str,
+) -> str:
+    """Render the edited "Subagent done / error / interrupted" body.
+
+    Edits the original tool_use message in place so the user sees the
+    dispatch and the result on the same Telegram message — the existing
+    ``_tool_msg_ids`` machinery owns the edit; this helper just shapes the
+    body. Long results are kept whole; the caller's split layer respects
+    Telegram's 4096-char limit.
+    """
+    inp = input_data if isinstance(input_data, dict) else {}
+    subagent_type = str(inp.get("subagent_type") or "general-purpose")
+    description = str(inp.get("description") or "")
+    glyph_map = {"done": "🤖✅", "error": "🤖❌", "interrupted": "🤖⏹"}
+    label_map = {
+        "done": "Subagent done",
+        "error": "Subagent error",
+        "interrupted": "Subagent interrupted",
+    }
+    glyph = glyph_map.get(status, "🤖✅")
+    label = label_map.get(status, "Subagent done")
+    body_lines = [f"{glyph} {label} — {subagent_type}"]
+    if description:
+        body_lines.append(f"Description: {description}")
+    body = (text or "").strip()
+    if body:
+        body_lines.append("")
+        body_lines.append(body)
+    return "\n".join(body_lines)
+
+
+async def _bump_agent_activity_counter(
+    bot: Bot,
+    user_id: int,
+    task: MessageTask,
+) -> None:
+    """Increment the activity digest's tool counter without appending a line.
+
+    The digest header reads ``Activity: N/M tool calls complete`` — for the
+    user that line must include Agent runs alongside short Read/Write/Bash,
+    or they'll see "0/1 complete" while a subagent is clearly running. The
+    body of the digest, however, would be misleading if Agent showed up as
+    a generic "⚙️ Agent(...)" line — Stage 4.c routes the body to the
+    top-level message instead.
+    """
+    wid = task.window_id or ""
+    tid = task.thread_id or 0
+    state = _activity_msg_info.get((user_id, tid))
+    if state is None or state.window_id != wid or state.done:
+        state = ActivityDigestState(message_id=0, window_id=wid)
+    if task.content_type == "tool_use":
+        state.tool_count += 1
+    elif task.content_type == "tool_result":
+        state.completed_count += 1
+    state.done = False
+    # Persist the slot up-front so the matching tool_result lands in the
+    # same digest state (otherwise the upsert path would only store after
+    # a successful send, and a stubbed upsert in tests would lose the
+    # tool_count carry-over).
+    _activity_msg_info[(user_id, tid)] = state
+    await _upsert_activity_digest(bot, user_id, task.thread_id, state)
+
+
+async def _process_agent_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Render the Agent tool_use / tool_result as a top-level message.
+
+    Top-level path uses ``_process_content_task`` so the existing
+    ``_tool_msg_ids`` edit machinery + multipart split + status handoff all
+    Just Work. After the top-level send, the activity counter is bumped so
+    the digest header reflects "M tool calls" including the subagent.
+    """
+    tid = task.thread_id or 0
+    rendered: str
+    if task.content_type == "tool_use":
+        rendered = _render_agent_tool_use(
+            task.tool_input,
+            task.tool_name or "Agent",
+        )
+        if task.tool_use_id:
+            # Stash the input dict so the matching tool_result can render
+            # the same description / subagent_type (tool_result blocks
+            # don't carry the original input).
+            _agent_tool_ids[(task.tool_use_id, user_id, tid)] = (
+                task.tool_input if isinstance(task.tool_input, dict) else {}
+            )
+    else:
+        status = _agent_result_status(task.text or "\n\n".join(task.parts))
+        # Look up the original tool_use input first; fall back to whatever
+        # the tool_result task carries (defense-in-depth) and finally to
+        # an empty dict so render shows generic "general-purpose".
+        recorded_input: dict[str, object] | None = None
+        if task.tool_use_id:
+            recorded_input = _agent_tool_ids.get((task.tool_use_id, user_id, tid))
+        effective_input = recorded_input
+        if effective_input is None and isinstance(task.tool_input, dict):
+            effective_input = task.tool_input
+        rendered = _render_agent_tool_result(
+            task.text or "\n\n".join(task.parts),
+            effective_input,
+            status,
+        )
+        if task.tool_use_id:
+            _agent_tool_ids.pop((task.tool_use_id, user_id, tid), None)
+
+    promoted = MessageTask(
+        task_type="content",
+        text=task.text,
+        window_id=task.window_id,
+        parts=[rendered],
+        tool_use_id=task.tool_use_id,
+        content_type=task.content_type,
+        thread_id=task.thread_id,
+        image_data=task.image_data,
+        tool_name=task.tool_name,
+        tool_input=task.tool_input,
+    )
+    await _process_content_task(bot, user_id, promoted)
+    await _bump_agent_activity_counter(bot, user_id, task)
+
+
 async def _finalize_activity_digest(
     bot: Bot,
     user_id: int,
     thread_id: int | None,
     window_id: str,
-    *,
-    final_text: str = "",
 ) -> None:
-    """Mark activity digest done before final assistant text unless it asks for input.
+    """Mark activity digest done before final assistant text.
 
-    Attention-worthy final text is surfaced by the attention card. Do not flip
-    the digest to ``✅ Done`` first; Stage 4 wants the digest to remain a
-    waiting indicator once the attention state is set.
+    Stage 4 / Option A: assistant text never raises an attention card, so the
+    digest is finalized to its terminal value driven by ``RunState`` (Done /
+    Waiting on you). The previous attention-heuristic short-circuit is gone —
+    it left the digest stuck on Busy whenever a card never raised.
     """
     tid = thread_id or 0
     state = _activity_msg_info.get((user_id, tid))
     if not state or state.window_id != window_id or state.done:
-        return
-    if final_text and attention.is_attention_request(final_text):
         return
     state.done = True
     await _upsert_activity_digest(bot, user_id, thread_id, state)
@@ -628,88 +1169,6 @@ async def _refresh_activity_digest_if_present(
 def _looks_like_attention_request(text: str) -> bool:
     """Backwards-compatible alias for ``attention.is_attention_request``."""
     return attention.is_attention_request(text)
-
-
-async def _attention_dm_if_needed(
-    bot: Bot,
-    user_id: int,
-    thread_id: int | None,
-    window_id: str,
-    text: str,
-) -> None:
-    """Surface assistant text that is waiting on the user.
-
-    Primary surface is the in-topic attention card maintained by
-    ``handlers.attention``. Only when the topic send/edit fails (topic
-    deleted, closed, forbidden, …) do we fall back to a direct DM so the
-    notification never silently disappears.
-    """
-    if not attention.is_attention_request(text):
-        return
-
-    outcome = await attention.notify_waiting(
-        bot,
-        user_id=user_id,
-        thread_id=thread_id,
-        window_id=window_id,
-        prompt_text=text,
-        kind="assistant_text",
-    )
-    if outcome is TopicSendOutcome.OK:
-        return
-    if outcome not in _TOPIC_BROKEN_OUTCOMES:
-        # Transient/unclassified failure: leave it for the next attention
-        # opportunity rather than burning a DM. Logged in topic_send already.
-        return
-
-    # Strict emergency: topic itself is gone/closed/forbidden — DM so the
-    # user does not lose the "Claude is waiting" signal entirely.
-    display = session_manager.get_display_name(window_id) if window_id else "unknown"
-    cleaned = strip_sentinels(text).strip()
-    if not attention.should_emit_emergency_dm(user_id, thread_id, window_id):
-        logger.debug(
-            "Skipping duplicate attention emergency DM for user=%d thread=%s window=%s",
-            user_id,
-            thread_id,
-            window_id,
-        )
-        return
-
-    prefix = f"🔔 Claude needs your input in {display}"
-    if thread_id is not None:
-        prefix += f" (topic {thread_id})"
-    prefix += f" — topic delivery failed ({outcome.value}):\n\n"
-    body = cleaned
-    if len(prefix) + len(body) > 3800:
-        body = body[: 3800 - len(prefix) - 20] + "\n… [truncated]"
-    try:
-        sent = await send_with_fallback(bot, user_id, prefix + body)
-        if sent:
-            logger.info(
-                "emergency_dm op=attention user=%d thread=%s window=%s outcome=%s sent",
-                user_id,
-                thread_id,
-                window_id,
-                outcome.value,
-            )
-        else:
-            logger.warning(
-                "emergency_dm op=attention user=%d thread=%s window=%s outcome=%s "
-                "send returned None",
-                user_id,
-                thread_id,
-                window_id,
-                outcome.value,
-            )
-    except Exception as e:
-        logger.warning(
-            "emergency_dm op=attention user=%d thread=%s window=%s outcome=%s failed: %s",
-            user_id,
-            thread_id,
-            window_id,
-            outcome.value,
-            e,
-        )
 
 
 async def _send_task_images(
@@ -744,7 +1203,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             user_id,
             task.thread_id,
             wid,
-            final_text=logical_text,
         )
 
     # 1. Handle tool_result editing (merged parts are edited together)
@@ -765,6 +1223,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 window_id=wid,
                 message_id=edit_msg_id,
                 text=full_text,
+                role="tool",
+                content_type="tool_result",
             )
             if outcome is TopicSendOutcome.OK:
                 # Tool work resumed → user no longer "needed".
@@ -781,8 +1241,17 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
     # 2. Send content messages, converting status message to first content part
     first_part = True
+    first_topic_send_done = False
     last_msg_id: int | None = None
-    for part in task.parts:
+    # Role for the message_refs row: tool_use/tool_result → "tool";
+    # everything else (text, thinking) → "assistant". This mirrors the
+    # taxonomy in §2.5.3 / §2.5.5: ``role`` is a coarse routing key, and the
+    # finer distinction lives in ``content_type``.
+    ref_role = (
+        "tool" if task.content_type in ("tool_use", "tool_result") else "assistant"
+    )
+    ref_session_id = _session_id_for_window(wid)
+    for part_idx, part in enumerate(task.parts):
         sent = None
 
         # For first part, try to convert status message to content (edit instead of delete)
@@ -794,20 +1263,76 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 tid,
                 wid,
                 part,
+                ref_role=ref_role,
+                ref_content_type=task.content_type,
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
+                # Status-conversion edits the existing status message — no
+                # fresh send happens here, so ``reply_parameters`` cannot
+                # attach (Telegram has no edit-with-reply primitive). The
+                # next iteration will be a real ``topic_send`` and that one
+                # is treated as the first anchor candidate.
                 continue
 
-        sent, outcome = await topic_send(
-            bot,
-            op="content",
-            user_id=user_id,
-            chat_id=chat_id,
-            thread_id=effective_thread_id,
-            window_id=wid,
-            text=part,
-        )
+        # Tool-use top-level messages (including the §2.7 Agent promotion)
+        # are content, not attention. They should not ping the user every
+        # time a subagent dispatches or a long-running tool starts.
+        # Assistant text uses the default (notify) — that's the
+        # conversational surface the user actually wants pinged.
+        silent = task.content_type in ("tool_use", "tool_result")
+
+        # §2.5.2 outbound anchor: first part of assistant final text only.
+        # Tool / activity / status sends are deliberately excluded — those
+        # are UI state, not conversation. The anchor is consumed here
+        # BEFORE the send attempt; if the send fails into the emergency-DM
+        # fallback below (topic-broken outcome), the DM is intentionally
+        # unanchored — Telegram replies cannot cross chat boundaries from
+        # the topic to the user's DM, so there is no anchor to carry.
+        anchor: ReplyParameters | None = None
+        if (
+            not first_topic_send_done
+            and task.content_type == "text"
+            and config.reply_context_enabled
+        ):
+            anchor_id = consume_route_last_user_message(user_id, task.thread_id, wid)
+            if anchor_id is not None:
+                anchor = ReplyParameters(message_id=anchor_id)
+        first_topic_send_done = True
+
+        if anchor is not None:
+            sent, outcome = await topic_send(
+                bot,
+                op="content",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=effective_thread_id,
+                window_id=wid,
+                text=part,
+                disable_notification=silent,
+                reply_parameters=anchor,
+                role=ref_role,
+                content_type=task.content_type,
+                part_index=part_idx,
+                transcript_uuid=task.transcript_uuid,
+                session_id=ref_session_id,
+            )
+        else:
+            sent, outcome = await topic_send(
+                bot,
+                op="content",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=effective_thread_id,
+                window_id=wid,
+                text=part,
+                disable_notification=silent,
+                role=ref_role,
+                content_type=task.content_type,
+                part_index=part_idx,
+                transcript_uuid=task.transcript_uuid,
+                session_id=ref_session_id,
+            )
 
         if sent is not None:
             last_msg_id = sent.message_id
@@ -847,20 +1372,19 @@ async def _maybe_attention_or_dismiss(
     text: str,
     content_type: str,
 ) -> None:
-    """Route content text to either the attention card or attention dismissal.
+    """Dismiss any standing attention card after assistant text lands.
 
-    Attention card is the topic-first surface. If the assistant text doesn't
-    look attention-worthy, the user is no longer being prompted, so any
-    standing card is dismissed back to idle.
+    We deliberately do NOT raise a fresh attention card for assistant text:
+    the user already sees Claude's message in the topic, so a "Claude needs
+    a decision" card right next to it is pure noise. Interactive-UI cards
+    (permission prompts, ExitPlanMode, etc.) are still emitted from
+    ``handlers.interactive_ui`` because those genuinely require the user to
+    open the topic — you can't dismiss a permission prompt with a text reply.
+
+    Any prior card is dismissed regardless of attention-cue heuristic so
+    routes don't get stuck in a "waiting" state once Claude resumes talking.
     """
-    if content_type != "text":
-        # tool_use / tool_result text continues active work; clear the card.
-        await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)
-        return
-    if attention.is_attention_request(text):
-        await _attention_dm_if_needed(bot, user_id, thread_id, window_id, text)
-    else:
-        await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)
+    await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)
 
 
 async def _convert_status_to_content(
@@ -869,10 +1393,16 @@ async def _convert_status_to_content(
     thread_id_or_0: int,
     window_id: str,
     content_text: str,
+    *,
+    ref_role: str = "assistant",
+    ref_content_type: str = "text",
 ) -> int | None:
     """Convert status message to content message by editing it.
 
     Returns the message_id if converted successfully, None otherwise.
+    The ``ref_role`` / ``ref_content_type`` are forwarded to
+    ``message_refs.update_role_and_content_type`` so the provenance row
+    flips from ``status`` to whatever first-content-part landed here.
     """
     skey = (user_id, thread_id_or_0)
     info = _status_msg_info.pop(skey, None)
@@ -906,6 +1436,8 @@ async def _convert_status_to_content(
         window_id=window_id,
         message_id=msg_id,
         text=content_text,
+        role=ref_role,
+        content_type=ref_content_type,
     )
     if outcome is TopicSendOutcome.OK:
         return msg_id
@@ -940,17 +1472,10 @@ async def _process_status_update_task(
             # Same content, skip edit
             return
         else:
-            # Same window, text changed - edit in place
-            # Send typing indicator when Claude is working
-            if "esc to interrupt" in status_text.lower():
-                try:
-                    await bot.send_chat_action(
-                        chat_id=chat_id, action=ChatAction.TYPING
-                    )
-                except RetryAfter:
-                    raise
-                except Exception:
-                    pass
+            # Same window, text changed - edit in place.
+            # (Topic-level "typing" indicator is fired by status_polling on
+            # every active poll — that's the right cadence for keeping the
+            # "Claude is typing…" line under the topic title alive.)
             outcome = await topic_edit(
                 bot,
                 op="status",
@@ -995,14 +1520,8 @@ async def _do_send_status_message(
             window_id=old[1],
             message_id=old[0],
         )
-    # Send typing indicator when Claude is working
-    if "esc to interrupt" in text.lower():
-        try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        except RetryAfter:
-            raise
-        except Exception:
-            pass
+    # (Topic-level "typing" indicator is fired by status_polling — see the
+    # is_running branch in update_status_message.)
     rendered = _status_display_text(window_id, text)
     sent, outcome = await topic_send(
         bot,
@@ -1012,6 +1531,10 @@ async def _do_send_status_message(
         thread_id=effective_thread_id,
         window_id=window_id,
         text=rendered,
+        disable_notification=True,
+        role="status",
+        content_type="status",
+        session_id=_session_id_for_window(window_id),
     )
     if sent is not None:
         _status_msg_info[skey] = (sent.message_id, window_id, text)
@@ -1058,8 +1581,11 @@ async def _check_and_send_status(
     thread_id: int | None = None,
 ) -> None:
     """Check terminal for status line and send status message if present."""
-    # Skip if there are more messages pending in the queue
-    queue = _message_queues.get(user_id)
+    # Per-route gate is now mostly cosmetic; rare to have queued content right
+    # after a content tick on the same route. Kept for symmetry with the
+    # polling-side _poll_one_binding skip_status check.
+    route = _route_for(user_id, thread_id, window_id)
+    queue = _route_queues.get(route)
     if queue and not queue.empty():
         return
     w = await tmux_manager.find_window_by_id(window_id)
@@ -1072,8 +1598,17 @@ async def _check_and_send_status(
 
     tid = thread_id or 0
     status_line = parse_status_line(pane_text)
-    if status_line:
+    # Mirror the gate used by status_polling.update_status_message: a
+    # post-completion summary like "✻ Worked for 2s" still parses as a
+    # status_line, but is_status_active() returns False because the spinner
+    # sits above a blank-line gap rather than directly above chrome. Without
+    # this check, the post-content status path would resurrect a "🟡 Busy"
+    # card right after Claude finishes — exactly the stale-Busy regression
+    # the polling path already guards against.
+    if status_line and is_status_active(pane_text):
         await _do_send_status_message(bot, user_id, tid, window_id, status_line)
+    else:
+        await _do_clear_status_message(bot, user_id, tid)
 
 
 async def enqueue_content_message(
@@ -1086,6 +1621,9 @@ async def enqueue_content_message(
     text: str | None = None,
     thread_id: int | None = None,
     image_data: list[tuple[str, bytes]] | None = None,
+    tool_name: str | None = None,
+    tool_input: dict[str, object] | None = None,
+    transcript_uuid: str | None = None,
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
@@ -1094,7 +1632,20 @@ async def enqueue_content_message(
         window_id,
         content_type,
     )
-    queue = get_or_create_queue(bot, user_id)
+    route = _route_for(user_id, thread_id, window_id)
+    if route in _route_tearing_down:
+        # Bug 1 guard: a teardown is in flight. Dropping content here is
+        # noisy but correct — re-creating the route now would race with
+        # the teardown's worker-cancel and leak _tool_msg_ids slots.
+        logger.warning(
+            "Dropping content for route %s: route is tearing down "
+            "(content_type=%s, parts=%d)",
+            route,
+            content_type,
+            len(parts),
+        )
+        return
+    queue = _get_or_create_route(bot, route)
 
     task = MessageTask(
         task_type="content",
@@ -1105,6 +1656,9 @@ async def enqueue_content_message(
         content_type=content_type,
         thread_id=thread_id,
         image_data=image_data,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        transcript_uuid=transcript_uuid,
     )
     queue.put_nowait(task)
 
@@ -1131,7 +1685,14 @@ async def enqueue_status_update(
         if info and info[1] == window_id and info[2] == status_text:
             return
 
-    queue = get_or_create_queue(bot, user_id)
+    route = _route_for(user_id, thread_id, window_id)
+    if route in _route_tearing_down:
+        # Bug 1 guard: silently drop ephemerals during teardown — they're
+        # latest-wins, and the route is going away anyway.
+        return
+    _get_or_create_route(bot, route)
+    lock = _route_locks[route]
+    kick = _route_ephemeral_kick[route]
 
     if status_text:
         task = MessageTask(
@@ -1143,7 +1704,13 @@ async def enqueue_status_update(
     else:
         task = MessageTask(task_type="status_clear", thread_id=thread_id)
 
-    queue.put_nowait(task)
+    # Set the slot AND the kick under the same lock that
+    # ``_drain_pending_ephemeral`` uses. Otherwise kick.set() can land
+    # after the worker observes "slot empty" and clears the kick under
+    # its own lock, leaving the new task parked indefinitely.
+    async with lock:
+        _route_pending_ephemeral[route] = task
+        kick.set()
 
 
 def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
@@ -1155,7 +1722,9 @@ def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
 def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:
     """Clear tool message ID tracking for a specific topic.
 
-    Removes all entries in _tool_msg_ids that match the given user and thread.
+    Removes all entries in _tool_msg_ids and _agent_tool_ids that match the
+    given user and thread, preventing per-topic teardown from leaking
+    long-lived (tool_use_id, user, thread) keys.
     """
     tid = thread_id or 0
     # Find and remove all matching keys
@@ -1164,17 +1733,99 @@ def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> 
     ]
     for key in keys_to_remove:
         _tool_msg_ids.pop(key, None)
+    agent_keys_to_remove = [
+        key for key in _agent_tool_ids if key[1] == user_id and key[2] == tid
+    ]
+    for key in agent_keys_to_remove:
+        _agent_tool_ids.pop(key, None)
+
+
+async def teardown_route(route: Route, *, drop_pending: bool) -> None:
+    """Tear down a route's queue + worker.
+
+    drop_pending=False → wait for queued tasks to drain naturally.
+    drop_pending=True  → discard queued tasks; in-flight task is still allowed
+    to finish so ``_tool_msg_ids`` slots are not leaked.
+
+    Bug 1 fix: marks the route in ``_route_tearing_down`` BEFORE awaiting
+    inflight, so ``enqueue_content_message`` / ``enqueue_status_update``
+    drop new work for this route instead of resurrecting the queue
+    between ``inflight.wait()`` and ``worker.cancel()``.
+    """
+    queue = _route_queues.get(route)
+    worker = _route_workers.get(route)
+    inflight = _route_inflight.get(route)
+    if queue is None and worker is None:
+        return
+
+    _route_tearing_down.add(route)
+    try:
+        if inflight is not None:
+            await inflight.wait()
+
+        if queue is not None:
+            if drop_pending:
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                        queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
+            else:
+                await queue.join()
+
+        if worker is not None:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+        _route_queues.pop(route, None)
+        _route_workers.pop(route, None)
+        _route_pending_ephemeral.pop(route, None)
+        _route_locks.pop(route, None)
+        _route_ephemeral_kick.pop(route, None)
+        _route_inflight.pop(route, None)
+        # Drop per-route agent_tool_ids so a session crash mid-Agent or a
+        # /clear-driven teardown can't leak (tool_use_id, user, thread)
+        # entries past the route's lifetime.
+        route_user_id, route_tid, _ = route
+        agent_keys_to_remove = [
+            key
+            for key in _agent_tool_ids
+            if key[1] == route_user_id and key[2] == route_tid
+        ]
+        for key in agent_keys_to_remove:
+            _agent_tool_ids.pop(key, None)
+        # §2.5.2: drop any per-route anchor candidate so a freshly re-bound
+        # route can't reply-to a Telegram message_id from the old session.
+        _route_last_user_message.pop(route, None)
+        busy_indicator.clear_route(route)
+    finally:
+        _route_tearing_down.discard(route)
+
+
+def routes_for_topic(user_id: int, thread_id: int | None) -> list[Route]:
+    """Return all live routes matching ``(user_id, thread_id_or_0)``."""
+    tid = thread_id or 0
+    # Snapshot the keys so concurrent mutation (teardown) cannot break
+    # iteration.
+    return [r for r in list(_route_queues) if r[0] == user_id and r[1] == tid]
 
 
 async def shutdown_workers() -> None:
     """Stop all queue workers (called during bot shutdown)."""
-    for _, worker in list(_queue_workers.items()):
+    for _, worker in list(_route_workers.items()):
         worker.cancel()
         try:
             await worker
         except asyncio.CancelledError:
             pass
-    _queue_workers.clear()
-    _message_queues.clear()
-    _queue_locks.clear()
+    _route_workers.clear()
+    _route_queues.clear()
+    _route_locks.clear()
+    _route_pending_ephemeral.clear()
+    _route_ephemeral_kick.clear()
+    _route_inflight.clear()
     logger.info("Message queue workers stopped")

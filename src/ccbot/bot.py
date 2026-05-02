@@ -101,9 +101,15 @@ from .handlers.directory_browser import (
     clear_session_picker_state,
     clear_window_picker_state,
 )
-from .handlers import attention
+from .handlers import attention, busy_indicator
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
+from .handlers.inbound_aggregator import (
+    aggregator_flush_route,
+    aggregator_offer_photo,
+    aggregator_offer_text,
+    aggregator_offer_voice,
+)
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
     clear_interactive_mode,
@@ -117,14 +123,17 @@ from .handlers.message_queue import (
     clear_status_msg_info,
     enqueue_content_message,
     enqueue_status_update,
-    get_message_queue,
+    get_content_queue,
+    set_route_last_user_message,
     shutdown_workers,
 )
+from . import message_refs
+from .handlers import reply_context as reply_context_mod
+from .handlers.reply_context import extract_reply_context, render_for_claude
 from .handlers.message_sender import (
     NO_LINK_PREVIEW,
     safe_edit,
     safe_reply,
-    safe_send,
     send_with_fallback,
 )
 from .markdown_v2 import convert_markdown
@@ -132,7 +141,7 @@ from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
-from .session_monitor import NewMessage, SessionMonitor
+from .session_monitor import NewMessage, SessionMonitor, TranscriptEvent
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
@@ -146,6 +155,36 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# §2.5.3 Stage 5.c: daily GC pass for the message_refs SQLite table.
+_message_refs_gc_task: asyncio.Task | None = None
+_MESSAGE_REFS_GC_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+async def _message_refs_gc_loop() -> None:
+    """Once-per-day prune of rows older than the retention window.
+
+    Long-sleep + cancel-aware shape mirrors ``status_poll_loop``. A SQLite
+    blip is logged inside ``message_refs.prune_older_than``; this loop
+    tolerates exceptions and keeps running so a single failure does not
+    leave the table growing unboundedly.
+    """
+    while True:
+        try:
+            deleted = await message_refs.prune_older_than(
+                config.message_refs_retention_days
+            )
+            if deleted:
+                logger.info("message_refs GC dropped %d row(s)", deleted)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("message_refs GC iteration failed: %s", e)
+        try:
+            await asyncio.sleep(_MESSAGE_REFS_GC_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -268,7 +307,13 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     display = session_manager.get_display_name(wid)
     session_manager.unbind_thread(user.id, thread_id)
-    await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+    await clear_topic_state(
+        user.id,
+        thread_id,
+        context.bot,
+        context.user_data,
+        drop_pending=False,
+    )
 
     await safe_reply(
         update.message,
@@ -522,6 +567,14 @@ async def forward_command_handler(
         "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
     )
     await update.message.chat.send_action(ChatAction.TYPING)
+
+    # §2.8: drain any pending aggregator bundle BEFORE the slash command so
+    # "user types text+photo, then a slash command" preserves arrival order.
+    # Without this, the text+photo bundle would still be debouncing while
+    # the slash command lands first in the tmux pane.
+    route = (user.id, thread_id or 0, wid)
+    await aggregator_flush_route(route)
+
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
         await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
@@ -586,11 +639,69 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
+
+    # Download the highest-resolution photo (we need a path either way:
+    # bound topic feeds the aggregator, unbound topic stashes the path so
+    # the directory-pick flush has the file ready).
+    photo = update.message.photo[-1]
+    tg_file = await photo.get_file()
+    filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
+    file_path = _IMAGES_DIR / filename
+    await tg_file.download_to_drive(file_path)
+
+    caption = update.message.caption or ""
+    media_group_id = update.message.media_group_id
+
     if wid is None:
-        await safe_reply(
-            update.message,
-            "❌ No session bound to this topic. Send a text message first to create one.",
-        )
+        # §2.8.3 photo-in-unbound-topic: stash the path so the directory
+        # picker's flush in _create_and_bind_window can feed the aggregator
+        # for the freshly-bound route. Multiple photos can pile up here
+        # while the user navigates the directory browser.
+        if context.user_data is not None:
+            pending_photos = context.user_data.setdefault("_pending_thread_photos", [])
+            pending_photos.append((str(file_path), caption, media_group_id))
+            context.user_data["_pending_thread_id"] = thread_id
+
+        # If the user is already mid-picker (text_handler opened the
+        # directory browser, window picker, or session picker for THIS
+        # topic), stashing the photo is enough — re-emitting the picker
+        # here would stomp on the existing browse/picker state and lose
+        # the user's progress. Mirrors the same-thread guards in
+        # text_handler at lines 889-936.
+        if context.user_data is not None:
+            current_state = context.user_data.get(STATE_KEY)
+            pending_tid = context.user_data.get("_pending_thread_id")
+            if pending_tid == thread_id and current_state in (
+                STATE_BROWSING_DIRECTORY,
+                STATE_SELECTING_WINDOW,
+                STATE_SELECTING_SESSION,
+            ):
+                return
+
+        # Open the directory browser exactly as text_handler does for the
+        # text-only first-message-in-unbound-topic flow.
+        all_windows = await tmux_manager.list_windows()
+        bound_ids = {bid for _, _, bid in session_manager.iter_thread_bindings()}
+        unbound = [
+            (w.window_id, w.window_name, w.cwd)
+            for w in all_windows
+            if w.window_id not in bound_ids
+        ]
+        if unbound:
+            msg_text, keyboard, win_ids = build_window_picker(unbound)
+            if context.user_data is not None:
+                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
+            await safe_reply(update.message, msg_text, reply_markup=keyboard)
+            return
+        start_path = str(Path.cwd())
+        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            context.user_data[BROWSE_PATH_KEY] = start_path
+            context.user_data[BROWSE_PAGE_KEY] = 0
+            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        await safe_reply(update.message, msg_text, reply_markup=keyboard)
         return
 
     w = await tmux_manager.find_window_by_id(wid)
@@ -604,29 +715,19 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # Download the highest-resolution photo
-    photo = update.message.photo[-1]
-    tg_file = await photo.get_file()
-
-    # Save to ~/.ccbot/images/<timestamp>_<file_unique_id>.jpg
-    filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
-    file_path = _IMAGES_DIR / filename
-    await tg_file.download_to_drive(file_path)
-
-    # Build the message to send to Claude Code
-    caption = update.message.caption or ""
-    if caption:
-        text_to_send = f"{caption}\n\n(image attached: {file_path})"
-    else:
-        text_to_send = f"(image attached: {file_path})"
-
     await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
 
-    success, message = await session_manager.send_to_window(wid, text_to_send)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
-        return
+    # §2.5.2: anchor the next assistant-text response to the LATEST inbound
+    # photo's message_id (matches Telegram's "reply to most recent" UX).
+    set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
+
+    # §2.8: feed photo + caption + media_group_id into the aggregator. The
+    # bundle's flush handler builds the §2.8.2 single-text + grouped-paths
+    # shape so a media-group with one caption stops fragmenting across
+    # N Claude turns.
+    route = (user.id, thread_id, wid)
+    await aggregator_offer_photo(route, file_path, caption, media_group_id)
 
     # Confirm to user
     await safe_reply(update.message, "📷 Image sent to Claude Code.")
@@ -700,10 +801,23 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
 
-    success, message = await session_manager.send_to_window(wid, text)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
-        return
+    # §2.5.2 + §2.8: voice messages take the same path as text — anchor the
+    # outbound response to the user's voice-message Telegram id, then feed
+    # the transcribed text into the aggregator so a voice-then-text or
+    # voice-then-photo bundle still lands as one Claude turn.
+    set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
+    route = (user.id, thread_id, wid)
+    if not text:
+        # ``aggregator_offer_voice`` (and its underlying
+        # ``aggregator_offer_text``) silently no-op on empty text. Surface
+        # that in logs so an empty-transcription failure mode is visible
+        # rather than looking like the bot dropped the voice message.
+        logger.debug(
+            "voice transcription empty for user=%d thread=%s",
+            user.id,
+            thread_id,
+        )
+    await aggregator_offer_voice(route, text)
 
     await safe_reply(update.message, f'🎤 "{text}"')
 
@@ -820,6 +934,22 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     text = update.message.text
+
+    # §2.5.1: render any reply-context BEFORE the _pending_thread_text stash
+    # paths below — otherwise a brand-new-topic flow (where the directory
+    # browser holds the text while the user picks a directory) would lose
+    # the quote when it eventually flushes via _create_and_bind_window.
+    if config.reply_context_enabled:
+        reply_ctx = extract_reply_context(update.message)
+        if reply_ctx is not None:
+            # §2.5.4 routing guardrail: ``resolve`` enriches role/session
+            # metadata for prompt rendering; routing still flows through
+            # the topic's currently-bound window, never through
+            # ``reply_ctx.session_id``.
+            reply_ctx = await reply_context_mod.resolve(
+                reply_ctx, update.message.chat.id
+            )
+            text = render_for_claude(text, reply_ctx)
 
     # Ignore text in window picker mode (only for the same thread)
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
@@ -968,10 +1098,18 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Small delay to let UI render in Telegram before text arrives
         await asyncio.sleep(0.3)
 
-    success, message = await session_manager.send_to_window(wid, text)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
-        return
+    # §2.5.2: stash the latest user message_id at the OFFER site (not at the
+    # aggregator flush) so the reply_parameters anchor follows the user's
+    # most recent visible Telegram message, not whatever the aggregator
+    # happens to flush at.
+    set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
+
+    # §2.8: feed the aggregator instead of sending direct. The reply-context
+    # render above still happened; its output flows through the aggregator
+    # and lands in Claude as one coherent turn alongside any caption /
+    # photo / fast-follow text within the debounce window.
+    route = (user.id, thread_id, wid)
+    await aggregator_offer_text(route, text)
 
     # User just replied → Claude is no longer waiting. Flip the topic-first
     # attention card back to idle so the next idle→waiting transition fires
@@ -1064,6 +1202,51 @@ async def _create_and_bind_window(
                 session_manager._save_state()
 
         if pending_thread_id is not None:
+            # Pre-register the new session in the monitor so the first
+            # user/assistant exchange isn't dropped by the default
+            # end-of-file offset initialization in
+            # ``SessionMonitor.check_for_updates``.
+            ws = session_manager.get_window_state(created_wid)
+            track_sid = resume_session_id or ws.session_id
+            track_cwd = ws.cwd or selected_path
+
+            if not track_sid:
+                # Non-resume + hook timeout: we don't know the session_id, so
+                # any pending text we send produces a response the monitor
+                # cannot route back. Surface the failure instead of silently
+                # dropping the first reply.
+                logger.warning(
+                    "Hook timed out for new window %s — refusing to forward "
+                    "pending text since session is unmonitored",
+                    created_wid,
+                )
+                await safe_edit(
+                    query,
+                    f"❌ {message}\n\nClaude session didn't register in time. "
+                    "Send your message again to retry.",
+                )
+                if context.user_data is not None:
+                    context.user_data.pop("_pending_thread_text", None)
+                    context.user_data.pop("_pending_thread_id", None)
+                await query.answer("Hook timeout")
+                return
+
+            if session_monitor is not None:
+                file_path = session_manager._build_session_file_path(
+                    track_sid, track_cwd
+                )
+                if file_path is not None:
+                    # Resume: skip pre-existing transcript history. New
+                    # sessions: read from the start so the seed message and
+                    # first reply are picked up.
+                    if resume_session_id and file_path.exists():
+                        offset = file_path.stat().st_size
+                    else:
+                        offset = 0
+                    session_monitor.register_session(
+                        track_sid, file_path, offset=offset
+                    )
+
             # Thread bind flow: bind thread to newly created window
             session_manager.bind_thread(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
@@ -1075,33 +1258,42 @@ async def _create_and_bind_window(
                 f"✅ {message}\n\n{status}. Send messages here.",
             )
 
-            # Send pending text if any
+            # Send pending text and/or photos through the aggregator so the
+            # bundle's flush owns the §2.8.2 output shape (single text +
+            # grouped paths). Force-flush at the end since the user has
+            # been waiting on the directory pick and the debounce window
+            # would otherwise stall the first turn.
             pending_text = (
                 context.user_data.get("_pending_thread_text")
                 if context.user_data
                 else None
             )
-            if pending_text:
-                logger.debug(
-                    "Forwarding pending text to window %s (len=%d)",
-                    created_wname,
-                    len(pending_text),
-                )
+            pending_photos: list[tuple[str, str, str | None]] = (
+                context.user_data.get("_pending_thread_photos") or []
+                if context.user_data
+                else []
+            )
+            if pending_text or pending_photos:
                 if context.user_data is not None:
                     context.user_data.pop("_pending_thread_text", None)
+                    context.user_data.pop("_pending_thread_photos", None)
                     context.user_data.pop("_pending_thread_id", None)
-                send_ok, send_msg = await session_manager.send_to_window(
-                    created_wid,
-                    pending_text,
-                )
-                if not send_ok:
-                    logger.warning("Failed to forward pending text: %s", send_msg)
-                    await safe_send(
-                        context.bot,
-                        session_manager.resolve_chat_id(user.id, pending_thread_id),
-                        f"❌ Failed to send pending message: {send_msg}",
-                        message_thread_id=pending_thread_id,
+                route = (user.id, pending_thread_id, created_wid)
+                if pending_text:
+                    logger.debug(
+                        "Forwarding pending text via aggregator to window %s (len=%d)",
+                        created_wname,
+                        len(pending_text),
                     )
+                    await aggregator_offer_text(route, pending_text)
+                for path_str, caption, media_group_id in pending_photos:
+                    await aggregator_offer_photo(
+                        route,
+                        Path(path_str),
+                        caption,
+                        media_group_id,
+                    )
+                await aggregator_flush_route(route)
             elif context.user_data is not None:
                 context.user_data.pop("_pending_thread_id", None)
         else:
@@ -1461,25 +1653,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"✅ Bound to window `{display}`",
         )
 
-        # Forward pending text if any
+        # Forward pending text and/or photos via the aggregator so the
+        # §2.8.2 single-text + grouped-paths shape applies on first turn.
         pending_text = (
             context.user_data.get("_pending_thread_text") if context.user_data else None
         )
+        pending_photos: list[tuple[str, str, str | None]] = (
+            context.user_data.get("_pending_thread_photos") or []
+            if context.user_data
+            else []
+        )
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_text", None)
+            context.user_data.pop("_pending_thread_photos", None)
             context.user_data.pop("_pending_thread_id", None)
-        if pending_text:
-            send_ok, send_msg = await session_manager.send_to_window(
-                selected_wid, pending_text
-            )
-            if not send_ok:
-                logger.warning("Failed to forward pending text: %s", send_msg)
-                await safe_send(
-                    context.bot,
-                    session_manager.resolve_chat_id(user.id, thread_id),
-                    f"❌ Failed to send pending message: {send_msg}",
-                    message_thread_id=thread_id,
+        if pending_text or pending_photos:
+            route = (user.id, thread_id, selected_wid)
+            if pending_text:
+                await aggregator_offer_text(route, pending_text)
+            for path_str, caption, media_group_id in pending_photos:
+                await aggregator_offer_photo(
+                    route,
+                    Path(path_str),
+                    caption,
+                    media_group_id,
                 )
+            await aggregator_flush_route(route)
         await query.answer("Bound")
 
     # Window picker: new session → transition to directory browser
@@ -1706,10 +1905,8 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     Messages are queued per-user to ensure status messages always appear last.
     Routes via thread_bindings to deliver to the correct topic.
     """
-    status = "complete" if msg.is_complete else "streaming"
     logger.info(
-        f"handle_new_message [{status}]: session={msg.session_id}, "
-        f"text_len={len(msg.text)}"
+        f"handle_new_message: session={msg.session_id}, text_len={len(msg.text)}"
     )
 
     # Find users whose thread-bound window matches this session
@@ -1724,8 +1921,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
             # Mark interactive mode BEFORE sleeping so polling skips this window
             set_interactive_mode(user_id, wid, thread_id)
-            # Flush pending messages (e.g. plan content) before sending interactive UI
-            queue = get_message_queue(user_id)
+            # Flush pending content for THIS route only — unrelated topics
+            # must not delay the interactive prompt.
+            queue = get_content_queue((user_id, thread_id or 0, wid))
             if queue:
                 await queue.join()
             # Wait briefly for Claude Code to render the question UI
@@ -1752,48 +1950,58 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await clear_interactive_msg(user_id, bot, thread_id)
 
         # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
-        if not config.show_tool_calls and msg.content_type in ("tool_use", "tool_result"):
+        if not config.show_tool_calls and msg.content_type in (
+            "tool_use",
+            "tool_result",
+        ):
             continue
 
         parts = build_response_parts(
             msg.text,
-            msg.is_complete,
             msg.content_type,
             msg.role,
         )
 
-        if msg.is_complete:
-            # Enqueue content message task
-            # Note: tool_result editing is handled inside _process_content_task
-            # to ensure sequential processing with tool_use message sending
-            await enqueue_content_message(
-                bot=bot,
-                user_id=user_id,
-                window_id=wid,
-                parts=parts,
-                tool_use_id=msg.tool_use_id,
-                content_type=msg.content_type,
-                text=msg.text,
-                thread_id=thread_id,
-                image_data=msg.image_data,
-            )
+        # Enqueue content message task
+        # Note: tool_result editing is handled inside _process_content_task
+        # to ensure sequential processing with tool_use message sending
+        await enqueue_content_message(
+            bot=bot,
+            user_id=user_id,
+            window_id=wid,
+            parts=parts,
+            tool_use_id=msg.tool_use_id,
+            content_type=msg.content_type,
+            text=msg.text,
+            thread_id=thread_id,
+            image_data=msg.image_data,
+            tool_name=msg.tool_name,
+            tool_input=msg.tool_input,
+            transcript_uuid=msg.transcript_uuid,
+        )
 
-            # Update user's read offset to current file position
-            # This marks these messages as "read" for this user
-            session = await session_manager.resolve_session_for_window(wid)
-            if session and session.file_path:
-                try:
-                    file_size = Path(session.file_path).stat().st_size
-                    session_manager.update_user_window_offset(user_id, wid, file_size)
-                except OSError:
-                    pass
+        # Update user's read offset to current file position
+        # This marks these messages as "read" for this user
+        session = await session_manager.resolve_session_for_window(wid)
+        if session and session.file_path:
+            try:
+                file_size = Path(session.file_path).stat().st_size
+                session_manager.update_user_window_offset(user_id, wid, file_size)
+            except OSError:
+                pass
 
 
 # --- App lifecycle ---
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global session_monitor, _status_poll_task, _message_refs_gc_task
+
+    # §2.5.3 Stage 5.c: open the persistent provenance DB before anything
+    # else can write to it. ``post_init`` runs before the message handlers
+    # are exposed, so no race against ``topic_send``'s fire-and-forget
+    # insert tasks.
+    await message_refs.init_db(config.message_refs_db_path)
 
     await application.bot.delete_my_commands()
 
@@ -1832,6 +2040,57 @@ async def post_init(application: Application) -> None:
         await handle_new_message(msg, application.bot)
 
     monitor.set_message_callback(message_callback)
+
+    # Stage 3: event-driven RunState. Gated together with the digest /
+    # status_polling RunState reads — flipping the flag wires both ends so
+    # the indicator never updates state without affecting any UI surface.
+    if config.busy_indicator_v2:
+
+        async def event_callback(event: TranscriptEvent) -> None:
+            active = await session_manager.find_users_for_session(event.session_id)
+            if not active:
+                return
+            routes: list[busy_indicator.Route] = [
+                (user_id, thread_id or 0, wid) for user_id, wid, thread_id in active
+            ]
+            await busy_indicator.on_transcript_event(event, routes)
+
+            # §2.6 narrow trigger: missed end-of-turn questions.
+            # Gate on the predicate first so the per-route fan-out doesn't
+            # walk every state lookup + topic send for normal assistant text.
+            for user_id, wid, thread_id in active:
+                route = (user_id, thread_id or 0, wid)
+                if not attention.is_end_of_turn_question(
+                    event, busy_indicator.state(route)
+                ):
+                    continue
+                excerpt = attention.final_paragraph(event.text)
+                cap = config.attention_question_preview_chars
+                if len(excerpt) > cap:
+                    excerpt = excerpt[: cap - 1].rstrip() + "…"
+                display = session_manager.get_display_name(wid) or wid or "Claude"
+                card_body = f'🔔 Awaiting your reply — {display}\n"{excerpt}"'
+                try:
+                    await attention.notify_waiting(
+                        application.bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        window_id=wid,
+                        prompt_text=card_body,
+                        kind="end_of_turn_question",
+                    )
+                except Exception as e:
+                    logger.error(
+                        "end-of-turn-question notify_waiting failed user=%d "
+                        "thread=%s window=%s: %s",
+                        user_id,
+                        thread_id,
+                        wid,
+                        e,
+                    )
+
+        monitor.set_event_callback(event_callback)
+
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
@@ -1840,9 +2099,14 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # §2.5.3 Stage 5.c: daily GC. Drift in cadence is fine — the only goal
+    # is keeping the table proportional to retention, not exact daily.
+    _message_refs_gc_task = asyncio.create_task(_message_refs_gc_loop())
+    logger.info("message_refs GC task started")
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _message_refs_gc_task
 
     # Stop status polling
     if _status_poll_task:
@@ -1854,6 +2118,17 @@ async def post_shutdown(application: Application) -> None:
         _status_poll_task = None
         logger.info("Status polling stopped")
 
+    # Stop the message_refs GC loop before closing the DB so a tick in
+    # flight can finish its prune cleanly.
+    if _message_refs_gc_task:
+        _message_refs_gc_task.cancel()
+        try:
+            await _message_refs_gc_task
+        except asyncio.CancelledError:
+            pass
+        _message_refs_gc_task = None
+        logger.info("message_refs GC task stopped")
+
     # Stop all queue workers
     await shutdown_workers()
 
@@ -1862,6 +2137,10 @@ async def post_shutdown(application: Application) -> None:
         logger.info("Session monitor stopped")
 
     await close_transcribe_client()
+
+    # Close the message_refs DB last so any final fire-and-forget insert
+    # tasks scheduled by the queue workers above can drain.
+    await message_refs.close()
 
 
 def create_bot() -> Application:
