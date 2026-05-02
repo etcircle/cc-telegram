@@ -139,7 +139,7 @@ from .handlers.message_sender import (
 )
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
-from .handlers.status_polling import status_poll_loop
+from .handlers.status_polling import status_poll_loop, typing_action_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor, TranscriptEvent
@@ -156,6 +156,11 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# Typing-action refresher (V2 indicator only). Decoupled from status_poll_loop
+# so its cadence stays under Telegram's 5s typing TTL regardless of how many
+# bindings exist or how slow tmux capture_pane is.
+_typing_action_task: asyncio.Task | None = None
 
 # §2.5.3 Stage 5.c: daily GC pass for the message_refs SQLite table.
 _message_refs_gc_task: asyncio.Task | None = None
@@ -2091,7 +2096,11 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task, _message_refs_gc_task
+    global \
+        session_monitor, \
+        _status_poll_task, \
+        _typing_action_task, \
+        _message_refs_gc_task
 
     # §2.5.3 Stage 5.c: open the persistent provenance DB before anything
     # else can write to it. ``post_init`` runs before the message handlers
@@ -2195,6 +2204,10 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Start typing-action refresher (V2 only; the function no-ops on V1)
+    _typing_action_task = asyncio.create_task(typing_action_loop(application.bot))
+    logger.info("Typing-action task started")
+
     # §2.5.3 Stage 5.c: daily GC. Drift in cadence is fine — the only goal
     # is keeping the table proportional to retention, not exact daily.
     _message_refs_gc_task = asyncio.create_task(_message_refs_gc_loop())
@@ -2202,7 +2215,7 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task, _message_refs_gc_task
+    global _status_poll_task, _typing_action_task, _message_refs_gc_task
 
     # Stop status polling
     if _status_poll_task:
@@ -2213,6 +2226,16 @@ async def post_shutdown(application: Application) -> None:
             pass
         _status_poll_task = None
         logger.info("Status polling stopped")
+
+    # Stop typing-action refresher
+    if _typing_action_task:
+        _typing_action_task.cancel()
+        try:
+            await _typing_action_task
+        except asyncio.CancelledError:
+            pass
+        _typing_action_task = None
+        logger.info("Typing-action task stopped")
 
     # Stop the message_refs GC loop before closing the DB so a tick in
     # flight can finish its prune cleanly.

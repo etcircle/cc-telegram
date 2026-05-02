@@ -52,6 +52,15 @@ logger = logging.getLogger(__name__)
 # Status polling interval
 STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send layer)
 
+# Typing-action refresh interval. Telegram drops the native typing indicator
+# after ~5s, so we re-emit faster than that. Decoupled from status polling
+# because the per-binding tmux fan-out in ``status_poll_loop`` can push the
+# full cycle past the 5s TTL (~6-8s on macOS with ~14 bindings), making the
+# indicator flash on instead of staying continuous. This loop reads
+# ``busy_indicator.state(route)`` directly with no tmux I/O so cadence stays
+# tight regardless of binding count.
+TYPING_ACTION_INTERVAL = 3.0
+
 # Wall-clock seconds of confirmed idle (post-completion summary or no status
 # line) before the stale "🟡 Busy" message is cleared. Time-based rather than
 # poll-count-based because the polling loop iterates all bindings sequentially
@@ -164,14 +173,12 @@ async def update_status_message(
     # interrupt", and past-tense summaries don't always omit the spinner.
     is_running = bool(status_line) and is_status_active(pane_text)
 
-    # Stage-3 V2: gate the native typing indicator on RunState rather than
-    # pane scraping. The pane signal still drives the visible Busy card and
-    # interactive-UI detection above; only the typing-action gate flips.
-    if config.busy_indicator_v2:
-        run = busy_indicator.state((user_id, thread_id or 0, window_id))
-        typing_active = run in (RunState.RUNNING, RunState.RUNNING_TOOL)
-    else:
-        typing_active = is_running
+    # V1 path: gate typing-action on the pane-derived ``is_running``. V2
+    # delegates the typing-action send to ``typing_action_loop`` (it reads
+    # busy_indicator.state directly with no tmux I/O so cadence stays under
+    # Telegram's 5s TTL even with many bindings). Firing it from both places
+    # would just double-bill the API.
+    typing_active = (not config.busy_indicator_v2) and is_running
 
     if typing_active:
         # Re-emit Telegram's native typing indicator on every active poll
@@ -316,5 +323,71 @@ async def _poll_one_binding(bot: Bot, user_id: int, thread_id: int, wid: str) ->
             "Status update error for user %d thread %d: %s",
             user_id,
             thread_id,
+            e,
+        )
+
+
+async def typing_action_loop(bot: Bot) -> None:
+    """Re-emit Telegram's native typing indicator for every actively-running
+    route on a fixed cadence, independent of pane polling.
+
+    Reads ``busy_indicator.state(route)`` directly: no tmux subprocess fan-out,
+    no per-binding capture_pane. With ~14 bindings the status poller's full
+    cycle empirically lands at 6-8s on macOS, longer than Telegram's ~5s
+    typing-action TTL, so the indicator was flashing rather than holding
+    steady. This loop fires every ``TYPING_ACTION_INTERVAL`` seconds so the
+    cadence stays well under the TTL regardless of binding count.
+
+    V1 (``busy_indicator_v2`` off) keeps the legacy pane-derived path in
+    ``update_status_message``. The two paths are mutually exclusive — when V2
+    is on, ``update_status_message`` skips the typing-action send.
+    """
+    if not config.busy_indicator_v2:
+        logger.info(
+            "Typing-action loop: V2 indicator disabled, deferring to status poller"
+        )
+        return
+    logger.info("Typing-action loop started (interval: %ss)", TYPING_ACTION_INTERVAL)
+    while True:
+        try:
+            bindings = list(session_manager.iter_thread_bindings())
+            sends: list = []
+            for user_id, thread_id, wid in bindings:
+                run = busy_indicator.state((user_id, thread_id or 0, wid))
+                if run not in (RunState.RUNNING, RunState.RUNNING_TOOL):
+                    continue
+                sends.append(_send_typing_action(bot, user_id, thread_id, wid))
+            if sends:
+                await asyncio.gather(*sends, return_exceptions=True)
+        except Exception as e:
+            logger.error("Typing-action loop error: %s", e)
+        await asyncio.sleep(TYPING_ACTION_INTERVAL)
+
+
+async def _send_typing_action(
+    bot: Bot, user_id: int, thread_id: int, wid: str
+) -> None:
+    """Best-effort typing-action send. Failures (rate limit, network) are
+    logged at debug and swallowed — never let one route's failure abort the
+    gather over all routes.
+    """
+    try:
+        await bot.send_chat_action(
+            chat_id=session_manager.resolve_chat_id(user_id, thread_id or None),
+            action=ChatAction.TYPING,
+            message_thread_id=thread_id or None,
+        )
+        logger.debug(
+            "typing_action user=%d thread=%s window=%s sent",
+            user_id,
+            thread_id,
+            wid,
+        )
+    except Exception as e:
+        logger.debug(
+            "typing_action user=%d thread=%s window=%s failed: %s",
+            user_id,
+            thread_id,
+            wid,
             e,
         )
