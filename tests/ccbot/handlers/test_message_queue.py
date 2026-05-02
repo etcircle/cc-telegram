@@ -1185,6 +1185,174 @@ class TestWireOrderRegression:
 
 
 @pytest.mark.usefixtures("_clear_queue_state")
+class TestConvertStatusToContentOrdering:
+    """``_convert_status_to_content`` must NOT repurpose the status into the
+    final text when an activity digest exists at a higher message_id.
+
+    Regression: the status is sent pre-emptively as soon as Claude starts
+    processing (well before the first JSONL emit). The first tool_use then
+    sends a fresh activity digest at a HIGHER message_id. When the final
+    text lands and the conversion repurposes the status (lower id) into the
+    text body, Telegram chat order becomes:
+        - <text> (at status's old position, lower id)
+        - <digest> (sent later for the tool work, higher id)
+    But the tool work happened BEFORE the text — chronological order is
+    backwards. Single-turn / no-tool cases keep the in-place edit
+    optimization (no extra API call).
+    """
+
+    @pytest.mark.asyncio
+    async def test_skips_conversion_when_digest_at_higher_msg_id(
+        self, mock_bot: AsyncMock
+    ):
+        from ccbot.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        window_id = "@7"
+        skey = (user_id, thread_id)
+
+        # Status at message_id=10 (sent first, pre-emptively)
+        mq._status_msg_info[skey] = (10, window_id, "🟡 Busy")
+        # Activity digest at message_id=15 (sent later for tool_use)
+        digest_state = mq.ActivityDigestState(message_id=15, window_id=window_id)
+        mq._activity_msg_info[skey] = digest_state
+
+        topic_delete_calls: list[dict] = []
+        topic_edit_calls: list[dict] = []
+
+        async def fake_delete(*args, **kwargs):
+            topic_delete_calls.append(kwargs)
+            return mq.TopicSendOutcome.OK
+
+        async def fake_edit(*args, **kwargs):
+            topic_edit_calls.append(kwargs)
+            return mq.TopicSendOutcome.OK
+
+        with (
+            patch.object(mq, "topic_delete", new=AsyncMock(side_effect=fake_delete)),
+            patch.object(mq, "topic_edit", new=AsyncMock(side_effect=fake_edit)),
+        ):
+            result = await mq._convert_status_to_content(
+                mock_bot,
+                user_id,
+                thread_id,
+                window_id,
+                "Yes — chooser is rendering correctly.",
+            )
+
+        # The conversion must bail out: status deleted, NOT edited into content.
+        assert result is None, (
+            "Should return None to force the caller to send content fresh; "
+            f"returned {result}"
+        )
+        assert len(topic_delete_calls) == 1, (
+            f"Expected exactly one topic_delete on the status; got {topic_delete_calls}"
+        )
+        assert topic_delete_calls[0]["message_id"] == 10
+        assert topic_delete_calls[0]["op"] == "status"
+        assert topic_edit_calls == [], (
+            f"topic_edit must NOT be called when digest is at higher id; "
+            f"got {topic_edit_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_keeps_conversion_when_no_digest(self, mock_bot: AsyncMock):
+        """Single-turn / no-tool case: conversion still happens (in-place edit
+        optimization). No digest exists for the route, so the status's
+        message_id IS the right slot for the final text."""
+        from ccbot.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        window_id = "@7"
+        skey = (user_id, thread_id)
+
+        mq._status_msg_info[skey] = (10, window_id, "🟡 Busy")
+        # No digest: _activity_msg_info is empty.
+
+        topic_delete_calls: list[dict] = []
+        topic_edit_calls: list[dict] = []
+
+        async def fake_delete(*args, **kwargs):
+            topic_delete_calls.append(kwargs)
+            return mq.TopicSendOutcome.OK
+
+        async def fake_edit(*args, **kwargs):
+            topic_edit_calls.append(kwargs)
+            return mq.TopicSendOutcome.OK
+
+        with (
+            patch.object(mq, "topic_delete", new=AsyncMock(side_effect=fake_delete)),
+            patch.object(mq, "topic_edit", new=AsyncMock(side_effect=fake_edit)),
+        ):
+            result = await mq._convert_status_to_content(
+                mock_bot,
+                user_id,
+                thread_id,
+                window_id,
+                "Quick reply, no tools.",
+            )
+
+        # No digest → conversion proceeds: status edited in place, no delete.
+        assert result == 10, (
+            f"Should return the status's message_id (10) when conversion succeeds; "
+            f"got {result}"
+        )
+        assert topic_delete_calls == [], (
+            f"topic_delete must NOT be called in the no-digest case; "
+            f"got {topic_delete_calls}"
+        )
+        assert len(topic_edit_calls) == 1
+        assert topic_edit_calls[0]["op"] == "content"
+        assert topic_edit_calls[0]["message_id"] == 10
+
+    @pytest.mark.asyncio
+    async def test_keeps_conversion_when_digest_below_status(
+        self, mock_bot: AsyncMock
+    ):
+        """Edge case: digest exists but at a LOWER message_id than the status
+        (e.g. digest from the previous turn that wasn't cleared). The status
+        is still the latest visual cue; conversion is fine — the final text
+        lands at the status's slot, which is below the old digest.
+        """
+        from ccbot.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        window_id = "@7"
+        skey = (user_id, thread_id)
+
+        mq._status_msg_info[skey] = (50, window_id, "🟡 Busy")
+        # Digest at lower id (older).
+        digest_state = mq.ActivityDigestState(message_id=20, window_id=window_id)
+        mq._activity_msg_info[skey] = digest_state
+
+        topic_delete_calls: list[dict] = []
+        topic_edit_calls: list[dict] = []
+
+        async def fake_delete(*args, **kwargs):
+            topic_delete_calls.append(kwargs)
+            return mq.TopicSendOutcome.OK
+
+        async def fake_edit(*args, **kwargs):
+            topic_edit_calls.append(kwargs)
+            return mq.TopicSendOutcome.OK
+
+        with (
+            patch.object(mq, "topic_delete", new=AsyncMock(side_effect=fake_delete)),
+            patch.object(mq, "topic_edit", new=AsyncMock(side_effect=fake_edit)),
+        ):
+            result = await mq._convert_status_to_content(
+                mock_bot, user_id, thread_id, window_id, "Final text."
+            )
+
+        assert result == 50
+        assert topic_delete_calls == []
+        assert len(topic_edit_calls) == 1
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
 class TestActivityDigestHeader:
     """Render the digest header from RunState + context_pct under V2 flag."""
 

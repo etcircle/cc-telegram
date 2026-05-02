@@ -1429,6 +1429,30 @@ async def _convert_status_to_content(
         )
         return None
 
+    # If an activity digest exists for this route at a HIGHER message_id than
+    # the status, repurposing the status into content would put the final text
+    # ABOVE the digest in chat order — wrong, because the digest covers
+    # tool_use that ran BEFORE the final text. Delete the status and let the
+    # caller send content fresh (it'll get a message_id higher than the
+    # digest, landing chronologically after it). Single-turn / no-tool cases
+    # keep the in-place edit optimization.
+    digest_state = _activity_msg_info.get(skey)
+    if (
+        digest_state is not None
+        and digest_state.message_id
+        and digest_state.message_id > msg_id
+    ):
+        await topic_delete(
+            bot,
+            op="status",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=effective_thread_id,
+            window_id=stored_wid,
+            message_id=msg_id,
+        )
+        return None
+
     # Edit status message to show content (op=content because the message is
     # being repurposed as the first content message).
     outcome = await topic_edit(
