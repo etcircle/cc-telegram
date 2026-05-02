@@ -1308,9 +1308,7 @@ class TestConvertStatusToContentOrdering:
         assert topic_edit_calls[0]["message_id"] == 10
 
     @pytest.mark.asyncio
-    async def test_keeps_conversion_when_digest_below_status(
-        self, mock_bot: AsyncMock
-    ):
+    async def test_keeps_conversion_when_digest_below_status(self, mock_bot: AsyncMock):
         """Edge case: digest exists but at a LOWER message_id than the status
         (e.g. digest from the previous turn that wasn't cleared). The status
         is still the latest visual cue; conversion is fine — the final text
@@ -2088,3 +2086,384 @@ class TestReplyParametersAnchor:
         message_queue._get_or_create_route(mock_bot, route)
         await message_queue.teardown_route(route, drop_pending=True)
         assert message_queue._route_last_user_message.get(route) is None
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestEmergencyDmReactiveCleanup:
+    """A topic-shaped failure proves the topic is gone — kill the orphan window.
+
+    Telegram does not emit ``forum_topic_deleted`` to bots, so a deleted topic
+    is only detectable from a failed send. ``_emergency_dm`` must therefore
+    perform the same cleanup ``topic_closed_handler`` does (kill window,
+    unbind, clear state) on the first TOPIC_NOT_FOUND/TOPIC_CLOSED for a
+    given (user, thread).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_bad_topics(self):
+        message_queue._bad_topic_threads.clear()
+        yield
+        message_queue._bad_topic_threads.clear()
+
+    async def _drain_pending_tasks(self) -> None:
+        """Run any tasks scheduled via asyncio.create_task during the test."""
+        # Two yields cover create_task → cleanup awaits → completion.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    def _patch_cleanup_targets(self):
+        """Patch tmux + session manager + clear_topic_state so cleanup is observable."""
+        from ccbot.handlers import cleanup as cleanup_mod
+
+        find_window = AsyncMock()
+        fake_window = MagicMock()
+        fake_window.window_id = "@0"
+        find_window.return_value = fake_window
+        kill_window = AsyncMock(return_value=True)
+        unbind = MagicMock(return_value="@0")
+        get_display = MagicMock(return_value="my-topic")
+        clear_state = AsyncMock()
+        should_emit = MagicMock(return_value=True)
+
+        return (
+            patch.object(message_queue.tmux_manager, "find_window_by_id", find_window),
+            patch.object(message_queue.tmux_manager, "kill_window", kill_window),
+            patch.object(message_queue.session_manager, "unbind_thread", unbind),
+            patch.object(
+                message_queue.session_manager, "get_display_name", get_display
+            ),
+            patch.object(cleanup_mod, "clear_topic_state", clear_state),
+            patch.object(
+                message_queue.attention, "should_emit_emergency_dm", should_emit
+            ),
+            find_window,
+            kill_window,
+            unbind,
+            clear_state,
+        )
+
+    @pytest.mark.asyncio
+    async def test_topic_not_found_kills_window_once(self, mock_bot: AsyncMock):
+        (
+            p_find,
+            p_kill,
+            p_unbind,
+            p_display,
+            p_clear,
+            p_should_emit,
+            find_window,
+            kill_window,
+            unbind,
+            clear_state,
+        ) = self._patch_cleanup_targets()
+
+        with p_find, p_kill, p_unbind, p_display, p_clear, p_should_emit:
+            # First failure: triggers cleanup.
+            await message_queue._emergency_dm(
+                mock_bot,
+                user_id=1,
+                thread_id=100,
+                window_id="@0",
+                text="hello",
+                kind="content",
+                outcome=message_queue.TopicSendOutcome.TOPIC_NOT_FOUND,
+            )
+            # Second failure on same topic: must NOT trigger cleanup again.
+            await message_queue._emergency_dm(
+                mock_bot,
+                user_id=1,
+                thread_id=100,
+                window_id="@0",
+                text="hello again",
+                kind="content",
+                outcome=message_queue.TopicSendOutcome.TOPIC_NOT_FOUND,
+            )
+            await self._drain_pending_tasks()
+
+        kill_window.assert_awaited_once_with("@0")
+        unbind.assert_called_once_with(1, 100)
+        clear_state.assert_awaited_once()
+        # Bad-topic set was populated so future sends route to DM.
+        assert (1, 100) in message_queue._bad_topic_threads
+
+    @pytest.mark.asyncio
+    async def test_topic_closed_also_triggers_cleanup(self, mock_bot: AsyncMock):
+        (
+            p_find,
+            p_kill,
+            p_unbind,
+            p_display,
+            p_clear,
+            p_should_emit,
+            _find_window,
+            kill_window,
+            unbind,
+            clear_state,
+        ) = self._patch_cleanup_targets()
+
+        with p_find, p_kill, p_unbind, p_display, p_clear, p_should_emit:
+            await message_queue._emergency_dm(
+                mock_bot,
+                user_id=2,
+                thread_id=200,
+                window_id="@5",
+                text="x",
+                kind="status",
+                outcome=message_queue.TopicSendOutcome.TOPIC_CLOSED,
+            )
+            await self._drain_pending_tasks()
+
+        kill_window.assert_awaited_once()
+        unbind.assert_called_once_with(2, 200)
+        clear_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_forbidden_does_not_trigger_cleanup(self, mock_bot: AsyncMock):
+        (
+            p_find,
+            p_kill,
+            p_unbind,
+            p_display,
+            p_clear,
+            p_should_emit,
+            _find_window,
+            kill_window,
+            unbind,
+            clear_state,
+        ) = self._patch_cleanup_targets()
+
+        with p_find, p_kill, p_unbind, p_display, p_clear, p_should_emit:
+            # FORBIDDEN is chat-level (bot kicked / lost permission). Do NOT
+            # nuke the underlying tmux window — the window can outlive the
+            # bot's Telegram access.
+            await message_queue._emergency_dm(
+                mock_bot,
+                user_id=3,
+                thread_id=300,
+                window_id="@7",
+                text="x",
+                kind="content",
+                outcome=message_queue.TopicSendOutcome.FORBIDDEN,
+            )
+            await self._drain_pending_tasks()
+
+        kill_window.assert_not_awaited()
+        unbind.assert_not_called()
+        clear_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_other_outcome_does_not_trigger_cleanup(self, mock_bot: AsyncMock):
+        (
+            p_find,
+            p_kill,
+            p_unbind,
+            p_display,
+            p_clear,
+            p_should_emit,
+            _find_window,
+            kill_window,
+            unbind,
+            clear_state,
+        ) = self._patch_cleanup_targets()
+
+        with p_find, p_kill, p_unbind, p_display, p_clear, p_should_emit:
+            await message_queue._emergency_dm(
+                mock_bot,
+                user_id=4,
+                thread_id=400,
+                window_id="@9",
+                text="x",
+                kind="content",
+                outcome=message_queue.TopicSendOutcome.OTHER,
+            )
+            await self._drain_pending_tasks()
+
+        kill_window.assert_not_awaited()
+        unbind.assert_not_called()
+        clear_state.assert_not_awaited()
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestProbeTopicLiveness:
+    """Daily probe catches deleted topics whose sessions were dormant.
+
+    Telegram never delivers ``forum_topic_deleted``; ``_emergency_dm`` only
+    fires on an outbound attempt. Without the probe, an idle session whose
+    topic was deleted would leak its tmux window forever.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_state_and_bindings(self):
+        message_queue._bad_topic_threads.clear()
+        # Snapshot/restore real session_manager.thread_bindings so the probe
+        # walks our test-only bindings without polluting state.json.
+        from ccbot.session import session_manager
+
+        original_bindings = dict(session_manager.thread_bindings)
+        session_manager.thread_bindings.clear()
+        yield
+        session_manager.thread_bindings.clear()
+        session_manager.thread_bindings.update(original_bindings)
+        message_queue._bad_topic_threads.clear()
+
+    def _set_bindings(self, bindings: dict[int, dict[int, str]]) -> None:
+        from ccbot.session import session_manager
+
+        session_manager.thread_bindings.clear()
+        session_manager.thread_bindings.update(bindings)
+
+    def _patch_targets(self, send_chat_action: AsyncMock):
+        """Patch tmux + session manager + clear_topic_state + chat-action."""
+        from ccbot.handlers import cleanup as cleanup_mod
+
+        find_window = AsyncMock()
+        fake_window = MagicMock()
+        fake_window.window_id = "@0"
+        find_window.return_value = fake_window
+        kill_window = AsyncMock(return_value=True)
+        unbind = MagicMock(return_value="@0")
+        get_display = MagicMock(return_value="my-topic")
+        clear_state = AsyncMock()
+        resolve_chat = MagicMock(side_effect=lambda u, t=None: u)
+
+        return (
+            patch.object(message_queue.tmux_manager, "find_window_by_id", find_window),
+            patch.object(message_queue.tmux_manager, "kill_window", kill_window),
+            patch.object(message_queue.session_manager, "unbind_thread", unbind),
+            patch.object(
+                message_queue.session_manager, "get_display_name", get_display
+            ),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", resolve_chat
+            ),
+            patch.object(cleanup_mod, "clear_topic_state", clear_state),
+            kill_window,
+            unbind,
+            clear_state,
+            send_chat_action,
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_alive_no_cleanup(self, mock_bot: AsyncMock):
+        """When sendChatAction succeeds for every topic, no cleanup runs."""
+        self._set_bindings({1: {100: "@0", 101: "@1"}})
+        mock_bot.send_chat_action = AsyncMock(return_value=True)
+        (
+            p_find,
+            p_kill,
+            p_unbind,
+            p_disp,
+            p_resolve,
+            p_clear,
+            kill_window,
+            unbind,
+            clear_state,
+            send_chat_action,
+        ) = self._patch_targets(mock_bot.send_chat_action)
+
+        with p_find, p_kill, p_unbind, p_disp, p_resolve, p_clear:
+            await message_queue.probe_topic_liveness(mock_bot)
+
+        assert send_chat_action.await_count == 2
+        kill_window.assert_not_awaited()
+        unbind.assert_not_called()
+        clear_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dead_topic_triggers_cleanup(self, mock_bot: AsyncMock):
+        """A TOPIC_NOT_FOUND on one binding cleans only that binding."""
+        from telegram.error import BadRequest
+
+        self._set_bindings({1: {100: "@0", 101: "@1"}})
+
+        async def fake_action(**kwargs):
+            if kwargs.get("message_thread_id") == 100:
+                raise BadRequest("message thread not found")
+            return True
+
+        mock_bot.send_chat_action = AsyncMock(side_effect=fake_action)
+
+        (
+            p_find,
+            p_kill,
+            p_unbind,
+            p_disp,
+            p_resolve,
+            p_clear,
+            kill_window,
+            unbind,
+            clear_state,
+            _,
+        ) = self._patch_targets(mock_bot.send_chat_action)
+
+        with p_find, p_kill, p_unbind, p_disp, p_resolve, p_clear:
+            await message_queue.probe_topic_liveness(mock_bot)
+
+        # Only the dead topic gets cleaned.
+        kill_window.assert_awaited_once()
+        unbind.assert_called_once_with(1, 100)
+        clear_state.assert_awaited_once()
+        # Dead topic recorded so reactive _emergency_dm won't double-clean.
+        assert (1, 100) in message_queue._bad_topic_threads
+        assert (1, 101) not in message_queue._bad_topic_threads
+
+    @pytest.mark.asyncio
+    async def test_already_bad_topic_skipped(self, mock_bot: AsyncMock):
+        """Topics already in _bad_topic_threads are not probed again."""
+        self._set_bindings({1: {100: "@0"}})
+        message_queue._bad_topic_threads.add((1, 100))
+        mock_bot.send_chat_action = AsyncMock(return_value=True)
+
+        (
+            p_find,
+            p_kill,
+            p_unbind,
+            p_disp,
+            p_resolve,
+            p_clear,
+            kill_window,
+            unbind,
+            clear_state,
+            send_chat_action,
+        ) = self._patch_targets(mock_bot.send_chat_action)
+
+        with p_find, p_kill, p_unbind, p_disp, p_resolve, p_clear:
+            await message_queue.probe_topic_liveness(mock_bot)
+
+        send_chat_action.assert_not_awaited()
+        kill_window.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_aborts_iteration(self, mock_bot: AsyncMock):
+        """RetryAfter on the probe defers the rest to the next daily tick."""
+        self._set_bindings({1: {100: "@0", 101: "@1", 102: "@2"}})
+
+        call_count = {"n": 0}
+
+        async def fake_action(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RetryAfter(retry_after=30)
+            return True
+
+        mock_bot.send_chat_action = AsyncMock(side_effect=fake_action)
+
+        (
+            p_find,
+            p_kill,
+            p_unbind,
+            p_disp,
+            p_resolve,
+            p_clear,
+            kill_window,
+            unbind,
+            clear_state,
+            _,
+        ) = self._patch_targets(mock_bot.send_chat_action)
+
+        with p_find, p_kill, p_unbind, p_disp, p_resolve, p_clear:
+            await message_queue.probe_topic_liveness(mock_bot)
+
+        # Probed first OK, second raised RetryAfter; third never reached.
+        assert call_count["n"] == 2
+        kill_window.assert_not_awaited()

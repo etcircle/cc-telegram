@@ -125,6 +125,7 @@ from .handlers.message_queue import (
     enqueue_content_message,
     enqueue_status_update,
     get_content_queue,
+    probe_topic_liveness,
     set_route_last_user_message,
     shutdown_workers,
 )
@@ -167,7 +168,7 @@ _message_refs_gc_task: asyncio.Task | None = None
 _MESSAGE_REFS_GC_INTERVAL_SECONDS = 24 * 60 * 60
 
 
-async def _message_refs_gc_loop() -> None:
+async def _message_refs_gc_loop(bot: Bot) -> None:
     """Once-per-day prune of rows older than the retention window.
 
     Long-sleep + cancel-aware shape mirrors ``status_poll_loop``. A SQLite
@@ -196,6 +197,16 @@ async def _message_refs_gc_loop() -> None:
             raise
         except Exception as e:
             logger.warning("attention token GC iteration failed: %s", e)
+        # Topic-liveness probe: catch silently-deleted topics whose sessions
+        # are dormant (reactive cleanup in _emergency_dm covers the active
+        # case). Telegram does not emit forum_topic_deleted, so this once-a-
+        # day probe is the only fallback for the dormant case.
+        try:
+            await probe_topic_liveness(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("topic liveness probe iteration failed: %s", e)
         try:
             await asyncio.sleep(_MESSAGE_REFS_GC_INTERVAL_SECONDS)
         except asyncio.CancelledError:
@@ -336,6 +347,57 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"✅ Topic unbound from window '{display}'.\n"
         "The Claude session is still running in tmux.\n"
         "Send a message to bind to a new session.",
+    )
+
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kill this topic's tmux window and clear bot state. Topic stays open in Telegram."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    display = session_manager.get_display_name(wid)
+    w = await tmux_manager.find_window_by_id(wid)
+    if w:
+        await tmux_manager.kill_window(w.window_id)
+        logger.info(
+            "/kill: killed window %s (user=%d, thread=%d)",
+            display,
+            user.id,
+            thread_id,
+        )
+    else:
+        logger.info(
+            "/kill: window %s already gone (user=%d, thread=%d)",
+            display,
+            user.id,
+            thread_id,
+        )
+    session_manager.unbind_thread(user.id, thread_id)
+    await clear_topic_state(
+        user.id,
+        thread_id,
+        context.bot,
+        context.user_data,
+        drop_pending=True,
+    )
+
+    await safe_reply(
+        update.message,
+        f"✅ Killed session '{display}'.\n"
+        "Topic remains open — send a message to bind to a new session.",
     )
 
 
@@ -1517,6 +1579,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         new_path_str = str(new_path)
+        logger.info(
+            "CB_DIR_SELECT: idx=%d name=%s current=%s -> new=%s (user=%d, thread=%s)",
+            idx,
+            subdir_name,
+            current_path,
+            new_path_str,
+            user.id,
+            pending_tid,
+        )
         if context.user_data is not None:
             context.user_data[BROWSE_PATH_KEY] = new_path_str
             context.user_data[BROWSE_PAGE_KEY] = 0
@@ -1802,6 +1873,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         clear_window_picker_state(context.user_data)
         start_path = str(config.browse_root)
         msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        logger.info(
+            "CB_WIN_NEW: opening directory browser at %s (subdirs=%d, user=%d, thread=%s)",
+            start_path,
+            len(subdirs),
+            user.id,
+            pending_tid,
+        )
         if context.user_data is not None:
             context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
             context.user_data[BROWSE_PATH_KEY] = start_path
@@ -2123,7 +2201,7 @@ async def post_init(application: Application) -> None:
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("kill", "Kill session and delete topic"),
+        BotCommand("kill", "Kill session, leave topic open"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
     ]
@@ -2218,7 +2296,7 @@ async def post_init(application: Application) -> None:
 
     # §2.5.3 Stage 5.c: daily GC. Drift in cadence is fine — the only goal
     # is keeping the table proportional to retention, not exact daily.
-    _message_refs_gc_task = asyncio.create_task(_message_refs_gc_loop())
+    _message_refs_gc_task = asyncio.create_task(_message_refs_gc_loop(application.bot))
     logger.info("message_refs GC task started")
 
 
@@ -2286,6 +2364,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
+    application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("usage", usage_command))
     # §2.9: pattern-scoped handler MUST be registered before the catch-all
     # ``callback_handler`` so PTB dispatches ``attn:*`` clicks here.

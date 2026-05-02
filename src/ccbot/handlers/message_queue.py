@@ -39,6 +39,7 @@ from . import attention, busy_indicator
 from .busy_indicator import RunState
 from .message_sender import (
     TopicSendOutcome,
+    _classify_bad_request,
     send_photo,
     send_with_fallback,
     strip_sentinels,
@@ -617,8 +618,7 @@ async def _message_queue_worker(bot: Bot, route: Route) -> None:
             try:
                 if task is not None:
                     logger.info(
-                        "worker_dequeue route=%s task_type=%s ctype=%s "
-                        "wid=%s qsize=%d",
+                        "worker_dequeue route=%s task_type=%s ctype=%s wid=%s qsize=%d",
                         route,
                         task.task_type,
                         task.content_type,
@@ -670,6 +670,130 @@ def _mark_bad_topic(user_id: int, thread_id: int | None) -> None:
         _bad_topic_threads.add((user_id, thread_id))
 
 
+# Outcomes that prove the topic itself is gone (deleted) or unreachable
+# (closed). Telegram does not emit a ``forum_topic_deleted`` service message,
+# so a failed send is the only signal we ever get for deletion. ``TOPIC_CLOSED``
+# is included as a fallback in case the dedicated ``FORUM_TOPIC_CLOSED``
+# handler missed the event (bot down at close time, privacy-mode quirk, etc).
+_TOPIC_GONE_OUTCOMES: frozenset[TopicSendOutcome] = frozenset(
+    {TopicSendOutcome.TOPIC_NOT_FOUND, TopicSendOutcome.TOPIC_CLOSED}
+)
+
+
+async def _orphan_window_for_dead_topic(
+    bot: Bot,
+    user_id: int,
+    thread_id: int,
+    window_id: str,
+    outcome: TopicSendOutcome,
+) -> None:
+    """Mirror ``topic_closed_handler`` cleanup when a send proves the topic is gone.
+
+    Invoked once per topic transition from ``_emergency_dm``. Spawned as a
+    detached task because ``clear_topic_state`` calls ``teardown_route`` on
+    the worker route currently executing this code path — awaiting it inline
+    would deadlock on ``inflight.wait()``.
+    """
+    display = session_manager.get_display_name(window_id) or window_id
+    window = await tmux_manager.find_window_by_id(window_id)
+    if window is not None:
+        await tmux_manager.kill_window(window.window_id)
+    session_manager.unbind_thread(user_id, thread_id)
+    # Lazy import: ``handlers.cleanup`` imports from this module.
+    from . import cleanup as _cleanup
+
+    await _cleanup.clear_topic_state(
+        user_id, thread_id, bot, user_data=None, drop_pending=True
+    )
+    logger.info(
+        "Reactive topic cleanup: outcome=%s killed window %s "
+        "(user=%d, thread=%d) — no service message; topic deleted "
+        "or close was missed",
+        outcome.value,
+        display,
+        user_id,
+        thread_id,
+    )
+
+
+# Tiny inter-probe pause so a user with many bindings doesn't get a thundering
+# herd of typing actions on the daily tick.
+_PROBE_INTER_DELAY_SECONDS = 0.1
+
+
+async def probe_topic_liveness(bot: Bot) -> None:
+    """Detect silently-deleted topics on a daily tick.
+
+    Telegram does not emit ``forum_topic_deleted`` to bots, so a topic the
+    user deleted while its session was idle would never surface — reactive
+    cleanup in ``_emergency_dm`` only runs when something tries to send. This
+    probe walks each bound topic and treats ``TOPIC_NOT_FOUND`` /
+    ``TOPIC_CLOSED`` as evidence the topic is gone, then runs the same
+    cleanup ``topic_closed_handler`` does.
+
+    Probe call: ``sendChatAction(typing, message_thread_id=...)``. Cheapest
+    side-effect-free RPC that reports the topic-shaped failures we care
+    about. The 5-second typing flicker on a dormant topic is essentially
+    invisible — no service message, no notification, no persistent UI.
+
+    Safe to ``await _orphan_window_for_dead_topic`` inline here: the probe
+    runs from the daily GC task, NOT from inside any per-route worker, so
+    ``teardown_route``'s ``inflight.wait()`` will not deadlock.
+    """
+    snapshot: list[tuple[int, int, str]] = []
+    for user_id, bindings in list(session_manager.thread_bindings.items()):
+        for thread_id, window_id in list(bindings.items()):
+            if (user_id, thread_id) in _bad_topic_threads:
+                continue
+            snapshot.append((user_id, thread_id, window_id))
+
+    if not snapshot:
+        return
+
+    cleaned = 0
+    for user_id, thread_id, window_id in snapshot:
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+        try:
+            await bot.send_chat_action(
+                chat_id=chat_id,
+                action="typing",
+                message_thread_id=thread_id,
+            )
+        except RetryAfter:
+            # Don't fight the global limiter on a best-effort probe; the
+            # remaining bindings get checked on the next daily tick.
+            logger.info(
+                "topic liveness probe deferred by RetryAfter at user=%d thread=%d",
+                user_id,
+                thread_id,
+            )
+            return
+        except Exception as exc:
+            outcome = _classify_bad_request(exc)
+            if outcome in _TOPIC_GONE_OUTCOMES:
+                _mark_bad_topic(user_id, thread_id)
+                await _orphan_window_for_dead_topic(
+                    bot, user_id, thread_id, window_id, outcome
+                )
+                cleaned += 1
+            else:
+                logger.debug(
+                    "topic_liveness probe non-gone failure user=%d thread=%d "
+                    "outcome=%s err=%r",
+                    user_id,
+                    thread_id,
+                    outcome.value,
+                    exc,
+                )
+        await asyncio.sleep(_PROBE_INTER_DELAY_SECONDS)
+
+    logger.info(
+        "topic liveness probe checked %d binding(s), cleaned %d dead topic(s)",
+        len(snapshot),
+        cleaned,
+    )
+
+
 async def _emergency_dm(
     bot: Bot,
     user_id: int,
@@ -687,8 +811,32 @@ async def _emergency_dm(
     Claude output and "needs your input" cues do not silently vanish when the
     topic is truly broken. Stage 3 (topic_repair) will reopen/recreate before
     we land here.
+
+    On the first occurrence of TOPIC_NOT_FOUND/TOPIC_CLOSED for a given
+    ``(user_id, thread_id)`` we also fire reactive cleanup of the orphaned
+    tmux window — Telegram does not notify bots of topic deletion, so this
+    failed send is the only deletion signal we get.
     """
+    # Sample membership before _mark_bad_topic mutates the set so the cleanup
+    # fires exactly once per topic transition. Check + mark are both sync, no
+    # await between them, so concurrent _emergency_dm calls cannot both observe
+    # ``already_marked=False``.
+    already_marked = (
+        thread_id is not None and (user_id, thread_id) in _bad_topic_threads
+    )
     _mark_bad_topic(user_id, thread_id)
+    if (
+        not already_marked
+        and thread_id is not None
+        and window_id
+        and outcome in _TOPIC_GONE_OUTCOMES
+    ):
+        # Detached task: clear_topic_state tears down the current worker's
+        # route; awaiting it from inside the worker would deadlock on
+        # teardown_route's inflight.wait().
+        asyncio.create_task(
+            _orphan_window_for_dead_topic(bot, user_id, thread_id, window_id, outcome)
+        )
     display = session_manager.get_display_name(window_id) if window_id else "unknown"
     if not attention.should_emit_emergency_dm(user_id, thread_id, window_id):
         logger.debug(

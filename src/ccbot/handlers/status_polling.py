@@ -364,9 +364,7 @@ async def typing_action_loop(bot: Bot) -> None:
         await asyncio.sleep(TYPING_ACTION_INTERVAL)
 
 
-async def _send_typing_action(
-    bot: Bot, user_id: int, thread_id: int, wid: str
-) -> None:
+async def _send_typing_action(bot: Bot, user_id: int, thread_id: int, wid: str) -> None:
     """Best-effort typing-action send. Failures (rate limit, network) are
     logged at debug and swallowed — never let one route's failure abort the
     gather over all routes.
