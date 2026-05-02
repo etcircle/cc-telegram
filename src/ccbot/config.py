@@ -212,6 +212,19 @@ class Config:
         except ValueError:
             self.message_ref_text_max_chars = 4000
 
+        # Directory-browser starting point. Defaults to ``~`` so the picker
+        # opens in the user's home regardless of where the bot was launched
+        # from. Previously defaulted to Path.cwd(), which surfaced ccbot's
+        # own repo when restarted from inside the project tree — surprising
+        # and OS-coupled. Override with CCBOT_BROWSE_ROOT to pin a specific
+        # workspace directory.
+        browse_root_env = os.getenv("CCBOT_BROWSE_ROOT")
+        self.browse_root: Path = (
+            Path(browse_root_env).expanduser().resolve()
+            if browse_root_env
+            else Path.home()
+        )
+
         # OpenAI API for voice message transcription (optional)
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(
