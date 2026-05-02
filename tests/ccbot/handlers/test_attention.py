@@ -12,6 +12,7 @@ topic-first attention card stays predictable:
     dwell window (the regression in the architect review).
 """
 
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -645,3 +646,165 @@ def test_should_emit_emergency_dm_distinct_routes_independent():
     # Different thread/window forms a distinct waiting episode.
     assert attention.should_emit_emergency_dm(1, 11, "@0") is True
     assert attention.should_emit_emergency_dm(1, 10, "@1") is True
+
+
+# ── §2.9 Inline-keyboard buttons on end-of-turn-question cards ────────────
+
+
+@pytest.mark.usefixtures("_reset_attention", "mock_session_manager")
+class TestAttentionButtons:
+    @pytest.mark.asyncio
+    async def test_end_of_turn_card_includes_three_buttons(self):
+        from telegram import InlineKeyboardMarkup
+
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with patch(
+            "ccbot.handlers.attention.topic_send",
+            new_callable=AsyncMock,
+        ) as mock_send:
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text='🔔 Awaiting your reply — ccbot\n"Want me to do X?"',
+                kind="end_of_turn_question",
+            )
+
+            kwargs = mock_send.await_args.kwargs
+            markup = kwargs.get("reply_markup")
+            assert isinstance(markup, InlineKeyboardMarkup)
+            buttons = list(markup.inline_keyboard[0])
+            assert len(buttons) == 3
+            assert buttons[0].callback_data is not None
+            assert buttons[0].callback_data.startswith("attn:yes:")
+            assert buttons[1].callback_data is not None
+            assert buttons[1].callback_data.startswith("attn:no:")
+            assert buttons[2].callback_data is not None
+            assert buttons[2].callback_data.startswith("attn:type:")
+
+    @pytest.mark.asyncio
+    async def test_other_attention_kinds_no_attn_buttons(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with patch(
+            "ccbot.handlers.attention.topic_send",
+            new_callable=AsyncMock,
+        ) as mock_send:
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text="Do you want me to proceed?",
+                kind="interactive_ui",
+            )
+
+            kwargs = mock_send.await_args.kwargs
+            # interactive_ui cards must not carry the §2.9 attn:* buttons.
+            # (They get their own keyboards rendered by interactive_ui.py.)
+            markup = kwargs.get("reply_markup")
+            if markup is None:
+                return
+            for row in markup.inline_keyboard:
+                for btn in row:
+                    assert not (
+                        btn.callback_data and btn.callback_data.startswith("attn:")
+                    )
+
+    @pytest.mark.asyncio
+    async def test_attention_buttons_disabled_via_flag(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "ccbot.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch.object(attention.config, "attention_buttons", False),
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text='🔔 Awaiting your reply — ccbot\n"Want me to do X?"',
+                kind="end_of_turn_question",
+            )
+
+            kwargs = mock_send.await_args.kwargs
+            markup = kwargs.get("reply_markup")
+            # Either no markup at all, or a markup that has no attn:* buttons.
+            if markup is None:
+                return
+            for row in markup.inline_keyboard:
+                for btn in row:
+                    assert not (
+                        btn.callback_data and btn.callback_data.startswith("attn:")
+                    )
+
+    @pytest.mark.asyncio
+    async def test_consume_attention_token_returns_route_then_none(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with patch(
+            "ccbot.handlers.attention.topic_send",
+            new_callable=AsyncMock,
+        ) as mock_send:
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text='🔔 Awaiting your reply — ccbot\n"Want me to do X?"',
+                kind="end_of_turn_question",
+            )
+
+            kwargs = mock_send.await_args.kwargs
+            markup = kwargs.get("reply_markup")
+            assert markup is not None
+            cb = markup.inline_keyboard[0][0].callback_data
+            assert cb is not None
+            token = cb.split(":", 2)[2]
+
+            entry = attention.consume_attention_token(token)
+            assert entry is not None
+            assert entry.route == (1, 10, "@0")
+            # Idempotency: second call returns None.
+            assert attention.consume_attention_token(token) is None
+
+
+@pytest.mark.usefixtures("_reset_attention")
+def test_prune_expired_attention_tokens_drops_old_entries():
+    # Inject one fresh entry and one backdated entry.
+    fresh = "fresh-token"
+    stale = "stale-token"
+    now = time.monotonic()
+    attention._attention_callback_routes[fresh] = attention._AttentionCallbackEntry(
+        route=(1, 10, "@0"),
+        created_at=now,
+        rendered_text="body",
+        parse_mode="MarkdownV2",
+    )
+    # Older than the default TTL (86400) — backdate by 2 days.
+    attention._attention_callback_routes[stale] = attention._AttentionCallbackEntry(
+        route=(1, 10, "@0"),
+        created_at=now - (2 * 86400),
+        rendered_text="body",
+        parse_mode="MarkdownV2",
+    )
+
+    dropped = attention.prune_expired_attention_tokens()
+
+    assert dropped == 1
+    assert fresh in attention._attention_callback_routes
+    assert stale not in attention._attention_callback_routes

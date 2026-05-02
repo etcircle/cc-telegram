@@ -29,13 +29,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import secrets
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
+from ..config import config
 from ..session import session_id_for_window, session_manager
+from .inbound_aggregator import Route
 from .message_sender import (
     TopicSendOutcome,
     strip_sentinels,
@@ -73,6 +76,21 @@ _TRAILING_MARKDOWN_CHARS = ".!*_~`)]}>"
 # Ack trailer text on dismiss. Kept short: the user already saw the prompt.
 DISMISS_TRAILER = "✅ Acknowledged — Claude is no longer waiting."
 
+# §2.9 Inline-keyboard buttons on end-of-turn-question attention cards.
+# Default 24h matches the configured ``attention_button_ttl_seconds`` default;
+# kept as a module constant so tests can patch it without forcing a Config
+# rebuild.
+ATTENTION_BUTTON_TTL_SECONDS = 86400
+
+# Trailer appended to the card body when the user clicks one of the §2.9
+# buttons. The buttons are removed from the message in the same edit; this
+# trailer is the only audit signal that the card was answered.
+VERB_LABELS: dict[str, str] = {
+    "yes": "✅ Replied: yes",
+    "no": "❌ Replied: no",
+    "type": "💬 Reply in chat",
+}
+
 
 @dataclass
 class AttentionState:
@@ -86,9 +104,36 @@ class AttentionState:
     kind: str
 
 
+@dataclass
+class _AttentionCallbackEntry:
+    """Per-token state for a §2.9 attention-card inline-keyboard.
+
+    ``rendered_text`` is the body that was passed to ``topic_send`` so the
+    callback handler can reconstruct the original message verbatim on edit
+    (Telegram's ``query.message.text`` returns the rendered plain view with
+    MarkdownV2 entities stripped, which would corrupt formatting on a naive
+    re-edit). ``parse_mode`` is the parse_mode the original send used so the
+    edit goes back through the same formatter.
+    """
+
+    route: Route
+    created_at: float
+    rendered_text: str
+    parse_mode: str | None
+
+
 # Keyed by ``(user_id, thread_id_or_0)`` so DM-only routes (thread_id is None)
 # still get a stable card slot.
 _attention_state: dict[tuple[int, int], AttentionState] = {}
+
+
+# §2.9: short-lived token → ``_AttentionCallbackEntry`` map. The token is
+# encoded into the inline-keyboard ``callback_data`` so we don't have to pack
+# the (user_id, thread_id, window_id) route into Telegram's 64-byte
+# callback_data cap. Single-use: the callback handler pops the entry on
+# click. Stale entries are pruned by ``prune_expired_attention_tokens`` on
+# the daily GC tick.
+_attention_callback_routes: dict[str, _AttentionCallbackEntry] = {}
 
 
 # Cross-module fence for emergency "Claude is waiting" DMs. interactive_ui
@@ -421,26 +466,77 @@ async def notify_waiting(
         )
         _attention_state.pop(key, None)
 
-    # IDLE → WAITING: send a fresh, audible card.
-    sent, outcome = await topic_send(
-        bot,
-        op="attention",
-        user_id=user_id,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        window_id=window_id,
-        text=text,
-        disable_notification=False,
-        # §2.5.5: attention cards are bot UI, not Claude output — write
-        # role="activity" so a quote-reply renders with the UI-noise header
-        # instead of being treated as load-bearing assistant conversation.
-        role="activity",
-        content_type="activity",
-        session_id=session_id_for_window(window_id),
-    )
+    # §2.9: only end-of-turn-question cards carry the inline-keyboard. Other
+    # ``kind`` values (interactive_ui) keep their existing surface untouched —
+    # interactive_ui already renders its own keyboards via
+    # ``interactive_ui.py``.
+    reply_markup: InlineKeyboardMarkup | None = None
+    pending_token: str | None = None
+    if kind == "end_of_turn_question" and getattr(config, "attention_buttons", True):
+        pending_token = _make_attention_callback_token()
+        reply_markup = _build_attention_keyboard(pending_token)
+        # Bug 2: register the token BEFORE ``topic_send`` so concurrent
+        # ``notify_waiting`` calls cannot race against a late registration
+        # while topic_send retries through its MarkdownV2 → plain-text
+        # fallback (each retry is an ``await``). On send failure we pop the
+        # orphan below so it cannot accumulate.
+        _attention_callback_routes[pending_token] = _AttentionCallbackEntry(
+            route=(user_id, thread_id or 0, window_id),
+            created_at=time.monotonic(),
+            rendered_text=text,
+            parse_mode="MarkdownV2",
+        )
+
+    # IDLE → WAITING: send a fresh, audible card. ``reply_markup`` is the
+    # one optional kwarg; pass it as a real keyword so pyright keeps strong
+    # types for the rest of ``topic_send``'s signature.
+    try:
+        if reply_markup is not None:
+            sent, outcome = await topic_send(
+                bot,
+                op="attention",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                text=text,
+                disable_notification=False,
+                role="activity",
+                content_type="activity",
+                session_id=session_id_for_window(window_id),
+                reply_markup=reply_markup,
+            )
+        else:
+            sent, outcome = await topic_send(
+                bot,
+                op="attention",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                text=text,
+                disable_notification=False,
+                # §2.5.5: attention cards are bot UI, not Claude output —
+                # write role="activity" so a quote-reply renders with the
+                # UI-noise header instead of being treated as load-bearing
+                # assistant conversation.
+                role="activity",
+                content_type="activity",
+                session_id=session_id_for_window(window_id),
+            )
+    except Exception:
+        # Bug 2: if the send raises, don't leave the pre-registered token
+        # orphaned in the map.
+        if pending_token is not None:
+            _attention_callback_routes.pop(pending_token, None)
+        raise
     if sent is None:
         # Don't mark waiting if the send failed — caller will route to repair
         # (Stage 3) and may retry, in which case we want to act like idle.
+        # Bug 2: also release the pre-registered token; no buttons reached
+        # Telegram so it can never be redeemed.
+        if pending_token is not None:
+            _attention_callback_routes.pop(pending_token, None)
         return outcome
 
     _attention_state[key] = AttentionState(
@@ -510,3 +606,79 @@ def reset_for_tests() -> None:
     """Test-only: drop all attention state."""
     _attention_state.clear()
     _emergency_dm_last_sent.clear()
+    _attention_callback_routes.clear()
+
+
+# ── §2.9 attention-button callback tokens ─────────────────────────────────
+
+
+def _make_attention_callback_token() -> str:
+    """Return a short URL-safe token for use in ``attn:<verb>:<token>``.
+
+    ``secrets.token_urlsafe(8)`` yields ~11 characters, leaving the full
+    ``attn:<verb>:<token>`` payload comfortably under Telegram's 64-byte
+    callback_data cap even with the longest verb (``type`` → 21 bytes).
+    """
+    return secrets.token_urlsafe(8)
+
+
+def _build_attention_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Build the §2.9 three-button row attached to end-of-turn-question cards."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Yes", callback_data=f"attn:yes:{token}"),
+                InlineKeyboardButton("❌ No", callback_data=f"attn:no:{token}"),
+                InlineKeyboardButton(
+                    "💬 Type in chat", callback_data=f"attn:type:{token}"
+                ),
+            ]
+        ]
+    )
+
+
+def consume_attention_token(token: str) -> _AttentionCallbackEntry | None:
+    """Pop and return the entry bound to ``token``, or ``None`` if unknown.
+
+    Single-use: a second click with the same token returns ``None`` so the
+    callback handler can render the "already answered or expired" alert.
+
+    The full ``_AttentionCallbackEntry`` is returned (not just the route) so
+    the caller can re-render the original card body verbatim on edit and
+    re-bind the token via ``rebind_attention_token`` if a downstream
+    aggregator step fails (Bug 3).
+    """
+    return _attention_callback_routes.pop(token, None)
+
+
+def rebind_attention_token(token: str, entry: _AttentionCallbackEntry) -> None:
+    """Re-insert ``entry`` under ``token`` after a failed consume-and-act.
+
+    Bug 3 (atomic consume): ``consume_attention_token`` pops eagerly so a
+    second concurrent click is rejected with "already answered or expired".
+    If the downstream aggregator step then raises, the user would otherwise
+    be stuck — clicking again hits the expired path and they have no other
+    affordance. The callback handler calls this to put the entry back so the
+    user can retry the click.
+    """
+    _attention_callback_routes[token] = entry
+
+
+def prune_expired_attention_tokens() -> int:
+    """Drop token entries older than ``config.attention_button_ttl_seconds``.
+
+    Returns the count of entries dropped so the GC loop can log a summary.
+    Called once per day from the same loop that prunes ``message_refs``.
+    """
+    ttl = float(
+        getattr(config, "attention_button_ttl_seconds", ATTENTION_BUTTON_TTL_SECONDS)
+    )
+    now = time.monotonic()
+    expired: list[str] = [
+        token
+        for token, entry in _attention_callback_routes.items()
+        if (now - entry.created_at) > ttl
+    ]
+    for token in expired:
+        _attention_callback_routes.pop(token, None)
+    return len(expired)

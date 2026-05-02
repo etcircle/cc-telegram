@@ -35,6 +35,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -180,6 +181,16 @@ async def _message_refs_gc_loop() -> None:
             raise
         except Exception as e:
             logger.warning("message_refs GC iteration failed: %s", e)
+        # §2.9: prune stale attention-button tokens on the same daily tick.
+        # Cheap (in-memory dict scan) so we don't bother with a separate loop.
+        try:
+            expired_tokens = attention.prune_expired_attention_tokens()
+            if expired_tokens:
+                logger.info("attention GC dropped %d expired token(s)", expired_tokens)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("attention token GC iteration failed: %s", e)
         try:
             await asyncio.sleep(_MESSAGE_REFS_GC_INTERVAL_SECONDS)
         except asyncio.CancelledError:
@@ -1310,6 +1321,91 @@ async def _create_and_bind_window(
 # --- Callback query handler ---
 
 
+# §2.9: pre-compiled to keep the callback hot-path off the regex compile cache.
+_ATTN_CALLBACK_RE = re.compile(r"^attn:(yes|no|type):([\w-]+)$")
+
+
+async def attention_callback_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle clicks on the §2.9 inline-keyboard buttons.
+
+    Resolves the token to a route, validates the clicker matches the route's
+    user, and either funnels "yes"/"no" into the inbound aggregator (so the
+    flow is identical to the user typing in the topic) or, for "type",
+    simply edits the card to remove the buttons and prompts the user to
+    type their reply.
+    """
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    m = _ATTN_CALLBACK_RE.match(query.data)
+    if not m:
+        # Not our pattern — silently ack so Telegram drops the spinner.
+        await query.answer()
+        return
+    verb, token = m.group(1), m.group(2)
+
+    # Item 4: enforce the global allow-list BEFORE token consumption. A user
+    # whose access was revoked but who still holds a live token from before
+    # the revocation must not be able to drive ``aggregator_offer_text``
+    # against their former session.
+    if not query.from_user or not is_user_allowed(query.from_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+
+    entry = attention.consume_attention_token(token)
+    if entry is None:
+        await query.answer("Already answered or expired.", show_alert=True)
+        return
+
+    if query.from_user.id != entry.route[0]:
+        # §2.9.3: route owner mismatch. Mirrors the official plugin's
+        # authorization check. Re-bind the token so the legitimate route
+        # owner can still redeem it.
+        attention.rebind_attention_token(token, entry)
+        await query.answer("Not your session.", show_alert=True)
+        return
+
+    if verb in ("yes", "no"):
+        # §2.9.2: route the literal "yes"/"no" through the aggregator so the
+        # path is identical to the user typing in the topic — provenance
+        # writes, RunState transitions, and digest refresh are all owned by
+        # the existing inbound flow.
+        try:
+            await aggregator_offer_text(entry.route, verb)
+            await aggregator_flush_route(entry.route)
+        except Exception as e:
+            # Bug 3: aggregator step failed. Re-bind the token so the user
+            # can retry the click instead of being stuck on an "expired"
+            # alert with no surfaced affordance.
+            attention.rebind_attention_token(token, entry)
+            logger.error("attention callback aggregator failed: %s", e)
+            await query.answer(
+                "Couldn't deliver — try again or type in chat.",
+                show_alert=True,
+            )
+            return
+    # else verb == "type": no-op send; the user is now expected to type in
+    # the topic. The card edit below removes the buttons.
+
+    label = attention.VERB_LABELS[verb]
+    try:
+        # Bug 1: re-use the rendered_text we stashed at registration time
+        # instead of reading ``query.message.text`` (Telegram returns the
+        # plain view there, with MarkdownV2 entities stripped — concatenating
+        # and editing back without a parse_mode silently corrupts the card).
+        new_text = f"{entry.rendered_text}\n\n{label}"
+        await query.edit_message_text(
+            new_text, reply_markup=None, parse_mode=entry.parse_mode
+        )
+    except Exception as e:  # pragma: no cover - defensive only
+        logger.debug("attention callback edit failed: %s", e)
+
+    await query.answer()
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
@@ -2159,6 +2255,11 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    # §2.9: pattern-scoped handler MUST be registered before the catch-all
+    # ``callback_handler`` so PTB dispatches ``attn:*`` clicks here.
+    application.add_handler(
+        CallbackQueryHandler(attention_callback_handler, pattern=r"^attn:")
+    )
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(

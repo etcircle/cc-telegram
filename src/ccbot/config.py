@@ -142,6 +142,25 @@ class Config:
         except ValueError:
             self.agent_prompt_preview_chars = 400
 
+        # §2.9 Inline-keyboard buttons on §2.6 attention cards.
+        # Master flag — flip to False to disable the buttons entirely while
+        # keeping the §2.6 text card. Useful as a kill-switch if the callback
+        # path causes any regression in production.
+        self.attention_buttons = (
+            os.getenv("CCBOT_ATTENTION_BUTTONS", "true").lower() != "false"
+        )
+
+        # Token-map retention for the attention-button callback tokens. The
+        # token is minted at card-render time and looked up on click; entries
+        # older than this are dropped by the daily GC pass so stale tokens
+        # from before a bot restart don't pile up forever.
+        try:
+            self.attention_button_ttl_seconds = int(
+                os.getenv("CCBOT_ATTENTION_BUTTON_TTL_SECONDS", "86400")
+            )
+        except ValueError:
+            self.attention_button_ttl_seconds = 86400
+
         # §2.5 Telegram reply-context bridge.
         # Master kill-switch: when False, ``text_handler`` skips
         # ``extract_reply_context`` and outbound sends drop ``reply_parameters``
