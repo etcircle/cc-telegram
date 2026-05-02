@@ -28,6 +28,7 @@ from pathlib import Path
 
 from ..config import config
 from ..session import session_manager
+from . import busy_indicator
 
 logger = logging.getLogger(__name__)
 
@@ -134,12 +135,20 @@ async def _flush(route: Route) -> None:
                 route,
                 message,
             )
+            return
     except Exception as exc:
         logger.error(
             "aggregator flush raised for route %s: %s",
             route,
             exc,
         )
+        return
+
+    # Closes the gap between "prompt accepted" and "first transcript event":
+    # the V2 typing loop only refreshes RUNNING / RUNNING_TOOL routes, so
+    # without this mark the indicator was dark during preliminary work.
+    if config.busy_indicator_v2:
+        await busy_indicator.mark_inbound_sent(route)
 
 
 async def aggregator_offer_text(route: Route, text: str) -> None:

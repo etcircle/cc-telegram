@@ -21,6 +21,7 @@ Public surface:
   - ``context_pct(route)``
   - ``update_context_pct(route, pct)``
   - ``on_transcript_event(event, routes)``
+  - ``mark_inbound_sent(route)`` — prompt successfully delivered to Claude
   - ``mark_topic_broken(route)`` / ``mark_topic_recovered(route)``
   - ``clear_route(route)``
 """
@@ -242,12 +243,6 @@ async def _apply_event(event: TranscriptEvent, route: Route) -> None:
         await _set_state(route, _state_from_open_tools(open_tools))
         return
 
-    # Thinking-only message with stop_reason="tool_use" → no transition.
-    # The accompanying tool_use event (next message) does the work.
-    if role == "assistant" and block == "thinking" and stop_reason == "tool_use":
-        _last_event_at[route] = _now()
-        return
-
     # End-of-turn signals: thinking or text with end_turn / stop_sequence
     # AND no open tools → IDLE_RECENT. With open tools we stay in
     # RUNNING_TOOL / WAITING_ON_USER until the matching tool_result lands.
@@ -269,10 +264,21 @@ async def _apply_event(event: TranscriptEvent, route: Route) -> None:
         await _set_state(route, RunState.RUNNING)
         return
 
-    # Assistant thinking without an end-of-turn stop_reason: keep state,
-    # just refresh last_event_at so IDLE_RECENT decay doesn't fire while
-    # the model is still thinking.
+    # Assistant thinking without an end-of-turn stop_reason: light up the
+    # indicator if the route was idle (preliminary thinking before the
+    # first text/tool_use is the most common pre-output signal). Keep
+    # RUNNING_TOOL / WAITING_ON_USER unchanged — open tools still gate.
+    # ``route not in _run_state`` covers the unknown-route case: ``current``
+    # defaults to RUNNING for unknown routes (intentional, see line 197),
+    # but visibly the surface treats them as IDLE_CLEARED, so we want to
+    # write the actual RUNNING state through.
     if role == "assistant" and block == "thinking":
+        if route not in _run_state or current in (
+            RunState.IDLE_CLEARED,
+            RunState.IDLE_RECENT,
+        ):
+            await _set_state(route, RunState.RUNNING)
+            return
         _last_event_at[route] = _now()
         return
 
@@ -294,6 +300,31 @@ async def on_transcript_event(event: TranscriptEvent, routes: list[Route]) -> No
     """
     for route in routes:
         await _apply_event(event, route)
+
+
+async def mark_inbound_sent(route: Route) -> None:
+    """Mark a route RUNNING after a Telegram-originated prompt is delivered
+    to the Claude tmux window.
+
+    Closes the visibility gap between "user message accepted" and "first
+    transcript event lands": without this, the route stays IDLE_CLEARED
+    until JSONL produces an assistant text/tool_use, so the V2 typing-action
+    loop has nothing to refresh and the one-shot ``send_chat_action`` from
+    the inbound handler expires after Telegram's ~5s TTL.
+
+    Idempotent against already-busy routes: never downgrade RUNNING_TOOL or
+    WAITING_ON_USER (open tools still gate), and don't overwrite
+    BROKEN_TOPIC (recovery happens on the next real event).
+    """
+    current = _run_state.get(route, RunState.IDLE_CLEARED)
+    if current in (
+        RunState.RUNNING_TOOL,
+        RunState.WAITING_ON_USER,
+        RunState.BROKEN_TOPIC,
+    ):
+        _last_event_at[route] = _now()
+        return
+    await _set_state(route, RunState.RUNNING)
 
 
 async def mark_topic_broken(route: Route) -> None:

@@ -58,12 +58,14 @@ async def test_single_tool_turn_walks_states(monkeypatch: pytest.MonkeyPatch):
     fake_now = [1000.0]
     monkeypatch.setattr(busy_indicator, "_now", lambda: fake_now[0])
 
-    # 1. Thinking with stop_reason=tool_use → no transition (default IDLE_CLEARED)
+    # 1. Thinking with stop_reason=tool_use from idle → RUNNING.
+    # Preliminary thinking is the most common pre-output signal; lighting
+    # the indicator here closes the gap before the first text/tool_use.
     await busy_indicator.on_transcript_event(
         _event(role="assistant", block_type="thinking", stop_reason="tool_use"),
         [ROUTE],
     )
-    assert busy_indicator.state(ROUTE) is RunState.IDLE_CLEARED
+    assert busy_indicator.state(ROUTE) is RunState.RUNNING
 
     # 2. tool_use → RUNNING_TOOL
     await busy_indicator.on_transcript_event(
@@ -543,3 +545,73 @@ async def test_state_callback_exception_does_not_block_others(
     assert seen_b == [(RunState.IDLE_CLEARED, RunState.RUNNING_TOOL)]
     # The error was logged.
     assert any("state callback error" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_mark_inbound_sent_from_idle_transitions_running():
+    # Fresh route — default visible state IDLE_CLEARED.
+    assert busy_indicator.state(ROUTE) is RunState.IDLE_CLEARED
+    await busy_indicator.mark_inbound_sent(ROUTE)
+    assert busy_indicator.state(ROUTE) is RunState.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_mark_inbound_sent_does_not_downgrade_running_tool():
+    # Walk to RUNNING_TOOL via a tool_use.
+    await busy_indicator.on_transcript_event(
+        _event(
+            role="assistant",
+            block_type="tool_use",
+            tool_use_id="t1",
+            tool_name="Bash",
+            stop_reason="tool_use",
+        ),
+        [ROUTE],
+    )
+    assert busy_indicator.state(ROUTE) is RunState.RUNNING_TOOL
+
+    # A second user prompt while a tool is still open: must not clobber
+    # RUNNING_TOOL with RUNNING. Open tools still gate the state.
+    await busy_indicator.mark_inbound_sent(ROUTE)
+    assert busy_indicator.state(ROUTE) is RunState.RUNNING_TOOL
+
+
+@pytest.mark.asyncio
+async def test_mark_inbound_sent_does_not_overwrite_broken_topic():
+    # Walk to RUNNING then mark broken.
+    await busy_indicator.on_transcript_event(
+        _event(role="assistant", block_type="text", text="hi"),
+        [ROUTE],
+    )
+    await busy_indicator.mark_topic_broken(ROUTE)
+    assert busy_indicator.state(ROUTE) is RunState.BROKEN_TOPIC
+
+    # mark_inbound_sent must not pretend recovery happened — recovery is the
+    # next real transcript event's job. Stay BROKEN_TOPIC.
+    await busy_indicator.mark_inbound_sent(ROUTE)
+    assert busy_indicator.state(ROUTE) is RunState.BROKEN_TOPIC
+
+
+@pytest.mark.asyncio
+async def test_thinking_from_idle_transitions_running(monkeypatch: pytest.MonkeyPatch):
+    # IDLE_RECENT → RUNNING on subsequent thinking. Set up by ending a turn.
+    fake_now = [1000.0]
+    monkeypatch.setattr(busy_indicator, "_now", lambda: fake_now[0])
+
+    await busy_indicator.on_transcript_event(
+        _event(
+            role="assistant",
+            block_type="text",
+            stop_reason="end_turn",
+            text="done",
+        ),
+        [ROUTE],
+    )
+    assert busy_indicator.state(ROUTE) is RunState.IDLE_RECENT
+
+    # New thinking event: thinking-from-idle should fire.
+    await busy_indicator.on_transcript_event(
+        _event(role="assistant", block_type="thinking", stop_reason="tool_use"),
+        [ROUTE],
+    )
+    assert busy_indicator.state(ROUTE) is RunState.RUNNING

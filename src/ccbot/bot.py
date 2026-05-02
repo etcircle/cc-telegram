@@ -594,6 +594,14 @@ async def forward_command_handler(
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
         await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
+        # Mark route busy so the V2 typing loop has something to refresh
+        # while Claude processes the slash command (most slash commands
+        # never produce a transcript event — /model opens a pane UI, /clear
+        # resets state — so the JSONL signal alone cannot light the
+        # indicator). status_polling will downgrade to WAITING_ON_USER if a
+        # pane interactive UI is detected later.
+        if config.busy_indicator_v2:
+            await busy_indicator.mark_inbound_sent(route)
         # If /clear command was sent, clear the session association
         # so we can detect the new session after first message
         if cc_slash.strip().lower() == "/clear":
