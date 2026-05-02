@@ -616,6 +616,15 @@ async def _message_queue_worker(bot: Bot, route: Route) -> None:
             inflight.clear()
             try:
                 if task is not None:
+                    logger.info(
+                        "worker_dequeue route=%s task_type=%s ctype=%s "
+                        "wid=%s qsize=%d",
+                        route,
+                        task.task_type,
+                        task.content_type,
+                        task.window_id,
+                        queue.qsize(),
+                    )
                     try:
                         await _run_with_retry(bot, user_id, queue, lock, task)
                     except Exception as e:
@@ -1201,6 +1210,23 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     chat_id, effective_thread_id = _delivery_target(user_id, task.thread_id)
 
     logical_text = "\n\n".join(task.parts)
+    # Diagnostic: track text content delivery — silent text-loss bug seen
+    # 2026-05-02 where topic_send op=content never fired for enqueued text
+    # tasks while activity-digest edits continued. Remove once the next
+    # firing has been root-caused.
+    skey = (user_id, tid)
+    logger.info(
+        "content_task entry: user=%d tid=%d wid=%s ctype=%s parts=%d "
+        "logical_len=%d status_present=%s digest_present=%s",
+        user_id,
+        tid,
+        wid,
+        task.content_type,
+        len(task.parts),
+        len(logical_text),
+        skey in _status_msg_info,
+        skey in _activity_msg_info,
+    )
     if task.content_type == "text":
         await _finalize_activity_digest(
             bot,
@@ -1270,6 +1296,16 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 ref_role=ref_role,
                 ref_content_type=task.content_type,
             )
+            logger.info(
+                "content_task convert: user=%d tid=%d wid=%s ctype=%s "
+                "part_idx=%d converted_msg_id=%s",
+                user_id,
+                tid,
+                wid,
+                task.content_type,
+                part_idx,
+                converted_msg_id,
+            )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
                 # Status-conversion edits the existing status message — no
@@ -1304,6 +1340,17 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 anchor = ReplyParameters(message_id=anchor_id)
         first_topic_send_done = True
 
+        logger.info(
+            "content_task send_pre: user=%d tid=%d wid=%s ctype=%s "
+            "part_idx=%d part_len=%d anchor=%s",
+            user_id,
+            tid,
+            wid,
+            task.content_type,
+            part_idx,
+            len(part),
+            anchor is not None,
+        )
         if anchor is not None:
             sent, outcome = await topic_send(
                 bot,
@@ -1337,6 +1384,17 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 transcript_uuid=task.transcript_uuid,
                 session_id=ref_session_id,
             )
+        logger.info(
+            "content_task send_post: user=%d tid=%d wid=%s ctype=%s "
+            "part_idx=%d sent=%s outcome=%s",
+            user_id,
+            tid,
+            wid,
+            task.content_type,
+            part_idx,
+            sent.message_id if sent is not None else None,
+            outcome.value if outcome is not None else None,
+        )
 
         if sent is not None:
             last_msg_id = sent.message_id
