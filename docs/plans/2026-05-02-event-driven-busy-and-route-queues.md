@@ -983,6 +983,141 @@ resolver. Both touch the user → Claude context-preservation surface
 Doing them together avoids redundant changes to `bot.py`'s handler
 wiring.
 
+### 2.9 Inline-keyboard buttons on end-of-turn-question attention cards
+
+**Update 2026-05-02 (after Stage 5.c shipped):** the user pointed at
+the official Anthropic Telegram plugin
+(`anthropics/claude-plugins-official/external_plugins/telegram/server.ts`)
+which renders permission requests as inline keyboard buttons
+(`See more / ✅ Allow / ❌ Deny`) and asked whether ccbot can do the
+same for end-of-turn questions. Today the §2.6 attention card is
+text-only; the user's only response path is to switch to the topic
+and type a reply. For frequent yes/no decisions, that's friction.
+
+#### 2.9.1 Scope and trigger
+
+§2.9 EXTENDS the §2.6 trigger — same six conditions that already gate
+the attention card. When §2.6 fires, the card now ALSO carries an
+inline keyboard with three buttons:
+
+```
+[✅ Yes] [❌ No] [💬 Type in chat]
+```
+
+The buttons are added unconditionally to every §2.6 card. We do
+**not** add a "is this question actually binary?" heuristic on top —
+the "Type in chat" button is the escape hatch for non-binary
+questions, and predicate-stacking would just add false negatives
+(question-detector says "this isn't binary" → no buttons → user is
+stuck typing again, the exact thing we're trying to fix).
+
+This keeps the trigger logic tightly aligned with §2.6: if the
+attention card fires at all, it carries buttons.
+
+Interactive-UI cards (AskUserQuestion / ExitPlanMode / Permission)
+keep their existing keyboards — they're already structured choices.
+§2.9 only adds buttons to the new §2.6 surface, not those.
+
+#### 2.9.2 Callback semantics
+
+The button rows use `callback_data` of the form `attn:<verb>:<token>`
+where `verb ∈ {yes, no, type}` and `token` is a short random
+identifier minted at card-render time. The token maps server-side
+(in-memory) to the `(user_id, thread_id, window_id)` route the card
+was sent for. We don't pack the route into the callback_data
+directly because Telegram caps callback_data at 64 bytes and a route
+key plus verb plus framing exceeds that comfortably.
+
+```python
+# at card render:
+token = secrets.token_urlsafe(8)            # ~11 chars
+_attention_callback_routes[token] = route
+keyboard = InlineKeyboardMarkup([[
+    InlineKeyboardButton("✅ Yes",          callback_data=f"attn:yes:{token}"),
+    InlineKeyboardButton("❌ No",           callback_data=f"attn:no:{token}"),
+    InlineKeyboardButton("💬 Type in chat", callback_data=f"attn:type:{token}"),
+]])
+```
+
+A callback handler resolves the token → route, applies the verb,
+then drops the token from the map (idempotent — second click does
+nothing). The token map has a per-entry TTL of
+`ATTENTION_BUTTON_TTL_SECONDS` (default 24 hours) so stale tokens
+from before a bot restart don't pile up; a daily GC pass prunes
+expired entries.
+
+Verb behavior:
+
+- **`yes` / `no`:** route the literal text "yes" or "no" through
+  `aggregator_offer_text(route, "yes")` then
+  `aggregator_flush_route(route)` — same path the user would have
+  taken by typing in the topic. The aggregator handles
+  `_route_last_user_message` and `topic_send` provenance writes
+  (5.c) automatically because the inbound flow is identical to a
+  normal text input.
+- **`type`:** no message sent; just edits the card to remove the
+  buttons (the user is now expected to type in the topic).
+
+After every successful click (yes/no/type), the card is edited:
+
+```
+🔔 Awaiting your reply — <topic>
+"<original excerpt>"
+
+✅ Replied: yes      (or "❌ Replied: no", or "💬 Reply in chat")
+```
+
+The buttons are removed from the edited message. This both prevents
+double-click and gives the topic history a visible audit trail of
+what was answered.
+
+#### 2.9.3 Authorization
+
+The callback handler MUST verify `update.callback_query.from_user.id`
+matches the route's `user_id` (the user the card was sent for).
+Reject mismatches with `ctx.answer_callback_query(text="Not your
+session.", show_alert=True)`. This mirrors the official plugin's
+authorization check (`server.ts:738-741`) and matters in
+multi-allowlist deployments.
+
+#### 2.9.4 RunState and BusyIndicator interaction
+
+A `yes` or `no` click is a normal user message from the
+BusyIndicator's perspective: it flows through `aggregator_offer_text`
+→ `text_handler`-equivalent path → `send_to_window` → Claude's next
+turn fires JSONL events that drive `RunState` back to RUNNING.
+
+A `type` click is a no-op for run state — the user is going to type
+something. The card's `WAITING_ON_USER` (or whatever §2.6 set) holds
+until either a real text input arrives or Claude resumes activity.
+
+#### 2.9.5 Anchoring (§2.5 interaction)
+
+A button click does NOT update `_route_last_user_message[route]`
+because there's no fresh Telegram user message to anchor to — the
+user didn't type a message. Claude's response to the click goes
+through the normal `_process_content_task` path; with the previous
+user message's anchor still in place (or expired), the response
+either anchors to the prior message or floats free. Neither is
+wrong; both are reasonable.
+
+If we ever want the response to anchor to the CARD itself (so the
+chat reads "→ ✅ Replied: yes ↳ Claude's response"), we'd update
+`_route_last_user_message[route]` to the card's `message_id` after
+the edit. Optional — start without it.
+
+#### 2.9.6 Telegram notification considerations
+
+The edited card (post-click) does NOT re-notify — `bot.edit_message_text`
+doesn't trigger a notification. The user clicked; they know the
+answer landed. The next assistant response notifies normally per the
+existing `disable_notification` discipline.
+
+#### 2.9.7 Implementation hook
+
+§2.9 lands as a new **Stage 6** because Stage 4 (where §2.6 lives)
+already shipped. Stage 6 is small and additive — see §3.6.
+
 ## 3. Implementation plan
 
 Stages are sized to land independently. Each ends with green ruff /
@@ -1584,6 +1719,101 @@ Tests:
   replies to an assistant message sent before the restart →
   `ReplyContext` still resolves with full provenance.
 
+### Stage 6 — Inline-keyboard buttons on §2.6 attention cards (§2.9)
+
+Small, additive. Stage 4 already shipped the §2.6 trigger and the
+attention-card surface; Stage 6 adds buttons + the callback handler.
+
+Files:
+
+- `src/ccbot/handlers/attention.py`:
+  - New module-level `_attention_callback_routes: dict[str, Route]`
+    — short-lived token → route map.
+  - In the `notify_waiting` (or wherever §2.6's
+    `kind="end_of_turn_question"` card is constructed) branch: mint
+    `token = secrets.token_urlsafe(8)`, store
+    `_attention_callback_routes[token] = route`, build a
+    3-button `InlineKeyboardMarkup` per §2.9.2 with
+    `callback_data` of `f"attn:{verb}:{token}"`. Pass the markup
+    via `reply_markup=` through to `topic_send`.
+  - **Other `kind` values keep their current keyboards / no
+    keyboards.** Only `kind="end_of_turn_question"` gets the
+    `attn:*` buttons.
+  - New `prune_expired_attention_tokens()` — drops entries older
+    than `ATTENTION_BUTTON_TTL_SECONDS` (default 86400). Wired
+    into the existing daily GC pass alongside
+    `message_refs.prune_older_than`.
+- `src/ccbot/handlers/message_sender.py`:
+  - `topic_send` already accepts `**kwargs`; `reply_markup` is a
+    standard `bot.send_message` kwarg, so no signature change.
+- `src/ccbot/bot.py`:
+  - New `attention_callback_handler(update, context)` registered
+    via `CallbackQueryHandler(pattern=r"^attn:")`. Pseudocode:
+    ```python
+    m = re.match(r"^attn:(yes|no|type):([\w-]+)$", query.data)
+    if not m:
+        await query.answer()
+        return
+    verb, token = m.groups()
+    route = attention.consume_attention_token(token)
+    if route is None:
+        await query.answer("Already answered or expired.", show_alert=True)
+        return
+    if query.from_user.id != route[0]:
+        await query.answer("Not your session.", show_alert=True)
+        return
+    if verb in ("yes", "no"):
+        await aggregator_offer_text(route, verb)
+        await aggregator_flush_route(route)
+    # else verb == "type": no-op send; just edit
+    new_text = f"{query.message.text}\n\n{_VERB_LABELS[verb]}"
+    await query.edit_message_text(new_text, reply_markup=None)
+    await query.answer()
+    ```
+    `_VERB_LABELS = {"yes": "✅ Replied: yes", "no": "❌ Replied:
+    no", "type": "💬 Reply in chat"}`.
+  - `consume_attention_token(token) -> Route | None` lives in
+    `attention.py` — pops the entry to enforce single-use.
+
+#### 6.a Configuration
+
+Add to §4:
+- `CCBOT_ATTENTION_BUTTONS=true` (master flag; flip to disable
+  §2.9 entirely while keeping the §2.6 text card).
+- `CCBOT_ATTENTION_BUTTON_TTL_SECONDS=86400` (token map retention).
+
+#### 6.b Tests
+
+In `tests/ccbot/handlers/test_attention.py`:
+- `test_end_of_turn_card_includes_three_buttons` — fire the §2.6
+  trigger, assert the resulting `topic_send` was called with a
+  `reply_markup` containing 3 buttons with `attn:yes:`,
+  `attn:no:`, `attn:type:` callback data.
+- `test_other_attention_kinds_no_attn_buttons` — interactive_ui
+  attention card does NOT carry `attn:*` buttons (its existing
+  keyboard is unchanged).
+- `test_attention_callback_unauthorized_rejected` — callback
+  query from a different user_id → `answer_callback_query` with
+  "Not your session." alert; no `aggregator_offer_text` called.
+- `test_attention_callback_expired_token_rejected` — callback
+  with a token that's not in the map → "Already answered or
+  expired." alert.
+- `test_attention_callback_yes_sends_yes_via_aggregator` — verb
+  yes → `aggregator_offer_text(route, "yes")` and
+  `aggregator_flush_route(route)` called; card edited to
+  "✅ Replied: yes" with `reply_markup=None`.
+- `test_attention_callback_no_sends_no` — same, with "no".
+- `test_attention_callback_type_does_not_send` — verb type → NO
+  `aggregator_offer_text` called; card edited to "💬 Reply in
+  chat" with `reply_markup=None`.
+- `test_attention_callback_idempotent_second_click` — first
+  click consumes the token, second click → "Already answered or
+  expired." alert; no double-send.
+- `test_prune_expired_attention_tokens_drops_old_entries` —
+  inject a stale token via direct `_attention_callback_routes`
+  manipulation with backdated `created_at`, run prune, assert
+  dropped.
+
 ## 4. Configuration
 
 Single new section in `~/.ccbot/.env`:
@@ -1600,6 +1830,11 @@ CCBOT_AGENT_PROMPT_PREVIEW_CHARS=400        # §2.7 subagent prompt excerpt boun
 
 CCBOT_AGGREGATOR_DEBOUNCE_SECONDS=1.5        # §2.8 inbound aggregator: how long to wait for related messages before flushing
 CCBOT_AGGREGATOR_MAX_PHOTOS=10               # §2.8 hard cap on photos per flush (force-flush when exceeded)
+
+CCBOT_ATTENTION_BUTTONS=true                  # §2.9 master flag for inline-keyboard buttons on §2.6 attention cards
+CCBOT_ATTENTION_BUTTON_TTL_SECONDS=86400      # §2.9 token map retention (24h)
+
+CCBOT_BROWSE_ROOT=                            # default Path.home(); set to override the directory-browser starting point
 
 CCBOT_REPLY_CONTEXT=true                  # master switch for §2.5 inbound resolver + outbound anchor
 CCBOT_QUOTE_INJECTION_MAX_CHARS=1600      # bound on quoted-text injection into Claude's prompt
