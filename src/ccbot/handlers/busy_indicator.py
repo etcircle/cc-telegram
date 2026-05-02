@@ -228,7 +228,12 @@ async def _apply_event(event: TranscriptEvent, route: Route) -> None:
     # here and is dropped — the next assistant event recovers state. The
     # transcript_parser._pending_tools carry-over does NOT seed _open_tools
     # (different layer).
-    if role == "user" and block == "tool_result" and event.tool_use_id:
+    #
+    # Role is intentionally NOT checked: transcript_parser flips tool_result
+    # ParsedEntries to role="assistant" so the bubble renders on Claude's
+    # side in Telegram, while the raw JSONL envelope is role="user". The
+    # block_type + tool_use_id are already specific enough.
+    if block == "tool_result" and event.tool_use_id:
         if event.tool_use_id not in open_tools:
             # Stale / pre-startup tool result. Don't touch _last_event_at —
             # that would falsely extend IDLE_RECENT.

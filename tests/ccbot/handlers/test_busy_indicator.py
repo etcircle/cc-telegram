@@ -80,7 +80,7 @@ async def test_single_tool_turn_walks_states(monkeypatch: pytest.MonkeyPatch):
 
     # 3. tool_result → RUNNING (open_tools empty)
     await busy_indicator.on_transcript_event(
-        _event(role="user", block_type="tool_result", tool_use_id="t1"),
+        _event(role="assistant", block_type="tool_result", tool_use_id="t1"),
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING
@@ -129,14 +129,14 @@ async def test_parallel_tool_use_tracks_both_ids():
 
     # First tool_result: still RUNNING_TOOL because B is open
     await busy_indicator.on_transcript_event(
-        _event(role="user", block_type="tool_result", tool_use_id="A"),
+        _event(role="assistant", block_type="tool_result", tool_use_id="A"),
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING_TOOL
 
     # Second tool_result: open_tools empty → RUNNING
     await busy_indicator.on_transcript_event(
-        _event(role="user", block_type="tool_result", tool_use_id="B"),
+        _event(role="assistant", block_type="tool_result", tool_use_id="B"),
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING
@@ -229,7 +229,7 @@ async def test_interactive_tool_waiting_on_user():
 
     # Result closes it → RUNNING (open_tools empty)
     await busy_indicator.on_transcript_event(
-        _event(role="user", block_type="tool_result", tool_use_id="ask-1"),
+        _event(role="assistant", block_type="tool_result", tool_use_id="ask-1"),
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING
@@ -257,7 +257,7 @@ async def test_broken_topic_recovery_restores_prior_state():
     # Next OK transcript event recovers prior state and applies the rule.
     # tool_result for the open tool → open_tools empty → RUNNING.
     await busy_indicator.on_transcript_event(
-        _event(role="user", block_type="tool_result", tool_use_id="t"),
+        _event(role="assistant", block_type="tool_result", tool_use_id="t"),
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING
@@ -267,7 +267,7 @@ async def test_broken_topic_recovery_restores_prior_state():
 async def test_stale_tool_result_ignored():
     # tool_result for an unknown id while idle: do not transition, do not crash.
     await busy_indicator.on_transcript_event(
-        _event(role="user", block_type="tool_result", tool_use_id="ghost"),
+        _event(role="assistant", block_type="tool_result", tool_use_id="ghost"),
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.IDLE_CLEARED
@@ -347,14 +347,14 @@ async def test_parallel_interactive_and_non_interactive_tools():
     # This is the regression: pre-fix code kept the route stuck at
     # WAITING_ON_USER because open_tools was non-empty.
     await busy_indicator.on_transcript_event(
-        _event(role="user", block_type="tool_result", tool_use_id="ask-1"),
+        _event(role="assistant", block_type="tool_result", tool_use_id="ask-1"),
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING_TOOL
 
     # 4. tool_result for Bash → open_tools empty → RUNNING.
     await busy_indicator.on_transcript_event(
-        _event(role="user", block_type="tool_result", tool_use_id="bash-1"),
+        _event(role="assistant", block_type="tool_result", tool_use_id="bash-1"),
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING
@@ -382,7 +382,7 @@ async def test_mark_topic_recovered_restores_prior_state():
         [ROUTE],
     )
     await busy_indicator.on_transcript_event(
-        _event(role="user", block_type="tool_result", tool_use_id="t"),
+        _event(role="assistant", block_type="tool_result", tool_use_id="t"),
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING
