@@ -18,11 +18,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TrackedSession:
-    """State for a tracked Claude Code session."""
+    """State for a tracked Claude Code session.
+
+    Sub-agent (sidechain) JSONL files are also tracked here, keyed by
+    ``"sub:<parent_session_id>:<agent_id>"`` with ``parent_session_id``
+    set so the monitor can route their activity back to the parent topic.
+    """
 
     session_id: str
     file_path: str  # Path to .jsonl file
     last_byte_offset: int = 0  # Byte offset for incremental reading
+    parent_session_id: str | None = None  # Set for sidechain (sub-agent) trackers
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""
@@ -35,6 +41,7 @@ class TrackedSession:
             session_id=data.get("session_id", ""),
             file_path=data.get("file_path", ""),
             last_byte_offset=data.get("last_byte_offset", 0),
+            parent_session_id=data.get("parent_session_id"),
         )
 
 

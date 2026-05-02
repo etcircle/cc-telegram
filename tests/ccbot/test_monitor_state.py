@@ -24,6 +24,28 @@ class TestTrackedSession:
         assert session.session_id == ""
         assert session.file_path == ""
         assert session.last_byte_offset == 0
+        assert session.parent_session_id is None
+
+    def test_parent_session_id_roundtrip(self):
+        original = TrackedSession(
+            session_id="sub:parent-uuid:agent-abc",
+            file_path="/tmp/sub.jsonl",
+            last_byte_offset=10,
+            parent_session_id="parent-uuid",
+        )
+        restored = TrackedSession.from_dict(original.to_dict())
+        assert restored.parent_session_id == "parent-uuid"
+
+    def test_from_dict_legacy_state_loads_with_none_parent(self):
+        # State files written before parent_session_id existed must still
+        # load — old entries default to None (regular non-sidechain session).
+        legacy = {
+            "session_id": "s1",
+            "file_path": "/a.jsonl",
+            "last_byte_offset": 5,
+        }
+        session = TrackedSession.from_dict(legacy)
+        assert session.parent_session_id is None
 
 
 class TestMonitorStateLoad:

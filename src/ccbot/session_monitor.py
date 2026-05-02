@@ -499,6 +499,183 @@ class SessionMonitor:
         self.state.save_if_dirty()
         return new_messages
 
+    async def check_sidechain_updates(
+        self, active_session_ids: set[str]
+    ) -> list[NewMessage]:
+        """Tail sub-agent JSONL files for active parent sessions.
+
+        Sub-agent (sidechain) transcripts live at
+        ``<project_dir>/<parent_session_id>/subagents/agent-*.jsonl``.
+        For each new file we track byte offsets the same way we do for
+        regular sessions and emit assistant ``tool_use``, ``text``, and
+        ``thinking`` blocks routed back to the parent's session_id so
+        they land in the parent's topic. Tool calls render as ``↳ ``
+        headers; prose and thinking render as ``↳ `` followed by an
+        expandable blockquote so the sub-agent's plan / narrative is
+        available to peek at without dominating the topic. Tool results
+        and the prompts the parent sends to the sub-agent are dropped.
+
+        Files first seen on bot startup begin at EOF (skip historical
+        runs). Mid-session discovery is best-effort — a sub-agent whose
+        first lines land between two poll ticks will lose those lines.
+        """
+        new_messages: list[NewMessage] = []
+
+        # Without show_tool_calls there's nothing useful to surface for
+        # sub-agents under option (a) + (ii) — bail early to keep this
+        # consistent with how the parent stream is filtered in bot.py.
+        if not config.show_tool_calls:
+            return new_messages
+
+        # Build parent_session_id -> parent_jsonl_path lookup from currently
+        # tracked parent sessions. Skip any tracking_key that's itself a
+        # sidechain (parent_session_id is set).
+        parent_files: dict[str, Path] = {}
+        for sid in active_session_ids:
+            tracked = self.state.get_session(sid)
+            if tracked is None or tracked.parent_session_id is not None:
+                continue
+            if not tracked.file_path:
+                continue
+            parent_files[sid] = Path(tracked.file_path)
+
+        for parent_session_id, parent_jsonl in parent_files.items():
+            sub_dir = parent_jsonl.parent / parent_session_id / "subagents"
+            try:
+                if not sub_dir.is_dir():
+                    continue
+                sidechain_files = list(sub_dir.glob("agent-*.jsonl"))
+            except OSError:
+                continue
+
+            for sc_file in sidechain_files:
+                # sc_file.stem looks like "agent-a05666f9d196136af"
+                tracking_key = f"sub:{parent_session_id}:{sc_file.stem}"
+
+                tracked = self.state.get_session(tracking_key)
+                if tracked is None:
+                    # New sidechain file — start at EOF to skip history.
+                    # On startup this avoids replaying long-finished
+                    # sub-agent runs; mid-session it means we miss a few
+                    # lines that landed before discovery, which is fine.
+                    try:
+                        st = sc_file.stat()
+                    except OSError:
+                        continue
+                    tracked = TrackedSession(
+                        session_id=tracking_key,
+                        file_path=str(sc_file),
+                        last_byte_offset=st.st_size,
+                        parent_session_id=parent_session_id,
+                    )
+                    self.state.update_session(tracked)
+                    self._file_mtimes[tracking_key] = st.st_mtime
+                    logger.info(
+                        "Started tracking sidechain %s (parent=%s, size=%d)",
+                        sc_file.name,
+                        parent_session_id[:8],
+                        st.st_size,
+                    )
+                    continue
+
+                try:
+                    st = sc_file.stat()
+                    current_mtime = st.st_mtime
+                    current_size = st.st_size
+                except OSError:
+                    continue
+
+                last_mtime = self._file_mtimes.get(tracking_key, 0.0)
+                if (
+                    current_mtime <= last_mtime
+                    and current_size <= tracked.last_byte_offset
+                ):
+                    continue
+
+                new_entries = await self._read_new_lines(tracked, sc_file)
+                self._file_mtimes[tracking_key] = current_mtime
+
+                if not new_entries:
+                    self.state.update_session(tracked)
+                    continue
+
+                carry = self._pending_tools.get(tracking_key, {})
+                parsed_entries, remaining = TranscriptParser.parse_entries(
+                    new_entries,
+                    pending_tools=carry,
+                )
+                if remaining:
+                    self._pending_tools[tracking_key] = remaining
+                else:
+                    self._pending_tools.pop(tracking_key, None)
+
+                for entry in parsed_entries:
+                    # Option (a) + (ii) extended: inline stream of tool
+                    # headers, plus the sub-agent's prose/thinking wrapped
+                    # in expandable blockquotes so the agent's plan and
+                    # narrative are peekable without dominating the topic.
+                    # Tool results are still dropped — the next tool_use
+                    # plus the parent's eventual Agent tool_result already
+                    # convey progress.
+                    if entry.role != "assistant":
+                        continue
+                    if not entry.text:
+                        continue
+                    if entry.content_type in ("tool_use", "thinking"):
+                        # tool_use: parser produces "**Bash**(cmd)"-style
+                        # one-liner, prefix it. thinking: parser already
+                        # wraps real content in EXPANDABLE_QUOTE markers
+                        # (or emits a bare "(thinking)" placeholder),
+                        # either way just prefix it.
+                        rendered = f"↳ {entry.text}"
+                    elif entry.content_type == "text":
+                        # Wrap raw assistant text in an expandable quote so
+                        # long plans / explanations stay collapsed.
+                        rendered = (
+                            f"↳ {TranscriptParser.EXPANDABLE_QUOTE_START}"
+                            f"{entry.text}"
+                            f"{TranscriptParser.EXPANDABLE_QUOTE_END}"
+                        )
+                    else:
+                        continue
+                    new_messages.append(
+                        NewMessage(
+                            session_id=parent_session_id,
+                            text=rendered,
+                            # Emit as text so the message_queue special-cases
+                            # for tool_use (Agent prominence, activity
+                            # digest, tool_use↔tool_result editing,
+                            # interactive UI dispatch) don't apply.
+                            content_type="text",
+                            tool_use_id=None,
+                            role="assistant",
+                            tool_name=None,
+                            image_data=None,
+                            tool_input=None,
+                            transcript_uuid=entry.uuid,
+                        )
+                    )
+
+                self.state.update_session(tracked)
+
+        self.state.save_if_dirty()
+        return new_messages
+
+    def _remove_sidechains_for_parent(self, parent_session_id: str) -> None:
+        """Drop sidechain trackers belonging to a parent that's been cleaned up."""
+        prefix = f"sub:{parent_session_id}:"
+        stale = [k for k in self.state.tracked_sessions if k.startswith(prefix)]
+        for k in stale:
+            self.state.remove_session(k)
+            self._file_mtimes.pop(k, None)
+            self._pending_tools.pop(k, None)
+        if stale:
+            logger.info(
+                "Removed %d sidechain tracker(s) for parent %s",
+                len(stale),
+                parent_session_id[:8],
+            )
+
     async def _load_current_session_map(self) -> dict[str, str]:
         """Load current session_map and return window_key -> session_id mapping.
 
@@ -533,7 +710,11 @@ class SessionMonitor:
         active_session_ids = set(current_map.values())
 
         stale_sessions = []
-        for session_id in self.state.tracked_sessions.keys():
+        for session_id, tracked in self.state.tracked_sessions.items():
+            # Skip sidechain trackers — they're cleaned up via
+            # _remove_sidechains_for_parent when their parent goes stale.
+            if tracked.parent_session_id is not None:
+                continue
             if session_id not in active_session_ids:
                 stale_sessions.append(session_id)
 
@@ -544,7 +725,35 @@ class SessionMonitor:
             for session_id in stale_sessions:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
-            self.state.save_if_dirty()
+                self._remove_sidechains_for_parent(session_id)
+
+        # Defensive sweep: drop any sidechain trackers whose parent isn't
+        # currently tracked. Reaches orphans left behind if a previous run
+        # crashed between removing a parent and removing its sidechains,
+        # or if a parent was removed by a code path that didn't call
+        # ``_remove_sidechains_for_parent``.
+        live_parents = {
+            sid
+            for sid, t in self.state.tracked_sessions.items()
+            if t.parent_session_id is None
+        }
+        orphan_sidechains = [
+            sid
+            for sid, t in self.state.tracked_sessions.items()
+            if t.parent_session_id is not None
+            and t.parent_session_id not in live_parents
+        ]
+        if orphan_sidechains:
+            logger.info(
+                "[Startup cleanup] Removing %d orphan sidechain tracker(s)",
+                len(orphan_sidechains),
+            )
+            for sid in orphan_sidechains:
+                self.state.remove_session(sid)
+                self._file_mtimes.pop(sid, None)
+                self._pending_tools.pop(sid, None)
+
+        self.state.save_if_dirty()
 
     async def _detect_and_cleanup_changes(self) -> dict[str, str]:
         """Detect session_map changes and cleanup replaced/removed sessions.
@@ -586,6 +795,7 @@ class SessionMonitor:
             for session_id in sessions_to_remove:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                self._remove_sidechains_for_parent(session_id)
             self.state.save_if_dirty()
 
         # Update last known map
@@ -619,6 +829,16 @@ class SessionMonitor:
 
                 # Check for new messages (all I/O is async)
                 new_messages = await self.check_for_updates(active_session_ids)
+
+                # Tail any sub-agent (sidechain) JSONL files for active
+                # parent sessions and append their filtered tool_use
+                # headers. Routed back to the parent session_id so they
+                # surface in the parent topic with a "↳ " prefix.
+                sidechain_messages = await self.check_sidechain_updates(
+                    active_session_ids
+                )
+                if sidechain_messages:
+                    new_messages.extend(sidechain_messages)
 
                 for msg in new_messages:
                     preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")

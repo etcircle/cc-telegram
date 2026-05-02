@@ -421,3 +421,240 @@ class TestEventCallback:
         # parent JSONL message.
         assert all(e.stop_reason == "tool_use" for e in events)
         assert all(e.timestamp == "2026-05-02T12:00:00.000Z" for e in events)
+
+
+class TestSidechainTailing:
+    """check_sidechain_updates: tail sub-agent JSONLs and prefix with ↳."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    def _write_jsonl(self, path, lines: list[dict]) -> None:
+        path.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+
+    def _append_jsonl(self, path, lines: list[dict]) -> None:
+        with path.open("a", encoding="utf-8") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+    def _setup_parent(self, monitor, tmp_path, parent_sid: str = "parent-sid") -> tuple:
+        """Build a fake project with a parent JSONL and an empty sidechain dir."""
+        proj_dir = tmp_path / "projects" / "-tmp-fake"
+        proj_dir.mkdir(parents=True)
+        parent_jsonl = proj_dir / f"{parent_sid}.jsonl"
+        parent_jsonl.write_text("")  # parent file just needs to exist
+        sub_dir = proj_dir / parent_sid / "subagents"
+        sub_dir.mkdir(parents=True)
+        # Pre-register the parent in tracked_sessions so check_sidechain_updates
+        # can resolve its file_path.
+        monitor.state.update_session(
+            TrackedSession(
+                session_id=parent_sid,
+                file_path=str(parent_jsonl),
+                last_byte_offset=0,
+            )
+        )
+        return parent_jsonl, sub_dir
+
+    @pytest.mark.asyncio
+    async def test_first_seen_registers_at_eof_no_emit(
+        self, monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+    ):
+        """A sidechain file present on first observation is registered at EOF."""
+        parent_sid = "parent-sid"
+        _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
+
+        # Pre-existing sidechain content (a "historical run" we should NOT replay).
+        sc_file = sub_dir / "agent-abc.jsonl"
+        old_entry = make_jsonl_entry(
+            "assistant",
+            [make_tool_use_block("t1", "Bash", {"command": "ls"})],
+            session_id="ignored",
+        )
+        self._write_jsonl(sc_file, [old_entry])
+
+        msgs = await monitor.check_sidechain_updates({parent_sid})
+
+        # Nothing emitted (started at EOF), but the tracker is registered.
+        assert msgs == []
+        tracking_key = f"sub:{parent_sid}:agent-abc"
+        tracked = monitor.state.get_session(tracking_key)
+        assert tracked is not None
+        assert tracked.parent_session_id == parent_sid
+        assert tracked.last_byte_offset == sc_file.stat().st_size
+
+    @pytest.mark.asyncio
+    async def test_appended_tool_use_emits_prefixed_text(
+        self, monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+    ):
+        """New tool_use lines after registration emit '↳ ...' text NewMessages."""
+        parent_sid = "parent-sid"
+        _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
+        sc_file = sub_dir / "agent-abc.jsonl"
+        sc_file.write_text("")  # start empty
+
+        # First call registers the empty file at offset 0.
+        await monitor.check_sidechain_updates({parent_sid})
+
+        # Sub-agent now emits a tool_use.
+        new_entry = make_jsonl_entry(
+            "assistant",
+            [make_tool_use_block("t1", "Bash", {"command": "pnpm test"})],
+            session_id="ignored",
+        )
+        self._append_jsonl(sc_file, [new_entry])
+
+        msgs = await monitor.check_sidechain_updates({parent_sid})
+
+        assert len(msgs) == 1
+        m = msgs[0]
+        assert m.session_id == parent_sid  # routed to parent's topic
+        assert m.text.startswith("↳ ")
+        assert "Bash" in m.text
+        assert "pnpm test" in m.text
+        # Emitted as text, not tool_use, so the queue's tool_use logic is bypassed.
+        assert m.content_type == "text"
+        assert m.tool_use_id is None
+        assert m.tool_name is None
+        assert m.role == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_text_thinking_and_tool_use_pass_tool_result_dropped(
+        self,
+        monitor,
+        tmp_path,
+        make_jsonl_entry,
+        make_text_block,
+        make_thinking_block,
+        make_tool_use_block,
+        make_tool_result_block,
+    ):
+        """Assistant text/thinking/tool_use forward; tool_result is dropped."""
+        from ccbot.transcript_parser import TranscriptParser
+
+        parent_sid = "parent-sid"
+        _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
+        sc_file = sub_dir / "agent-abc.jsonl"
+        sc_file.write_text("")
+
+        await monitor.check_sidechain_updates({parent_sid})
+
+        text_entry = make_jsonl_entry(
+            "assistant", [make_text_block("agent's plan")], session_id="x"
+        )
+        thinking_entry = make_jsonl_entry(
+            "assistant", [make_thinking_block("agent thinking")], session_id="x"
+        )
+        tool_use_entry = make_jsonl_entry(
+            "assistant",
+            [make_tool_use_block("t1", "Read", {"file_path": "a.py"})],
+            session_id="x",
+        )
+        tool_result_entry = make_jsonl_entry(
+            "user",
+            [make_tool_result_block("t1", "file contents...")],
+            session_id="x",
+        )
+        self._append_jsonl(
+            sc_file, [text_entry, thinking_entry, tool_use_entry, tool_result_entry]
+        )
+
+        msgs = await monitor.check_sidechain_updates({parent_sid})
+
+        # text + thinking + tool_use → 3; tool_result dropped.
+        assert len(msgs) == 3
+        for m in msgs:
+            assert m.text.startswith("↳ ")
+            assert m.session_id == parent_sid
+            assert m.content_type == "text"
+            assert m.tool_use_id is None
+
+        text_msg, thinking_msg, tool_msg = msgs
+        # Prose is wrapped in expandable quote markers (collapsed by default).
+        assert TranscriptParser.EXPANDABLE_QUOTE_START in text_msg.text
+        assert "agent's plan" in text_msg.text
+        # Thinking is also wrapped (parser does the wrapping for us).
+        assert TranscriptParser.EXPANDABLE_QUOTE_START in thinking_msg.text
+        assert "agent thinking" in thinking_msg.text
+        # Tool header is plain markdown, no expandable wrapper.
+        assert TranscriptParser.EXPANDABLE_QUOTE_START not in tool_msg.text
+        assert "Read" in tool_msg.text
+
+    @pytest.mark.asyncio
+    async def test_show_tool_calls_false_short_circuits(
+        self, monitor, tmp_path, monkeypatch, make_jsonl_entry, make_tool_use_block
+    ):
+        """When show_tool_calls is disabled, no sidechain messages are emitted."""
+        from ccbot.session_monitor import config as monitor_config
+
+        monkeypatch.setattr(monitor_config, "show_tool_calls", False)
+
+        parent_sid = "parent-sid"
+        _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
+        sc_file = sub_dir / "agent-abc.jsonl"
+        entry = make_jsonl_entry(
+            "assistant",
+            [make_tool_use_block("t1", "Bash", {"command": "ls"})],
+            session_id="x",
+        )
+        self._write_jsonl(sc_file, [entry])
+
+        msgs = await monitor.check_sidechain_updates({parent_sid})
+
+        assert msgs == []
+        # Also: no tracker registered, since we bailed before the scan.
+        assert monitor.state.get_session(f"sub:{parent_sid}:agent-abc") is None
+
+    def test_remove_sidechains_for_parent_drops_all(self, monitor, tmp_path):
+        """_remove_sidechains_for_parent clears trackers + caches for one parent only."""
+        parent_a = "parent-a"
+        parent_b = "parent-b"
+
+        # Two trackers for parent_a, one for parent_b, plus a non-sidechain.
+        monitor.state.update_session(
+            TrackedSession(
+                session_id=f"sub:{parent_a}:agent-1",
+                file_path="/tmp/a1.jsonl",
+                parent_session_id=parent_a,
+            )
+        )
+        monitor.state.update_session(
+            TrackedSession(
+                session_id=f"sub:{parent_a}:agent-2",
+                file_path="/tmp/a2.jsonl",
+                parent_session_id=parent_a,
+            )
+        )
+        monitor.state.update_session(
+            TrackedSession(
+                session_id=f"sub:{parent_b}:agent-1",
+                file_path="/tmp/b1.jsonl",
+                parent_session_id=parent_b,
+            )
+        )
+        monitor.state.update_session(
+            TrackedSession(
+                session_id=parent_a,
+                file_path="/tmp/parent_a.jsonl",
+            )
+        )
+        monitor._file_mtimes[f"sub:{parent_a}:agent-1"] = 1.0
+        monitor._pending_tools[f"sub:{parent_a}:agent-2"] = {"x": object()}
+
+        monitor._remove_sidechains_for_parent(parent_a)
+
+        # Parent A's sidechains gone; parent A itself + parent B's child remain.
+        assert monitor.state.get_session(f"sub:{parent_a}:agent-1") is None
+        assert monitor.state.get_session(f"sub:{parent_a}:agent-2") is None
+        assert monitor.state.get_session(f"sub:{parent_b}:agent-1") is not None
+        assert monitor.state.get_session(parent_a) is not None
+        # Caches scrubbed for the removed keys only.
+        assert f"sub:{parent_a}:agent-1" not in monitor._file_mtimes
+        assert f"sub:{parent_a}:agent-2" not in monitor._pending_tools
