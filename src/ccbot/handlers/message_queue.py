@@ -1332,7 +1332,7 @@ def _is_todo_tool_result(task: MessageTask, user_id: int) -> bool:
     return (task.tool_use_id, user_id, tid) in _todo_tool_ids
 
 
-def _render_todo_digest(todos: list[dict[str, object]], window_id: str) -> str:
+def _render_todo_digest(todos: list[dict[str, object]]) -> str:
     """Render the editable to-do-list card from a TodoWrite snapshot.
 
     Status emoji mirror Claude Code's pane: ✅ completed, 🔄 in_progress,
@@ -1404,7 +1404,7 @@ async def _upsert_todo_digest(
     """Send or edit the to-do-list digest card."""
     tid = thread_id or 0
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
-    text = _render_todo_digest(todos, state.window_id)
+    text = _render_todo_digest(todos)
     if text == state.last_text:
         return
 
@@ -1480,14 +1480,21 @@ def _schedule_todo_flush(
         except asyncio.CancelledError:
             return
         _todo_flush_tasks.pop(key, None)
-        snapshot = _todo_pending_snapshot.get(key)
-        if snapshot is None:
-            return
-        state = _todo_msg_info.get(key)
-        if state is None:
-            return
         try:
+            # Read snapshot + state INSIDE the lock so an interleaved
+            # _process_todo_task can't write a newer snapshot between our
+            # ``.get()`` and the upsert; the lock now defines the
+            # "render the latest known snapshot" boundary.
             async with _get_todo_lock(user_id, tid):
+                snapshot = _todo_pending_snapshot.get(key)
+                if snapshot is None:
+                    return
+                state = _todo_msg_info.get(key)
+                if state is None:
+                    # _process_todo_task creates the state record before
+                    # scheduling the flush, so missing state here means
+                    # teardown raced us.
+                    return
                 await _upsert_todo_digest(bot, user_id, thread_id, state, snapshot)
         except asyncio.CancelledError:
             raise
@@ -1510,6 +1517,12 @@ async def _process_todo_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     if not isinstance(todos_raw, list):
         return
     todos: list[dict[str, object]] = [t for t in todos_raw if isinstance(t, dict)]
+    # Empty todos render as "📋 Tasks (0/0 done)" — visual noise on session
+    # start where Claude sometimes opens with TodoWrite([]) to clear the
+    # prior list. Skip the card entirely; the next non-empty TodoWrite will
+    # send a fresh one.
+    if not todos:
+        return
 
     wid = task.window_id or ""
     tid = task.thread_id or 0

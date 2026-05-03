@@ -2866,7 +2866,6 @@ class TestTodoDigest:
                 },
                 {"content": "third", "status": "pending"},
             ],
-            "@0",
         )
         assert "📋 Tasks (1/3 done · 1 active)" in text
         assert "✅ first" in text
@@ -2881,10 +2880,34 @@ class TestTodoDigest:
             {"content": f"item {i}", "status": "pending"}
             for i in range(message_queue.TODO_DIGEST_MAX_VISIBLE + 5)
         ]
-        text = message_queue._render_todo_digest(todos, "@0")
+        text = message_queue._render_todo_digest(todos)
         assert "… +5 more" in text
         # The first MAX_VISIBLE items are shown, the rest collapse.
         assert text.count("⬜") == message_queue.TODO_DIGEST_MAX_VISIBLE
+
+    @pytest.mark.asyncio
+    async def test_empty_todos_skipped(self, mock_bot: AsyncMock):
+        """TodoWrite([]) is a clear-the-list signal, not "show 0/0 done".
+
+        Claude sometimes opens a session with TodoWrite([]) to wipe the
+        prior list. Rendering that as a card is visual noise. The next
+        non-empty TodoWrite will start a fresh card.
+        """
+        with patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=1
+        ):
+            await message_queue._process_todo_task(
+                mock_bot,
+                1,
+                self._todo_use_task(todos=[], tool_use_id="tu-empty"),
+            )
+        assert (1, 42) not in message_queue._todo_msg_info
+        assert (1, 42) not in message_queue._todo_pending_snapshot
+        assert (1, 42) not in message_queue._todo_flush_tasks
+        # The id IS not added — empty TodoWrite has no follow-up payload
+        # to suppress, so leaving it un-recorded keeps the activity flow
+        # consistent for the (uninteresting) tool_result.
+        assert ("tu-empty", 1, 42) not in message_queue._todo_tool_ids
 
     def test_is_todo_tool_use_skips_subagent_todos(self):
         """A sub-agent's TodoWrite stays on the sub-agent path, not the parent's
