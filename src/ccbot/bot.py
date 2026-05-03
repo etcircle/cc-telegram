@@ -42,8 +42,12 @@ from pathlib import Path
 from telegram import (
     Bot,
     BotCommand,
+    BotCommandScopeAllChatAdministrators,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    BotCommandScopeChatAdministrators,
+    BotCommandScopeChatMember,
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -2207,19 +2211,73 @@ async def post_init(application: Application) -> None:
     # insert tasks.
     await message_refs.init_db(config.message_refs_db_path)
 
-    # Telegram resolves the bot's command menu by scope: in a forum / group
-    # chat it checks the group scope first and only falls back to Default if
-    # nothing is set there. A prior deploy that called set_my_commands with
-    # an explicit group scope would otherwise pin an old menu forever, since
-    # delete_my_commands() without scope only clears Default. Clear all
-    # scopes we care about, then re-set Default + AllGroupChats so both
-    # private chats and forum topics show the current list.
+    # Telegram resolves the bot's command menu by scope priority. In a
+    # forum / group chat the order is, roughly:
+    #   chat → chat_administrators → all_chat_administrators
+    #     → all_group_chats → default
+    # Whichever scope has commands set wins; only "no commands at this
+    # scope" falls through. A prior deploy that ever called
+    # set_my_commands with ``all_chat_administrators`` (Stage 1 of this
+    # bot did exactly that) leaves an orphan menu that shadows
+    # ``all_group_chats`` forever for any admin user — including the bot
+    # owner, who is always an admin of their own forum.
+    # ``delete_my_commands`` without a scope only clears Default, so we
+    # explicitly walk every scope we've ever published to and clear it,
+    # then re-set the two scopes we actually want.
     for scope in (
         BotCommandScopeDefault(),
         BotCommandScopeAllGroupChats(),
         BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllChatAdministrators(),
     ):
         await application.bot.delete_my_commands(scope=scope)
+
+    # Per-chat scopes (``chat`` and ``chat_administrators``) outrank the
+    # ``all_*`` family, so an old menu set on a specific chat shadows the
+    # one we just installed for every admin in that chat. We never set
+    # these scopes intentionally, but earlier deploys did, and Telegram
+    # has no "delete every per-chat scope" API call. Walk the persisted
+    # ``group_chat_ids`` map for the set of chats this bot has ever
+    # touched and clear both per-chat scopes there. Idempotent: deleting
+    # an already-empty scope is a no-op success on the Telegram side.
+    # Group chat scopes — keys in ``group_chat_ids`` are
+    # ``"user_id:thread_id"`` and values are chat_ids. We need the
+    # distinct (user_id, chat_id) pairs for ``chat_member`` (the
+    # highest-priority scope of all — set on a specific user in a
+    # specific chat) and the distinct chat_ids for ``chat`` /
+    # ``chat_administrators``.
+    seen_chats: set[int] = set()
+    seen_user_chat: set[tuple[int, int]] = set()
+    for key, chat_id in session_manager.group_chat_ids.items():
+        seen_chats.add(chat_id)
+        try:
+            user_id_str, _ = key.split(":", 1)
+            seen_user_chat.add((int(user_id_str), chat_id))
+        except (ValueError, AttributeError):
+            continue
+
+    chat_scopes: list[BotCommandScopeChat | BotCommandScopeChatAdministrators] = []
+    for chat_id in seen_chats:
+        chat_scopes.append(BotCommandScopeChat(chat_id=chat_id))
+        chat_scopes.append(BotCommandScopeChatAdministrators(chat_id=chat_id))
+    member_scopes = [
+        BotCommandScopeChatMember(chat_id=chat_id, user_id=user_id)
+        for (user_id, chat_id) in seen_user_chat
+    ]
+
+    for scope in (*chat_scopes, *member_scopes):
+        try:
+            await application.bot.delete_my_commands(scope=scope)
+        except Exception as e:
+            # Telegram returns 400 BadRequest if the bot isn't a member
+            # of the chat anymore (group archived, kicked, etc.) or the
+            # user has blocked the bot. Don't let one stale chat block
+            # startup.
+            logger.warning(
+                "delete_my_commands failed for scope=%s: %s",
+                scope.type,
+                e,
+            )
 
     bot_commands = [
         BotCommand("start", "Show welcome message"),
