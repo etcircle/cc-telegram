@@ -156,7 +156,7 @@ _activity_flush_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
 # window: the second caller waits, sees the freshly-updated ``state.message_id``,
 # and either edits or no-ops via the ``text == last_text`` check.
 _activity_locks: dict[tuple[int, int], asyncio.Lock] = {}
-ACTIVITY_FLUSH_DEBOUNCE_SECONDS = 5.0
+ACTIVITY_FLUSH_DEBOUNCE_SECONDS = 10.0
 ACTIVITY_DIGEST_CONTENT_TYPES = {"tool_use", "tool_result", "thinking"}
 ACTIVITY_DIGEST_MAX_LINES = 10
 # Per-line cap inside the activity digest. The previous 180 was tight
