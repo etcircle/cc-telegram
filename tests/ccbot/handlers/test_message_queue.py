@@ -3026,7 +3026,7 @@ class TestTodoDigest:
         and returns True; the dispatcher returns early.
         """
         # Seed the id as if we'd just routed a TodoWrite tool_use through.
-        message_queue._todo_tool_ids.add(("tu-x", 1, 42))
+        message_queue._todo_tool_ids_record(("tu-x", 1, 42))
         result_task = message_queue.MessageTask(
             task_type="content",
             window_id="@0",
@@ -3101,7 +3101,7 @@ class TestTodoDigest:
             message_id=123, window_id="@0"
         )
         message_queue._todo_pending_snapshot[(1, 42)] = [{"content": "x"}]
-        message_queue._todo_tool_ids.add(("tu-1", 1, 42))
+        message_queue._todo_tool_ids_record(("tu-1", 1, 42))
         message_queue._todo_locks[(1, 42)] = asyncio.Lock()
 
         await message_queue.teardown_route(route, drop_pending=True)
@@ -3110,3 +3110,113 @@ class TestTodoDigest:
         assert (1, 42) not in message_queue._todo_pending_snapshot
         assert (1, 42) not in message_queue._todo_locks
         assert ("tu-1", 1, 42) not in message_queue._todo_tool_ids
+
+    @pytest.mark.asyncio
+    async def test_shielded_upsert_completes_after_outer_cancel(
+        self, mock_bot: AsyncMock
+    ):
+        """Cancelling the debounced flush task while ``topic_send`` is in flight
+        must NOT lose the post-send state assignment.
+
+        Without ``asyncio.shield`` around the upsert, the cancel-and-replace
+        in ``_schedule_todo_flush`` would interrupt the in-flight network
+        call, potentially after Telegram already created the message but
+        before ``state.message_id`` was recorded — orphaning a Telegram
+        message that the next flush would re-send instead of edit.
+
+        We simulate the race by holding ``topic_send`` open with an event
+        until after we've requested cancellation, then releasing it.
+        ``_run_locked_todo_upsert`` should complete and the state should
+        carry the new message_id.
+        """
+        from ccbot.handlers.message_sender import TopicSendOutcome
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 8123
+        topic_send_started = asyncio.Event()
+        release_topic_send = asyncio.Event()
+
+        async def slow_send(*a, **kw):
+            topic_send_started.set()
+            await release_topic_send.wait()
+            return sent_msg, TopicSendOutcome.OK
+
+        with (
+            patch.object(message_queue, "topic_send", side_effect=slow_send),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+            patch.object(message_queue, "ACTIVITY_FLUSH_DEBOUNCE_SECONDS", 0.0),
+        ):
+            await message_queue._process_todo_task(
+                mock_bot,
+                1,
+                self._todo_use_task(
+                    todos=[{"content": "racy", "status": "in_progress"}],
+                    tool_use_id="tu-race",
+                ),
+            )
+            flush = message_queue._todo_flush_tasks.get((1, 42))
+            assert flush is not None
+
+            # Wait for the flush to enter topic_send.
+            await topic_send_started.wait()
+
+            # Now cancel the outer task — simulating a 2nd TodoWrite arriving
+            # mid-network-call. Without shield, this would orphan the message.
+            flush.cancel()
+
+            # Let topic_send return; the shielded upsert should finish and
+            # write state.message_id even though the outer task was cancelled.
+            release_topic_send.set()
+
+            # Drain background work. The shielded coroutine completes
+            # asynchronously, so yield until state is updated.
+            for _ in range(50):
+                state = message_queue._todo_msg_info.get((1, 42))
+                if state is not None and state.message_id == 8123:
+                    break
+                await asyncio.sleep(0.01)
+
+        state = message_queue._todo_msg_info.get((1, 42))
+        assert state is not None
+        assert state.message_id == 8123, (
+            "shielded upsert dropped the message_id after outer cancel"
+        )
+
+    def test_todo_tool_ids_evicts_oldest_over_cap(self):
+        """LRU bounded cap on _todo_tool_ids prevents unbounded growth.
+
+        The set is process-global; if a TodoWrite's tool_result never
+        arrives (transcript truncation, hook drop, kill mid-tool), the
+        entry would otherwise stay forever. Bounded at TODO_TOOL_IDS_MAX
+        with insertion-order eviction.
+        """
+        cap = message_queue.TODO_TOOL_IDS_MAX
+        # Fill to cap.
+        for i in range(cap):
+            message_queue._todo_tool_ids_record((f"tu-{i}", 1, 42))
+        assert len(message_queue._todo_tool_ids) == cap
+        assert ("tu-0", 1, 42) in message_queue._todo_tool_ids
+
+        # One more push evicts the oldest (tu-0).
+        message_queue._todo_tool_ids_record(("tu-overflow", 1, 42))
+        assert len(message_queue._todo_tool_ids) == cap
+        assert ("tu-0", 1, 42) not in message_queue._todo_tool_ids
+        assert ("tu-overflow", 1, 42) in message_queue._todo_tool_ids
+
+    def test_todo_tool_ids_record_idempotent_refreshes_recency(self):
+        """Re-recording an id moves it to the LRU end (refreshes recency).
+
+        Without ``move_to_end``, a long-lived TodoWrite that gets re-added
+        (e.g., the same tool_use_id surfaces twice in a JSONL replay) would
+        sit at its original insertion point and risk premature eviction.
+        """
+        message_queue._todo_tool_ids_record(("a", 1, 42))
+        message_queue._todo_tool_ids_record(("b", 1, 42))
+        # Re-record "a" — should move it to the end.
+        message_queue._todo_tool_ids_record(("a", 1, 42))
+        # Walk ordered keys; "a" is now most-recent.
+        keys = list(message_queue._todo_tool_ids)
+        assert keys[-1] == ("a", 1, 42)
+        assert keys[-2] == ("b", 1, 42)

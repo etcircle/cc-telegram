@@ -25,6 +25,7 @@ Key components:
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -194,9 +195,32 @@ _todo_pending_snapshot: dict[tuple[int, int], list[dict[str, object]]] = {}
 # the matching ``tool_result`` (which carries no tool_name) can be dropped
 # from the activity digest path; otherwise the result line leaks into the
 # activity card as "**TodoWrite** — applied" noise duplicating the digest.
-_todo_tool_ids: set[tuple[str, int, int]] = set()
+#
+# Bounded LRU because the entry is only removed on (a) the matching
+# tool_result landing or (b) ``teardown_route``. A TodoWrite whose
+# tool_result never arrives (transcript truncation, session killed
+# mid-tool, hook drop) would otherwise leak forever in this
+# process-global structure.
+_todo_tool_ids: OrderedDict[tuple[str, int, int], None] = OrderedDict()
+TODO_TOOL_IDS_MAX = 1024
 TODO_DIGEST_MAX_VISIBLE = 8
 TODO_DIGEST_CONTENT_SNIPPET = 120
+
+
+def _todo_tool_ids_record(key: tuple[str, int, int]) -> None:
+    """Record a TodoWrite tool_use id; evict the oldest if over cap.
+
+    Wrapping the add path centralizes the bounded-size invariant — call
+    sites stay one-liners, and the eviction policy can be tuned in one
+    place if we ever switch to TTL or per-route bounds.
+    """
+    if key in _todo_tool_ids:
+        _todo_tool_ids.move_to_end(key)
+        return
+    _todo_tool_ids[key] = None
+    if len(_todo_tool_ids) > TODO_TOOL_IDS_MAX:
+        _todo_tool_ids.popitem(last=False)
+
 
 ACTIVITY_DIGEST_CONTENT_TYPES = {"tool_use", "tool_result", "thinking"}
 ACTIVITY_DIGEST_MAX_LINES = 10
@@ -496,7 +520,7 @@ async def _dispatch_task(
             # duplicate "**TodoWrite** — applied" line on the activity card.
             tid = task.thread_id or 0
             if task.tool_use_id:
-                _todo_tool_ids.discard((task.tool_use_id, user_id, tid))
+                _todo_tool_ids.pop((task.tool_use_id, user_id, tid), None)
             return task
         if task.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
             await _process_activity_task(bot, user_id, task)
@@ -538,7 +562,7 @@ async def _dispatch_already_merged(
         if _is_todo_tool_result(task, user_id):
             tid = task.thread_id or 0
             if task.tool_use_id:
-                _todo_tool_ids.discard((task.tool_use_id, user_id, tid))
+                _todo_tool_ids.pop((task.tool_use_id, user_id, tid), None)
             return
         if task.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
             await _process_activity_task(bot, user_id, task)
@@ -1456,6 +1480,45 @@ async def _upsert_todo_digest(
         )
 
 
+async def _run_locked_todo_upsert(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    tid: int,
+    key: tuple[int, int],
+) -> None:
+    """Acquire the per-route lock and run one todo-digest upsert.
+
+    Lifted out of ``_schedule_todo_flush._delayed`` so the flush task can
+    wrap *this* awaitable in ``asyncio.shield`` — protecting the
+    network-call window and the immediately-following state assignment
+    (``state.message_id = sent.message_id``) from outer cancellation.
+
+    Without the shield, a TodoWrite arriving while ``await topic_send``
+    is in flight would cancel the in-flight task; if Telegram had
+    already created the message but our local state was never updated,
+    the next flush would issue a *second* card instead of editing the
+    first. With shield, the inner upsert runs to completion even if the
+    outer ``_delayed`` task was cancelled — and any subsequent flush
+    correctly waits on this lock before reading state.
+
+    Reading snapshot + state INSIDE the lock keeps the
+    "render the latest known snapshot" boundary at the lock; an
+    interleaved ``_process_todo_task`` cannot mutate state between our
+    read and the upsert.
+    """
+    async with _get_todo_lock(user_id, tid):
+        snapshot = _todo_pending_snapshot.get(key)
+        if snapshot is None:
+            return
+        state = _todo_msg_info.get(key)
+        if state is None:
+            # _process_todo_task creates the state record before scheduling
+            # the flush, so missing state here means teardown raced us.
+            return
+        await _upsert_todo_digest(bot, user_id, thread_id, state, snapshot)
+
+
 def _schedule_todo_flush(
     bot: Bot,
     user_id: int,
@@ -1467,6 +1530,10 @@ def _schedule_todo_flush(
     budget logic. The pending snapshot is read at flush time, not capture
     time, so two TodoWrites within the debounce window correctly collapse
     to "edit once with the latest snapshot".
+
+    Cancellation safety: the upsert runs under ``asyncio.shield`` so
+    cancelling this debounced task while a network call is in flight
+    cannot orphan a Telegram message. See ``_run_locked_todo_upsert``.
     """
     tid = thread_id or 0
     key = (user_id, tid)
@@ -1481,21 +1548,9 @@ def _schedule_todo_flush(
             return
         _todo_flush_tasks.pop(key, None)
         try:
-            # Read snapshot + state INSIDE the lock so an interleaved
-            # _process_todo_task can't write a newer snapshot between our
-            # ``.get()`` and the upsert; the lock now defines the
-            # "render the latest known snapshot" boundary.
-            async with _get_todo_lock(user_id, tid):
-                snapshot = _todo_pending_snapshot.get(key)
-                if snapshot is None:
-                    return
-                state = _todo_msg_info.get(key)
-                if state is None:
-                    # _process_todo_task creates the state record before
-                    # scheduling the flush, so missing state here means
-                    # teardown raced us.
-                    return
-                await _upsert_todo_digest(bot, user_id, thread_id, state, snapshot)
+            await asyncio.shield(
+                _run_locked_todo_upsert(bot, user_id, thread_id, tid, key)
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # pragma: no cover - background task safety
@@ -1537,7 +1592,7 @@ async def _process_todo_task(bot: Bot, user_id: int, task: MessageTask) -> None:
 
     _todo_pending_snapshot[key] = todos
     if task.tool_use_id:
-        _todo_tool_ids.add((task.tool_use_id, user_id, tid))
+        _todo_tool_ids_record((task.tool_use_id, user_id, tid))
     _schedule_todo_flush(bot, user_id, task.thread_id)
 
 
@@ -2478,12 +2533,13 @@ async def teardown_route(route: Route, *, drop_pending: bool) -> None:
         if todo_flush is not None and not todo_flush.done():
             todo_flush.cancel()
         _todo_locks.pop((route_user_id, route_tid), None)
-        # _todo_tool_ids is set-of-tuples; filter rather than drop-by-key.
+        # _todo_tool_ids is OrderedDict-as-set; filter rather than drop-by-key.
+        # ``list()`` snapshots keys so the pop loop can mutate the dict.
         todo_ids_to_remove = [
             k for k in _todo_tool_ids if k[1] == route_user_id and k[2] == route_tid
         ]
         for k in todo_ids_to_remove:
-            _todo_tool_ids.discard(k)
+            _todo_tool_ids.pop(k, None)
     finally:
         _route_tearing_down.discard(route)
 
