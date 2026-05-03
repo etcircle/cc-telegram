@@ -193,15 +193,26 @@ class Config:
         except ValueError:
             self.aggregator_debounce_seconds = 1.5
 
-        # Hard cap on photos per aggregated bundle. Beyond this, the
+        # Hard cap on attachments per aggregated bundle. Beyond this, the
         # aggregator force-flushes immediately rather than waiting on the
-        # debounce — prevents an unbounded image dump from blocking flush.
+        # debounce — prevents an unbounded media dump from blocking flush.
         try:
-            self.aggregator_max_photos = int(
-                os.getenv("CCBOT_AGGREGATOR_MAX_PHOTOS", "10")
+            self.aggregator_max_attachments = int(
+                os.getenv("CCBOT_AGGREGATOR_MAX_ATTACHMENTS", "10")
             )
         except ValueError:
-            self.aggregator_max_photos = 10
+            self.aggregator_max_attachments = 10
+
+        # Upper bound on document uploads forwarded to Claude Code. Telegram
+        # itself caps bot getFile downloads at 20 MB; self-hosted Bot API
+        # users can raise this. We fail fast before download to avoid the
+        # less-actionable error from get_file() past the cap.
+        try:
+            self.max_attachment_size_bytes: int = int(
+                os.getenv("CCBOT_MAX_ATTACHMENT_SIZE_BYTES", str(20 * 1024 * 1024))
+            )
+        except ValueError:
+            self.max_attachment_size_bytes = 20 * 1024 * 1024
 
         # §2.5.3 Stage 5.c: Telegram message-refs SQLite. The DB file lives
         # under the config dir by default so it follows the rest of ccbot's

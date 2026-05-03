@@ -100,8 +100,8 @@ async def test_media_group_coalesces_to_one_flush(captured_sends):
         < flushed.index("img2.jpg")
         < flushed.index("img3.jpg")
     )
-    # Single grouped block: only one "(images attached:" header.
-    assert flushed.count("(images attached:") == 1
+    # Single grouped block: only one "(attachments:" header.
+    assert flushed.count("(attachments:") == 1
 
 
 @pytest.mark.asyncio
@@ -119,7 +119,7 @@ async def test_media_group_no_caption_groups_paths(captured_sends):
     await _wait_until_flushed(captured_sends, expected=1)
     assert len(captured_sends) == 1
     flushed = captured_sends[0][1]
-    assert flushed.startswith("(images attached:")
+    assert flushed.startswith("(attachments:")
     assert "/tmp/a.jpg" in flushed
     assert "/tmp/b.jpg" in flushed
     assert "/tmp/c.jpg" in flushed
@@ -143,11 +143,11 @@ async def test_media_group_then_followup_text_appends_once(captured_sends):
     flushed = captured_sends[0][1]
     assert flushed.count("shared caption") == 1
     assert "and one more thing" in flushed
-    # Caption appears before follow-up; both before the (images attached: …)
+    # Caption appears before follow-up; both before the (attachments: …)
     # block, all three paths grouped.
     assert flushed.index("shared caption") < flushed.index("and one more thing")
-    assert flushed.index("and one more thing") < flushed.index("(images attached:")
-    assert flushed.count("(images attached:") == 1
+    assert flushed.index("and one more thing") < flushed.index("(attachments:")
+    assert flushed.count("(attachments:") == 1
     for p in ("/tmp/x1.jpg", "/tmp/x2.jpg", "/tmp/x3.jpg"):
         assert p in flushed
 
@@ -167,10 +167,61 @@ async def test_photo_then_fast_follow_text_coalesces(captured_sends):
 
 
 @pytest.mark.asyncio
-async def test_max_photos_triggers_immediate_flush(captured_sends):
+async def test_distinct_media_groups_force_flush_at_boundary(captured_sends):
+    """Two media-groups inside the debounce window must NOT merge.
+
+    Caption from group-2 leaking into group-1's bundle was the §2.8 bug:
+    the boundary check force-flushes the in-progress bundle when a new
+    mg-id arrives.
+    """
     route = (1, 100, "@0")
-    original_max = config.aggregator_max_photos
-    config.aggregator_max_photos = 10
+    config.aggregator_debounce_seconds = 5.0
+    await inbound_aggregator.aggregator_offer_photo(
+        route, Path("/tmp/g1a.jpg"), "first album", "mg-1"
+    )
+    await inbound_aggregator.aggregator_offer_photo(
+        route, Path("/tmp/g1b.jpg"), None, "mg-1"
+    )
+    # Boundary: different mg-id → previous bundle force-flushes.
+    await inbound_aggregator.aggregator_offer_photo(
+        route, Path("/tmp/g2a.jpg"), "second album", "mg-2"
+    )
+    await _wait_until_flushed(captured_sends, expected=1)
+    # Force the new bundle out so we can inspect it.
+    await inbound_aggregator.aggregator_flush_route(route)
+    assert len(captured_sends) == 2
+    first, second = captured_sends[0][1], captured_sends[1][1]
+    assert "first album" in first
+    assert "second album" not in first
+    assert "/tmp/g1a.jpg" in first and "/tmp/g1b.jpg" in first
+    assert "/tmp/g2a.jpg" not in first
+    assert "second album" in second
+    assert "/tmp/g2a.jpg" in second
+
+
+@pytest.mark.asyncio
+async def test_caption_dedup_within_media_group(captured_sends):
+    """Telegram repeats the same caption on every media-group item; we dedup."""
+    route = (1, 100, "@0")
+    await inbound_aggregator.aggregator_offer_photo(
+        route, Path("/tmp/d1.jpg"), "same caption", "mg-d"
+    )
+    await inbound_aggregator.aggregator_offer_photo(
+        route, Path("/tmp/d2.jpg"), "same caption", "mg-d"
+    )
+    await inbound_aggregator.aggregator_offer_photo(
+        route, Path("/tmp/d3.jpg"), "same caption", "mg-d"
+    )
+    await _wait_until_flushed(captured_sends, expected=1)
+    flushed = captured_sends[0][1]
+    assert flushed.count("same caption") == 1
+
+
+@pytest.mark.asyncio
+async def test_max_attachments_triggers_immediate_flush(captured_sends):
+    route = (1, 100, "@0")
+    original_max = config.aggregator_max_attachments
+    config.aggregator_max_attachments = 10
     # Use a large debounce so we can prove the cap, not the timer, fired.
     config.aggregator_debounce_seconds = 5.0
     try:
@@ -190,7 +241,7 @@ async def test_max_photos_triggers_immediate_flush(captured_sends):
             assert f"/tmp/m{i}.jpg" in flushed
         assert "/tmp/m10.jpg" not in flushed
     finally:
-        config.aggregator_max_photos = original_max
+        config.aggregator_max_attachments = original_max
 
 
 @pytest.mark.asyncio
@@ -256,7 +307,7 @@ async def test_unbound_topic_pending_then_directory_pick_flushes(captured_sends)
     assert "stash caption" in flushed
     assert "/tmp/u1.jpg" in flushed
     assert "/tmp/u2.jpg" in flushed
-    assert flushed.count("(images attached:") == 1
+    assert flushed.count("(attachments:") == 1
 
 
 @pytest.mark.asyncio

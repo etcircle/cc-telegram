@@ -7,14 +7,15 @@ context across multiple Claude turns and (for media-groups) attaches the
 caption to whichever photo arrived first, leaving the rest contextless.
 
 This module buffers offers per route and flushes on a debounce window or on a
-max-photo cap. The flushed string follows the §2.8.2 shape: the user's typed
-text once, then a single ``(images attached: …)`` block with all paths in
-arrival order. The caption is never repeated per image.
+max-attachment cap. The flushed string follows the §2.8.2 shape: the user's
+typed text once, then a single ``(attachments: …)`` block with all paths in
+arrival order. The caption is never repeated per attachment.
 
 Public surface:
   - ``aggregator_offer_text(route, text)``
   - ``aggregator_offer_voice(route, transcribed_text)``
   - ``aggregator_offer_photo(route, path, caption, media_group_id)``
+  - ``aggregator_offer_document(route, path, caption, media_group_id)``
   - ``aggregator_flush_route(route)`` — public force-flush (slash-command path)
   - ``aggregator_clear_route(route)`` — teardown hook (cancels pending flush)
 """
@@ -38,20 +39,24 @@ Route = tuple[int, int, str]
 
 @dataclass
 class _PendingBundle:
-    # ``media_group_id`` is intentionally NOT tracked here. Telegram delivers
-    # all photos in a media-group within milliseconds of each other, so the
-    # debounce window already coalesces them into one bundle without needing
-    # to key by group id. Adding a coalesce key would also imply a
-    # boundary-check ("different mg-id force-flushes the old bundle") that
-    # the §2.8 spec doesn't require.
     text_parts: list[str] = field(default_factory=list)
-    photo_paths: list[Path] = field(default_factory=list)
+    attachment_paths: list[Path] = field(default_factory=list)
     flush_handle: asyncio.TimerHandle | None = None
+    # Track the current media-group so a transition to a different group's
+    # first attachment can force-flush the bundle in progress. Telegram
+    # delivers media-group items within milliseconds, but two distinct
+    # groups arriving inside the same debounce window must NOT merge — that
+    # would attach group-2's caption to group-1's images.
+    current_media_group_id: str | None = None
+    # Caption dedup: Telegram repeats the same caption on every item of a
+    # media-group when the user sets it on the album, so without dedup we
+    # emit the caption N times.
+    seen_captions: set[str] = field(default_factory=set)
 
 
 # Per-route pending bundle. Mutation guarded by ``_route_locks[route]`` so the
-# flush callback and the offer paths can't race the same bundle's photos /
-# text-parts list.
+# flush callback and the offer paths can't race the same bundle's attachments
+# / text-parts list.
 _route_pending: dict[Route, _PendingBundle] = {}
 _route_locks: dict[Route, asyncio.Lock] = {}
 
@@ -100,9 +105,9 @@ def _schedule_flush(route: Route, bundle: _PendingBundle) -> None:
 def _format_bundle(bundle: _PendingBundle) -> str:
     """Render the §2.8.2 output shape for a bundle."""
     text_block = "\n\n".join(part for part in bundle.text_parts if part)
-    if bundle.photo_paths:
-        path_lines = "\n".join(f"  - {path}" for path in bundle.photo_paths)
-        attached_block = f"(images attached:\n{path_lines})"
+    if bundle.attachment_paths:
+        path_lines = "\n".join(f"  - {path}" for path in bundle.attachment_paths)
+        attached_block = f"(attachments:\n{path_lines})"
     else:
         attached_block = ""
 
@@ -193,29 +198,46 @@ async def aggregator_offer_voice(route: Route, transcribed_text: str) -> None:
     await aggregator_offer_text(route, transcribed_text)
 
 
-async def aggregator_offer_photo(
+async def _offer_attachment(
     route: Route,
     path: Path,
     caption: str | None,
     media_group_id: str | None,
 ) -> None:
-    """Append a photo (and any caption) to the route's bundle.
+    """Append an attachment (and any caption) to the route's bundle.
 
-    When ``len(photo_paths)`` reaches the configured cap the bundle is
+    When ``len(attachment_paths)`` reaches the configured cap the bundle is
     force-flushed immediately rather than waiting on the debounce — keeps an
     unbounded media dump from sitting in memory.
     """
-    # ``media_group_id`` is accepted for API parity with the Telegram
-    # update payload but intentionally not stored — see _PendingBundle.
-    del media_group_id
     lock = _get_lock(route)
     flush_now = False
     async with lock:
         bundle = _get_or_create_bundle(route)
-        if caption:
+
+        # Boundary force-flush: a new media-group arriving inside the
+        # debounce window must not merge with the previous group's items.
+        # Pop and dispatch the in-progress bundle without awaiting (the
+        # lock is non-reentrant and ``_send_bundle`` does network IO),
+        # then start a fresh bundle under the same lock acquisition.
+        if (
+            media_group_id is not None
+            and bundle.current_media_group_id is not None
+            and media_group_id != bundle.current_media_group_id
+            and (bundle.attachment_paths or bundle.text_parts)
+        ):
+            old_bundle = _pop_bundle_locked(route)
+            if old_bundle is not None:
+                asyncio.create_task(_send_bundle(route, old_bundle))
+            bundle = _get_or_create_bundle(route)
+
+        if caption and caption not in bundle.seen_captions:
             bundle.text_parts.append(caption)
-        bundle.photo_paths.append(path)
-        if len(bundle.photo_paths) >= config.aggregator_max_photos:
+            bundle.seen_captions.add(caption)
+        bundle.attachment_paths.append(path)
+        bundle.current_media_group_id = media_group_id
+
+        if len(bundle.attachment_paths) >= config.aggregator_max_attachments:
             flush_now = True
             _cancel_handle(bundle)
         else:
@@ -223,6 +245,39 @@ async def aggregator_offer_photo(
 
     if flush_now:
         await _flush(route)
+
+
+async def aggregator_offer_photo(
+    route: Route,
+    path: Path,
+    caption: str | None,
+    media_group_id: str | None,
+) -> None:
+    await _offer_attachment(route, path, caption, media_group_id)
+
+
+async def aggregator_offer_document(
+    route: Route,
+    path: Path,
+    caption: str | None,
+    media_group_id: str | None,
+) -> None:
+    await _offer_attachment(route, path, caption, media_group_id)
+
+
+async def aggregator_offer_attachment(
+    route: Route,
+    path: Path,
+    caption: str | None,
+    media_group_id: str | None,
+) -> None:
+    """Kind-agnostic offer for the unbound-topic flush sites.
+
+    Photo and document handlers stash a ``PendingAttachment`` without a
+    ``kind`` field; the bind-flush replays them through this wrapper since
+    both routes converge on the same internal coroutine.
+    """
+    await _offer_attachment(route, path, caption, media_group_id)
 
 
 async def aggregator_flush_route(route: Route) -> None:
@@ -250,4 +305,6 @@ def aggregator_clear_route(route: Route) -> None:
 def has_pending(route: Route) -> bool:
     """Test helper / introspection: is there a bundle waiting to flush?"""
     bundle = _route_pending.get(route)
-    return bundle is not None and (bool(bundle.text_parts) or bool(bundle.photo_paths))
+    return bundle is not None and (
+        bool(bundle.text_parts) or bool(bundle.attachment_paths)
+    )

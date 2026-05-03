@@ -35,8 +35,10 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from telegram import (
@@ -114,6 +116,8 @@ from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.inbound_aggregator import (
     aggregator_flush_route,
+    aggregator_offer_attachment,
+    aggregator_offer_document,
     aggregator_offer_photo,
     aggregator_offer_text,
     aggregator_offer_voice,
@@ -234,6 +238,13 @@ CC_COMMANDS: dict[str, str] = {
 
 def is_user_allowed(user_id: int | None) -> bool:
     return user_id is not None and config.is_user_allowed(user_id)
+
+
+@dataclass(frozen=True)
+class PendingAttachment:
+    path: str
+    caption: str
+    media_group_id: str | None
 
 
 def _get_thread_id(update: Update) -> int | None:
@@ -699,13 +710,17 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ Only text, photo, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
+        "⚠ Only text, photo, voice, and document messages are supported. Stickers and video cannot be forwarded to Claude Code.",
     )
 
 
 # --- Image directory for incoming photos ---
 _IMAGES_DIR = ccbot_dir() / "images"
 _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- File directory for incoming documents ---
+_FILES_DIR = ccbot_dir() / "files"
+_FILES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -752,8 +767,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # for the freshly-bound route. Multiple photos can pile up here
         # while the user navigates the directory browser.
         if context.user_data is not None:
-            pending_photos = context.user_data.setdefault("_pending_thread_photos", [])
-            pending_photos.append((str(file_path), caption, media_group_id))
+            pending_attachments = context.user_data.setdefault(
+                "_pending_thread_attachments", []
+            )
+            pending_attachments.append(
+                PendingAttachment(str(file_path), caption, media_group_id)
+            )
             context.user_data["_pending_thread_id"] = thread_id
 
         # If the user is already mid-picker (text_handler opened the
@@ -914,6 +933,132 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await aggregator_offer_voice(route, text)
 
     await safe_reply(update.message, f'🎤 "{text}"')
+
+
+def _sanitize_filename_part(part: str, max_len: int) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", part)
+    return cleaned[:max_len]
+
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle documents sent by the user: download and forward path to Claude Code."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        if update.message:
+            await safe_reply(update.message, "You are not authorized to use this bot.")
+        return
+
+    if not update.message or not update.message.document:
+        return
+
+    chat = update.message.chat
+    thread_id = _get_thread_id(update)
+    if chat.type in ("group", "supergroup") and thread_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+
+    if thread_id is None:
+        await safe_reply(
+            update.message,
+            "❌ Please use a named topic. Create a new topic to start a session.",
+        )
+        return
+
+    document = update.message.document
+    file_size = document.file_size
+    limit_mb = config.max_attachment_size_bytes / (1024 * 1024)
+    if file_size is None:
+        await safe_reply(
+            update.message,
+            f"⚠ File size unknown — refusing to download. Limit is {limit_mb:.0f} MB.",
+        )
+        return
+    if file_size > config.max_attachment_size_bytes:
+        size_mb = file_size / (1024 * 1024)
+        await safe_reply(
+            update.message,
+            f"⚠ File too large ({size_mb:.1f} MB). Limit is {limit_mb:.0f} MB.",
+        )
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+
+    original = document.file_name or "file"
+    stem, ext = os.path.splitext(original)
+    safe_stem = _sanitize_filename_part(stem, 100) or "file"
+    safe_ext = _sanitize_filename_part(ext, 16) if ext else ""
+    filename = f"{int(time.time())}_{document.file_unique_id}_{safe_stem}{safe_ext}"
+    file_path = _FILES_DIR / filename
+
+    tg_file = await document.get_file()
+    await tg_file.download_to_drive(file_path)
+
+    caption = update.message.caption or ""
+    media_group_id = update.message.media_group_id
+
+    if wid is None:
+        if context.user_data is not None:
+            pending_attachments = context.user_data.setdefault(
+                "_pending_thread_attachments", []
+            )
+            pending_attachments.append(
+                PendingAttachment(str(file_path), caption, media_group_id)
+            )
+            context.user_data["_pending_thread_id"] = thread_id
+
+        if context.user_data is not None:
+            current_state = context.user_data.get(STATE_KEY)
+            pending_tid = context.user_data.get("_pending_thread_id")
+            if pending_tid == thread_id and current_state in (
+                STATE_BROWSING_DIRECTORY,
+                STATE_SELECTING_WINDOW,
+                STATE_SELECTING_SESSION,
+            ):
+                return
+
+        all_windows = await tmux_manager.list_windows()
+        bound_ids = {bid for _, _, bid in session_manager.iter_thread_bindings()}
+        unbound = [
+            (w.window_id, w.window_name, w.cwd)
+            for w in all_windows
+            if w.window_id not in bound_ids
+        ]
+        if unbound:
+            msg_text, keyboard, win_ids = build_window_picker(unbound)
+            if context.user_data is not None:
+                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
+            await safe_reply(update.message, msg_text, reply_markup=keyboard)
+            return
+        start_path = str(config.browse_root)
+        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            context.user_data[BROWSE_PATH_KEY] = start_path
+            context.user_data[BROWSE_PAGE_KEY] = 0
+            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        session_manager.unbind_thread(user.id, thread_id)
+        await safe_reply(
+            update.message,
+            f"❌ Window '{display}' no longer exists. Binding removed.\n"
+            "Send a message to start a new session.",
+        )
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    clear_status_msg_info(user.id, thread_id)
+
+    set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
+
+    route = (user.id, thread_id, wid)
+    await aggregator_offer_document(route, file_path, caption, media_group_id)
+
+    await safe_reply(update.message, "📎 File sent to Claude Code.")
 
 
 # Active bash capture tasks: (user_id, thread_id) → asyncio.Task
@@ -1352,25 +1497,25 @@ async def _create_and_bind_window(
                 f"✅ {message}\n\n{status}. Send messages here.",
             )
 
-            # Send pending text and/or photos through the aggregator so the
-            # bundle's flush owns the §2.8.2 output shape (single text +
-            # grouped paths). Force-flush at the end since the user has
-            # been waiting on the directory pick and the debounce window
-            # would otherwise stall the first turn.
+            # Send pending text and/or attachments through the aggregator so
+            # the bundle's flush owns the §2.8.2 output shape (single text +
+            # grouped paths). Force-flush at the end since the user has been
+            # waiting on the directory pick and the debounce window would
+            # otherwise stall the first turn.
             pending_text = (
                 context.user_data.get("_pending_thread_text")
                 if context.user_data
                 else None
             )
-            pending_photos: list[tuple[str, str, str | None]] = (
-                context.user_data.get("_pending_thread_photos") or []
+            pending_attachments: list[PendingAttachment] = (
+                context.user_data.get("_pending_thread_attachments") or []
                 if context.user_data
                 else []
             )
-            if pending_text or pending_photos:
+            if pending_text or pending_attachments:
                 if context.user_data is not None:
                     context.user_data.pop("_pending_thread_text", None)
-                    context.user_data.pop("_pending_thread_photos", None)
+                    context.user_data.pop("_pending_thread_attachments", None)
                     context.user_data.pop("_pending_thread_id", None)
                 route = (user.id, pending_thread_id, created_wid)
                 if pending_text:
@@ -1380,12 +1525,12 @@ async def _create_and_bind_window(
                         len(pending_text),
                     )
                     await aggregator_offer_text(route, pending_text)
-                for path_str, caption, media_group_id in pending_photos:
-                    await aggregator_offer_photo(
+                for attachment in pending_attachments:
+                    await aggregator_offer_attachment(
                         route,
-                        Path(path_str),
-                        caption,
-                        media_group_id,
+                        Path(attachment.path),
+                        attachment.caption,
+                        attachment.media_group_id,
                     )
                 await aggregator_flush_route(route)
             elif context.user_data is not None:
@@ -1841,30 +1986,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"✅ Bound to window `{display}`",
         )
 
-        # Forward pending text and/or photos via the aggregator so the
+        # Forward pending text and/or attachments via the aggregator so the
         # §2.8.2 single-text + grouped-paths shape applies on first turn.
         pending_text = (
             context.user_data.get("_pending_thread_text") if context.user_data else None
         )
-        pending_photos: list[tuple[str, str, str | None]] = (
-            context.user_data.get("_pending_thread_photos") or []
+        pending_attachments: list[PendingAttachment] = (
+            context.user_data.get("_pending_thread_attachments") or []
             if context.user_data
             else []
         )
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_text", None)
-            context.user_data.pop("_pending_thread_photos", None)
+            context.user_data.pop("_pending_thread_attachments", None)
             context.user_data.pop("_pending_thread_id", None)
-        if pending_text or pending_photos:
+        if pending_text or pending_attachments:
             route = (user.id, thread_id, selected_wid)
             if pending_text:
                 await aggregator_offer_text(route, pending_text)
-            for path_str, caption, media_group_id in pending_photos:
-                await aggregator_offer_photo(
+            for attachment in pending_attachments:
+                await aggregator_offer_attachment(
                     route,
-                    Path(path_str),
-                    caption,
-                    media_group_id,
+                    Path(attachment.path),
+                    attachment.caption,
+                    attachment.media_group_id,
                 )
             await aggregator_flush_route(route)
         await query.answer("Bound")
@@ -2506,6 +2651,8 @@ def create_bot() -> Application:
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     # Voice: transcribe via OpenAI and forward text to Claude Code
     application.add_handler(MessageHandler(filters.VOICE, voice_handler))
+    # Documents: download and forward file path to Claude Code (≤20 MB)
+    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     # Catch-all: non-text content (stickers, video, etc.)
     application.add_handler(
         MessageHandler(

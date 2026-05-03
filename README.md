@@ -63,7 +63,7 @@ in):
 - **Inbound aggregator.** Per-route 1.5-second debounce coalesces
   caption + media-group + photo-then-text fast-follow into a single
   `send_to_window` call. Multi-screenshot rule: caption appears
-  exactly once, all paths grouped under `(images attached: …)` in
+  exactly once, all paths grouped under `(attachments: …)` in
   arrival order.
 - **Photos → Claude as base64.** Telegram photos (and photos with
   captions) are forwarded as base64 image blocks alongside the text,
