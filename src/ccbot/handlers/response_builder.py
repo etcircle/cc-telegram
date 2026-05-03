@@ -13,9 +13,57 @@ Key function:
   - build_response_parts: Build paginated response messages
 """
 
+import re
+
 from ..markdown_v2 import convert_markdown_tables
 from ..telegram_sender import split_message
 from ..transcript_parser import TranscriptParser
+
+_TASK_NOTIF_RE = re.compile(
+    r"\A<task-notification>(.*?)</task-notification>\s*\Z", re.DOTALL
+)
+_TASK_NOTIF_TAG_RE = re.compile(
+    r"<(?P<tag>task-id|summary|event)>(?P<body>.*?)</(?P=tag)>", re.DOTALL
+)
+
+
+def _render_task_notification(text: str) -> str | None:
+    """Render an external `<task-notification>` envelope as a clean card.
+
+    Returns None if the text isn't a recognizable task-notification, in
+    which case the caller falls back to the default rendering path.
+    """
+    m = _TASK_NOTIF_RE.match(text)
+    if not m:
+        return None
+
+    task_id: str | None = None
+    summary: str | None = None
+    events: list[str] = []
+    for tm in _TASK_NOTIF_TAG_RE.finditer(m.group(1)):
+        tag = tm.group("tag")
+        body = tm.group("body").strip()
+        if not body:
+            continue
+        if tag == "task-id" and task_id is None:
+            task_id = body
+        elif tag == "summary" and summary is None:
+            summary = body
+        elif tag == "event":
+            events.append(body)
+
+    if not (task_id or summary or events):
+        return None
+
+    header = f"🔔 *Task* `{task_id}`" if task_id else "🔔 *Task notification*"
+    lines = [header]
+    if summary:
+        lines.append(summary)
+    head = "\n".join(lines)
+    if events:
+        events_block = "\n".join(events)
+        return head + "\n\n" + TranscriptParser._format_expandable_quote(events_block)
+    return head
 
 
 def build_response_parts(
@@ -30,6 +78,14 @@ def build_response_parts(
     Markdown-to-MarkdownV2 conversion is done by the send layer, not here.
     """
     text = text.strip()
+
+    # External `<task-notification>` envelopes (injected by hooks / external
+    # agents as user-role prompts) get a custom card instead of the raw
+    # 👤 echo — they're system events, not "the user said X".
+    if role == "user":
+        rendered = _render_task_notification(text)
+        if rendered is not None:
+            return [rendered]
 
     # User messages: add emoji prefix (no newline)
     if role == "user":

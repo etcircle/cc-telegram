@@ -56,3 +56,78 @@ class TestBuildResponseParts:
         assert len(parts) == 1
         assert "\U0001f464" not in parts[0]
         assert "Thinking" not in parts[0]
+
+
+class TestTaskNotification:
+    def test_full_envelope_renders_as_card(self):
+        text = (
+            "<task-notification>"
+            "<task-id>bfxtsefjq</task-id>"
+            '<summary>Monitor event: "Stream Phase 0.5"</summary>'
+            "<event>2026-05-03 08:24:24 [info] phase0_skipped doc=foo.pdf</event>"
+            "</task-notification>"
+        )
+        parts = build_response_parts(text, role="user")
+        assert len(parts) == 1
+        out = parts[0]
+        # No raw 👤 user-echo prefix
+        assert "\U0001f464" not in out
+        # Header with task id and bell icon
+        assert "🔔" in out
+        assert "bfxtsefjq" in out
+        assert 'Monitor event: "Stream Phase 0.5"' in out
+        # Event body wrapped in expandable quote sentinels
+        assert EXP_START in out and EXP_END in out
+        assert "phase0_skipped" in out
+        # XML tags should not survive
+        assert "<task-id>" not in out
+        assert "<event>" not in out
+        assert "</task-notification>" not in out
+
+    def test_multiple_events_joined(self):
+        text = (
+            "<task-notification>"
+            "<summary>x</summary>"
+            "<event>line one</event>"
+            "<event>line two</event>"
+            "</task-notification>"
+        )
+        parts = build_response_parts(text, role="user")
+        assert len(parts) == 1
+        assert "line one" in parts[0]
+        assert "line two" in parts[0]
+
+    def test_summary_only_no_events_block(self):
+        text = "<task-notification><summary>only summary</summary></task-notification>"
+        parts = build_response_parts(text, role="user")
+        assert len(parts) == 1
+        assert "only summary" in parts[0]
+        assert EXP_START not in parts[0]
+
+    def test_empty_envelope_falls_back(self):
+        text = "<task-notification></task-notification>"
+        parts = build_response_parts(text, role="user")
+        # No recognizable fields → falls back to user-message rendering
+        assert "\U0001f464" in parts[0]
+
+    def test_assistant_role_not_intercepted(self):
+        # Assistant text mentioning the tag literally must not be hijacked.
+        text = "<task-notification><summary>x</summary></task-notification>"
+        parts = build_response_parts(text, role="assistant")
+        assert "🔔" not in parts[0]
+
+    def test_non_envelope_user_text_unchanged(self):
+        parts = build_response_parts("just a normal message", role="user")
+        assert "\U0001f464" in parts[0]
+        assert "🔔" not in parts[0]
+
+    def test_envelope_with_surrounding_whitespace(self):
+        text = (
+            "\n  <task-notification>"
+            "<task-id>abc</task-id>"
+            "<summary>s</summary>"
+            "</task-notification>  \n"
+        )
+        parts = build_response_parts(text, role="user")
+        assert "abc" in parts[0]
+        assert "🔔" in parts[0]
