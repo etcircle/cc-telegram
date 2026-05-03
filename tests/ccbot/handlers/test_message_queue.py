@@ -2820,6 +2820,64 @@ class TestActivityDigestDebounce:
             # No upsert because the route is being torn down.
             assert upsert_calls == 0
 
+    @pytest.mark.asyncio
+    async def test_window_rebind_during_upsert_does_not_clobber_fresh_state(
+        self, mock_bot: AsyncMock
+    ):
+        """Same race as the to-do digest: a window-rebind landing while the
+        activity-digest upsert is in flight must not be overwritten when
+        the upsert completes.
+
+        The activity-digest path is far hotter than to-do (every tool_use /
+        tool_result / thinking event in every active topic flows through
+        it), so the symmetric fix matters here too.
+        """
+        from ccbot.handlers.message_sender import TopicSendOutcome
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 7777
+        topic_send_started = asyncio.Event()
+        release_topic_send = asyncio.Event()
+
+        async def slow_send(*a, **kw):
+            topic_send_started.set()
+            await release_topic_send.wait()
+            return sent_msg, TopicSendOutcome.OK
+
+        state_a = message_queue.ActivityDigestState(message_id=0, window_id="@0-old")
+        state_a.lines = ["⚙️ first event"]
+        state_a.tool_count = 1
+        message_queue._activity_msg_info[(1, 42)] = state_a
+
+        with (
+            patch.object(message_queue, "topic_send", side_effect=slow_send),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+        ):
+            upsert_task = asyncio.create_task(
+                message_queue._upsert_activity_digest(mock_bot, 1, 42, state_a)
+            )
+            await topic_send_started.wait()
+
+            # Mid-flight rebind: a fresh activity state (different window) is
+            # written into the same slot.
+            state_b = message_queue.ActivityDigestState(
+                message_id=0, window_id="@0-new"
+            )
+            message_queue._activity_msg_info[(1, 42)] = state_b
+
+            release_topic_send.set()
+            await upsert_task
+
+        assert state_a is not state_b
+        assert state_a.message_id == 7777, (
+            "upsert returned without reaching the post-send mutation"
+        )
+        assert message_queue._activity_msg_info[(1, 42)] is state_b
+        assert message_queue._activity_msg_info[(1, 42)].message_id == 0
+        assert message_queue._activity_msg_info[(1, 42)].window_id == "@0-new"
+
 
 @pytest.mark.usefixtures("_clear_queue_state")
 class TestTodoDigest:
@@ -3220,3 +3278,85 @@ class TestTodoDigest:
         keys = list(message_queue._todo_tool_ids)
         assert keys[-1] == ("a", 1, 42)
         assert keys[-2] == ("b", 1, 42)
+
+    @pytest.mark.asyncio
+    async def test_window_rebind_during_upsert_does_not_clobber_fresh_state(
+        self, mock_bot: AsyncMock
+    ):
+        """A window-rebind that lands while an upsert is in flight must not
+        be overwritten by the upsert's late state assignment.
+
+        Race walk:
+          1. Flush A captures ``state_A`` and enters ``_upsert_todo_digest``.
+          2. ``await topic_send(...)`` is in flight.
+          3. ``_process_todo_task`` runs with a different ``window_id``,
+             creates ``state_B``, and writes ``_todo_msg_info[key] = state_B``.
+          4. ``topic_send`` returns OK. The upsert mutates ``state_A`` in
+             place — it must NOT also write
+             ``_todo_msg_info[(user_id, tid)] = state_A``, because that
+             would clobber ``state_B``.
+
+        Before the fix, a subsequent flush would read the clobbered
+        ``state_A`` (with the OLD window's ``message_id`` and
+        ``window_id``) and edit a message in the now-stale topic. After
+        the fix, the dict still holds ``state_B`` and the next flush
+        sends a fresh card in the new topic.
+        """
+        from ccbot.handlers.message_sender import TopicSendOutcome
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 4444
+        topic_send_started = asyncio.Event()
+        release_topic_send = asyncio.Event()
+
+        async def slow_send(*a, **kw):
+            topic_send_started.set()
+            await release_topic_send.wait()
+            return sent_msg, TopicSendOutcome.OK
+
+        state_a = message_queue.TodoListDigestState(message_id=0, window_id="@0-old")
+        message_queue._todo_msg_info[(1, 42)] = state_a
+        message_queue._todo_pending_snapshot[(1, 42)] = [
+            {"content": "a", "status": "in_progress"}
+        ]
+
+        with (
+            patch.object(message_queue, "topic_send", side_effect=slow_send),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+        ):
+            # Start the upsert directly with state_a. It will park in
+            # topic_send.
+            upsert_task = asyncio.create_task(
+                message_queue._upsert_todo_digest(
+                    mock_bot,
+                    1,
+                    42,
+                    state_a,
+                    [{"content": "a", "status": "in_progress"}],
+                )
+            )
+            await topic_send_started.wait()
+
+            # Mid-flight rebind: a different window's TodoWrite lands and
+            # replaces the slot with a fresh state.
+            state_b = message_queue.TodoListDigestState(
+                message_id=0, window_id="@0-new"
+            )
+            message_queue._todo_msg_info[(1, 42)] = state_b
+
+            # Release topic_send; upsert finishes.
+            release_topic_send.set()
+            await upsert_task
+
+        # state_a was mutated in place (message_id is set) but the dict
+        # slot still holds state_b — the upsert did NOT clobber it.
+        assert state_a is not state_b
+        assert state_a.message_id == 4444, (
+            "upsert returned without reaching the post-send mutation — "
+            "the test didn't actually exercise the race"
+        )
+        assert message_queue._todo_msg_info[(1, 42)] is state_b
+        assert message_queue._todo_msg_info[(1, 42)].message_id == 0
+        assert message_queue._todo_msg_info[(1, 42)].window_id == "@0-new"

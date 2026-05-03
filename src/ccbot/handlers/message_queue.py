@@ -1128,8 +1128,17 @@ async def _upsert_activity_digest(
     thread_id: int | None,
     state: ActivityDigestState,
 ) -> None:
-    """Send or edit the per-topic activity digest."""
-    tid = thread_id or 0
+    """Send or edit the per-topic activity digest.
+
+    Precondition: the caller has already bound ``_activity_msg_info[(user_id,
+    thread_id_or_0)]`` to ``state``. ``_process_activity_task`` and
+    ``_bump_agent_activity_counter`` both do this before scheduling the
+    flush. We mutate ``state`` in place and rely on that pre-bind; we do
+    NOT re-assign the dict slot after a successful send/edit. Re-binding
+    would clobber a fresh state that a concurrent ``_process_activity_task``
+    may have written during the in-flight ``topic_send`` (window rebind),
+    leaving the next flush editing a message in the now-stale topic.
+    """
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
     route = _route_for(user_id, thread_id, state.window_id)
     text = _render_activity_digest(
@@ -1153,7 +1162,6 @@ async def _upsert_activity_digest(
         )
         if outcome is TopicSendOutcome.OK:
             state.last_text = text
-            _activity_msg_info[(user_id, tid)] = state
             return
         # Edit failed (message gone, topic gone, etc). Drop the id and retry as
         # a fresh send below; topic-shaped failures cascade into emergency DM.
@@ -1175,7 +1183,6 @@ async def _upsert_activity_digest(
     if sent is not None:
         state.message_id = sent.message_id
         state.last_text = text
-        _activity_msg_info[(user_id, tid)] = state
         return
     if thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
         await _emergency_dm(
@@ -1437,8 +1444,17 @@ async def _upsert_todo_digest(
     state: TodoListDigestState,
     todos: list[dict[str, object]],
 ) -> None:
-    """Send or edit the to-do-list digest card."""
-    tid = thread_id or 0
+    """Send or edit the to-do-list digest card.
+
+    Precondition: the caller has already bound ``_todo_msg_info[(user_id,
+    thread_id_or_0)]`` to ``state`` (``_process_todo_task`` does this before
+    scheduling the flush). We mutate ``state`` in place and rely on that
+    pre-bind; we do NOT re-assign the dict slot after a successful
+    send/edit. Re-binding would clobber a fresh state that a concurrent
+    ``_process_todo_task`` may have written during the in-flight
+    ``topic_send`` (window rebind under the same topic), leaving the next
+    flush editing a message in the now-stale topic.
+    """
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
     text = _render_todo_digest(todos)
     if text == state.last_text:
@@ -1456,8 +1472,14 @@ async def _upsert_todo_digest(
             text=text,
         )
         if outcome is TopicSendOutcome.OK:
+            # Mutate state in place — do NOT re-bind ``_todo_msg_info[key]``
+            # to ``state``. ``_process_todo_task`` already put this state in
+            # the dict before scheduling us, and may have *replaced* the slot
+            # with a fresh state during a window_id rebind that ran while
+            # ``topic_edit`` was in flight. Re-binding to our captured
+            # reference would clobber the fresh state and leave the next
+            # flush editing a message in the now-stale window.
             state.last_text = text
-            _todo_msg_info[(user_id, tid)] = state
             return
         # Edit failed (message gone, etc). Drop the id and retry as a fresh send.
         state.message_id = 0
@@ -1476,9 +1498,12 @@ async def _upsert_todo_digest(
         session_id=_session_id_for_window(state.window_id),
     )
     if sent is not None:
+        # Same in-place-mutation rule as the edit branch above. The dict
+        # reference was set by ``_process_todo_task``; if it has since been
+        # replaced (window rebind), our captured ``state`` is an orphan and
+        # the next flush should pick up the fresh slot, not our message_id.
         state.message_id = sent.message_id
         state.last_text = text
-        _todo_msg_info[(user_id, tid)] = state
         return
     if thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
         await _emergency_dm(
