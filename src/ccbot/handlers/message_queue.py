@@ -77,6 +77,12 @@ class MessageTask:
     # _render_agent_tool_use to extract description / subagent_type / prompt.
     tool_input: dict[str, object] | None = None
     transcript_uuid: str | None = None
+    # Sub-agent (sidechain) run identifier when this task represents a
+    # block emitted from a sub-agent's own JSONL. The todo digest gates
+    # on ``subagent_key is None`` so a sub-agent's TodoWrites don't paint
+    # the parent topic's task card. Other digest paths may also branch
+    # on this field.
+    subagent_key: str | None = None
 
 
 @dataclass
@@ -90,6 +96,21 @@ class ActivityDigestState:
     completed_count: int = 0
     last_text: str = ""
     done: bool = False
+
+
+@dataclass
+class TodoListDigestState:
+    """Single editable to-do-list digest per ``(user_id, thread_id_or_0)``.
+
+    Each ``TodoWrite`` call carries the *complete* todo snapshot, so the
+    digest is a snapshot replace, not a delta accumulator. We keep only
+    ``last_text`` for dedup; the todo content is always re-rendered from
+    the most recent ``TodoWrite.tool_input`` before edit/send.
+    """
+
+    message_id: int
+    window_id: str
+    last_text: str = ""
 
 
 # Per-route message queues, workers, locks, and ephemeral slots
@@ -157,6 +178,26 @@ _activity_flush_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
 # and either edits or no-ops via the ``text == last_text`` check.
 _activity_locks: dict[tuple[int, int], asyncio.Lock] = {}
 ACTIVITY_FLUSH_DEBOUNCE_SECONDS = 10.0
+
+# To-do-list digest tracking: one editable card per ``(user_id, thread_id_or_0)``
+# rendered from the most recent parent ``TodoWrite`` snapshot. The Telegram
+# message_id is held in ``_todo_msg_info``; the lock + debounce mirror the
+# activity digest pattern so a burst of TodoWrites coalesces into one edit.
+_todo_msg_info: dict[tuple[int, int], TodoListDigestState] = {}
+_todo_locks: dict[tuple[int, int], asyncio.Lock] = {}
+_todo_flush_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+# Latest snapshot of todos, keyed by route. Cached so the debounced flush
+# can render after the original task is gone, and so back-to-back TodoWrites
+# within the debounce window collapse to "render the most recent only".
+_todo_pending_snapshot: dict[tuple[int, int], list[dict[str, object]]] = {}
+# tool_use_ids that came from a parent ``TodoWrite``. Tracked per-route so
+# the matching ``tool_result`` (which carries no tool_name) can be dropped
+# from the activity digest path; otherwise the result line leaks into the
+# activity card as "**TodoWrite** — applied" noise duplicating the digest.
+_todo_tool_ids: set[tuple[str, int, int]] = set()
+TODO_DIGEST_MAX_VISIBLE = 8
+TODO_DIGEST_CONTENT_SNIPPET = 120
+
 ACTIVITY_DIGEST_CONTENT_TYPES = {"tool_use", "tool_result", "thinking"}
 ACTIVITY_DIGEST_MAX_LINES = 10
 # Per-line cap inside the activity digest. The previous 180 was tight
@@ -447,6 +488,16 @@ async def _dispatch_task(
         if _is_agent_tool_use(task) or _is_agent_tool_result(task, user_id):
             await _process_agent_task(bot, user_id, task)
             return task
+        if _is_todo_tool_use(task):
+            await _process_todo_task(bot, user_id, task)
+            return task
+        if _is_todo_tool_result(task, user_id):
+            # Drop the matching tool_result entirely so it doesn't paint a
+            # duplicate "**TodoWrite** — applied" line on the activity card.
+            tid = task.thread_id or 0
+            if task.tool_use_id:
+                _todo_tool_ids.discard((task.tool_use_id, user_id, tid))
+            return task
         if task.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
             await _process_activity_task(bot, user_id, task)
             return task
@@ -480,6 +531,14 @@ async def _dispatch_already_merged(
     if task.task_type == "content":
         if _is_agent_tool_use(task) or _is_agent_tool_result(task, user_id):
             await _process_agent_task(bot, user_id, task)
+            return
+        if _is_todo_tool_use(task):
+            await _process_todo_task(bot, user_id, task)
+            return
+        if _is_todo_tool_result(task, user_id):
+            tid = task.thread_id or 0
+            if task.tool_use_id:
+                _todo_tool_ids.discard((task.tool_use_id, user_id, tid))
             return
         if task.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
             await _process_activity_task(bot, user_id, task)
@@ -1235,6 +1294,238 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
     if task.image_data:
         chat_id, effective_thread_id = _delivery_target(user_id, task.thread_id)
         await _send_task_images(bot, chat_id, task, effective_thread_id)
+
+
+# ── To-do list digest ────────────────────────────────────────────────────
+
+
+def _is_todo_tool_use(task: MessageTask) -> bool:
+    """Parent (non-sidechain) TodoWrite tool_use that gates the digest path.
+
+    Sub-agent TodoWrites stay on the sub-agent digest path — they describe
+    the sub-agent's plan, not the parent's task list, and surfacing them
+    on the parent's todo card would conflate two different agendas.
+    """
+    return (
+        task.task_type == "content"
+        and task.content_type == "tool_use"
+        and task.tool_name == "TodoWrite"
+        and task.subagent_key is None
+    )
+
+
+def _is_todo_tool_result(task: MessageTask, user_id: int) -> bool:
+    """tool_result for an id we've already routed through the todo digest.
+
+    tool_result tasks don't carry tool_name, so the per-route id set is
+    the only way to identify them. Identification is required so the
+    result doesn't leak into the activity digest as a duplicate line.
+    """
+    if (
+        task.task_type != "content"
+        or task.content_type != "tool_result"
+        or not task.tool_use_id
+        or task.subagent_key is not None
+    ):
+        return False
+    tid = task.thread_id or 0
+    return (task.tool_use_id, user_id, tid) in _todo_tool_ids
+
+
+def _render_todo_digest(todos: list[dict[str, object]], window_id: str) -> str:
+    """Render the editable to-do-list card from a TodoWrite snapshot.
+
+    Status emoji mirror Claude Code's pane: ✅ completed, 🔄 in_progress,
+    ⬜ pending. ``activeForm`` is preferred for the in_progress label
+    because it reads as "what's happening right now"; ``content`` is the
+    canonical task description and is preferred for everything else.
+
+    Long todo lists are truncated to ``TODO_DIGEST_MAX_VISIBLE`` rows to
+    fit Telegram's compact-card visual budget; remaining items get a
+    "… +N more" tail line so the user knows the list isn't fully shown.
+    """
+    total = len(todos)
+    completed = sum(
+        1 for t in todos if isinstance(t, dict) and t.get("status") == "completed"
+    )
+    in_progress = sum(
+        1 for t in todos if isinstance(t, dict) and t.get("status") == "in_progress"
+    )
+    header = f"📋 Tasks ({completed}/{total} done"
+    if in_progress:
+        header += f" · {in_progress} active"
+    header += ")"
+
+    visible = todos[:TODO_DIGEST_MAX_VISIBLE]
+    hidden = max(0, total - len(visible))
+
+    lines = [header]
+    for item in visible:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        if status == "completed":
+            emoji = "✅"
+            label = item.get("content", "")
+        elif status == "in_progress":
+            emoji = "🔄"
+            label = item.get("activeForm") or item.get("content", "")
+        else:
+            emoji = "⬜"
+            label = item.get("content", "")
+        if not isinstance(label, str):
+            label = str(label)
+        label = label.strip().replace("\n", " ")
+        if len(label) > TODO_DIGEST_CONTENT_SNIPPET:
+            label = label[: TODO_DIGEST_CONTENT_SNIPPET - 1].rstrip() + "…"
+        lines.append(f"{emoji} {label}")
+    if hidden:
+        lines.append(f"… +{hidden} more")
+    return "\n".join(lines)
+
+
+def _get_todo_lock(user_id: int, tid: int) -> asyncio.Lock:
+    """Return (creating if needed) the per-route todo upsert lock."""
+    key = (user_id, tid)
+    lock = _todo_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _todo_locks[key] = lock
+    return lock
+
+
+async def _upsert_todo_digest(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    state: TodoListDigestState,
+    todos: list[dict[str, object]],
+) -> None:
+    """Send or edit the to-do-list digest card."""
+    tid = thread_id or 0
+    chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
+    text = _render_todo_digest(todos, state.window_id)
+    if text == state.last_text:
+        return
+
+    if state.message_id:
+        outcome = await topic_edit(
+            bot,
+            op="todo_digest",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=effective_thread_id,
+            window_id=state.window_id,
+            message_id=state.message_id,
+            text=text,
+        )
+        if outcome is TopicSendOutcome.OK:
+            state.last_text = text
+            _todo_msg_info[(user_id, tid)] = state
+            return
+        # Edit failed (message gone, etc). Drop the id and retry as a fresh send.
+        state.message_id = 0
+
+    sent, outcome = await topic_send(
+        bot,
+        op="todo_digest",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=effective_thread_id,
+        window_id=state.window_id,
+        text=text,
+        disable_notification=True,
+        role="activity",
+        content_type="todo_digest",
+        session_id=_session_id_for_window(state.window_id),
+    )
+    if sent is not None:
+        state.message_id = sent.message_id
+        state.last_text = text
+        _todo_msg_info[(user_id, tid)] = state
+        return
+    if thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
+        await _emergency_dm(
+            bot,
+            user_id,
+            thread_id,
+            state.window_id,
+            text,
+            kind="todo_digest",
+            outcome=outcome,
+        )
+
+
+def _schedule_todo_flush(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+) -> None:
+    """Debounced flush of the to-do digest for this (user, thread).
+
+    Reuses ``ACTIVITY_FLUSH_DEBOUNCE_SECONDS`` to share the same flood
+    budget logic. The pending snapshot is read at flush time, not capture
+    time, so two TodoWrites within the debounce window correctly collapse
+    to "edit once with the latest snapshot".
+    """
+    tid = thread_id or 0
+    key = (user_id, tid)
+    pending = _todo_flush_tasks.get(key)
+    if pending is not None and not pending.done():
+        pending.cancel()
+
+    async def _delayed() -> None:
+        try:
+            await asyncio.sleep(ACTIVITY_FLUSH_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        _todo_flush_tasks.pop(key, None)
+        snapshot = _todo_pending_snapshot.get(key)
+        if snapshot is None:
+            return
+        state = _todo_msg_info.get(key)
+        if state is None:
+            return
+        try:
+            async with _get_todo_lock(user_id, tid):
+                await _upsert_todo_digest(bot, user_id, thread_id, state, snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - background task safety
+            logger.warning(
+                "debounced todo flush failed user=%d thread=%s: %s",
+                user_id,
+                thread_id,
+                e,
+            )
+
+    _todo_flush_tasks[key] = asyncio.create_task(_delayed())
+
+
+async def _process_todo_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Route a parent TodoWrite tool_use to the per-route todo digest."""
+    if not task.tool_input:
+        return
+    todos_raw = task.tool_input.get("todos")
+    if not isinstance(todos_raw, list):
+        return
+    todos: list[dict[str, object]] = [t for t in todos_raw if isinstance(t, dict)]
+
+    wid = task.window_id or ""
+    tid = task.thread_id or 0
+    key = (user_id, tid)
+    state = _todo_msg_info.get(key)
+    if state is None or state.window_id != wid:
+        # New route or window changed under us (re-bind): start a fresh card.
+        # Stale ``message_id`` from a different window would point into the
+        # wrong topic; safer to send anew than try to edit it.
+        state = TodoListDigestState(message_id=0, window_id=wid)
+        _todo_msg_info[key] = state
+
+    _todo_pending_snapshot[key] = todos
+    if task.tool_use_id:
+        _todo_tool_ids.add((task.tool_use_id, user_id, tid))
+    _schedule_todo_flush(bot, user_id, task.thread_id)
 
 
 # ── §2.7 Agent (subagent) prominence ──────────────────────────────────────
@@ -2165,6 +2456,21 @@ async def teardown_route(route: Route, *, drop_pending: bool) -> None:
         if flush is not None and not flush.done():
             flush.cancel()
         _activity_locks.pop((route_user_id, route_tid), None)
+        # Drop the to-do digest state and any pending flush for this route.
+        # Mirrors the activity digest cleanup above; a fresh route should
+        # start with a fresh card, not inherit an old message_id.
+        _todo_msg_info.pop((route_user_id, route_tid), None)
+        _todo_pending_snapshot.pop((route_user_id, route_tid), None)
+        todo_flush = _todo_flush_tasks.pop((route_user_id, route_tid), None)
+        if todo_flush is not None and not todo_flush.done():
+            todo_flush.cancel()
+        _todo_locks.pop((route_user_id, route_tid), None)
+        # _todo_tool_ids is set-of-tuples; filter rather than drop-by-key.
+        todo_ids_to_remove = [
+            k for k in _todo_tool_ids if k[1] == route_user_id and k[2] == route_tid
+        ]
+        for k in todo_ids_to_remove:
+            _todo_tool_ids.discard(k)
     finally:
         _route_tearing_down.discard(route)
 
@@ -2192,6 +2498,14 @@ async def shutdown_workers() -> None:
             flush.cancel()
     _activity_flush_tasks.clear()
     _activity_locks.clear()
+    for _, flush in list(_todo_flush_tasks.items()):
+        if not flush.done():
+            flush.cancel()
+    _todo_flush_tasks.clear()
+    _todo_locks.clear()
+    _todo_msg_info.clear()
+    _todo_pending_snapshot.clear()
+    _todo_tool_ids.clear()
     _route_workers.clear()
     _route_queues.clear()
     _route_locks.clear()

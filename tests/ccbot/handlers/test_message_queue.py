@@ -54,6 +54,14 @@ def _reset_state() -> None:
             flush.cancel()
     message_queue._activity_flush_tasks.clear()
     message_queue._activity_locks.clear()
+    for _, flush in list(message_queue._todo_flush_tasks.items()):
+        if not flush.done():
+            flush.cancel()
+    message_queue._todo_flush_tasks.clear()
+    message_queue._todo_locks.clear()
+    message_queue._todo_msg_info.clear()
+    message_queue._todo_pending_snapshot.clear()
+    message_queue._todo_tool_ids.clear()
     message_queue._flood_until.clear()
 
 
@@ -2811,3 +2819,271 @@ class TestActivityDigestDebounce:
 
             # No upsert because the route is being torn down.
             assert upsert_calls == 0
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestTodoDigest:
+    """Parent ``TodoWrite`` calls coalesce into one editable card per route.
+
+    The todo list visible in Claude's terminal pane (``2 tasks (1 done, 1
+    open)``, etc.) used to be invisible in Telegram: each TodoWrite landed
+    as its own activity-card line summarized as ``**TodoWrite**(N item(s))``,
+    and the matching tool_result added a duplicate "applied" line. The
+    digest replaces that with a single editable message keyed by
+    ``(user_id, thread_id_or_0)``.
+    """
+
+    @staticmethod
+    def _todo_use_task(
+        *,
+        todos: list[dict],
+        tool_use_id: str = "tu-todo-1",
+        thread_id: int = 42,
+        window_id: str = "@0",
+        subagent_key: str | None = None,
+    ) -> "message_queue.MessageTask":
+        return message_queue.MessageTask(
+            task_type="content",
+            window_id=window_id,
+            parts=[],
+            tool_use_id=tool_use_id,
+            content_type="tool_use",
+            thread_id=thread_id,
+            tool_name="TodoWrite",
+            tool_input={"todos": todos},
+            subagent_key=subagent_key,
+        )
+
+    def test_render_emojis_match_status(self):
+        """✅/🔄/⬜ emoji map cleanly to completed/in_progress/pending."""
+        text = message_queue._render_todo_digest(
+            [
+                {"content": "first", "status": "completed"},
+                {
+                    "content": "second",
+                    "activeForm": "Doing second",
+                    "status": "in_progress",
+                },
+                {"content": "third", "status": "pending"},
+            ],
+            "@0",
+        )
+        assert "📋 Tasks (1/3 done · 1 active)" in text
+        assert "✅ first" in text
+        # in_progress prefers activeForm because it reads as "what's
+        # happening right now".
+        assert "🔄 Doing second" in text
+        assert "⬜ third" in text
+
+    def test_render_truncates_long_lists(self):
+        """Lists past TODO_DIGEST_MAX_VISIBLE collapse into a tail line."""
+        todos = [
+            {"content": f"item {i}", "status": "pending"}
+            for i in range(message_queue.TODO_DIGEST_MAX_VISIBLE + 5)
+        ]
+        text = message_queue._render_todo_digest(todos, "@0")
+        assert "… +5 more" in text
+        # The first MAX_VISIBLE items are shown, the rest collapse.
+        assert text.count("⬜") == message_queue.TODO_DIGEST_MAX_VISIBLE
+
+    def test_is_todo_tool_use_skips_subagent_todos(self):
+        """A sub-agent's TodoWrite stays on the sub-agent path, not the parent's
+        todo card. Otherwise two todo lists fight for the parent topic."""
+        sub_task = self._todo_use_task(
+            todos=[{"content": "sub", "status": "pending"}],
+            subagent_key="sub:parent:agent-x",
+        )
+        assert message_queue._is_todo_tool_use(sub_task) is False
+        parent_task = self._todo_use_task(
+            todos=[{"content": "parent", "status": "pending"}]
+        )
+        assert message_queue._is_todo_tool_use(parent_task) is True
+
+    @pytest.mark.asyncio
+    async def test_process_todo_records_state_and_schedules_flush(
+        self, mock_bot: AsyncMock
+    ):
+        """First TodoWrite creates a digest state and arms a debounced flush.
+
+        The flush itself is debounced (no immediate send). What we assert is
+        the bookkeeping that lets the flush land later: snapshot cached,
+        tool_use_id tracked so the matching tool_result is suppressed, and
+        a flush task pending in the registry.
+        """
+        with patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=1
+        ):
+            await message_queue._process_todo_task(
+                mock_bot,
+                1,
+                self._todo_use_task(
+                    todos=[
+                        {"content": "a", "status": "in_progress"},
+                        {"content": "b", "status": "pending"},
+                    ],
+                    tool_use_id="tu-1",
+                ),
+            )
+
+        key = (1, 42)
+        assert key in message_queue._todo_msg_info
+        assert message_queue._todo_msg_info[key].window_id == "@0"
+        assert key in message_queue._todo_pending_snapshot
+        assert ("tu-1", 1, 42) in message_queue._todo_tool_ids
+        flush = message_queue._todo_flush_tasks.get(key)
+        assert flush is not None and not flush.done()
+
+    @pytest.mark.asyncio
+    async def test_two_todowrites_in_window_collapse_to_one_edit(
+        self, mock_bot: AsyncMock
+    ):
+        """Back-to-back TodoWrites within debounce render the latest only.
+
+        The debounce timer is cancelled on the second call, the cached
+        snapshot is overwritten, and a single flush eventually fires using
+        the most recent snapshot — not the first.
+        """
+        from ccbot.handlers.message_sender import TopicSendOutcome
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 5151
+        send_calls: list[dict] = []
+        edit_calls: list[dict] = []
+
+        async def fake_send(bot, *, op, text, **kw):
+            send_calls.append({"op": op, "text": text})
+            return sent_msg, TopicSendOutcome.OK
+
+        async def fake_edit(bot, *, op, message_id, text, **kw):
+            edit_calls.append({"op": op, "message_id": message_id, "text": text})
+            return TopicSendOutcome.OK
+
+        with (
+            patch.object(message_queue, "topic_send", side_effect=fake_send),
+            patch.object(message_queue, "topic_edit", side_effect=fake_edit),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+            patch.object(message_queue, "ACTIVITY_FLUSH_DEBOUNCE_SECONDS", 0.05),
+        ):
+            await message_queue._process_todo_task(
+                mock_bot,
+                1,
+                self._todo_use_task(
+                    todos=[{"content": "old", "status": "pending"}],
+                    tool_use_id="tu-1",
+                ),
+            )
+            await message_queue._process_todo_task(
+                mock_bot,
+                1,
+                self._todo_use_task(
+                    todos=[{"content": "new", "status": "in_progress"}],
+                    tool_use_id="tu-2",
+                ),
+            )
+            # Wait for debounce to fire.
+            await asyncio.sleep(0.15)
+
+        # One send total — the second TodoWrite cancels the first's pending
+        # flush. Render shows the latest snapshot only.
+        assert len(send_calls) == 1
+        assert "new" in send_calls[0]["text"]
+        assert "old" not in send_calls[0]["text"]
+        # No edits yet (only one flush completed; no later TodoWrite to edit it).
+        assert edit_calls == []
+
+    @pytest.mark.asyncio
+    async def test_todo_tool_result_dropped_from_activity(self, mock_bot: AsyncMock):
+        """The TodoWrite tool_result must not paint a duplicate activity line.
+
+        Without the drop, an activity card already showing the digest would
+        also gain "**TodoWrite** — applied", duplicating the user-visible
+        signal. ``_is_todo_tool_result`` consumes the id from the registry
+        and returns True; the dispatcher returns early.
+        """
+        # Seed the id as if we'd just routed a TodoWrite tool_use through.
+        message_queue._todo_tool_ids.add(("tu-x", 1, 42))
+        result_task = message_queue.MessageTask(
+            task_type="content",
+            window_id="@0",
+            parts=[],
+            tool_use_id="tu-x",
+            content_type="tool_result",
+            thread_id=42,
+        )
+        assert message_queue._is_todo_tool_result(result_task, 1) is True
+        # An unrelated tool_result for an id we don't know is a no-match.
+        unknown = message_queue.MessageTask(
+            task_type="content",
+            window_id="@0",
+            parts=[],
+            tool_use_id="tu-y",
+            content_type="tool_result",
+            thread_id=42,
+        )
+        assert message_queue._is_todo_tool_result(unknown, 1) is False
+
+    @pytest.mark.asyncio
+    async def test_dedup_skips_edit_when_text_identical(self, mock_bot: AsyncMock):
+        """Re-rendering the same todo list does not emit a no-op edit.
+
+        Telegram counts no-op edits toward the per-group flood ceiling, so
+        skipping them is a real cost saver. The activity digest does the
+        same; the todo digest must too.
+        """
+        from ccbot.handlers.message_sender import TopicSendOutcome
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 9999
+        send_calls = 0
+        edit_calls = 0
+
+        async def fake_send(*a, **kw):
+            nonlocal send_calls
+            send_calls += 1
+            return sent_msg, TopicSendOutcome.OK
+
+        async def fake_edit(*a, **kw):
+            nonlocal edit_calls
+            edit_calls += 1
+            return TopicSendOutcome.OK
+
+        with (
+            patch.object(message_queue, "topic_send", side_effect=fake_send),
+            patch.object(message_queue, "topic_edit", side_effect=fake_edit),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+        ):
+            todos = [{"content": "x", "status": "in_progress"}]
+            state = message_queue.TodoListDigestState(message_id=0, window_id="@0")
+            message_queue._todo_msg_info[(1, 42)] = state
+            await message_queue._upsert_todo_digest(mock_bot, 1, 42, state, todos)
+            # Same snapshot a second time — must skip the edit.
+            await message_queue._upsert_todo_digest(mock_bot, 1, 42, state, todos)
+
+        assert send_calls == 1
+        assert edit_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_teardown_route_drops_todo_state(self, mock_bot: AsyncMock):
+        """Tearing down a route must clear its todo digest state, lock, and
+        pending snapshot. A fresh route should start with a fresh card."""
+        route: message_queue.Route = (1, 42, "@0")
+        # Register the route so teardown_route has something to dismantle —
+        # the early return otherwise short-circuits cleanup.
+        message_queue._get_or_create_route(mock_bot, route)
+        message_queue._todo_msg_info[(1, 42)] = message_queue.TodoListDigestState(
+            message_id=123, window_id="@0"
+        )
+        message_queue._todo_pending_snapshot[(1, 42)] = [{"content": "x"}]
+        message_queue._todo_tool_ids.add(("tu-1", 1, 42))
+        message_queue._todo_locks[(1, 42)] = asyncio.Lock()
+
+        await message_queue.teardown_route(route, drop_pending=True)
+
+        assert (1, 42) not in message_queue._todo_msg_info
+        assert (1, 42) not in message_queue._todo_pending_snapshot
+        assert (1, 42) not in message_queue._todo_locks
+        assert ("tu-1", 1, 42) not in message_queue._todo_tool_ids
