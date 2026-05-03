@@ -21,6 +21,12 @@ from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
+# Mirrors handlers.busy_indicator._TURN_END_REASONS so the lifecycle-only
+# end-of-turn marker emitted in ``parse_entries`` is keyed off the same
+# stop_reason set the indicator's transition table reads. Duplicated rather
+# than imported to keep the parser dependency-free.
+_TURN_END_REASONS_LITERAL = frozenset({"end_turn", "stop_sequence"})
+
 
 @dataclass
 class ParsedMessage:
@@ -57,6 +63,12 @@ class ParsedEntry:
     # description / subagent_type / prompt without re-parsing JSONL.
     tool_input: dict[str, Any] | None = None
     uuid: str | None = None
+    # When True, this entry exists only to drive run-state transitions in
+    # the busy indicator and must NOT be rendered in Telegram. Emitted for
+    # raw JSONL events that lack visible content (empty tool_result, an
+    # end_turn assistant message with no text/thinking) but still matter
+    # to lifecycle bookkeeping.
+    lifecycle_only: bool = False
 
 
 @dataclass
@@ -527,6 +539,7 @@ class TranscriptParser:
             if msg_type == "assistant":
                 # Process content blocks
                 has_text = False
+                _result_len_before = len(result)
                 for block in content:
                     if not isinstance(block, dict):
                         continue
@@ -637,6 +650,31 @@ class TranscriptParser:
                                     uuid=entry_uuid,
                                 )
                             )
+
+                # Lifecycle-only end-of-turn marker.
+                #
+                # If this assistant message terminated cleanly (end_turn /
+                # stop_sequence) but produced no visible text/thinking entry,
+                # the busy indicator would never see the end-of-turn signal
+                # and stay stuck in RUNNING. Emit a content-less entry so
+                # ``_apply_event`` can drive the route to IDLE_RECENT. The
+                # session_monitor honors ``lifecycle_only`` by dispatching a
+                # TranscriptEvent without enqueueing a Telegram message.
+                if (
+                    entry_stop_reason in _TURN_END_REASONS_LITERAL
+                    and len(result) == _result_len_before
+                ):
+                    result.append(
+                        ParsedEntry(
+                            role="assistant",
+                            text="",
+                            content_type="text",
+                            timestamp=entry_timestamp,
+                            stop_reason=entry_stop_reason,
+                            uuid=entry_uuid,
+                            lifecycle_only=True,
+                        )
+                    )
 
             elif msg_type == "user":
                 # Check for tool_result blocks and merge with pending tools
@@ -790,6 +828,28 @@ class TranscriptParser:
                                     if isinstance(tool_input_data, dict)
                                     else None,
                                     uuid=entry_uuid,
+                                )
+                            )
+                        elif tool_use_id:
+                            # No visible content (no summary, no result text /
+                            # image, not an error / interruption) but the raw
+                            # JSONL block has a tool_use_id. After a bot
+                            # restart this is the common shape — the parser's
+                            # in-memory ``pending_tools`` no longer remembers
+                            # the matching tool_use, so a perfectly normal
+                            # quiet tool_result becomes invisible to the
+                            # busy indicator and the route stays stuck in
+                            # RUNNING_TOOL. Emit a lifecycle-only entry so
+                            # ``_apply_event`` can close the open tool slot.
+                            result.append(
+                                ParsedEntry(
+                                    role="assistant",
+                                    text="",
+                                    content_type="tool_result",
+                                    tool_use_id=_tuid,
+                                    timestamp=entry_timestamp,
+                                    uuid=entry_uuid,
+                                    lifecycle_only=True,
                                 )
                             )
 

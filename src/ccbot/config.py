@@ -106,9 +106,11 @@ class Config:
         #   2. activity-digest renderer + status_polling: whether they read
         #      RunState / context_pct, or fall back to the legacy
         #      state.done / is_status_active(pane) paths.
-        # Default false for one release; flip to true after Stage 4 lands.
+        # Default true after Stage 4 + the lifecycle-event / pane-idle
+        # backstop fixes landed; legacy V1 path remains accessible by
+        # setting CCBOT_BUSY_INDICATOR_V2=false.
         self.busy_indicator_v2 = (
-            os.getenv("CCBOT_BUSY_INDICATOR_V2", "false").lower() == "true"
+            os.getenv("CCBOT_BUSY_INDICATOR_V2", "true").lower() == "true"
         )
 
         # Context-window indicator threshold (percent). The activity-digest

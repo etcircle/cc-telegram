@@ -113,16 +113,25 @@ def _format_bundle(bundle: _PendingBundle) -> str:
     return attached_block
 
 
-async def _flush(route: Route) -> None:
-    """Send the buffered bundle to the bound tmux window and clear it."""
-    lock = _get_lock(route)
-    async with lock:
-        bundle = _route_pending.pop(route, None)
-        if bundle is None:
-            return
-        _cancel_handle(bundle)
-        text_to_send = _format_bundle(bundle)
+def _pop_bundle_locked(route: Route) -> _PendingBundle | None:
+    """Pop and disarm the route's pending bundle.
 
+    Caller is responsible for holding ``_get_lock(route)``. Split out from
+    ``_flush`` so the public ``aggregator_flush_route`` can pop and send
+    without re-entering the lock — ``asyncio.Lock`` is non-reentrant, and
+    while the previous "lock → release → call _flush which re-locks" shape
+    didn't formally deadlock, it left a window where another offer path
+    could race in and rebuild the bundle between the cancel and the send.
+    """
+    bundle = _route_pending.pop(route, None)
+    if bundle is not None:
+        _cancel_handle(bundle)
+    return bundle
+
+
+async def _send_bundle(route: Route, bundle: _PendingBundle) -> None:
+    """Render and send a popped bundle. Caller must NOT hold the route lock."""
+    text_to_send = _format_bundle(bundle)
     if not text_to_send:
         return
 
@@ -149,6 +158,17 @@ async def _flush(route: Route) -> None:
     # without this mark the indicator was dark during preliminary work.
     if config.busy_indicator_v2:
         await busy_indicator.mark_inbound_sent(route)
+
+
+async def _flush(route: Route) -> None:
+    """Send the buffered bundle to the bound tmux window and clear it."""
+    async with _get_lock(route):
+        bundle = _pop_bundle_locked(route)
+
+    if bundle is None:
+        return
+
+    await _send_bundle(route, bundle)
 
 
 async def aggregator_offer_text(route: Route, text: str) -> None:
@@ -206,13 +226,12 @@ async def aggregator_offer_photo(
 
 
 async def aggregator_flush_route(route: Route) -> None:
-    """Force-flush a route's bundle. Used by slash-command forwarders."""
-    lock = _get_lock(route)
-    async with lock:
-        bundle = _route_pending.get(route)
-        if bundle is None:
-            return
-        _cancel_handle(bundle)
+    """Force-flush a route's bundle. Used by slash-command forwarders.
+
+    Delegates straight to ``_flush`` so the pop and the cancel happen under
+    a single lock acquisition — no reentrancy hazard, no race window where a
+    concurrent offer can resurrect the bundle between cancel and send.
+    """
     await _flush(route)
 
 

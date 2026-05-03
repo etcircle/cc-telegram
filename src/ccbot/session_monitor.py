@@ -427,25 +427,14 @@ class SessionMonitor:
                     )
 
                 for entry in parsed_entries:
-                    if not entry.text and not entry.image_data:
-                        continue
-                    # Skip user messages unless show_user_messages is enabled
-                    if entry.role == "user" and not config.show_user_messages:
-                        continue
-                    # Suppress user-message echoes for text we just typed
-                    # into the pane via send_to_window — the user already
-                    # saw their own bubble in Telegram. Direct typing into
-                    # tmux (which never goes through send_to_window) still
-                    # falls through and gets surfaced.
-                    if entry.role == "user" and entry.text:
-                        from .session import consume_bot_sent_text
-
-                        if consume_bot_sent_text(session_info.session_id, entry.text):
-                            continue
-
-                    # Dispatch the lower-level event before queueing the
-                    # legacy NewMessage so consumers (BusyIndicator) see
-                    # raw lifecycle metadata in the same iteration.
+                    # Dispatch the lower-level event BEFORE display
+                    # filtering. Run-state transitions (BusyIndicator) are
+                    # lifecycle events, not display events: a quiet
+                    # tool_result, an empty-text end_turn, or a hidden user
+                    # message must still reach the indicator so it can close
+                    # an open tool slot or step the route to IDLE_RECENT.
+                    # Coupling lifecycle dispatch to "has visible content"
+                    # is exactly what leaves the typing indicator stuck on.
                     if self._event_callback is not None and entry.role in (
                         "user",
                         "assistant",
@@ -474,6 +463,28 @@ class SessionMonitor:
                                 await self._event_callback(event)
                             except Exception as e:
                                 logger.error(f"Event callback error: {e}")
+
+                    # Lifecycle-only entries exist purely to drive the
+                    # busy indicator; they have no visible content and must
+                    # not fan out to Telegram.
+                    if entry.lifecycle_only:
+                        continue
+
+                    if not entry.text and not entry.image_data:
+                        continue
+                    # Skip user messages unless show_user_messages is enabled
+                    if entry.role == "user" and not config.show_user_messages:
+                        continue
+                    # Suppress user-message echoes for text we just typed
+                    # into the pane via send_to_window — the user already
+                    # saw their own bubble in Telegram. Direct typing into
+                    # tmux (which never goes through send_to_window) still
+                    # falls through and gets surfaced.
+                    if entry.role == "user" and entry.text:
+                        from .session import consume_bot_sent_text
+
+                        if consume_bot_sent_text(session_info.session_id, entry.text):
+                            continue
 
                     new_messages.append(
                         NewMessage(

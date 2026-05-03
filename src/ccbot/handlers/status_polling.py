@@ -242,6 +242,15 @@ async def update_status_message(
     if (now - state) < IDLE_CLEAR_DELAY_SECONDS:
         return
     _idle_state[key] = "cleared"
+    # V2 backstop: same confirmed-idle window that clears the status card
+    # also reconciles the run-state machine. Without this, a missed
+    # lifecycle event (lost tool_result, transcript-parser miss, crashed
+    # Claude run) leaves the typing-action loop refreshing the native
+    # indicator forever. ``mark_pane_idle`` is a no-op when an interactive
+    # prompt is visible (WAITING_ON_USER) so we don't fight the UI in
+    # ``handle_interactive_ui`` — that branch already returned early above.
+    if config.busy_indicator_v2:
+        await busy_indicator.mark_pane_idle((user_id, thread_id or 0, window_id))
     await enqueue_status_update(
         bot,
         user_id,

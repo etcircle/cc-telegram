@@ -18,11 +18,48 @@ if ! tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep
     exit 1
 fi
 
-# Get the pane PID and check if uv run ccbot is running
+# Get the pane PID and check if uv run ccbot is running.
+#
+# Originally used `pstree -a $PANE_PID`, but `pstree` is GNU-only and not
+# installed by default on macOS — the call silently returned nothing and
+# `is_ccbot_running` was always false, so restart.sh skipped the kill step
+# and `tmux send-keys` typed the start command into the still-running
+# bot's stdin. Result: the user thought they restarted, but the live
+# process was hours-old stale code. Use `pgrep` instead — descends from
+# PANE_PID down through the process tree, no external pstree needed.
 PANE_PID=$(tmux list-panes -t "$TARGET" -F '#{pane_pid}')
 
+# Walk the pgrep -P parent-of tree starting at PANE_PID, returning all
+# descendant PIDs (one per line). Pure POSIX-ish, works on macOS + Linux.
+descendants_of() {
+    local parent="$1"
+    local children
+    children=$(pgrep -P "$parent" 2>/dev/null || true)
+    [ -z "$children" ] && return
+    for c in $children; do
+        echo "$c"
+        descendants_of "$c"
+    done
+}
+
 is_ccbot_running() {
-    pstree -a "$PANE_PID" 2>/dev/null | grep -q 'uv.*run ccbot\|ccbot.*\.venv/bin/ccbot'
+    local pids
+    pids=$(descendants_of "$PANE_PID")
+    [ -z "$pids" ] && return 1
+    # shellcheck disable=SC2086
+    ps -o command= -p $pids 2>/dev/null \
+        | grep -qE 'uv[[:space:]]+run[[:space:]]+ccbot|\.venv/bin/ccbot'
+}
+
+# Echo the uv parent PID for the running ccbot tree (used as the SIGTERM
+# target so a hung Python process can be reaped cleanly).
+ccbot_uv_pid() {
+    local pids
+    pids=$(descendants_of "$PANE_PID")
+    [ -z "$pids" ] && return
+    # shellcheck disable=SC2086
+    ps -o pid=,command= -p $pids 2>/dev/null \
+        | awk '/uv[[:space:]]+run[[:space:]]+ccbot/ { print $1; exit }'
 }
 
 # Stop existing process if running
@@ -40,8 +77,7 @@ if is_ccbot_running; then
 
     if is_ccbot_running; then
         echo "Process did not exit after ${MAX_WAIT}s, sending SIGTERM..."
-        # Kill the uv process directly
-        UV_PID=$(pstree -ap "$PANE_PID" 2>/dev/null | grep -oP 'uv,\K\d+' | head -1)
+        UV_PID=$(ccbot_uv_pid)
         if [ -n "$UV_PID" ]; then
             kill "$UV_PID" 2>/dev/null || true
             sleep 2

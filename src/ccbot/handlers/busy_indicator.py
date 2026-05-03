@@ -280,6 +280,13 @@ async def _set_state(route: Route, new: RunState) -> None:
     if old is new:
         return
     _run_state[route] = new
+    logger.debug(
+        "busy_state route=%s old=%s new=%s open_tools=%s",
+        route,
+        old.value,
+        new.value,
+        sorted(_open_tools.get(route, {}).keys()),
+    )
     for cb in list(_state_callbacks):
         try:
             await cb(route, old, new)
@@ -447,6 +454,45 @@ async def mark_topic_broken(route: Route) -> None:
         return
     _pre_broken_state[route] = current
     await _set_state(route, RunState.BROKEN_TOPIC)
+
+
+async def mark_pane_idle(route: Route) -> None:
+    """Reconcile the route to IDLE_CLEARED after a confirmed pane-idle stretch.
+
+    Backstop against missed lifecycle events. Even with §Fix-2's
+    lifecycle-only ParsedEntries, a malformed JSONL line, a parser bug,
+    or a Claude run that dies without writing end_turn can leave a route
+    pinned at RUNNING / RUNNING_TOOL forever — the V2 typing-action loop
+    keeps refreshing the native indicator on a route that long ago went
+    quiet. The status poller already debounces ``IDLE_CLEAR_DELAY_SECONDS``
+    of confirmed pane-idle before clearing the visible status card; mirror
+    that decision into the run-state machine so the indicator clears too.
+
+    No-op while a known interactive prompt is open
+    (``WAITING_ON_USER``) — those legitimately sit on the pane with no
+    spinner and we don't want to spam-clear them. ``BROKEN_TOPIC`` is
+    similarly preserved (recovery is gated on the next real event).
+    """
+    current = _run_state.get(route)
+    if current in (RunState.WAITING_ON_USER, RunState.BROKEN_TOPIC):
+        return
+    # Drop any lingering open tools — the pane has been confirmed idle for
+    # long enough that those tools are no longer in flight (the matching
+    # tool_result was either lost or never written).
+    open_tools = _open_tools.pop(route, None)
+    new = RunState.IDLE_CLEARED
+    if current is new:
+        # Refresh the activity timer but skip the callback fan-out.
+        _last_event_at[route] = _now()
+        return
+    logger.debug(
+        "busy_state pane_idle route=%s old=%s new=%s dropped_tools=%s",
+        route,
+        current.value if current else None,
+        new.value,
+        sorted(open_tools.keys()) if open_tools else [],
+    )
+    await _set_state(route, new)
 
 
 async def mark_topic_recovered(route: Route) -> None:
