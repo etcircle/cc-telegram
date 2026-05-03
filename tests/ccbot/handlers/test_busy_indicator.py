@@ -615,3 +615,203 @@ async def test_thinking_from_idle_transitions_running(monkeypatch: pytest.Monkey
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING
+
+
+# ── parse_pending_tools_from_jsonl / seed_open_tools ─────────────────────
+
+
+def _write_jsonl(path: str, entries: list[dict]) -> None:
+    """Write one JSON entry per line. Test helper for the replay parser."""
+    import json
+
+    with open(path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+
+def _entry(content: list[dict], *, is_sidechain: bool = False) -> dict:
+    """Wrap a content list in the JSONL envelope shape the parser expects."""
+    return {
+        "type": "assistant",
+        "isSidechain": is_sidechain,
+        "message": {"role": "assistant", "content": content},
+    }
+
+
+def test_replay_returns_unmatched_tool_uses(tmp_path):
+    """tool_use without a matching tool_result remains in the open set."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry([{"type": "tool_use", "id": "t1", "name": "Bash"}]),
+            _entry([{"type": "tool_result", "tool_use_id": "t1"}]),
+            _entry([{"type": "tool_use", "id": "t2", "name": "Task"}]),
+        ],
+    )
+    pending = busy_indicator.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"t2": False}
+
+
+def test_replay_marks_interactive_tool(tmp_path):
+    """An open AskUserQuestion is flagged as interactive in the replay."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry([{"type": "tool_use", "id": "q1", "name": "AskUserQuestion"}]),
+        ],
+    )
+    pending = busy_indicator.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"q1": True}
+
+
+def test_replay_skips_sidechain_entries(tmp_path):
+    """isSidechain=true entries are ignored — they belong to a sub-agent."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry(
+                [{"type": "tool_use", "id": "s1", "name": "Bash"}],
+                is_sidechain=True,
+            ),
+            _entry([{"type": "tool_use", "id": "p1", "name": "Bash"}]),
+        ],
+    )
+    pending = busy_indicator.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"p1": False}
+
+
+def test_replay_tolerates_malformed_lines(tmp_path):
+    """Bad JSON lines don't break the scan — we just skip them."""
+    p = tmp_path / "sess.jsonl"
+    p.write_text(
+        "\n".join(
+            [
+                "not json {",
+                "",
+                '{"type":"assistant","message":{"content":'
+                '[{"type":"tool_use","id":"ok","name":"Read"}]}}',
+                '{"type":"assistant","message":"not-a-dict"}',
+                '{"type":"assistant","message":{"content":"not-a-list"}}',
+            ]
+        )
+        + "\n"
+    )
+    pending = busy_indicator.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"ok": False}
+
+
+def test_replay_returns_empty_for_missing_file(tmp_path):
+    """Missing JSONL is non-fatal: replay yields nothing, route stays idle."""
+    pending = busy_indicator.parse_pending_tools_from_jsonl(
+        str(tmp_path / "does-not-exist.jsonl")
+    )
+    assert pending == {}
+
+
+def test_replay_pairs_tool_result_before_tool_use(tmp_path):
+    """Branch / rewind / --resume can lay tool_result *before* its tool_use.
+
+    A forward-pop walk would leave a phantom open tool here. Set-difference
+    semantics correctly pair them regardless of line order.
+    """
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry([{"type": "tool_result", "tool_use_id": "rewound"}]),
+            _entry([{"type": "tool_use", "id": "rewound", "name": "Bash"}]),
+        ],
+    )
+    pending = busy_indicator.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {}
+
+
+def test_replay_repeated_tool_use_same_id_collapses(tmp_path):
+    """A duplicate tool_use line (same id) does not produce two open entries."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry([{"type": "tool_use", "id": "dup", "name": "Bash"}]),
+            _entry([{"type": "tool_use", "id": "dup", "name": "Bash"}]),
+        ],
+    )
+    pending = busy_indicator.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"dup": False}
+
+
+def test_replay_skips_string_content(tmp_path):
+    """Some entries have ``message.content`` as a string, not a list. Skip."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            {"type": "user", "message": {"role": "user", "content": "hello world"}},
+            _entry([{"type": "tool_use", "id": "t1", "name": "Read"}]),
+        ],
+    )
+    pending = busy_indicator.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"t1": False}
+
+
+def test_seed_open_tools_sets_running_tool_state():
+    """Non-interactive open tool seeds RUNNING_TOOL; state() reflects it."""
+    busy_indicator.seed_open_tools(ROUTE, {"t1": False, "t2": False})
+    assert busy_indicator.state(ROUTE) is RunState.RUNNING_TOOL
+    assert busy_indicator._open_tools[ROUTE] == {"t1": False, "t2": False}
+
+
+def test_seed_open_tools_sets_waiting_on_user_for_interactive():
+    """Any interactive id in the seed flips the route to WAITING_ON_USER."""
+    busy_indicator.seed_open_tools(ROUTE, {"t1": False, "q1": True})
+    assert busy_indicator.state(ROUTE) is RunState.WAITING_ON_USER
+
+
+def test_seed_open_tools_empty_is_noop():
+    """Empty seed must not stomp existing state — startup must be idempotent
+    against routes that landed a real event before replay finished."""
+    busy_indicator._run_state[ROUTE] = RunState.RUNNING
+    busy_indicator.seed_open_tools(ROUTE, {})
+    assert busy_indicator.state(ROUTE) is RunState.RUNNING
+    assert ROUTE not in busy_indicator._open_tools
+
+
+def test_seed_open_tools_skips_route_with_existing_state():
+    """A real event landed before replay walked this route — don't downgrade.
+
+    BROKEN_TOPIC is the case that hurts: a JSONL-derived seed would silently
+    paper over a topic-broken signal that was raised by the inbound send
+    classifier. Guarding against any pre-existing run_state covers the
+    general principle (live events are more authoritative than a JSONL
+    snapshot) and BROKEN_TOPIC specifically.
+    """
+    busy_indicator._run_state[ROUTE] = RunState.BROKEN_TOPIC
+    busy_indicator.seed_open_tools(ROUTE, {"task-1": False})
+    assert busy_indicator.state(ROUTE) is RunState.BROKEN_TOPIC
+    assert ROUTE not in busy_indicator._open_tools
+
+
+@pytest.mark.asyncio
+async def test_seeded_tool_result_closes_via_normal_path(monkeypatch):
+    """A tool_result for a seeded id is NOT stale: it walks the route to
+    RUNNING just like an open tool that was seen live. This is the user-
+    visible payoff of the replay — the post-restart Task tool_result lands
+    in _open_tools and recovers the route."""
+    fake_now = [1000.0]
+    monkeypatch.setattr(busy_indicator, "_now", lambda: fake_now[0])
+
+    busy_indicator.seed_open_tools(ROUTE, {"task-1": False})
+    assert busy_indicator.state(ROUTE) is RunState.RUNNING_TOOL
+
+    await busy_indicator.on_transcript_event(
+        _event(
+            role="assistant",
+            block_type="tool_result",
+            tool_use_id="task-1",
+        ),
+        [ROUTE],
+    )
+    assert busy_indicator.state(ROUTE) is RunState.RUNNING

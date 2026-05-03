@@ -2282,6 +2282,31 @@ async def post_init(application: Application) -> None:
 
         monitor.set_event_callback(event_callback)
 
+        # Replay tool_use/tool_result pairs from each tracked parent JSONL so
+        # tools that were open at the moment of bot shutdown (most painfully,
+        # long-running sub-agent Task calls) are visible to the busy indicator
+        # immediately. Without this, ``_open_tools`` is empty after restart
+        # and routes stay IDLE_CLEARED until the parent emits a fresh event —
+        # for an in-flight Task that means no typing indicator for the entire
+        # sub-agent runtime, since sub-agents write to a separate JSONL.
+        seeded_routes = 0
+        for sid, tracked in monitor.state.tracked_sessions.items():
+            pending = await asyncio.to_thread(
+                busy_indicator.parse_pending_tools_from_jsonl, tracked.file_path
+            )
+            if not pending:
+                continue
+            active = await session_manager.find_users_for_session(sid)
+            for user_id, wid, thread_id in active:
+                route: busy_indicator.Route = (user_id, thread_id or 0, wid)
+                busy_indicator.seed_open_tools(route, pending)
+                seeded_routes += 1
+        if seeded_routes:
+            logger.info(
+                "Replayed pending tool state for %d route(s) at startup",
+                seeded_routes,
+            )
+
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")

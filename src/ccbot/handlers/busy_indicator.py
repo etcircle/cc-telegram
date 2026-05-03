@@ -28,6 +28,7 @@ Public surface:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from enum import Enum
@@ -167,6 +168,109 @@ def clear_route(route: Route) -> None:
     _last_event_at.pop(route, None)
     _context_pct.pop(route, None)
     _pre_broken_state.pop(route, None)
+
+
+def parse_pending_tools_from_jsonl(jsonl_path: str) -> dict[str, bool]:
+    """Scan a session's parent JSONL for tool_use entries with no tool_result.
+
+    Returns ``{tool_use_id: is_interactive}`` for the open set, suitable for
+    feeding into ``seed_open_tools``. Used at startup to recover the
+    in-flight tool state lost when the bot restarts mid-turn — most acutely
+    important for sub-agent ``Task`` calls, which can sit open for many
+    minutes with no parent-JSONL activity to re-arm the busy indicator.
+
+    Set-difference rather than running open-set: parent JSONL is NOT strictly
+    chronological. Branch / rewind / ``--resume`` flows can lay a tool_result
+    line down before its tool_use line, so a forward "pop on result" walk
+    leaves phantom open tools in finished sessions. Collect all uses and all
+    results in one pass, then return ``uses − results``.
+
+    Sidechain entries (``isSidechain=true``) are skipped: they live in a
+    separate JSONL but if any leak into the parent, they belong to a
+    sub-agent's tool space, not the parent's.
+
+    Malformed lines and unexpected shapes are tolerated — the parent JSONL
+    is the source of truth so a few skipped lines just mean we miss a tool.
+    A missed tool means the indicator stays dark until the next event;
+    that's the pre-replay behavior, so this fails safely.
+    """
+    uses: dict[str, bool] = {}
+    results: set[str] = set()
+    try:
+        with open(jsonl_path, encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("isSidechain"):
+                    continue
+                message = entry.get("message")
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type")
+                    if item_type == "tool_use":
+                        tool_id = item.get("id")
+                        if not isinstance(tool_id, str):
+                            continue
+                        tool_name = item.get("name")
+                        is_interactive = bool(
+                            isinstance(tool_name, str)
+                            and tool_name in INTERACTIVE_TOOL_NAMES
+                        )
+                        # Don't downgrade an interactive id that appeared
+                        # earlier (idempotent against duplicate tool_use
+                        # lines after rewind).
+                        uses[tool_id] = uses.get(tool_id, False) or is_interactive
+                    elif item_type == "tool_result":
+                        tool_id = item.get("tool_use_id")
+                        if isinstance(tool_id, str):
+                            results.add(tool_id)
+    except OSError as e:
+        logger.warning("replay: failed to read %s: %s", jsonl_path, e)
+        return {}
+    return {tid: interactive for tid, interactive in uses.items() if tid not in results}
+
+
+def seed_open_tools(route: Route, tools: dict[str, bool]) -> None:
+    """Seed ``_open_tools[route]`` from a startup replay.
+
+    Sets the route's run state from the seeded open-tool set so the typing
+    indicator and digest header reflect the in-flight state immediately.
+
+    No-op when ``tools`` is empty: the route already defaults to
+    ``IDLE_CLEARED`` via ``state()``, and writing an explicit IDLE_CLEARED
+    here would override any concurrent event that landed during startup.
+
+    No-op when the route already has live ``_run_state``: a real
+    ``on_transcript_event`` (or ``mark_inbound_sent`` / ``mark_topic_broken``)
+    landed between callback registration and the replay walk. The live
+    event is more authoritative than a JSONL-derived snapshot, especially
+    for ``BROKEN_TOPIC`` which we'd otherwise silently downgrade.
+
+    ``_last_event_at`` is set so a subsequent ``_apply_event`` doesn't
+    treat the seeded route as never-seen (which would make idle decay
+    behave oddly). Callbacks are NOT fired — startup seeding is bookkeeping,
+    not a transition the surfaces should react to.
+    """
+    if not tools:
+        return
+    if route in _run_state:
+        return
+    _open_tools[route] = dict(tools)
+    _run_state[route] = _state_from_open_tools(tools)
+    _last_event_at[route] = _now()
 
 
 async def _set_state(route: Route, new: RunState) -> None:
