@@ -212,14 +212,26 @@ def _todo_tool_ids_record(key: tuple[str, int, int]) -> None:
 
     Wrapping the add path centralizes the bounded-size invariant — call
     sites stay one-liners, and the eviction policy can be tuned in one
-    place if we ever switch to TTL or per-route bounds.
+    place if we ever switch to TTL or per-route bounds. ``move_to_end``
+    on a re-recorded key is defensive: in normal flow each TodoWrite has
+    a fresh tool_use_id so the branch is dead, but if a future code path
+    ever re-records (e.g. JSONL replay on startup), it keeps still-open
+    ids from being prematurely evicted by a flood of new ones.
     """
     if key in _todo_tool_ids:
         _todo_tool_ids.move_to_end(key)
         return
     _todo_tool_ids[key] = None
     if len(_todo_tool_ids) > TODO_TOOL_IDS_MAX:
-        _todo_tool_ids.popitem(last=False)
+        evicted, _ = _todo_tool_ids.popitem(last=False)
+        # Hitting the cap shouldn't happen at typical TodoWrite rates;
+        # if we do, it's likely a leak path (a tool_result code path
+        # that doesn't pop) rather than legitimate volume. Surface it.
+        logger.debug(
+            "todo_tool_ids LRU evicted oldest entry %s (cap=%d)",
+            evicted,
+            TODO_TOOL_IDS_MAX,
+        )
 
 
 ACTIVITY_DIGEST_CONTENT_TYPES = {"tool_use", "tool_result", "thinking"}
@@ -1484,8 +1496,6 @@ async def _run_locked_todo_upsert(
     bot: Bot,
     user_id: int,
     thread_id: int | None,
-    tid: int,
-    key: tuple[int, int],
 ) -> None:
     """Acquire the per-route lock and run one todo-digest upsert.
 
@@ -1507,6 +1517,8 @@ async def _run_locked_todo_upsert(
     interleaved ``_process_todo_task`` cannot mutate state between our
     read and the upsert.
     """
+    tid = thread_id or 0
+    key = (user_id, tid)
     async with _get_todo_lock(user_id, tid):
         snapshot = _todo_pending_snapshot.get(key)
         if snapshot is None:
@@ -1548,9 +1560,7 @@ def _schedule_todo_flush(
             return
         _todo_flush_tasks.pop(key, None)
         try:
-            await asyncio.shield(
-                _run_locked_todo_upsert(bot, user_id, thread_id, tid, key)
-            )
+            await asyncio.shield(_run_locked_todo_upsert(bot, user_id, thread_id))
         except asyncio.CancelledError:
             raise
         except Exception as e:  # pragma: no cover - background task safety
@@ -2533,8 +2543,10 @@ async def teardown_route(route: Route, *, drop_pending: bool) -> None:
         if todo_flush is not None and not todo_flush.done():
             todo_flush.cancel()
         _todo_locks.pop((route_user_id, route_tid), None)
-        # _todo_tool_ids is OrderedDict-as-set; filter rather than drop-by-key.
-        # ``list()`` snapshots keys so the pop loop can mutate the dict.
+        # _todo_tool_ids is OrderedDict-as-set keyed by tool_use_id; we don't
+        # know which ids belong to this route without scanning. Materialize
+        # the list of matches first so the pop loop doesn't mutate during
+        # iteration.
         todo_ids_to_remove = [
             k for k in _todo_tool_ids if k[1] == route_user_id and k[2] == route_tid
         ]
