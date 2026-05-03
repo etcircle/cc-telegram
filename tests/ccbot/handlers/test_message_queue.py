@@ -54,6 +54,13 @@ def _reset_state() -> None:
             flush.cancel()
     message_queue._activity_flush_tasks.clear()
     message_queue._activity_locks.clear()
+    message_queue._subagent_msg_info.clear()
+    message_queue._subagent_tool_indices.clear()
+    for _, flush in list(message_queue._subagent_flush_tasks.items()):
+        if not flush.done():
+            flush.cancel()
+    message_queue._subagent_flush_tasks.clear()
+    message_queue._subagent_locks.clear()
     for _, flush in list(message_queue._todo_flush_tasks.items()):
         if not flush.done():
             flush.cancel()
@@ -2877,6 +2884,290 @@ class TestActivityDigestDebounce:
         assert message_queue._activity_msg_info[(1, 42)] is state_b
         assert message_queue._activity_msg_info[(1, 42)].message_id == 0
         assert message_queue._activity_msg_info[(1, 42)].window_id == "@0-new"
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestSubagentDigest:
+    """Sub-agent (sidechain) blocks collapse into one editable digest message.
+
+    Before this digest existed, every text / thinking / tool_use / tool_result
+    block from a sidechain JSONL was sent as its own ``↳ ...`` Telegram
+    message. A multi-step sub-agent run produced N bubbles in the parent
+    topic. The digest replaces that with one editable message per run, keyed
+    by ``subagent_key``.
+    """
+
+    @staticmethod
+    def _task(
+        *,
+        content_type: str,
+        parts: list[str],
+        subagent_key: str,
+        tool_use_id: str | None = None,
+        thread_id: int = 42,
+        window_id: str = "@0",
+    ) -> "message_queue.MessageTask":
+        return message_queue.MessageTask(
+            task_type="content",
+            window_id=window_id,
+            parts=parts,
+            tool_use_id=tool_use_id,
+            content_type=content_type,
+            thread_id=thread_id,
+            subagent_key=subagent_key,
+        )
+
+    @pytest.mark.asyncio
+    async def test_multiple_blocks_coalesce_into_one_send_plus_edits(
+        self, mock_bot: AsyncMock
+    ):
+        """Four sub-agent blocks → one topic_send (initial) + edits, all subagent_activity."""
+        from ccbot.handlers.message_sender import TopicSendOutcome
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 7777
+        send_calls: list[dict] = []
+        edit_calls: list[dict] = []
+
+        async def fake_send(bot, *, op, text, **kw):
+            send_calls.append({"op": op, "text": text})
+            return sent_msg, TopicSendOutcome.OK
+
+        async def fake_edit(bot, *, op, message_id, text, **kw):
+            edit_calls.append({"op": op, "message_id": message_id, "text": text})
+            return TopicSendOutcome.OK
+
+        key = "sub:parent-sid:agent-abc"
+
+        with (
+            patch.object(message_queue, "topic_send", side_effect=fake_send),
+            patch.object(message_queue, "topic_edit", side_effect=fake_edit),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+        ):
+            # Process four blocks for the same sub-agent run, flushing after each
+            # so the test exercises the full send→edit lifecycle without waiting
+            # for the 10s debounce.
+            await message_queue._process_subagent_activity_task(
+                mock_bot,
+                1,
+                self._task(
+                    content_type="text", parts=["I'll start now"], subagent_key=key
+                ),
+            )
+            await message_queue._upsert_subagent_digest(
+                mock_bot,
+                1,
+                42,
+                message_queue._subagent_msg_info[(1, 42, key)],
+            )
+
+            await message_queue._process_subagent_activity_task(
+                mock_bot,
+                1,
+                self._task(
+                    content_type="tool_use",
+                    parts=["**Bash**(ls -la)"],
+                    subagent_key=key,
+                    tool_use_id="t1",
+                ),
+            )
+            await message_queue._upsert_subagent_digest(
+                mock_bot, 1, 42, message_queue._subagent_msg_info[(1, 42, key)]
+            )
+
+            await message_queue._process_subagent_activity_task(
+                mock_bot,
+                1,
+                self._task(
+                    content_type="thinking", parts=["(thinking)"], subagent_key=key
+                ),
+            )
+            await message_queue._upsert_subagent_digest(
+                mock_bot, 1, 42, message_queue._subagent_msg_info[(1, 42, key)]
+            )
+
+            await message_queue._process_subagent_activity_task(
+                mock_bot,
+                1,
+                self._task(content_type="text", parts=["done"], subagent_key=key),
+            )
+            await message_queue._upsert_subagent_digest(
+                mock_bot, 1, 42, message_queue._subagent_msg_info[(1, 42, key)]
+            )
+
+        # First block creates the digest message; subsequent blocks edit it.
+        assert len(send_calls) == 1
+        assert send_calls[0]["op"] == "subagent_activity"
+        assert len(edit_calls) == 3
+        assert all(c["op"] == "subagent_activity" for c in edit_calls)
+        assert all(c["message_id"] == 7777 for c in edit_calls)
+        # The final edit's body should mention each of the four entries.
+        final_text = edit_calls[-1]["text"]
+        assert "I'll start now" in final_text
+        assert "Bash" in final_text
+        assert "Thinking" in final_text
+        assert "done" in final_text
+
+    @pytest.mark.asyncio
+    async def test_tool_use_then_tool_result_edits_same_line(self, mock_bot: AsyncMock):
+        """A tool_result with a known tool_use_id replaces (not appends to) its line."""
+        key = "sub:parent-sid:agent-abc"
+
+        await message_queue._process_subagent_activity_task(
+            None,  # bot only used for scheduling the debounce; we don't await it
+            1,
+            self._task(
+                content_type="tool_use",
+                parts=["**Bash**(pytest)"],
+                subagent_key=key,
+                tool_use_id="t1",
+            ),
+        )
+        state = message_queue._subagent_msg_info[(1, 42, key)]
+        assert len(state.lines) == 1
+        assert state.tool_count == 1
+        assert state.completed_count == 0
+        # The tool_use line's index is recorded for pairing.
+        assert message_queue._subagent_tool_indices[("t1", 1, 42, key)] == 0
+
+        await message_queue._process_subagent_activity_task(
+            None,
+            1,
+            self._task(
+                content_type="tool_result",
+                parts=["**Bash**(pytest)  ⎿  3 passed"],
+                subagent_key=key,
+                tool_use_id="t1",
+            ),
+        )
+        state = message_queue._subagent_msg_info[(1, 42, key)]
+        # tool_result edited the existing line — still one line, not two.
+        assert len(state.lines) == 1
+        assert state.tool_count == 1
+        assert state.completed_count == 1
+        # Pairing index consumed.
+        assert ("t1", 1, 42, key) not in message_queue._subagent_tool_indices
+        # The line now reflects the result, not the dispatch.
+        assert "3 passed" in state.lines[0]
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_subagents_get_distinct_digests(
+        self, mock_bot: AsyncMock
+    ):
+        """Two sub-agent runs in the same topic produce two distinct messages."""
+        from ccbot.handlers.message_sender import TopicSendOutcome
+
+        sent_a = MagicMock()
+        sent_a.message_id = 1001
+        sent_b = MagicMock()
+        sent_b.message_id = 1002
+        sent_msgs = iter([sent_a, sent_b])
+
+        send_calls: list[dict] = []
+
+        async def fake_send(bot, *, op, text, **kw):
+            send_calls.append({"op": op, "text": text})
+            return next(sent_msgs), TopicSendOutcome.OK
+
+        async def fake_edit(bot, **kw):
+            return TopicSendOutcome.OK
+
+        key_a = "sub:parent-sid:agent-aaa"
+        key_b = "sub:parent-sid:agent-bbb"
+
+        with (
+            patch.object(message_queue, "topic_send", side_effect=fake_send),
+            patch.object(message_queue, "topic_edit", side_effect=fake_edit),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+        ):
+            await message_queue._process_subagent_activity_task(
+                mock_bot,
+                1,
+                self._task(content_type="text", parts=["A start"], subagent_key=key_a),
+            )
+            await message_queue._upsert_subagent_digest(
+                mock_bot, 1, 42, message_queue._subagent_msg_info[(1, 42, key_a)]
+            )
+
+            await message_queue._process_subagent_activity_task(
+                mock_bot,
+                1,
+                self._task(content_type="text", parts=["B start"], subagent_key=key_b),
+            )
+            await message_queue._upsert_subagent_digest(
+                mock_bot, 1, 42, message_queue._subagent_msg_info[(1, 42, key_b)]
+            )
+
+        # Two distinct sub-agent runs → two distinct digest messages.
+        assert len(send_calls) == 2
+        assert all(c["op"] == "subagent_activity" for c in send_calls)
+        state_a = message_queue._subagent_msg_info[(1, 42, key_a)]
+        state_b = message_queue._subagent_msg_info[(1, 42, key_b)]
+        assert state_a.message_id == 1001
+        assert state_b.message_id == 1002
+        # The two digests don't share state.
+        assert state_a.lines != state_b.lines
+        assert "A start" in state_a.lines[0]
+        assert "B start" in state_b.lines[0]
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_routes_subagent_task_to_digest(self, mock_bot: AsyncMock):
+        """A queued sub-agent task hits _process_subagent_activity_task,
+        not the parent activity digest or the agent-promotion path.
+        """
+        called: dict[str, int] = {
+            "sub": 0,
+            "activity": 0,
+            "agent": 0,
+            "content": 0,
+        }
+
+        async def fake_sub(bot, user_id, task):
+            called["sub"] += 1
+
+        async def fake_activity(bot, user_id, task):
+            called["activity"] += 1
+
+        async def fake_agent(bot, user_id, task):
+            called["agent"] += 1
+
+        async def fake_content(bot, user_id, task):
+            called["content"] += 1
+
+        with (
+            patch.object(
+                message_queue,
+                "_process_subagent_activity_task",
+                side_effect=fake_sub,
+            ),
+            patch.object(
+                message_queue, "_process_activity_task", side_effect=fake_activity
+            ),
+            patch.object(message_queue, "_process_agent_task", side_effect=fake_agent),
+            patch.object(
+                message_queue, "_process_content_task", side_effect=fake_content
+            ),
+        ):
+            queue: asyncio.Queue[message_queue.MessageTask] = asyncio.Queue()
+            lock = asyncio.Lock()
+            await message_queue._dispatch_task(
+                mock_bot,
+                1,
+                queue,
+                lock,
+                self._task(
+                    content_type="tool_use",
+                    parts=["**Bash**(ls)"],
+                    subagent_key="sub:parent:agent-xyz",
+                    tool_use_id="t1",
+                ),
+            )
+
+        assert called == {"sub": 1, "activity": 0, "agent": 0, "content": 0}
 
 
 @pytest.mark.usefixtures("_clear_queue_state")

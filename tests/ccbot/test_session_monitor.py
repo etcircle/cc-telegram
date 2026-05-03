@@ -424,7 +424,7 @@ class TestEventCallback:
 
 
 class TestSidechainTailing:
-    """check_sidechain_updates: tail sub-agent JSONLs and prefix with ↳."""
+    """check_sidechain_updates: tail sub-agent JSONLs and tag with subagent_key."""
 
     @pytest.fixture
     def monitor(self, tmp_path):
@@ -491,10 +491,10 @@ class TestSidechainTailing:
         assert tracked.last_byte_offset == sc_file.stat().st_size
 
     @pytest.mark.asyncio
-    async def test_appended_tool_use_emits_prefixed_text(
+    async def test_appended_tool_use_emits_subagent_tagged_event(
         self, monitor, tmp_path, make_jsonl_entry, make_tool_use_block
     ):
-        """New tool_use lines after registration emit '↳ ...' text NewMessages."""
+        """New tool_use lines after registration emit subagent-tagged NewMessages."""
         parent_sid = "parent-sid"
         _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
         sc_file = sub_dir / "agent-abc.jsonl"
@@ -516,17 +516,18 @@ class TestSidechainTailing:
         assert len(msgs) == 1
         m = msgs[0]
         assert m.session_id == parent_sid  # routed to parent's topic
-        assert m.text.startswith("↳ ")
         assert "Bash" in m.text
         assert "pnpm test" in m.text
-        # Emitted as text, not tool_use, so the queue's tool_use logic is bypassed.
-        assert m.content_type == "text"
-        assert m.tool_use_id is None
-        assert m.tool_name is None
+        # Underlying block type is preserved so the digest can pair tool_use
+        # with its tool_result; the queue routes via subagent_key first.
+        assert m.content_type == "tool_use"
+        assert m.tool_use_id == "t1"
+        assert m.tool_name == "Bash"
         assert m.role == "assistant"
+        assert m.subagent_key == f"sub:{parent_sid}:agent-abc"
 
     @pytest.mark.asyncio
-    async def test_text_thinking_and_tool_use_pass_tool_result_dropped(
+    async def test_text_thinking_tool_use_and_tool_result_all_forwarded(
         self,
         monitor,
         tmp_path,
@@ -536,9 +537,7 @@ class TestSidechainTailing:
         make_tool_use_block,
         make_tool_result_block,
     ):
-        """Assistant text/thinking/tool_use forward; tool_result is dropped."""
-        from ccbot.transcript_parser import TranscriptParser
-
+        """All four block types forward as subagent-tagged events for the digest."""
         parent_sid = "parent-sid"
         _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
         sc_file = sub_dir / "agent-abc.jsonl"
@@ -568,24 +567,18 @@ class TestSidechainTailing:
 
         msgs = await monitor.check_sidechain_updates({parent_sid})
 
-        # text + thinking + tool_use → 3; tool_result dropped.
-        assert len(msgs) == 3
+        expected_key = f"sub:{parent_sid}:agent-abc"
         for m in msgs:
-            assert m.text.startswith("↳ ")
             assert m.session_id == parent_sid
-            assert m.content_type == "text"
-            assert m.tool_use_id is None
+            assert m.subagent_key == expected_key
 
-        text_msg, thinking_msg, tool_msg = msgs
-        # Prose is wrapped in expandable quote markers (collapsed by default).
-        assert TranscriptParser.EXPANDABLE_QUOTE_START in text_msg.text
-        assert "agent's plan" in text_msg.text
-        # Thinking is also wrapped (parser does the wrapping for us).
-        assert TranscriptParser.EXPANDABLE_QUOTE_START in thinking_msg.text
-        assert "agent thinking" in thinking_msg.text
-        # Tool header is plain markdown, no expandable wrapper.
-        assert TranscriptParser.EXPANDABLE_QUOTE_START not in tool_msg.text
-        assert "Read" in tool_msg.text
+        # Text, thinking, tool_use, and tool_result all flow through the
+        # digest path now — the per-sub-agent card handles pairing.
+        kinds = [m.content_type for m in msgs]
+        assert "text" in kinds
+        assert "thinking" in kinds
+        assert "tool_use" in kinds
+        assert "tool_result" in kinds
 
     @pytest.mark.asyncio
     async def test_show_tool_calls_false_short_circuits(

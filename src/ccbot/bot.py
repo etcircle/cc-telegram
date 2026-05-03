@@ -42,6 +42,9 @@ from pathlib import Path
 from telegram import (
     Bot,
     BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
@@ -213,13 +216,14 @@ async def _message_refs_gc_loop(bot: Bot) -> None:
             raise
 
 
-# Claude Code commands shown in bot menu (forwarded via tmux)
+# Claude Code commands shown in bot menu (forwarded via tmux).
+# Only commands whose output actually lands in the JSONL transcript belong
+# here. /memory and /help open TUI-interactive panels inside Claude Code
+# that never reach the transcript, so they're useless over Telegram.
 CC_COMMANDS: dict[str, str] = {
     "clear": "↗ Clear conversation history",
     "compact": "↗ Compact conversation context",
     "cost": "↗ Show token/cost usage",
-    "help": "↗ Show Claude Code help",
-    "memory": "↗ Edit CLAUDE.md",
     "model": "↗ Switch AI model",
 }
 
@@ -2104,8 +2108,16 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         return
 
     for user_id, wid, thread_id in active_users:
-        # Handle interactive tools specially - capture terminal and send UI
-        if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
+        # Handle interactive tools specially - capture terminal and send UI.
+        # Sub-agent (sidechain) tool calls are routed to the per-sub-agent
+        # digest regardless of tool name; their interactive prompts don't
+        # surface to the parent topic — only the top-level Agent
+        # tool_use/tool_result pair does.
+        if (
+            msg.subagent_key is None
+            and msg.tool_name in INTERACTIVE_TOOL_NAMES
+            and msg.content_type == "tool_use"
+        ):
             # Mark interactive mode BEFORE sleeping so polling skips this window
             set_interactive_mode(user_id, wid, thread_id)
             # Flush pending content for THIS route only — unrelated topics
@@ -2165,6 +2177,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             tool_name=msg.tool_name,
             tool_input=msg.tool_input,
             transcript_uuid=msg.transcript_uuid,
+            subagent_key=msg.subagent_key,
         )
 
         # Update user's read offset to current file position
@@ -2194,7 +2207,19 @@ async def post_init(application: Application) -> None:
     # insert tasks.
     await message_refs.init_db(config.message_refs_db_path)
 
-    await application.bot.delete_my_commands()
+    # Telegram resolves the bot's command menu by scope: in a forum / group
+    # chat it checks the group scope first and only falls back to Default if
+    # nothing is set there. A prior deploy that called set_my_commands with
+    # an explicit group scope would otherwise pin an old menu forever, since
+    # delete_my_commands() without scope only clears Default. Clear all
+    # scopes we care about, then re-set Default + AllGroupChats so both
+    # private chats and forum topics show the current list.
+    for scope in (
+        BotCommandScopeDefault(),
+        BotCommandScopeAllGroupChats(),
+        BotCommandScopeAllPrivateChats(),
+    ):
+        await application.bot.delete_my_commands(scope=scope)
 
     bot_commands = [
         BotCommand("start", "Show welcome message"),
@@ -2210,6 +2235,9 @@ async def post_init(application: Application) -> None:
         bot_commands.append(BotCommand(cmd_name, desc))
 
     await application.bot.set_my_commands(bot_commands)
+    await application.bot.set_my_commands(
+        bot_commands, scope=BotCommandScopeAllGroupChats()
+    )
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()

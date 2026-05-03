@@ -76,6 +76,11 @@ class NewMessage:
     # the JSONL block without a second pass over the file.
     tool_input: dict[str, Any] | None = None
     transcript_uuid: str | None = None
+    # When non-None, this message represents a block from a sub-agent's
+    # sidechain JSONL. The handler routes it to the per-sub-agent digest
+    # so a multi-step run renders as one editable message instead of one
+    # bubble per block.
+    subagent_key: str | None = None
 
 
 class SessionMonitor:
@@ -610,49 +615,38 @@ class SessionMonitor:
                     self._pending_tools.pop(tracking_key, None)
 
                 for entry in parsed_entries:
-                    # Option (a) + (ii) extended: inline stream of tool
-                    # headers, plus the sub-agent's prose/thinking wrapped
-                    # in expandable blockquotes so the agent's plan and
-                    # narrative are peekable without dominating the topic.
-                    # Tool results are still dropped — the next tool_use
-                    # plus the parent's eventual Agent tool_result already
-                    # convey progress.
+                    # Each block (text / thinking / tool_use / tool_result)
+                    # becomes one event for the per-sub-agent digest. The
+                    # message_queue collapses these into a single editable
+                    # message keyed by ``subagent_key=tracking_key`` so a
+                    # multi-step run renders as one bubble in the parent
+                    # topic, not N. Routing through ``subagent_key`` also
+                    # bypasses Agent prominence / parent activity digest /
+                    # interactive UI dispatch — those apply only to the
+                    # parent's own blocks.
                     if entry.role != "assistant":
                         continue
-                    if not entry.text:
+                    if entry.content_type not in (
+                        "text",
+                        "thinking",
+                        "tool_use",
+                        "tool_result",
+                    ):
                         continue
-                    if entry.content_type in ("tool_use", "thinking"):
-                        # tool_use: parser produces "**Bash**(cmd)"-style
-                        # one-liner, prefix it. thinking: parser already
-                        # wraps real content in EXPANDABLE_QUOTE markers
-                        # (or emits a bare "(thinking)" placeholder),
-                        # either way just prefix it.
-                        rendered = f"↳ {entry.text}"
-                    elif entry.content_type == "text":
-                        # Wrap raw assistant text in an expandable quote so
-                        # long plans / explanations stay collapsed.
-                        rendered = (
-                            f"↳ {TranscriptParser.EXPANDABLE_QUOTE_START}"
-                            f"{entry.text}"
-                            f"{TranscriptParser.EXPANDABLE_QUOTE_END}"
-                        )
-                    else:
+                    if not entry.text and not entry.tool_use_id:
                         continue
                     new_messages.append(
                         NewMessage(
                             session_id=parent_session_id,
-                            text=rendered,
-                            # Emit as text so the message_queue special-cases
-                            # for tool_use (Agent prominence, activity
-                            # digest, tool_use↔tool_result editing,
-                            # interactive UI dispatch) don't apply.
-                            content_type="text",
-                            tool_use_id=None,
+                            text=entry.text,
+                            content_type=entry.content_type,
+                            tool_use_id=entry.tool_use_id,
                             role="assistant",
-                            tool_name=None,
+                            tool_name=entry.tool_name,
                             image_data=None,
-                            tool_input=None,
+                            tool_input=entry.tool_input,
                             transcript_uuid=entry.uuid,
+                            subagent_key=tracking_key,
                         )
                     )
 

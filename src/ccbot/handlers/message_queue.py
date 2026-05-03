@@ -78,11 +78,13 @@ class MessageTask:
     # _render_agent_tool_use to extract description / subagent_type / prompt.
     tool_input: dict[str, object] | None = None
     transcript_uuid: str | None = None
-    # Sub-agent (sidechain) run identifier when this task represents a
-    # block emitted from a sub-agent's own JSONL. The todo digest gates
-    # on ``subagent_key is None`` so a sub-agent's TodoWrites don't paint
-    # the parent topic's task card. Other digest paths may also branch
-    # on this field.
+    # Sub-agent (sidechain) run identifier. When non-None, the task
+    # represents an event from one sub-agent JSONL — text/thinking/tool_use/
+    # tool_result blocks emitted by the sub-agent itself. The dispatcher
+    # routes these through ``_process_subagent_activity_task`` so each run
+    # collapses into a single editable digest message instead of one bubble
+    # per block. The to-do-list digest also gates on this field so a
+    # sub-agent's TodoWrites don't paint the parent topic's task card.
     subagent_key: str | None = None
 
 
@@ -97,6 +99,27 @@ class ActivityDigestState:
     completed_count: int = 0
     last_text: str = ""
     done: bool = False
+
+
+@dataclass
+class SubagentDigestState:
+    """Single editable digest for one sub-agent run.
+
+    Mirrors ``ActivityDigestState`` but lives at per-sidechain granularity:
+    one digest per ``(user_id, thread_id, subagent_key)``. Each text /
+    thinking / tool_use / tool_result block emitted by the sub-agent
+    appends or edits a line in this digest, so a long sub-agent run
+    surfaces as a single editable message in the parent topic instead of
+    one bubble per block.
+    """
+
+    message_id: int
+    window_id: str
+    subagent_key: str
+    lines: list[str] = field(default_factory=list)
+    tool_count: int = 0
+    completed_count: int = 0
+    last_text: str = ""
 
 
 @dataclass
@@ -180,10 +203,29 @@ _activity_flush_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
 _activity_locks: dict[tuple[int, int], asyncio.Lock] = {}
 ACTIVITY_FLUSH_DEBOUNCE_SECONDS = 10.0
 
+# Sub-agent (sidechain) digest tracking: one editable message per sub-agent
+# run, keyed by (user_id, thread_id_or_0, subagent_key). The parent topic's
+# regular activity digest stays untouched — a sub-agent's blocks live in
+# their own card so a multi-step run is one bubble, not N.
+_subagent_msg_info: dict[tuple[int, int, str], SubagentDigestState] = {}
+# (tool_use_id, user_id, thread_id_or_0, subagent_key) → index into
+# state.lines for tool_use → tool_result pairing inside the digest.
+_subagent_tool_indices: dict[tuple[str, int, int, str], int] = {}
+# Per-(user, thread, subagent_key) lock that serializes upsert calls so a
+# debounced flush can't race a synchronous flush. Mirrors _activity_locks.
+_subagent_locks: dict[tuple[int, int, str], asyncio.Lock] = {}
+# Per-(user, thread, subagent_key) debounce timer. Same rationale as the
+# parent activity digest: bursts of sub-agent events coalesce into one edit.
+_subagent_flush_tasks: dict[tuple[int, int, str], asyncio.Task[None]] = {}
+SUBAGENT_DIGEST_MAX_LINES = 12
+SUBAGENT_DIGEST_MAX_LINE_LENGTH = 400
+SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH = 240
+
 # To-do-list digest tracking: one editable card per ``(user_id, thread_id_or_0)``
 # rendered from the most recent parent ``TodoWrite`` snapshot. The Telegram
 # message_id is held in ``_todo_msg_info``; the lock + debounce mirror the
-# activity digest pattern so a burst of TodoWrites coalesces into one edit.
+# activity / subagent digest patterns so a burst of TodoWrites coalesces into
+# one edit.
 _todo_msg_info: dict[tuple[int, int], TodoListDigestState] = {}
 _todo_locks: dict[tuple[int, int], asyncio.Lock] = {}
 _todo_flush_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
@@ -401,6 +443,11 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
         return False
     if candidate.content_type in ACTIVITY_DIGEST_CONTENT_TYPES:
         return False
+    # Sub-agent events go to the per-sidechain editable digest, never merged
+    # into ad-hoc text bubbles. (The base check covers the case where a
+    # sub-agent task is at the head of the queue.)
+    if base.subagent_key is not None or candidate.subagent_key is not None:
+        return False
     return True
 
 
@@ -516,6 +563,12 @@ async def _dispatch_task(
     ``_dispatch_already_merged`` so retries never re-drain the queue.
     """
     if task.task_type == "content":
+        # Sub-agent events route to the per-sidechain editable digest BEFORE
+        # any other branching. They never reach the agent / activity / merge
+        # paths because each sub-agent run owns its own editable card.
+        if task.subagent_key is not None:
+            await _process_subagent_activity_task(bot, user_id, task)
+            return task
         # §2.7: Agent (subagent) tool_use / tool_result get promoted to
         # top-level messages BEFORE the digest short-circuit. The activity
         # counter still tracks them so the digest header stays accurate
@@ -565,6 +618,9 @@ async def _dispatch_already_merged(
     live queue and double-count ``task_done``).
     """
     if task.task_type == "content":
+        if task.subagent_key is not None:
+            await _process_subagent_activity_task(bot, user_id, task)
+            return
         if _is_agent_tool_use(task) or _is_agent_tool_result(task, user_id):
             await _process_agent_task(bot, user_id, task)
             return
@@ -1339,6 +1395,261 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
         await _send_task_images(bot, chat_id, task, effective_thread_id)
 
 
+# ── Sub-agent (sidechain) digest ──────────────────────────────────────────
+
+
+def _short_subagent_id(key: str) -> str:
+    """Compact display id from a sidechain tracking key.
+
+    Tracking keys look like ``sub:<parent_session>:agent-<id>``; the
+    user-visible suffix is the trailing 6 chars of the agent id.
+    """
+    suffix = key.rsplit(":", 1)[-1]
+    if suffix.startswith("agent-"):
+        suffix = suffix[len("agent-") :]
+    return suffix[-6:] if len(suffix) > 6 else suffix
+
+
+def _compact_subagent_line(task: MessageTask) -> str:
+    """Render one line for the sub-agent digest from a sub-agent task.
+
+    Mirrors ``_compact_activity_line`` for tool_use / tool_result / thinking
+    so the per-sub-agent digest reads like the parent activity card. Text
+    blocks (assistant prose) are truncated to a snippet — full prose still
+    lives in the parent transcript / file system; the digest is a peek.
+    """
+    if task.content_type == "thinking":
+        return "💭 Thinking"
+
+    raw = " ".join(part.strip() for part in task.parts if part and part.strip())
+    raw = strip_sentinels(raw).replace("\n", " ")
+    raw = " ".join(raw.split())
+    if not raw:
+        raw = task.content_type
+
+    if task.content_type == "text":
+        snippet = raw
+        if len(snippet) > SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH:
+            snippet = snippet[: SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH - 1].rstrip() + "…"
+        return f"📝 {snippet}"
+
+    # tool_use / tool_result share the activity-card formatting: the parent's
+    # parser produces "**Bash**(cmd)  ⎿  output" so split off the result
+    # snippet and trim aggressively for the card.
+    if "  ⎿  " in raw:
+        left, rest = raw.split("  ⎿  ", 1)
+        first_line = rest.split("\n", 1)[0].strip()
+        if len(first_line) > SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH:
+            first_line = (
+                first_line[: SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH - 1].rstrip() + "…"
+            )
+        raw = f"{left} — {first_line}" if first_line else left
+
+    if len(raw) > SUBAGENT_DIGEST_MAX_LINE_LENGTH:
+        raw = raw[: SUBAGENT_DIGEST_MAX_LINE_LENGTH - 1].rstrip() + "…"
+
+    if task.content_type == "tool_result":
+        if "error" in raw.lower():
+            return f"❌ {raw}"
+        if "interrupted" in raw.lower():
+            return f"⏹ {raw}"
+        return f"✅ {raw}"
+    return f"⚙️ {raw}"
+
+
+def _render_subagent_digest(state: SubagentDigestState) -> str:
+    """Render the editable per-sub-agent digest card."""
+    sid = _short_subagent_id(state.subagent_key)
+    header = f"↳ Sub-agent · {sid}"
+    if state.tool_count or state.completed_count:
+        progress = (
+            f"Activity: {state.completed_count}/{state.tool_count} tool calls complete"
+        )
+    else:
+        progress = "Activity: thinking"
+    lines = [header, progress]
+
+    shown = state.lines[-SUBAGENT_DIGEST_MAX_LINES:]
+    hidden = max(0, len(state.lines) - len(shown))
+    if hidden:
+        lines.append(f"• … {hidden} earlier event(s)")
+    lines.extend(f"• {line}" for line in shown)
+    return "\n".join(lines)
+
+
+def _get_subagent_lock(user_id: int, tid: int, subagent_key: str) -> asyncio.Lock:
+    """Return (creating if needed) the per-(user, thread, subagent_key) upsert lock."""
+    key = (user_id, tid, subagent_key)
+    lock = _subagent_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _subagent_locks[key] = lock
+    return lock
+
+
+async def _upsert_subagent_digest(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    state: SubagentDigestState,
+) -> None:
+    """Send or edit the per-sub-agent digest card.
+
+    TODO(window-rebind race): the post-edit and post-send writes to
+    ``_subagent_msg_info[...]`` below have the same clobber race that
+    commit 0a4aeb7 fixed in ``_upsert_todo_digest`` and
+    ``_upsert_activity_digest``. If a fresh ``_process_subagent_activity_task``
+    replaces the slot while ``topic_send`` is in flight, the post-await
+    write here re-binds the slot to our captured (stale) ``state`` and
+    clobbers the fresh one. The producer (``_process_subagent_activity_task``)
+    already pre-binds the slot, so removing both writes is the symmetric
+    fix — see the docstring on ``_upsert_todo_digest`` for the precondition
+    pattern. Add a parallel test under ``TestSubagentDigest`` modeled on
+    ``test_window_rebind_during_upsert_does_not_clobber_fresh_state``.
+    """
+    tid = thread_id or 0
+    chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
+    text = _render_subagent_digest(state)
+    if text == state.last_text:
+        return
+
+    if state.message_id:
+        outcome = await topic_edit(
+            bot,
+            op="subagent_activity",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=effective_thread_id,
+            window_id=state.window_id,
+            message_id=state.message_id,
+            text=text,
+        )
+        if outcome is TopicSendOutcome.OK:
+            state.last_text = text
+            _subagent_msg_info[(user_id, tid, state.subagent_key)] = state
+            return
+        # Edit failed (message gone, topic gone, etc). Drop the id and retry as
+        # a fresh send below; topic-shaped failures cascade into emergency DM.
+        state.message_id = 0
+
+    sent, outcome = await topic_send(
+        bot,
+        op="subagent_activity",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=effective_thread_id,
+        window_id=state.window_id,
+        text=text,
+        disable_notification=True,
+        role="activity",
+        content_type="subagent_activity",
+        session_id=_session_id_for_window(state.window_id),
+    )
+    if sent is not None:
+        state.message_id = sent.message_id
+        state.last_text = text
+        _subagent_msg_info[(user_id, tid, state.subagent_key)] = state
+        return
+    if thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
+        await _emergency_dm(
+            bot,
+            user_id,
+            thread_id,
+            state.window_id,
+            text,
+            kind="subagent_activity",
+            outcome=outcome,
+        )
+
+
+def _schedule_subagent_flush(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    subagent_key: str,
+) -> None:
+    """Debounced flush of the sub-agent digest for this (user, thread, key)."""
+    tid = thread_id or 0
+    key = (user_id, tid, subagent_key)
+    pending = _subagent_flush_tasks.get(key)
+    if pending is not None and not pending.done():
+        pending.cancel()
+
+    async def _delayed() -> None:
+        try:
+            await asyncio.sleep(ACTIVITY_FLUSH_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        _subagent_flush_tasks.pop(key, None)
+        state = _subagent_msg_info.get(key)
+        if state is None:
+            return
+        try:
+            async with _get_subagent_lock(user_id, tid, subagent_key):
+                await _upsert_subagent_digest(bot, user_id, thread_id, state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - background task safety
+            logger.warning(
+                "debounced subagent flush failed user=%d thread=%s key=%s: %s",
+                user_id,
+                thread_id,
+                subagent_key,
+                e,
+            )
+
+    _subagent_flush_tasks[key] = asyncio.create_task(_delayed())
+
+
+async def _process_subagent_activity_task(
+    bot: Bot, user_id: int, task: MessageTask
+) -> None:
+    """Collapse one sub-agent run's blocks into a single editable digest."""
+    if not task.subagent_key:
+        return
+    wid = task.window_id or ""
+    tid = task.thread_id or 0
+    subagent_key = task.subagent_key
+    state_key = (user_id, tid, subagent_key)
+    state = _subagent_msg_info.get(state_key)
+    if state is None or state.window_id != wid:
+        state = SubagentDigestState(
+            message_id=0,
+            window_id=wid,
+            subagent_key=subagent_key,
+        )
+
+    line = _compact_subagent_line(task)
+    if task.content_type == "tool_use":
+        state.tool_count += 1
+        state.lines.append(line)
+        if task.tool_use_id:
+            _subagent_tool_indices[(task.tool_use_id, user_id, tid, subagent_key)] = (
+                len(state.lines) - 1
+            )
+    elif task.content_type == "tool_result":
+        state.completed_count += 1
+        idx_key = (
+            (task.tool_use_id, user_id, tid, subagent_key) if task.tool_use_id else None
+        )
+        if idx_key is not None and idx_key in _subagent_tool_indices:
+            idx = _subagent_tool_indices.pop(idx_key)
+            if 0 <= idx < len(state.lines):
+                state.lines[idx] = line
+            else:
+                state.lines.append(line)
+        else:
+            state.lines.append(line)
+    else:
+        # text / thinking — append, but coalesce identical thinking placeholders
+        # so a sub-agent's repeated "(thinking)" markers don't pile up.
+        if not state.lines or state.lines[-1] != line:
+            state.lines.append(line)
+
+    _subagent_msg_info[state_key] = state
+    _schedule_subagent_flush(bot, user_id, task.thread_id, subagent_key)
+
+
 # ── To-do list digest ────────────────────────────────────────────────────
 
 
@@ -1412,6 +1723,8 @@ def _render_todo_digest(todos: list[dict[str, object]]) -> str:
             label = item.get("content", "")
         elif status == "in_progress":
             emoji = "🔄"
+            # activeForm is the present-continuous label Claude writes for
+            # the current task; falls back to content when missing.
             label = item.get("activeForm") or item.get("content", "")
         else:
             emoji = "⬜"
@@ -2374,6 +2687,7 @@ async def enqueue_content_message(
     tool_name: str | None = None,
     tool_input: dict[str, object] | None = None,
     transcript_uuid: str | None = None,
+    subagent_key: str | None = None,
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
@@ -2409,6 +2723,7 @@ async def enqueue_content_message(
         tool_name=tool_name,
         tool_input=tool_input,
         transcript_uuid=transcript_uuid,
+        subagent_key=subagent_key,
     )
     queue.put_nowait(task)
 
@@ -2559,6 +2874,25 @@ async def teardown_route(route: Route, *, drop_pending: bool) -> None:
         if flush is not None and not flush.done():
             flush.cancel()
         _activity_locks.pop((route_user_id, route_tid), None)
+        # Sub-agent digests are scoped per (user, thread, subagent_key) — drop
+        # all entries that belong to this route. Same rationale as the parent
+        # activity digest above; a torn-down route must not own ghost state.
+        sub_keys_to_remove = [
+            k for k in _subagent_msg_info if k[0] == route_user_id and k[1] == route_tid
+        ]
+        for k in sub_keys_to_remove:
+            _subagent_msg_info.pop(k, None)
+            sub_flush = _subagent_flush_tasks.pop(k, None)
+            if sub_flush is not None and not sub_flush.done():
+                sub_flush.cancel()
+            _subagent_locks.pop(k, None)
+        sub_tool_keys_to_remove = [
+            k
+            for k in _subagent_tool_indices
+            if k[1] == route_user_id and k[2] == route_tid
+        ]
+        for k in sub_tool_keys_to_remove:
+            _subagent_tool_indices.pop(k, None)
         # Drop the to-do digest state and any pending flush for this route.
         # Mirrors the activity digest cleanup above; a fresh route should
         # start with a fresh card, not inherit an old message_id.
@@ -2604,6 +2938,13 @@ async def shutdown_workers() -> None:
             flush.cancel()
     _activity_flush_tasks.clear()
     _activity_locks.clear()
+    for _, flush in list(_subagent_flush_tasks.items()):
+        if not flush.done():
+            flush.cancel()
+    _subagent_flush_tasks.clear()
+    _subagent_locks.clear()
+    _subagent_msg_info.clear()
+    _subagent_tool_indices.clear()
     for _, flush in list(_todo_flush_tasks.items()):
         if not flush.done():
             flush.cancel()
