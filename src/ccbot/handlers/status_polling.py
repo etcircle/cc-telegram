@@ -37,7 +37,7 @@ from ..terminal_parser import (
 )
 from ..transcript_parser import read_latest_usage
 from ..tmux_manager import tmux_manager
-from . import busy_indicator, topic_title
+from . import busy_indicator
 from .busy_indicator import RunState
 from .interactive_ui import (
     clear_interactive_msg,
@@ -118,31 +118,23 @@ async def update_status_message(
         # Transient capture failure - keep existing status message
         return
 
-    # Read the next-turn context size from the session's JSONL — the chrome
-    # footer in current Claude Code versions no longer carries Context: NN%
-    # at all, so the pane is no longer a viable source. read_latest_usage
-    # is mtime-cached so a 1Hz poller doesn't re-scan unchanged files.
-    route = (user_id, thread_id or 0, window_id)
-    usage = None
-    session = await session_manager.resolve_session_for_window(window_id)
-    if session and session.file_path:
-        latest = read_latest_usage(session.file_path)
-        if latest is not None:
-            if config.busy_indicator_v2:
+    # Read the next-turn context size from the session's JSONL into the
+    # busy_indicator cache. The activity-digest header reads it via
+    # ``context_pct`` and the per-message footer (``bot._build_context_footer``)
+    # routes through the same cache so the 1M-cap latch is shared.
+    # read_latest_usage is mtime+size-cached so a 1Hz poller doesn't re-scan
+    # unchanged files.
+    if config.busy_indicator_v2:
+        route = (user_id, thread_id or 0, window_id)
+        session = await session_manager.resolve_session_for_window(window_id)
+        if session and session.file_path:
+            latest = read_latest_usage(session.file_path)
+            if latest is not None:
                 busy_indicator.update_context_usage(route, latest.tokens, latest.model)
-            usage = busy_indicator.context_usage(route)
-    if usage is None and config.busy_indicator_v2:
-        # No usage observed yet — clear any stale cache (e.g. post-/clear).
-        busy_indicator.update_context_usage(route, None, None)
-
-    # Bake the same usage into the forum topic title (debounced inside).
-    if thread_id and usage is not None:
-        base_name = session_manager.get_display_name(window_id)
-        if base_name:
-            chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-            await topic_title.maybe_rename_topic(
-                bot, chat_id, thread_id, base_name, usage
-            )
+            else:
+                busy_indicator.update_context_usage(route, None, None)
+        else:
+            busy_indicator.update_context_usage(route, None, None)
 
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True
