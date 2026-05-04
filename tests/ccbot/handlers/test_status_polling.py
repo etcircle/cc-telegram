@@ -27,13 +27,18 @@ def mock_bot():
 @pytest.fixture
 def _clear_interactive_state():
     """Ensure interactive state is clean before and after each test."""
+    from ccbot.handlers import status_polling
     from ccbot.handlers.interactive_ui import _interactive_mode, _interactive_msgs
 
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    status_polling._last_pane_capture.clear()
+    status_polling._idle_state.clear()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
+    status_polling._last_pane_capture.clear()
+    status_polling._idle_state.clear()
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
@@ -191,7 +196,12 @@ class TestStatusPollerSettingsDetection:
             await status_polling.update_status_message(
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
-            fake_now[0] += 2.0  # Below delay.
+            # Wave 2: bump past the WATCHDOG_INTERVAL so the next poll actually
+            # scrapes the pane and sees the busy transition. Within the
+            # watchdog window the cleanup-only path runs and the pane-derived
+            # status doesn't refresh — the V2 indicator covers this gap via
+            # JSONL events.
+            fake_now[0] += status_polling.WATCHDOG_INTERVAL + 0.1
 
             # Active poll arrives — drops idle state, enqueues real status.
             mock_tmux.capture_pane = AsyncMock(return_value=busy_pane)
@@ -201,7 +211,11 @@ class TestStatusPollerSettingsDetection:
             assert mock_enqueue.await_args.args[3] == "Cooking for 2s"
             enqueue_count_after_busy = mock_enqueue.await_count
 
-            # Idle again — must wait the FULL delay before clearing.
+            # Idle again — must wait the FULL delay before clearing. The
+            # capture below scrapes (watchdog reset by the busy poll → still
+            # within window, but the in_interactive / V1 paths don't apply
+            # here so we need to elapse the watchdog again to capture idle).
+            fake_now[0] += status_polling.WATCHDOG_INTERVAL + 0.1
             mock_tmux.capture_pane = AsyncMock(return_value=idle_pane)
             await status_polling.update_status_message(
                 mock_bot, user_id=1, window_id=window_id, thread_id=42

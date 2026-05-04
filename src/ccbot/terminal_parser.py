@@ -1,13 +1,20 @@
 """Terminal output parser — detects Claude Code UI elements in pane text.
 
 Parses captured tmux pane content to detect:
-  - Interactive UIs (AskUserQuestion, ExitPlanMode, Permission Prompt,
-    RestoreCheckpoint) via regex-based UIPattern matching with top/bottom
+  - Interactive UIs (AskUserQuestion, ExitPlanMode, RestoreCheckpoint,
+    Settings) via regex-based UIPattern matching with top/bottom
     delimiters.
   - Status line (spinner characters + working text) by scanning from bottom up.
 
 All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
+
+PermissionPrompt and BashApproval detection has been intentionally removed:
+the deployment runs Claude Code with ``--dangerously-skip-permissions``
+(YOLO mode), so neither prompt ever renders in the pane and the patterns
+were dead code wasting capture cycles. ExitPlanMode and AskUserQuestion
+remain because they still appear in the JSONL stream as ``tool_use``
+events and are also detected via pane scrape as a redundant safety net.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
 parse_status_line(), strip_pane_chrome(), extract_bash_output().
@@ -70,32 +77,6 @@ UI_PATTERNS: list[UIPattern] = [
         top=(re.compile(r"^\s*[☐✔☒]"),),  # Single-tab: bottom required
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=1,
-    ),
-    UIPattern(
-        name="PermissionPrompt",
-        top=(
-            re.compile(r"^\s*Do you want to proceed\?"),
-            re.compile(r"^\s*Do you want to make this edit"),
-            re.compile(r"^\s*Do you want to create \S"),
-            re.compile(r"^\s*Do you want to delete \S"),
-        ),
-        bottom=(re.compile(r"^\s*Esc to cancel"),),
-    ),
-    UIPattern(
-        # Permission menu with numbered choices (no "Esc to cancel" line)
-        name="PermissionPrompt",
-        top=(re.compile(r"^\s*❯\s*1\.\s*Yes"),),
-        bottom=(),
-        min_gap=2,
-    ),
-    UIPattern(
-        # Bash command approval
-        name="BashApproval",
-        top=(
-            re.compile(r"^\s*Bash command\s*$"),
-            re.compile(r"^\s*This command requires approval"),
-        ),
-        bottom=(re.compile(r"^\s*Esc to cancel"),),
     ),
     UIPattern(
         name="RestoreCheckpoint",

@@ -157,11 +157,12 @@ class TestExtractInteractiveContent:
         assert result.name == "AskUserQuestion"
         assert "Enter to select" in result.content
 
-    def test_permission_prompt(self, sample_pane_permission: str):
-        result = extract_interactive_content(sample_pane_permission)
-        assert result is not None
-        assert result.name == "PermissionPrompt"
-        assert "Do you want to proceed?" in result.content
+    def test_permission_prompt_no_longer_detected(self, sample_pane_permission: str):
+        # Wave 2: PermissionPrompt is dead code under
+        # ``--dangerously-skip-permissions`` (the deployment's mode), so the
+        # patterns were removed from UI_PATTERNS. Verify the pane no longer
+        # matches anything.
+        assert extract_interactive_content(sample_pane_permission) is None
 
     def test_restore_checkpoint(self):
         pane = (
@@ -231,7 +232,10 @@ class TestExtractInteractiveContent:
     def test_returns_none(self, pane: str):
         assert extract_interactive_content(pane) is None
 
-    def test_min_gap_too_small_returns_none(self):
+    def test_dropped_permission_pattern_returns_none(self):
+        # Wave 2: PermissionPrompt patterns were removed (dead code under
+        # ``--dangerously-skip-permissions``). Pane shapes that previously
+        # matched must now return None.
         pane = "  Do you want to proceed?\n  Esc to cancel\n"
         assert extract_interactive_content(pane) is None
 

@@ -52,6 +52,25 @@ logger = logging.getLogger(__name__)
 # Status polling interval
 STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send layer)
 
+# Watchdog interval for adaptive pane capture. The 1Hz loop still ticks
+# every second so stale-binding cleanup and idle-clear delay processing
+# stay responsive, but the expensive ``capture_pane`` subprocess only
+# fires when one of:
+#   - this route is currently in interactive mode (we need to detect when
+#     the user closes the open UI),
+#   - WATCHDOG_INTERVAL seconds have elapsed since the last capture for
+#     this route (catches RestoreCheckpoint / Settings / non-V2 status
+#     transitions that don't show up in the JSONL stream),
+#   - V1 indicator is in use — V1 still relies on pane-derived ``is_running``
+#     to gate the typing-action send and therefore needs a fresh pane every
+#     tick. V2 reads ``busy_indicator.state`` directly, so the watchdog is
+#     enough to catch missed transitions.
+# JSONL-driven AskUserQuestion / ExitPlanMode dispatch already happens in
+# ``bot.handle_new_message`` (tool_use → ``handle_interactive_ui``), so the
+# pane scrape is a redundant safety net for those — fine to skip it most
+# ticks.
+WATCHDOG_INTERVAL = 10.0
+
 # Typing-action refresh interval. Telegram drops the native typing indicator
 # after ~5s, so we re-emit faster than that. Decoupled from status polling
 # because the per-binding tmux fan-out in ``status_poll_loop`` can push the
@@ -77,6 +96,14 @@ IDLE_CLEAR_DELAY_SECONDS = 4.0
 #                 further idle ticks are no-ops until ``is_running`` flips
 #                 back true and the entry is dropped.
 _idle_state: dict[tuple[int, int], float | Literal["cleared"]] = {}
+
+# Per-route last-capture timestamp, keyed by ``(user_id, thread_id_or_0,
+# window_id)``. Drives the WATCHDOG_INTERVAL gate in ``update_status_message``
+# — entries are written each time we successfully scrape a pane and read each
+# tick to decide whether to scrape again. Stale entries (route unbound) are
+# harmless: a stale dict entry just costs a few bytes until the process
+# restarts.
+_last_pane_capture: dict[tuple[int, int, str], float] = {}
 
 
 def reset_idle_counter(user_id: int, thread_id: int | None) -> None:
@@ -116,12 +143,37 @@ async def update_status_message(
             await enqueue_status_update(
                 bot, user_id, window_id, None, thread_id=thread_id
             )
+        # Drop the watchdog entry so a re-bind starts fresh.
+        _last_pane_capture.pop((user_id, thread_id or 0, window_id), None)
+        return
+
+    # Adaptive pane-capture gate. The 1Hz loop still runs (so cleanup,
+    # idle-clear timing, and stale-binding sweeps remain responsive), but
+    # we skip the ``capture_pane`` subprocess most ticks. See
+    # WATCHDOG_INTERVAL above for the criteria.
+    route = (user_id, thread_id or 0, window_id)
+    interactive_window = get_interactive_window(user_id, thread_id)
+    in_interactive = interactive_window == window_id
+    now_mono = time.monotonic()
+    last_capture = _last_pane_capture.get(route)
+    watchdog_elapsed = (
+        last_capture is None or (now_mono - last_capture) >= WATCHDOG_INTERVAL
+    )
+    should_capture = in_interactive or watchdog_elapsed or not config.busy_indicator_v2
+
+    if not should_capture:
+        # Cleanup-only path: stale-binding cleanup already ran above
+        # (find_window_by_id returned a live window). Process the idle-clear
+        # state machine so a previously-shown "🟡 Busy" status still gets
+        # cleared on schedule, then return without scraping the pane.
+        await _process_idle_clear_only(bot, user_id, window_id, thread_id, skip_status)
         return
 
     pane_text = await tmux_manager.capture_pane(window.window_id)
     if not pane_text:
         # Transient capture failure - keep existing status message
         return
+    _last_pane_capture[route] = time.monotonic()
 
     # Read the next-turn context size from the session's JSONL into the
     # busy_indicator cache. The activity-digest header reads it via
@@ -130,7 +182,6 @@ async def update_status_message(
     # read_latest_usage is mtime+size-cached so a 1Hz poller doesn't re-scan
     # unchanged files.
     if config.busy_indicator_v2:
-        route = (user_id, thread_id or 0, window_id)
         session = await session_manager.resolve_session_for_window(window_id)
         if session and session.file_path:
             latest = read_latest_usage(session.file_path)
@@ -141,7 +192,6 @@ async def update_status_message(
         else:
             busy_indicator.update_context_usage(route, None, None)
 
-    interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True
 
     if interactive_window == window_id:
@@ -264,6 +314,51 @@ async def update_status_message(
     # indicator forever. ``mark_pane_idle`` is a no-op when an interactive
     # prompt is visible (WAITING_ON_USER) so we don't fight the UI in
     # ``handle_interactive_ui`` — that branch already returned early above.
+    if config.busy_indicator_v2:
+        await busy_indicator.mark_pane_idle((user_id, thread_id or 0, window_id))
+    await enqueue_status_update(
+        bot,
+        user_id,
+        window_id,
+        None,
+        thread_id=thread_id,
+    )
+
+
+async def _process_idle_clear_only(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None,
+    skip_status: bool,
+) -> None:
+    """Cleanup-only path used when adaptive gating skips the pane capture.
+
+    Without a pane scrape we can't run interactive-UI detection or update
+    the busy indicator's pane-derived signals — but the IDLE_CLEAR_DELAY
+    state machine still needs to advance so a previously-shown "🟡 Busy"
+    status gets cleared on schedule.
+
+    Semantics:
+      - If we have no idle-state entry for this route, do nothing. The next
+        watchdog-elapsed tick will scrape the pane and either confirm idle
+        (start the timer) or refresh the status. Starting the idle timer
+        here without confirming the pane is actually idle would falsely
+        clear an active status.
+      - If the route is already in idle-pending state and the delay has
+        elapsed, fire the clear once. This is the only case we're solving
+        for here; everything else is handled the next time we capture.
+    """
+    if skip_status:
+        return
+    key = (user_id, thread_id or 0)
+    state = _idle_state.get(key)
+    if state is None or state == "cleared":
+        return
+    assert isinstance(state, float)
+    if (time.monotonic() - state) < IDLE_CLEAR_DELAY_SECONDS:
+        return
+    _idle_state[key] = "cleared"
     if config.busy_indicator_v2:
         await busy_indicator.mark_pane_idle((user_id, thread_id or 0, window_id))
     await enqueue_status_update(
