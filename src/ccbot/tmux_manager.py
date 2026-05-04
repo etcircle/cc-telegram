@@ -146,34 +146,136 @@ class TmuxManager:
             except Exception:
                 pass  # var not set in session env — nothing to remove
 
-    def _sync_list_windows(self) -> list[TmuxWindow]:
+    # Field separator for `tmux list-panes -F`. ASCII unit separator (\x1f)
+    # cannot appear in any of the captured fields (window names, paths,
+    # command names), so split-by-separator is unambiguous.
+    _PANE_FIELD_SEP = "\x1f"
+    _PANE_FORMAT = _PANE_FIELD_SEP.join(
+        [
+            "#{session_name}",
+            "#{window_id}",
+            "#{window_name}",
+            "#{pane_active}",
+            "#{pane_current_path}",
+            "#{pane_current_command}",
+        ]
+    )
+
+    async def _list_windows_direct(self) -> list[TmuxWindow]:
+        """List windows by running a single `tmux list-panes -a -F` subprocess.
+
+        Replaces the libtmux-driven path which fans out one `tmux list-panes`
+        subprocess per window. Falls back to the libtmux implementation
+        (`_list_windows_libtmux`) on tmux failure so the bot keeps working
+        if tmux misbehaves.
+        """
+        # If tmux wasn't resolvable at import, the libtmux fallback would
+        # fail the same way every cycle. Skip the subprocess attempt to
+        # avoid per-second warning spam, and route straight to the
+        # fallback (which logs at debug and returns []).
+        if _TMUX_BIN is None:
+            return await asyncio.to_thread(self._list_windows_libtmux)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _TMUX_BIN,
+                "list-panes",
+                "-a",
+                "-F",
+                self._PANE_FORMAT,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+        except Exception as e:
+            logger.warning(
+                "tmux list-panes subprocess failed (%s); falling back to libtmux",
+                e,
+            )
+            return await asyncio.to_thread(self._list_windows_libtmux)
+
+        if proc.returncode != 0:
+            logger.warning(
+                "tmux list-panes returned non-zero (%s): %s; falling back to libtmux",
+                proc.returncode,
+                stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return await asyncio.to_thread(self._list_windows_libtmux)
+
         windows: list[TmuxWindow] = []
-        session = self.get_session()
-        if not session:
-            return windows
-        for window in session.windows:
-            name = window.window_name or ""
-            # Skip the main window (placeholder window)
-            if name == config.tmux_main_window_name:
+        for raw_line in stdout.decode("utf-8", errors="replace").splitlines():
+            line = raw_line.rstrip("\r")
+            if not line:
                 continue
-            try:
-                pane = window.active_pane
-                if pane:
-                    cwd = pane.pane_current_path or ""
-                    pane_cmd = pane.pane_current_command or ""
-                else:
-                    cwd = ""
-                    pane_cmd = ""
-                windows.append(
-                    TmuxWindow(
-                        window_id=window.window_id or "",
-                        window_name=name,
-                        cwd=cwd,
-                        pane_current_command=pane_cmd,
-                    )
+            parts = line.split(self._PANE_FIELD_SEP, 5)
+            if len(parts) != 6:
+                logger.debug("Skipping malformed pane line: %r", line)
+                continue
+            (
+                session_name,
+                window_id,
+                window_name,
+                pane_active,
+                cwd,
+                pane_cmd,
+            ) = parts
+            if session_name != self.session_name:
+                continue
+            if pane_active != "1":
+                continue
+            if window_name == config.tmux_main_window_name:
+                continue
+            if window_id == "":
+                continue
+            windows.append(
+                TmuxWindow(
+                    window_id=window_id,
+                    window_name=window_name,
+                    cwd=cwd,
+                    pane_current_command=pane_cmd,
                 )
-            except Exception as e:
-                logger.debug(f"Error getting window info: {e}")
+            )
+        return windows
+
+    def _list_windows_libtmux(self) -> list[TmuxWindow]:
+        """Fallback: enumerate windows via libtmux (one subprocess per window).
+
+        Used only when the direct `tmux list-panes -a` path fails. Kept as a
+        safety net so the bot remains functional if tmux output format
+        changes or the binary misbehaves. Wrapped in a top-level try/except
+        because libtmux can raise mid-iteration during a server reconnect —
+        a fallback must never propagate.
+        """
+        windows: list[TmuxWindow] = []
+        try:
+            session = self.get_session()
+            if not session:
+                return windows
+            for window in session.windows:
+                name = window.window_name or ""
+                # Skip the main window (placeholder window)
+                if name == config.tmux_main_window_name:
+                    continue
+                try:
+                    pane = window.active_pane
+                    if pane:
+                        cwd = pane.pane_current_path or ""
+                        pane_cmd = pane.pane_current_command or ""
+                    else:
+                        cwd = ""
+                        pane_cmd = ""
+                    windows.append(
+                        TmuxWindow(
+                            window_id=window.window_id or "",
+                            window_name=name,
+                            cwd=cwd,
+                            pane_current_command=pane_cmd,
+                        )
+                    )
+                except Exception as e:
+                    logger.debug(f"Error getting window info: {e}")
+        except Exception as e:
+            logger.warning("libtmux fallback failed: %s; returning empty list", e)
+            return []
         return windows
 
     async def _ensure_list_cache(self) -> dict[str, TmuxWindow]:
@@ -204,7 +306,7 @@ class TmuxManager:
                 and (now - self._list_cache_at) < self._LIST_CACHE_TTL
             ):
                 return self._list_cache
-            windows = await asyncio.to_thread(self._sync_list_windows)
+            windows = await self._list_windows_direct()
             self._list_cache = {w.window_id: w for w in windows if w.window_id}
             self._list_cache_at = now
             return self._list_cache
@@ -256,49 +358,28 @@ class TmuxManager:
         Returns:
             The captured text, or None on failure.
         """
+        tmux_bin = _TMUX_BIN if _TMUX_BIN is not None else "tmux"
+        args: list[str] = [tmux_bin, "capture-pane"]
         if with_ansi:
-            # Use async subprocess to call tmux capture-pane -e for ANSI colors
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "tmux",
-                    "capture-pane",
-                    "-e",
-                    "-p",
-                    "-t",
-                    window_id,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode == 0:
-                    return stdout.decode("utf-8")
-                logger.error(
-                    f"Failed to capture pane {window_id}: {stderr.decode('utf-8')}"
-                )
-                return None
-            except Exception as e:
-                logger.error(f"Unexpected error capturing pane {window_id}: {e}")
-                return None
-
-        # Original implementation for plain text - wrap in thread
-        def _sync_capture() -> str | None:
-            session = self.get_session()
-            if not session:
-                return None
-            try:
-                window = session.windows.get(window_id=window_id)
-                if not window:
-                    return None
-                pane = window.active_pane
-                if not pane:
-                    return None
-                lines = pane.capture_pane()
-                return "\n".join(lines) if isinstance(lines, list) else str(lines)
-            except Exception as e:
-                logger.error(f"Failed to capture pane {window_id}: {e}")
-                return None
-
-        return await asyncio.to_thread(_sync_capture)
+            args.append("-e")
+        args.extend(["-p", "-t", window_id])
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                return stdout.decode("utf-8", errors="replace")
+            logger.error(
+                f"Failed to capture pane {window_id}: "
+                f"{stderr.decode('utf-8', errors='replace')}"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error capturing pane {window_id}: {e}")
+            return None
 
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
