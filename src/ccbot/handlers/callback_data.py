@@ -22,6 +22,7 @@ CB_DIR_UP = "db:up"
 CB_DIR_CONFIRM = "db:confirm"
 CB_DIR_CANCEL = "db:cancel"
 CB_DIR_PAGE = "db:page:"
+CB_DIR_BIND_EXISTING = "db:bind"  # switch to window picker (opt-in)
 
 # Window picker (bind existing unbound window)
 CB_WIN_BIND = "wb:sel:"  # wb:sel:<index>

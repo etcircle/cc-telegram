@@ -82,6 +82,7 @@ from .handlers.callback_data import (
     CB_DIR_CONFIRM,
     CB_DIR_PAGE,
     CB_DIR_SELECT,
+    CB_DIR_BIND_EXISTING,
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
@@ -98,6 +99,7 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
+    BROWSE_UNBOUND_COUNT_KEY,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
@@ -258,6 +260,17 @@ def _get_thread_id(update: Update) -> int | None:
     if tid is None or tid == 1:
         return None
     return tid
+
+
+async def _list_unbound_windows() -> list[tuple[str, str, str]]:
+    """Return tmux windows not currently bound to any topic, as (id, name, cwd)."""
+    all_windows = await tmux_manager.list_windows()
+    bound_ids = {bid for _, _, bid in session_manager.iter_thread_bindings()}
+    return [
+        (w.window_id, w.window_name, w.cwd)
+        for w in all_windows
+        if w.window_id not in bound_ids
+    ]
 
 
 # --- Command handlers ---
@@ -783,7 +796,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # topic), stashing the photo is enough — re-emitting the picker
         # here would stomp on the existing browse/picker state and lose
         # the user's progress. Mirrors the same-thread guards in
-        # text_handler at lines 889-936.
+        # text_handler.
         if context.user_data is not None:
             current_state = context.user_data.get(STATE_KEY)
             pending_tid = context.user_data.get("_pending_thread_id")
@@ -794,29 +807,21 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             ):
                 return
 
-        # Open the directory browser exactly as text_handler does for the
-        # text-only first-message-in-unbound-topic flow.
-        all_windows = await tmux_manager.list_windows()
-        bound_ids = {bid for _, _, bid in session_manager.iter_thread_bindings()}
-        unbound = [
-            (w.window_id, w.window_name, w.cwd)
-            for w in all_windows
-            if w.window_id not in bound_ids
-        ]
-        if unbound:
-            msg_text, keyboard, win_ids = build_window_picker(unbound)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-            await safe_reply(update.message, msg_text, reply_markup=keyboard)
-            return
+        # Always open the directory browser for unbound topics. If
+        # unbound tmux windows exist, the browser surfaces an opt-in
+        # "🖥 Bind existing window" button so the user can pivot to the
+        # window picker — but the directory choice stays primary.
+        unbound_count = len(await _list_unbound_windows())
         start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        msg_text, keyboard, subdirs = build_directory_browser(
+            start_path, unbound_count=unbound_count
+        )
         if context.user_data is not None:
             context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
             context.user_data[BROWSE_PATH_KEY] = start_path
             context.user_data[BROWSE_PAGE_KEY] = 0
             context.user_data[BROWSE_DIRS_KEY] = subdirs
+            context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
         await safe_reply(update.message, msg_text, reply_markup=keyboard)
         return
 
@@ -1018,27 +1023,17 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             ):
                 return
 
-        all_windows = await tmux_manager.list_windows()
-        bound_ids = {bid for _, _, bid in session_manager.iter_thread_bindings()}
-        unbound = [
-            (w.window_id, w.window_name, w.cwd)
-            for w in all_windows
-            if w.window_id not in bound_ids
-        ]
-        if unbound:
-            msg_text, keyboard, win_ids = build_window_picker(unbound)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-            await safe_reply(update.message, msg_text, reply_markup=keyboard)
-            return
+        unbound_count = len(await _list_unbound_windows())
         start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        msg_text, keyboard, subdirs = build_directory_browser(
+            start_path, unbound_count=unbound_count
+        )
         if context.user_data is not None:
             context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
             context.user_data[BROWSE_PATH_KEY] = start_path
             context.user_data[BROWSE_PAGE_KEY] = 0
             context.user_data[BROWSE_DIRS_KEY] = subdirs
+            context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
         await safe_reply(update.message, msg_text, reply_markup=keyboard)
         return
 
@@ -1252,51 +1247,28 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
-        # Unbound topic — check for unbound windows first
-        all_windows = await tmux_manager.list_windows()
-        bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
-        unbound = [
-            (w.window_id, w.window_name, w.cwd)
-            for w in all_windows
-            if w.window_id not in bound_ids
-        ]
-        logger.debug(
-            "Window picker check: all=%s, bound=%s, unbound=%s",
-            [w.window_name for w in all_windows],
-            bound_ids,
-            [name for _, name, _ in unbound],
-        )
-
-        if unbound:
-            # Show window picker
-            logger.info(
-                "Unbound topic: showing window picker (%d unbound windows, user=%d, thread=%d)",
-                len(unbound),
-                user.id,
-                thread_id,
-            )
-            msg_text, keyboard, win_ids = build_window_picker(unbound)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-                context.user_data["_pending_thread_id"] = thread_id
-                context.user_data["_pending_thread_text"] = text
-            await safe_reply(update.message, msg_text, reply_markup=keyboard)
-            return
-
-        # No unbound windows — show directory browser to create a new session
+        # Unbound topic — always show the directory browser. If unbound
+        # tmux windows exist, the browser includes a "🖥 Bind existing
+        # window" opt-in row that pivots to the window picker. We never
+        # auto-default to an existing window's cwd, since that locks the
+        # user into a directory they didn't choose.
+        unbound_count = len(await _list_unbound_windows())
         logger.info(
-            "Unbound topic: showing directory browser (user=%d, thread=%d)",
+            "Unbound topic: showing directory browser (user=%d, thread=%d, unbound=%d)",
             user.id,
             thread_id,
+            unbound_count,
         )
         start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        msg_text, keyboard, subdirs = build_directory_browser(
+            start_path, unbound_count=unbound_count
+        )
         if context.user_data is not None:
             context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
             context.user_data[BROWSE_PATH_KEY] = start_path
             context.user_data[BROWSE_PAGE_KEY] = 0
             context.user_data[BROWSE_DIRS_KEY] = subdirs
+            context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
             context.user_data["_pending_thread_id"] = thread_id
             context.user_data["_pending_thread_text"] = text
         await safe_reply(update.message, msg_text, reply_markup=keyboard)
@@ -1748,7 +1720,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data[BROWSE_PATH_KEY] = new_path_str
             context.user_data[BROWSE_PAGE_KEY] = 0
 
-        msg_text, keyboard, subdirs = build_directory_browser(new_path_str)
+        unbound_count = (
+            context.user_data.get(BROWSE_UNBOUND_COUNT_KEY, 0)
+            if context.user_data
+            else 0
+        )
+        msg_text, keyboard, subdirs = build_directory_browser(
+            new_path_str, unbound_count=unbound_count
+        )
         if context.user_data is not None:
             context.user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
@@ -1776,7 +1755,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data[BROWSE_PATH_KEY] = parent_path
             context.user_data[BROWSE_PAGE_KEY] = 0
 
-        msg_text, keyboard, subdirs = build_directory_browser(parent_path)
+        unbound_count = (
+            context.user_data.get(BROWSE_UNBOUND_COUNT_KEY, 0)
+            if context.user_data
+            else 0
+        )
+        msg_text, keyboard, subdirs = build_directory_browser(
+            parent_path, unbound_count=unbound_count
+        )
         if context.user_data is not None:
             context.user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
@@ -1803,7 +1789,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if context.user_data is not None:
             context.user_data[BROWSE_PAGE_KEY] = pg
 
-        msg_text, keyboard, subdirs = build_directory_browser(current_path, pg)
+        unbound_count = (
+            context.user_data.get(BROWSE_UNBOUND_COUNT_KEY, 0)
+            if context.user_data
+            else 0
+        )
+        msg_text, keyboard, subdirs = build_directory_browser(
+            current_path, pg, unbound_count=unbound_count
+        )
         if context.user_data is not None:
             context.user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
@@ -2027,8 +2020,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         # Preserve pending thread info, clear only picker state
         clear_window_picker_state(context.user_data)
+        unbound_count = len(await _list_unbound_windows())
         start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        msg_text, keyboard, subdirs = build_directory_browser(
+            start_path, unbound_count=unbound_count
+        )
         logger.info(
             "CB_WIN_NEW: opening directory browser at %s (subdirs=%d, user=%d, thread=%s)",
             start_path,
@@ -2041,6 +2037,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data[BROWSE_PATH_KEY] = start_path
             context.user_data[BROWSE_PAGE_KEY] = 0
             context.user_data[BROWSE_DIRS_KEY] = subdirs
+            context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+        await safe_edit(query, msg_text, reply_markup=keyboard)
+        await query.answer()
+
+    # Directory browser: opt-in pivot to window picker
+    elif data == CB_DIR_BIND_EXISTING:
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale browser (topic mismatch)", show_alert=True)
+            return
+        unbound = await _list_unbound_windows()
+        if not unbound:
+            await query.answer("No unbound windows available", show_alert=True)
+            return
+        msg_text, keyboard, win_ids = build_window_picker(unbound)
+        # Swap state from browse → picker. Keep pending thread/text/attachments
+        # so the bind handler can flush them once a window is chosen.
+        clear_browse_state(context.user_data)
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+            context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 

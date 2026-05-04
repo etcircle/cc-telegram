@@ -23,6 +23,7 @@ from ..session import ClaudeSession
 
 from ..config import config
 from .callback_data import (
+    CB_DIR_BIND_EXISTING,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_PAGE,
@@ -46,6 +47,9 @@ STATE_SELECTING_WINDOW = "selecting_window"
 BROWSE_PATH_KEY = "browse_path"
 BROWSE_PAGE_KEY = "browse_page"
 BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
+BROWSE_UNBOUND_COUNT_KEY = (
+    "browse_unbound_count"  # Count of unbound tmux windows (for opt-in bind button)
+)
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
@@ -58,6 +62,7 @@ def clear_browse_state(user_data: dict | None) -> None:
         user_data.pop(BROWSE_PATH_KEY, None)
         user_data.pop(BROWSE_PAGE_KEY, None)
         user_data.pop(BROWSE_DIRS_KEY, None)
+        user_data.pop(BROWSE_UNBOUND_COUNT_KEY, None)
 
 
 def clear_window_picker_state(user_data: dict | None) -> None:
@@ -120,9 +125,17 @@ def build_window_picker(
 
 
 def build_directory_browser(
-    current_path: str, page: int = 0
+    current_path: str, page: int = 0, unbound_count: int = 0
 ) -> tuple[str, InlineKeyboardMarkup, list[str]]:
     """Build directory browser UI.
+
+    Args:
+        current_path: Directory currently being shown.
+        page: 0-indexed page within ``current_path``'s subdir list.
+        unbound_count: Number of unbound tmux windows. When > 0, an
+            opt-in "Bind existing window" button row is added so the
+            user can pivot to the window picker instead of creating a
+            new session.
 
     Returns: (text, keyboard, subdirs) where subdirs is the full list for caching.
     """
@@ -183,6 +196,20 @@ def build_directory_browser(
     action_row.append(InlineKeyboardButton("Select", callback_data=CB_DIR_CONFIRM))
     action_row.append(InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL))
     buttons.append(action_row)
+
+    # Opt-in bind-existing row (only when unbound tmux windows exist).
+    # Lets the user pivot to the window picker instead of creating a new
+    # session in the current directory. Inverse transition (picker → browser)
+    # already exists via CB_WIN_NEW.
+    if unbound_count > 0:
+        label = (
+            f"🖥 Bind existing window ({unbound_count})"
+            if unbound_count > 1
+            else "🖥 Bind existing window"
+        )
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=CB_DIR_BIND_EXISTING)]
+        )
 
     display_path = str(path).replace(str(Path.home()), "~")
     if not subdirs:
