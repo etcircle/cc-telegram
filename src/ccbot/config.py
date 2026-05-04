@@ -196,9 +196,18 @@ class Config:
         # Hard cap on attachments per aggregated bundle. Beyond this, the
         # aggregator force-flushes immediately rather than waiting on the
         # debounce — prevents an unbounded media dump from blocking flush.
+        raw_max_attachments = os.getenv("CCBOT_AGGREGATOR_MAX_ATTACHMENTS")
+        if raw_max_attachments is None:
+            legacy = os.getenv("CCBOT_AGGREGATOR_MAX_PHOTOS")
+            if legacy is not None:
+                logger.warning(
+                    "CCBOT_AGGREGATOR_MAX_PHOTOS is deprecated; "
+                    "use CCBOT_AGGREGATOR_MAX_ATTACHMENTS"
+                )
+                raw_max_attachments = legacy
         try:
-            self.aggregator_max_attachments = int(
-                os.getenv("CCBOT_AGGREGATOR_MAX_ATTACHMENTS", "10")
+            self.aggregator_max_attachments = (
+                int(raw_max_attachments) if raw_max_attachments else 10
             )
         except ValueError:
             self.aggregator_max_attachments = 10

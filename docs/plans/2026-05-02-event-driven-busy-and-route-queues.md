@@ -1829,7 +1829,7 @@ CCBOT_ATTENTION_QUESTION_PREVIEW_CHARS=200 # §2.6 narrow trigger card excerpt b
 CCBOT_AGENT_PROMPT_PREVIEW_CHARS=400        # §2.7 subagent prompt excerpt bound in promoted message
 
 CCBOT_AGGREGATOR_DEBOUNCE_SECONDS=1.5        # §2.8 inbound aggregator: how long to wait for related messages before flushing
-CCBOT_AGGREGATOR_MAX_PHOTOS=10               # §2.8 hard cap on photos per flush (force-flush when exceeded)
+CCBOT_AGGREGATOR_MAX_ATTACHMENTS=10          # §2.8 hard cap on attachments per flush (force-flush when exceeded)
 
 CCBOT_ATTENTION_BUTTONS=true                  # §2.9 master flag for inline-keyboard buttons on §2.6 attention cards
 CCBOT_ATTENTION_BUTTON_TTL_SECONDS=86400      # §2.9 token map retention (24h)

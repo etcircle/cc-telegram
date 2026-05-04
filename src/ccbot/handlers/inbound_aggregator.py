@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -59,6 +60,17 @@ class _PendingBundle:
 # / text-parts list.
 _route_pending: dict[Route, _PendingBundle] = {}
 _route_locks: dict[Route, asyncio.Lock] = {}
+
+# Strong refs for fire-and-forget tasks. Without this, the GC can collect a
+# task before it completes (cpython#91887) — most likely under load, exactly
+# when boundary force-flushes fire.
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _spawn_background(coro: Coroutine[object, object, None]) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def _get_lock(route: Route) -> asyncio.Lock:
@@ -97,7 +109,7 @@ def _schedule_flush(route: Route, bundle: _PendingBundle) -> None:
     def _fire() -> None:
         # Schedule the flush coroutine on the running loop; the TimerHandle
         # callback itself runs sync.
-        asyncio.create_task(_flush(route))
+        _spawn_background(_flush(route))
 
     bundle.flush_handle = loop.call_later(delay, _fire)
 
@@ -228,14 +240,18 @@ async def _offer_attachment(
         ):
             old_bundle = _pop_bundle_locked(route)
             if old_bundle is not None:
-                asyncio.create_task(_send_bundle(route, old_bundle))
+                _spawn_background(_send_bundle(route, old_bundle))
             bundle = _get_or_create_bundle(route)
 
         if caption and caption not in bundle.seen_captions:
             bundle.text_parts.append(caption)
             bundle.seen_captions.add(caption)
         bundle.attachment_paths.append(path)
-        bundle.current_media_group_id = media_group_id
+        # Only update on a grouped attachment: a non-grouped item joining the
+        # bundle must not erase the "last group" memory, or the next group's
+        # boundary check would silently merge it with the previous album.
+        if media_group_id is not None:
+            bundle.current_media_group_id = media_group_id
 
         if len(bundle.attachment_paths) >= config.aggregator_max_attachments:
             flush_now = True

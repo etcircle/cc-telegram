@@ -196,7 +196,8 @@ Feature flags for fork-specific behavior:
 | `CCBOT_ATTENTION_BUTTON_TTL_SECONDS` | `86400` | how long an attention token stays clickable |
 | `CCBOT_REPLY_CONTEXT` | `true` | forward Telegram reply / quote to Claude inside fenced quotes |
 | `CCBOT_AGGREGATOR_DEBOUNCE_SECONDS` | `1.5` | inbound aggregator window for caption + media-group bundling |
-| `CCBOT_AGGREGATOR_MAX_PHOTOS` | `10` | per-bundle photo cap |
+| `CCBOT_AGGREGATOR_MAX_ATTACHMENTS` | `10` | per-bundle attachment cap (photos + documents) |
+| `CCBOT_MAX_ATTACHMENT_SIZE_BYTES` | `20971520` | upper bound on document downloads (default 20 MB) |
 | `CCBOT_CONTEXT_PCT_THRESHOLD` | `80` | digest header shows context-% at or above this |
 | `CCBOT_MESSAGE_REFS_RETENTION_DAYS` | `30` | provenance-table GC retention |
 | `CCBOT_MESSAGE_REFS_DB_PATH` | `$CCBOT_DIR/message_refs.db` | SQLite path |

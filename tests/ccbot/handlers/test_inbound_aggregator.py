@@ -200,6 +200,38 @@ async def test_distinct_media_groups_force_flush_at_boundary(captured_sends):
 
 
 @pytest.mark.asyncio
+async def test_ungrouped_attachment_does_not_reset_media_group_boundary(captured_sends):
+    """An mg=None attachment between two groups must not erase the boundary memory."""
+    route = (1, 100, "@0")
+    config.aggregator_debounce_seconds = 5.0
+    await inbound_aggregator.aggregator_offer_photo(
+        route, Path("/tmp/g1.jpg"), "first album", "mg-1"
+    )
+    # Non-grouped photo joins the in-progress bundle. Must NOT reset
+    # current_media_group_id to None, else the next group's boundary
+    # check would skip and merge the two albums.
+    await inbound_aggregator.aggregator_offer_photo(
+        route, Path("/tmp/loose.jpg"), None, None
+    )
+    # Boundary: arrival of mg-2 must force-flush g1 + loose together,
+    # then start a fresh bundle for mg-2.
+    await inbound_aggregator.aggregator_offer_photo(
+        route, Path("/tmp/g2.jpg"), "second album", "mg-2"
+    )
+    await _wait_until_flushed(captured_sends, expected=1)
+    await inbound_aggregator.aggregator_flush_route(route)
+    assert len(captured_sends) == 2
+    first, second = captured_sends[0][1], captured_sends[1][1]
+    assert "first album" in first
+    assert "/tmp/g1.jpg" in first and "/tmp/loose.jpg" in first
+    assert "/tmp/g2.jpg" not in first
+    assert "second album" not in first
+    assert "second album" in second
+    assert "/tmp/g2.jpg" in second
+    assert "/tmp/g1.jpg" not in second
+
+
+@pytest.mark.asyncio
 async def test_caption_dedup_within_media_group(captured_sends):
     """Telegram repeats the same caption on every media-group item; we dedup."""
     route = (1, 100, "@0")
