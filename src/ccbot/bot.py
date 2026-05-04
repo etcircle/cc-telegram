@@ -602,14 +602,6 @@ async def topic_edited_handler(
         # Icon-only change, no rename needed
         return
 
-    # Strip our own "· ctx NN%" suffix so bot-initiated renames don't
-    # pollute the cached base name. User renames pass through unchanged.
-    from .handlers.topic_title import strip_ctx_suffix
-
-    new_name = strip_ctx_suffix(new_name)
-    if not new_name:
-        return
-
     thread_id = _get_thread_id(update)
     if thread_id is None:
         return
@@ -2413,52 +2405,6 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 # --- App lifecycle ---
 
 
-async def _cleanup_legacy_title_suffixes(bot: Bot) -> None:
-    """One-shot reset of any forum topic titles still carrying our legacy
-    "· Nk/Mk" or "· ctx NN%" suffix.
-
-    Iterates all bound (user_id, thread_id, window_id) triples, computes the
-    intended clean name from ``session_manager.get_display_name`` (which is
-    already maintained suffix-free by ``topic_edited_handler``), and pushes
-    one ``edit_forum_topic`` per topic. Telegram returns TOPIC_NOT_MODIFIED
-    for titles already matching, which we treat as success. Failures are
-    logged at debug and swallowed — startup must not block on a stale chat.
-    """
-    from telegram.error import TelegramError
-
-    cleaned = 0
-    for user_id, thread_id, wid in session_manager.iter_thread_bindings():
-        if not thread_id:
-            continue
-        display = session_manager.get_display_name(wid)
-        if not display:
-            continue
-        try:
-            chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-        except Exception:
-            continue
-        try:
-            await bot.edit_forum_topic(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                name=display,
-            )
-            cleaned += 1
-        except TelegramError as e:
-            msg = str(e).lower()
-            if "not_modified" in msg or "not modified" in msg:
-                continue
-            logger.debug(
-                "legacy title cleanup chat=%d thread=%d wid=%s failed: %s",
-                chat_id,
-                thread_id,
-                wid,
-                e,
-            )
-    if cleaned:
-        logger.info("Reset %d forum topic title(s) to drop legacy ctx suffix", cleaned)
-
-
 async def post_init(application: Application) -> None:
     global \
         session_monitor, \
@@ -2560,13 +2506,6 @@ async def post_init(application: Application) -> None:
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
-
-    # One-shot migration: an earlier version of this bot baked a "· Nk/Mk"
-    # context-window suffix into forum topic titles. That behavior was
-    # reverted; reset every bound topic's title to its tracked display_name
-    # so users don't see the legacy pollution. Idempotent — Telegram returns
-    # TOPIC_NOT_MODIFIED for titles already matching, which we swallow.
-    await _cleanup_legacy_title_suffixes(application.bot)
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's

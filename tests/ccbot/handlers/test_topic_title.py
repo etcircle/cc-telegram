@@ -1,31 +1,8 @@
-"""Tests for the surviving topic_title helpers.
-
-The original module rewrote forum topic titles; that was reverted. What
-remains:
-  - strip_ctx_suffix: still used defensively in topic_edited_handler.
-  - format_tokens / format_max: shared by the message footer + /context.
-"""
+"""Tests for the compact token formatters used by the message footer."""
 
 from __future__ import annotations
 
 from ccbot.handlers import topic_title
-
-
-def test_strip_ctx_suffix_removes_kk_form() -> None:
-    assert topic_title.strip_ctx_suffix("foo · 113k/200k") == "foo"
-    assert topic_title.strip_ctx_suffix("foo  ·  324k/1M  ") == "foo"
-    assert topic_title.strip_ctx_suffix("foo • 1.2M/1M") == "foo"
-
-
-def test_strip_ctx_suffix_removes_legacy_pct_form() -> None:
-    assert topic_title.strip_ctx_suffix("foo · ctx 16%") == "foo"
-    assert topic_title.strip_ctx_suffix("foo · CTX 99%") == "foo"
-
-
-def test_strip_ctx_suffix_leaves_user_names_alone() -> None:
-    assert topic_title.strip_ctx_suffix("Project · v2") == "Project · v2"
-    assert topic_title.strip_ctx_suffix("113k/200k") == "113k/200k"
-    assert topic_title.strip_ctx_suffix("foo · ctx done") == "foo · ctx done"
 
 
 def test_format_tokens_under_1m() -> None:
