@@ -445,68 +445,6 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await safe_reply(update.message, "⎋ Sent Escape")
 
 
-async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show Claude Code's context-window size for this topic.
-
-    Reads ``message.usage`` from the latest assistant entry in the bound
-    session's JSONL (input + cache_read + cache_creation = next-turn
-    context size). Detects 1M-context sessions when observed tokens exceed
-    the 200k cap.
-    """
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
-    if not update.message:
-        return
-
-    thread_id = _get_thread_id(update)
-    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
-    if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
-        return
-
-    session = await session_manager.resolve_session_for_window(wid)
-    if not session or not session.file_path:
-        await safe_reply(
-            update.message,
-            "📊 Context: unknown (no Claude session bound yet).",
-        )
-        return
-
-    from .transcript_parser import read_latest_usage
-
-    latest = read_latest_usage(session.file_path)
-    if latest is None:
-        await safe_reply(
-            update.message,
-            "📊 Context: unknown (no assistant turn in transcript yet).",
-        )
-        return
-
-    # Mirror busy_indicator's 1M auto-detection so the answer matches the
-    # topic-title indicator.
-    route = (user.id, thread_id or 0, wid)
-    from .handlers import busy_indicator
-
-    busy_indicator.update_context_usage(route, latest.tokens, latest.model)
-    usage = busy_indicator.context_usage(route)
-    assert usage is not None  # just set above
-    pct = int(round(usage.tokens * 100 / usage.max_tokens))
-    headroom = usage.max_tokens - usage.tokens
-
-    from .handlers.topic_title import format_max, format_tokens
-
-    await safe_reply(
-        update.message,
-        (
-            f"📊 Context: {format_tokens(usage.tokens)} / "
-            f"{format_max(usage.max_tokens)} "
-            f"({pct}% used · {format_tokens(headroom)} headroom)\n"
-            f"Model: `{latest.model}`"
-        ),
-    )
-
-
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fetch Claude Code usage stats from TUI and send to Telegram."""
     user = update.effective_user
@@ -2610,7 +2548,6 @@ async def post_init(application: Application) -> None:
         BotCommand("kill", "Kill session, leave topic open"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
-        BotCommand("context", "Show context-window % used"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -2808,7 +2745,6 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("usage", usage_command))
-    application.add_handler(CommandHandler("context", context_command))
     # §2.9: pattern-scoped handler MUST be registered before the catch-all
     # ``callback_handler`` so PTB dispatches ``attn:*`` clicks here.
     application.add_handler(
