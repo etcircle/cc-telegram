@@ -18,8 +18,8 @@ Public surface:
   - ``RunState``
   - ``register_state_callback(cb)`` — process-lifetime registration; deduped by identity
   - ``state(route)``
-  - ``context_pct(route)``
-  - ``update_context_pct(route, pct)``
+  - ``context_usage(route)`` / ``update_context_usage(route, tokens, model)``
+  - ``context_pct(route)`` — derived from usage, kept for the digest gate
   - ``on_transcript_event(event, routes)``
   - ``mark_inbound_sent(route)`` — prompt successfully delivered to Claude
   - ``mark_topic_broken(route)`` / ``mark_topic_recovered(route)``
@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable
 
@@ -68,7 +69,33 @@ _TURN_END_REASONS = frozenset({"end_turn", "stop_sequence"})
 _open_tools: dict[Route, dict[str, bool]] = {}
 _run_state: dict[Route, RunState] = {}
 _last_event_at: dict[Route, float] = {}
-_context_pct: dict[Route, int | None] = {}
+
+
+@dataclass(frozen=True)
+class ContextUsage:
+    """Snapshot of a route's context-window state.
+
+    ``tokens`` is the next-turn input size (input + cache_read + cache_creation
+    from the latest assistant ``message.usage``). ``max_tokens`` is the
+    detected window cap — 200_000 by default, latched up to 1_000_000 once
+    we observe a session exceeding the 200k threshold (the ``[1m]`` model
+    variant doesn't carry a suffix in JSONL ``message.model``, so observed
+    overflow is the only signal).
+    """
+
+    tokens: int
+    max_tokens: int
+
+
+# Routes whose observed tokens strictly exceed 200k must be on the 1M
+# variant — a 200k session can never legitimately exceed its cap. Once
+# latched, stay locked there for the rest of the session. The strict
+# inequality matters: real 200k sessions can sit at 195–199k just before
+# auto-compact, and we MUST keep reporting them as "97% / 200k" rather than
+# silently flipping the denominator to 1M and showing "20%".
+_CONTEXT_DETECT_1M_THRESHOLD = 200_001
+
+_context_usage: dict[Route, ContextUsage] = {}
 # Pre-broken state remembered so a successful event after BROKEN_TOPIC can
 # restore where we were rather than guessing.
 _pre_broken_state: dict[Route, RunState] = {}
@@ -111,7 +138,7 @@ def reset_for_tests() -> None:
     _run_state.clear()
     _open_tools.clear()
     _last_event_at.clear()
-    _context_pct.clear()
+    _context_usage.clear()
     _pre_broken_state.clear()
     _state_callbacks.clear()
 
@@ -148,17 +175,50 @@ def state(route: Route) -> RunState:
     return _maybe_decay_idle(route)
 
 
-def context_pct(route: Route) -> int | None:
-    """Return the cached context-window percent for a route, or None."""
-    return _context_pct.get(route)
+def context_usage(route: Route) -> ContextUsage | None:
+    """Return the cached ContextUsage for a route, or None."""
+    return _context_usage.get(route)
 
 
-def update_context_pct(route: Route, pct: int | None) -> None:
-    """Cache the latest context-window percent observed by status_polling."""
-    if pct is None:
-        _context_pct.pop(route, None)
+def update_context_usage(route: Route, tokens: int | None, model: str | None) -> None:
+    """Cache the latest ContextUsage for a route from a JSONL ``message.usage``.
+
+    Auto-detects the 1M variant: once a route is observed above
+    ``_CONTEXT_DETECT_1M_THRESHOLD``, it latches to a 1M cap and stays
+    there. Otherwise defaults to 200k. ``model`` is accepted for future
+    use (logging / explicit cap overrides) but the cap itself is derived
+    from observed tokens, since JSONL doesn't carry the ``[1m]`` suffix.
+
+    Passing ``tokens=None`` drops the cache entry — used after ``/clear``
+    when there's no assistant turn yet.
+    """
+    if tokens is None or tokens <= 0:
+        _context_usage.pop(route, None)
+        return
+    prior = _context_usage.get(route)
+    prior_max = prior.max_tokens if prior else 200_000
+    if tokens >= _CONTEXT_DETECT_1M_THRESHOLD or prior_max >= 1_000_000:
+        max_tokens = 1_000_000
     else:
-        _context_pct[route] = pct
+        max_tokens = 200_000
+    _context_usage[route] = ContextUsage(tokens=tokens, max_tokens=max_tokens)
+    # Bind unused arg so type-checkers are happy and future callers can
+    # override the cap based on the model id.
+    _ = model
+
+
+def context_pct(route: Route) -> int | None:
+    """Derived: integer 0–100 percent of the current context window used.
+
+    Kept as a getter so the activity-digest threshold gate
+    (``message_queue._context_pct_suffix``) keeps working unchanged. Returns
+    None when no usage has been observed yet for this route.
+    """
+    usage = _context_usage.get(route)
+    if usage is None or usage.max_tokens <= 0:
+        return None
+    pct = int(round(usage.tokens * 100 / usage.max_tokens))
+    return max(0, min(100, pct))
 
 
 def clear_route(route: Route) -> None:
@@ -166,7 +226,7 @@ def clear_route(route: Route) -> None:
     _run_state.pop(route, None)
     _open_tools.pop(route, None)
     _last_event_at.pop(route, None)
-    _context_pct.pop(route, None)
+    _context_usage.pop(route, None)
     _pre_broken_state.pop(route, None)
 
 

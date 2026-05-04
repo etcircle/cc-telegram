@@ -124,6 +124,33 @@ class Config:
         except ValueError:
             self.context_pct_threshold = 80
 
+        # Bake "· ctx NN%" into the Telegram forum topic title so the
+        # context-window indicator is visible at the top of the chat
+        # regardless of scroll. The bot debounces edits per topic to stay
+        # well under Telegram's per-chat admin-action rate limits.
+        self.context_in_title = (
+            os.getenv("CCBOT_CONTEXT_IN_TITLE", "true").lower() == "true"
+        )
+        try:
+            self.context_title_min_interval_seconds = float(
+                os.getenv("CCBOT_CONTEXT_TITLE_MIN_INTERVAL_SECONDS", "60")
+            )
+        except ValueError:
+            self.context_title_min_interval_seconds = 60.0
+        try:
+            self.context_title_min_delta_tokens = int(
+                os.getenv("CCBOT_CONTEXT_TITLE_MIN_DELTA_TOKENS", "5000")
+            )
+        except ValueError:
+            self.context_title_min_delta_tokens = 5000
+
+        # Per-turn footer in assistant messages, e.g. "📊 113k / 200k".
+        # Snapshot at send-time on end-of-turn text bubbles only — no edits,
+        # so MarkdownV2 is rendered once and forgotten.
+        self.context_in_message_footer = (
+            os.getenv("CCBOT_CONTEXT_IN_MESSAGE_FOOTER", "true").lower() == "true"
+        )
+
         # §2.6 narrow end-of-turn-question card preview length. The card
         # excerpts the final paragraph of an end-of-turn assistant message
         # so the user sees what's being asked without opening the topic.

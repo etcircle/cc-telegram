@@ -81,6 +81,10 @@ class NewMessage:
     # so a multi-step run renders as one editable message instead of one
     # bubble per block.
     subagent_key: str | None = None
+    # JSONL ``message.stop_reason``, propagated from ParsedEntry. Used by
+    # the bot adapter to identify end-of-turn assistant text bubbles, where
+    # the per-message context-window footer is appended.
+    stop_reason: str | None = None
 
 
 class SessionMonitor:
@@ -497,6 +501,7 @@ class SessionMonitor:
                             image_data=entry.image_data,
                             tool_input=entry.tool_input,
                             transcript_uuid=entry.uuid,
+                            stop_reason=entry.stop_reason,
                         )
                     )
                     logger.info(
@@ -658,6 +663,7 @@ class SessionMonitor:
                             tool_input=entry.tool_input,
                             transcript_uuid=entry.uuid,
                             subagent_key=tracking_key,
+                            stop_reason=entry.stop_reason,
                         )
                     )
 

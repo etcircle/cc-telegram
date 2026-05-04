@@ -1,10 +1,15 @@
 """Tests for ccbot.transcript_parser — pure logic, no I/O."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from ccbot.transcript_parser import (
     ParsedMessage,
     TranscriptParser,
+    clear_usage_cache,
+    read_latest_usage,
 )
 
 EXPQUOTE_START = TranscriptParser.EXPANDABLE_QUOTE_START
@@ -676,3 +681,137 @@ class TestUuidPropagation:
         result, _ = TranscriptParser.parse_entries([entry])
         assert len(result) == 1
         assert result[0].uuid is None
+
+
+# ── read_latest_usage ────────────────────────────────────────────────────
+
+
+def _write_jsonl(path: Path, entries: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+
+def _assistant(
+    tokens_input: int, tokens_cache: int, model: str = "claude-opus-4-7"
+) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "model": model,
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": tokens_input,
+                "cache_read_input_tokens": tokens_cache,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 100,
+            },
+            "content": [{"type": "text", "text": "ok"}],
+        },
+    }
+
+
+class TestReadLatestUsage:
+    def setup_method(self):
+        clear_usage_cache()
+
+    def test_reads_latest_assistant_usage(self, tmp_path: Path):
+        f = tmp_path / "s.jsonl"
+        _write_jsonl(
+            f,
+            [
+                _assistant(10, 1000),
+                _assistant(20, 113000),
+            ],
+        )
+        usage = read_latest_usage(str(f))
+        assert usage is not None
+        assert usage.tokens == 20 + 113000
+        assert usage.model == "claude-opus-4-7"
+
+    def test_skips_sidechain(self, tmp_path: Path):
+        f = tmp_path / "s.jsonl"
+        entries = [
+            _assistant(1, 100),
+            {**_assistant(99, 99999), "isSidechain": True},
+        ]
+        _write_jsonl(f, entries)
+        usage = read_latest_usage(str(f))
+        assert usage is not None
+        assert usage.tokens == 1 + 100  # picked the non-sidechain entry
+
+    def test_skips_user_entries(self, tmp_path: Path):
+        f = tmp_path / "s.jsonl"
+        _write_jsonl(
+            f,
+            [
+                _assistant(5, 500),
+                {"type": "user", "message": {"content": []}},
+            ],
+        )
+        usage = read_latest_usage(str(f))
+        assert usage is not None
+        assert usage.tokens == 5 + 500
+
+    def test_returns_none_on_no_assistant(self, tmp_path: Path):
+        f = tmp_path / "s.jsonl"
+        _write_jsonl(f, [{"type": "user", "message": {"content": []}}])
+        assert read_latest_usage(str(f)) is None
+
+    def test_returns_none_on_missing_file(self, tmp_path: Path):
+        assert read_latest_usage(str(tmp_path / "nonexistent.jsonl")) is None
+
+    def test_returns_none_on_malformed_lines(self, tmp_path: Path):
+        f = tmp_path / "s.jsonl"
+        f.write_text("not json\n{}\nbroken{\n")
+        assert read_latest_usage(str(f)) is None
+
+    def test_caches_by_mtime_and_size(self, tmp_path: Path):
+        f = tmp_path / "s.jsonl"
+        _write_jsonl(f, [_assistant(5, 500)])
+        first = read_latest_usage(str(f))
+        # Same mtime AND same size → cache hit even if content magically
+        # differs (we simulate this by overwriting with same-length garbage
+        # and pinning mtime). This pins the cache-key contract.
+        import os
+
+        st = f.stat()
+        f.write_bytes(b"x" * st.st_size)
+        os.utime(f, (st.st_atime, st.st_mtime))
+        second = read_latest_usage(str(f))
+        assert second == first  # cache hit
+
+    def test_size_change_busts_cache(self, tmp_path: Path):
+        f = tmp_path / "s.jsonl"
+        _write_jsonl(f, [_assistant(5, 500)])
+        first = read_latest_usage(str(f))
+        # Append a new entry with different tokens; same-second mtime but
+        # bigger size should still bust the cache.
+        import os
+
+        st_before = f.stat()
+        with open(f, "a") as fp:
+            fp.write(json.dumps(_assistant(7, 700)) + "\n")
+        os.utime(f, (st_before.st_atime, st_before.st_mtime))
+        second = read_latest_usage(str(f))
+        assert second is not None and first is not None
+        assert second.tokens == 7 + 700
+        assert first.tokens == 5 + 500
+
+    def test_skips_zero_token_entries(self, tmp_path: Path):
+        f = tmp_path / "s.jsonl"
+        # Latest entry has zero tokens — skip back to a usable one.
+        zero = {
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-7",
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            },
+        }
+        _write_jsonl(f, [_assistant(5, 500), zero])
+        usage = read_latest_usage(str(f))
+        assert usage is not None
+        assert usage.tokens == 5 + 500

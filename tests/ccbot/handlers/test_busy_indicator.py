@@ -275,21 +275,48 @@ async def test_stale_tool_result_ignored():
     assert busy_indicator.state(ROUTE) is RunState.IDLE_CLEARED
 
 
-def test_context_pct_cache_round_trip():
-    busy_indicator.update_context_pct(ROUTE, 89)
+def test_context_usage_cache_round_trip():
+    busy_indicator.update_context_usage(ROUTE, 178_000, "claude-opus-4-7")
+    usage = busy_indicator.context_usage(ROUTE)
+    assert usage is not None
+    assert usage.tokens == 178_000
+    assert usage.max_tokens == 200_000
     assert busy_indicator.context_pct(ROUTE) == 89
-    busy_indicator.update_context_pct(ROUTE, None)
+    busy_indicator.update_context_usage(ROUTE, None, None)
+    assert busy_indicator.context_usage(ROUTE) is None
     assert busy_indicator.context_pct(ROUTE) is None
 
 
+def test_context_usage_latches_to_1m():
+    # Strictly > 200k confirms the 1M variant. 200_001 is the smallest such.
+    busy_indicator.update_context_usage(ROUTE, 200_001, "claude-opus-4-7")
+    usage = busy_indicator.context_usage(ROUTE)
+    assert usage is not None
+    assert usage.max_tokens == 1_000_000
+    # A subsequent low-token observation must NOT downgrade the cap.
+    busy_indicator.update_context_usage(ROUTE, 50_000, "claude-opus-4-7")
+    usage = busy_indicator.context_usage(ROUTE)
+    assert usage is not None
+    assert usage.max_tokens == 1_000_000
+
+
+def test_context_usage_does_not_latch_at_high_200k():
+    # 199k on a 200k session must stay at 200k cap and report 100% (not 20%).
+    busy_indicator.update_context_usage(ROUTE, 199_000, "claude-opus-4-7")
+    usage = busy_indicator.context_usage(ROUTE)
+    assert usage is not None
+    assert usage.max_tokens == 200_000
+    assert busy_indicator.context_pct(ROUTE) == 100  # rounded
+
+
 def test_clear_route_drops_state():
-    busy_indicator.update_context_pct(ROUTE, 50)
+    busy_indicator.update_context_usage(ROUTE, 100_000, "claude-opus-4-7")
     busy_indicator._run_state[ROUTE] = RunState.RUNNING_TOOL
     busy_indicator._open_tools[ROUTE] = {"x": False}
 
     busy_indicator.clear_route(ROUTE)
     assert busy_indicator.state(ROUTE) is RunState.IDLE_CLEARED
-    assert busy_indicator.context_pct(ROUTE) is None
+    assert busy_indicator.context_usage(ROUTE) is None
 
 
 @pytest.mark.asyncio

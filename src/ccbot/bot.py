@@ -445,6 +445,68 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await safe_reply(update.message, "⎋ Sent Escape")
 
 
+async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show Claude Code's context-window size for this topic.
+
+    Reads ``message.usage`` from the latest assistant entry in the bound
+    session's JSONL (input + cache_read + cache_creation = next-turn
+    context size). Detects 1M-context sessions when observed tokens exceed
+    the 200k cap.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    session = await session_manager.resolve_session_for_window(wid)
+    if not session or not session.file_path:
+        await safe_reply(
+            update.message,
+            "📊 Context: unknown (no Claude session bound yet).",
+        )
+        return
+
+    from .transcript_parser import read_latest_usage
+
+    latest = read_latest_usage(session.file_path)
+    if latest is None:
+        await safe_reply(
+            update.message,
+            "📊 Context: unknown (no assistant turn in transcript yet).",
+        )
+        return
+
+    # Mirror busy_indicator's 1M auto-detection so the answer matches the
+    # topic-title indicator.
+    route = (user.id, thread_id or 0, wid)
+    from .handlers import busy_indicator
+
+    busy_indicator.update_context_usage(route, latest.tokens, latest.model)
+    usage = busy_indicator.context_usage(route)
+    assert usage is not None  # just set above
+    pct = int(round(usage.tokens * 100 / usage.max_tokens))
+    headroom = usage.max_tokens - usage.tokens
+
+    from .handlers.topic_title import format_max, format_tokens
+
+    await safe_reply(
+        update.message,
+        (
+            f"📊 Context: {format_tokens(usage.tokens)} / "
+            f"{format_max(usage.max_tokens)} "
+            f"({pct}% used · {format_tokens(headroom)} headroom)\n"
+            f"Model: `{latest.model}`"
+        ),
+    )
+
+
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fetch Claude Code usage stats from TUI and send to Telegram."""
     user = update.effective_user
@@ -602,6 +664,14 @@ async def topic_edited_handler(
         # Icon-only change, no rename needed
         return
 
+    # Strip our own "· ctx NN%" suffix so bot-initiated renames don't
+    # pollute the cached base name. User renames pass through unchanged.
+    from .handlers.topic_title import strip_ctx_suffix
+
+    new_name = strip_ctx_suffix(new_name)
+    if not new_name:
+        return
+
     thread_id = _get_thread_id(update)
     if thread_id is None:
         return
@@ -614,6 +684,9 @@ async def topic_edited_handler(
         return
 
     old_name = session_manager.get_display_name(wid)
+    if old_name == new_name:
+        # Idempotent: most likely Telegram echoing our own rename back.
+        return
     await tmux_manager.rename_window(wid, new_name)
     session_manager.update_display_name(wid, new_name)
     logger.info(
@@ -2239,6 +2312,47 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # --- Streaming response / notifications ---
 
 
+_TURN_END_STOP_REASONS = frozenset({"end_turn", "stop_sequence"})
+
+
+async def _build_context_footer(
+    user_id: int, thread_id: int | None, window_id: str
+) -> str | None:
+    """Read the latest usage for a window's session and render a footer.
+
+    Returns ``None`` when no usage has been observed yet (e.g. brand-new
+    session, post-/clear, JSONL not yet flushed). The footer is a snapshot
+    of context size at the moment the assistant turn ended, so a user
+    scrolling back through history sees how context evolved turn by turn.
+
+    Routes through ``busy_indicator.update_context_usage`` so the 1M-cap
+    latch is shared with the topic-title indicator — otherwise a session
+    that previously crossed 200k but is now back to 80k would show
+    ``80k / 1M`` in the title and ``80k / 200k`` in the footer.
+    """
+    if not window_id:
+        return None
+
+    session = await session_manager.resolve_session_for_window(window_id)
+    if session is None or not session.file_path:
+        return None
+
+    from .handlers import busy_indicator
+    from .handlers.topic_title import format_max, format_tokens
+    from .transcript_parser import read_latest_usage
+
+    latest = read_latest_usage(session.file_path)
+    if latest is None:
+        return None
+
+    route = (user_id, thread_id or 0, window_id)
+    busy_indicator.update_context_usage(route, latest.tokens, latest.model)
+    usage = busy_indicator.context_usage(route)
+    if usage is None:
+        return None
+    return f"_📊 {format_tokens(usage.tokens)} / {format_max(usage.max_tokens)}_"
+
+
 async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     """Handle a new assistant message — enqueue for sequential processing.
 
@@ -2304,8 +2418,26 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         ):
             continue
 
+        # Per-turn context footer. Appended at send-time (no edits later)
+        # so MarkdownV2 is rendered once and forgotten — assistant text
+        # bubbles end up with a small "_ctx 113k/200k_" line on the last
+        # block of each turn. Sub-agent (sidechain) blocks are skipped:
+        # their context budget is independent and the footer would clutter
+        # the per-sub-agent digest.
+        text = msg.text
+        if (
+            config.context_in_message_footer
+            and msg.role == "assistant"
+            and msg.content_type == "text"
+            and msg.stop_reason in _TURN_END_STOP_REASONS
+            and msg.subagent_key is None
+        ):
+            footer = await _build_context_footer(user_id, thread_id, wid)
+            if footer:
+                text = f"{text}\n\n{footer}"
+
         parts = build_response_parts(
-            msg.text,
+            text,
             msg.content_type,
             msg.role,
         )
@@ -2432,6 +2564,7 @@ async def post_init(application: Application) -> None:
         BotCommand("kill", "Kill session, leave topic open"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("context", "Show context-window % used"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -2622,6 +2755,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("context", context_command))
     # §2.9: pattern-scoped handler MUST be registered before the catch-all
     # ``callback_handler`` so PTB dispatches ``attn:*`` clicks here.
     application.add_handler(

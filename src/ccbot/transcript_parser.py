@@ -15,6 +15,7 @@ import base64
 import difflib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -896,3 +897,107 @@ class TranscriptParser:
             entry.text = entry.text.strip()
 
         return result, remaining_pending
+
+
+# ── Latest-usage lookup (for context-window indicator) ────────────────────
+
+
+@dataclass(frozen=True)
+class LatestUsage:
+    """Snapshot of the latest assistant turn's token + model usage."""
+
+    tokens: int  # input + cache_read + cache_creation (== next-turn ctx size)
+    model: str  # raw model id from JSONL, e.g. "claude-opus-4-7"
+
+
+# Cached by (jsonl_path, mtime, size) so a status-poller hitting this every
+# second only re-reads when the file actually changed. Tracking size as well
+# as mtime guards against same-second appends that wouldn't bump mtime on
+# coarse-resolution filesystems. The cache is bounded by the number of
+# distinct sessions; old entries can be evicted by clear_usage_cache.
+_latest_usage_cache: dict[str, tuple[tuple[float, int], LatestUsage | None]] = {}
+
+
+def clear_usage_cache(jsonl_path: str | None = None) -> None:
+    """Drop the cached latest-usage for a path, or all paths if None."""
+    if jsonl_path is None:
+        _latest_usage_cache.clear()
+    else:
+        _latest_usage_cache.pop(jsonl_path, None)
+
+
+def read_latest_usage(jsonl_path: str) -> LatestUsage | None:
+    """Return the most recent assistant message's usage + model, or None.
+
+    Reads the file from end → beginning, line-buffered, stopping at the
+    first assistant entry that carries a ``message.usage`` block. Sums
+    ``input_tokens + cache_read_input_tokens + cache_creation_input_tokens``
+    — that's the size of the prompt the next turn would re-feed, i.e.
+    "what's currently in context." ``output_tokens`` is excluded because
+    next turn it shows up inside ``cache_read_input_tokens``.
+
+    Sidechain entries (``isSidechain=true``) are skipped: they belong to
+    sub-agents and have their own context budget.
+
+    Caches by (path, mtime) so a 1Hz poller doesn't re-read unchanged files.
+    """
+    try:
+        st = os.stat(jsonl_path)
+    except OSError:
+        return None
+    cache_key = (st.st_mtime, st.st_size)
+
+    cached = _latest_usage_cache.get(jsonl_path)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
+    result: LatestUsage | None = None
+    try:
+        # Tail-first scan — most JSONLs are small enough that reading the
+        # whole file is fine, and we get correctness without seek juggling.
+        # If profiling ever shows a hotspot we can switch to a reverse-line
+        # iterator with a 64KB tail buffer.
+        with open(jsonl_path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        _latest_usage_cache[jsonl_path] = (cache_key, None)
+        return None
+
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        if entry.get("isSidechain"):
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            continue
+
+        def _int(v: Any) -> int:
+            return v if isinstance(v, int) and v >= 0 else 0
+
+        tokens = (
+            _int(usage.get("input_tokens"))
+            + _int(usage.get("cache_read_input_tokens"))
+            + _int(usage.get("cache_creation_input_tokens"))
+        )
+        model_raw = message.get("model")
+        model = model_raw if isinstance(model_raw, str) else ""
+        if tokens <= 0 or not model:
+            continue
+        result = LatestUsage(tokens=tokens, model=model)
+        break
+
+    _latest_usage_cache[jsonl_path] = (cache_key, result)
+    return result

@@ -1470,7 +1470,7 @@ class TestActivityDigestHeader:
         self._enable_v2(monkeypatch)
         busy_indicator.reset_for_tests()
         route = (1, 42, "@7")
-        busy_indicator.update_context_pct(route, 50)
+        busy_indicator.update_context_usage(route, 100_000, "claude-opus-4-7")
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         assert "ctx" not in rendered
@@ -1481,7 +1481,7 @@ class TestActivityDigestHeader:
         self._enable_v2(monkeypatch)
         busy_indicator.reset_for_tests()
         route = (1, 42, "@7")
-        busy_indicator.update_context_pct(route, 89)
+        busy_indicator.update_context_usage(route, 178_000, "claude-opus-4-7")
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         first_line = rendered.split("\n", 1)[0]
@@ -1494,7 +1494,7 @@ class TestActivityDigestHeader:
         self._enable_v2(monkeypatch)
         busy_indicator.reset_for_tests()
         route = (1, 42, "@7")
-        busy_indicator.update_context_pct(route, 97)
+        busy_indicator.update_context_usage(route, 194_000, "claude-opus-4-7")
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         first_line = rendered.split("\n", 1)[0]
@@ -1559,9 +1559,9 @@ class TestActivityDigestHeader:
         monkeypatch.setattr(cfg, "busy_indicator_v2", False)
         busy_indicator.reset_for_tests()
         route = (1, 42, "@7")
-        # Even with high context_pct + a non-default RunState, the legacy
+        # Even with high context usage + a non-default RunState, the legacy
         # path renders the legacy header and never adds the ctx suffix.
-        busy_indicator.update_context_pct(route, 99)
+        busy_indicator.update_context_usage(route, 198_000, "claude-opus-4-7")
         busy_indicator._run_state[route] = busy_indicator.RunState.WAITING_ON_USER
 
         rendered = message_queue._render_activity_digest(

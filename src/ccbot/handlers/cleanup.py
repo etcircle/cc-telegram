@@ -11,7 +11,7 @@ from typing import Any
 
 from telegram import Bot
 
-from . import attention
+from . import attention, topic_title
 from .inbound_aggregator import aggregator_clear_route
 from .interactive_ui import clear_interactive_msg
 from .message_queue import (
@@ -64,6 +64,17 @@ async def clear_topic_state(
     from .status_polling import reset_idle_counter
 
     reset_idle_counter(user_id, thread_id)
+
+    # Drop the topic-title rename bookkeeping so a re-bound topic starts
+    # without a stale last-tokens/last-base preventing the first edit.
+    from ..session import session_manager
+
+    try:
+        chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    except Exception:
+        chat_id = None
+    if chat_id is not None:
+        topic_title.clear_route(chat_id, thread_id)
 
     # Clear pending thread state from user_data
     if user_data is not None:

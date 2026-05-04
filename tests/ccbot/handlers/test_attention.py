@@ -135,9 +135,7 @@ async def test_refresh_activity_digest_renders_waiting_after_attention_state_cha
     # Pins the V1 attention-driven header path. V2 sources the header from
     # ``RunState`` and ignores attention state, so this test scopes itself
     # to V1 explicitly. Equivalent V2 coverage lives in test_busy_indicator.
-    monkeypatch.setattr(
-        "ccbot.handlers.message_queue.config.busy_indicator_v2", False
-    )
+    monkeypatch.setattr("ccbot.handlers.message_queue.config.busy_indicator_v2", False)
     bot = AsyncMock()
     key = (1, 10)
     state = ActivityDigestState(message_id=123, window_id="@0")
