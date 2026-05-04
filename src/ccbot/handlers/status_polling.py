@@ -36,7 +36,7 @@ from ..terminal_parser import (
     parse_status_line,
 )
 from ..transcript_parser import read_latest_usage
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import TmuxWindow, tmux_manager
 from . import busy_indicator
 from .busy_indicator import RunState
 from .interactive_ui import (
@@ -94,6 +94,7 @@ async def update_status_message(
     window_id: str,
     thread_id: int | None = None,
     skip_status: bool = False,
+    window: TmuxWindow | None = None,
 ) -> None:
     """Poll terminal and check for interactive UIs and status updates.
 
@@ -103,9 +104,13 @@ async def update_status_message(
 
     Also detects permission prompt UIs (not triggered via JSONL) and enters
     interactive mode when found.
+
+    ``window`` lets callers (e.g. ``_poll_one_binding``) pass in an already-
+    resolved TmuxWindow to avoid a redundant find_window_by_id round-trip.
     """
-    w = await tmux_manager.find_window_by_id(window_id)
-    if not w:
+    if window is None:
+        window = await tmux_manager.find_window_by_id(window_id)
+    if not window:
         # Window gone, enqueue clear (unless skipping status)
         if not skip_status:
             await enqueue_status_update(
@@ -113,7 +118,7 @@ async def update_status_message(
             )
         return
 
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await tmux_manager.capture_pane(window.window_id)
     if not pane_text:
         # Transient capture failure - keep existing status message
         return
@@ -336,6 +341,7 @@ async def _poll_one_binding(bot: Bot, user_id: int, thread_id: int, wid: str) ->
             wid,
             thread_id=thread_id,
             skip_status=skip_status,
+            window=w,
         )
     except Exception as e:
         logger.debug(
