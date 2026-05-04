@@ -186,6 +186,22 @@ def hook_main() -> None:
         logger.debug("Ignoring non-SessionStart event: %s", event)
         return
 
+    # Skip SDK-spawned sub-agents (e.g. /self-curate fired by a Stop hook).
+    # They share the user's tmux pane and would overwrite session_map with
+    # a sidecar session_id, causing ccbot to watch the wrong session after
+    # /clear. Denylist sdk-* rather than allowlisting cli so future legitimate
+    # entrypoints (e.g. vscode-extension) keep working.
+    entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    if entrypoint.startswith("sdk-"):
+        source = payload.get("source", "")
+        logger.info(
+            "Skipping SDK sub-agent hook (entrypoint=%s, source=%s, sid=%s)",
+            entrypoint,
+            source,
+            session_id,
+        )
+        return
+
     # Get tmux session:window key for the pane running this hook.
     # TMUX_PANE is set by tmux for every process inside a pane.
     pane_id = os.environ.get("TMUX_PANE", "")
