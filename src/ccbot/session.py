@@ -22,6 +22,7 @@ Key methods for thread binding access:
 """
 
 import asyncio
+import fcntl
 import json
 import logging
 import re
@@ -415,28 +416,41 @@ class SessionManager:
         """Remove old-format keys (window_name instead of @window_id) from session_map.json."""
         if not config.session_map_file.exists():
             return
-        try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
-            session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
-            return
 
         prefix = f"{config.tmux_session_name}:"
-        old_keys = [
-            key
-            for key in session_map
-            if key.startswith(prefix) and not self._is_window_id(key[len(prefix) :])
-        ]
-        if not old_keys:
-            return
+        # Hold session_map.lock across read-modify-write so a concurrent hook
+        # update can't be clobbered by writing back our stale snapshot.
+        lock_path = config.session_map_file.with_suffix(".lock")
+        try:
+            with open(lock_path, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                try:
+                    try:
+                        session_map = json.loads(config.session_map_file.read_text())
+                    except (json.JSONDecodeError, OSError):
+                        return
 
-        for key in old_keys:
-            del session_map[key]
-        atomic_write_json(config.session_map_file, session_map)
-        logger.info(
-            "Cleaned up %d old-format session_map keys: %s", len(old_keys), old_keys
-        )
+                    old_keys = [
+                        key
+                        for key in session_map
+                        if key.startswith(prefix)
+                        and not self._is_window_id(key[len(prefix) :])
+                    ]
+                    if not old_keys:
+                        return
+
+                    for key in old_keys:
+                        del session_map[key]
+                    atomic_write_json(config.session_map_file, session_map)
+                    logger.info(
+                        "Cleaned up %d old-format session_map keys: %s",
+                        len(old_keys),
+                        old_keys,
+                    )
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+        except OSError as e:
+            logger.warning("Failed to clean up old-format session_map keys: %s", e)
 
     async def _cleanup_stale_session_map_entries(self, live_ids: set[str]) -> None:
         """Remove entries for tmux windows that no longer exist.
@@ -447,33 +461,43 @@ class SessionManager:
         """
         if not config.session_map_file.exists():
             return
-        try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
-            session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
-            return
 
         prefix = f"{config.tmux_session_name}:"
-        stale_keys = [
-            key
-            for key in session_map
-            if key.startswith(prefix)
-            and self._is_window_id(key[len(prefix) :])
-            and key[len(prefix) :] not in live_ids
-        ]
-        if not stale_keys:
-            return
+        # Hold session_map.lock across read-modify-write so a concurrent hook
+        # update can't be clobbered by writing back our stale snapshot.
+        lock_path = config.session_map_file.with_suffix(".lock")
+        try:
+            with open(lock_path, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                try:
+                    try:
+                        session_map = json.loads(config.session_map_file.read_text())
+                    except (json.JSONDecodeError, OSError):
+                        return
 
-        for key in stale_keys:
-            del session_map[key]
-            logger.info("Removed stale session_map entry: %s", key)
+                    stale_keys = [
+                        key
+                        for key in session_map
+                        if key.startswith(prefix)
+                        and self._is_window_id(key[len(prefix) :])
+                        and key[len(prefix) :] not in live_ids
+                    ]
+                    if not stale_keys:
+                        return
 
-        atomic_write_json(config.session_map_file, session_map)
-        logger.info(
-            "Cleaned up %d stale session_map entries (windows no longer in tmux)",
-            len(stale_keys),
-        )
+                    for key in stale_keys:
+                        del session_map[key]
+                        logger.info("Removed stale session_map entry: %s", key)
+
+                    atomic_write_json(config.session_map_file, session_map)
+                    logger.info(
+                        "Cleaned up %d stale session_map entries (windows no longer in tmux)",
+                        len(stale_keys),
+                    )
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+        except OSError as e:
+            logger.warning("Failed to clean up stale session_map entries: %s", e)
 
     # --- Display name management ---
 
