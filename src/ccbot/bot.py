@@ -1186,7 +1186,39 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             reply_ctx = await reply_context_mod.resolve(
                 reply_ctx, update.message.chat.id
             )
-            text = render_for_claude(text, reply_ctx)
+            # Stale-quote guard. If the reply points at a message from a
+            # session that has since been /clear-ed (or otherwise replaced),
+            # the rendered ``<<<QUOTE_…>>>`` block references context the
+            # current session can't see. Empirically this can produce empty
+            # turns from the model — it sees a quoted reference to a
+            # nonexistent session and returns no output. Drop the wrapper
+            # and just send the user text in that case.
+            current_sid = None
+            bound_wid = session_manager.resolve_window_for_thread(
+                user.id, thread_id
+            )
+            if bound_wid is not None:
+                current_session = await session_manager.resolve_session_for_window(
+                    bound_wid
+                )
+                if current_session is not None:
+                    current_sid = current_session.session_id
+            stale_quote = (
+                reply_ctx.session_id is not None
+                and current_sid is not None
+                and reply_ctx.session_id != current_sid
+            )
+            if stale_quote:
+                logger.info(
+                    "Dropping reply context: quoted session %s != current %s "
+                    "(window=%s, thread=%s)",
+                    reply_ctx.session_id,
+                    current_sid,
+                    bound_wid,
+                    thread_id,
+                )
+            else:
+                text = render_for_claude(text, reply_ctx)
 
     # Ignore text in window picker mode (only for the same thread)
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:

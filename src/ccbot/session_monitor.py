@@ -774,6 +774,12 @@ class SessionMonitor:
         current_map = await self._load_current_session_map()
 
         sessions_to_remove: set[str] = set()
+        # Windows whose session_id flipped (e.g. /clear): the route's
+        # busy_indicator carries pre-/clear ``open_tools`` IDs that the new
+        # session will never close, pinning the route to RUNNING forever.
+        # Tracked here so we can hand them to ``busy_indicator.clear_route``
+        # once routes are resolved below.
+        changed_window_ids: set[str] = set()
 
         # Check for window session changes (window exists in both, but session_id changed)
         for window_id, old_session_id in self._last_session_map.items():
@@ -786,6 +792,7 @@ class SessionMonitor:
                     new_session_id,
                 )
                 sessions_to_remove.add(old_session_id)
+                changed_window_ids.add(window_id)
 
         # Check for deleted windows (window in old map but not in current)
         old_windows = set(self._last_session_map.keys())
@@ -808,6 +815,28 @@ class SessionMonitor:
                 self._file_mtimes.pop(session_id, None)
                 self._remove_sidechains_for_parent(session_id)
             self.state.save_if_dirty()
+
+        # Reset busy_indicator state for routes bound to windows whose
+        # session changed. Without this, ``_open_tools`` keeps the
+        # tool_use_ids from the pre-/clear session and ``_state_from_open_tools``
+        # never returns to IDLE, so the typing indicator and "🟡 Busy" card
+        # stay stuck forever even though the new session is genuinely idle.
+        # Deferred imports for the same reason as ``_monitor_loop`` — these
+        # modules transitively pull in this one.
+        if changed_window_ids:
+            from .session import session_manager
+            from .handlers import busy_indicator
+
+            for user_id, thread_id, wid in session_manager.iter_thread_bindings():
+                if wid in changed_window_ids:
+                    busy_indicator.clear_route((user_id, thread_id or 0, wid))
+                    logger.info(
+                        "Cleared busy_indicator route after session change: "
+                        "user=%d thread=%s window=%s",
+                        user_id,
+                        thread_id,
+                        wid,
+                    )
 
         # Update last known map
         self._last_session_map = current_map

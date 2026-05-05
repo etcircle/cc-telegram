@@ -480,8 +480,64 @@ class TranscriptParser:
         else:
             pending_tools = dict(pending_tools)  # don't mutate caller's dict
 
+        # Empty-turn detection within this batch. Tracks "did the most recent
+        # user prompt produce any assistant output before the turn ended."
+        # Reset on each user-text entry; flipped True on any assistant
+        # text/thinking/tool_use; consulted when a system ``turn_duration``
+        # entry is seen. A definitive empty turn (Claude received the prompt,
+        # ran the model, emitted nothing) otherwise looks identical to "still
+        # working" to the user — no message reaches the topic.
+        seen_user_prompt = False
+        assistant_emitted_after_prompt = False
+
         for data in entries:
             msg_type = cls.get_message_type(data)
+            # System ``turn_duration`` is the only definitive end-of-turn
+            # signal Claude writes when the assistant message is absent
+            # entirely (model returned nothing). It's the marker we use to
+            # diagnose empty turns and to drive busy_indicator to IDLE in
+            # cases where no assistant ``stop_reason=end_turn`` ever lands.
+            if msg_type == "system" and data.get("subtype") == "turn_duration":
+                if seen_user_prompt and not assistant_emitted_after_prompt:
+                    ts = cls.get_timestamp(data)
+                    raw_uuid = data.get("uuid")
+                    eu = raw_uuid if isinstance(raw_uuid, str) else None
+                    duration_ms = data.get("durationMs")
+                    suffix = ""
+                    if isinstance(duration_ms, int | float):
+                        suffix = f" (turn took {duration_ms / 1000:.1f}s)"
+                    warn_text = (
+                        "⚠️ Claude finished the turn without responding"
+                        f"{suffix}. Try resending — this often happens when "
+                        "replying to a message from a /clear-ed session."
+                    )
+                    result.append(
+                        ParsedEntry(
+                            role="assistant",
+                            text=warn_text,
+                            content_type="text",
+                            timestamp=ts,
+                            uuid=eu,
+                        )
+                    )
+                    # Synthetic end-of-turn lifecycle marker so the
+                    # busy_indicator transitions to IDLE_RECENT even though
+                    # no assistant text/thinking with stop_reason=end_turn
+                    # was emitted by Claude itself.
+                    result.append(
+                        ParsedEntry(
+                            role="assistant",
+                            text="",
+                            content_type="text",
+                            timestamp=ts,
+                            stop_reason="end_turn",
+                            uuid=eu,
+                            lifecycle_only=True,
+                        )
+                    )
+                seen_user_prompt = False
+                assistant_emitted_after_prompt = False
+                continue
             if msg_type not in ("user", "assistant"):
                 continue
 
@@ -538,6 +594,12 @@ class TranscriptParser:
             last_cmd_name = None
 
             if msg_type == "assistant":
+                # Any assistant turn — even one whose blocks the parser
+                # ultimately filters — counts as Claude responding to the
+                # prompt. Empty-turn detection fires only when no assistant
+                # entry at all lands between the user prompt and the
+                # ``turn_duration`` system marker.
+                assistant_emitted_after_prompt = True
                 # Process content blocks
                 has_text = False
                 _result_len_before = len(result)
@@ -875,6 +937,12 @@ class TranscriptParser:
                                 uuid=entry_uuid,
                             )
                         )
+                        # Empty-turn tracking — a real user prompt resets the
+                        # window. Tool_result-only user messages never reach
+                        # this branch (they short-circuit above), so we won't
+                        # falsely re-arm the warning mid-tool-loop.
+                        seen_user_prompt = True
+                        assistant_emitted_after_prompt = False
 
         # Flush remaining pending tools at end.
         # In carry-over mode (monitor), keep them pending for the next call
