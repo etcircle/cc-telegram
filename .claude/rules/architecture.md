@@ -71,7 +71,7 @@ Additional modules:
   screenshot.py       ─ Terminal text → PNG rendering (ANSI color, font fallback)
   transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
   main.py             ─ CLI entry point
-  utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
+  utils.py            ─ Shared utilities (app_dir, atomic_write_json)
 
 Handler modules (handlers/):
   message_sender.py   ─ safe_reply/safe_edit/safe_send + rate_limit_send
@@ -83,7 +83,7 @@ Handler modules (handlers/):
   cleanup.py          ─ Topic state cleanup on close/delete
   callback_data.py    ─ Callback data constants
 
-State files (~/.ccbot/ or $CCBOT_DIR/):
+State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
   state.json         ─ thread bindings + window states + display names + read offsets
   session_map.json   ─ hook-generated window_id→session mapping
   monitor_state.json ─ poll progress (byte offset) per JSONL file

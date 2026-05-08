@@ -2,7 +2,7 @@
 
 import pytest
 
-from ccbot.monitor_state import MonitorState, TrackedSession
+from cctelegram.monitor_state import MonitorState, TrackedSession
 
 pytestmark = pytest.mark.integration
 

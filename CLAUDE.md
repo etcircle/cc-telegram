@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-ccmux — Telegram bot that bridges Telegram Forum topics to Claude Code sessions via tmux windows. Each topic is bound to one tmux window running one Claude Code instance.
+cc-telegram — Telegram bot that bridges Telegram Forum topics to Claude Code sessions via tmux windows. Each topic is bound to one tmux window running one Claude Code instance.
 
 Tech stack: Python, python-telegram-bot, tmux, uv.
 
@@ -9,9 +9,9 @@ Tech stack: Python, python-telegram-bot, tmux, uv.
 ```bash
 uv run ruff check src/ tests/         # Lint — MUST pass before committing
 uv run ruff format src/ tests/        # Format — auto-fix, then verify with --check
-uv run pyright src/ccbot/             # Type check — MUST be 0 errors before committing
-./scripts/restart.sh                  # Restart the ccbot service after code changes
-ccbot hook --install                  # Auto-install Claude Code SessionStart hook
+uv run pyright src/cctelegram/             # Type check — MUST be 0 errors before committing
+./scripts/restart.sh                  # Restart the cc-telegram service after code changes
+cc-telegram hook --install                  # Auto-install Claude Code SessionStart hook
 ```
 
 ## Core Design Constraints
@@ -31,13 +31,13 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 
 ## Configuration
 
-- Config directory: `~/.ccbot/` by default, override with `CCBOT_DIR` env var.
+- Config directory: `~/.cc-telegram/` by default, override with `CC_TELEGRAM_DIR` env var.
 - `.env` loading priority: local `.env` > config dir `.env`.
 - State files: `state.json` (thread bindings), `session_map.json` (hook-generated), `monitor_state.json` (byte offsets).
 
 ## Hook Configuration
 
-Auto-install: `ccbot hook --install`
+Auto-install: `cc-telegram hook --install`
 
 Or manually in `~/.claude/settings.json`:
 ```json
@@ -45,7 +45,7 @@ Or manually in `~/.claude/settings.json`:
   "hooks": {
     "SessionStart": [
       {
-        "hooks": [{ "type": "command", "command": "ccbot hook", "timeout": 5 }]
+        "hooks": [{ "type": "command", "command": "cc-telegram hook", "timeout": 5 }]
       }
     ]
   }
