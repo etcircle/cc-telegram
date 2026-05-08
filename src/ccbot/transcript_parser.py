@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .config import config
+
 logger = logging.getLogger(__name__)
 
 # Mirrors handlers.busy_indicator._TURN_END_REASONS so the lifecycle-only
@@ -97,14 +99,6 @@ class TranscriptParser:
     # Magic string constants
     _NO_CONTENT_PLACEHOLDER = "(no content)"
     _INTERRUPTED_TEXT = "[Request interrupted by user for tool use]"
-    # Max length of the per-tool input string surfaced in
-    # ``format_tool_use_summary`` (e.g. the bash command, file path, grep
-    # pattern). 200 was tight enough that long bash invocations got
-    # truncated mid-pipe — the activity-digest line then looked like
-    # "Bash(curl -sk -o /dev/null -w…)" with no useful suffix. 600 covers
-    # almost every real bash one-liner without bloating short summaries
-    # (file paths, search patterns, etc., are still well below the cap).
-    _MAX_SUMMARY_LENGTH = 600
 
     @staticmethod
     def parse_line(line: str) -> dict | None:
@@ -257,8 +251,9 @@ class TranscriptParser:
                     break
 
         if summary:
-            if len(summary) > cls._MAX_SUMMARY_LENGTH:
-                summary = summary[: cls._MAX_SUMMARY_LENGTH] + "…"
+            max_chars = config.tool_summary_max_chars
+            if len(summary) > max_chars:
+                summary = summary[:max_chars] + "…"
             return f"**{name}**({summary})"
         return f"**{name}**"
 

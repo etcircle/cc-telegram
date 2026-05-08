@@ -122,7 +122,9 @@ class TestFormatToolUseSummary:
         )
 
     def test_truncation_at_max_summary_length(self):
-        cap = TranscriptParser._MAX_SUMMARY_LENGTH
+        from ccbot.config import config
+
+        cap = config.tool_summary_max_chars
         long_value = "x" * (cap + 50)
         result = TranscriptParser.format_tool_use_summary(
             "Bash", {"command": long_value}

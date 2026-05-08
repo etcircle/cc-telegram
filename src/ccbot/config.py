@@ -101,6 +101,18 @@ class Config:
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
 
+        # Max length of the per-tool input string surfaced in tool_use summary
+        # lines (e.g. "**Bash**(<command>)", "**Read**(<path>)"). Long inputs
+        # are truncated with a "…" marker. Default 40 keeps the activity feed
+        # compact; raise it (e.g. 600) to preserve full bash one-liners at the
+        # cost of multi-line summary entries on Telegram.
+        try:
+            self.tool_summary_max_chars = int(
+                os.getenv("CCBOT_TOOL_SUMMARY_MAX_CHARS", "40")
+            )
+        except ValueError:
+            self.tool_summary_max_chars = 40
+
         # Stage-3 event-driven RunState. Gates two coupled changes together:
         #   1. bot.py: whether monitor.set_event_callback is wired
         #   2. activity-digest renderer + status_polling: whether they read
