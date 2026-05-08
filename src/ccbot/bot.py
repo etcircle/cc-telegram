@@ -54,6 +54,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
+    Message,
     Update,
 )
 from telegram.constants import ChatAction
@@ -739,6 +740,50 @@ _FILES_DIR = ccbot_dir() / "files"
 _FILES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+async def _apply_reply_context(
+    message: Message,
+    user_id: int,
+    thread_id: int | None,
+    text: str,
+) -> str:
+    """Render the §2.5 quote block onto ``text`` for a reply-aware message.
+
+    Returns ``text`` unchanged when the kill switch is off, when there is
+    no quoted referent, or when the quote points at a stale (e.g. /clear-ed)
+    session — the same stale-quote guard the text_handler had inline. Used
+    by text/voice/photo/document handlers so a reply made via voice or
+    photo+caption carries the same quote-injection block as a text reply.
+    """
+    if not config.reply_context_enabled:
+        return text
+    reply_ctx = extract_reply_context(message)
+    if reply_ctx is None:
+        return text
+    reply_ctx = await reply_context_mod.resolve(reply_ctx, message.chat.id)
+    current_sid = None
+    bound_wid = session_manager.resolve_window_for_thread(user_id, thread_id)
+    if bound_wid is not None:
+        current_session = await session_manager.resolve_session_for_window(bound_wid)
+        if current_session is not None:
+            current_sid = current_session.session_id
+    stale_quote = (
+        reply_ctx.session_id is not None
+        and current_sid is not None
+        and reply_ctx.session_id != current_sid
+    )
+    if stale_quote:
+        logger.info(
+            "Dropping reply context: quoted session %s != current %s "
+            "(window=%s, thread=%s)",
+            reply_ctx.session_id,
+            current_sid,
+            bound_wid,
+            thread_id,
+        )
+        return text
+    return render_for_claude(text, reply_ctx)
+
+
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle photos sent by the user: download and forward path to Claude Code."""
     user = update.effective_user
@@ -843,6 +888,17 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # photo's message_id (matches Telegram's "reply to most recent" UX).
     set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
 
+    # §2.5: render reply-context onto the caption so a photo reply carries
+    # the same quote-injection block as a text reply. Skip when this update
+    # is a non-caption-bearing item of a media group — Telegram puts the
+    # caption on item 1 only, and rendering with empty caption on items 2-N
+    # would re-emit the quote block multiple times (the random nonce in
+    # ``render_for_claude`` defeats the aggregator's exact-string dedup).
+    if caption or media_group_id is None:
+        caption = await _apply_reply_context(
+            update.message, user.id, thread_id, caption
+        )
+
     # §2.8: feed photo + caption + media_group_id into the aggregator. The
     # bundle's flush handler builds the §2.8.2 single-text + grouped-paths
     # shape so a media-group with one caption stops fragmenting across
@@ -938,9 +994,14 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             user.id,
             thread_id,
         )
-    await aggregator_offer_voice(route, text)
+    # Show the raw transcription to the user (echo bubble) before wrapping
+    # the prompt with §2.5 reply context — the echo is for the human, the
+    # rendered text is what Claude actually sees.
+    echo = text
+    rendered = await _apply_reply_context(update.message, user.id, thread_id, text)
+    await aggregator_offer_voice(route, rendered)
 
-    await safe_reply(update.message, f'🎤 "{text}"')
+    await safe_reply(update.message, f'🎤 "{echo}"')
 
 
 def _sanitize_filename_part(part: str, max_len: int) -> str:
@@ -1052,6 +1113,12 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     clear_status_msg_info(user.id, thread_id)
 
     set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
+
+    # §2.5: see photo_handler for the media-group caption-skip rationale.
+    if caption or media_group_id is None:
+        caption = await _apply_reply_context(
+            update.message, user.id, thread_id, caption
+        )
 
     route = (user.id, thread_id, wid)
     await aggregator_offer_document(route, file_path, caption, media_group_id)
@@ -1176,49 +1243,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # paths below — otherwise a brand-new-topic flow (where the directory
     # browser holds the text while the user picks a directory) would lose
     # the quote when it eventually flushes via _create_and_bind_window.
-    if config.reply_context_enabled:
-        reply_ctx = extract_reply_context(update.message)
-        if reply_ctx is not None:
-            # §2.5.4 routing guardrail: ``resolve`` enriches role/session
-            # metadata for prompt rendering; routing still flows through
-            # the topic's currently-bound window, never through
-            # ``reply_ctx.session_id``.
-            reply_ctx = await reply_context_mod.resolve(
-                reply_ctx, update.message.chat.id
-            )
-            # Stale-quote guard. If the reply points at a message from a
-            # session that has since been /clear-ed (or otherwise replaced),
-            # the rendered ``<<<QUOTE_…>>>`` block references context the
-            # current session can't see. Empirically this can produce empty
-            # turns from the model — it sees a quoted reference to a
-            # nonexistent session and returns no output. Drop the wrapper
-            # and just send the user text in that case.
-            current_sid = None
-            bound_wid = session_manager.resolve_window_for_thread(
-                user.id, thread_id
-            )
-            if bound_wid is not None:
-                current_session = await session_manager.resolve_session_for_window(
-                    bound_wid
-                )
-                if current_session is not None:
-                    current_sid = current_session.session_id
-            stale_quote = (
-                reply_ctx.session_id is not None
-                and current_sid is not None
-                and reply_ctx.session_id != current_sid
-            )
-            if stale_quote:
-                logger.info(
-                    "Dropping reply context: quoted session %s != current %s "
-                    "(window=%s, thread=%s)",
-                    reply_ctx.session_id,
-                    current_sid,
-                    bound_wid,
-                    thread_id,
-                )
-            else:
-                text = render_for_claude(text, reply_ctx)
+    text = await _apply_reply_context(update.message, user.id, thread_id, text)
 
     # Ignore text in window picker mode (only for the same thread)
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
