@@ -31,12 +31,24 @@ in):
   tool-result lifecycle events instead of pane scraping. Native "is
   typing…" indicator runs on a dedicated 3-second loop that reads
   state directly with no tmux I/O — so it doesn't expire mid-turn even
-  with 14+ active bindings. Gated by `CCBOT_BUSY_INDICATOR_V2`.
+  with 14+ active bindings. On by default; toggle with
+  `CCBOT_BUSY_INDICATOR_V2=false` to fall back to the legacy V1 path.
 - **Activity digest.** A per-turn digest message summarizes tool
   activity (counts, snippets) under a run-state header, with a
-  threshold-gated context-% suffix lifted from the terminal pane (e.g.
-  `· ctx 89%`, `⚠️` past 95%). Final assistant text always lands
+  threshold-gated context-% suffix lifted from the JSONL transcript
+  (e.g. `· ctx 89%`, `⚠️` past 95%). Final assistant text always lands
   *after* the digest in chronological order.
+- **Context-window usage in three places.** The same JSONL-derived
+  context-% drives (1) the run-state digest header, (2) an optional
+  per-turn footer on end-of-turn assistant messages (`📊 113k / 200k`
+  — snapshot at send-time, never edited), and (3) a warning glyph on
+  long-running topics. Replaces the old `/context` slash command —
+  now removed since the footer covers the same need.
+- **Tool-call summary truncation, configurable.** The per-tool input
+  surfaced in tool_use lines (e.g. `**Bash**(...)`, `**Read**(...)`)
+  is bounded by `CCBOT_TOOL_SUMMARY_MAX_CHARS` (default 40 — compact
+  feed; raise to 600 to preserve full bash one-liners at the cost of
+  multi-line activity entries).
 - **End-of-turn attention card with answer buttons.** Strict trigger
   (assistant text + `stop_reason ∈ {end_turn, stop_sequence}` + final
   paragraph ends with `?` + `WAITING_ON_USER`) surfaces a prominent
@@ -51,15 +63,23 @@ in):
   message; completion edits the same message in place with `🤖✅` /
   `❌` / `⏹` and the result, so subagent runs don't get buried in the
   per-turn digest.
-- **Reply-context bridge.** When you reply to a Telegram message (with
-  optional Telegram quote), the original + the quoted body are
-  forwarded to Claude inside random-token quote fences
-  (`<<<QUOTE_xxx>>>` / `<<<END_QUOTE_xxx>>>`) so adversarial quoted
-  content can't break out into a fake `[User message]` block. SQLite
-  provenance lookups enrich the quote with role / content_type — quotes
-  of UI noise (status / activity cards) render under a "this is UI
-  state" header instead of being passed to Claude as load-bearing
-  instruction.
+- **Reply-context bridge — across all message types.** When you reply
+  to a Telegram message (with optional Telegram quote), the original
+  + the quoted body are forwarded to Claude inside random-token quote
+  fences (`<<<QUOTE_xxx>>>` / `<<<END_QUOTE_xxx>>>`) so adversarial
+  quoted content can't break out into a fake `[User message]` block.
+  SQLite provenance lookups enrich the quote with role / content_type
+  — quotes of UI noise (status / activity cards) render under a
+  "this is UI state" header instead of being passed to Claude as
+  load-bearing instruction. The render covers text, voice
+  (transcribed), photo, and document replies; previously voice / photo
+  / document silently dropped the quote.
+- **Stay out of the topic title.** The bot never modifies forum topic
+  titles. Earlier versions appended live tokens / context indicators
+  to titles, which spammed Telegram's "topic changed" system events;
+  status now lives entirely in messages. On startup, any leftover
+  `· Nk/Mk` suffixes from the old behavior are stripped from
+  ``window_display_names``.
 - **Inbound aggregator.** Per-route 1.5-second debounce coalesces
   caption + media-group + photo-then-text fast-follow into a single
   `send_to_window` call. Multi-screenshot rule: caption appears
@@ -84,6 +104,38 @@ in):
   text column, and writes never block the send path. DB path
   overridable via `CCBOT_MESSAGE_REFS_DB_PATH`.
 - **Reliability hotfixes** that arrived alongside the bigger work:
+  - **Silent message loss after `/clear` (3 root causes).** When a
+    user hit `/clear` and immediately sent a quoted reply, the bot
+    delivered nothing for ~10 minutes while the topic stayed pinned
+    "🟡 Busy". Three landed fixes: `session_monitor` calls
+    `busy_indicator.clear_route` on a window's session-id flip so
+    `_open_tools` from the dead session can't pin RUNNING forever; the
+    transcript parser detects `system / turn_duration` empty-turn
+    entries and emits a visible "⚠️ Claude finished without
+    responding" warning plus a synthetic `end_turn` lifecycle marker;
+    and the bot drops the `<<<QUOTE_…>>>` reply-context wrapper when
+    the quoted message's session_id no longer matches the topic's
+    current bound session (the model returned empty turns when asked
+    to reason about a quote that pointed into a `/clear`-ed session).
+  - **`session_map.json` cleanup race.** Cleanup paths in
+    `SessionManager` were doing read-modify-write on `session_map.json`
+    without holding `session_map.lock`. A SessionStart hook write
+    landing between read and write was getting clobbered by the bot's
+    stale snapshot, leaving the bot tailing dead JSONL files. Both
+    cleanup paths now flock the same lock as `hook.py`.
+  - **Skip SDK sub-agent SessionStart hooks.** Sub-agents launched
+    inside Claude (entrypoint `sdk-cli`) were overwriting
+    `session_map.json` with their own short-lived session id, so the
+    bot would start tailing a session that disappears when the
+    sub-agent finishes — and miss every subsequent user reply.
+  - **Status polling: adaptive pane capture + 10 s watchdog.** Pane
+    captures back off to coarser intervals when the pane is idle and
+    are bounded by a 10 s watchdog so a hung tmux subprocess can't
+    stall the polling loop.
+  - **tmux call hot path.** Cached `shutil.which`, a TTL cache on
+    `list_windows`, and a single subprocess per cache miss for hot
+    read paths — measurable cut to the per-poll wall-clock, and
+    a much calmer process tree.
   - Status card no longer resurrected by a post-completion pane summary.
   - Bounded `RetryAfter` retry path for content tasks (3 attempts) with
     correct merged-task capture so retries don't re-drain the queue.
@@ -94,12 +146,18 @@ in):
   - Directory browser defaults to `~` (overridable via
     `CCBOT_BROWSE_ROOT`) instead of the bot's cwd, so restarting from
     inside the project tree no longer surfaces the bot's own source.
+    Unbound topics open the directory browser first; "🖥 Bind existing
+    window" is an opt-in button rather than the default flow.
   - `TELEGRAM_BOT_TOKEN` / `ALLOWED_USERS` / `OPENAI_API_KEY`
     scrubbed from `os.environ` after load so they can't leak to the
     Claude subprocess via tmux.
 
-The next round of design work is in
-[`docs/plans/2026-05-02-event-driven-busy-and-route-queues.md`](docs/plans/2026-05-02-event-driven-busy-and-route-queues.md).
+Active design notes live in [`docs/plans/`](docs/plans/) — the
+event-driven busy + per-route-queue plan
+([`2026-05-02-…`](docs/plans/2026-05-02-event-driven-busy-and-route-queues.md))
+and the in-progress lean-rename effort
+([`2026-05-05-…-implementation-plan.md`](docs/plans/2026-05-05-cc-telegram-lean-rename-implementation-plan.md))
+are the current ones.
 
 ## Features
 
@@ -184,6 +242,7 @@ Core variables:
 | `CCBOT_SHOW_USER_MESSAGES` | `true` | echo direct-tmux user input back to Telegram |
 | `CCBOT_SHOW_TOOL_CALLS` | `true` | include tool use / result in stream |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | show dot-directories in the picker |
+| `CCBOT_TOOL_SUMMARY_MAX_CHARS` | `40` | truncation for tool input shown in `**Tool**(...)` lines |
 | `OPENAI_API_KEY` | — | enables voice transcription |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | for OpenAI-compatible proxies |
 
@@ -191,14 +250,18 @@ Feature flags for fork-specific behavior:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CCBOT_BUSY_INDICATOR_V2` | `false` | event-driven RunState (typing-action, digest header, busy state) |
+| `CCBOT_BUSY_INDICATOR_V2` | `true` | event-driven RunState (typing-action, digest header, busy state); set `false` for legacy V1 |
 | `CCBOT_ATTENTION_BUTTONS` | `true` | yes / no / type-in-chat buttons on end-of-turn cards |
 | `CCBOT_ATTENTION_BUTTON_TTL_SECONDS` | `86400` | how long an attention token stays clickable |
+| `CCBOT_ATTENTION_QUESTION_PREVIEW_CHARS` | `200` | end-of-turn-question card excerpt length |
+| `CCBOT_AGENT_PROMPT_PREVIEW_CHARS` | `400` | excerpt length on the `🤖 Subagent dispatched` card |
 | `CCBOT_REPLY_CONTEXT` | `true` | forward Telegram reply / quote to Claude inside fenced quotes |
+| `CCBOT_QUOTE_INJECTION_MAX_CHARS` | `1600` | upper bound on the quoted-text excerpt injected into Claude's prompt |
 | `CCBOT_AGGREGATOR_DEBOUNCE_SECONDS` | `1.5` | inbound aggregator window for caption + media-group bundling |
 | `CCBOT_AGGREGATOR_MAX_ATTACHMENTS` | `10` | per-bundle attachment cap (photos + documents) |
 | `CCBOT_MAX_ATTACHMENT_SIZE_BYTES` | `20971520` | upper bound on document downloads (default 20 MB) |
 | `CCBOT_CONTEXT_PCT_THRESHOLD` | `80` | digest header shows context-% at or above this |
+| `CCBOT_CONTEXT_IN_MESSAGE_FOOTER` | `true` | per-turn `📊 113k / 200k` footer on end-of-turn assistant messages |
 | `CCBOT_MESSAGE_REFS_RETENTION_DAYS` | `30` | provenance-table GC retention |
 | `CCBOT_MESSAGE_REFS_DB_PATH` | `$CCBOT_DIR/message_refs.db` | SQLite path |
 
@@ -231,12 +294,6 @@ MONITOR_POLL_INTERVAL=1.0
 
 # Voice → text. Worth the API cost; talking is faster than typing.
 OPENAI_API_KEY=sk-...
-
-# Turn on the event-driven busy/run-state machine. Off by default,
-# but this is what powers the live "is typing…" indicator that
-# survives long tool runs, the run-state digest header, and the
-# end-of-turn answer buttons working as intended.
-CCBOT_BUSY_INDICATOR_V2=true
 
 # Optional: directory picker default. Point at your code root.
 CCBOT_BROWSE_ROOT=~/dev
