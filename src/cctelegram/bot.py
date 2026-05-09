@@ -250,6 +250,35 @@ class PendingAttachment:
     media_group_id: str | None
 
 
+def _clear_pending_route_payload(
+    user_data: dict | None, *, delete_files: bool
+) -> list[PendingAttachment]:
+    """Clear pending unbound-topic payload state and optionally delete files.
+
+    Pending text/photo/document data lives outside the aggregator while the
+    user is choosing a directory/window/session. Cancel, stale-topic mismatch,
+    and bind failure must clear the whole bundle, not just text, otherwise a
+    later bind can forward media the user already cancelled.
+    """
+    if user_data is None:
+        return []
+    attachments: list[PendingAttachment] = list(
+        user_data.pop("_pending_thread_attachments", []) or []
+    )
+    user_data.pop("_pending_thread_id", None)
+    user_data.pop("_pending_thread_text", None)
+    user_data.pop("_selected_path", None)
+    if delete_files:
+        for attachment in attachments:
+            try:
+                Path(attachment.path).unlink(missing_ok=True)
+            except OSError as e:
+                logger.debug(
+                    "failed to delete pending attachment %s: %s", attachment.path, e
+                )
+    return attachments
+
+
 def _get_thread_id(update: Update) -> int | None:
     """Extract thread_id from an update, returning None if not in a named topic."""
     msg = update.message or (
@@ -823,6 +852,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     media_group_id = update.message.media_group_id
 
     if wid is None:
+        if context.user_data is not None:
+            pending_tid = context.user_data.get("_pending_thread_id")
+            if pending_tid is not None and pending_tid != thread_id:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
         # §2.8.3 photo-in-unbound-topic: stash the path so the directory
         # picker's flush in _create_and_bind_window can feed the aggregator
         # for the freshly-bound route. Multiple photos can pile up here
@@ -1066,6 +1099,9 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if wid is None:
         if context.user_data is not None:
+            pending_tid = context.user_data.get("_pending_thread_id")
+            if pending_tid is not None and pending_tid != thread_id:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             pending_attachments = context.user_data.setdefault(
                 "_pending_thread_attachments", []
             )
@@ -1256,8 +1292,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         # Stale picker state from a different thread — clear it
         clear_window_picker_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
+        _clear_pending_route_payload(context.user_data, delete_files=True)
 
     # Ignore text in directory browsing mode (only for the same thread)
     if (
@@ -1273,8 +1308,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         # Stale browsing state from a different thread — clear it
         clear_browse_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
+        _clear_pending_route_payload(context.user_data, delete_files=True)
 
     # Ignore text in session picker mode (only for the same thread)
     if (
@@ -1290,9 +1324,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         # Stale picker state from a different thread — clear it
         clear_session_picker_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
-        context.user_data.pop("_selected_path", None)
+        _clear_pending_route_payload(context.user_data, delete_files=True)
 
     # Must be in a named topic
     if thread_id is None:
@@ -1497,8 +1529,7 @@ async def _create_and_bind_window(
                     "Send your message again to retry.",
                 )
                 if context.user_data is not None:
-                    context.user_data.pop("_pending_thread_text", None)
-                    context.user_data.pop("_pending_thread_id", None)
+                    _clear_pending_route_payload(context.user_data, delete_files=True)
                 await query.answer("Hook timeout")
                 return
 
@@ -1546,9 +1577,7 @@ async def _create_and_bind_window(
             )
             if pending_text or pending_attachments:
                 if context.user_data is not None:
-                    context.user_data.pop("_pending_thread_text", None)
-                    context.user_data.pop("_pending_thread_attachments", None)
-                    context.user_data.pop("_pending_thread_id", None)
+                    _clear_pending_route_payload(context.user_data, delete_files=False)
                 route = (user.id, pending_thread_id, created_wid)
                 if pending_text:
                     logger.debug(
@@ -1566,15 +1595,14 @@ async def _create_and_bind_window(
                     )
                 await aggregator_flush_route(route)
             elif context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
+                _clear_pending_route_payload(context.user_data, delete_files=False)
         else:
             # Should not happen in topic-only mode, but handle gracefully
             await safe_edit(query, f"✅ {message}")
     else:
         await safe_edit(query, f"❌ {message}")
         if pending_thread_id is not None and context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
+            _clear_pending_route_payload(context.user_data, delete_files=True)
     await query.answer("Created" if success else "Failed")
 
 
@@ -1771,6 +1799,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         # callback_data contains index, not dir name (to avoid 64-byte limit)
@@ -1835,6 +1865,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         default_path = str(Path.cwd())
@@ -1870,6 +1902,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         try:
@@ -1916,8 +1950,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if pending_thread_id is not None and confirm_thread_id != pending_thread_id:
             clear_browse_state(context.user_data)
             if context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
-                context.user_data.pop("_pending_thread_text", None)
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
 
@@ -1946,12 +1979,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         clear_browse_state(context.user_data)
         if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
+            _clear_pending_route_payload(context.user_data, delete_files=True)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
@@ -1965,6 +1999,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if pending_tid is None:
             pending_tid = _get_thread_id(update)
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         try:
@@ -2006,6 +2042,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if pending_tid is None:
             pending_tid = _get_thread_id(update)
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         selected_path = (
@@ -2024,13 +2062,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         clear_session_picker_state(context.user_data)
         if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
-            context.user_data.pop("_selected_path", None)
+            _clear_pending_route_payload(context.user_data, delete_files=True)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
@@ -2040,6 +2078,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         try:
@@ -2090,9 +2130,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             else []
         )
         if context.user_data is not None:
-            context.user_data.pop("_pending_thread_text", None)
-            context.user_data.pop("_pending_thread_attachments", None)
-            context.user_data.pop("_pending_thread_id", None)
+            _clear_pending_route_payload(context.user_data, delete_files=False)
         if pending_text or pending_attachments:
             route = (user.id, thread_id, selected_wid)
             if pending_text:
@@ -2113,6 +2151,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         # Preserve pending thread info, clear only picker state
@@ -2144,6 +2184,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         unbound = await _list_unbound_windows()
@@ -2166,12 +2208,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         clear_window_picker_state(context.user_data)
         if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
+            _clear_pending_route_payload(context.user_data, delete_files=True)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
