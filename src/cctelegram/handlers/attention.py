@@ -116,6 +116,10 @@ class _AttentionCallbackEntry:
     """
 
     route: Route
+    chat_id: int
+    thread_id: int | None
+    window_id: str
+    session_id: str | None
     created_at: float
     rendered_text: str
     parse_mode: str | None
@@ -481,6 +485,10 @@ async def notify_waiting(
         # orphan below so it cannot accumulate.
         _attention_callback_routes[pending_token] = _AttentionCallbackEntry(
             route=(user_id, thread_id or 0, window_id),
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            session_id=session_id_for_window(window_id),
             created_at=time.monotonic(),
             rendered_text=text,
             parse_mode="MarkdownV2",
@@ -599,6 +607,29 @@ def clear(user_id: int, thread_id: int | None) -> None:
     rotation so a fresh attention episode never inherits a stale fingerprint.
     """
     _attention_state.pop(_key(user_id, thread_id), None)
+    revoke_attention_tokens(user_id=user_id, thread_id=thread_id)
+
+
+def revoke_attention_tokens(
+    *, user_id: int, thread_id: int | None, window_id: str | None = None
+) -> int:
+    """Revoke live attention-button tokens for a route.
+
+    ``clear`` calls this on route teardown/session rotation so old inline
+    buttons cannot later inject ``yes``/``no`` into a rebound or cleared route.
+    ``window_id`` narrows the revocation when a caller knows the exact route.
+    """
+    route_thread = thread_id or 0
+    stale_tokens = [
+        token
+        for token, entry in _attention_callback_routes.items()
+        if entry.route[0] == user_id
+        and entry.route[1] == route_thread
+        and (window_id is None or entry.route[2] == window_id)
+    ]
+    for token in stale_tokens:
+        _attention_callback_routes.pop(token, None)
+    return len(stale_tokens)
 
 
 def reset_for_tests() -> None:

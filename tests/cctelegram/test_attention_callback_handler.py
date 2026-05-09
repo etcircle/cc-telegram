@@ -28,10 +28,21 @@ def _reset_attention():
     attention.reset_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _current_attention_route():
+    """Default handler tests to a still-current topic→window binding."""
+    with patch.object(
+        bot_module.session_manager, "resolve_window_for_thread", return_value="@0"
+    ):
+        yield
+
+
 def _make_query(
     *,
     callback_data: str,
     from_user_id: int,
+    chat_id: int = -100123,
+    thread_id: int = 10,
     message_text: str = '🔔 Awaiting your reply — cc-telegram\n"Want me to do X?"',
 ) -> MagicMock:
     """Build a mock callback_query with the bits the handler reads."""
@@ -43,6 +54,9 @@ def _make_query(
     query.from_user.id = from_user_id
     query.message = MagicMock()
     query.message.text = message_text
+    query.message.chat = MagicMock()
+    query.message.chat.id = chat_id
+    query.message.message_thread_id = thread_id
     return query
 
 
@@ -55,6 +69,8 @@ def _make_update(query: MagicMock) -> MagicMock:
 def _register_token(
     route: tuple[int, int, str],
     *,
+    chat_id: int = -100123,
+    session_id: str | None = None,
     rendered_text: str = '🔔 Awaiting your reply — cc-telegram\n"Want me to do X?"',
     parse_mode: str | None = "MarkdownV2",
 ) -> str:
@@ -64,6 +80,10 @@ def _register_token(
     token = attention._make_attention_callback_token()
     attention._attention_callback_routes[token] = attention._AttentionCallbackEntry(
         route=route,
+        chat_id=chat_id,
+        thread_id=route[1],
+        window_id=route[2],
+        session_id=session_id,
         created_at=_time.monotonic(),
         rendered_text=rendered_text,
         parse_mode=parse_mode,
@@ -287,6 +307,153 @@ async def test_attention_callback_idempotent_second_click():
 
 
 # ── Bug fix regression tests ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_reset_attention")
+async def test_attention_callback_rejects_topic_rebound_without_rebinding():
+    """Stale token must not inject yes/no after the topic is rebound."""
+    route = (1, 10, "@0")
+    token = _register_token(route)
+
+    query = _make_query(callback_data=f"attn:yes:{token}", from_user_id=1)
+    update = _make_update(query)
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module.session_manager, "resolve_window_for_thread", return_value="@1"
+        ),
+        patch.object(
+            bot_module, "aggregator_offer_text", new_callable=AsyncMock
+        ) as mock_offer,
+        patch.object(
+            bot_module, "aggregator_flush_route", new_callable=AsyncMock
+        ) as mock_flush,
+    ):
+        await bot_module.attention_callback_handler(update, MagicMock())
+
+    query.answer.assert_awaited_once()
+    args, kwargs = query.answer.await_args
+    assert (args[0] if args else kwargs.get("text")) == "This attention card is stale."
+    assert kwargs.get("show_alert") is True
+    mock_offer.assert_not_called()
+    mock_flush.assert_not_called()
+    assert token not in attention._attention_callback_routes
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_reset_attention")
+async def test_attention_callback_rejects_wrong_chat_thread_without_rebinding():
+    """Callback must originate from the chat/topic captured in the card token."""
+    route = (1, 10, "@0")
+    token = _register_token(route, chat_id=-100123)
+
+    query = _make_query(
+        callback_data=f"attn:no:{token}",
+        from_user_id=1,
+        chat_id=-100999,
+        thread_id=10,
+    )
+    update = _make_update(query)
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module, "aggregator_offer_text", new_callable=AsyncMock
+        ) as mock_offer,
+        patch.object(
+            bot_module, "aggregator_flush_route", new_callable=AsyncMock
+        ) as mock_flush,
+    ):
+        await bot_module.attention_callback_handler(update, MagicMock())
+
+    query.answer.assert_awaited_once()
+    args, kwargs = query.answer.await_args
+    assert (args[0] if args else kwargs.get("text")) == "This attention card is stale."
+    assert kwargs.get("show_alert") is True
+    mock_offer.assert_not_called()
+    mock_flush.assert_not_called()
+    assert token not in attention._attention_callback_routes
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_reset_attention")
+async def test_attention_callback_rejects_wrong_thread_without_rebinding():
+    """Callback from the right chat but wrong topic must not redeem the token."""
+    route = (1, 10, "@0")
+    token = _register_token(route, chat_id=-100123)
+
+    query = _make_query(
+        callback_data=f"attn:yes:{token}",
+        from_user_id=1,
+        chat_id=-100123,
+        thread_id=99,
+    )
+    update = _make_update(query)
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module, "aggregator_offer_text", new_callable=AsyncMock
+        ) as mock_offer,
+        patch.object(
+            bot_module, "aggregator_flush_route", new_callable=AsyncMock
+        ) as mock_flush,
+    ):
+        await bot_module.attention_callback_handler(update, MagicMock())
+
+    query.answer.assert_awaited_once()
+    args, kwargs = query.answer.await_args
+    assert (args[0] if args else kwargs.get("text")) == "This attention card is stale."
+    assert kwargs.get("show_alert") is True
+    mock_offer.assert_not_called()
+    mock_flush.assert_not_called()
+    assert token not in attention._attention_callback_routes
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_reset_attention")
+async def test_attention_callback_rejects_session_generation_change():
+    """Session drift after /clear/restart revokes the old button token."""
+    route = (1, 10, "@0")
+    token = _register_token(route, session_id="old-session")
+
+    query = _make_query(callback_data=f"attn:yes:{token}", from_user_id=1)
+    update = _make_update(query)
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module, "session_id_for_window", return_value="new-session"),
+        patch.object(
+            bot_module, "aggregator_offer_text", new_callable=AsyncMock
+        ) as mock_offer,
+        patch.object(
+            bot_module, "aggregator_flush_route", new_callable=AsyncMock
+        ) as mock_flush,
+    ):
+        await bot_module.attention_callback_handler(update, MagicMock())
+
+    query.answer.assert_awaited_once()
+    args, kwargs = query.answer.await_args
+    assert (args[0] if args else kwargs.get("text")) == "This attention card is stale."
+    assert kwargs.get("show_alert") is True
+    mock_offer.assert_not_called()
+    mock_flush.assert_not_called()
+    assert token not in attention._attention_callback_routes
+
+
+def test_attention_clear_revokes_route_tokens(_reset_attention):
+    """Route teardown must revoke old buttons, not just hide card state."""
+    kept = _register_token((1, 11, "@0"))
+    revoked_a = _register_token((1, 10, "@0"))
+    revoked_b = _register_token((1, 10, "@1"))
+
+    attention.clear(1, 10)
+
+    assert kept in attention._attention_callback_routes
+    assert revoked_a not in attention._attention_callback_routes
+    assert revoked_b not in attention._attention_callback_routes
 
 
 @pytest.mark.asyncio

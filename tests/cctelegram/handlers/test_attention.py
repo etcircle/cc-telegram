@@ -797,6 +797,10 @@ def test_prune_expired_attention_tokens_drops_old_entries():
     now = time.monotonic()
     attention._attention_callback_routes[fresh] = attention._AttentionCallbackEntry(
         route=(1, 10, "@0"),
+        chat_id=-100123,
+        thread_id=10,
+        window_id="@0",
+        session_id="sess",
         created_at=now,
         rendered_text="body",
         parse_mode="MarkdownV2",
@@ -804,6 +808,10 @@ def test_prune_expired_attention_tokens_drops_old_entries():
     # Older than the default TTL (86400) — backdate by 2 days.
     attention._attention_callback_routes[stale] = attention._AttentionCallbackEntry(
         route=(1, 10, "@0"),
+        chat_id=-100123,
+        thread_id=10,
+        window_id="@0",
+        session_id="sess",
         created_at=now - (2 * 86400),
         rendered_text="body",
         parse_mode="MarkdownV2",

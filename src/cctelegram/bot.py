@@ -156,7 +156,7 @@ from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop, typing_action_loop
 from .screenshot import text_to_image
-from .session import session_manager
+from .session import session_id_for_window, session_manager
 from .session_monitor import NewMessage, SessionMonitor, TranscriptEvent
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
@@ -1585,6 +1585,39 @@ async def _create_and_bind_window(
 _ATTN_CALLBACK_RE = re.compile(r"^attn:(yes|no|type):([\w-]+)$")
 
 
+def _attention_callback_stale_reason(
+    query: object, entry: attention._AttentionCallbackEntry
+) -> str | None:
+    """Return a user-facing reject reason if an attention token is stale.
+
+    Attention buttons send literal ``yes``/``no`` into Claude, so they need the
+    same freshness guard as raw window callbacks: the click must come from the
+    original Telegram chat/topic, the route must still bind to the same tmux
+    window, and the window's current Claude session must still match the one
+    captured when the card was created.
+    """
+    message = getattr(query, "message", None)
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is not None and chat_id != entry.chat_id:
+        return "This attention card is stale."
+
+    thread_id = getattr(message, "message_thread_id", None)
+    if entry.thread_id is not None and thread_id != entry.thread_id:
+        return "This attention card is stale."
+
+    current_window = session_manager.resolve_window_for_thread(
+        entry.route[0], entry.thread_id
+    )
+    if current_window != entry.window_id:
+        return "This attention card is stale."
+
+    if session_id_for_window(entry.window_id) != entry.session_id:
+        return "This attention card is stale."
+
+    return None
+
+
 async def attention_callback_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1626,6 +1659,13 @@ async def attention_callback_handler(
         # owner can still redeem it.
         attention.rebind_attention_token(token, entry)
         await query.answer("Not your session.", show_alert=True)
+        return
+
+    stale_reason = _attention_callback_stale_reason(query, entry)
+    if stale_reason is not None:
+        # Do not re-bind: a stale route/session token is intentionally revoked
+        # so the old button cannot become a delayed send gadget.
+        await query.answer(stale_reason, show_alert=True)
         return
 
     if verb in ("yes", "no"):
