@@ -292,6 +292,13 @@ def _get_thread_id(update: Update) -> int | None:
     return tid
 
 
+def _callback_window_is_current(
+    user_id: int, thread_id: int | None, window_id: str
+) -> bool:
+    """Return True when a callback's encoded window still owns the topic."""
+    return session_manager.resolve_window_for_thread(user_id, thread_id) == window_id
+
+
 async def _list_unbound_windows() -> list[tuple[str, str, str]]:
     """Return tmux windows not currently bound to any topic, as (id, name, cwd)."""
     all_windows = await tmux_manager.list_windows()
@@ -1754,6 +1761,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
 
+    async def reject_stale_window_callback(window_id: str) -> bool:
+        """Answer and short-circuit if controls no longer match this topic."""
+        if _callback_window_is_current(user.id, cb_thread_id, window_id):
+            return False
+        await query.answer("Stale controls (topic mismatch)", show_alert=True)
+        return True
+
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>
     if data.startswith(CB_HISTORY_PREV) or data.startswith(CB_HISTORY_NEXT):
@@ -2108,6 +2122,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Not in a topic", show_alert=True)
             return
 
+        current_unbound_ids = {wid for wid, _, _ in await _list_unbound_windows()}
+        if selected_wid not in current_unbound_ids:
+            await query.answer(
+                "Window is no longer unbound, please retry", show_alert=True
+            )
+            return
+
         display = w.window_name
         clear_window_picker_state(context.user_data)
         session_manager.bind_thread(
@@ -2221,6 +2242,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Screenshot: Refresh
     elif data.startswith(CB_SCREENSHOT_REFRESH):
         window_id = data[len(CB_SCREENSHOT_REFRESH) :]
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if not w:
             await query.answer("Window no longer exists", show_alert=True)
@@ -2252,6 +2275,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_UP):
         window_id = data[len(CB_ASK_UP) :]
         thread_id = _get_thread_id(update)
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
@@ -2263,6 +2288,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_DOWN):
         window_id = data[len(CB_ASK_DOWN) :]
         thread_id = _get_thread_id(update)
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
@@ -2276,6 +2303,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_LEFT):
         window_id = data[len(CB_ASK_LEFT) :]
         thread_id = _get_thread_id(update)
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
@@ -2289,6 +2318,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_RIGHT):
         window_id = data[len(CB_ASK_RIGHT) :]
         thread_id = _get_thread_id(update)
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
@@ -2302,6 +2333,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_ESC):
         window_id = data[len(CB_ASK_ESC) :]
         thread_id = _get_thread_id(update)
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
@@ -2314,6 +2347,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_ENTER):
         window_id = data[len(CB_ASK_ENTER) :]
         thread_id = _get_thread_id(update)
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
@@ -2327,6 +2362,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_SPACE):
         window_id = data[len(CB_ASK_SPACE) :]
         thread_id = _get_thread_id(update)
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
@@ -2340,6 +2377,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_TAB):
         window_id = data[len(CB_ASK_TAB) :]
         thread_id = _get_thread_id(update)
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
@@ -2351,6 +2390,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data.startswith(CB_ASK_REFRESH):
         window_id = data[len(CB_ASK_REFRESH) :]
         thread_id = _get_thread_id(update)
+        if await reject_stale_window_callback(window_id):
+            return
         await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("🔄")
 
@@ -2370,6 +2411,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         tmux_key, enter, literal = key_info
+        if await reject_stale_window_callback(window_id):
+            return
         w = await tmux_manager.find_window_by_id(window_id)
         if not w:
             await query.answer("Window not found", show_alert=True)

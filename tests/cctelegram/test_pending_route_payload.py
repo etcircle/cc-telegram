@@ -218,6 +218,12 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
             new_callable=AsyncMock,
             return_value=window,
         ),
+        patch.object(
+            bot_module,
+            "_list_unbound_windows",
+            new_callable=AsyncMock,
+            return_value=[("window-1", "window one", "/tmp")],
+        ),
         patch.object(bot_module, "safe_edit", new_callable=AsyncMock),
         patch.object(
             bot_module, "aggregator_offer_text", new_callable=AsyncMock
