@@ -15,6 +15,12 @@ from .utils import app_dir
 
 LEGACY_DIR_NAME = ".ccbot"
 NEW_DIR_NAME = ".cc-telegram"
+OBVIOUS_STATE_FILES = (
+    "state.json",
+    "session_map.json",
+    "monitor_state.json",
+    "message_refs.db",
+)
 
 
 def _default_legacy_dir() -> Path:
@@ -76,6 +82,14 @@ def _copy_tree_contents(src: Path, dst: Path) -> None:
             shutil.copy2(child, target)
 
 
+def _describe_target_state_files(target: Path) -> list[str]:
+    """Return human-readable status lines for well-known target state files."""
+    return [
+        f"  - {name}: {'present' if (target / name).exists() else 'missing'}"
+        for name in OBVIOUS_STATE_FILES
+    ]
+
+
 def doctor_main(argv: list[str] | None = None) -> int:
     """Run migration diagnostics, optionally copying legacy state."""
     parser = argparse.ArgumentParser(
@@ -106,6 +120,17 @@ def doctor_main(argv: list[str] | None = None) -> int:
         return 0
 
     if legacy.exists() and target.exists():
+        if args.migrate:
+            print("ERROR: migration skipped because target state dir already exists.")
+            print(f"  legacy: {legacy}")
+            print(f"  target: {target}")
+            print("Target obvious state files:")
+            for line in _describe_target_state_files(target):
+                print(line)
+            print("\nNo files were copied to avoid overwriting existing state.")
+            print("Review both directories, then migrate manually if intended:")
+            print(f"  {migration_command(legacy, target)}")
+            return 1
         print(f"OK: both legacy and new state dirs exist ({legacy}, {target}).")
         print("Runtime uses only the new state dir unless CC_TELEGRAM_DIR is set.")
         return 0

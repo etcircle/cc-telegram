@@ -105,3 +105,47 @@ class TestDoctorMain:
         assert "Migration available" in out
         assert f"cp -R {legacy}/. {target}/" in out
         assert not target.exists()
+
+    def test_migrate_refuses_when_legacy_and_target_both_exist(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        legacy = tmp_path / ".ccbot"
+        target = tmp_path / ".cc-telegram"
+        legacy.mkdir()
+        target.mkdir()
+        (legacy / "state.json").write_text("legacy", encoding="utf-8")
+        (target / "state.json").write_text("target", encoding="utf-8")
+        monkeypatch.setattr(doctor, "_default_legacy_dir", lambda: legacy)
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(target))
+
+        assert doctor.doctor_main(["--migrate"]) == 1
+
+        out = capsys.readouterr().out
+        assert "ERROR: migration skipped because target state dir already exists" in out
+        assert "No files were copied" in out
+        assert f"cp -R {legacy}/. {target}/" in out
+        assert "state.json: present" in out
+        assert "session_map.json: missing" in out
+        assert (target / "state.json").read_text(encoding="utf-8") == "target"
+
+    def test_non_migrate_is_ok_when_legacy_and_target_both_exist(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        legacy = tmp_path / ".ccbot"
+        target = tmp_path / ".cc-telegram"
+        legacy.mkdir()
+        target.mkdir()
+        monkeypatch.setattr(doctor, "_default_legacy_dir", lambda: legacy)
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(target))
+
+        assert doctor.doctor_main([]) == 0
+
+        out = capsys.readouterr().out
+        assert "OK: both legacy and new state dirs exist" in out
+        assert "migration skipped" not in out

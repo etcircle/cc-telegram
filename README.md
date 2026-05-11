@@ -34,6 +34,26 @@ cd cc-telegram
 uv sync --all-extras
 ```
 
+## Migrate from old `ccbot` state
+
+The runtime uses `~/.cc-telegram` only. It does **not** silently dual-read `~/.ccbot`.
+
+**Existing `ccbot` users:** migrate before creating or using `~/.cc-telegram`. If both `~/.ccbot` and `~/.cc-telegram` already exist, `doctor --migrate` refuses to copy so it cannot overwrite or hide existing state.
+
+Check state:
+
+```bash
+uv run cc-telegram doctor
+```
+
+Copy old state when needed:
+
+```bash
+uv run cc-telegram doctor --migrate
+```
+
+The bot start path refuses to run if `~/.ccbot` exists and `~/.cc-telegram` is missing, unless you explicitly set `CC_TELEGRAM_DIR`.
+
 ## Configure
 
 Create `~/.cc-telegram/.env`:
@@ -77,24 +97,6 @@ Useful behavior knobs:
 - `CC_TELEGRAM_MESSAGE_REFS_RETENTION_DAYS` — provenance retention; default `30`.
 - `CC_TELEGRAM_MESSAGE_REFS_DB_PATH` — SQLite path; default `$CC_TELEGRAM_DIR/message_refs.db`.
 - `CC_TELEGRAM_MESSAGE_REF_TEXT_MAX_CHARS` — stored body cap; default `4000`.
-
-## Migrate from old `ccbot` state
-
-The runtime uses `~/.cc-telegram` only. It does **not** silently dual-read `~/.ccbot`.
-
-Check state:
-
-```bash
-uv run cc-telegram doctor
-```
-
-Copy old state when needed:
-
-```bash
-uv run cc-telegram doctor --migrate
-```
-
-The bot start path refuses to run if `~/.ccbot` exists and `~/.cc-telegram` is missing, unless you explicitly set `CC_TELEGRAM_DIR`.
 
 ## Install the Claude Code hook
 
