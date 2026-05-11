@@ -108,7 +108,7 @@
 
 ---
 
-## 2. Feature Implementation Status in ccbot
+## 2. Feature Implementation Status in cc-telegram
 
 ### Already Implemented
 
@@ -121,10 +121,10 @@
 | **editMessageText** | ✅ | Status-to-content conversion, tool_result editing into tool_use messages |
 | **editMessageMedia** | ✅ | Screenshot refresh replaces image in-place |
 | **deleteMessage** | ✅ | Status message cleanup, interactive UI cleanup |
-| **BotCommand + set_my_commands** | ✅ | 10 commands registered: /start, /list, /history, /screenshot, /esc + 5 Claude Code forwards |
+| **BotCommand + set_my_commands** | ✅ | 11 commands registered in the bot menu: 7 cc-telegram controls plus 4 Claude Code forwards |
 | **sendDocument** | ✅ | Screenshots sent as PNG documents |
 | **ReplyKeyboardRemove** | ✅ | Used when switching away from reply keyboard |
-| **Claude Code command forwarding** | ✅ | /clear, /compact, /cost, /help, /memory forwarded to tmux |
+| **Claude Code command forwarding** | ✅ | `/clear`, `/compact`, `/cost`, and `/model` are registered in the bot menu and forwarded to tmux |
 | **Message rate limiting** | ✅ | 1.1s minimum interval per user to avoid flood control |
 | **Per-user message queues** | ✅ | FIFO ordering, content/status task separation, message merging |
 | **Status message deduplication** | ✅ | Skip edit if status text unchanged |
@@ -146,19 +146,42 @@
 
 ---
 
-## 3. Claude Code Slash Commands
+## 3. Slash Commands
 
-### Currently Forwarded by ccbot
+### Bot menu / native cc-telegram controls
 
-These 5 commands are registered in the Telegram bot menu and forwarded to Claude Code via tmux:
+These commands are handled by cc-telegram itself and are not forwarded to Claude Code:
 
 | Command | Bot Menu Description | Function |
 |---------|---------------------|----------|
-| `/clear` | ↗ Clear conversation history | Wipes conversation, starts fresh. ccbot also clears session association |
+| `/start` | Show welcome message | Show the welcome / usage entry point |
+| `/history` | Message history for this topic | Page through stored Telegram message history for the current topic |
+| `/screenshot` | Terminal screenshot with control keys | Send a terminal screenshot and inline control buttons |
+| `/esc` | Send Escape to interrupt Claude | Send Escape to the bound tmux window |
+| `/kill` | Kill session, leave topic open | Terminate the bound Claude Code/tmux window without closing the Telegram topic |
+| `/unbind` | Unbind topic from session (keeps window running) | Detach the Telegram topic from its current tmux window/session |
+| `/usage` | Show Claude Code usage remaining | Show remaining Claude Code usage information |
+
+### Claude Code commands registered in the bot menu
+
+These 4 commands are registered in the Telegram bot menu and forwarded to Claude Code via tmux:
+
+| Command | Bot Menu Description | Function |
+|---------|---------------------|----------|
+| `/clear` | ↗ Clear conversation history | Wipes Claude Code conversation history, starts fresh, and cc-telegram clears the tracked session association so the next `SessionStart` hook can re-bind it |
 | `/compact` | ↗ Compact conversation context | Summarize/compress context to free token budget. Supports optional instructions |
-| `/cost` | ↗ Show token/cost usage | Display token counts and API cost for current session |
-| `/help` | ↗ Show Claude Code help | List available commands and usage help |
-| `/memory` | ↗ Edit CLAUDE.md | Open CLAUDE.md for editing project instructions |
+| `/cost` | ↗ Show token/cost usage | Display token counts and API cost for the current session |
+| `/model` | ↗ Switch AI model | Open Claude Code's model selector in the terminal UI |
+
+cc-telegram also has a catch-all command handler after its native commands; manually typed non-native slash commands are sent to the bound Claude Code window. They are not published in the bot menu unless added to `CC_COMMANDS`.
+
+### Not registered / unsupported legacy commands
+
+| Command | Status | Notes |
+|---------|--------|-------|
+| `/help` | Not registered in the bot menu | Claude Code's help panel is terminal-interactive and does not reliably produce transcript output for Telegram |
+| `/memory` | Not registered in the bot menu | Opens an interactive CLAUDE.md editor/panel in Claude Code, which is not useful through Telegram forwarding |
+| `/list` | Removed | Older non-topic/session-list behavior is gone; current cc-telegram is topic-first |
 
 ### Other Claude Code Commands (Full Reference)
 
@@ -181,7 +204,7 @@ These 5 commands are registered in the Telegram bot menu and forwarded to Claude
 
 ### Recommendations for Additional Forwarding
 
-Consider adding `/context` to CC_COMMANDS — it is parameterless, non-interactive, and provides useful context window usage info that complements `/cost`.
+Consider adding `/context` to `CC_COMMANDS` — it is parameterless, non-interactive, and provides useful context window usage info that complements `/cost`.
 
 ---
 
