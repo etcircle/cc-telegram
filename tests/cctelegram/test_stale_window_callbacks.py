@@ -14,6 +14,8 @@ import pytest
 from cctelegram import bot as bot_module
 from cctelegram.handlers.callback_data import (
     CB_ASK_UP,
+    CB_HISTORY_NEXT,
+    CB_HISTORY_PREV,
     CB_KEYS_PREFIX,
     CB_SCREENSHOT_REFRESH,
     CB_WIN_BIND,
@@ -85,6 +87,37 @@ async def test_stale_screenshot_refresh_rejected_after_topic_rebound_or_unbound(
     mock_capture.assert_not_called()
     mock_image.assert_not_called()
     update.callback_query.edit_message_media.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_window", ["@1", None], ids=["rebound", "unbound"])
+@pytest.mark.parametrize("history_prefix", [CB_HISTORY_PREV, CB_HISTORY_NEXT])
+async def test_stale_history_pagination_rejected_before_tmux_lookup(
+    current_window: str | None, history_prefix: str
+):
+    update = _make_callback_update(f"{history_prefix}1:@0:10:20")
+    context = _make_context()
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager,
+            "resolve_window_for_thread",
+            return_value=current_window,
+        ),
+        patch.object(
+            bot_module.tmux_manager, "find_window_by_id", new_callable=AsyncMock
+        ) as mock_find,
+        patch.object(bot_module, "send_history", new_callable=AsyncMock) as mock_history,
+    ):
+        await bot_module.callback_handler(update, context)
+
+    update.callback_query.answer.assert_awaited_once_with(
+        "Stale history (topic mismatch)", show_alert=True
+    )
+    mock_find.assert_not_called()
+    mock_history.assert_not_called()
 
 
 @pytest.mark.asyncio

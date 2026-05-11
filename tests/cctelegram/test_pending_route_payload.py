@@ -166,6 +166,26 @@ def _make_document_update(*, thread_id: int = 99) -> MagicMock:
     return update
 
 
+def _make_text_update(*, thread_id: int = 99, text: str = "topic b text") -> MagicMock:
+    message = MagicMock()
+    message.text = text
+    message.photo = None
+    message.document = None
+    message.message_thread_id = thread_id
+    message.message_id = 122
+    message.chat = MagicMock()
+    message.chat.id = -100123
+    message.chat.type = "supergroup"
+
+    update = MagicMock()
+    update.message = message
+    update.callback_query = None
+    update.effective_user = MagicMock()
+    update.effective_user.id = 1
+    update.effective_chat = message.chat
+    return update
+
+
 def _cross_topic_picker_user_data(
     stale_file: Path, *, stale_state: str, thread_id: int = 10
 ) -> dict[str, object]:
@@ -465,6 +485,78 @@ async def test_replaced_topic_stale_callback_does_not_clear_new_photo_payload(
     mock_edit.assert_not_called()
     mock_create.assert_not_called()
     assert context.user_data["_pending_thread_id"] == 99
+    assert context.user_data["_pending_thread_attachments"] == pending_attachments
+    assert pending_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_text_replaced_topic_stale_cancel_does_not_clear_new_text_photo_payload(
+    tmp_path: Path,
+):
+    stale_file = tmp_path / "topic-a-pending.bin"
+    stale_file.write_bytes(b"stale")
+    context = MagicMock()
+    context.user_data = _cross_topic_picker_user_data(
+        stale_file, stale_state=STATE_BROWSING_DIRECTORY, thread_id=10
+    )
+    media_dir = tmp_path / "images"
+
+    with (
+        patch.object(bot_module, "_IMAGES_DIR", media_dir),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ),
+        patch.object(bot_module, "_apply_reply_context", new_callable=AsyncMock) as apply_reply,
+        patch.object(
+            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
+        ),
+        patch.object(
+            bot_module,
+            "build_directory_browser",
+            return_value=("picker", MagicMock(), ["new-dir"]),
+        ),
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+    ):
+        apply_reply.side_effect = lambda _message, _user_id, _thread_id, text: text
+        await bot_module.text_handler(
+            _make_text_update(thread_id=99, text="topic b text"), context
+        )
+        await bot_module.photo_handler(_make_photo_update(thread_id=99), context)
+
+    assert not stale_file.exists()
+    assert context.user_data["_pending_thread_id"] == 99
+    assert context.user_data["_pending_thread_text"] == "topic b text"
+    assert context.user_data["_ignored_stale_thread_ids"] == [10]
+    pending_attachments = context.user_data["_pending_thread_attachments"]
+    assert len(pending_attachments) == 1
+    pending_path = Path(pending_attachments[0].path)
+    assert pending_path.parent == media_dir
+    assert pending_path.exists()
+
+    stale_callback = _make_callback_update(CB_DIR_CANCEL, thread_id=10)
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock) as mock_reply,
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
+        patch.object(
+            bot_module, "_create_and_bind_window", new_callable=AsyncMock
+        ) as mock_create,
+    ):
+        await bot_module.callback_handler(stale_callback, context)
+
+    stale_callback.callback_query.answer.assert_awaited_once_with(
+        "Stale browser (topic mismatch)", show_alert=True
+    )
+    mock_reply.assert_not_called()
+    mock_edit.assert_not_called()
+    mock_create.assert_not_called()
+    mock_bind.assert_not_called()
+    assert context.user_data["_pending_thread_id"] == 99
+    assert context.user_data["_pending_thread_text"] == "topic b text"
     assert context.user_data["_pending_thread_attachments"] == pending_attachments
     assert pending_path.exists()
 

@@ -1392,8 +1392,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
         # Stale picker state from a different thread — clear it
+        stale_thread_id = pending_tid if isinstance(pending_tid, int) else None
         clear_window_picker_state(context.user_data)
-        _clear_pending_route_payload(context.user_data, delete_files=True)
+        _clear_pending_route_payload(
+            context.user_data,
+            delete_files=True,
+            clear_ignored_stale_threads=False,
+        )
+        _remember_ignored_stale_thread_id(context.user_data, stale_thread_id)
 
     # Ignore text in directory browsing mode (only for the same thread)
     if (
@@ -1408,8 +1414,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
         # Stale browsing state from a different thread — clear it
+        stale_thread_id = pending_tid if isinstance(pending_tid, int) else None
         clear_browse_state(context.user_data)
-        _clear_pending_route_payload(context.user_data, delete_files=True)
+        _clear_pending_route_payload(
+            context.user_data,
+            delete_files=True,
+            clear_ignored_stale_threads=False,
+        )
+        _remember_ignored_stale_thread_id(context.user_data, stale_thread_id)
 
     # Ignore text in session picker mode (only for the same thread)
     if (
@@ -1424,8 +1436,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
         # Stale picker state from a different thread — clear it
+        stale_thread_id = pending_tid if isinstance(pending_tid, int) else None
         clear_session_picker_state(context.user_data)
-        _clear_pending_route_payload(context.user_data, delete_files=True)
+        _clear_pending_route_payload(
+            context.user_data,
+            delete_files=True,
+            clear_ignored_stale_threads=False,
+        )
+        _remember_ignored_stale_thread_id(context.user_data, stale_thread_id)
 
     # Must be in a named topic
     if thread_id is None:
@@ -1461,6 +1479,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
             context.user_data["_pending_thread_id"] = thread_id
             context.user_data["_pending_thread_text"] = text
+            _forget_ignored_stale_thread_id(context.user_data, thread_id)
         await safe_reply(update.message, msg_text, reply_markup=keyboard)
         return
 
@@ -1892,6 +1911,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             offset = int(offset_str)
         except (ValueError, IndexError):
             await query.answer("Invalid data")
+            return
+
+        if not _callback_window_is_current(user.id, cb_thread_id, window_id):
+            await query.answer("Stale history (topic mismatch)", show_alert=True)
             return
 
         w = await tmux_manager.find_window_by_id(window_id)
