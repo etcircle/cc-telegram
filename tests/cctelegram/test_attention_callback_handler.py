@@ -499,6 +499,59 @@ async def test_aggregator_failure_rebinds_token_and_alerts():
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_reset_attention")
+async def test_send_to_window_false_rebinds_token_and_does_not_mark_replied():
+    """Item 3: swallowed tmux send failure must not become a Replied card."""
+    from cctelegram.handlers import inbound_aggregator
+
+    route = (1, 10, "@0")
+    token = _register_token(route)
+
+    query = _make_query(
+        callback_data=f"attn:yes:{token}",
+        from_user_id=1,
+    )
+    update = _make_update(query)
+    captured_sends: list[tuple[str, str]] = []
+
+    async def _send_failed(window_id: str, text: str) -> tuple[bool, str]:
+        captured_sends.append((window_id, text))
+        return False, "Window not found"
+
+    inbound_aggregator._route_pending.clear()
+    inbound_aggregator._route_locks.clear()
+    try:
+        with (
+            patch.object(bot_module, "is_user_allowed", return_value=True),
+            patch.object(
+                inbound_aggregator.session_manager,
+                "send_to_window",
+                side_effect=_send_failed,
+            ),
+        ):
+            await bot_module.attention_callback_handler(update, MagicMock())
+    finally:
+        inbound_aggregator._route_pending.clear()
+        inbound_aggregator._route_locks.clear()
+
+    assert captured_sends == [("@0", "yes")]
+
+    # Token re-bound — the same button remains retryable instead of becoming
+    # an expired token after a delivery failure below the aggregator.
+    entry = attention.consume_attention_token(token)
+    assert entry is not None
+    assert entry.route == route
+
+    query.answer.assert_awaited_once()
+    args, kwargs = query.answer.await_args
+    alert_text = args[0] if args else kwargs.get("text")
+    assert "couldn't deliver" in (alert_text or "").lower()
+    assert "try again" in (alert_text or "").lower()
+    assert kwargs.get("show_alert") is True
+    query.edit_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_reset_attention")
 async def test_revoked_user_rejected_before_consume():
     """Item 4: revoked user (not in allow-list) must be rejected before consume."""
     route = (1, 10, "@0")

@@ -16,7 +16,7 @@ Public surface:
   - ``aggregator_offer_voice(route, transcribed_text)``
   - ``aggregator_offer_photo(route, path, caption, media_group_id)``
   - ``aggregator_offer_document(route, path, caption, media_group_id)``
-  - ``aggregator_flush_route(route)`` — public force-flush (slash-command path)
+  - ``aggregator_flush_route(route)`` — public force-flush, returns delivery ok
   - ``aggregator_clear_route(route)`` — teardown hook (cancels pending flush)
 """
 
@@ -30,7 +30,6 @@ from pathlib import Path
 
 from ..config import config
 from ..session import session_manager
-from . import busy_indicator
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +63,10 @@ _route_locks: dict[Route, asyncio.Lock] = {}
 # Strong refs for fire-and-forget tasks. Without this, the GC can collect a
 # task before it completes (cpython#91887) — most likely under load, exactly
 # when boundary force-flushes fire.
-_background_tasks: set[asyncio.Task[None]] = set()
+_background_tasks: set[asyncio.Task[object]] = set()
 
 
-def _spawn_background(coro: Coroutine[object, object, None]) -> None:
+def _spawn_background(coro: Coroutine[object, object, object]) -> None:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -146,11 +145,11 @@ def _pop_bundle_locked(route: Route) -> _PendingBundle | None:
     return bundle
 
 
-async def _send_bundle(route: Route, bundle: _PendingBundle) -> None:
+async def _send_bundle(route: Route, bundle: _PendingBundle) -> bool:
     """Render and send a popped bundle. Caller must NOT hold the route lock."""
     text_to_send = _format_bundle(bundle)
     if not text_to_send:
-        return
+        return True
 
     window_id = route[2]
     try:
@@ -161,31 +160,34 @@ async def _send_bundle(route: Route, bundle: _PendingBundle) -> None:
                 route,
                 message,
             )
-            return
+            return False
     except Exception as exc:
         logger.error(
             "aggregator flush raised for route %s: %s",
             route,
             exc,
         )
-        return
+        return False
 
     # Closes the gap between "prompt accepted" and "first transcript event":
     # the V2 typing loop only refreshes RUNNING / RUNNING_TOOL routes, so
     # without this mark the indicator was dark during preliminary work.
     if config.busy_indicator_v2:
+        from . import busy_indicator
+
         await busy_indicator.mark_inbound_sent(route)
+    return True
 
 
-async def _flush(route: Route) -> None:
+async def _flush(route: Route) -> bool:
     """Send the buffered bundle to the bound tmux window and clear it."""
     async with _get_lock(route):
         bundle = _pop_bundle_locked(route)
 
     if bundle is None:
-        return
+        return True
 
-    await _send_bundle(route, bundle)
+    return await _send_bundle(route, bundle)
 
 
 async def aggregator_offer_text(route: Route, text: str) -> None:
@@ -296,14 +298,15 @@ async def aggregator_offer_attachment(
     await _offer_attachment(route, path, caption, media_group_id)
 
 
-async def aggregator_flush_route(route: Route) -> None:
+async def aggregator_flush_route(route: Route) -> bool:
     """Force-flush a route's bundle. Used by slash-command forwarders.
 
     Delegates straight to ``_flush`` so the pop and the cancel happen under
     a single lock acquisition — no reentrancy hazard, no race window where a
-    concurrent offer can resurrect the bundle between cancel and send.
+    concurrent offer can resurrect the bundle between cancel and send. Returns
+    ``False`` when the forced send was attempted but delivery failed.
     """
-    await _flush(route)
+    return await _flush(route)
 
 
 def aggregator_clear_route(route: Route) -> None:

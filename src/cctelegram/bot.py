@@ -1804,13 +1804,23 @@ async def attention_callback_handler(
         # the existing inbound flow.
         try:
             await aggregator_offer_text(entry.route, verb)
-            await aggregator_flush_route(entry.route)
+            delivered = await aggregator_flush_route(entry.route)
         except Exception as e:
             # Bug 3: aggregator step failed. Re-bind the token so the user
             # can retry the click instead of being stuck on an "expired"
             # alert with no surfaced affordance.
             attention.rebind_attention_token(token, entry)
             logger.error("attention callback aggregator failed: %s", e)
+            await query.answer(
+                "Couldn't deliver — try again or type in chat.",
+                show_alert=True,
+            )
+            return
+        if not delivered:
+            # Item 3: the aggregator now reports forced-send delivery status.
+            # If tmux disappeared or send_to_window returned false, leave the
+            # card untouched and re-bind the token so the user can retry.
+            attention.rebind_attention_token(token, entry)
             await query.answer(
                 "Couldn't deliver — try again or type in chat.",
                 show_alert=True,
