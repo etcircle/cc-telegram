@@ -51,6 +51,7 @@ from telegram import (
     BotCommandScopeChatAdministrators,
     BotCommandScopeChatMember,
     BotCommandScopeDefault,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
@@ -250,8 +251,50 @@ class PendingAttachment:
     media_group_id: str | None
 
 
+_IGNORED_STALE_THREAD_IDS_KEY = "_ignored_stale_thread_ids"
+
+
+def _pending_thread_id(user_data: dict | None) -> int | None:
+    """Return the active pending route thread id, if present."""
+    if user_data is None:
+        return None
+    value = user_data.get("_pending_thread_id")
+    return value if isinstance(value, int) else None
+
+
+def _remember_ignored_stale_thread_id(user_data: dict | None, thread_id: int | None) -> None:
+    """Remember a replaced pending thread whose old picker callbacks are stale."""
+    if user_data is None or thread_id is None:
+        return
+    ignored = set(user_data.get(_IGNORED_STALE_THREAD_IDS_KEY, []) or [])
+    ignored.add(thread_id)
+    user_data[_IGNORED_STALE_THREAD_IDS_KEY] = sorted(ignored)
+
+
+def _forget_ignored_stale_thread_id(user_data: dict | None, thread_id: int | None) -> None:
+    """Stop treating ``thread_id`` as a replaced stale pending thread."""
+    if user_data is None or thread_id is None:
+        return
+    ignored = set(user_data.get(_IGNORED_STALE_THREAD_IDS_KEY, []) or [])
+    ignored.discard(thread_id)
+    if ignored:
+        user_data[_IGNORED_STALE_THREAD_IDS_KEY] = sorted(ignored)
+    else:
+        user_data.pop(_IGNORED_STALE_THREAD_IDS_KEY, None)
+
+
+def _is_ignored_stale_thread_id(user_data: dict | None, thread_id: int | None) -> bool:
+    """Return True for old replaced-topic callbacks that must not clear current state."""
+    if user_data is None or thread_id is None:
+        return False
+    return thread_id in set(user_data.get(_IGNORED_STALE_THREAD_IDS_KEY, []) or [])
+
+
 def _clear_pending_route_payload(
-    user_data: dict | None, *, delete_files: bool
+    user_data: dict | None,
+    *,
+    delete_files: bool,
+    clear_ignored_stale_threads: bool = True,
 ) -> list[PendingAttachment]:
     """Clear pending unbound-topic payload state and optionally delete files.
 
@@ -268,6 +311,8 @@ def _clear_pending_route_payload(
     user_data.pop("_pending_thread_id", None)
     user_data.pop("_pending_thread_text", None)
     user_data.pop("_selected_path", None)
+    if clear_ignored_stale_threads:
+        user_data.pop(_IGNORED_STALE_THREAD_IDS_KEY, None)
     if delete_files:
         for attachment in attachments:
             try:
@@ -277,6 +322,41 @@ def _clear_pending_route_payload(
                     "failed to delete pending attachment %s: %s", attachment.path, e
                 )
     return attachments
+
+
+def _clear_picker_state_for_current_state(user_data: dict | None) -> None:
+    """Clear the active picker/browser state based on ``STATE_KEY``."""
+    if user_data is None:
+        return
+    current_state = user_data.get(STATE_KEY)
+    if current_state == STATE_BROWSING_DIRECTORY:
+        clear_browse_state(user_data)
+    elif current_state == STATE_SELECTING_WINDOW:
+        clear_window_picker_state(user_data)
+    elif current_state == STATE_SELECTING_SESSION:
+        clear_session_picker_state(user_data)
+
+
+async def _answer_stale_pending_thread_mismatch(
+    query: CallbackQuery,
+    user_data: dict | None,
+    callback_thread_id: int | None,
+    answer_text: str,
+    *,
+    clear_picker_state: bool = False,
+) -> None:
+    """Answer a pending-thread mismatch without deleting newer replacement media.
+
+    Old callbacks from a pending topic that was explicitly replaced by a newer
+    pending topic are only acknowledged as stale. Other mismatches retain the
+    prior safety behavior: reject and clear/delete the active stale payload.
+    """
+    if not _is_ignored_stale_thread_id(user_data, callback_thread_id):
+        if clear_picker_state:
+            clear_browse_state(user_data)
+        if user_data is not None:
+            _clear_pending_route_payload(user_data, delete_files=True)
+    await query.answer(answer_text, show_alert=True)
 
 
 def _get_thread_id(update: Update) -> int | None:
@@ -860,9 +940,15 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if wid is None:
         if context.user_data is not None:
-            pending_tid = context.user_data.get("_pending_thread_id")
+            pending_tid = _pending_thread_id(context.user_data)
             if pending_tid is not None and pending_tid != thread_id:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
+                _clear_picker_state_for_current_state(context.user_data)
+                _clear_pending_route_payload(
+                    context.user_data,
+                    delete_files=True,
+                    clear_ignored_stale_threads=False,
+                )
+                _remember_ignored_stale_thread_id(context.user_data, pending_tid)
         # §2.8.3 photo-in-unbound-topic: stash the path so the directory
         # picker's flush in _create_and_bind_window can feed the aggregator
         # for the freshly-bound route. Multiple photos can pile up here
@@ -875,6 +961,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 PendingAttachment(str(file_path), caption, media_group_id)
             )
             context.user_data["_pending_thread_id"] = thread_id
+            _forget_ignored_stale_thread_id(context.user_data, thread_id)
 
         # If the user is already mid-picker (text_handler opened the
         # directory browser, window picker, or session picker for THIS
@@ -1106,9 +1193,15 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if wid is None:
         if context.user_data is not None:
-            pending_tid = context.user_data.get("_pending_thread_id")
+            pending_tid = _pending_thread_id(context.user_data)
             if pending_tid is not None and pending_tid != thread_id:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
+                _clear_picker_state_for_current_state(context.user_data)
+                _clear_pending_route_payload(
+                    context.user_data,
+                    delete_files=True,
+                    clear_ignored_stale_threads=False,
+                )
+                _remember_ignored_stale_thread_id(context.user_data, pending_tid)
             pending_attachments = context.user_data.setdefault(
                 "_pending_thread_attachments", []
             )
@@ -1116,6 +1209,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 PendingAttachment(str(file_path), caption, media_group_id)
             )
             context.user_data["_pending_thread_id"] = thread_id
+            _forget_ignored_stale_thread_id(context.user_data, thread_id)
 
         if context.user_data is not None:
             current_state = context.user_data.get(STATE_KEY)
@@ -1812,10 +1906,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale browser (topic mismatch)",
+            )
             return
         # callback_data contains index, not dir name (to avoid 64-byte limit)
         try:
@@ -1878,10 +1975,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale browser (topic mismatch)",
+            )
             return
         default_path = str(Path.cwd())
         current_path = (
@@ -1915,10 +2015,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale browser (topic mismatch)",
+            )
             return
         try:
             pg = int(data[len(CB_DIR_PAGE) :])
@@ -1960,12 +2063,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
         # Validate: confirm button must come from the same topic that started browsing
-        confirm_thread_id = _get_thread_id(update)
+        confirm_thread_id = cb_thread_id
         if pending_thread_id is not None and confirm_thread_id != pending_thread_id:
-            clear_browse_state(context.user_data)
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                confirm_thread_id,
+                "Stale browser (topic mismatch)",
+                clear_picker_state=True,
+            )
             return
 
         clear_browse_state(context.user_data)
@@ -1992,10 +2098,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale browser (topic mismatch)",
+            )
             return
         clear_browse_state(context.user_data)
         if context.user_data is not None:
@@ -2012,10 +2121,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # another topic), recover it from the callback query's message context
         if pending_tid is None:
             pending_tid = _get_thread_id(update)
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale picker (topic mismatch)",
+            )
             return
         try:
             idx = int(data[len(CB_SESSION_SELECT) :])
@@ -2055,10 +2167,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         if pending_tid is None:
             pending_tid = _get_thread_id(update)
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale picker (topic mismatch)",
+            )
             return
         selected_path = (
             context.user_data.get("_selected_path", str(Path.cwd()))
@@ -2075,10 +2190,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale picker (topic mismatch)",
+            )
             return
         clear_session_picker_state(context.user_data)
         if context.user_data is not None:
@@ -2091,10 +2209,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale picker (topic mismatch)",
+            )
             return
         try:
             idx = int(data[len(CB_WIN_BIND) :])
@@ -2171,10 +2292,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale picker (topic mismatch)",
+            )
             return
         # Preserve pending thread info, clear only picker state
         clear_window_picker_state(context.user_data)
@@ -2204,10 +2328,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale browser (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale browser (topic mismatch)",
+            )
             return
         unbound = await _list_unbound_windows()
         if not unbound:
@@ -2228,10 +2355,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            if context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await _answer_stale_pending_thread_mismatch(
+                query,
+                context.user_data,
+                cb_thread_id,
+                "Stale picker (topic mismatch)",
+            )
             return
         clear_window_picker_state(context.user_data)
         if context.user_data is not None:

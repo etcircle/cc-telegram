@@ -134,4 +134,5 @@ For each item:
 ## Status log
 
 - 2026-05-11: Tracker created. No item implementation started yet.
-- 2026-05-11: Item 1 implemented by Hermes agent, parent targeted verification passed (`19 passed`, ruff clean, `pyright src/cctelegram/bot.py` clean), independent Hermes reviewer returned PASS. Ready to freeze/commit.
+- 2026-05-11: Item 1 implemented by Hermes agent, parent targeted verification passed (`19 passed`, ruff clean, `pyright src/cctelegram/bot.py` clean), independent Hermes reviewer returned PASS. Committed as `9b38cef`.
+- 2026-05-11: Item 2 implemented by Hermes agent, reviewer caught old replaced-topic callbacks deleting newer pending media, fix agent patched ignored-stale-thread handling, parent verification passed (`29 passed`, ruff clean, `pyright src/cctelegram/bot.py` clean), independent re-review returned PASS. Ready to freeze/commit.

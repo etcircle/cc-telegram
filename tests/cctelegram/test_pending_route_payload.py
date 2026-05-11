@@ -22,12 +22,20 @@ from cctelegram.handlers.callback_data import (
     CB_DIR_UP,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
+    CB_SESSION_SELECT,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
+    CB_WIN_NEW,
 )
 from cctelegram.handlers.directory_browser import (
+    BROWSE_DIRS_KEY,
+    BROWSE_PAGE_KEY,
+    BROWSE_PATH_KEY,
+    BROWSE_UNBOUND_COUNT_KEY,
+    SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
 )
@@ -51,6 +59,7 @@ def test_clear_pending_route_payload_deletes_cancelled_files(tmp_path: Path):
     payload = tmp_path / "cancelled.jpg"
     payload.write_bytes(b"image")
     user_data = _pending_user_data(payload)
+    user_data["_ignored_stale_thread_ids"] = [99]
 
     attachments = bot_module._clear_pending_route_payload(user_data, delete_files=True)
 
@@ -60,6 +69,7 @@ def test_clear_pending_route_payload_deletes_cancelled_files(tmp_path: Path):
     assert "_pending_thread_text" not in user_data
     assert "_pending_thread_attachments" not in user_data
     assert "_selected_path" not in user_data
+    assert "_ignored_stale_thread_ids" not in user_data
 
 
 def test_clear_pending_route_payload_preserves_files_for_successful_flush(
@@ -93,6 +103,84 @@ def _make_callback_update(data: str, *, thread_id: int = 10) -> MagicMock:
     update.effective_user.id = 1
     update.effective_chat = query.message.chat
     return update
+
+
+class _DownloadedFile:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    async def download_to_drive(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(self.payload)
+
+
+def _make_photo_update(*, thread_id: int = 99) -> MagicMock:
+    photo = MagicMock()
+    photo.file_unique_id = "new-photo"
+    photo.get_file = AsyncMock(return_value=_DownloadedFile(b"new photo"))
+
+    message = MagicMock()
+    message.photo = [photo]
+    message.document = None
+    message.caption = "new caption"
+    message.media_group_id = None
+    message.message_thread_id = thread_id
+    message.message_id = 123
+    message.chat = MagicMock()
+    message.chat.id = -100123
+    message.chat.type = "supergroup"
+
+    update = MagicMock()
+    update.message = message
+    update.callback_query = None
+    update.effective_user = MagicMock()
+    update.effective_user.id = 1
+    update.effective_chat = message.chat
+    return update
+
+
+def _make_document_update(*, thread_id: int = 99) -> MagicMock:
+    document = MagicMock()
+    document.file_unique_id = "new-doc"
+    document.file_name = "report.txt"
+    document.file_size = 11
+    document.get_file = AsyncMock(return_value=_DownloadedFile(b"new doc"))
+
+    message = MagicMock()
+    message.photo = None
+    message.document = document
+    message.caption = "new caption"
+    message.media_group_id = None
+    message.message_thread_id = thread_id
+    message.message_id = 124
+    message.chat = MagicMock()
+    message.chat.id = -100123
+    message.chat.type = "supergroup"
+
+    update = MagicMock()
+    update.message = message
+    update.callback_query = None
+    update.effective_user = MagicMock()
+    update.effective_user.id = 1
+    update.effective_chat = message.chat
+    return update
+
+
+def _cross_topic_picker_user_data(
+    stale_file: Path, *, stale_state: str, thread_id: int = 10
+) -> dict[str, object]:
+    user_data = _pending_user_data(stale_file, thread_id=thread_id)
+    user_data[STATE_KEY] = stale_state
+    if stale_state == STATE_BROWSING_DIRECTORY:
+        user_data[BROWSE_PATH_KEY] = "/old/topic-a"
+        user_data[BROWSE_PAGE_KEY] = 7
+        user_data[BROWSE_DIRS_KEY] = ["old-dir"]
+        user_data[BROWSE_UNBOUND_COUNT_KEY] = 3
+    elif stale_state == STATE_SELECTING_WINDOW:
+        user_data[UNBOUND_WINDOWS_KEY] = ["old-window"]
+    elif stale_state == STATE_SELECTING_SESSION:
+        user_data[SESSIONS_KEY] = ["old-session"]
+    return user_data
 
 
 @pytest.mark.asyncio
@@ -181,6 +269,204 @@ async def test_stale_directory_browser_callbacks_clear_pending_attachments(
     assert "_pending_thread_id" not in context.user_data
     mock_safe_edit.assert_not_called()
     update.callback_query.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_state",
+    [
+        STATE_BROWSING_DIRECTORY,
+        STATE_SELECTING_WINDOW,
+        STATE_SELECTING_SESSION,
+    ],
+)
+async def test_photo_from_new_topic_clears_cross_topic_picker_state_and_opens_picker(
+    tmp_path: Path, stale_state: str
+):
+    stale_file = tmp_path / "topic-a-photo.bin"
+    stale_file.write_bytes(b"stale")
+    context = MagicMock()
+    context.user_data = _cross_topic_picker_user_data(
+        stale_file, stale_state=stale_state, thread_id=10
+    )
+    update = _make_photo_update(thread_id=99)
+    media_dir = tmp_path / "images"
+
+    with (
+        patch.object(bot_module, "_IMAGES_DIR", media_dir),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
+        ),
+        patch.object(
+            bot_module,
+            "build_directory_browser",
+            return_value=("picker", MagicMock(), ["new-dir"]),
+        ) as mock_build_picker,
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock) as mock_reply,
+    ):
+        await bot_module.photo_handler(update, context)
+
+    assert not stale_file.exists()
+    assert context.user_data["_pending_thread_id"] == 99
+    assert context.user_data[STATE_KEY] == STATE_BROWSING_DIRECTORY
+    assert context.user_data[BROWSE_PATH_KEY] == str(bot_module.config.browse_root)
+    assert context.user_data[BROWSE_PAGE_KEY] == 0
+    assert context.user_data[BROWSE_DIRS_KEY] == ["new-dir"]
+    assert context.user_data[BROWSE_UNBOUND_COUNT_KEY] == 0
+    assert "_pending_thread_text" not in context.user_data
+    assert "_selected_path" not in context.user_data
+    assert UNBOUND_WINDOWS_KEY not in context.user_data
+    assert SESSIONS_KEY not in context.user_data
+    pending_attachments = context.user_data["_pending_thread_attachments"]
+    assert len(pending_attachments) == 1
+    pending_path = Path(pending_attachments[0].path)
+    assert pending_path.parent == media_dir
+    assert pending_path.exists()
+    assert pending_attachments[0].caption == "new caption"
+    mock_build_picker.assert_called_once_with(str(bot_module.config.browse_root), unbound_count=0)
+    mock_reply.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_state",
+    [
+        STATE_BROWSING_DIRECTORY,
+        STATE_SELECTING_WINDOW,
+        STATE_SELECTING_SESSION,
+    ],
+)
+async def test_document_from_new_topic_clears_cross_topic_picker_state_and_opens_picker(
+    tmp_path: Path, stale_state: str
+):
+    stale_file = tmp_path / "topic-a-doc.bin"
+    stale_file.write_bytes(b"stale")
+    context = MagicMock()
+    context.user_data = _cross_topic_picker_user_data(
+        stale_file, stale_state=stale_state, thread_id=10
+    )
+    update = _make_document_update(thread_id=99)
+    media_dir = tmp_path / "files"
+
+    with (
+        patch.object(bot_module, "_FILES_DIR", media_dir),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
+        ),
+        patch.object(
+            bot_module,
+            "build_directory_browser",
+            return_value=("picker", MagicMock(), ["new-dir"]),
+        ) as mock_build_picker,
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock) as mock_reply,
+    ):
+        await bot_module.document_handler(update, context)
+
+    assert not stale_file.exists()
+    assert context.user_data["_pending_thread_id"] == 99
+    assert context.user_data[STATE_KEY] == STATE_BROWSING_DIRECTORY
+    assert context.user_data[BROWSE_PATH_KEY] == str(bot_module.config.browse_root)
+    assert context.user_data[BROWSE_PAGE_KEY] == 0
+    assert context.user_data[BROWSE_DIRS_KEY] == ["new-dir"]
+    assert context.user_data[BROWSE_UNBOUND_COUNT_KEY] == 0
+    assert "_pending_thread_text" not in context.user_data
+    assert "_selected_path" not in context.user_data
+    assert UNBOUND_WINDOWS_KEY not in context.user_data
+    assert SESSIONS_KEY not in context.user_data
+    pending_attachments = context.user_data["_pending_thread_attachments"]
+    assert len(pending_attachments) == 1
+    pending_path = Path(pending_attachments[0].path)
+    assert pending_path.parent == media_dir
+    assert pending_path.exists()
+    assert pending_attachments[0].caption == "new caption"
+    mock_build_picker.assert_called_once_with(str(bot_module.config.browse_root), unbound_count=0)
+    mock_reply.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("callback_data", "expected_answer"),
+    [
+        (f"{CB_DIR_SELECT}0", "Stale browser (topic mismatch)"),
+        (CB_DIR_UP, "Stale browser (topic mismatch)"),
+        (f"{CB_DIR_PAGE}1", "Stale browser (topic mismatch)"),
+        (CB_DIR_CANCEL, "Stale browser (topic mismatch)"),
+        (CB_DIR_BIND_EXISTING, "Stale browser (topic mismatch)"),
+        (f"{CB_SESSION_SELECT}0", "Stale picker (topic mismatch)"),
+        (CB_SESSION_NEW, "Stale picker (topic mismatch)"),
+        (CB_SESSION_CANCEL, "Stale picker (topic mismatch)"),
+        (f"{CB_WIN_BIND}0", "Stale picker (topic mismatch)"),
+        (CB_WIN_NEW, "Stale picker (topic mismatch)"),
+        (CB_WIN_CANCEL, "Stale picker (topic mismatch)"),
+    ],
+)
+async def test_replaced_topic_stale_callback_does_not_clear_new_photo_payload(
+    tmp_path: Path, callback_data: str, expected_answer: str
+):
+    stale_file = tmp_path / "topic-a-photo.bin"
+    stale_file.write_bytes(b"stale")
+    context = MagicMock()
+    context.user_data = _cross_topic_picker_user_data(
+        stale_file, stale_state=STATE_BROWSING_DIRECTORY, thread_id=10
+    )
+    media_dir = tmp_path / "images"
+
+    with (
+        patch.object(bot_module, "_IMAGES_DIR", media_dir),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
+        ),
+        patch.object(
+            bot_module,
+            "build_directory_browser",
+            return_value=("picker", MagicMock(), ["new-dir"]),
+        ),
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+    ):
+        await bot_module.photo_handler(_make_photo_update(thread_id=99), context)
+
+    assert not stale_file.exists()
+    pending_attachments = context.user_data["_pending_thread_attachments"]
+    assert len(pending_attachments) == 1
+    pending_path = Path(pending_attachments[0].path)
+    assert pending_path.exists()
+
+    stale_callback = _make_callback_update(callback_data, thread_id=10)
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock) as mock_reply,
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
+        patch.object(
+            bot_module, "_create_and_bind_window", new_callable=AsyncMock
+        ) as mock_create,
+    ):
+        await bot_module.callback_handler(stale_callback, context)
+
+    stale_callback.callback_query.answer.assert_awaited_once_with(
+        expected_answer, show_alert=True
+    )
+    mock_reply.assert_not_called()
+    mock_edit.assert_not_called()
+    mock_create.assert_not_called()
+    assert context.user_data["_pending_thread_id"] == 99
+    assert context.user_data["_pending_thread_attachments"] == pending_attachments
+    assert pending_path.exists()
 
 
 @pytest.mark.asyncio
