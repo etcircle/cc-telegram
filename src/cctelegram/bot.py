@@ -264,7 +264,16 @@ def _pending_thread_id(user_data: dict | None) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _remember_ignored_stale_thread_id(user_data: dict | None, thread_id: int | None) -> None:
+def _pending_owner_matches(user_data: dict | None, thread_id: int | None) -> bool:
+    """Return True when ``thread_id`` still owns the active pending payload."""
+    if thread_id is None:
+        return False
+    return _pending_thread_id(user_data) == thread_id
+
+
+def _remember_ignored_stale_thread_id(
+    user_data: dict | None, thread_id: int | None
+) -> None:
     """Remember a replaced pending thread whose old picker callbacks are stale."""
     if user_data is None or thread_id is None:
         return
@@ -273,7 +282,9 @@ def _remember_ignored_stale_thread_id(user_data: dict | None, thread_id: int | N
     user_data[_IGNORED_STALE_THREAD_IDS_KEY] = sorted(ignored)
 
 
-def _forget_ignored_stale_thread_id(user_data: dict | None, thread_id: int | None) -> None:
+def _forget_ignored_stale_thread_id(
+    user_data: dict | None, thread_id: int | None
+) -> None:
     """Stop treating ``thread_id`` as a replaced stale pending thread."""
     if user_data is None or thread_id is None:
         return
@@ -369,7 +380,9 @@ def _delete_pending_attachment_files(attachments: list[PendingAttachment]) -> No
         try:
             Path(attachment.path).unlink(missing_ok=True)
         except OSError as e:
-            logger.debug("failed to delete pending attachment %s: %s", attachment.path, e)
+            logger.debug(
+                "failed to delete pending attachment %s: %s", attachment.path, e
+            )
 
 
 async def _flush_pending_route_payload(
@@ -385,11 +398,17 @@ async def _flush_pending_route_payload(
     so the user gets an explicit resend prompt instead of a hidden retry that
     could duplicate a manual resend.
     """
+    if user_data is not None and not _pending_owner_matches(user_data, route[1]):
+        logger.warning(
+            "Refusing to flush pending payload for route %s because pending owner is %s",
+            route,
+            _pending_thread_id(user_data),
+        )
+        return None
+
     pending_text = user_data.get("_pending_thread_text") if user_data else None
     pending_attachments: list[PendingAttachment] = (
-        list(user_data.get("_pending_thread_attachments") or [])
-        if user_data
-        else []
+        list(user_data.get("_pending_thread_attachments") or []) if user_data else []
     )
     if user_data is not None:
         _clear_pending_route_payload(user_data, delete_files=False)
@@ -1722,38 +1741,92 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _cleanup_unbound_created_window(
     window_id: str,
     window_name: str,
+    *,
+    reason: str = "SessionStart hook timeout",
 ) -> bool:
-    """Best-effort kill of a newly-created window that never became monitored."""
+    """Best-effort kill of a newly-created window that should not be bound."""
     if not window_id:
         logger.error(
-            "Hook timed out for new window '%s', but no window_id was returned; "
-            "cannot clean up unmonitored tmux window",
+            "Cannot clean up unbound tmux window '%s' after %s because no "
+            "window_id was returned",
             window_name,
+            reason,
         )
         return False
     try:
         killed = await tmux_manager.kill_window(window_id)
     except Exception as e:  # pragma: no cover - tmux_manager normally swallows errors
         logger.error(
-            "Failed to clean up unmonitored tmux window %s (%s): %s",
+            "Failed to clean up unbound tmux window %s (%s) after %s: %s",
             window_id,
             window_name,
+            reason,
             e,
         )
         return False
     if killed:
         logger.warning(
-            "Cleaned up unmonitored tmux window %s (%s) after SessionStart hook timeout",
+            "Cleaned up unbound tmux window %s (%s) after %s",
             window_id,
             window_name,
+            reason,
         )
         return True
     logger.error(
-        "Could not clean up unmonitored tmux window %s (%s) after SessionStart hook timeout",
+        "Could not clean up unbound tmux window %s (%s) after %s",
         window_id,
         window_name,
+        reason,
     )
     return False
+
+
+async def _abort_created_window_after_pending_owner_change(
+    query: CallbackQuery,
+    *,
+    user_data: dict | None,
+    user_id: int,
+    pending_thread_id: int,
+    created_wid: str,
+    created_wname: str,
+    resume_session_id: str | None,
+) -> None:
+    """Surface a stale picker after a window was created but before binding."""
+    logger.warning(
+        "Pending owner changed before binding created window %s "
+        "(user=%d, callback_thread=%d, current_owner=%s)",
+        created_wid,
+        user_id,
+        pending_thread_id,
+        _pending_thread_id(user_data),
+    )
+    cleanup_note = ""
+    show_alert = False
+    if resume_session_id is None:
+        cleanup_ok = await _cleanup_unbound_created_window(
+            created_wid,
+            created_wname,
+            reason="pending owner change before bind",
+        )
+        cleanup_note = (
+            " The newly-created tmux window was cleaned up."
+            if cleanup_ok
+            else (
+                f" The newly-created tmux window '{created_wname}' "
+                f"({created_wid or 'unknown id'}) could not be cleaned up "
+                "automatically; please inspect tmux."
+            )
+        )
+        show_alert = not cleanup_ok
+    else:
+        cleanup_note = " The resumed tmux window was left unbound."
+
+    await safe_edit(
+        query,
+        "⚠️ This picker is stale because another topic now owns the pending "
+        f"message.{cleanup_note}",
+    )
+    await query.answer("Stale picker", show_alert=show_alert)
 
 
 async def _create_and_bind_window(
@@ -1773,6 +1846,19 @@ async def _create_and_bind_window(
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
+    if pending_thread_id is not None and not _pending_owner_matches(
+        context.user_data, pending_thread_id
+    ):
+        logger.warning(
+            "Refusing to create window for stale picker "
+            "(user=%d, callback_thread=%d, current_owner=%s)",
+            user.id,
+            pending_thread_id,
+            _pending_thread_id(context.user_data),
+        )
+        await query.answer("Stale picker", show_alert=True)
+        return
+
     success, message, created_wname, created_wid = await tmux_manager.create_window(
         selected_path, resume_session_id=resume_session_id
     )
@@ -1786,6 +1872,20 @@ async def _create_and_bind_window(
             pending_thread_id,
             resume_session_id,
         )
+        if pending_thread_id is not None and not _pending_owner_matches(
+            context.user_data, pending_thread_id
+        ):
+            await _abort_created_window_after_pending_owner_change(
+                query,
+                user_data=context.user_data,
+                user_id=user.id,
+                pending_thread_id=pending_thread_id,
+                created_wid=created_wid,
+                created_wname=created_wname,
+                resume_session_id=resume_session_id,
+            )
+            return
+
         # Wait for Claude Code's SessionStart hook to register in session_map.
         # Resume sessions take longer to start (loading session state), so use
         # a longer timeout to avoid silently dropping messages.
@@ -1793,6 +1893,20 @@ async def _create_and_bind_window(
         hook_ok = await session_manager.wait_for_session_map_entry(
             created_wid, timeout=hook_timeout
         )
+
+        if pending_thread_id is not None and not _pending_owner_matches(
+            context.user_data, pending_thread_id
+        ):
+            await _abort_created_window_after_pending_owner_change(
+                query,
+                user_data=context.user_data,
+                user_id=user.id,
+                pending_thread_id=pending_thread_id,
+                created_wid=created_wid,
+                created_wname=created_wname,
+                resume_session_id=resume_session_id,
+            )
+            return
 
         if not hook_ok and not resume_session_id:
             # A brand-new (non-resume) window that never registers in
@@ -1823,7 +1937,9 @@ async def _create_and_bind_window(
                 f"❌ {message}\n\nClaude session didn't register in time. "
                 f"{cleanup_note} Send your message again to retry.",
             )
-            if context.user_data is not None:
+            if context.user_data is not None and _pending_owner_matches(
+                context.user_data, pending_thread_id
+            ):
                 _clear_pending_route_payload(context.user_data, delete_files=True)
             await query.answer(
                 "Hook timeout" if cleanup_ok else "Hook timeout; cleanup failed",
@@ -1884,7 +2000,9 @@ async def _create_and_bind_window(
                     f"❌ {message}\n\nClaude session didn't register in time. "
                     "Send your message again to retry.",
                 )
-                if context.user_data is not None:
+                if context.user_data is not None and _pending_owner_matches(
+                    context.user_data, pending_thread_id
+                ):
                     _clear_pending_route_payload(context.user_data, delete_files=True)
                 await query.answer("Hook timeout")
                 return
@@ -1904,6 +2022,18 @@ async def _create_and_bind_window(
                     session_monitor.register_session(
                         track_sid, file_path, offset=offset
                     )
+
+            if not _pending_owner_matches(context.user_data, pending_thread_id):
+                await _abort_created_window_after_pending_owner_change(
+                    query,
+                    user_data=context.user_data,
+                    user_id=user.id,
+                    pending_thread_id=pending_thread_id,
+                    created_wid=created_wid,
+                    created_wname=created_wname,
+                    resume_session_id=resume_session_id,
+                )
+                return
 
             # Thread bind flow: bind thread to newly created window
             session_manager.bind_thread(
@@ -1940,7 +2070,11 @@ async def _create_and_bind_window(
             await safe_edit(query, f"✅ {message}")
     else:
         await safe_edit(query, f"❌ {message}")
-        if pending_thread_id is not None and context.user_data is not None:
+        if (
+            pending_thread_id is not None
+            and context.user_data is not None
+            and _pending_owner_matches(context.user_data, pending_thread_id)
+        ):
             _clear_pending_route_payload(context.user_data, delete_files=True)
     await query.answer("Created" if success else "Failed")
 
@@ -2319,6 +2453,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Check for existing sessions in this directory
         sessions = await session_manager.list_sessions_for_directory(selected_path)
+        if not _pending_owner_matches(context.user_data, pending_thread_id):
+            await _answer_invalid_pending_picker_callback(
+                query,
+                "Stale browser (topic mismatch)",
+            )
+            return
         if sessions:
             # Show session picker — store state for later
             if context.user_data is not None:
@@ -2455,6 +2595,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
+        ok, _pending_tid, _reason = _validate_pending_picker_callback(
+            context.user_data,
+            cb_thread_id,
+            (STATE_SELECTING_WINDOW,),
+        )
+        if not ok:
+            await _answer_invalid_pending_picker_callback(
+                query,
+                "Stale picker (topic mismatch)",
+            )
+            return
+
         display = w.window_name
         clear_window_picker_state(context.user_data)
         session_manager.bind_thread(
@@ -2476,9 +2628,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Bound; first message failed", show_alert=True)
             return
 
-        first_turn_note = (
-            "\n\nFirst message sent." if pending_delivered is True else ""
-        )
+        first_turn_note = "\n\nFirst message sent." if pending_delivered is True else ""
         await safe_edit(
             query,
             f"✅ Bound to window `{display}`{first_turn_note}",

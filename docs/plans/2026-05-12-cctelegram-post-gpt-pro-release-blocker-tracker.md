@@ -71,6 +71,16 @@ No push without explicit user instruction.
 - Scope: docs only
 - Expected behavior: label dated `docs/plans` as historical context if necessary; do not rewrite history docs broadly.
 
+### H-A — GPT Pro follow-up: pending owner can change after validation
+- Severity: MUST FIX / release blocker
+- Scope: `src/cctelegram/bot.py`, pending route payload tests
+- Expected behavior: owner is revalidated after awaited work and before bind/flush; `_flush_pending_route_payload()` refuses to clear/replay if active pending owner no longer matches the target route; stale non-resume creates clean up the just-created tmux window.
+
+### H-B — GPT Pro follow-up: consumed attention token can be resurrected
+- Severity: MUST FIX / release blocker
+- Scope: `src/cctelegram/bot.py`, `src/cctelegram/handlers/attention.py`, attention tests
+- Expected behavior: a token consumed by an in-flight callback must not be rebound after typed reply, dismiss, or card replacement revokes/replaces the live attention generation.
+
 ### Real Telegram smoke
 - Severity: release gate / blocked by config
 - Expected behavior: safe local smoke is not enough. Manual/live Telegram smoke remains required before production release. If no token/config is present, record as blocked; do not fake it.
@@ -88,3 +98,4 @@ No push without explicit user instruction.
 - 2026-05-12: M5 implemented by Hermes agent. Parent targeted proof passed (`82 passed`, ruff clean, pyright clean). Independent Hermes reviewer returned PASS. Subagent digest upserts no longer rebind stale state after awaited send/edit, matching activity/todo digest race pattern.
 - 2026-05-12: M6 implemented by Hermes agent. Parent targeted proof passed (`65 passed`, ruff clean, pyright clean). Independent Hermes reviewer returned PASS. Non-resume hook/session registration timeout now avoids binding/forwarding, best-effort kills the just-created tmux window, surfaces cleanup status, and clears pending payload; resume behavior preserved.
 - 2026-05-12: L1 implemented directly. Added `docs/plans/README.md` to label dated plan files as historical implementation context and point current operator guidance to root README / `doc/telegram-bot-features.md`.
+- 2026-05-12: Follow-up GPT Pro review of current HEAD returned NOT READY with two high findings: H-A pending owner post-validation race and H-B consumed attention token resurrection race. H-A implemented by Hermes agent. Parent targeted proof passed (`68 passed`, ruff clean, pyright clean, diff-check clean). Independent Hermes reviewer returned PASS. Pending replay now has a final owner guard; create/bind paths revalidate owner after awaits; stale non-resume creates clean up their just-created tmux window.

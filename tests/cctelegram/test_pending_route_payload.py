@@ -335,7 +335,7 @@ async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
 async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_window() -> None:
     query, user = _make_real_callback_query()
     context = MagicMock()
-    context.user_data = {}
+    context.user_data = {"_pending_thread_id": 10}
     window_state = SimpleNamespace(session_id="", cwd="", window_name="")
 
     with (
@@ -1390,6 +1390,155 @@ def _make_user() -> MagicMock:
     user = MagicMock(spec=User)
     user.id = 1
     return user
+
+
+@pytest.mark.asyncio
+async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_payload(
+    tmp_path: Path,
+):
+    old_payload = tmp_path / "topic-10.bin"
+    old_payload.write_bytes(b"old")
+    new_payload = tmp_path / "topic-99.bin"
+    new_payload.write_bytes(b"new")
+    context = MagicMock()
+    context.user_data = _pending_user_data(old_payload, thread_id=10)
+    query = _make_create_query()
+    user = _make_user()
+
+    async def replace_owner_during_hook_wait(
+        *_args: object, **_kwargs: object
+    ) -> bool:
+        context.user_data = _pending_user_data(new_payload, thread_id=99)
+        context.user_data["_pending_thread_text"] = "topic 99 text"
+        return True
+
+    with (
+        patch.object(bot_module, "session_monitor", None),
+        patch.object(
+            bot_module.tmux_manager,
+            "create_window",
+            new_callable=AsyncMock,
+            return_value=(True, "Window created", "created-window", "@10"),
+        ),
+        patch.object(
+            bot_module.session_manager,
+            "wait_for_session_map_entry",
+            new_callable=AsyncMock,
+            side_effect=replace_owner_during_hook_wait,
+        ),
+        patch.object(
+            bot_module.tmux_manager,
+            "kill_window",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_kill,
+        patch.object(bot_module.session_manager, "get_window_state") as get_window_state,
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
+        patch.object(
+            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
+        ) as mock_replay,
+    ):
+        await bot_module._create_and_bind_window(
+            query, context, user, str(tmp_path), pending_thread_id=10
+        )
+
+    mock_kill.assert_awaited_once_with("@10")
+    get_window_state.assert_not_called()
+    mock_bind.assert_not_called()
+    mock_replay.assert_not_called()
+    edit_text = mock_edit.await_args.args[1]
+    assert "stale" in edit_text
+    assert "newly-created tmux window was cleaned up" in edit_text
+    query.answer.assert_awaited_once_with("Stale picker", show_alert=False)
+    assert context.user_data["_pending_thread_id"] == 99
+    assert context.user_data["_pending_thread_text"] == "topic 99 text"
+    assert context.user_data["_pending_thread_attachments"] == [_attachment(new_payload)]
+    assert new_payload.exists()
+
+
+@pytest.mark.asyncio
+async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_flush(
+    tmp_path: Path,
+):
+    old_payload = tmp_path / "topic-10-existing.bin"
+    old_payload.write_bytes(b"old")
+    new_payload = tmp_path / "topic-99-existing.bin"
+    new_payload.write_bytes(b"new")
+    context = MagicMock()
+    context.user_data = _pending_user_data(old_payload, thread_id=10)
+    context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+    context.user_data[UNBOUND_WINDOWS_KEY] = ["@0"]
+    update = _make_callback_update(f"{CB_WIN_BIND}0", thread_id=10)
+    window = MagicMock()
+    window.window_id = "@0"
+    window.window_name = "existing-window"
+
+    async def replace_owner_during_unbound_list() -> list[tuple[str, str, str]]:
+        context.user_data = _pending_user_data(new_payload, thread_id=99)
+        context.user_data["_pending_thread_text"] = "topic 99 text"
+        return [("@0", "existing-window", str(tmp_path))]
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(
+            bot_module.tmux_manager,
+            "find_window_by_id",
+            new_callable=AsyncMock,
+            return_value=window,
+        ),
+        patch.object(
+            bot_module,
+            "_list_unbound_windows",
+            new_callable=AsyncMock,
+            side_effect=replace_owner_during_unbound_list,
+        ),
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
+        patch.object(
+            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
+        ) as mock_replay,
+    ):
+        await bot_module.callback_handler(update, context)
+
+    mock_bind.assert_not_called()
+    mock_replay.assert_not_called()
+    mock_edit.assert_not_called()
+    update.callback_query.answer.assert_awaited_once_with(
+        "Stale picker (topic mismatch)", show_alert=True
+    )
+    assert context.user_data["_pending_thread_id"] == 99
+    assert context.user_data["_pending_thread_text"] == "topic 99 text"
+    assert context.user_data["_pending_thread_attachments"] == [_attachment(new_payload)]
+    assert new_payload.exists()
+
+
+@pytest.mark.asyncio
+async def test_flush_pending_route_payload_owner_mismatch_preserves_new_payload(
+    tmp_path: Path,
+):
+    payload = tmp_path / "topic-99-flush.bin"
+    payload.write_bytes(b"new")
+    user_data = _pending_user_data(payload, thread_id=99)
+
+    with (
+        patch.object(
+            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
+        ) as mock_replay,
+        patch.object(bot_module, "aggregator_clear_route") as mock_clear_route,
+    ):
+        delivered = await bot_module._flush_pending_route_payload(
+            (1, 10, "@old"), user_data
+        )
+
+    assert delivered is None
+    mock_replay.assert_not_called()
+    mock_clear_route.assert_not_called()
+    assert user_data["_pending_thread_id"] == 99
+    assert user_data["_pending_thread_text"] == "hello"
+    assert user_data["_pending_thread_attachments"] == [_attachment(payload)]
+    assert payload.exists()
 
 
 @pytest.mark.asyncio
