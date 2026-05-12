@@ -1405,6 +1405,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     thread_id = _get_thread_id(update)
+    wid = (
+        session_manager.get_window_for_thread(user.id, thread_id)
+        if thread_id is not None
+        else None
+    )
+    if wid is not None:
+        # Bound-topic user text supersedes any visible yes/no attention card.
+        # Revoke the token before the first await in this flow so a delayed
+        # concurrent callback cannot inject a stale button response while this
+        # message is still waiting on reply-context/tmux/aggregator work.
+        attention.revoke_attention_tokens(
+            user_id=user.id,
+            thread_id=thread_id,
+            window_id=wid,
+        )
 
     # Capture group chat_id for supergroup forum topic routing.
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
@@ -1492,7 +1507,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
         # Unbound topic — always show the directory browser. If unbound
         # tmux windows exist, the browser includes a "🖥 Bind existing

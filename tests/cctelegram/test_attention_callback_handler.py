@@ -13,6 +13,7 @@ explicitly rather than constructing real ``Update`` instances.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -454,6 +455,111 @@ def test_attention_clear_revokes_route_tokens(_reset_attention):
     assert kept in attention._attention_callback_routes
     assert revoked_a not in attention._attention_callback_routes
     assert revoked_b not in attention._attention_callback_routes
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_reset_attention")
+async def test_user_text_revokes_old_yes_token_before_first_awaited_work():
+    """Bound-topic text expires old yes/no buttons before a delayed callback."""
+    old_token = _register_token((1, 10, "@0"))
+
+    message = MagicMock()
+    message.text = "typed reply"
+    message.message_thread_id = 10
+    message.message_id = 500
+    message.chat = MagicMock()
+    message.chat.send_action = AsyncMock()
+    update = MagicMock()
+    update.effective_user = MagicMock(id=1)
+    update.message = message
+    update.callback_query = None
+    update.effective_chat = MagicMock(type="supergroup", id=-100123)
+    context = MagicMock()
+    context.bot = MagicMock()
+    context.user_data = {}
+    window = MagicMock()
+    window.window_id = "@0"
+
+    first_await_entered = asyncio.Event()
+    allow_text_handler_to_continue = asyncio.Event()
+
+    async def _pause_reply_context(
+        _message: object,
+        _user_id: int,
+        _thread_id: int | None,
+        text: str,
+    ) -> str:
+        first_await_entered.set()
+        await allow_text_handler_to_continue.wait()
+        return text
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module, "_apply_reply_context", side_effect=_pause_reply_context
+        ),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value="@0"
+        ),
+        patch.object(
+            bot_module.session_manager, "resolve_window_for_thread", return_value="@0"
+        ),
+        patch.object(
+            bot_module.tmux_manager, "find_window_by_id", new_callable=AsyncMock
+        ) as find_window,
+        patch.object(
+            bot_module.tmux_manager, "capture_pane", new_callable=AsyncMock
+        ) as capture,
+        patch.object(bot_module, "enqueue_status_update", new_callable=AsyncMock),
+        patch.object(bot_module, "set_route_last_user_message"),
+        patch.object(bot_module, "aggregator_offer_text", new_callable=AsyncMock) as offer,
+        patch.object(bot_module, "aggregator_flush_route", new_callable=AsyncMock) as flush,
+        patch.object(bot_module.attention, "dismiss", new_callable=AsyncMock) as dismiss,
+        patch.object(bot_module, "get_interactive_window", return_value=None),
+    ):
+        find_window.return_value = window
+        capture.return_value = ""
+
+        text_task = asyncio.create_task(bot_module.text_handler(update, context))
+        try:
+            await asyncio.wait_for(first_await_entered.wait(), timeout=1.0)
+
+            # The old token must already be gone while text_handler is paused
+            # in its first awaited operation, before aggregator work or dismiss.
+            assert old_token not in attention._attention_callback_routes
+            offer.assert_not_called()
+            flush.assert_not_called()
+            dismiss.assert_not_called()
+
+            delayed_query = _make_query(
+                callback_data=f"attn:yes:{old_token}",
+                from_user_id=1,
+            )
+            await bot_module.attention_callback_handler(_make_update(delayed_query), context)
+
+            delayed_query.answer.assert_awaited_once()
+            args, kwargs = delayed_query.answer.await_args
+            assert (
+                args[0] if args else kwargs.get("text")
+            ) == "Already answered or expired."
+            assert kwargs.get("show_alert") is True
+            delayed_query.edit_message_text.assert_not_called()
+            offer.assert_not_called()
+            flush.assert_not_called()
+            dismiss.assert_not_called()
+
+            allow_text_handler_to_continue.set()
+            await text_task
+        finally:
+            if not text_task.done():
+                text_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await text_task
+
+        offer.assert_awaited_once_with((1, 10, "@0"), "typed reply")
+        flush.assert_not_called()
+        dismiss.assert_awaited_once_with(context.bot, user_id=1, thread_id=10)
 
 
 @pytest.mark.asyncio

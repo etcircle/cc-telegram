@@ -355,8 +355,8 @@ async def notify_waiting(
 
     Returns the ``TopicSendOutcome`` of the underlying topic operation so the
     caller can route to repair (Stage 3) on ``TOPIC_NOT_FOUND``/
-    ``TOPIC_CLOSED``. Same-fingerprint repeats inside the dwell window are
-    silently treated as ``OK`` (no Telegram call made).
+    ``TOPIC_CLOSED``. Same-fingerprint repeats are silently treated as ``OK``
+    (no Telegram call made).
     """
     key = _key(user_id, thread_id)
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
@@ -376,13 +376,13 @@ async def notify_waiting(
         and (now - existing.last_send_at) < ATTENTION_REPEAT_DWELL_SECONDS
     )
 
-    # WAITING + same fingerprint within dwell: silent no-op.
+    # WAITING + same fingerprint: silent no-op. The live card and any
+    # attn:* token are still current even after dwell expires.
     if (
         existing is not None
         and existing.state == "waiting"
         and existing.window_id == window_id
         and existing.last_fingerprint == fingerprint
-        and (now - existing.last_send_at) < ATTENTION_REPEAT_DWELL_SECONDS
     ):
         logger.debug(
             "attention noop user=%d thread=%s window=%s kind=%s fingerprint=%s",
@@ -406,6 +406,13 @@ async def notify_waiting(
         and within_dwell
         and existing.message_id
     ):
+        # Replacing the acknowledged card in-place invalidates any old
+        # attn:* buttons for that route/window. Revoke before the edit so a
+        # delayed click on the previous card cannot inject yes/no after the
+        # user already typed a reply.
+        revoke_attention_tokens(
+            user_id=user_id, thread_id=thread_id, window_id=existing.window_id
+        )
         outcome = await topic_edit(
             bot,
             op="attention",
@@ -439,6 +446,12 @@ async def notify_waiting(
         and existing.window_id == window_id
         and existing.message_id
     ):
+        # This edit replaces the visible attention request. Revoke tokens for
+        # the old request before removing/replacing the buttons so stale
+        # callbacks cannot act on the new prompt.
+        revoke_attention_tokens(
+            user_id=user_id, thread_id=thread_id, window_id=existing.window_id
+        )
         outcome = await topic_edit(
             bot,
             op="attention",
@@ -475,6 +488,13 @@ async def notify_waiting(
     # ``interactive_ui.py``.
     reply_markup: InlineKeyboardMarkup | None = None
     pending_token: str | None = None
+    if existing is not None:
+        # Fresh send after an existing slot (edit failed, idle dwell elapsed,
+        # or route/window replacement): retire the previous card's buttons
+        # before minting any token for the new card below.
+        revoke_attention_tokens(
+            user_id=user_id, thread_id=thread_id, window_id=existing.window_id
+        )
     if kind == "end_of_turn_question" and getattr(config, "attention_buttons", True):
         pending_token = _make_attention_callback_token()
         reply_markup = _build_attention_keyboard(pending_token)
@@ -570,6 +590,11 @@ async def dismiss(
     """
     key = _key(user_id, thread_id)
     state = _attention_state.get(key)
+    revoke_attention_tokens(
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=state.window_id if state is not None else None,
+    )
     if state is None or state.state != "waiting":
         # Idle already — nothing to do. Keep state slot so subsequent
         # notify_waiting still hits the IDLE→WAITING branch cleanly.

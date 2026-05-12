@@ -4,7 +4,7 @@ The state-machine tests pin the four corners of ``notify_waiting`` so the
 topic-first attention card stays predictable:
 
   - idle → waiting fires a single fresh, audible ``topic_send``.
-  - waiting → waiting (same fingerprint, dwell window) is a silent no-op.
+  - waiting → waiting (same fingerprint, even after dwell) is a silent no-op.
   - waiting → waiting (different fingerprint) edits the live card silently.
   - dismiss flips state back to idle and edits the ack trailer.
   - the anti-flap guard prevents a second fresh send when a user reply has
@@ -755,6 +755,130 @@ class TestAttentionButtons:
                     assert not (
                         btn.callback_data and btn.callback_data.startswith("attn:")
                     )
+
+    @pytest.mark.asyncio
+    async def test_dismiss_revokes_attention_button_token(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "cctelegram.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "cctelegram.handlers.attention.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+            mock_edit.return_value = TopicSendOutcome.OK
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text='🔔 Awaiting your reply — cc-telegram\n"Want me to do X?"',
+                kind="end_of_turn_question",
+            )
+            token = next(iter(attention._attention_callback_routes))
+
+            await attention.dismiss(bot, user_id=1, thread_id=10)
+
+            assert attention.consume_attention_token(token) is None
+            assert attention._attention_callback_routes == {}
+            assert attention.is_waiting(1, 10) is False
+
+    @pytest.mark.asyncio
+    async def test_replacing_waiting_card_revokes_old_attention_button_token(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        with (
+            patch(
+                "cctelegram.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "cctelegram.handlers.attention.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+            mock_edit.return_value = TopicSendOutcome.OK
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text='🔔 Awaiting your reply — cc-telegram\n"Want me to do X?"',
+                kind="end_of_turn_question",
+            )
+            old_token = next(iter(attention._attention_callback_routes))
+
+            outcome = await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text='🔔 Awaiting your reply — cc-telegram\n"Different question?"',
+                kind="end_of_turn_question",
+            )
+
+            assert outcome is TopicSendOutcome.OK
+            mock_edit.assert_awaited_once()
+            assert attention.consume_attention_token(old_token) is None
+            assert attention._attention_callback_routes == {}
+
+    @pytest.mark.asyncio
+    async def test_same_fingerprint_after_dwell_preserves_attention_button_token(self):
+        bot = AsyncMock()
+        sent = _make_sent_message(message_id=42)
+        prompt = '🔔 Awaiting your reply — cc-telegram\n"Want me to do X?"'
+        with (
+            patch(
+                "cctelegram.handlers.attention.topic_send",
+                new_callable=AsyncMock,
+            ) as mock_send,
+            patch(
+                "cctelegram.handlers.attention.topic_edit",
+                new_callable=AsyncMock,
+            ) as mock_edit,
+        ):
+            mock_send.return_value = (sent, TopicSendOutcome.OK)
+            mock_edit.return_value = TopicSendOutcome.OK
+
+            await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text=prompt,
+                kind="end_of_turn_question",
+            )
+            token = next(iter(attention._attention_callback_routes))
+            entry = attention._attention_callback_routes[token]
+            existing = attention._attention_state[(1, 10)]
+            existing.last_send_at = (
+                time.monotonic() - attention.ATTENTION_REPEAT_DWELL_SECONDS - 1
+            )
+            mock_send.reset_mock()
+            mock_edit.reset_mock()
+
+            outcome = await attention.notify_waiting(
+                bot,
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text=prompt,
+                kind="end_of_turn_question",
+            )
+
+            assert outcome is TopicSendOutcome.OK
+            mock_send.assert_not_called()
+            mock_edit.assert_not_called()
+            assert attention._attention_callback_routes[token] is entry
+            assert entry.route == (1, 10, "@0")
 
     @pytest.mark.asyncio
     async def test_consume_attention_token_returns_route_then_none(self):

@@ -79,3 +79,4 @@ No push without explicit user instruction.
 
 - 2026-05-12: Tracker created from user-pasted GPT Pro response. CGC not available in this repo; using targeted file reads/searches and live tests.
 - 2026-05-12: H1 implemented by Hermes agent. Parent targeted proof passed (`46 passed`, ruff clean, `pyright src/cctelegram/bot.py` clean). Independent Hermes reviewer returned PASS. Missing pending picker owner is now stale and session callbacks no longer recover ownership from callback topic.
+- 2026-05-12: H2 implemented with two reviewer-driven fix loops. Parent targeted proof passed (`63 passed`, ruff clean, pyright clean). Independent Hermes final re-review returned PASS. Attention tokens are revoked on dismiss/card replacement and synchronously before bound-topic text awaits; same-current-card repeated notifications preserve their live token.
