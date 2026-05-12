@@ -7,6 +7,8 @@ Functions:
   - clear_topic_state: Clean up all memory state for a specific topic
 """
 
+import logging
+from pathlib import Path
 from typing import Any
 
 from telegram import Bot
@@ -20,6 +22,23 @@ from .message_queue import (
     routes_for_topic,
     teardown_route,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _delete_pending_attachment_files(attachments: list[Any]) -> None:
+    """Best-effort deletion for pending-route attachment objects."""
+    for attachment in attachments:
+        path = getattr(attachment, "path", None)
+        if path is None and isinstance(attachment, dict):
+            path = attachment.get("path")
+        if not isinstance(path, (str, Path)):
+            continue
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug("failed to delete pending attachment %s: %s", path, e)
 
 
 async def clear_topic_state(
@@ -68,6 +87,9 @@ async def clear_topic_state(
     # Clear pending thread state from user_data
     if user_data is not None:
         if user_data.get("_pending_thread_id") == thread_id:
+            attachments = list(user_data.get("_pending_thread_attachments") or [])
+            if drop_pending:
+                _delete_pending_attachment_files(attachments)
             user_data.pop("_pending_thread_id", None)
             user_data.pop("_pending_thread_text", None)
             user_data.pop("_pending_thread_attachments", None)

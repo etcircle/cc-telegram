@@ -326,6 +326,30 @@ def _clear_pending_route_payload(
     return attachments
 
 
+def _clear_pending_route_payload_for_thread(
+    user_data: dict | None,
+    thread_id: int,
+    *,
+    delete_files: bool,
+    clear_ignored_stale_threads: bool = True,
+) -> list[PendingAttachment]:
+    """Clear pending payload only when ``thread_id`` owns it.
+
+    Topic-close cleanup can race with a newer unbound-topic payload in another
+    thread. Keep all file deletion behind the same payload cleanup helper used
+    by cancel/replacement, but gate it by pending owner so closing an old topic
+    cannot delete the active newer payload.
+    """
+    if _pending_thread_id(user_data) != thread_id:
+        return []
+    _clear_picker_state_for_current_state(user_data)
+    return _clear_pending_route_payload(
+        user_data,
+        delete_files=delete_files,
+        clear_ignored_stale_threads=clear_ignored_stale_threads,
+    )
+
+
 def _clear_picker_state_for_current_state(user_data: dict | None) -> None:
     """Clear the active picker/browser state based on ``STATE_KEY``."""
     if user_data is None:
@@ -786,6 +810,12 @@ async def topic_closed_handler(
     thread_id = _get_thread_id(update)
     if thread_id is None:
         return
+
+    _clear_pending_route_payload_for_thread(
+        context.user_data,
+        thread_id,
+        delete_files=True,
+    )
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid:

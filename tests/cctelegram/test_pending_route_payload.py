@@ -94,6 +94,127 @@ def test_clear_pending_route_payload_preserves_files_for_successful_flush(
     assert "_pending_thread_attachments" not in user_data
 
 
+def _make_topic_closed_update(*, thread_id: int = 10) -> MagicMock:
+    message = MagicMock()
+    message.message_thread_id = thread_id
+    message.chat = MagicMock()
+    message.chat.id = -100123
+    message.chat.type = "supergroup"
+    message.forum_topic_closed = MagicMock()
+
+    update = MagicMock()
+    update.message = message
+    update.callback_query = None
+    update.effective_user = MagicMock()
+    update.effective_user.id = 1
+    update.effective_chat = message.chat
+    return update
+
+
+@pytest.mark.asyncio
+async def test_topic_close_unbound_matching_pending_file_deletes_and_clears_state(
+    tmp_path: Path,
+):
+    payload = tmp_path / "unbound-close.bin"
+    payload.write_bytes(b"data")
+    context = MagicMock()
+    context.user_data = _pending_user_data(payload, thread_id=10)
+    context.bot = MagicMock()
+    update = _make_topic_closed_update(thread_id=10)
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ) as mock_get_window,
+        patch.object(bot_module, "clear_topic_state", new_callable=AsyncMock) as mock_clear,
+    ):
+        await bot_module.topic_closed_handler(update, context)
+
+    mock_get_window.assert_called_once_with(1, 10)
+    mock_clear.assert_not_called()
+    assert not payload.exists()
+    assert STATE_KEY not in context.user_data
+    assert BROWSE_PATH_KEY not in context.user_data
+    assert "_pending_thread_attachments" not in context.user_data
+    assert "_pending_thread_text" not in context.user_data
+    assert "_pending_thread_id" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_topic_close_bound_matching_pending_attachments_deletes_and_clears_state(
+    tmp_path: Path,
+):
+    payload = tmp_path / "bound-close.bin"
+    payload.write_bytes(b"data")
+    context = MagicMock()
+    context.user_data = _pending_user_data(payload, thread_id=10)
+    context.bot = MagicMock()
+    update = _make_topic_closed_update(thread_id=10)
+    window = MagicMock()
+    window.window_id = "@0"
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value="@0"
+        ),
+        patch.object(
+            bot_module.session_manager, "get_display_name", return_value="bound-window"
+        ),
+        patch.object(bot_module.session_manager, "unbind_thread") as mock_unbind,
+        patch.object(
+            bot_module.tmux_manager,
+            "find_window_by_id",
+            new_callable=AsyncMock,
+            return_value=window,
+        ) as mock_find,
+        patch.object(
+            bot_module.tmux_manager, "kill_window", new_callable=AsyncMock
+        ) as mock_kill,
+        patch.object(bot_module, "clear_topic_state", new_callable=AsyncMock) as mock_clear,
+    ):
+        await bot_module.topic_closed_handler(update, context)
+
+    mock_find.assert_awaited_once_with("@0")
+    mock_kill.assert_awaited_once_with("@0")
+    mock_unbind.assert_called_once_with(1, 10)
+    mock_clear.assert_awaited_once_with(1, 10, context.bot, context.user_data)
+    assert not payload.exists()
+    assert STATE_KEY not in context.user_data
+    assert "_pending_thread_attachments" not in context.user_data
+    assert "_pending_thread_text" not in context.user_data
+    assert "_pending_thread_id" not in context.user_data
+
+
+@pytest.mark.asyncio
+async def test_topic_close_different_thread_preserves_active_pending_payload(
+    tmp_path: Path,
+):
+    payload = tmp_path / "other-topic.bin"
+    payload.write_bytes(b"data")
+    context = MagicMock()
+    context.user_data = _pending_user_data(payload, thread_id=99)
+    context.bot = MagicMock()
+    update = _make_topic_closed_update(thread_id=10)
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ),
+        patch.object(bot_module, "clear_topic_state", new_callable=AsyncMock) as mock_clear,
+    ):
+        await bot_module.topic_closed_handler(update, context)
+
+    mock_clear.assert_not_called()
+    assert payload.exists()
+    assert context.user_data[STATE_KEY] == STATE_BROWSING_DIRECTORY
+    assert context.user_data["_pending_thread_id"] == 99
+    assert context.user_data["_pending_thread_text"] == "hello"
+    assert context.user_data["_pending_thread_attachments"] == [_attachment(payload)]
+
+
 def _make_callback_update(data: str, *, thread_id: int = 10) -> MagicMock:
     query = MagicMock()
     query.data = data
