@@ -98,6 +98,7 @@ class AttentionState:
     message_id: int
     window_id: str
     last_fingerprint: str
+    generation: int
     state: Literal["idle", "waiting"]
     last_send_at: float
     kind: str
@@ -112,7 +113,9 @@ class _AttentionCallbackEntry:
     (Telegram's ``query.message.text`` returns the rendered plain view with
     MarkdownV2 entities stripped, which would corrupt formatting on a naive
     re-edit). ``parse_mode`` is the parse_mode the original send used so the
-    edit goes back through the same formatter.
+    edit goes back through the same formatter. ``fingerprint`` and
+    ``generation`` pin the token to the exact live card state so a consumed
+    token cannot be re-bound after that state is dismissed or replaced.
     """
 
     route: Route
@@ -120,6 +123,8 @@ class _AttentionCallbackEntry:
     thread_id: int | None
     window_id: str
     session_id: str | None
+    fingerprint: str
+    generation: int
     created_at: float
     rendered_text: str
     parse_mode: str | None
@@ -137,6 +142,12 @@ _attention_state: dict[tuple[int, int], AttentionState] = {}
 # click. Stale entries are pruned by ``prune_expired_attention_tokens`` on
 # the daily GC tick.
 _attention_callback_routes: dict[str, _AttentionCallbackEntry] = {}
+
+# Monotonic per-route card generation. This is separate from
+# ``_attention_state`` so an in-flight consumed token cannot become current
+# again merely because the route later creates a new state with the same
+# window/fingerprint after a dismiss, typed reply, or clear/recreate cycle.
+_attention_generations: dict[tuple[int, int], int] = {}
 
 
 # Cross-module fence for emergency "Claude is waiting" DMs. interactive_ui
@@ -284,6 +295,13 @@ def _fingerprint(window_id: str, kind: str, prompt_text: str) -> str:
     return hashlib.sha1(body.encode("utf-8", "replace")).hexdigest()
 
 
+def _bump_attention_generation(key: tuple[int, int]) -> int:
+    """Advance and return the route-local attention generation."""
+    generation = _attention_generations.get(key, 0) + 1
+    _attention_generations[key] = generation
+    return generation
+
+
 def _display_name(window_id: str) -> str:
     return session_manager.get_display_name(window_id) or window_id or "Claude"
 
@@ -425,6 +443,7 @@ async def notify_waiting(
         )
         if outcome in (TopicSendOutcome.OK, TopicSendOutcome.MESSAGE_NOT_MODIFIED):
             existing.last_fingerprint = fingerprint
+            existing.generation = _bump_attention_generation(key)
             existing.kind = kind
             existing.state = "waiting"
             return TopicSendOutcome.OK
@@ -468,6 +487,7 @@ async def notify_waiting(
         # audible duplicate of a card the user is already looking at.
         if outcome in (TopicSendOutcome.OK, TopicSendOutcome.MESSAGE_NOT_MODIFIED):
             existing.last_fingerprint = fingerprint
+            existing.generation = _bump_attention_generation(key)
             existing.kind = kind
             return TopicSendOutcome.OK
         # Edit failed (message gone, topic shifted, etc.). Fall through to
@@ -488,6 +508,7 @@ async def notify_waiting(
     # ``interactive_ui.py``.
     reply_markup: InlineKeyboardMarkup | None = None
     pending_token: str | None = None
+    pending_generation = _bump_attention_generation(key)
     if existing is not None:
         # Fresh send after an existing slot (edit failed, idle dwell elapsed,
         # or route/window replacement): retire the previous card's buttons
@@ -495,6 +516,7 @@ async def notify_waiting(
         revoke_attention_tokens(
             user_id=user_id, thread_id=thread_id, window_id=existing.window_id
         )
+        pending_generation = _bump_attention_generation(key)
     if kind == "end_of_turn_question" and getattr(config, "attention_buttons", True):
         pending_token = _make_attention_callback_token()
         reply_markup = _build_attention_keyboard(pending_token)
@@ -509,6 +531,8 @@ async def notify_waiting(
             thread_id=thread_id,
             window_id=window_id,
             session_id=session_id_for_window(window_id),
+            fingerprint=fingerprint,
+            generation=pending_generation,
             created_at=time.monotonic(),
             rendered_text=text,
             parse_mode="MarkdownV2",
@@ -570,6 +594,7 @@ async def notify_waiting(
         message_id=sent.message_id,
         window_id=window_id,
         last_fingerprint=fingerprint,
+        generation=pending_generation,
         state="waiting",
         last_send_at=now,
         kind=kind,
@@ -643,8 +668,18 @@ def revoke_attention_tokens(
     ``clear`` calls this on route teardown/session rotation so old inline
     buttons cannot later inject ``yes``/``no`` into a rebound or cleared route.
     ``window_id`` narrows the revocation when a caller knows the exact route.
+
+    Revocation also advances the live state's generation when the route/window
+    still matches. That catches tokens already consumed by an in-flight
+    callback: they are no longer visible in ``_attention_callback_routes``, but
+    a later failed delivery must not be allowed to re-bind them after typed
+    reply, dismiss, or card replacement invalidated the card.
     """
     route_thread = thread_id or 0
+    key = (user_id, route_thread)
+    state = _attention_state.get(key)
+    if state is not None and (window_id is None or state.window_id == window_id):
+        state.generation = _bump_attention_generation(key)
     stale_tokens = [
         token
         for token, entry in _attention_callback_routes.items()
@@ -660,6 +695,7 @@ def revoke_attention_tokens(
 def reset_for_tests() -> None:
     """Test-only: drop all attention state."""
     _attention_state.clear()
+    _attention_generations.clear()
     _emergency_dm_last_sent.clear()
     _attention_callback_routes.clear()
 
@@ -706,7 +742,24 @@ def consume_attention_token(token: str) -> _AttentionCallbackEntry | None:
     return _attention_callback_routes.pop(token, None)
 
 
-def rebind_attention_token(token: str, entry: _AttentionCallbackEntry) -> None:
+def _attention_entry_is_current(entry: _AttentionCallbackEntry) -> bool:
+    """Return True iff ``entry`` still belongs to the live waiting card."""
+    key = _key(entry.route[0], entry.thread_id)
+    state = _attention_state.get(key)
+    if state is None or state.state != "waiting":
+        return False
+    if state.window_id != entry.window_id:
+        return False
+    if state.last_fingerprint != entry.fingerprint:
+        return False
+    if state.generation != entry.generation:
+        return False
+    if session_id_for_window(entry.window_id) != entry.session_id:
+        return False
+    return True
+
+
+def rebind_attention_token(token: str, entry: _AttentionCallbackEntry) -> bool:
     """Re-insert ``entry`` under ``token`` after a failed consume-and-act.
 
     Bug 3 (atomic consume): ``consume_attention_token`` pops eagerly so a
@@ -714,9 +767,21 @@ def rebind_attention_token(token: str, entry: _AttentionCallbackEntry) -> None:
     If the downstream aggregator step then raises, the user would otherwise
     be stuck — clicking again hits the expired path and they have no other
     affordance. The callback handler calls this to put the entry back so the
-    user can retry the click.
+    user can retry the click. The re-bind is deliberately conditional: a token
+    consumed by an in-flight callback may have been revoked while delivery was
+    awaiting. Only the still-current waiting card generation may be restored.
     """
+    if not _attention_entry_is_current(entry):
+        logger.debug(
+            "not rebinding stale attention token user=%d thread=%s window=%s generation=%d",
+            entry.route[0],
+            entry.thread_id,
+            entry.window_id,
+            entry.generation,
+        )
+        return False
     _attention_callback_routes[token] = entry
+    return True
 
 
 def prune_expired_attention_tokens() -> int:

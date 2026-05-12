@@ -20,6 +20,7 @@ import pytest
 
 from cctelegram import bot as bot_module
 from cctelegram.handlers import attention
+from cctelegram.handlers.message_sender import TopicSendOutcome
 
 
 @pytest.fixture
@@ -74,17 +75,34 @@ def _register_token(
     session_id: str | None = None,
     rendered_text: str = '🔔 Awaiting your reply — cc-telegram\n"Want me to do X?"',
     parse_mode: str | None = "MarkdownV2",
+    kind: str = "end_of_turn_question",
 ) -> str:
     """Mint a token and bind it to ``route``, mimicking notify_waiting."""
     import time as _time
 
     token = attention._make_attention_callback_token()
+    key = (route[0], route[1] or 0)
+    generation = attention._bump_attention_generation(key)
+    fingerprint = attention._fingerprint(route[2], kind, rendered_text)
+    if session_id is None:
+        session_id = attention.session_id_for_window(route[2])
+    attention._attention_state[key] = attention.AttentionState(
+        message_id=555,
+        window_id=route[2],
+        last_fingerprint=fingerprint,
+        generation=generation,
+        state="waiting",
+        last_send_at=_time.monotonic(),
+        kind=kind,
+    )
     attention._attention_callback_routes[token] = attention._AttentionCallbackEntry(
         route=route,
         chat_id=chat_id,
         thread_id=route[1],
         window_id=route[2],
         session_id=session_id,
+        fingerprint=fingerprint,
+        generation=generation,
         created_at=_time.monotonic(),
         rendered_text=rendered_text,
         parse_mode=parse_mode,
@@ -513,9 +531,15 @@ async def test_user_text_revokes_old_yes_token_before_first_awaited_work():
         ) as capture,
         patch.object(bot_module, "enqueue_status_update", new_callable=AsyncMock),
         patch.object(bot_module, "set_route_last_user_message"),
-        patch.object(bot_module, "aggregator_offer_text", new_callable=AsyncMock) as offer,
-        patch.object(bot_module, "aggregator_flush_route", new_callable=AsyncMock) as flush,
-        patch.object(bot_module.attention, "dismiss", new_callable=AsyncMock) as dismiss,
+        patch.object(
+            bot_module, "aggregator_offer_text", new_callable=AsyncMock
+        ) as offer,
+        patch.object(
+            bot_module, "aggregator_flush_route", new_callable=AsyncMock
+        ) as flush,
+        patch.object(
+            bot_module.attention, "dismiss", new_callable=AsyncMock
+        ) as dismiss,
         patch.object(bot_module, "get_interactive_window", return_value=None),
     ):
         find_window.return_value = window
@@ -536,7 +560,9 @@ async def test_user_text_revokes_old_yes_token_before_first_awaited_work():
                 callback_data=f"attn:yes:{old_token}",
                 from_user_id=1,
             )
-            await bot_module.attention_callback_handler(_make_update(delayed_query), context)
+            await bot_module.attention_callback_handler(
+                _make_update(delayed_query), context
+            )
 
             delayed_query.answer.assert_awaited_once()
             args, kwargs = delayed_query.answer.await_args
@@ -599,6 +625,170 @@ async def test_aggregator_failure_rebinds_token_and_alerts():
         "try again" in (alert_text or "").lower()
         or "couldn't" in (alert_text or "").lower()
     )
+    assert kwargs.get("show_alert") is True
+    query.edit_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_reset_attention")
+async def test_inflight_delivery_failure_after_dismiss_does_not_rebind_token():
+    """A consumed token cannot be resurrected after direct dismiss invalidates it."""
+    route = (1, 10, "@0")
+    token = _register_token(route)
+    query = _make_query(callback_data=f"attn:yes:{token}", from_user_id=1)
+
+    offer_entered = asyncio.Event()
+    allow_offer_to_fail = asyncio.Event()
+
+    async def _pause_then_raise(*_args: object, **_kwargs: object) -> None:
+        offer_entered.set()
+        await allow_offer_to_fail.wait()
+        raise RuntimeError("simulated delivery failure")
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module, "aggregator_offer_text", side_effect=_pause_then_raise
+        ),
+        patch.object(bot_module, "aggregator_flush_route", new_callable=AsyncMock),
+        patch.object(
+            attention.session_manager, "resolve_chat_id", return_value=-100123
+        ),
+        patch.object(attention, "topic_edit", new_callable=AsyncMock) as mock_edit,
+    ):
+        mock_edit.return_value = TopicSendOutcome.OK
+        task = asyncio.create_task(
+            bot_module.attention_callback_handler(_make_update(query), MagicMock())
+        )
+        try:
+            await asyncio.wait_for(offer_entered.wait(), timeout=1.0)
+            assert token not in attention._attention_callback_routes
+
+            await attention.dismiss(MagicMock(), user_id=1, thread_id=10)
+            allow_offer_to_fail.set()
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+    assert token not in attention._attention_callback_routes
+    query.answer.assert_awaited_once()
+    args, kwargs = query.answer.await_args
+    assert "try again" in ((args[0] if args else kwargs.get("text")) or "").lower()
+    assert kwargs.get("show_alert") is True
+    query.edit_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_reset_attention")
+async def test_inflight_delivery_failure_after_typed_reply_revocation_does_not_rebind_token():
+    """Typed-reply pre-await revocation invalidates consumed in-flight tokens."""
+    route = (1, 10, "@0")
+    token = _register_token(route)
+    query = _make_query(callback_data=f"attn:no:{token}", from_user_id=1)
+
+    offer_entered = asyncio.Event()
+    allow_offer_to_fail = asyncio.Event()
+
+    async def _pause_then_raise(*_args: object, **_kwargs: object) -> None:
+        offer_entered.set()
+        await allow_offer_to_fail.wait()
+        raise RuntimeError("simulated delivery failure")
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module, "aggregator_offer_text", side_effect=_pause_then_raise
+        ),
+        patch.object(bot_module, "aggregator_flush_route", new_callable=AsyncMock),
+    ):
+        task = asyncio.create_task(
+            bot_module.attention_callback_handler(_make_update(query), MagicMock())
+        )
+        try:
+            await asyncio.wait_for(offer_entered.wait(), timeout=1.0)
+            assert token not in attention._attention_callback_routes
+
+            attention.revoke_attention_tokens(user_id=1, thread_id=10, window_id="@0")
+            allow_offer_to_fail.set()
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+    assert token not in attention._attention_callback_routes
+    query.answer.assert_awaited_once()
+    args, kwargs = query.answer.await_args
+    assert "try again" in ((args[0] if args else kwargs.get("text")) or "").lower()
+    assert kwargs.get("show_alert") is True
+    query.edit_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_reset_attention")
+async def test_inflight_delivery_failure_after_replacement_does_not_rebind_old_token():
+    """Replacing the waiting card with a new prompt invalidates old consumed tokens."""
+    route = (1, 10, "@0")
+    old_prompt = '🔔 Awaiting your reply — cc-telegram\n"Want me to do X?"'
+    token = _register_token(route, rendered_text=old_prompt)
+    query = _make_query(callback_data=f"attn:yes:{token}", from_user_id=1)
+
+    offer_entered = asyncio.Event()
+    allow_offer_to_fail = asyncio.Event()
+
+    async def _pause_then_raise(*_args: object, **_kwargs: object) -> None:
+        offer_entered.set()
+        await allow_offer_to_fail.wait()
+        raise RuntimeError("simulated delivery failure")
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(
+            bot_module, "aggregator_offer_text", side_effect=_pause_then_raise
+        ),
+        patch.object(bot_module, "aggregator_flush_route", new_callable=AsyncMock),
+        patch.object(
+            attention.session_manager, "resolve_chat_id", return_value=-100123
+        ),
+        patch.object(
+            attention.session_manager, "get_display_name", return_value="cctelegram"
+        ),
+        patch.object(attention, "topic_edit", new_callable=AsyncMock) as mock_edit,
+    ):
+        mock_edit.return_value = TopicSendOutcome.OK
+        task = asyncio.create_task(
+            bot_module.attention_callback_handler(_make_update(query), MagicMock())
+        )
+        try:
+            await asyncio.wait_for(offer_entered.wait(), timeout=1.0)
+            assert token not in attention._attention_callback_routes
+
+            outcome = await attention.notify_waiting(
+                MagicMock(),
+                user_id=1,
+                thread_id=10,
+                window_id="@0",
+                prompt_text='🔔 Awaiting your reply — cc-telegram\n"Different prompt?"',
+                kind="end_of_turn_question",
+            )
+            assert outcome is TopicSendOutcome.OK
+
+            allow_offer_to_fail.set()
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+    assert token not in attention._attention_callback_routes
+    query.answer.assert_awaited_once()
+    args, kwargs = query.answer.await_args
+    assert "try again" in ((args[0] if args else kwargs.get("text")) or "").lower()
     assert kwargs.get("show_alert") is True
     query.edit_message_text.assert_not_called()
 
