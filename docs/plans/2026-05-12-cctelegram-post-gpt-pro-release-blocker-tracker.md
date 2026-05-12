@@ -1,0 +1,81 @@
+# cc-telegram post-GPT-Pro release blocker tracker
+
+Created: 2026-05-12
+Repo: `/Users/felixcardix/dev-workspaces/cc-telegram`
+Branch: `main`
+Starting HEAD: `6978351 docs: add merged main GPT review brief`
+External response artifact: `/Users/felixcardix/.hermes/handoffs/chatgpt-pro/2026-05-12_071931-cctelegram-merged-main-post-remediation-review/RESPONSE.md`
+
+## Operating model
+
+Every item gets:
+1. Hermes implementation agent.
+2. Parent targeted verification.
+3. Independent Hermes peer reviewer.
+4. Narrow fix loop if reviewer finds a blocker.
+5. Parent commit before the next item.
+6. Final full-suite verification + red-team.
+
+No push without explicit user instruction.
+
+## Items
+
+### H1 — Picker callbacks stale-actionable after pending ownership is gone
+- Severity: MUST FIX / release blocker
+- Scope: `src/cctelegram/bot.py`, stale picker tests
+- Expected behavior: every directory/session/window picker callback requires active expected picker state and matching `_pending_thread_id`. Missing owner is stale, not recoverable. Remove session fallback from callback topic.
+- Verification: focused stale picker tests + pending route payload tests + pyright/ruff on touched files.
+
+### H2 — Attention tokens survive dismiss/card replacement
+- Severity: MUST FIX / release blocker
+- Scope: `src/cctelegram/handlers/attention.py`, `src/cctelegram/bot.py`, attention callback tests
+- Expected behavior: `dismiss()` and card replacement revoke stale tokens so delayed old yes/no/type cannot inject after typed reply or replacement.
+
+### H3 — Pending first-turn payload silently lost on bind/create flush failure
+- Severity: MUST FIX / release blocker
+- Scope: `src/cctelegram/bot.py`, inbound aggregator tests/pending route tests
+- Expected behavior: create/bind flush result is consumed; UI does not claim first-turn delivery on failure; cleanup/preservation behavior is explicit and tested.
+
+### M1 — Test/CI config imports not hermetic
+- Severity: MUST FIX before push/CI
+- Scope: root/conftest and `.github/workflows/check.yml`
+- Expected behavior: tests set dummy `TELEGRAM_BOT_TOKEN`, `ALLOWED_USERS`, and isolated `CC_TELEGRAM_DIR` before app config imports; CI does not depend on local `.env`.
+
+### M2 — Topic close pending media cleanup gaps
+- Severity: SHOULD FIX
+- Scope: `src/cctelegram/bot.py`, `src/cctelegram/handlers/cleanup.py`, tests
+- Expected behavior: topic close clears pending payload/files when pending topic matches, including unbound pending topics.
+
+### M3 — Unbound photo/document captions lose reply context
+- Severity: SHOULD FIX
+- Scope: `src/cctelegram/bot.py`, pending route/media tests
+- Expected behavior: reply context is applied before stashing unbound media captions, respecting media-group caption guard.
+
+### M4 — Legacy hook detection too broad
+- Severity: SHOULD FIX
+- Scope: `src/cctelegram/hook.py`, hook tests
+- Expected behavior: tighten legacy matching or document/test intentional substring behavior. Prefer tightening unless wrappers require substring behavior.
+
+### M5 — Subagent digest clobber race TODO
+- Severity: SHOULD FIX
+- Scope: `src/cctelegram/handlers/message_queue.py`, message queue tests
+- Expected behavior: remove post-await stale writes per TODO and add regression.
+
+### M6 — Non-resume hook timeout can leave unmonitored tmux window
+- Severity: SHOULD FIX
+- Scope: `_create_and_bind_window()` in `src/cctelegram/bot.py`, tests
+- Expected behavior: kill created tmux window or clearly surface cleanup when hook/session timeout fails before binding.
+
+### L1 — Historical plan docs old naming
+- Severity: LOW
+- Scope: docs only
+- Expected behavior: label dated `docs/plans` as historical context if necessary; do not rewrite history docs broadly.
+
+### Real Telegram smoke
+- Severity: release gate / blocked by config
+- Expected behavior: safe local smoke is not enough. Manual/live Telegram smoke remains required before production release. If no token/config is present, record as blocked; do not fake it.
+
+## Status log
+
+- 2026-05-12: Tracker created from user-pasted GPT Pro response. CGC not available in this repo; using targeted file reads/searches and live tests.
+- 2026-05-12: H1 implemented by Hermes agent. Parent targeted proof passed (`46 passed`, ruff clean, `pyright src/cctelegram/bot.py` clean). Independent Hermes reviewer returned PASS. Missing pending picker owner is now stale and session callbacks no longer recover ownership from callback topic.

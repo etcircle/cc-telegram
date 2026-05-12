@@ -242,3 +242,54 @@ async def test_window_picker_rejects_window_that_became_bound_after_render():
     mock_offer_text.assert_not_called()
     mock_flush.assert_not_called()
     assert context.user_data[UNBOUND_WINDOWS_KEY] == ["@0"]
+
+
+@pytest.mark.asyncio
+async def test_window_picker_bind_without_pending_owner_rejects_before_tmux_lookup():
+    update = _make_callback_update(f"{CB_WIN_BIND}0")
+    context = _make_context(
+        {
+            STATE_KEY: STATE_SELECTING_WINDOW,
+            UNBOUND_WINDOWS_KEY: ["@0"],
+        }
+    )
+    window = MagicMock()
+    window.window_id = "@0"
+    window.window_name = "unbound-window"
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(
+            bot_module.tmux_manager,
+            "find_window_by_id",
+            new_callable=AsyncMock,
+            return_value=window,
+        ) as mock_find,
+        patch.object(
+            bot_module,
+            "_list_unbound_windows",
+            new_callable=AsyncMock,
+            return_value=[("@0", "unbound-window", "/tmp")],
+        ) as mock_list_unbound,
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_safe_edit,
+        patch.object(
+            bot_module, "aggregator_offer_text", new_callable=AsyncMock
+        ) as mock_offer_text,
+        patch.object(
+            bot_module, "aggregator_flush_route", new_callable=AsyncMock
+        ) as mock_flush,
+    ):
+        await bot_module.callback_handler(update, context)
+
+    update.callback_query.answer.assert_awaited_once_with(
+        "Stale picker (topic mismatch)", show_alert=True
+    )
+    mock_find.assert_not_called()
+    mock_list_unbound.assert_not_called()
+    mock_bind.assert_not_called()
+    mock_safe_edit.assert_not_called()
+    mock_offer_text.assert_not_called()
+    mock_flush.assert_not_called()
+    assert context.user_data[UNBOUND_WINDOWS_KEY] == ["@0"]

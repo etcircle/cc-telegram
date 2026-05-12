@@ -359,6 +359,45 @@ async def _answer_stale_pending_thread_mismatch(
     await query.answer(answer_text, show_alert=True)
 
 
+_PICKER_STALE_TOPIC_MISMATCH = "topic_mismatch"
+
+
+def _validate_pending_picker_callback(
+    user_data: dict | None,
+    callback_thread_id: int | None,
+    expected_states: tuple[str, ...],
+) -> tuple[bool, int | None, str | None]:
+    """Validate a picker callback still owns an active pending topic route.
+
+    Directory/session/window picker buttons are only actionable while their
+    pending route payload is active. Missing user_data, missing/wrong state, a
+    missing ``_pending_thread_id``, or a different callback topic are all stale.
+    """
+    if user_data is None:
+        return False, None, "missing_user_data"
+
+    current_state = user_data.get(STATE_KEY)
+    if current_state not in expected_states:
+        return False, None, "wrong_state"
+
+    pending_tid = _pending_thread_id(user_data)
+    if pending_tid is None:
+        return False, None, "missing_pending_owner"
+
+    if callback_thread_id != pending_tid:
+        return False, pending_tid, _PICKER_STALE_TOPIC_MISMATCH
+
+    return True, pending_tid, None
+
+
+async def _answer_invalid_pending_picker_callback(
+    query: CallbackQuery,
+    answer_text: str,
+) -> None:
+    """Answer a stale picker callback without mutating pending picker state."""
+    await query.answer(answer_text, show_alert=True)
+
+
 def _get_thread_id(update: Update) -> int | None:
     """Extract thread_id from an update, returning None if not in a named topic."""
     msg = update.message or (
@@ -1891,6 +1930,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("Stale controls (topic mismatch)", show_alert=True)
         return True
 
+    async def reject_invalid_pending_picker(
+        expected_states: tuple[str, ...],
+        answer_text: str,
+    ) -> tuple[bool, int | None]:
+        """Answer and short-circuit if a picker callback lost pending ownership."""
+        ok, pending_tid, _reason = _validate_pending_picker_callback(
+            context.user_data,
+            cb_thread_id,
+            expected_states,
+        )
+        if ok:
+            return False, pending_tid
+        await _answer_invalid_pending_picker_callback(
+            query,
+            answer_text,
+        )
+        return True, pending_tid
+
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>
     if data.startswith(CB_HISTORY_PREV) or data.startswith(CB_HISTORY_NEXT):
@@ -1935,17 +1992,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Directory browser handlers
     elif data.startswith(CB_DIR_SELECT):
-        # Validate: callback must come from the same topic that started browsing
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, pending_tid = await reject_invalid_pending_picker(
+            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
         )
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale browser (topic mismatch)",
-            )
+        if stale:
             return
         # callback_data contains index, not dir name (to avoid 64-byte limit)
         try:
@@ -2005,16 +2055,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer()
 
     elif data == CB_DIR_UP:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, _pending_tid = await reject_invalid_pending_picker(
+            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
         )
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale browser (topic mismatch)",
-            )
+        if stale:
             return
         default_path = str(Path.cwd())
         current_path = (
@@ -2045,16 +2089,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer()
 
     elif data.startswith(CB_DIR_PAGE):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, _pending_tid = await reject_invalid_pending_picker(
+            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
         )
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale browser (topic mismatch)",
-            )
+        if stale:
             return
         try:
             pg = int(data[len(CB_DIR_PAGE) :])
@@ -2084,28 +2122,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer()
 
     elif data == CB_DIR_CONFIRM:
+        stale, pending_thread_id = await reject_invalid_pending_picker(
+            (STATE_BROWSING_DIRECTORY,),
+            "Stale browser (topic mismatch)",
+        )
+        if stale:
+            return
         default_path = str(Path.cwd())
         selected_path = (
             context.user_data.get(BROWSE_PATH_KEY, default_path)
             if context.user_data
             else default_path
         )
-        # Check if this was initiated from a thread bind flow
-        pending_thread_id: int | None = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-
-        # Validate: confirm button must come from the same topic that started browsing
-        confirm_thread_id = cb_thread_id
-        if pending_thread_id is not None and confirm_thread_id != pending_thread_id:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                confirm_thread_id,
-                "Stale browser (topic mismatch)",
-                clear_picker_state=True,
-            )
-            return
 
         clear_browse_state(context.user_data)
 
@@ -2128,16 +2156,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
     elif data == CB_DIR_CANCEL:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, _pending_tid = await reject_invalid_pending_picker(
+            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
         )
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale browser (topic mismatch)",
-            )
+        if stale:
             return
         clear_browse_state(context.user_data)
         if context.user_data is not None:
@@ -2147,20 +2169,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Session picker: resume existing session
     elif data.startswith(CB_SESSION_SELECT):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, pending_tid = await reject_invalid_pending_picker(
+            (STATE_SELECTING_SESSION,), "Stale picker (topic mismatch)"
         )
-        # Fallback: if _pending_thread_id was cleared (e.g. by a message in
-        # another topic), recover it from the callback query's message context
-        if pending_tid is None:
-            pending_tid = _get_thread_id(update)
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale picker (topic mismatch)",
-            )
+        if stale:
             return
         try:
             idx = int(data[len(CB_SESSION_SELECT) :])
@@ -2195,18 +2207,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
     elif data == CB_SESSION_NEW:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, pending_tid = await reject_invalid_pending_picker(
+            (STATE_SELECTING_SESSION,), "Stale picker (topic mismatch)"
         )
-        if pending_tid is None:
-            pending_tid = _get_thread_id(update)
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale picker (topic mismatch)",
-            )
+        if stale:
             return
         selected_path = (
             context.user_data.get("_selected_path", str(Path.cwd()))
@@ -2220,16 +2224,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _create_and_bind_window(query, context, user, selected_path, pending_tid)
 
     elif data == CB_SESSION_CANCEL:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, _pending_tid = await reject_invalid_pending_picker(
+            (STATE_SELECTING_SESSION,), "Stale picker (topic mismatch)"
         )
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale picker (topic mismatch)",
-            )
+        if stale:
             return
         clear_session_picker_state(context.user_data)
         if context.user_data is not None:
@@ -2239,16 +2237,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Window picker: bind existing window
     elif data.startswith(CB_WIN_BIND):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, _pending_tid = await reject_invalid_pending_picker(
+            (STATE_SELECTING_WINDOW,), "Stale picker (topic mismatch)"
         )
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale picker (topic mismatch)",
-            )
+        if stale:
             return
         try:
             idx = int(data[len(CB_WIN_BIND) :])
@@ -2322,16 +2314,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Window picker: new session → transition to directory browser
     elif data == CB_WIN_NEW:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, pending_tid = await reject_invalid_pending_picker(
+            (STATE_SELECTING_WINDOW,), "Stale picker (topic mismatch)"
         )
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale picker (topic mismatch)",
-            )
+        if stale:
             return
         # Preserve pending thread info, clear only picker state
         clear_window_picker_state(context.user_data)
@@ -2358,16 +2344,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Directory browser: opt-in pivot to window picker
     elif data == CB_DIR_BIND_EXISTING:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, _pending_tid = await reject_invalid_pending_picker(
+            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
         )
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale browser (topic mismatch)",
-            )
+        if stale:
             return
         unbound = await _list_unbound_windows()
         if not unbound:
@@ -2385,16 +2365,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Window picker: cancel
     elif data == CB_WIN_CANCEL:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+        stale, _pending_tid = await reject_invalid_pending_picker(
+            (STATE_SELECTING_WINDOW,), "Stale picker (topic mismatch)"
         )
-        if pending_tid is not None and cb_thread_id != pending_tid:
-            await _answer_stale_pending_thread_mismatch(
-                query,
-                context.user_data,
-                cb_thread_id,
-                "Stale picker (topic mismatch)",
-            )
+        if stale:
             return
         clear_window_picker_state(context.user_data)
         if context.user_data is not None:

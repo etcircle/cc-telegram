@@ -1,9 +1,9 @@
 """Regression tests for unbound-topic pending payload cleanup.
 
 Unbound text/photo/document payloads live in ``context.user_data`` while the
-user is choosing a directory, existing session, or tmux window. Cancel and
-stale-picker paths must clear the whole bundle, including downloaded files, so
-old media cannot be forwarded on a later bind.
+user is choosing a directory, existing session, or tmux window. Cancel paths
+must clear the whole bundle, including downloaded files. Stale picker callbacks
+must be rejected without acting on or deleting the active pending owner.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from cctelegram import bot as bot_module
 from cctelegram.handlers.callback_data import (
     CB_DIR_BIND_EXISTING,
     CB_DIR_CANCEL,
+    CB_DIR_CONFIRM,
     CB_DIR_PAGE,
     CB_DIR_SELECT,
     CB_DIR_UP,
@@ -39,6 +40,7 @@ from cctelegram.handlers.directory_browser import (
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
 )
+from cctelegram.session import ClaudeSession
 
 
 def _attachment(path: Path) -> bot_module.PendingAttachment:
@@ -214,6 +216,12 @@ async def test_picker_cancel_clears_pending_attachments_and_deletes_file(
     payload.write_bytes(b"data")
     context = MagicMock()
     context.user_data = _pending_user_data(payload, thread_id=10)
+    if callback_data == CB_SESSION_CANCEL:
+        context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+        context.user_data[SESSIONS_KEY] = []
+    elif callback_data == CB_WIN_CANCEL:
+        context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+        context.user_data[UNBOUND_WINDOWS_KEY] = []
     update = _make_callback_update(callback_data, thread_id=10)
 
     with (
@@ -232,11 +240,12 @@ async def test_picker_cancel_clears_pending_attachments_and_deletes_file(
 
 
 @pytest.mark.asyncio
-async def test_stale_session_picker_mismatch_clears_pending_attachments(tmp_path: Path):
+async def test_stale_session_picker_mismatch_preserves_pending_attachments(tmp_path: Path):
     payload = tmp_path / "stale.bin"
     payload.write_bytes(b"data")
     context = MagicMock()
     context.user_data = _pending_user_data(payload, thread_id=10)
+    context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
     update = _make_callback_update(CB_SESSION_NEW, thread_id=99)
 
     with (
@@ -248,12 +257,14 @@ async def test_stale_session_picker_mismatch_clears_pending_attachments(tmp_path
     ):
         await bot_module.callback_handler(update, context)
 
-    assert not payload.exists()
-    assert "_pending_thread_attachments" not in context.user_data
-    assert "_pending_thread_text" not in context.user_data
-    assert "_pending_thread_id" not in context.user_data
+    assert payload.exists()
+    assert context.user_data["_pending_thread_attachments"] == [_attachment(payload)]
+    assert context.user_data["_pending_thread_text"] == "hello"
+    assert context.user_data["_pending_thread_id"] == 10
     mock_create.assert_not_called()
-    update.callback_query.answer.assert_awaited_once()
+    update.callback_query.answer.assert_awaited_once_with(
+        "Stale picker (topic mismatch)", show_alert=True
+    )
 
 
 @pytest.mark.asyncio
@@ -267,7 +278,7 @@ async def test_stale_session_picker_mismatch_clears_pending_attachments(tmp_path
         CB_DIR_BIND_EXISTING,
     ],
 )
-async def test_stale_directory_browser_callbacks_clear_pending_attachments(
+async def test_stale_directory_browser_callbacks_preserve_pending_attachments(
     tmp_path: Path, callback_data: str
 ):
     payload = tmp_path / "stale-dir.bin"
@@ -283,12 +294,14 @@ async def test_stale_directory_browser_callbacks_clear_pending_attachments(
     ):
         await bot_module.callback_handler(update, context)
 
-    assert not payload.exists()
-    assert "_pending_thread_attachments" not in context.user_data
-    assert "_pending_thread_text" not in context.user_data
-    assert "_pending_thread_id" not in context.user_data
+    assert payload.exists()
+    assert context.user_data["_pending_thread_attachments"] == [_attachment(payload)]
+    assert context.user_data["_pending_thread_text"] == "hello"
+    assert context.user_data["_pending_thread_id"] == 10
     mock_safe_edit.assert_not_called()
-    update.callback_query.answer.assert_awaited_once()
+    update.callback_query.answer.assert_awaited_once_with(
+        "Stale browser (topic mismatch)", show_alert=True
+    )
 
 
 @pytest.mark.asyncio
@@ -562,6 +575,138 @@ async def test_text_replaced_topic_stale_cancel_does_not_clear_new_text_photo_pa
 
 
 @pytest.mark.asyncio
+async def test_dir_confirm_without_pending_owner_rejects_without_create_or_bind(
+    tmp_path: Path,
+):
+    context = MagicMock()
+    context.user_data = {
+        STATE_KEY: STATE_BROWSING_DIRECTORY,
+        BROWSE_PATH_KEY: str(tmp_path),
+        BROWSE_DIRS_KEY: [],
+        BROWSE_UNBOUND_COUNT_KEY: 0,
+    }
+    update = _make_callback_update(CB_DIR_CONFIRM, thread_id=10)
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager,
+            "list_sessions_for_directory",
+            new_callable=AsyncMock,
+        ) as mock_list_sessions,
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(
+            bot_module.tmux_manager, "create_window", new_callable=AsyncMock
+        ) as mock_create_window,
+        patch.object(
+            bot_module, "_create_and_bind_window", new_callable=AsyncMock
+        ) as mock_create_and_bind,
+    ):
+        await bot_module.callback_handler(update, context)
+
+    update.callback_query.answer.assert_awaited_once_with(
+        "Stale browser (topic mismatch)", show_alert=True
+    )
+    mock_list_sessions.assert_not_called()
+    mock_create_and_bind.assert_not_called()
+    mock_create_window.assert_not_called()
+    mock_bind.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_new_without_pending_owner_does_not_recover_from_topic(
+    tmp_path: Path,
+):
+    context = MagicMock()
+    context.user_data = {
+        STATE_KEY: STATE_SELECTING_SESSION,
+        "_selected_path": str(tmp_path),
+    }
+    update = _make_callback_update(CB_SESSION_NEW, thread_id=10)
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(
+            bot_module.tmux_manager, "create_window", new_callable=AsyncMock
+        ) as mock_create_window,
+        patch.object(
+            bot_module, "_create_and_bind_window", new_callable=AsyncMock
+        ) as mock_create_and_bind,
+    ):
+        await bot_module.callback_handler(update, context)
+
+    update.callback_query.answer.assert_awaited_once_with(
+        "Stale picker (topic mismatch)", show_alert=True
+    )
+    mock_create_and_bind.assert_not_called()
+    mock_create_window.assert_not_called()
+    mock_bind.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_select_without_pending_owner_rejects(tmp_path: Path):
+    context = MagicMock()
+    context.user_data = {
+        STATE_KEY: STATE_SELECTING_SESSION,
+        SESSIONS_KEY: [ClaudeSession("sid", "summary", 1, str(tmp_path / "s.jsonl"))],
+        "_selected_path": str(tmp_path),
+    }
+    update = _make_callback_update(f"{CB_SESSION_SELECT}0", thread_id=10)
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(
+            bot_module, "_create_and_bind_window", new_callable=AsyncMock
+        ) as mock_create,
+    ):
+        await bot_module.callback_handler(update, context)
+
+    update.callback_query.answer.assert_awaited_once_with(
+        "Stale picker (topic mismatch)", show_alert=True
+    )
+    mock_create.assert_not_called()
+    mock_bind.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_new_double_click_after_pending_owner_cleared_is_rejected(
+    tmp_path: Path,
+):
+    context = MagicMock()
+    context.user_data = {
+        STATE_KEY: STATE_SELECTING_SESSION,
+        "_pending_thread_id": 10,
+        "_selected_path": str(tmp_path),
+    }
+    first_update = _make_callback_update(CB_SESSION_NEW, thread_id=10)
+    second_update = _make_callback_update(CB_SESSION_NEW, thread_id=10)
+
+    async def clear_pending_after_first_click(*_args: object, **_kwargs: object) -> None:
+        context.user_data.clear()
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module, "_create_and_bind_window", new_callable=AsyncMock
+        ) as mock_create,
+    ):
+        mock_create.side_effect = clear_pending_after_first_click
+        await bot_module.callback_handler(first_update, context)
+        await bot_module.callback_handler(second_update, context)
+
+    mock_create.assert_awaited_once()
+    second_update.callback_query.answer.assert_awaited_once_with(
+        "Stale picker (topic mismatch)", show_alert=True
+    )
+
+
+@pytest.mark.asyncio
 async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: Path):
     payload = tmp_path / "cancel-then-bind.bin"
     payload.write_bytes(b"data")
@@ -589,20 +734,20 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
     with (
         patch.object(bot_module, "is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(bot_module.session_manager, "bind_thread"),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
         patch.object(
             bot_module.tmux_manager,
             "find_window_by_id",
             new_callable=AsyncMock,
             return_value=window,
-        ),
+        ) as mock_find,
         patch.object(
             bot_module,
             "_list_unbound_windows",
             new_callable=AsyncMock,
             return_value=[("window-1", "window one", "/tmp")],
-        ),
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock),
+        ) as mock_list_unbound,
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
         patch.object(
             bot_module, "aggregator_offer_text", new_callable=AsyncMock
         ) as mock_offer_text,
@@ -615,7 +760,13 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
     ):
         await bot_module.callback_handler(bind_update, context)
 
+    mock_bind.assert_not_called()
+    mock_find.assert_not_called()
+    mock_list_unbound.assert_not_called()
+    mock_edit.assert_not_called()
     mock_offer_text.assert_not_called()
     mock_offer_attachment.assert_not_called()
     mock_flush.assert_not_called()
-    bind_update.callback_query.answer.assert_awaited_once_with("Bound")
+    bind_update.callback_query.answer.assert_awaited_once_with(
+        "Stale picker (topic mismatch)", show_alert=True
+    )
