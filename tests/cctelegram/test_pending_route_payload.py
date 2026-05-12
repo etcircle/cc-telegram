@@ -243,21 +243,38 @@ class _DownloadedFile:
         path.write_bytes(self.payload)
 
 
-def _make_photo_update(*, thread_id: int = 99) -> MagicMock:
+def _make_photo_update(
+    *,
+    thread_id: int = 99,
+    caption: str = "new caption",
+    media_group_id: str | None = None,
+    reply_text: str | None = None,
+    file_unique_id: str = "new-photo",
+) -> MagicMock:
     photo = MagicMock()
-    photo.file_unique_id = "new-photo"
+    photo.file_unique_id = file_unique_id
     photo.get_file = AsyncMock(return_value=_DownloadedFile(b"new photo"))
 
     message = MagicMock()
     message.photo = [photo]
     message.document = None
-    message.caption = "new caption"
-    message.media_group_id = None
+    message.caption = caption
+    message.media_group_id = media_group_id
     message.message_thread_id = thread_id
     message.message_id = 123
     message.chat = MagicMock()
     message.chat.id = -100123
     message.chat.type = "supergroup"
+    message.chat.send_action = AsyncMock()
+    message.quote = None
+    if reply_text is None:
+        message.reply_to_message = None
+    else:
+        original = MagicMock()
+        original.message_id = 42
+        original.text = reply_text
+        original.caption = None
+        message.reply_to_message = original
 
     update = MagicMock()
     update.message = message
@@ -268,9 +285,16 @@ def _make_photo_update(*, thread_id: int = 99) -> MagicMock:
     return update
 
 
-def _make_document_update(*, thread_id: int = 99) -> MagicMock:
+def _make_document_update(
+    *,
+    thread_id: int = 99,
+    caption: str = "new caption",
+    media_group_id: str | None = None,
+    reply_text: str | None = None,
+    file_unique_id: str = "new-doc",
+) -> MagicMock:
     document = MagicMock()
-    document.file_unique_id = "new-doc"
+    document.file_unique_id = file_unique_id
     document.file_name = "report.txt"
     document.file_size = 11
     document.get_file = AsyncMock(return_value=_DownloadedFile(b"new doc"))
@@ -278,13 +302,23 @@ def _make_document_update(*, thread_id: int = 99) -> MagicMock:
     message = MagicMock()
     message.photo = None
     message.document = document
-    message.caption = "new caption"
-    message.media_group_id = None
+    message.caption = caption
+    message.media_group_id = media_group_id
     message.message_thread_id = thread_id
     message.message_id = 124
     message.chat = MagicMock()
     message.chat.id = -100123
     message.chat.type = "supergroup"
+    message.chat.send_action = AsyncMock()
+    message.quote = None
+    if reply_text is None:
+        message.reply_to_message = None
+    else:
+        original = MagicMock()
+        original.message_id = 42
+        original.text = reply_text
+        original.caption = None
+        message.reply_to_message = original
 
     update = MagicMock()
     update.message = message
@@ -551,6 +585,306 @@ async def test_document_from_new_topic_clears_cross_topic_picker_state_and_opens
     assert pending_attachments[0].caption == "new caption"
     mock_build_picker.assert_called_once_with(str(bot_module.config.browse_root), unbound_count=0)
     mock_reply.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unbound_photo_caption_reply_context_is_stashed_rendered(
+    tmp_path: Path,
+):
+    context = MagicMock()
+    context.user_data = {}
+    update = _make_photo_update(
+        caption="please apply this",
+        reply_text="prior assistant guidance",
+    )
+    media_dir = tmp_path / "images"
+
+    with (
+        patch.object(bot_module, "_IMAGES_DIR", media_dir),
+        patch.object(bot_module.config, "reply_context_enabled", True),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module.session_manager, "resolve_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module.reply_context_mod, "resolve", new_callable=AsyncMock
+        ) as mock_resolve,
+        patch.object(
+            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
+        ),
+        patch.object(
+            bot_module,
+            "build_directory_browser",
+            return_value=("picker", MagicMock(), []),
+        ),
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+    ):
+        mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
+        await bot_module.photo_handler(update, context)
+
+    pending_attachments = context.user_data["_pending_thread_attachments"]
+    assert len(pending_attachments) == 1
+    caption = pending_attachments[0].caption
+    assert "[Telegram reply context]" in caption
+    assert "prior assistant guidance" in caption
+    assert "Telegram message id: 42" in caption
+    assert "[User message]\nplease apply this" in caption
+    mock_resolve.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unbound_document_caption_reply_context_is_stashed_rendered(
+    tmp_path: Path,
+):
+    context = MagicMock()
+    context.user_data = {}
+    update = _make_document_update(
+        caption="please apply this to the file",
+        reply_text="prior document guidance",
+    )
+    media_dir = tmp_path / "files"
+
+    with (
+        patch.object(bot_module, "_FILES_DIR", media_dir),
+        patch.object(bot_module.config, "reply_context_enabled", True),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module.session_manager, "resolve_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module.reply_context_mod, "resolve", new_callable=AsyncMock
+        ) as mock_resolve,
+        patch.object(
+            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
+        ),
+        patch.object(
+            bot_module,
+            "build_directory_browser",
+            return_value=("picker", MagicMock(), []),
+        ),
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+    ):
+        mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
+        await bot_module.document_handler(update, context)
+
+    pending_attachments = context.user_data["_pending_thread_attachments"]
+    assert len(pending_attachments) == 1
+    caption = pending_attachments[0].caption
+    assert "[Telegram reply context]" in caption
+    assert "prior document guidance" in caption
+    assert "Telegram message id: 42" in caption
+    assert "[User message]\nplease apply this to the file" in caption
+    mock_resolve.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unbound_photo_media_group_caption_guard_avoids_duplicate_context(
+    tmp_path: Path,
+):
+    context = MagicMock()
+    context.user_data = {}
+    first = _make_photo_update(
+        caption="album caption",
+        media_group_id="album-1",
+        reply_text="quoted album context",
+        file_unique_id="album-photo-1",
+    )
+    second = _make_photo_update(
+        caption="",
+        media_group_id="album-1",
+        reply_text="quoted album context",
+        file_unique_id="album-photo-2",
+    )
+    media_dir = tmp_path / "images"
+
+    with (
+        patch.object(bot_module, "_IMAGES_DIR", media_dir),
+        patch.object(bot_module.config, "reply_context_enabled", True),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module.session_manager, "resolve_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module.reply_context_mod, "resolve", new_callable=AsyncMock
+        ) as mock_resolve,
+        patch.object(
+            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
+        ),
+        patch.object(
+            bot_module,
+            "build_directory_browser",
+            return_value=("picker", MagicMock(), []),
+        ),
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+    ):
+        mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
+        await bot_module.photo_handler(first, context)
+        await bot_module.photo_handler(second, context)
+
+    captions = [
+        attachment.caption
+        for attachment in context.user_data["_pending_thread_attachments"]
+    ]
+    assert len(captions) == 2
+    assert captions[0].count("[Telegram reply context]") == 1
+    assert "[User message]\nalbum caption" in captions[0]
+    assert captions[1] == ""
+    mock_resolve.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unbound_document_media_group_caption_guard_avoids_duplicate_context(
+    tmp_path: Path,
+):
+    context = MagicMock()
+    context.user_data = {}
+    first = _make_document_update(
+        caption="album caption",
+        media_group_id="album-1",
+        reply_text="quoted album context",
+        file_unique_id="album-doc-1",
+    )
+    second = _make_document_update(
+        caption="",
+        media_group_id="album-1",
+        reply_text="quoted album context",
+        file_unique_id="album-doc-2",
+    )
+    media_dir = tmp_path / "files"
+
+    with (
+        patch.object(bot_module, "_FILES_DIR", media_dir),
+        patch.object(bot_module.config, "reply_context_enabled", True),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module.session_manager, "resolve_window_for_thread", return_value=None
+        ),
+        patch.object(
+            bot_module.reply_context_mod, "resolve", new_callable=AsyncMock
+        ) as mock_resolve,
+        patch.object(
+            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
+        ),
+        patch.object(
+            bot_module,
+            "build_directory_browser",
+            return_value=("picker", MagicMock(), []),
+        ),
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+    ):
+        mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
+        await bot_module.document_handler(first, context)
+        await bot_module.document_handler(second, context)
+
+    captions = [
+        attachment.caption
+        for attachment in context.user_data["_pending_thread_attachments"]
+    ]
+    assert len(captions) == 2
+    assert captions[0].count("[Telegram reply context]") == 1
+    assert "[User message]\nalbum caption" in captions[0]
+    assert captions[1] == ""
+    mock_resolve.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bound_photo_caption_still_uses_apply_reply_context(
+    tmp_path: Path,
+):
+    context = MagicMock()
+    context.user_data = {}
+    update = _make_photo_update(caption="bound caption")
+    media_dir = tmp_path / "images"
+    window = MagicMock()
+
+    with (
+        patch.object(bot_module, "_IMAGES_DIR", media_dir),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value="@0"
+        ),
+        patch.object(
+            bot_module.tmux_manager,
+            "find_window_by_id",
+            new_callable=AsyncMock,
+            return_value=window,
+        ),
+        patch.object(bot_module, "clear_status_msg_info"),
+        patch.object(bot_module, "set_route_last_user_message"),
+        patch.object(
+            bot_module, "_apply_reply_context", new_callable=AsyncMock
+        ) as mock_apply,
+        patch.object(
+            bot_module, "aggregator_offer_photo", new_callable=AsyncMock
+        ) as mock_offer,
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+    ):
+        mock_apply.return_value = "rendered bound caption"
+        await bot_module.photo_handler(update, context)
+
+    mock_apply.assert_awaited_once_with(update.message, 1, 99, "bound caption")
+    mock_offer.assert_awaited_once()
+    assert mock_offer.await_args.args[0] == (1, 99, "@0")
+    assert mock_offer.await_args.args[2] == "rendered bound caption"
+
+
+@pytest.mark.asyncio
+async def test_bound_document_caption_still_uses_apply_reply_context(
+    tmp_path: Path,
+):
+    context = MagicMock()
+    context.user_data = {}
+    update = _make_document_update(caption="bound caption")
+    media_dir = tmp_path / "files"
+    window = MagicMock()
+
+    with (
+        patch.object(bot_module, "_FILES_DIR", media_dir),
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(
+            bot_module.session_manager, "get_window_for_thread", return_value="@0"
+        ),
+        patch.object(
+            bot_module.tmux_manager,
+            "find_window_by_id",
+            new_callable=AsyncMock,
+            return_value=window,
+        ),
+        patch.object(bot_module, "clear_status_msg_info"),
+        patch.object(bot_module, "set_route_last_user_message"),
+        patch.object(
+            bot_module, "_apply_reply_context", new_callable=AsyncMock
+        ) as mock_apply,
+        patch.object(
+            bot_module, "aggregator_offer_document", new_callable=AsyncMock
+        ) as mock_offer,
+        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+    ):
+        mock_apply.return_value = "rendered bound caption"
+        await bot_module.document_handler(update, context)
+
+    mock_apply.assert_awaited_once_with(update.message, 1, 99, "bound caption")
+    mock_offer.assert_awaited_once()
+    assert mock_offer.await_args.args[0] == (1, 99, "@0")
+    assert mock_offer.await_args.args[2] == "rendered bound caption"
 
 
 @pytest.mark.asyncio

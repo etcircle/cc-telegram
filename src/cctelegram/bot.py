@@ -1079,6 +1079,15 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     clear_ignored_stale_threads=False,
                 )
                 _remember_ignored_stale_thread_id(context.user_data, pending_tid)
+        # §2.5: render reply-context before stashing an unbound-topic caption
+        # so the later directory/window/session-picker flush preserves the
+        # same quote block as the bound aggregator path below. Keep the same
+        # media-group guard as the bound path: non-caption-bearing album items
+        # must not each synthesize their own quote block.
+        if caption or media_group_id is None:
+            caption = await _apply_reply_context(
+                update.message, user.id, thread_id, caption
+            )
         # §2.8.3 photo-in-unbound-topic: stash the path so the directory
         # picker's flush in _create_and_bind_window can feed the aggregator
         # for the freshly-bound route. Multiple photos can pile up here
@@ -1332,6 +1341,15 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     clear_ignored_stale_threads=False,
                 )
                 _remember_ignored_stale_thread_id(context.user_data, pending_tid)
+            # §2.5: render reply-context before stashing an unbound-topic
+            # caption so the later picker flush preserves the same quote block
+            # as the bound aggregator path below. Keep the same media-group
+            # guard as the bound path to avoid duplicate quote blocks for
+            # non-caption-bearing album items.
+            if caption or media_group_id is None:
+                caption = await _apply_reply_context(
+                    update.message, user.id, thread_id, caption
+                )
             pending_attachments = context.user_data.setdefault(
                 "_pending_thread_attachments", []
             )
