@@ -9,6 +9,7 @@ must be rejected without acting on or deleting the active pending owner.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -232,6 +233,160 @@ def _make_callback_update(data: str, *, thread_id: int = 10) -> MagicMock:
     update.effective_user.id = 1
     update.effective_chat = query.message.chat
     return update
+
+
+def _make_real_callback_query(*, user_id: int = 1) -> tuple[CallbackQuery, User]:
+    user = User(id=user_id, first_name="Test", is_bot=False)
+    query = CallbackQuery(id="cbq", from_user=user, chat_instance="chat", data="x")
+    return query, user
+
+
+@pytest.mark.asyncio
+async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() -> None:
+    query, user = _make_real_callback_query()
+    context = MagicMock()
+    context.user_data = {"_pending_thread_id": 10, "_pending_thread_text": "hello"}
+
+    with (
+        patch.object(
+            bot_module.tmux_manager,
+            "create_window",
+            new_callable=AsyncMock,
+            return_value=(True, "Created window 'repo' at /repo", "repo", "@42"),
+        ),
+        patch.object(
+            bot_module.session_manager,
+            "wait_for_session_map_entry",
+            new_callable=AsyncMock,
+            return_value=False,
+        ) as wait_for_map,
+        patch.object(
+            bot_module.tmux_manager,
+            "kill_window",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as kill_window,
+        patch.object(bot_module.session_manager, "get_window_state") as get_window_state,
+        patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as safe_edit,
+        patch.object(CallbackQuery, "answer", new_callable=AsyncMock) as answer,
+    ):
+        await bot_module._create_and_bind_window(
+            query, context, user, "/repo", pending_thread_id=10
+        )
+
+    wait_for_map.assert_awaited_once_with("@42", timeout=5.0)
+    kill_window.assert_awaited_once_with("@42")
+    get_window_state.assert_not_called()
+    bind_thread.assert_not_called()
+    safe_edit.assert_awaited_once()
+    edited_text = safe_edit.await_args.args[1]
+    assert "Claude session didn't register in time" in edited_text
+    assert "unmonitored tmux window was cleaned up" in edited_text
+    assert "_pending_thread_id" not in context.user_data
+    assert "_pending_thread_text" not in context.user_data
+    answer.assert_awaited_once_with("Hook timeout", show_alert=False)
+
+
+@pytest.mark.asyncio
+async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
+    query, user = _make_real_callback_query()
+    context = MagicMock()
+    context.user_data = {"_pending_thread_id": 10, "_pending_thread_text": "hello"}
+
+    with (
+        patch.object(
+            bot_module.tmux_manager,
+            "create_window",
+            new_callable=AsyncMock,
+            return_value=(True, "Created window 'repo' at /repo", "repo", "@43"),
+        ),
+        patch.object(
+            bot_module.session_manager,
+            "wait_for_session_map_entry",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch.object(
+            bot_module.tmux_manager,
+            "kill_window",
+            new_callable=AsyncMock,
+            return_value=False,
+        ) as kill_window,
+        patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as safe_edit,
+        patch.object(CallbackQuery, "answer", new_callable=AsyncMock) as answer,
+    ):
+        await bot_module._create_and_bind_window(
+            query, context, user, "/repo", pending_thread_id=10
+        )
+
+    kill_window.assert_awaited_once_with("@43")
+    bind_thread.assert_not_called()
+    safe_edit.assert_awaited_once()
+    edited_text = safe_edit.await_args.args[1]
+    assert "Claude session didn't register in time" in edited_text
+    assert "hook timeout remains the primary failure" in edited_text
+    assert "could not be cleaned up automatically" in edited_text
+    answer.assert_awaited_once_with("Hook timeout; cleanup failed", show_alert=True)
+
+
+@pytest.mark.asyncio
+async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_window() -> None:
+    query, user = _make_real_callback_query()
+    context = MagicMock()
+    context.user_data = {}
+    window_state = SimpleNamespace(session_id="", cwd="", window_name="")
+
+    with (
+        patch.object(
+            bot_module.tmux_manager,
+            "create_window",
+            new_callable=AsyncMock,
+            return_value=(True, "Created window 'repo' at /repo", "repo", "@44"),
+        ),
+        patch.object(
+            bot_module.session_manager,
+            "wait_for_session_map_entry",
+            new_callable=AsyncMock,
+            return_value=False,
+        ) as wait_for_map,
+        patch.object(
+            bot_module.tmux_manager,
+            "kill_window",
+            new_callable=AsyncMock,
+        ) as kill_window,
+        patch.object(
+            bot_module.session_manager,
+            "get_window_state",
+            return_value=window_state,
+        ),
+        patch.object(bot_module.session_manager, "_save_state") as save_state,
+        patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
+        patch.object(
+            bot_module, "_flush_pending_route_payload", new_callable=AsyncMock, return_value=None
+        ),
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as safe_edit,
+        patch.object(CallbackQuery, "answer", new_callable=AsyncMock),
+    ):
+        await bot_module._create_and_bind_window(
+            query,
+            context,
+            user,
+            "/repo",
+            pending_thread_id=10,
+            resume_session_id="resume-123",
+        )
+
+    wait_for_map.assert_awaited_once_with("@44", timeout=15.0)
+    kill_window.assert_not_awaited()
+    assert window_state.session_id == "resume-123"
+    assert window_state.cwd == "/repo"
+    assert window_state.window_name == "repo"
+    save_state.assert_called_once()
+    bind_thread.assert_called_once_with(1, 10, "@44", window_name="repo")
+    safe_edit.assert_awaited_once()
+    assert "Resumed." in safe_edit.await_args.args[1]
 
 
 class _DownloadedFile:

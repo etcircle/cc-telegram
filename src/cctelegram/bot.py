@@ -1719,6 +1719,43 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Window creation helper ---
 
 
+async def _cleanup_unbound_created_window(
+    window_id: str,
+    window_name: str,
+) -> bool:
+    """Best-effort kill of a newly-created window that never became monitored."""
+    if not window_id:
+        logger.error(
+            "Hook timed out for new window '%s', but no window_id was returned; "
+            "cannot clean up unmonitored tmux window",
+            window_name,
+        )
+        return False
+    try:
+        killed = await tmux_manager.kill_window(window_id)
+    except Exception as e:  # pragma: no cover - tmux_manager normally swallows errors
+        logger.error(
+            "Failed to clean up unmonitored tmux window %s (%s): %s",
+            window_id,
+            window_name,
+            e,
+        )
+        return False
+    if killed:
+        logger.warning(
+            "Cleaned up unmonitored tmux window %s (%s) after SessionStart hook timeout",
+            window_id,
+            window_name,
+        )
+        return True
+    logger.error(
+        "Could not clean up unmonitored tmux window %s (%s) after SessionStart hook timeout",
+        window_id,
+        window_name,
+    )
+    return False
+
+
 async def _create_and_bind_window(
     query: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1756,6 +1793,43 @@ async def _create_and_bind_window(
         hook_ok = await session_manager.wait_for_session_map_entry(
             created_wid, timeout=hook_timeout
         )
+
+        if not hook_ok and not resume_session_id:
+            # A brand-new (non-resume) window that never registers in
+            # session_map is unmonitored: binding or sending to it would lose
+            # the first response. Since this helper just created the window and
+            # has not bound it yet, it is safe to clean up by exact window_id.
+            logger.warning(
+                "Hook timed out for new window %s — cleaning up before binding "
+                "(user=%d, thread=%s)",
+                created_wid,
+                user.id,
+                pending_thread_id,
+            )
+            cleanup_ok = await _cleanup_unbound_created_window(
+                created_wid, created_wname
+            )
+            cleanup_note = (
+                "The unmonitored tmux window was cleaned up."
+                if cleanup_ok
+                else (
+                    "The hook timeout remains the primary failure, but the "
+                    f"unmonitored tmux window '{created_wname}' ({created_wid or 'unknown id'}) "
+                    "could not be cleaned up automatically. Please inspect tmux."
+                )
+            )
+            await safe_edit(
+                query,
+                f"❌ {message}\n\nClaude session didn't register in time. "
+                f"{cleanup_note} Send your message again to retry.",
+            )
+            if context.user_data is not None:
+                _clear_pending_route_payload(context.user_data, delete_files=True)
+            await query.answer(
+                "Hook timeout" if cleanup_ok else "Hook timeout; cleanup failed",
+                show_alert=not cleanup_ok,
+            )
+            return
 
         # --resume creates a new session_id in the hook, but messages continue
         # writing to the resumed session's JSONL file. Override window_state to
