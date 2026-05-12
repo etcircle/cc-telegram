@@ -27,15 +27,41 @@ _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 _CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 _CURRENT_HOOK_COMMAND_SUFFIX = "cc-telegram hook"
 _LEGACY_HOOK_COMMAND_SUFFIX = "ccbot hook"
+_HOOK_PATH_PREFIX_RE = re.compile(r"^[A-Za-z0-9_./~@+-]+$")
 HookStatus = Literal["current", "legacy", "mixed", "missing"]
 
 
 def _command_matches(cmd: str, suffix: str) -> bool:
-    return cmd == suffix or cmd.endswith("/" + suffix)
+    """Return whether cmd is exactly suffix or a bare path ending in suffix.
+
+    Claude hook commands are shell command strings, but this installer only
+    owns the simple commands it writes itself: ``cc-telegram hook`` and
+    path-qualified variants such as ``/opt/bin/cc-telegram hook``. Requiring
+    the path prefix to be the whole command, and to contain only ordinary path
+    characters, prevents wrapper/comment strings like ``echo /opt/bin/ccbot
+    hook`` or ``true&&/opt/bin/ccbot hook`` from being treated as managed
+    hooks.
+    """
+    if cmd == suffix:
+        return True
+
+    path_suffix = "/" + suffix
+    if not cmd.endswith(path_suffix):
+        return False
+
+    path_prefix = cmd[: -len(path_suffix)]
+    return _HOOK_PATH_PREFIX_RE.fullmatch(path_prefix) is not None
 
 
 def _command_contains_legacy_hook(cmd: str) -> bool:
-    return _LEGACY_HOOK_COMMAND_SUFFIX in cmd
+    """Return whether cmd is a managed legacy hook command.
+
+    Legacy cleanup intentionally mirrors current-hook matching: only exact
+    ``ccbot hook`` commands or path-qualified ``.../ccbot hook`` commands are
+    considered legacy. Wrapper shell snippets that merely mention the legacy
+    hook are user-owned and must not be rewritten or removed.
+    """
+    return _command_matches(cmd, _LEGACY_HOOK_COMMAND_SUFFIX)
 
 
 def _find_cc_telegram_path() -> str:

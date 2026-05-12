@@ -9,6 +9,31 @@ import pytest
 from cctelegram.hook import _UUID_RE, _install_hook, _is_hook_installed, hook_main
 
 
+def _settings_with_commands(commands: list[str]) -> dict:
+    return {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": command, "timeout": 5}
+                        for command in commands
+                    ]
+                }
+            ]
+        }
+    }
+
+
+def _commands_from_settings(settings: dict) -> list[str]:
+    return [
+        hook["command"]
+        for entry in settings.get("hooks", {}).get("SessionStart", [])
+        if isinstance(entry, dict)
+        for hook in entry.get("hooks", [])
+        if isinstance(hook, dict) and isinstance(hook.get("command"), str)
+    ]
+
+
 class TestUuidRegex:
     @pytest.mark.parametrize(
         "value",
@@ -82,6 +107,54 @@ class TestIsHookInstalled:
         }
         assert _is_hook_installed(settings) == "legacy"
 
+    def test_relative_path_matches(self) -> None:
+        settings = _settings_with_commands([".venv/bin/ccbot hook"])
+        assert _is_hook_installed(settings) == "legacy"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ccbot hook",
+            "echo /usr/local/bin/ccbot hook",
+            "# ccbot hook",
+            "ccbot hook # comment",
+            "ccbot hook && other-tool hook",
+            "true&&/usr/local/bin/ccbot hook",
+            "CCBOT=/usr/local/bin/ccbot hook",
+            "https://example.test/ccbot hook",
+            "sh -c 'ccbot hook'",
+            "some-ccbot hook",
+        ],
+        ids=[
+            "echo-exact",
+            "echo-path-suffix",
+            "comment",
+            "trailing-comment",
+            "shell-chain",
+            "shell-chain-no-spaces",
+            "assignment-prefix",
+            "url-mention",
+            "shell-wrapper",
+            "substring-command",
+        ],
+    )
+    def test_legacy_mentions_are_not_classified_or_rewritten(
+        self, command: str, tmp_path, monkeypatch
+    ) -> None:
+        settings = _settings_with_commands([command])
+        assert _is_hook_installed(settings) == "missing"
+
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(settings))
+        monkeypatch.setattr(
+            "cctelegram.hook._find_cc_telegram_path", lambda: "cc-telegram"
+        )
+
+        assert _install_hook(settings_file=settings_file) == 0
+        data = json.loads(settings_file.read_text())
+        commands = _commands_from_settings(data)
+        assert commands == [command, "cc-telegram hook"]
+
     def test_current_hook_matches(self) -> None:
         settings = {
             "hooks": {
@@ -128,6 +201,7 @@ class TestIsHookInstalled:
             "cctelegram.hook._find_cc_telegram_path", lambda: "cc-telegram"
         )
 
+        assert _is_hook_installed(json.loads(settings_file.read_text())) == "legacy"
         assert _install_hook(settings_file=settings_file) == 0
         data = json.loads(settings_file.read_text())
         command = data["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -137,6 +211,36 @@ class TestIsHookInstalled:
         data = json.loads(settings_file.read_text())
         hooks = data["hooks"]["SessionStart"]
         assert len(hooks) == 1
+
+    def test_install_rewrites_path_qualified_legacy_ccbot_hook(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(_settings_with_commands(["/opt/bin/ccbot hook"])))
+        monkeypatch.setattr(
+            "cctelegram.hook._find_cc_telegram_path", lambda: "cc-telegram"
+        )
+
+        assert _is_hook_installed(json.loads(settings_file.read_text())) == "legacy"
+        assert _install_hook(settings_file=settings_file) == 0
+        data = json.loads(settings_file.read_text())
+        assert _commands_from_settings(data) == ["cc-telegram hook"]
+
+    def test_path_qualified_current_hook_is_idempotent(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(_settings_with_commands(["/opt/bin/cc-telegram hook"]))
+        )
+        monkeypatch.setattr(
+            "cctelegram.hook._find_cc_telegram_path", lambda: "cc-telegram"
+        )
+
+        assert _is_hook_installed(json.loads(settings_file.read_text())) == "current"
+        assert _install_hook(settings_file=settings_file) == 0
+        data = json.loads(settings_file.read_text())
+        assert _commands_from_settings(data) == ["/opt/bin/cc-telegram hook"]
 
     def test_install_removes_legacy_hook_when_current_hook_exists(
         self, tmp_path, monkeypatch
