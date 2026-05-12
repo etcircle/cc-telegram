@@ -12,8 +12,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telegram import CallbackQuery, User
 
 from cctelegram import bot as bot_module
+
 from cctelegram.handlers.callback_data import (
     CB_DIR_BIND_EXISTING,
     CB_DIR_CANCEL,
@@ -45,6 +47,10 @@ from cctelegram.session import ClaudeSession
 
 def _attachment(path: Path) -> bot_module.PendingAttachment:
     return bot_module.PendingAttachment(str(path), "caption", None)
+
+
+def _replay_attachment(path: Path) -> bot_module.AggregatorReplayAttachment:
+    return bot_module.AggregatorReplayAttachment(path=path, caption="caption")
 
 
 def _pending_user_data(path: Path, *, thread_id: int = 10) -> dict[str, object]:
@@ -749,14 +755,8 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
         ) as mock_list_unbound,
         patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
         patch.object(
-            bot_module, "aggregator_offer_text", new_callable=AsyncMock
-        ) as mock_offer_text,
-        patch.object(
-            bot_module, "aggregator_offer_attachment", new_callable=AsyncMock
-        ) as mock_offer_attachment,
-        patch.object(
-            bot_module, "aggregator_flush_route", new_callable=AsyncMock
-        ) as mock_flush,
+            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
+        ) as mock_replay,
     ):
         await bot_module.callback_handler(bind_update, context)
 
@@ -764,9 +764,275 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
     mock_find.assert_not_called()
     mock_list_unbound.assert_not_called()
     mock_edit.assert_not_called()
-    mock_offer_text.assert_not_called()
-    mock_offer_attachment.assert_not_called()
-    mock_flush.assert_not_called()
+    mock_replay.assert_not_called()
     bind_update.callback_query.answer.assert_awaited_once_with(
         "Stale picker (topic mismatch)", show_alert=True
     )
+
+
+def _make_create_query() -> MagicMock:
+    query = MagicMock(spec=CallbackQuery)
+    query.answer = AsyncMock()
+    return query
+
+
+def _make_user() -> MagicMock:
+    user = MagicMock(spec=User)
+    user.id = 1
+    return user
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "flush_failure",
+    [False, RuntimeError("tmux send exploded")],
+    ids=["flush-false", "flush-exception"],
+)
+async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_cleans_up(
+    tmp_path: Path, flush_failure: object
+):
+    payload = tmp_path / "create-flush-fail.bin"
+    payload.write_bytes(b"data")
+    context = MagicMock()
+    context.user_data = _pending_user_data(payload, thread_id=10)
+    query = _make_create_query()
+    user = _make_user()
+    window_state = MagicMock()
+    window_state.session_id = "sid"
+    window_state.cwd = str(tmp_path)
+
+    with (
+        patch.object(bot_module, "session_monitor", None),
+        patch.object(
+            bot_module.tmux_manager,
+            "create_window",
+            new_callable=AsyncMock,
+            return_value=(True, "Window created", "created-window", "@0"),
+        ),
+        patch.object(
+            bot_module.session_manager,
+            "wait_for_session_map_entry",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch.object(
+            bot_module.session_manager,
+            "get_window_state",
+            return_value=window_state,
+        ),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
+        patch.object(
+            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
+        ) as mock_replay,
+        patch.object(bot_module, "aggregator_clear_route") as mock_clear_route,
+    ):
+        if isinstance(flush_failure, BaseException):
+            mock_replay.side_effect = flush_failure
+        else:
+            mock_replay.return_value = flush_failure
+        await bot_module._create_and_bind_window(
+            query, context, user, str(tmp_path), pending_thread_id=10
+        )
+
+    mock_bind.assert_called_once_with(1, 10, "@0", window_name="created-window")
+    mock_replay.assert_awaited_once_with(
+        (1, 10, "@0"), text="hello", attachments=[_replay_attachment(payload)]
+    )
+    mock_clear_route.assert_called_once_with((1, 10, "@0"))
+    edit_text = mock_edit.await_args.args[1]
+    assert "Created, but the first message failed to send" in edit_text
+    assert "pending payload was cleared" in edit_text
+    assert "please resend" in edit_text
+    query.answer.assert_awaited_once_with(
+        "Created; first message failed", show_alert=True
+    )
+    assert "_pending_thread_text" not in context.user_data
+    assert "_pending_thread_attachments" not in context.user_data
+    assert "_pending_thread_id" not in context.user_data
+    assert not payload.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "flush_failure",
+    [False, RuntimeError("tmux send exploded")],
+    ids=["flush-false", "flush-exception"],
+)
+async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans_up(
+    tmp_path: Path, flush_failure: object
+):
+    payload = tmp_path / "existing-flush-fail.bin"
+    payload.write_bytes(b"data")
+    context = MagicMock()
+    context.user_data = _pending_user_data(payload, thread_id=10)
+    context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+    context.user_data[UNBOUND_WINDOWS_KEY] = ["@0"]
+    update = _make_callback_update(f"{CB_WIN_BIND}0", thread_id=10)
+    window = MagicMock()
+    window.window_id = "@0"
+    window.window_name = "existing-window"
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(
+            bot_module.tmux_manager,
+            "find_window_by_id",
+            new_callable=AsyncMock,
+            return_value=window,
+        ),
+        patch.object(
+            bot_module,
+            "_list_unbound_windows",
+            new_callable=AsyncMock,
+            return_value=[("@0", "existing-window", str(tmp_path))],
+        ),
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
+        patch.object(
+            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
+        ) as mock_replay,
+        patch.object(bot_module, "aggregator_clear_route") as mock_clear_route,
+    ):
+        if isinstance(flush_failure, BaseException):
+            mock_replay.side_effect = flush_failure
+        else:
+            mock_replay.return_value = flush_failure
+        await bot_module.callback_handler(update, context)
+
+    mock_bind.assert_called_once_with(1, 10, "@0", window_name="existing-window")
+    mock_replay.assert_awaited_once_with(
+        (1, 10, "@0"), text="hello", attachments=[_replay_attachment(payload)]
+    )
+    mock_clear_route.assert_called_once_with((1, 10, "@0"))
+    edit_text = mock_edit.await_args.args[1]
+    assert "Bound to window `existing-window`" in edit_text
+    assert "First message failed to send" in edit_text
+    assert "pending payload was cleared" in edit_text
+    assert "please resend" in edit_text
+    update.callback_query.answer.assert_awaited_once_with(
+        "Bound; first message failed", show_alert=True
+    )
+    assert "_pending_thread_text" not in context.user_data
+    assert "_pending_thread_attachments" not in context.user_data
+    assert "_pending_thread_id" not in context.user_data
+    assert not payload.exists()
+
+
+@pytest.mark.asyncio
+async def test_existing_window_bind_pending_flush_success_remains_normal(
+    tmp_path: Path,
+):
+    payload = tmp_path / "existing-flush-ok.bin"
+    payload.write_bytes(b"data")
+    context = MagicMock()
+    context.user_data = _pending_user_data(payload, thread_id=10)
+    context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+    context.user_data[UNBOUND_WINDOWS_KEY] = ["@0"]
+    update = _make_callback_update(f"{CB_WIN_BIND}0", thread_id=10)
+    window = MagicMock()
+    window.window_id = "@0"
+    window.window_name = "existing-window"
+
+    with (
+        patch.object(bot_module, "is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(
+            bot_module.tmux_manager,
+            "find_window_by_id",
+            new_callable=AsyncMock,
+            return_value=window,
+        ),
+        patch.object(
+            bot_module,
+            "_list_unbound_windows",
+            new_callable=AsyncMock,
+            return_value=[("@0", "existing-window", str(tmp_path))],
+        ),
+        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
+        patch.object(
+            bot_module,
+            "aggregator_replay_payload",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_replay,
+    ):
+        await bot_module.callback_handler(update, context)
+
+    mock_bind.assert_called_once_with(1, 10, "@0", window_name="existing-window")
+    mock_replay.assert_awaited_once_with(
+        (1, 10, "@0"), text="hello", attachments=[_replay_attachment(payload)]
+    )
+    edit_text = mock_edit.await_args.args[1]
+    assert edit_text == "✅ Bound to window `existing-window`\n\nFirst message sent."
+    update.callback_query.answer.assert_awaited_once_with("Bound")
+    assert "_pending_thread_text" not in context.user_data
+    assert "_pending_thread_attachments" not in context.user_data
+    assert "_pending_thread_id" not in context.user_data
+    assert payload.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "max_attachments", "media_groups"),
+    [
+        ("media-boundary", 10, ["g1", "g1", "g2"]),
+        ("attachment-cap", 2, ["g1", "g1", "g1"]),
+    ],
+)
+async def test_pending_replay_observes_all_split_send_failures(
+    tmp_path: Path,
+    case: str,
+    max_attachments: int,
+    media_groups: list[str],
+):
+    paths = [tmp_path / f"{case}-{idx}.bin" for idx in range(3)]
+    for path in paths:
+        path.write_bytes(b"data")
+    context = MagicMock()
+    context.user_data = {
+        "_pending_thread_id": 10,
+        "_pending_thread_text": "hello",
+        "_pending_thread_attachments": [
+            bot_module.PendingAttachment(
+                str(paths[0]), "caption one", media_groups[0]
+            ),
+            bot_module.PendingAttachment(str(paths[1]), "", media_groups[1]),
+            bot_module.PendingAttachment(
+                str(paths[2]), "caption two", media_groups[2]
+            ),
+        ],
+    }
+    route = (1, 10, "@0")
+
+    with (
+        patch.object(bot_module.config, "busy_indicator_v2", False),
+        patch.object(
+            bot_module.config, "aggregator_max_attachments", max_attachments
+        ),
+        patch.object(
+            bot_module.session_manager,
+            "send_to_window",
+            new_callable=AsyncMock,
+            side_effect=[(False, "first split failed"), (True, "ok")],
+        ) as mock_send,
+    ):
+        delivered = await bot_module._flush_pending_route_payload(
+            route, context.user_data
+        )
+
+    assert delivered is False
+    assert mock_send.await_count == 2
+    first_send = mock_send.await_args_list[0].args[1]
+    second_send = mock_send.await_args_list[1].args[1]
+    assert "hello" in first_send
+    assert str(paths[0]) in first_send
+    assert str(paths[1]) in first_send
+    assert str(paths[2]) not in first_send
+    assert str(paths[2]) in second_send
+    assert "_pending_thread_text" not in context.user_data
+    assert "_pending_thread_attachments" not in context.user_data
+    assert "_pending_thread_id" not in context.user_data
+    assert all(not path.exists() for path in paths)

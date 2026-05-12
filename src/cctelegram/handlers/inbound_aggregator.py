@@ -16,6 +16,7 @@ Public surface:
   - ``aggregator_offer_voice(route, transcribed_text)``
   - ``aggregator_offer_photo(route, path, caption, media_group_id)``
   - ``aggregator_offer_document(route, path, caption, media_group_id)``
+  - ``aggregator_replay_payload(route, text, attachments)`` — sync replay
   - ``aggregator_flush_route(route)`` — public force-flush, returns delivery ok
   - ``aggregator_clear_route(route)`` — teardown hook (cancels pending flush)
 """
@@ -24,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +53,15 @@ class _PendingBundle:
     # media-group when the user sets it on the album, so without dedup we
     # emit the caption N times.
     seen_captions: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class AggregatorReplayAttachment:
+    """Attachment metadata for deterministic pending first-turn replay."""
+
+    path: Path
+    caption: str | None = None
+    media_group_id: str | None = None
 
 
 # Per-route pending bundle. Mutation guarded by ``_route_locks[route]`` so the
@@ -296,6 +306,65 @@ async def aggregator_offer_attachment(
     both routes converge on the same internal coroutine.
     """
     await _offer_attachment(route, path, caption, media_group_id)
+
+
+async def aggregator_replay_payload(
+    route: Route,
+    *,
+    text: str | None,
+    attachments: Sequence[AggregatorReplayAttachment],
+) -> bool:
+    """Synchronously send a pending first-turn payload and aggregate status.
+
+    This is the safe replay path for unbound-topic payloads held while the user
+    chooses a directory/window/session. It intentionally bypasses the offer API:
+    offers can force-flush on media-group boundaries or attachment-count caps,
+    and those intermediate sends are backgrounded/ignored in the normal live
+    aggregation path. Pending replay must instead await every send it causes so
+    the UI never reports "First message sent" after an earlier split failed.
+
+    The bundle construction mirrors ``_offer_attachment`` as closely as
+    practical: pending text is included once at the front, captions are deduped
+    per bundle, media-group boundaries split bundles, and the max-attachment cap
+    still prevents unbounded bundle growth. Every split is sent via
+    ``_send_bundle`` sequentially and contributes to the returned boolean.
+    """
+    delivered = True
+    bundle = _PendingBundle()
+    max_attachments = max(1, config.aggregator_max_attachments)
+
+    if text:
+        bundle.text_parts.append(text)
+
+    async def send_current_bundle() -> None:
+        nonlocal bundle, delivered
+        if not (bundle.text_parts or bundle.attachment_paths):
+            return
+        delivered = bool(await _send_bundle(route, bundle)) and delivered
+        bundle = _PendingBundle()
+
+    for attachment in attachments:
+        media_group_id = attachment.media_group_id
+        if (
+            media_group_id is not None
+            and bundle.current_media_group_id is not None
+            and media_group_id != bundle.current_media_group_id
+            and (bundle.attachment_paths or bundle.text_parts)
+        ):
+            await send_current_bundle()
+
+        if attachment.caption and attachment.caption not in bundle.seen_captions:
+            bundle.text_parts.append(attachment.caption)
+            bundle.seen_captions.add(attachment.caption)
+        bundle.attachment_paths.append(attachment.path)
+        if media_group_id is not None:
+            bundle.current_media_group_id = media_group_id
+
+        if len(bundle.attachment_paths) >= max_attachments:
+            await send_current_bundle()
+
+    await send_current_bundle()
+    return delivered
 
 
 async def aggregator_flush_route(route: Route) -> bool:

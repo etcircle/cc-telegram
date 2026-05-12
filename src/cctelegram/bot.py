@@ -119,12 +119,14 @@ from .handlers import attention, busy_indicator
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.inbound_aggregator import (
+    AggregatorReplayAttachment,
+    aggregator_clear_route,
     aggregator_flush_route,
-    aggregator_offer_attachment,
     aggregator_offer_document,
     aggregator_offer_photo,
     aggregator_offer_text,
     aggregator_offer_voice,
+    aggregator_replay_payload,
 )
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
@@ -335,6 +337,65 @@ def _clear_picker_state_for_current_state(user_data: dict | None) -> None:
         clear_window_picker_state(user_data)
     elif current_state == STATE_SELECTING_SESSION:
         clear_session_picker_state(user_data)
+
+
+def _delete_pending_attachment_files(attachments: list[PendingAttachment]) -> None:
+    """Delete downloaded files that belonged to a failed pending-route payload."""
+    for attachment in attachments:
+        try:
+            Path(attachment.path).unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug("failed to delete pending attachment %s: %s", attachment.path, e)
+
+
+async def _flush_pending_route_payload(
+    route: tuple[int, int, str],
+    user_data: dict | None,
+) -> bool | None:
+    """Synchronously replay the pending first-turn payload for a new binding.
+
+    Returns ``True`` when a pending payload was delivered, ``False`` when it
+    failed, and ``None`` when there was no pending payload. Pending picker state
+    is cleared before sending to make callback double-clicks idempotent; on
+    failure, route buffers are cleared and downloaded pending files are deleted
+    so the user gets an explicit resend prompt instead of a hidden retry that
+    could duplicate a manual resend.
+    """
+    pending_text = user_data.get("_pending_thread_text") if user_data else None
+    pending_attachments: list[PendingAttachment] = (
+        list(user_data.get("_pending_thread_attachments") or [])
+        if user_data
+        else []
+    )
+    if user_data is not None:
+        _clear_pending_route_payload(user_data, delete_files=False)
+
+    if not pending_text and not pending_attachments:
+        return None
+
+    replay_attachments = [
+        AggregatorReplayAttachment(
+            path=Path(attachment.path),
+            caption=attachment.caption,
+            media_group_id=attachment.media_group_id,
+        )
+        for attachment in pending_attachments
+    ]
+
+    try:
+        delivered = await aggregator_replay_payload(
+            route,
+            text=pending_text if isinstance(pending_text, str) else None,
+            attachments=replay_attachments,
+        )
+    except Exception as e:
+        logger.error("pending route payload replay raised for route %s: %s", route, e)
+        delivered = False
+
+    if not delivered:
+        aggregator_clear_route(route)
+        _delete_pending_attachment_files(pending_attachments)
+    return delivered
 
 
 async def _answer_stale_pending_thread_mismatch(
@@ -1728,47 +1789,30 @@ async def _create_and_bind_window(
             )
 
             status = "Resumed" if resume_session_id else "Created"
+
+            # Replay pending text and/or attachments through the synchronous
+            # aggregator helper so §2.8.2 formatting is preserved without
+            # offer-path background/intermediate flushes hiding failures.
+            route = (user.id, pending_thread_id, created_wid)
+            pending_delivered = await _flush_pending_route_payload(
+                route, context.user_data
+            )
+            if pending_delivered is False:
+                await safe_edit(
+                    query,
+                    f"✅ {message}\n\n{status}, but the first message failed to send. "
+                    "The pending payload was cleared; please resend it here.",
+                )
+                await query.answer(f"{status}; first message failed", show_alert=True)
+                return
+
+            first_turn_note = (
+                " First message sent." if pending_delivered is True else ""
+            )
             await safe_edit(
                 query,
-                f"✅ {message}\n\n{status}. Send messages here.",
+                f"✅ {message}\n\n{status}.{first_turn_note} Send messages here.",
             )
-
-            # Send pending text and/or attachments through the aggregator so
-            # the bundle's flush owns the §2.8.2 output shape (single text +
-            # grouped paths). Force-flush at the end since the user has been
-            # waiting on the directory pick and the debounce window would
-            # otherwise stall the first turn.
-            pending_text = (
-                context.user_data.get("_pending_thread_text")
-                if context.user_data
-                else None
-            )
-            pending_attachments: list[PendingAttachment] = (
-                context.user_data.get("_pending_thread_attachments") or []
-                if context.user_data
-                else []
-            )
-            if pending_text or pending_attachments:
-                if context.user_data is not None:
-                    _clear_pending_route_payload(context.user_data, delete_files=False)
-                route = (user.id, pending_thread_id, created_wid)
-                if pending_text:
-                    logger.debug(
-                        "Forwarding pending text via aggregator to window %s (len=%d)",
-                        created_wname,
-                        len(pending_text),
-                    )
-                    await aggregator_offer_text(route, pending_text)
-                for attachment in pending_attachments:
-                    await aggregator_offer_attachment(
-                        route,
-                        Path(attachment.path),
-                        attachment.caption,
-                        attachment.media_group_id,
-                    )
-                await aggregator_flush_route(route)
-            elif context.user_data is not None:
-                _clear_pending_route_payload(context.user_data, delete_files=False)
         else:
             # Should not happen in topic-only mode, but handle gracefully
             await safe_edit(query, f"✅ {message}")
@@ -2295,35 +2339,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             user.id, thread_id, selected_wid, window_name=display
         )
 
+        # Replay pending text and/or attachments through the synchronous
+        # aggregator helper so §2.8.2 formatting is preserved without
+        # offer-path background/intermediate flushes hiding failures.
+        route = (user.id, thread_id, selected_wid)
+        pending_delivered = await _flush_pending_route_payload(route, context.user_data)
+        if pending_delivered is False:
+            await safe_edit(
+                query,
+                f"✅ Bound to window `{display}`\n\n"
+                "⚠️ First message failed to send. The pending payload was "
+                "cleared; please resend it here.",
+            )
+            await query.answer("Bound; first message failed", show_alert=True)
+            return
+
+        first_turn_note = (
+            "\n\nFirst message sent." if pending_delivered is True else ""
+        )
         await safe_edit(
             query,
-            f"✅ Bound to window `{display}`",
+            f"✅ Bound to window `{display}`{first_turn_note}",
         )
-
-        # Forward pending text and/or attachments via the aggregator so the
-        # §2.8.2 single-text + grouped-paths shape applies on first turn.
-        pending_text = (
-            context.user_data.get("_pending_thread_text") if context.user_data else None
-        )
-        pending_attachments: list[PendingAttachment] = (
-            context.user_data.get("_pending_thread_attachments") or []
-            if context.user_data
-            else []
-        )
-        if context.user_data is not None:
-            _clear_pending_route_payload(context.user_data, delete_files=False)
-        if pending_text or pending_attachments:
-            route = (user.id, thread_id, selected_wid)
-            if pending_text:
-                await aggregator_offer_text(route, pending_text)
-            for attachment in pending_attachments:
-                await aggregator_offer_attachment(
-                    route,
-                    Path(attachment.path),
-                    attachment.caption,
-                    attachment.media_group_id,
-                )
-            await aggregator_flush_route(route)
         await query.answer("Bound")
 
     # Window picker: new session → transition to directory browser

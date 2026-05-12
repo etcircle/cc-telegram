@@ -226,11 +226,8 @@ async def test_window_picker_rejects_window_that_became_bound_after_render():
         ),
         patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_safe_edit,
         patch.object(
-            bot_module, "aggregator_offer_text", new_callable=AsyncMock
-        ) as mock_offer_text,
-        patch.object(
-            bot_module, "aggregator_flush_route", new_callable=AsyncMock
-        ) as mock_flush,
+            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
+        ) as mock_replay,
     ):
         await bot_module.callback_handler(update, context)
 
@@ -239,8 +236,7 @@ async def test_window_picker_rejects_window_that_became_bound_after_render():
     )
     mock_bind.assert_not_called()
     mock_safe_edit.assert_not_called()
-    mock_offer_text.assert_not_called()
-    mock_flush.assert_not_called()
+    mock_replay.assert_not_called()
     assert context.user_data[UNBOUND_WINDOWS_KEY] == ["@0"]
 
 
@@ -275,11 +271,8 @@ async def test_window_picker_bind_without_pending_owner_rejects_before_tmux_look
         ) as mock_list_unbound,
         patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_safe_edit,
         patch.object(
-            bot_module, "aggregator_offer_text", new_callable=AsyncMock
-        ) as mock_offer_text,
-        patch.object(
-            bot_module, "aggregator_flush_route", new_callable=AsyncMock
-        ) as mock_flush,
+            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
+        ) as mock_replay,
     ):
         await bot_module.callback_handler(update, context)
 
@@ -290,6 +283,5 @@ async def test_window_picker_bind_without_pending_owner_rejects_before_tmux_look
     mock_list_unbound.assert_not_called()
     mock_bind.assert_not_called()
     mock_safe_edit.assert_not_called()
-    mock_offer_text.assert_not_called()
-    mock_flush.assert_not_called()
+    mock_replay.assert_not_called()
     assert context.user_data[UNBOUND_WINDOWS_KEY] == ["@0"]
