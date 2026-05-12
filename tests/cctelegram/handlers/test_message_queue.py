@@ -3115,6 +3115,91 @@ class TestSubagentDigest:
         assert "B start" in state_b.lines[0]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("initial_message_id", "expected_stale_message_id"),
+        [(0, 4444), (1234, 1234)],
+    )
+    async def test_parallel_upsert_rebind_does_not_clobber_fresh_state(
+        self,
+        mock_bot: AsyncMock,
+        initial_message_id: int,
+        expected_stale_message_id: int,
+    ):
+        """A slower stale sub-agent upsert must not overwrite a newer state slot.
+
+        Covers both awaited branches in ``_upsert_subagent_digest``:
+        initial send (``message_id == 0``) and edit (``message_id != 0``).
+        While the Telegram call is in flight, a newer digest state is installed
+        for the same ``(user, thread, subagent_key)``. The stale upsert may
+        mutate its captured state object, but it must not re-bind
+        ``_subagent_msg_info`` back to that stale object when it resumes.
+        """
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        key = "sub:parent-sid:agent-race"
+        state_a = message_queue.SubagentDigestState(
+            message_id=initial_message_id,
+            window_id="@0-old",
+            subagent_key=key,
+            lines=["📝 stale event"],
+            last_text="previous render" if initial_message_id else "",
+        )
+        message_queue._subagent_msg_info[(1, 42, key)] = state_a
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 4444
+        telegram_call_started = asyncio.Event()
+        release_telegram_call = asyncio.Event()
+
+        async def slow_send(*a, **kw):
+            telegram_call_started.set()
+            await release_telegram_call.wait()
+            return sent_msg, TopicSendOutcome.OK
+
+        async def slow_edit(*a, **kw):
+            telegram_call_started.set()
+            await release_telegram_call.wait()
+            return TopicSendOutcome.OK
+
+        with (
+            patch.object(message_queue, "topic_send", side_effect=slow_send),
+            patch.object(message_queue, "topic_edit", side_effect=slow_edit),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+        ):
+            upsert_task = asyncio.create_task(
+                message_queue._upsert_subagent_digest(mock_bot, 1, 42, state_a)
+            )
+            await telegram_call_started.wait()
+
+            # Mid-flight rebind/update: a newer digest state for the same
+            # sidechain key lands while the stale upsert is awaiting Telegram.
+            state_b = message_queue.SubagentDigestState(
+                message_id=9999,
+                window_id="@0-new",
+                subagent_key=key,
+                lines=["📝 fresh event"],
+                last_text="fresh render",
+            )
+            message_queue._subagent_msg_info[(1, 42, key)] = state_b
+
+            release_telegram_call.set()
+            await upsert_task
+
+        assert state_a is not state_b
+        assert state_a.message_id == expected_stale_message_id, (
+            "stale upsert did not reach its post-await in-place mutation"
+        )
+        assert state_a.last_text == message_queue._render_subagent_digest(state_a)
+        current = message_queue._subagent_msg_info[(1, 42, key)]
+        assert current is state_b
+        assert current.message_id == 9999
+        assert current.window_id == "@0-new"
+        assert current.last_text == "fresh render"
+        assert current.lines == ["📝 fresh event"]
+
+    @pytest.mark.asyncio
     async def test_dispatcher_routes_subagent_task_to_digest(self, mock_bot: AsyncMock):
         """A queued sub-agent task hits _process_subagent_activity_task,
         not the parent activity digest or the agent-promotion path.

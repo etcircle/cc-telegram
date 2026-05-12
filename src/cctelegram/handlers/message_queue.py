@@ -1492,19 +1492,16 @@ async def _upsert_subagent_digest(
 ) -> None:
     """Send or edit the per-sub-agent digest card.
 
-    TODO(window-rebind race): the post-edit and post-send writes to
-    ``_subagent_msg_info[...]`` below have the same clobber race that
-    commit 0a4aeb7 fixed in ``_upsert_todo_digest`` and
-    ``_upsert_activity_digest``. If a fresh ``_process_subagent_activity_task``
-    replaces the slot while ``topic_send`` is in flight, the post-await
-    write here re-binds the slot to our captured (stale) ``state`` and
-    clobbers the fresh one. The producer (``_process_subagent_activity_task``)
-    already pre-binds the slot, so removing both writes is the symmetric
-    fix — see the docstring on ``_upsert_todo_digest`` for the precondition
-    pattern. Add a parallel test under ``TestSubagentDigest`` modeled on
-    ``test_window_rebind_during_upsert_does_not_clobber_fresh_state``.
+    Precondition: the caller has already bound ``_subagent_msg_info[(user_id,
+    thread_id_or_0, subagent_key)]`` to ``state``
+    (``_process_subagent_activity_task`` does this before scheduling the
+    flush). We mutate ``state`` in place and rely on that pre-bind; we do NOT
+    re-assign the dict slot after a successful send/edit. Re-binding would
+    clobber a fresh state that a concurrent ``_process_subagent_activity_task``
+    may have written during the in-flight Telegram call (window rebind under
+    the same sub-agent key), leaving the next flush editing a message in the
+    now-stale topic.
     """
-    tid = thread_id or 0
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
     text = _render_subagent_digest(state)
     if text == state.last_text:
@@ -1523,7 +1520,6 @@ async def _upsert_subagent_digest(
         )
         if outcome is TopicSendOutcome.OK:
             state.last_text = text
-            _subagent_msg_info[(user_id, tid, state.subagent_key)] = state
             return
         # Edit failed (message gone, topic gone, etc). Drop the id and retry as
         # a fresh send below; topic-shaped failures cascade into emergency DM.
@@ -1545,7 +1541,6 @@ async def _upsert_subagent_digest(
     if sent is not None:
         state.message_id = sent.message_id
         state.last_text = text
-        _subagent_msg_info[(user_id, tid, state.subagent_key)] = state
         return
     if thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
         await _emergency_dm(
