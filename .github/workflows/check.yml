@@ -7,6 +7,11 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: "0000000000:ci-dummy-token"
+      ALLOWED_USERS: "12345"
+      CC_TELEGRAM_DIR: ${{ runner.temp }}/cc-telegram-config
+      PYTHON_DOTENV_DISABLED: "1"
     strategy:
       matrix:
         python-version:

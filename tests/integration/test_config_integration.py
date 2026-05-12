@@ -9,6 +9,7 @@ pytestmark = pytest.mark.integration
 
 class TestConfigIntegration:
     def test_reads_env_file_from_config_dir(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
         env_file = tmp_path / ".env"
         env_file.write_text(
             "TELEGRAM_BOT_TOKEN=from-dotenv-token\nALLOWED_USERS=99999\n"
