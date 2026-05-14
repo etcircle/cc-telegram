@@ -20,8 +20,9 @@ Key functions: is_interactive_ui(), extract_interactive_content(),
 parse_status_line(), strip_pane_chrome(), extract_bash_output().
 """
 
+import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -172,6 +173,354 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
 def is_interactive_ui(pane_text: str) -> bool:
     """Check if terminal currently shows an interactive UI."""
     return extract_interactive_content(pane_text) is not None
+
+
+# ── AskUserQuestion structured parser ───────────────────────────────────
+#
+# Background: ``extract_interactive_content`` above answers "is there an
+# AskUserQuestion picker on screen?" and returns the raw pane region for
+# verbatim relay to Telegram. That's enough to surface the picker, but
+# leaves the user with arrow-key buttons on a phone — useless for
+# multi-tab forms with 4+ options per question.
+#
+# This parser produces a structured view of the same region so a future
+# renderer (PR 2) can build option buttons matched to each tab and
+# question, and a callback handler can validate that the form hasn't
+# shifted under it before dispatching keystrokes.
+#
+# Strict-or-``None`` rule, per peer review: any partial / ambiguous /
+# mid-redraw parse returns ``None`` so the existing keystroke fallback
+# stays in charge. Hermes flagged this as load-bearing.
+#
+# Anchor lines (multi-tab):  ``^\s*←\s+[☐☒✔]``  (tab header)
+# Anchor lines (single-tab): a numbered-options block ending in
+#                            ``Enter to select``.
+#
+# Pane-text is an unstable adapter — Claude Code reworks its TUI between
+# versions. The parser is biased toward returning ``None`` rather than
+# guessing when markers shift. Fixture coverage in tests is the safety net.
+
+
+# Matches a tab cell: state glyph (☐ ☒ ✔) followed by optional label.
+# The submit cell is sometimes rendered as ``✔`` with no label, sometimes as
+# ``✔ Submit``. Both are valid.
+_RE_TAB_CELL = re.compile(r"(?P<state>[☐☒✔])\s*(?P<label>[^☐☒✔→]*?)\s*(?=[☐☒✔]|→|$)")
+
+# Matches the multi-tab header line: ``←  ☐ X  ☒ Y  ✔ Submit  →`` (or similar).
+# The trailing ``→`` is required so we don't confuse this with a stray ``←``
+# in narrative text.
+_RE_TAB_HEADER = re.compile(r"^\s*←\s+(?P<body>.*?)\s*→\s*$")
+
+# Matches a numbered option: ``❯ 1. Some option label`` or ``  2. Another``.
+# Cursor markers Claude Code uses: ❯, ›, ▶, * .
+_RE_NUMBERED_OPTION = re.compile(
+    r"^(?P<cursor>[❯›▶*]\s+|\s{2,})(?P<num>\d+)\.\s+(?P<label>.+?)\s*$"
+)
+
+# Matches the picker's "Enter to select / Tab / Esc" footer.
+_RE_PICKER_FOOTER = re.compile(r"Enter to select")
+
+# Matches the review-screen footer that asks the user to confirm submission.
+_RE_REVIEW_HEADER = re.compile(r"^\s*Review your answers\s*$")
+_RE_SUBMIT_PROMPT = re.compile(r"^\s*Ready to submit your answers\?\s*$")
+
+# Matches a free-text "Type something" option (variant where the user can
+# type free text instead of picking a numbered option).
+_RE_FREE_TEXT_OPTION = re.compile(r"Type something")
+
+# Matches ``(Recommended)`` suffix on an option label.
+_RE_RECOMMENDED = re.compile(r"\(Recommended\)\s*$")
+
+
+@dataclass(frozen=True)
+class AskOption:
+    """One picker option inside an AskUserQuestion form."""
+
+    label: str  # e.g. "C — Parallel tracks: stabilize core + scaffold copilot"
+    recommended: bool  # True if "(Recommended)" suffix present
+    cursor: bool  # True if this option is the current selection (❯ / › prefix)
+    number: int | None  # 1-9 numeric shortcut, or None when not rendered
+
+
+@dataclass(frozen=True)
+class AskTab:
+    """One question-tab in a multi-question AskUserQuestion form."""
+
+    label: str  # e.g. "Approach" — may be empty for the submit cell
+    answered: bool  # ☒ filled (question has an answer)
+    is_submit: bool  # ✔ marker — the synthetic "Submit" cell
+    is_current: bool  # the tab the user is currently viewing
+
+
+@dataclass(frozen=True)
+class AskUserQuestionForm:
+    """Structured snapshot of the AskUserQuestion picker visible in a pane.
+
+    The shape covers three Claude Code variants:
+
+    1. Single-question, numbered options: ``tabs == ()``, ``options`` is
+       populated. Footer is ``Enter to select``.
+    2. Multi-tab form mid-navigation: ``tabs`` populated, ``options`` is the
+       set visible under the current tab.
+    3. Multi-tab form on the review screen: ``is_review_screen == True``.
+       ``options`` may still be populated with the two submit/cancel rows.
+
+    A parse always carries the raw pane excerpt for verbatim fallback
+    rendering. The ``fingerprint`` method gives a stable hash over the
+    structured fields so callbacks can verify the form hasn't shifted
+    between display and dispatch.
+    """
+
+    tabs: tuple[AskTab, ...] = ()
+    current_question_title: str | None = None
+    options: tuple[AskOption, ...] = ()
+    is_review_screen: bool = False
+    is_free_text: bool = False
+    pane_excerpt: str = ""
+    # Source-of-truth fields used in fingerprinting are above this line.
+    # Anything appended below MUST be excluded from ``_canonical_repr`` so
+    # adding diagnostic state doesn't break callback tokens minted by
+    # earlier renders.
+    _meta: dict[str, str] = field(default_factory=dict, compare=False)
+
+    def _canonical_repr(self) -> str:
+        """Stable string form used by ``fingerprint``.
+
+        Excludes ``pane_excerpt`` (carries cursor noise and re-flows on
+        redraw) and ``_meta`` (diagnostic). Order is fixed; if you add a
+        field that should influence callback freshness, append a new line
+        here — don't reorder existing ones.
+        """
+        tabs_str = "|".join(
+            f"{t.label}:{'A' if t.answered else 'E'}"
+            f":{'C' if t.is_current else '_'}"
+            f":{'S' if t.is_submit else '_'}"
+            for t in self.tabs
+        )
+        opts_str = "|".join(
+            f"{o.number}:{o.label}"
+            f":{'R' if o.recommended else '_'}"
+            f":{'C' if o.cursor else '_'}"
+            for o in self.options
+        )
+        return "\n".join(
+            [
+                f"TABS:{tabs_str}",
+                f"Q:{self.current_question_title or ''}",
+                f"OPTS:{opts_str}",
+                f"RVW:{'1' if self.is_review_screen else '0'}",
+                f"FT:{'1' if self.is_free_text else '0'}",
+            ]
+        )
+
+    def fingerprint(self) -> str:
+        """Stable 16-char hex digest over the structured form state.
+
+        Used by the (PR 2) renderer to mint callback tokens. On click, the
+        handler reparses the pane and compares fingerprints — a mismatch
+        means the form changed under us (user navigated, skill advanced,
+        Claude Code redrew) and the click must not be dispatched verbatim.
+        """
+        return hashlib.sha1(self._canonical_repr().encode()).hexdigest()[:16]
+
+
+def _parse_tab_header(line: str) -> tuple[AskTab, ...] | None:
+    """Parse ``←  ☐ X  ☒ Y  ✔ Submit  →`` into a tuple of ``AskTab``.
+
+    Returns ``None`` if the line doesn't look like a tab header. Empty tab
+    list is treated as a parse failure too — a header with no cells is
+    indistinguishable from noise.
+    """
+    m = _RE_TAB_HEADER.match(line)
+    if m is None:
+        return None
+    body = m.group("body")
+    cells: list[AskTab] = []
+    # _RE_TAB_CELL uses a lookahead so cells are matched left-to-right with
+    # no consumption past the next state glyph. ``finditer`` walks the body
+    # in order.
+    for cm in _RE_TAB_CELL.finditer(body):
+        state = cm.group("state")
+        label = cm.group("label").rstrip(":").strip()
+        cells.append(
+            AskTab(
+                label=label,
+                answered=state == "☒",
+                is_submit=state == "✔",
+                # ``is_current`` is reconstructed later — the header line
+                # alone doesn't say which tab is being viewed (Claude Code
+                # marks the current tab by what's rendered below the
+                # header, not by the cell glyph).
+                is_current=False,
+            )
+        )
+    if not cells:
+        return None
+    return tuple(cells)
+
+
+def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
+    """Walk lines top-down collecting consecutive numbered options.
+
+    Stops at the first non-option, non-blank line so a description line
+    following an option doesn't get folded into the next option's label.
+    Returns ``()`` if no numbered options are found or numbering has a
+    gap (a gap usually means we're mid-redraw — caller should treat as a
+    parse failure).
+    """
+    options: list[AskOption] = []
+    for line in lines:
+        m = _RE_NUMBERED_OPTION.match(line)
+        if m is None:
+            if options:
+                # Allow a trailing blank or description line only if we
+                # haven't started collecting; once we start, the block must
+                # be contiguous.
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith(("·", "—", "-", "▸")):
+                    # description continuation for the previous option
+                    continue
+                break
+            continue
+        try:
+            num = int(m.group("num"))
+        except ValueError:
+            return ()
+        label = m.group("label").strip()
+        cursor = m.group("cursor").strip() in ("❯", "›", "▶", "*")
+        recommended = bool(_RE_RECOMMENDED.search(label))
+        if recommended:
+            label = _RE_RECOMMENDED.sub("", label).rstrip()
+        options.append(
+            AskOption(
+                label=label,
+                recommended=recommended,
+                cursor=cursor,
+                number=num,
+            )
+        )
+    # Contiguity guard: trim the block to the prefix that runs 1..N without
+    # gaps. The picker doesn't skip numbers within a question, but trailing
+    # special rows like ``0. Dismiss`` (Claude Code's feedback survey) break
+    # the numeric run — those are dropped from the structured view so PR 2
+    # can render options 1..N cleanly. The keystroke fallback (Enter/digit
+    # keys) still reaches them.
+    kept: list[AskOption] = []
+    for expected, opt in enumerate(options, start=1):
+        if opt.number != expected:
+            break
+        kept.append(opt)
+    return tuple(kept)
+
+
+def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
+    """Structured parse of the AskUserQuestion picker in ``pane_text``.
+
+    PR 1 surface: pure parser, no caller change. Returns ``None`` when the
+    pane does not contain a recognizable AskUserQuestion picker, or when
+    the parse is ambiguous (mid-redraw, unknown variant, gaps in
+    numbering). The keystroke-keyboard fallback in ``handle_interactive_ui``
+    stays in charge for ``None`` returns.
+
+    Detection is anchored on one of:
+      * a multi-tab header line (``← ☐ X  ☒ Y  ✔ Submit →``)
+      * a numbered-options block followed by ``Enter to select``
+
+    Returns ``AskUserQuestionForm`` with whichever fields were extractable.
+    Empty / partial fields are preserved (e.g. mid-redraw tab header with
+    no visible options yet → ``options=()`` rather than ``None``) so the
+    fingerprint can still detect that the form is on a particular tab.
+    """
+    if not pane_text:
+        return None
+
+    lines = pane_text.split("\n")
+
+    # Locate the lowest-on-screen tab header (most recent redraw wins).
+    # We scan bottom-up so a stale header earlier in the scrollback does
+    # not shadow the live one.
+    tab_header_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _RE_TAB_HEADER.match(lines[i]):
+            tab_header_idx = i
+            break
+
+    # Detect picker footer or review-screen markers anywhere in the last
+    # ~25 lines — the live picker stays near the bottom of the pane.
+    tail = lines[-25:]
+    has_footer = any(_RE_PICKER_FOOTER.search(line) for line in tail)
+    is_review = any(_RE_REVIEW_HEADER.match(line) for line in tail) and any(
+        _RE_SUBMIT_PROMPT.match(line) for line in tail
+    )
+    is_free_text = any(_RE_FREE_TEXT_OPTION.search(line) for line in tail)
+
+    if tab_header_idx is None and not has_footer and not is_review:
+        return None
+
+    tabs: tuple[AskTab, ...] = ()
+    if tab_header_idx is not None:
+        parsed_tabs = _parse_tab_header(lines[tab_header_idx])
+        if parsed_tabs is None:
+            return None
+        tabs = parsed_tabs
+
+    # Collect options below the tab header (multi-tab) or in the tail
+    # window (single-tab). For multi-tab, options live between the header
+    # and the next separator / next tab header / picker footer.
+    if tab_header_idx is not None:
+        end_idx = len(lines)
+        for j in range(tab_header_idx + 1, len(lines)):
+            line = lines[j]
+            if _RE_TAB_HEADER.match(line):
+                end_idx = j
+                break
+            stripped = line.strip()
+            if stripped and all(c == "─" for c in stripped):
+                end_idx = j
+                break
+        options_region = lines[tab_header_idx + 1 : end_idx]
+    else:
+        options_region = tail
+
+    options = _parse_numbered_options(options_region)
+
+    # Question title heuristic: the first non-empty, non-separator line
+    # *above* the options block that doesn't look like an option / tab /
+    # separator. None when no such line is available within a small window.
+    current_question_title: str | None = None
+    search_top = tab_header_idx + 1 if tab_header_idx is not None else 0
+    for line in options_region:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _RE_NUMBERED_OPTION.match(line):
+            break
+        if _RE_TAB_HEADER.match(line):
+            continue
+        if all(c == "─" for c in stripped):
+            continue
+        current_question_title = stripped
+        break
+    _ = search_top  # reserved for a future "search bounded above tabs" tweak
+
+    # Build a pane excerpt for verbatim fallback rendering. We pin it to the
+    # tab header (if any) or the last ~25 lines otherwise — the renderer in
+    # PR 2 won't use the full pane scrollback.
+    excerpt_start = (
+        tab_header_idx if tab_header_idx is not None else max(0, len(lines) - 25)
+    )
+    pane_excerpt = "\n".join(lines[excerpt_start:]).rstrip()
+
+    return AskUserQuestionForm(
+        tabs=tabs,
+        current_question_title=current_question_title,
+        options=options,
+        is_review_screen=is_review,
+        is_free_text=is_free_text,
+        pane_excerpt=pane_excerpt,
+    )
 
 
 # ── Status line parsing ─────────────────────────────────────────────────

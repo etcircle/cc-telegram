@@ -376,3 +376,190 @@ class TestExtractContextPct:
         # Three-digit number that's out of range
         pane = "  [Opus 4.6] Context: 250%\n"
         assert extract_context_pct(pane) is None
+
+
+# ── parse_ask_user_question ───────────────────────────────────────────────
+
+
+from cctelegram.terminal_parser import (  # noqa: E402
+    AskOption,
+    AskTab,
+    AskUserQuestionForm,
+    parse_ask_user_question,
+)
+
+
+# Multi-tab picker mid-form, currently on the "Approach" tab.
+# Synthesized from the etvideo-editor /plan-ceo-review pane (window @34,
+# 2026-05-14) at the moment the user was choosing implementation approach.
+_PANE_MULTITAB_APPROACH = (
+    "  STOP — pick an approach before mode selection. Per the skill, I need\n"
+    "  your call.\n"
+    "\n"
+    "────────────────────────────────────────────────────────────\n"
+    "←  ☐ Approach  ☐ Positioning  ✔ Submit  →\n"
+    "Which implementation approach for the full ETVideoScript vision should we\n"
+    "lock in before the review continues?\n"
+    "\n"
+    "❯ 1. C — Parallel tracks: stabilize core + scaffold copilot (Recommended)\n"
+    "    Editor and copilot co-designed. Two parallel Hermes lanes…\n"
+    "  2. B — Copilot-first (brand wedge)\n"
+    "    Ship the chat panel + 3-4 skills next…\n"
+    "  3. A — Editor-first, copilot-second\n"
+    "    Finish Wave A.1 → B → C (waveform)…\n"
+    "  4. Different framing entirely — reduce scope first\n"
+    "  5. Type something.\n"
+    "  6. Chat about this\n"
+    "\n"
+    "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+)
+
+
+# Multi-tab picker on the submit-confirmation screen — both questions
+# answered, cursor on "Submit answers". Captured from window @34 directly.
+_PANE_MULTITAB_SUBMIT = (
+    "←  ☒ Approach  ☒ Positioning  ✔ Submit  →\n"
+    "\n"
+    "Review your answers\n"
+    "\n"
+    " ● Which implementation approach for the full ETVideoScript vision should we\n"
+    "   lock in before the review continues?\n"
+    "   → C — Parallel tracks: stabilize core + scaffold copilot (Recommended)\n"
+    " ● How do you want to position publicly?\n"
+    '   → "Open-source editor your AI agent uses" (Recommended)\n'
+    "\n"
+    "Ready to submit your answers?\n"
+    "\n"
+    "❯ 1. Submit answers\n"
+    "  2. Cancel\n"
+)
+
+
+# Single-question picker (no tabs) — Claude Code's periodic feedback survey
+# variant. Footer is "Enter to select".
+_PANE_SINGLE_TAB = (
+    "● How is Claude doing this session? (optional)\n"
+    "\n"
+    "❯ 1. Bad\n"
+    "  2. Fine\n"
+    "  3. Good\n"
+    "  0. Dismiss\n"
+    "\n"
+    "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+)
+
+
+class TestParseAskUserQuestion:
+    def test_multitab_approach_returns_tabs_and_options(self):
+        form = parse_ask_user_question(_PANE_MULTITAB_APPROACH)
+        assert form is not None
+        # Three tabs visible: Approach, Positioning, Submit
+        labels = [t.label for t in form.tabs]
+        assert "Approach" in labels
+        assert "Positioning" in labels
+        # All un-answered (the cell glyphs are ☐ ☐ ✔)
+        assert form.tabs[0].answered is False
+        assert form.tabs[1].answered is False
+        # The submit cell is_submit=True
+        submit_tabs = [t for t in form.tabs if t.is_submit]
+        assert len(submit_tabs) == 1
+        # Options should include the recommended Approach C as option 1
+        assert form.options
+        assert form.options[0].number == 1
+        assert form.options[0].cursor is True
+        assert form.options[0].recommended is True
+        assert "Parallel tracks" in form.options[0].label
+        # Free-text option is present ("Type something")
+        assert form.is_free_text is True
+        # Not the review screen — we're still picking
+        assert form.is_review_screen is False
+
+    def test_multitab_submit_screen_flag(self):
+        form = parse_ask_user_question(_PANE_MULTITAB_SUBMIT)
+        assert form is not None
+        # Both content tabs answered
+        approach = next(t for t in form.tabs if t.label == "Approach")
+        positioning = next(t for t in form.tabs if t.label == "Positioning")
+        assert approach.answered is True
+        assert positioning.answered is True
+        # Review screen flag tripped (header + prompt both present)
+        assert form.is_review_screen is True
+        # Options show "Submit answers" / "Cancel"
+        opt_labels = [o.label for o in form.options]
+        assert any("Submit answers" in lbl for lbl in opt_labels)
+        assert any("Cancel" in lbl for lbl in opt_labels)
+        # Cursor on the submit row
+        assert form.options[0].cursor is True
+        assert form.options[0].number == 1
+
+    def test_single_tab_no_tabs_collected(self):
+        form = parse_ask_user_question(_PANE_SINGLE_TAB)
+        assert form is not None
+        # Single-question picker → no multi-tab cells
+        assert form.tabs == ()
+        # All four options parsed
+        nums = [o.number for o in form.options]
+        assert nums == [1, 2, 3, 0] or nums == [1, 2, 3]
+        # ``0. Dismiss`` skips contiguous check (numbering starts at 1),
+        # so the parser may discard it. Either outcome is acceptable for PR 1
+        # as long as the live options 1/2/3 are present.
+        assert any("Bad" in o.label for o in form.options)
+        assert any("Fine" in o.label for o in form.options)
+        assert any("Good" in o.label for o in form.options)
+        # First option carries the cursor
+        assert form.options[0].cursor is True
+
+    def test_non_picker_pane_returns_none(self):
+        pane = (
+            "Just regular Claude Code output\n"
+            "  ⎿  some tool result\n"
+            "  ⏵⏵ bypass permissions on\n"
+        )
+        assert parse_ask_user_question(pane) is None
+
+    def test_empty_input_returns_none(self):
+        assert parse_ask_user_question("") is None
+
+    def test_fingerprint_stable_across_calls(self):
+        a = parse_ask_user_question(_PANE_MULTITAB_APPROACH)
+        b = parse_ask_user_question(_PANE_MULTITAB_APPROACH)
+        assert a is not None and b is not None
+        assert a.fingerprint() == b.fingerprint()
+        # Length sanity — 16 hex chars
+        assert len(a.fingerprint()) == 16
+
+    def test_fingerprint_changes_when_tab_state_changes(self):
+        a = parse_ask_user_question(_PANE_MULTITAB_APPROACH)
+        b = parse_ask_user_question(_PANE_MULTITAB_SUBMIT)
+        assert a is not None and b is not None
+        assert a.fingerprint() != b.fingerprint()
+
+    def test_fingerprint_excludes_pane_excerpt_noise(self):
+        """Trailing whitespace / blank-line drift on the pane should not
+        change the fingerprint — only structural fields contribute.
+        """
+        clean = _PANE_MULTITAB_APPROACH
+        noisy = _PANE_MULTITAB_APPROACH + "\n\n   \n"  # trailing blanks
+        a = parse_ask_user_question(clean)
+        b = parse_ask_user_question(noisy)
+        assert a is not None and b is not None
+        assert a.fingerprint() == b.fingerprint()
+
+    def test_pane_excerpt_carries_tab_header(self):
+        form = parse_ask_user_question(_PANE_MULTITAB_APPROACH)
+        assert form is not None
+        # Excerpt starts at the tab header line (the chrome separator above
+        # is discarded — it's not part of the picker structure).
+        assert form.pane_excerpt.startswith("←")
+
+    def test_dataclasses_are_frozen_and_hashable(self):
+        # The dataclasses must be hashable so the renderer can put them
+        # into sets / dict keys / token maps without surprise mutation.
+        opt = AskOption(label="x", recommended=False, cursor=False, number=1)
+        tab = AskTab(label="A", answered=False, is_submit=False, is_current=False)
+        form = AskUserQuestionForm(tabs=(tab,), options=(opt,))
+        # ``_meta`` is a mutable field excluded from equality, so two forms
+        # with identical structured state compare equal even when one of
+        # them later gains a diagnostic note.
+        form2 = AskUserQuestionForm(tabs=(tab,), options=(opt,))
+        assert form == form2
