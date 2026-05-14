@@ -15,6 +15,9 @@ State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
 import logging
+import secrets
+import time
+from dataclasses import dataclass
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
@@ -33,6 +36,7 @@ from .callback_data import (
     CB_ASK_ENTER,
     CB_ASK_ESC,
     CB_ASK_LEFT,
+    CB_ASK_PICK,
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
@@ -57,6 +61,145 @@ _interactive_msgs: dict[tuple[int, int], int] = {}
 
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
+
+
+# ── PR 2b: structured option-pick callback tokens ────────────────────────
+#
+# When ``handle_interactive_ui`` lands a structured AskUserQuestion card, it
+# mints one callback token per option button. The token resolves server-side
+# (via ``_pick_tokens``) to the (window, fingerprint, option_number,
+# option_label) bound at mint time. On click, the callback handler:
+#
+#   1. Looks up the token. Missing / expired → "Card expired, refresh".
+#   2. Re-captures the pane and re-runs the parser. None → "Form gone".
+#   3. Compares ``form.fingerprint()`` to the token's pinned value. Mismatch
+#      → "Form changed, refreshing" + repaint the card. Do NOT dispatch
+#      the key — that's the load-bearing staleness check Hermes flagged.
+#   4. Sends the literal digit via tmux_manager.send_keys(literal=True,
+#      enter=False). Marks the token used (single-use).
+#
+# Token lifetime is short (5 minutes) because the form is interactive and
+# the user will either resolve or abandon it within minutes. No daily GC
+# needed; ``_prune_expired_pick_tokens`` runs on every mint so the map
+# stays bounded.
+
+# Conservative TTL — Claude Code's AskUserQuestion picker stays open at most
+# a few minutes in practice. 300s is comfortably longer than the slowest
+# turnaround but short enough that a forgotten token can't pile up.
+_PICK_TOKEN_TTL_SECONDS = 300.0
+
+
+@dataclass(frozen=True)
+class _PickTokenEntry:
+    """Server-side state bound to a single option-button click.
+
+    Frozen because once minted, the entry must not mutate (the staleness
+    check compares the *minted* fingerprint against the *current* parse).
+    Marking entries used is done by popping from the map, not flipping a
+    field, so single-use semantics are enforced by ``consume_pick_token``.
+    """
+
+    window_id: str
+    user_id: int
+    thread_id: int | None
+    fingerprint: str  # form.fingerprint() at the moment the keyboard rendered
+    option_number: int  # the numeric shortcut to send (1-9)
+    option_label: str  # human label, used for log messages + sanity
+    is_review_submit: bool  # True iff this click should submit the review screen
+    expires_at: float  # monotonic clock deadline
+
+
+_pick_tokens: dict[str, _PickTokenEntry] = {}
+
+# Stable per-route cache so a re-render of the same form (same fingerprint)
+# reuses the same callback tokens. Without this, every status-polling tick
+# would mint fresh random tokens, the reply_markup would never match the
+# previous edit, Telegram would never return MESSAGE_NOT_MODIFIED, and the
+# bot would re-edit the card every poll cycle while the user is reading it.
+# Hermes peer review flagged this as a no-ship before fix.
+#
+# Key: (user_id, thread_id_or_0, window_id, fingerprint)
+# Value: list[token] — one token per option button, in the order the
+#        keyboard builder emitted them.
+_pick_token_cache: dict[tuple[int, int, str, str], list[str]] = {}
+
+
+def _prune_expired_pick_tokens(now: float | None = None) -> None:
+    """Drop expired tokens from the in-memory map.
+
+    Runs on every mint — the map is small (≤ #options per active picker, so
+    typically ≤ 10) so the O(n) scan is cheap. Cache entries pointing at
+    expired tokens are pruned too so a stale fingerprint can't pin a dead
+    token list.
+    """
+    if now is None:
+        now = time.monotonic()
+    stale = [tok for tok, e in _pick_tokens.items() if e.expires_at <= now]
+    for tok in stale:
+        _pick_tokens.pop(tok, None)
+    if stale:
+        stale_set = set(stale)
+        for cache_key, tokens in list(_pick_token_cache.items()):
+            if any(t in stale_set for t in tokens):
+                _pick_token_cache.pop(cache_key, None)
+
+
+def _mint_pick_token(entry: _PickTokenEntry) -> str:
+    """Register a token for an option button. Returns the token id.
+
+    Token is 12 hex chars from ``secrets.token_hex(6)``. The full callback
+    payload is ``aqp:<token>`` → 17 chars total, well under Telegram's
+    64-byte cap.
+    """
+    _prune_expired_pick_tokens()
+    # 6 bytes = 12 hex chars. Collision space ~2^48; with at most a few
+    # tokens live at any moment, accidental clash is astronomically
+    # unlikely. Loop on the off chance.
+    for _ in range(8):
+        token = secrets.token_hex(6)
+        if token not in _pick_tokens:
+            _pick_tokens[token] = entry
+            return token
+    # Pathological — shouldn't happen, but signal loudly rather than
+    # silently overwrite an existing token.
+    raise RuntimeError("Unable to mint a unique pick token")
+
+
+def consume_pick_token(token: str) -> _PickTokenEntry | None:
+    """Pop a token (single-use). Returns the entry or None if missing/expired.
+
+    Also drops the cache entry for the form generation this token belonged
+    to: once a click lands, the form is about to advance to the next tab /
+    question / review screen, and the next render needs fresh tokens
+    against the new fingerprint anyway. Leaving the cache populated would
+    keep handing out the just-consumed token (which would then 404 on
+    click).
+    """
+    _prune_expired_pick_tokens()
+    entry = _pick_tokens.pop(token, None)
+    if entry is not None:
+        cache_key = (
+            entry.user_id,
+            entry.thread_id or 0,
+            entry.window_id,
+            entry.fingerprint,
+        )
+        # Remove the cache row AND drop every sibling token belonging to
+        # that row — the whole generation is dead now that the user has
+        # acted on one of its buttons.
+        sibling_tokens = _pick_token_cache.pop(cache_key, None)
+        if sibling_tokens:
+            for sib in sibling_tokens:
+                if sib != token:
+                    _pick_tokens.pop(sib, None)
+    return entry
+
+
+def reset_pick_tokens_for_tests() -> None:
+    """Clear the pick-token map. Test-only helper."""
+    _pick_tokens.clear()
+    _pick_token_cache.clear()
+
 
 # Cross-module emergency DM cooldown lives in ``handlers.attention``
 # (``attention.should_emit_emergency_dm``). The interactive-UI surface and
@@ -229,18 +372,142 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
     return ""
 
 
+def _build_pick_button_rows(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    form: AskUserQuestionForm,
+) -> list[list[InlineKeyboardButton]]:
+    """Build inline-keyboard rows of option-pick buttons for a parsed form.
+
+    One button per option; max 5 per row. Each button mints a single-use
+    token bound to ``(window, fingerprint, option_number, option_label)``
+    so the callback handler can detect a "form changed under us" race
+    before dispatching the keystroke.
+
+    Review-screen Submit/Cancel rows are rendered here too. The Submit
+    button is flagged ``is_review_submit=True`` so the callback handler
+    can apply a tighter guard (must still be on the review screen) before
+    sending Enter / digit 1.
+
+    Returns an empty list when the form has no options — caller drops the
+    structured-pick row and falls back to the keystroke keyboard only.
+    """
+    if not form.options:
+        return []
+
+    fingerprint = form.fingerprint()
+    deadline = time.monotonic() + _PICK_TOKEN_TTL_SECONDS
+
+    # Filter to options that can be dispatched via literal-N. Tokens are
+    # only allocated for these; the keystroke fallback still reaches the
+    # rest.
+    pickable = [opt for opt in form.options if opt.number is not None]
+    if not pickable:
+        return []
+
+    cache_key = (user_id, thread_id or 0, window_id, fingerprint)
+
+    def _mint(opt_number: int, label: str, is_submit: bool) -> str:
+        return _mint_pick_token(
+            _PickTokenEntry(
+                window_id=window_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                fingerprint=fingerprint,
+                option_number=opt_number,
+                option_label=label,
+                is_review_submit=is_submit,
+                expires_at=deadline,
+            )
+        )
+
+    # Token-reuse path: if we already minted tokens for this exact form
+    # generation (matching fingerprint), re-emit the same callback_data so
+    # the rendered reply_markup is byte-identical and Telegram returns
+    # MESSAGE_NOT_MODIFIED on the next edit. The cache row is wiped on
+    # consume + on fingerprint change, so this can't hand out a stale
+    # token bound to a different form.
+    cached = _pick_token_cache.get(cache_key)
+    if cached is not None and len(cached) == len(pickable):
+        # Double-check that every cached token is still alive — TTL eviction
+        # may have dropped some out from under us. If any are missing, fall
+        # through to fresh-mint so callbacks don't 404 immediately.
+        if all(t in _pick_tokens for t in cached):
+            tokens: list[str] = cached
+        else:
+            _pick_token_cache.pop(cache_key, None)
+            tokens = [
+                _mint(
+                    opt.number or 0,
+                    opt.label,
+                    form.is_review_screen and opt.cursor and opt.number == 1,
+                )
+                for opt in pickable
+            ]
+            _pick_token_cache[cache_key] = tokens
+    else:
+        tokens = [
+            _mint(
+                opt.number or 0,
+                opt.label,
+                form.is_review_screen and opt.cursor and opt.number == 1,
+            )
+            for opt in pickable
+        ]
+        _pick_token_cache[cache_key] = tokens
+
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    # Telegram tolerates more than 5 buttons per row, but on a phone the
+    # text gets clipped after ~5. Cap conservatively.
+    width = 5
+    for opt, token in zip(pickable, tokens):
+        # ``opt.number is None`` was filtered above, but reassure the type
+        # checker.
+        assert opt.number is not None
+        is_submit = form.is_review_screen and opt.cursor and opt.number == 1
+        # Button text: number + truncated label + recommended star
+        prefix = "✅ " if is_submit else f"{opt.number}. "
+        # Cap label so the whole button stays under Telegram's tap-target
+        # readable width. 24 chars before truncation keeps "C — Parallel
+        # tracks…" visible. Recommended star adds 1 char.
+        max_label = 24
+        truncated = (
+            opt.label if len(opt.label) <= max_label else opt.label[:max_label] + "…"
+        )
+        star = " ★" if opt.recommended else ""
+        text = f"{prefix}{truncated}{star}"
+        row.append(InlineKeyboardButton(text, callback_data=f"{CB_ASK_PICK}{token}"))
+        if len(row) >= width:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return rows
+
+
 def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
+    pick_rows: list[list[InlineKeyboardButton]] | None = None,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
     ``ui_name`` controls the layout: ``RestoreCheckpoint`` omits ←/→ keys
     since only vertical selection is needed.
+
+    ``pick_rows`` is the optional output of ``_build_pick_button_rows`` —
+    when present, the structured pick row(s) are placed at the top of the
+    keyboard, above the keystroke navigation. The keystroke row stays even
+    when pick buttons are available so the user can still pick a free-text
+    "Type something" option, dismiss with Esc, or refresh.
     """
     vertical_only = ui_name == "RestoreCheckpoint"
 
     rows: list[list[InlineKeyboardButton]] = []
+    if pick_rows:
+        rows.extend(pick_rows)
     # Row 1: directional keys
     rows.append(
         [
@@ -330,23 +597,33 @@ async def handle_interactive_ui(
     if not content:
         return False
 
-    # Build message with navigation keyboard
-    keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)
-
     # For AskUserQuestion specifically, try the structured renderer first.
     # ``parse_ask_user_question`` is strict-or-None: it only returns a form
     # when it can produce a clean structured view. On a non-empty render we
     # use it; otherwise we fall back to the raw pane excerpt (the legacy
-    # behavior for every other interactive UI). Keyboard stays the same in
-    # both branches — PR 2b will add structured option buttons once the
-    # parser has proven stable against real-world forms.
+    # behavior for every other interactive UI).
+    #
+    # PR 2b: when the form carries numeric options, also mint a row of
+    # option-pick buttons. The keystroke keyboard stays underneath so the
+    # user can still navigate manually, dismiss with Esc, or write a free-
+    # text reply.
     text = content.content
+    pick_rows: list[list[InlineKeyboardButton]] | None = None
     if content.name == "AskUserQuestion":
         form = parse_ask_user_question(pane_text)
         if form is not None:
             structured = _render_ask_user_question(form)
             if structured:
                 text = structured
+            built = _build_pick_button_rows(user_id, thread_id, window_id, form)
+            if built:
+                pick_rows = built
+
+    # Build message with navigation keyboard (structured rows on top when
+    # available, keystroke nav row below for free-text / manual paths).
+    keyboard = _build_interactive_keyboard(
+        window_id, ui_name=content.name, pick_rows=pick_rows
+    )
 
     # Check if we have an existing interactive message to edit
     existing_msg_id = _interactive_msgs.get(ikey)

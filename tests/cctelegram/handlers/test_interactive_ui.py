@@ -1,5 +1,6 @@
 """Tests for interactive_ui — handle_interactive_ui and keyboard layout."""
 
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -339,3 +340,288 @@ class TestRenderAskUserQuestion:
         # caller can fall back to the raw pane excerpt.
         form = AskUserQuestionForm()
         assert _render_ask_user_question(form) == ""
+
+
+# ── PR 2b: pick-token map + structured option keyboard ────────────────────
+
+
+from cctelegram.handlers.interactive_ui import (  # noqa: E402
+    _PICK_TOKEN_TTL_SECONDS,
+    _build_pick_button_rows,
+    _PickTokenEntry,
+    _mint_pick_token,
+    consume_pick_token,
+    reset_pick_tokens_for_tests,
+)
+
+
+@pytest.fixture
+def _clear_pick_tokens():
+    reset_pick_tokens_for_tests()
+    yield
+    reset_pick_tokens_for_tests()
+
+
+@pytest.mark.usefixtures("_clear_pick_tokens")
+class TestPickTokenMap:
+    def test_mint_and_consume_roundtrip(self):
+        entry = _PickTokenEntry(
+            window_id="@1",
+            user_id=42,
+            thread_id=7,
+            fingerprint="abc123def456",
+            option_number=2,
+            option_label="Fine",
+            is_review_submit=False,
+            expires_at=time.monotonic() + 60,
+        )
+        token = _mint_pick_token(entry)
+        # Token is short hex (12 chars) so the full ``aqp:<token>`` payload
+        # fits well under the 64-byte callback_data cap.
+        assert len(token) == 12
+        all_hex_digits = set("0123456789abcdef")
+        assert all(c in all_hex_digits for c in token)
+        # Consume returns the entry once, then None (single-use).
+        got = consume_pick_token(token)
+        assert got is entry
+        assert consume_pick_token(token) is None
+
+    def test_consume_expired_returns_none(self):
+        entry = _PickTokenEntry(
+            window_id="@1",
+            user_id=42,
+            thread_id=None,
+            fingerprint="x",
+            option_number=1,
+            option_label="A",
+            is_review_submit=False,
+            expires_at=time.monotonic() - 1,  # already past deadline
+        )
+        token = _mint_pick_token(entry)
+        # The mint itself ran a prune pass that should have dropped this
+        # token before we even tried to consume — consume sees nothing.
+        assert consume_pick_token(token) is None
+
+    def test_mint_unique_tokens(self):
+        entry_template = _PickTokenEntry(
+            window_id="@1",
+            user_id=42,
+            thread_id=None,
+            fingerprint="abc",
+            option_number=1,
+            option_label="A",
+            is_review_submit=False,
+            expires_at=time.monotonic() + 60,
+        )
+        seen = set()
+        for _ in range(20):
+            token = _mint_pick_token(entry_template)
+            assert token not in seen
+            seen.add(token)
+
+
+@pytest.mark.usefixtures("_clear_pick_tokens")
+class TestBuildPickButtonRows:
+    def test_no_options_returns_empty(self):
+        form = AskUserQuestionForm()
+        rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@1", form=form
+        )
+        assert rows == []
+
+    def test_one_button_per_numbered_option(self):
+        form = AskUserQuestionForm(
+            options=(
+                AskOption(label="Bad", recommended=False, cursor=True, number=1),
+                AskOption(label="Fine", recommended=False, cursor=False, number=2),
+                AskOption(label="Good", recommended=True, cursor=False, number=3),
+            ),
+        )
+        rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@9", form=form
+        )
+        # All three buttons land on a single row (cap is 5).
+        assert len(rows) == 1
+        assert len(rows[0]) == 3
+        # Button text starts with "N. " for non-submit options.
+        assert rows[0][0].text.startswith("1. ")
+        # Recommended star is appended.
+        assert "★" in rows[0][2].text
+        # Each button carries a unique aqp:<token> callback.
+        tokens = [b.callback_data for b in rows[0]]
+        assert len(set(tokens)) == 3
+        assert all(t.startswith("aqp:") for t in tokens)
+
+    def test_review_submit_button_flagged(self):
+        # On the review screen with cursor on "1. Submit answers", the
+        # builder must mark the first button as is_review_submit so the
+        # callback handler can apply the tighter guardrail.
+        form = AskUserQuestionForm(
+            options=(
+                AskOption(
+                    label="Submit answers",
+                    recommended=False,
+                    cursor=True,
+                    number=1,
+                ),
+                AskOption(label="Cancel", recommended=False, cursor=False, number=2),
+            ),
+            is_review_screen=True,
+        )
+        rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@9", form=form
+        )
+        assert len(rows) == 1
+        # The submit button reads "✅ Submit answers".
+        assert rows[0][0].text.startswith("✅ ")
+        # Consume Cancel first — consuming a token now wipes its whole form
+        # generation (sibling invalidation, see TestPickTokenReuse), so we
+        # can't pop Submit then Cancel from the same render.
+        cancel_token = rows[0][1].callback_data[len("aqp:") :]
+        cancel_entry = consume_pick_token(cancel_token)
+        assert cancel_entry is not None
+        assert cancel_entry.is_review_submit is False
+        # Re-mint the form to check the Submit entry's flag.
+        rows2 = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@9", form=form
+        )
+        submit_token = rows2[0][0].callback_data[len("aqp:") :]
+        submit_entry = consume_pick_token(submit_token)
+        assert submit_entry is not None
+        assert submit_entry.is_review_submit is True
+
+    def test_skips_options_without_a_numeric_shortcut(self):
+        # Parser may emit options with number=None for free-text rows it
+        # detected but couldn't bind to a digit. Those must NOT get a pick
+        # button — the keystroke fallback still reaches them.
+        form = AskUserQuestionForm(
+            options=(
+                AskOption(label="Bad", recommended=False, cursor=False, number=1),
+                AskOption(
+                    label="Type something",
+                    recommended=False,
+                    cursor=False,
+                    number=None,
+                ),
+            ),
+        )
+        rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@9", form=form
+        )
+        assert len(rows[0]) == 1
+        assert rows[0][0].text.startswith("1. Bad")
+
+    def test_six_options_split_across_two_rows(self):
+        form = AskUserQuestionForm(
+            options=tuple(
+                AskOption(label=f"opt{i}", recommended=False, cursor=False, number=i)
+                for i in range(1, 7)
+            ),
+        )
+        rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@9", form=form
+        )
+        # Cap is 5 per row → first row has 5, second has 1.
+        assert [len(r) for r in rows] == [5, 1]
+
+    def test_token_carries_full_entry_for_staleness_check(self):
+        form = AskUserQuestionForm(
+            options=(
+                AskOption(
+                    label="C — Parallel tracks", recommended=True, cursor=True, number=1
+                ),
+            ),
+            current_question_title="approach?",
+        )
+        fp = form.fingerprint()
+        rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@9", form=form
+        )
+        token = rows[0][0].callback_data[len("aqp:") :]
+        entry = consume_pick_token(token)
+        assert entry is not None
+        # Everything the callback handler needs is on the entry.
+        assert entry.window_id == "@9"
+        assert entry.user_id == 42
+        assert entry.thread_id == 7
+        assert entry.fingerprint == fp
+        assert entry.option_number == 1
+        assert entry.option_label == "C — Parallel tracks"
+        # Expiration roughly matches the configured TTL.
+        assert entry.expires_at > time.monotonic()
+        assert entry.expires_at <= time.monotonic() + _PICK_TOKEN_TTL_SECONDS + 1
+
+
+@pytest.mark.usefixtures("_clear_pick_tokens")
+class TestPickTokenReuse:
+    """Token churn would defeat MESSAGE_NOT_MODIFIED on edit. Hermes review
+    flagged this as the load-bearing fix before PR 2b can ship: a re-render
+    of the same form (same fingerprint) MUST reuse the same callback tokens
+    so the reply_markup is byte-identical and Telegram can dedupe the edit.
+    """
+
+    def test_same_fingerprint_reuses_tokens(self):
+        form = AskUserQuestionForm(
+            options=(
+                AskOption(label="Bad", recommended=False, cursor=True, number=1),
+                AskOption(label="Fine", recommended=False, cursor=False, number=2),
+            ),
+        )
+        first = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@1", form=form
+        )
+        second = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@1", form=form
+        )
+        # Two renders against the same fingerprint must produce identical
+        # callback_data — otherwise every status-polling tick rewrites the
+        # reply_markup and Telegram never returns MESSAGE_NOT_MODIFIED.
+        first_tokens = [b.callback_data for b in first[0]]
+        second_tokens = [b.callback_data for b in second[0]]
+        assert first_tokens == second_tokens
+
+    def test_different_fingerprint_mints_fresh_tokens(self):
+        form_a = AskUserQuestionForm(
+            options=(AskOption(label="Bad", recommended=False, cursor=True, number=1),),
+        )
+        form_b = AskUserQuestionForm(
+            options=(
+                # Different label → different fingerprint → fresh tokens.
+                AskOption(label="Terrible", recommended=False, cursor=True, number=1),
+            ),
+        )
+        a_rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@1", form=form_a
+        )
+        b_rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@1", form=form_b
+        )
+        a_token = a_rows[0][0].callback_data
+        b_token = b_rows[0][0].callback_data
+        assert a_token != b_token
+
+    def test_consume_invalidates_cache_for_that_generation(self):
+        form = AskUserQuestionForm(
+            options=(
+                AskOption(label="Bad", recommended=False, cursor=True, number=1),
+                AskOption(label="Fine", recommended=False, cursor=False, number=2),
+            ),
+        )
+        rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@1", form=form
+        )
+        first_token = rows[0][0].callback_data[len("aqp:") :]
+        second_token = rows[0][1].callback_data[len("aqp:") :]
+        # Click the first button — the cache row for this fingerprint dies,
+        # AND every sibling token in that row dies too (the form is about to
+        # advance, so a stale sibling click is a bug to prevent).
+        consumed = consume_pick_token(first_token)
+        assert consumed is not None
+        # Sibling token no longer resolves.
+        assert consume_pick_token(second_token) is None
+        # Next render against the same fingerprint mints fresh tokens.
+        rows2 = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@1", form=form
+        )
+        new_token = rows2[0][0].callback_data
+        assert new_token != f"aqp:{first_token}"

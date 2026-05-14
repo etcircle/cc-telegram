@@ -42,6 +42,12 @@ CB_ASK_ENTER = "aq:enter:"  # aq:enter:<window>
 CB_ASK_SPACE = "aq:spc:"  # aq:spc:<window>
 CB_ASK_TAB = "aq:tab:"  # aq:tab:<window>
 CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
+# Structured option pick (PR 2b). The callback carries a short token that
+# resolves server-side to the (window, fingerprint, option_number,
+# option_label) bound when the keyboard was minted. Token-keyed instead of
+# embedding state in the 64-byte callback_data — same shape as the
+# attention-card flow in handlers/attention.py.
+CB_ASK_PICK = "aqp:"  # aqp:<token>
 
 # Session picker (resume existing session)
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>

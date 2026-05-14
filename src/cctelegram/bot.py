@@ -75,6 +75,7 @@ from .handlers.callback_data import (
     CB_ASK_ENTER,
     CB_ASK_ESC,
     CB_ASK_LEFT,
+    CB_ASK_PICK,
     CB_ASK_REFRESH,
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
@@ -132,6 +133,7 @@ from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
     clear_interactive_mode,
     clear_interactive_msg,
+    consume_pick_token,
     get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
@@ -2854,6 +2856,100 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("🔄")
+
+    # Interactive UI: structured option pick (PR 2b)
+    elif data.startswith(CB_ASK_PICK):
+        token = data[len(CB_ASK_PICK) :]
+        entry = consume_pick_token(token)
+        if entry is None:
+            # Token never existed, was already used, or has aged past the
+            # 5-minute TTL. Refresh the card so the user sees the live form
+            # state and can click a fresh button.
+            await query.answer("Card expired, refreshing.", show_alert=False)
+            thread_id = _get_thread_id(update)
+            window_id = get_interactive_window(user.id, thread_id) or ""
+            if window_id:
+                await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            return
+        thread_id = entry.thread_id
+        window_id = entry.window_id
+        # Wrong user clicking another user's card — refuse without leaking
+        # what the click would have done.
+        if entry.user_id != user.id:
+            await query.answer("Not your card.", show_alert=False)
+            return
+        if await reject_stale_window_callback(window_id):
+            await query.answer("Window gone, refreshing.")
+            return
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            await query.answer("Window not found", show_alert=True)
+            return
+
+        # Staleness check: re-capture the pane and re-parse before dispatching
+        # any key. If the form has shifted under us (user navigated, skill
+        # advanced, Claude Code redrew, /clear fired), the minted fingerprint
+        # won't match and we MUST NOT send a digit — picking "1" on a new
+        # form could submit the wrong answer.
+        from .terminal_parser import parse_ask_user_question
+
+        pane = await tmux_manager.capture_pane(w.window_id)
+        current_form = parse_ask_user_question(pane) if pane else None
+        if current_form is None or current_form.fingerprint() != entry.fingerprint:
+            logger.info(
+                "Pick-token staleness reject: user=%d window=%s opt=%d "
+                "minted_fp=%s current_fp=%s",
+                user.id,
+                window_id,
+                entry.option_number,
+                entry.fingerprint,
+                current_form.fingerprint() if current_form else "none",
+            )
+            await query.answer("Form changed, refreshing.", show_alert=False)
+            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            return
+
+        # Submit-button guardrail: a click flagged ``is_review_submit`` only
+        # fires when the live parse still says we're on the review screen
+        # with the cursor on the submit row, AND the label matches. The
+        # fingerprint check above already encodes is_review_screen + cursor
+        # + option number + option label, so a mismatch would already have
+        # bounced — Hermes review asked for an explicit label compare here
+        # as belt-and-braces, so a future fingerprint-format change can't
+        # accidentally let an off-screen Submit dispatch.
+        if entry.is_review_submit:
+            cursor_on_submit_one = (
+                current_form.is_review_screen
+                and current_form.options
+                and current_form.options[0].cursor
+                and current_form.options[0].number == 1
+                and current_form.options[0].label == entry.option_label
+            )
+            if not cursor_on_submit_one:
+                logger.info(
+                    "Pick-token submit-guard reject: user=%d window=%s",
+                    user.id,
+                    window_id,
+                )
+                await query.answer("Review screen moved, refreshing.", show_alert=False)
+                await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+                return
+
+        # Dispatch: send the literal digit. Claude Code's AskUserQuestion
+        # picker accepts ``1``-``9`` as shortcuts; the digit moves the
+        # cursor to that option and Enter submits. We send digit + Enter
+        # in two passes (no auto-Enter on the digit) so the picker has
+        # time to register the selection before the Enter key arrives.
+        # 500ms matches the gap tmux_manager uses internally for the
+        # literal-text-then-Enter path — boring beats flaky.
+        await tmux_manager.send_keys(
+            w.window_id, str(entry.option_number), enter=False, literal=True
+        )
+        await asyncio.sleep(0.5)
+        await tmux_manager.send_keys(w.window_id, "Enter", enter=False, literal=False)
+        await query.answer(f"{entry.option_number}. {entry.option_label[:32]}")
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
 
     # Screenshot quick keys: send key to tmux window
     elif data.startswith(CB_KEYS_PREFIX):
