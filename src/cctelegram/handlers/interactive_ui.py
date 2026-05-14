@@ -20,7 +20,12 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParam
 
 from ..config import config
 from ..session import session_id_for_window, session_manager
-from ..terminal_parser import extract_interactive_content, is_interactive_ui
+from ..terminal_parser import (
+    AskUserQuestionForm,
+    extract_interactive_content,
+    is_interactive_ui,
+    parse_ask_user_question,
+)
 from ..tmux_manager import tmux_manager
 from . import attention
 from .callback_data import (
@@ -150,6 +155,80 @@ async def _notify_waiting_dm(
         logger.debug("Failed to send interactive waiting DM to %d: %s", user_id, e)
 
 
+def _render_ask_user_question(form: AskUserQuestionForm) -> str:
+    """Render a structured AskUserQuestion form into Telegram-friendly text.
+
+    The body produced here replaces the raw pane excerpt for picker variants
+    that ``parse_ask_user_question`` understands. Two layout modes:
+
+    * ``is_review_screen`` → render the summary header + the resolved answers,
+      then the Submit / Cancel choice. This is the screen the user lands on
+      after answering every tab.
+    * Otherwise → render the tab strip with state glyphs, the current
+      question title (if any), and the numbered options below.
+
+    Output is plain text (no markdown conversion downstream) so terminal
+    glyphs like ``☒`` / ``☐`` / ``✔`` survive verbatim. The caller still
+    sends with ``plain=True``.
+    """
+    lines: list[str] = []
+
+    if form.is_review_screen:
+        lines.append("✔ Review your answers")
+        # Tab strip with resolved markers; tabs are in the order they appeared
+        # in the picker. Skip the synthetic submit cell — the prompt and
+        # button row below carry that information already.
+        content_tabs = [t for t in form.tabs if not t.is_submit]
+        if content_tabs:
+            lines.append("")
+            for t in content_tabs:
+                glyph = "☒" if t.answered else "☐"
+                lines.append(f"  {glyph} {t.label}".rstrip())
+        if form.options:
+            lines.append("")
+            lines.append("Ready to submit your answers?")
+            lines.append("")
+            for opt in form.options:
+                cursor = "❯ " if opt.cursor else "  "
+                rec = " (Recommended)" if opt.recommended else ""
+                lines.append(f"{cursor}{opt.number}. {opt.label}{rec}")
+        return "\n".join(lines).rstrip()
+
+    # Picker layout — tabs (if any) → question title → options
+    if form.tabs:
+        cells: list[str] = []
+        for t in form.tabs:
+            if t.is_submit:
+                cells.append("✔")
+            else:
+                glyph = "☒" if t.answered else "☐"
+                label = t.label or ""
+                cells.append(f"{glyph} {label}".rstrip())
+        lines.append("  ".join(cells))
+        lines.append("")
+
+    if form.current_question_title:
+        lines.append(form.current_question_title)
+        lines.append("")
+
+    if form.options:
+        for opt in form.options:
+            cursor = "❯ " if opt.cursor else "  "
+            rec = " (Recommended)" if opt.recommended else ""
+            lines.append(f"{cursor}{opt.number}. {opt.label}{rec}")
+        if form.is_free_text:
+            lines.append("")
+            lines.append("  (Type something — send a regular message to free-text)")
+        lines.append("")
+        lines.append("Enter to select · Tab/Arrow keys to navigate · Esc to cancel")
+        return "\n".join(lines).rstrip()
+
+    # No options extracted (mid-redraw, or a layout the parser only partially
+    # recognized). Caller falls back to the raw pane excerpt — return an
+    # empty string to signal "no structured render available".
+    return ""
+
+
 def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
@@ -254,8 +333,20 @@ async def handle_interactive_ui(
     # Build message with navigation keyboard
     keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)
 
-    # Send as plain text (no markdown conversion)
+    # For AskUserQuestion specifically, try the structured renderer first.
+    # ``parse_ask_user_question`` is strict-or-None: it only returns a form
+    # when it can produce a clean structured view. On a non-empty render we
+    # use it; otherwise we fall back to the raw pane excerpt (the legacy
+    # behavior for every other interactive UI). Keyboard stays the same in
+    # both branches — PR 2b will add structured option buttons once the
+    # parser has proven stable against real-world forms.
     text = content.content
+    if content.name == "AskUserQuestion":
+        form = parse_ask_user_question(pane_text)
+        if form is not None:
+            structured = _render_ask_user_question(form)
+            if structured:
+                text = structured
 
     # Check if we have an existing interactive message to edit
     existing_msg_id = _interactive_msgs.get(ikey)

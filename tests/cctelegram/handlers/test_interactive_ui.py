@@ -219,3 +219,123 @@ class TestKeyboardLayoutForSettings:
         assert any(CB_ASK_RIGHT in d for d in all_cb_data if d)
         assert any(CB_ASK_ESC in d for d in all_cb_data if d)
         assert any(CB_ASK_ENTER in d for d in all_cb_data if d)
+
+
+# ── _render_ask_user_question ─────────────────────────────────────────────
+
+
+from cctelegram.handlers.interactive_ui import (  # noqa: E402
+    _render_ask_user_question,
+)
+from cctelegram.terminal_parser import (  # noqa: E402
+    AskOption,
+    AskTab,
+    AskUserQuestionForm,
+)
+
+
+class TestRenderAskUserQuestion:
+    def test_single_question_picker(self):
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title="How is Claude doing this session? (optional)",
+            options=(
+                AskOption(label="Bad", recommended=False, cursor=True, number=1),
+                AskOption(label="Fine", recommended=False, cursor=False, number=2),
+                AskOption(label="Good", recommended=False, cursor=False, number=3),
+            ),
+        )
+        out = _render_ask_user_question(form)
+        # Title on top, then options, then footer hint
+        assert "How is Claude doing this session?" in out
+        assert "❯ 1. Bad" in out
+        assert "  2. Fine" in out
+        assert "  3. Good" in out
+        assert "Enter to select" in out
+        # No tab strip rendered for a single-question form
+        assert "☒" not in out and "☐" not in out
+
+    def test_multitab_picker_with_recommended(self):
+        form = AskUserQuestionForm(
+            tabs=(
+                AskTab(
+                    label="Approach", answered=False, is_submit=False, is_current=False
+                ),
+                AskTab(
+                    label="Positioning",
+                    answered=False,
+                    is_submit=False,
+                    is_current=False,
+                ),
+                AskTab(label="", answered=False, is_submit=True, is_current=False),
+            ),
+            current_question_title="Which implementation approach should we lock in?",
+            options=(
+                AskOption(
+                    label="C — Parallel tracks",
+                    recommended=True,
+                    cursor=True,
+                    number=1,
+                ),
+                AskOption(
+                    label="B — Copilot-first",
+                    recommended=False,
+                    cursor=False,
+                    number=2,
+                ),
+            ),
+            is_free_text=True,
+        )
+        out = _render_ask_user_question(form)
+        # Tab strip uses ☐ for un-answered and ✔ for the submit cell
+        assert "☐ Approach" in out
+        assert "☐ Positioning" in out
+        assert "✔" in out
+        # Question title preserved
+        assert "Which implementation approach" in out
+        # Recommended option carries the "(Recommended)" suffix
+        assert "❯ 1. C — Parallel tracks (Recommended)" in out
+        assert "  2. B — Copilot-first" in out
+        # Free-text hint surfaces when present
+        assert "Type something" in out
+
+    def test_review_screen(self):
+        form = AskUserQuestionForm(
+            tabs=(
+                AskTab(
+                    label="Approach", answered=True, is_submit=False, is_current=False
+                ),
+                AskTab(
+                    label="Positioning",
+                    answered=True,
+                    is_submit=False,
+                    is_current=False,
+                ),
+                AskTab(label="", answered=False, is_submit=True, is_current=False),
+            ),
+            options=(
+                AskOption(
+                    label="Submit answers", recommended=False, cursor=True, number=1
+                ),
+                AskOption(label="Cancel", recommended=False, cursor=False, number=2),
+            ),
+            is_review_screen=True,
+        )
+        out = _render_ask_user_question(form)
+        # Header signals review-screen rather than picker
+        assert "Review your answers" in out
+        # Both content tabs marked answered; submit cell suppressed in the
+        # "review" body (the Submit/Cancel choice below covers it).
+        assert "☒ Approach" in out
+        assert "☒ Positioning" in out
+        assert "Submit" not in out.split("\n")[0]  # not on the first line
+        # Submit/Cancel row visible with cursor on Submit
+        assert "Ready to submit your answers?" in out
+        assert "❯ 1. Submit answers" in out
+        assert "  2. Cancel" in out
+
+    def test_empty_render_when_no_structure(self):
+        # No tabs, no options, no review flag → renderer returns "" so the
+        # caller can fall back to the raw pane excerpt.
+        form = AskUserQuestionForm()
+        assert _render_ask_user_question(form) == ""
