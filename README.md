@@ -17,6 +17,19 @@ Each Telegram topic maps to one tmux window running one Claude Code process. The
 - **SQLite provenance** — outgoing Telegram messages are indexed for safer reply-context resolution.
 - **Reactive broken-topic fallback** — if Telegram says a topic is gone/closed/forbidden, the bot falls back to DM rather than silently dropping Claude output.
 
+## Quick start
+
+Zero to working bot in a handful of commands:
+
+```bash
+git clone https://github.com/etcircle/cc-telegram.git && cd cc-telegram
+uv tool install --force .
+mkdir -p ~/.cc-telegram && $EDITOR ~/.cc-telegram/.env  # TELEGRAM_BOT_TOKEN, ALLOWED_USERS, TMUX_SESSION_NAME, CLAUDE_COMMAND
+cc-telegram hook --install
+cc-telegram doctor       # verify all green
+# Then either: cc-telegram (foreground) or install the launchd plist
+```
+
 ## Requirements
 
 - Python 3.12+
@@ -34,25 +47,31 @@ cd cc-telegram
 uv sync --all-extras
 ```
 
-## Migrate from old `ccbot` state
+## After upgrading from ccbot
 
-The runtime uses `~/.cc-telegram` only. It does **not** silently dual-read `~/.ccbot`.
+The runtime uses `~/.cc-telegram` only. It does not silently dual-read `~/.ccbot`. If both `~/.ccbot` and `~/.cc-telegram` already exist, `doctor --migrate` refuses to copy so it cannot overwrite or hide existing state. The bot start path refuses to run if `~/.ccbot` exists and `~/.cc-telegram` is missing, unless you explicitly set `CC_TELEGRAM_DIR`.
 
-**Existing `ccbot` users:** migrate before creating or using `~/.cc-telegram`. If both `~/.ccbot` and `~/.cc-telegram` already exist, `doctor --migrate` refuses to copy so it cannot overwrite or hide existing state.
+When moving from a `ccbot` install:
 
-Check state:
+1. Copy state into the new dir. Retry safe: stages into a temp dir and atomic-renames on success.
 
-```bash
-uv run cc-telegram doctor
-```
+   ```bash
+   cc-telegram doctor --migrate
+   ```
 
-Copy old state when needed:
+2. Refresh the Claude Code `SessionStart` hook. Rewrites any legacy `ccbot hook` entry in `~/.claude/settings.json`.
 
-```bash
-uv run cc-telegram doctor --migrate
-```
+   ```bash
+   cc-telegram hook --install
+   ```
 
-The bot start path refuses to run if `~/.ccbot` exists and `~/.cc-telegram` is missing, unless you explicitly set `CC_TELEGRAM_DIR`.
+3. Restart the launchd service.
+
+   ```bash
+   launchctl kickstart -k gui/$(id -u)/com.felixcardix.ccbot
+   ```
+
+`cc-telegram doctor` (no flag) prints the post-migration health readout.
 
 ## Configure
 
@@ -134,11 +153,29 @@ If installed as a tool:
 cc-telegram
 ```
 
-For day-to-day use, run it inside tmux or a process supervisor. The included helper assumes the default `cc-telegram` tmux session:
+For day-to-day use, run it inside tmux or a process supervisor.
+
+## Restart the service
+
+If the bot runs under launchd (the recommended setup on macOS), restart it with:
 
 ```bash
-./scripts/restart.sh
+launchctl kickstart -k gui/$(id -u)/com.felixcardix.ccbot
 ```
+
+## Config directory override
+
+Default config dir: `~/.cc-telegram`.
+
+Override with the `CC_TELEGRAM_DIR` env var:
+
+```bash
+CC_TELEGRAM_DIR=/path/to/state cc-telegram
+```
+
+Useful for testing or running multiple profiles against the same install.
+
+Setting `CC_TELEGRAM_DIR` bypasses the migration preflight guard. `cc-telegram doctor` emits a warning if the override points at a legacy-looking dir (e.g., the name contains `.ccbot`, or its `session_map.json` keys use the `ccbot:` prefix).
 
 ## Recommended daily-driver `.env`
 

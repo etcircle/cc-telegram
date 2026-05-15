@@ -216,7 +216,9 @@ class TestIsHookInstalled:
         self, tmp_path, monkeypatch
     ) -> None:
         settings_file = tmp_path / "settings.json"
-        settings_file.write_text(json.dumps(_settings_with_commands(["/opt/bin/ccbot hook"])))
+        settings_file.write_text(
+            json.dumps(_settings_with_commands(["/opt/bin/ccbot hook"]))
+        )
         monkeypatch.setattr(
             "cctelegram.hook._find_cc_telegram_path", lambda: "cc-telegram"
         )

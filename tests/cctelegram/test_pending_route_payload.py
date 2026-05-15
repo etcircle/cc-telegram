@@ -128,7 +128,9 @@ async def test_topic_close_unbound_matching_pending_file_deletes_and_clears_stat
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
         ) as mock_get_window,
-        patch.object(bot_module, "clear_topic_state", new_callable=AsyncMock) as mock_clear,
+        patch.object(
+            bot_module, "clear_topic_state", new_callable=AsyncMock
+        ) as mock_clear,
     ):
         await bot_module.topic_closed_handler(update, context)
 
@@ -173,7 +175,9 @@ async def test_topic_close_bound_matching_pending_attachments_deletes_and_clears
         patch.object(
             bot_module.tmux_manager, "kill_window", new_callable=AsyncMock
         ) as mock_kill,
-        patch.object(bot_module, "clear_topic_state", new_callable=AsyncMock) as mock_clear,
+        patch.object(
+            bot_module, "clear_topic_state", new_callable=AsyncMock
+        ) as mock_clear,
     ):
         await bot_module.topic_closed_handler(update, context)
 
@@ -204,7 +208,9 @@ async def test_topic_close_different_thread_preserves_active_pending_payload(
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
         ),
-        patch.object(bot_module, "clear_topic_state", new_callable=AsyncMock) as mock_clear,
+        patch.object(
+            bot_module, "clear_topic_state", new_callable=AsyncMock
+        ) as mock_clear,
     ):
         await bot_module.topic_closed_handler(update, context)
 
@@ -266,7 +272,9 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
             new_callable=AsyncMock,
             return_value=True,
         ) as kill_window,
-        patch.object(bot_module.session_manager, "get_window_state") as get_window_state,
+        patch.object(
+            bot_module.session_manager, "get_window_state"
+        ) as get_window_state,
         patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
         patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as safe_edit,
         patch.object(CallbackQuery, "answer", new_callable=AsyncMock) as answer,
@@ -332,7 +340,9 @@ async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_window() -> None:
+async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_window() -> (
+    None
+):
     query, user = _make_real_callback_query()
     context = MagicMock()
     context.user_data = {"_pending_thread_id": 10}
@@ -364,7 +374,10 @@ async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_windo
         patch.object(bot_module.session_manager, "_save_state") as save_state,
         patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
         patch.object(
-            bot_module, "_flush_pending_route_payload", new_callable=AsyncMock, return_value=None
+            bot_module,
+            "_flush_pending_route_payload",
+            new_callable=AsyncMock,
+            return_value=None,
         ),
         patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as safe_edit,
         patch.object(CallbackQuery, "answer", new_callable=AsyncMock),
@@ -556,7 +569,9 @@ async def test_picker_cancel_clears_pending_attachments_and_deletes_file(
 
 
 @pytest.mark.asyncio
-async def test_stale_session_picker_mismatch_preserves_pending_attachments(tmp_path: Path):
+async def test_stale_session_picker_mismatch_preserves_pending_attachments(
+    tmp_path: Path,
+):
     payload = tmp_path / "stale.bin"
     payload.write_bytes(b"data")
     context = MagicMock()
@@ -677,7 +692,9 @@ async def test_photo_from_new_topic_clears_cross_topic_picker_state_and_opens_pi
     assert pending_path.parent == media_dir
     assert pending_path.exists()
     assert pending_attachments[0].caption == "new caption"
-    mock_build_picker.assert_called_once_with(str(bot_module.config.browse_root), unbound_count=0)
+    mock_build_picker.assert_called_once_with(
+        str(bot_module.config.browse_root), unbound_count=0
+    )
     mock_reply.assert_awaited_once()
 
 
@@ -738,7 +755,9 @@ async def test_document_from_new_topic_clears_cross_topic_picker_state_and_opens
     assert pending_path.parent == media_dir
     assert pending_path.exists()
     assert pending_attachments[0].caption == "new caption"
-    mock_build_picker.assert_called_once_with(str(bot_module.config.browse_root), unbound_count=0)
+    mock_build_picker.assert_called_once_with(
+        str(bot_module.config.browse_root), unbound_count=0
+    )
     mock_reply.assert_awaited_once()
 
 
@@ -1137,7 +1156,9 @@ async def test_text_replaced_topic_stale_cancel_does_not_clear_new_text_photo_pa
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
         ),
-        patch.object(bot_module, "_apply_reply_context", new_callable=AsyncMock) as apply_reply,
+        patch.object(
+            bot_module, "_apply_reply_context", new_callable=AsyncMock
+        ) as apply_reply,
         patch.object(
             bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
         ),
@@ -1302,7 +1323,9 @@ async def test_session_new_double_click_after_pending_owner_cleared_is_rejected(
     first_update = _make_callback_update(CB_SESSION_NEW, thread_id=10)
     second_update = _make_callback_update(CB_SESSION_NEW, thread_id=10)
 
-    async def clear_pending_after_first_click(*_args: object, **_kwargs: object) -> None:
+    async def clear_pending_after_first_click(
+        *_args: object, **_kwargs: object
+    ) -> None:
         context.user_data.clear()
 
     with (
@@ -1405,9 +1428,7 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
     query = _make_create_query()
     user = _make_user()
 
-    async def replace_owner_during_hook_wait(
-        *_args: object, **_kwargs: object
-    ) -> bool:
+    async def replace_owner_during_hook_wait(*_args: object, **_kwargs: object) -> bool:
         context.user_data = _pending_user_data(new_payload, thread_id=99)
         context.user_data["_pending_thread_text"] = "topic 99 text"
         return True
@@ -1432,7 +1453,9 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
             new_callable=AsyncMock,
             return_value=True,
         ) as mock_kill,
-        patch.object(bot_module.session_manager, "get_window_state") as get_window_state,
+        patch.object(
+            bot_module.session_manager, "get_window_state"
+        ) as get_window_state,
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
         patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
         patch.object(
@@ -1453,7 +1476,9 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
     query.answer.assert_awaited_once_with("Stale picker", show_alert=False)
     assert context.user_data["_pending_thread_id"] == 99
     assert context.user_data["_pending_thread_text"] == "topic 99 text"
-    assert context.user_data["_pending_thread_attachments"] == [_attachment(new_payload)]
+    assert context.user_data["_pending_thread_attachments"] == [
+        _attachment(new_payload)
+    ]
     assert new_payload.exists()
 
 
@@ -1510,7 +1535,9 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
     )
     assert context.user_data["_pending_thread_id"] == 99
     assert context.user_data["_pending_thread_text"] == "topic 99 text"
-    assert context.user_data["_pending_thread_attachments"] == [_attachment(new_payload)]
+    assert context.user_data["_pending_thread_attachments"] == [
+        _attachment(new_payload)
+    ]
     assert new_payload.exists()
 
 
@@ -1755,22 +1782,16 @@ async def test_pending_replay_observes_all_split_send_failures(
         "_pending_thread_id": 10,
         "_pending_thread_text": "hello",
         "_pending_thread_attachments": [
-            bot_module.PendingAttachment(
-                str(paths[0]), "caption one", media_groups[0]
-            ),
+            bot_module.PendingAttachment(str(paths[0]), "caption one", media_groups[0]),
             bot_module.PendingAttachment(str(paths[1]), "", media_groups[1]),
-            bot_module.PendingAttachment(
-                str(paths[2]), "caption two", media_groups[2]
-            ),
+            bot_module.PendingAttachment(str(paths[2]), "caption two", media_groups[2]),
         ],
     }
     route = (1, 10, "@0")
 
     with (
         patch.object(bot_module.config, "busy_indicator_v2", False),
-        patch.object(
-            bot_module.config, "aggregator_max_attachments", max_attachments
-        ),
+        patch.object(bot_module.config, "aggregator_max_attachments", max_attachments),
         patch.object(
             bot_module.session_manager,
             "send_to_window",

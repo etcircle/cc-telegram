@@ -109,7 +109,9 @@ async def test_stale_history_pagination_rejected_before_tmux_lookup(
         patch.object(
             bot_module.tmux_manager, "find_window_by_id", new_callable=AsyncMock
         ) as mock_find,
-        patch.object(bot_module, "send_history", new_callable=AsyncMock) as mock_history,
+        patch.object(
+            bot_module, "send_history", new_callable=AsyncMock
+        ) as mock_history,
     ):
         await bot_module.callback_handler(update, context)
 
