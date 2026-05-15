@@ -63,6 +63,33 @@ _interactive_msgs: dict[tuple[int, int], int] = {}
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
 
+# Cache of the most recent AskUserQuestion ``tool_use.input`` payload keyed by
+# window_id. JSONL dispatch (``bot.handle_new_message``) passes ``tool_input``
+# directly to ``handle_interactive_ui``; the status-poller dispatch (which is
+# the safety-net path for stale events or restart replays) has only the pane
+# text. Reading the cached input here lets the poller render the same
+# structured option list as the JSONL path instead of falling back to a
+# scrollback-truncated pane parse.
+_latest_ask_tool_input: dict[str, dict] = {}
+
+
+def remember_ask_tool_input(window_id: str, tool_input: dict | None) -> None:
+    """Store the latest AskUserQuestion ``tool_use.input`` for a window."""
+    if isinstance(tool_input, dict):
+        _latest_ask_tool_input[window_id] = tool_input
+
+
+def forget_ask_tool_input(window_id: str) -> None:
+    """Drop the cached AskUserQuestion input for a window (e.g. on tool_result)."""
+    _latest_ask_tool_input.pop(window_id, None)
+
+
+def _resolve_ask_tool_input(window_id: str, explicit: dict | None) -> dict | None:
+    """Pick the freshest tool_input available for an AskUserQuestion render."""
+    if explicit is not None:
+        return explicit
+    return _latest_ask_tool_input.get(window_id)
+
 
 # ── PR 2b: structured option-pick callback tokens ────────────────────────
 #
@@ -625,7 +652,8 @@ async def handle_interactive_ui(
         # full option list even when the question text scrolled option 1
         # off the top of the visible pane. Fall back to the pane parser
         # only when tool_input is absent or doesn't yield options.
-        form: AskUserQuestionForm | None = build_form_from_tool_input(tool_input)
+        resolved_input = _resolve_ask_tool_input(window_id, tool_input)
+        form: AskUserQuestionForm | None = build_form_from_tool_input(resolved_input)
         if form is None:
             form = parse_ask_user_question(pane_text)
         if form is not None:

@@ -136,7 +136,9 @@ from .handlers.interactive_ui import (
     consume_pick_token,
     get_interactive_msg_id,
     get_interactive_window,
+    forget_ask_tool_input,
     handle_interactive_ui,
+    remember_ask_tool_input,
     set_interactive_mode,
 )
 from .handlers.message_queue import (
@@ -3071,6 +3073,11 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         ):
             # Mark interactive mode BEFORE sleeping so polling skips this window
             set_interactive_mode(user_id, wid, thread_id)
+            # Cache the structured input so the status-poller safety-net path
+            # (which has only pane text) can also render the full option list
+            # via the JSONL payload when it dispatches handle_interactive_ui.
+            if msg.tool_name == "AskUserQuestion":
+                remember_ask_tool_input(wid, msg.tool_input)
             # Flush pending content for THIS route only — unrelated topics
             # must not delay the interactive prompt.
             queue = get_content_queue((user_id, thread_id or 0, wid))
@@ -3100,6 +3107,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # Any non-interactive message means the interaction is complete — delete the UI message
         if get_interactive_msg_id(user_id, thread_id):
             await clear_interactive_msg(user_id, bot, thread_id)
+            forget_ask_tool_input(wid)
 
         # Skip tool call notifications when CC_TELEGRAM_SHOW_TOOL_CALLS=false
         if not config.show_tool_calls and msg.content_type in (
