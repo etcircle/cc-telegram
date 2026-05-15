@@ -888,3 +888,371 @@ class TestCallbackValidatorParityRender:
             from cctelegram.handlers.interactive_ui import forget_ask_tool_input
 
             forget_ask_tool_input("@99")
+
+
+# ── PR 3: multi-tab state machine, lock, generation guard, FA5+ gate ────
+
+
+class TestAskToolInputDigest:
+    def test_none_returns_none(self):
+        from cctelegram.handlers.interactive_ui import _ask_tool_input_digest
+
+        assert _ask_tool_input_digest(None) is None
+
+    def test_content_based_equality(self):
+        from cctelegram.handlers.interactive_ui import _ask_tool_input_digest
+
+        # Structurally equal but distinct dict objects must produce equal
+        # digests. Without content-based comparison the rerender_guard
+        # would false-positive on every cache read.
+        a = {"questions": [{"question": "Q", "options": [{"label": "A"}]}]}
+        b = {"questions": [{"question": "Q", "options": [{"label": "A"}]}]}
+        assert a is not b  # sanity — distinct objects
+        assert _ask_tool_input_digest(a) == _ask_tool_input_digest(b)
+
+    def test_content_changes_produce_different_digests(self):
+        from cctelegram.handlers.interactive_ui import _ask_tool_input_digest
+
+        a = {"questions": [{"question": "Q1", "options": [{"label": "A"}]}]}
+        b = {"questions": [{"question": "Q2", "options": [{"label": "A"}]}]}
+        assert _ask_tool_input_digest(a) != _ask_tool_input_digest(b)
+
+    def test_no_guard_sentinel_distinct_from_none(self):
+        from cctelegram.handlers.interactive_ui import _NO_GUARD
+
+        # ``None`` is a real value (= "cache was cleared") and must be
+        # distinguishable from ``_NO_GUARD`` (= "don't guard at all").
+        assert _NO_GUARD is not None
+
+
+class TestHasInteractiveSurface:
+    def test_returns_false_when_neither_map(self):
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_msgs,
+            _multi_tab_sessions,
+            has_interactive_surface,
+        )
+
+        _interactive_msgs.clear()
+        _multi_tab_sessions.clear()
+        assert has_interactive_surface(42, 7) is False
+
+    def test_returns_true_for_single_card(self):
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_msgs,
+            _multi_tab_sessions,
+            has_interactive_surface,
+        )
+
+        _interactive_msgs.clear()
+        _multi_tab_sessions.clear()
+        _interactive_msgs[(42, 7)] = 100
+        try:
+            assert has_interactive_surface(42, 7) is True
+        finally:
+            _interactive_msgs.clear()
+
+    def test_returns_true_for_multi_tab(self):
+        from cctelegram.handlers.interactive_ui import (
+            _MultiTabSession,
+            _interactive_msgs,
+            _multi_tab_sessions,
+            has_interactive_surface,
+        )
+
+        _interactive_msgs.clear()
+        _multi_tab_sessions.clear()
+        _multi_tab_sessions[(42, 7)] = _MultiTabSession(
+            window_id="@1",
+            shape_digest="x",
+            message_ids=[1, 2, 3],
+            current_tab_idx=0,
+        )
+        try:
+            assert has_interactive_surface(42, 7) is True
+        finally:
+            _multi_tab_sessions.clear()
+
+
+class TestPickButtonRowsFA5Gate:
+    """FA5+ safety: multi-tab forms with current_tab_inferred=False MUST
+    NOT mint pick buttons. The dispatched digit could answer the wrong
+    tab in the live TUI.
+    """
+
+    def _multi_tab_form(self, inferred: bool):
+        from cctelegram.terminal_parser import (
+            AskOption,
+            AskQuestion,
+            AskUserQuestionForm,
+        )
+
+        q1 = AskQuestion(
+            title="Q1?",
+            header="A",
+            options=(
+                AskOption(label="alpha", recommended=False, cursor=False, number=1),
+                AskOption(label="beta", recommended=False, cursor=False, number=2),
+            ),
+        )
+        q2 = AskQuestion(
+            title="Q2?",
+            header="B",
+            options=(
+                AskOption(label="gamma", recommended=False, cursor=False, number=1),
+                AskOption(label="delta", recommended=False, cursor=False, number=2),
+            ),
+        )
+        return AskUserQuestionForm(
+            tabs=(),
+            current_question_title="Q1?",
+            options=q1.options,
+            questions=(q1, q2),
+            current_tab_inferred=inferred,
+        )
+
+    def test_inferred_true_mints_buttons(self):
+        from cctelegram.handlers.interactive_ui import _build_pick_button_rows
+
+        rows = _build_pick_button_rows(
+            user_id=1, thread_id=2, window_id="@1", form=self._multi_tab_form(True)
+        )
+        assert rows  # non-empty
+
+    def test_inferred_false_returns_empty(self):
+        from cctelegram.handlers.interactive_ui import _build_pick_button_rows
+
+        rows = _build_pick_button_rows(
+            user_id=1, thread_id=2, window_id="@1", form=self._multi_tab_form(False)
+        )
+        assert rows == []
+
+    def test_single_question_form_ignores_inferred_flag(self):
+        # Single-question forms always carry current_tab_inferred=True
+        # by default; FA5+ only applies to multi-tab. Sanity-check that
+        # a single-question form with inferred=False (artificial) still
+        # gets buttons — the gate only fires for multi-tab.
+        from cctelegram.handlers.interactive_ui import _build_pick_button_rows
+        from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
+
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title="Pick.",
+            options=(AskOption(label="A", recommended=False, cursor=False, number=1),),
+            questions=(),  # single-question shape
+            current_tab_inferred=False,
+        )
+        rows = _build_pick_button_rows(
+            user_id=1, thread_id=2, window_id="@1", form=form
+        )
+        assert rows  # still gets buttons; FA5+ doesn't apply
+
+
+class TestPickButtonRows19Cap:
+    """Options 10+ render as text only — no pick button. Sending literal
+    ``"10"`` would type ``1`` then ``0`` and dispatch wrong.
+    """
+
+    def test_options_10_plus_skipped(self):
+        from cctelegram.handlers.interactive_ui import _build_pick_button_rows
+        from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
+
+        opts = tuple(
+            AskOption(
+                label=f"opt {i}",
+                recommended=False,
+                cursor=(i == 1),
+                number=i,
+            )
+            for i in range(1, 13)  # 1..12
+        )
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title="Pick.",
+            options=opts,
+        )
+        rows = _build_pick_button_rows(
+            user_id=1, thread_id=2, window_id="@1", form=form
+        )
+        # Flatten rows → button labels.
+        labels = [btn.text for row in rows for btn in row]
+        # Buttons exist for 1..9.
+        for i in range(1, 10):
+            assert any(f"{i}." in lab or lab.startswith(str(i)) for lab in labels), (
+                f"missing button for option {i}: {labels}"
+            )
+        # No buttons for 10, 11, 12.
+        for i in range(10, 13):
+            assert not any(lab.startswith(f"{i}.") for lab in labels), (
+                f"unexpected button for option {i}: {labels}"
+            )
+
+
+class TestMultiTabPostN:
+    """First-render multi-tab flow: post one card per question."""
+
+    @pytest.fixture
+    def _clear_multi_state(self):
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+            _latest_ask_tool_input,
+            _multi_tab_sessions,
+            _route_locks,
+        )
+
+        _interactive_msgs.clear()
+        _interactive_mode.clear()
+        _multi_tab_sessions.clear()
+        _latest_ask_tool_input.clear()
+        _route_locks.clear()
+        yield
+        _interactive_msgs.clear()
+        _interactive_mode.clear()
+        _multi_tab_sessions.clear()
+        _latest_ask_tool_input.clear()
+        _route_locks.clear()
+
+    @pytest.mark.asyncio
+    async def test_post_n_cards_for_multi_question(self, _clear_multi_state):
+        """Multi-tab form posts N cards; current tab carries pick buttons,
+        non-current tabs have no markup."""
+        from cctelegram.handlers.interactive_ui import (
+            _multi_tab_sessions,
+            handle_interactive_ui,
+            remember_ask_tool_input,
+        )
+
+        # Three-question form. Cache the JSONL payload so resolve_ask_form
+        # picks it up.
+        remember_ask_tool_input(
+            "@multi",
+            {
+                "questions": [
+                    {
+                        "question": "Pick A.",
+                        "options": [
+                            {"label": "alpha", "description": "first"},
+                            {"label": "beta", "description": "second"},
+                        ],
+                    },
+                    {
+                        "question": "Pick B.",
+                        "options": [
+                            {"label": "gamma", "description": "third"},
+                            {"label": "delta", "description": "fourth"},
+                        ],
+                    },
+                    {
+                        "question": "Pick C.",
+                        "options": [
+                            {"label": "epsilon", "description": "fifth"},
+                            {"label": "zeta", "description": "sixth"},
+                        ],
+                    },
+                ]
+            },
+        )
+
+        # Pane points to the FIRST question — current_tab_idx will be 0.
+        pane_text = (
+            "Pick A.\n"
+            "\n"
+            "❯ 1. alpha\n"
+            "  2. beta\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+
+        # Mock the bot: each topic_send returns a fresh fake message_id.
+        bot = AsyncMock()
+        sent_counter = [100]
+
+        async def fake_send_message(*args, **kwargs):
+            sent_counter[0] += 1
+            msg = MagicMock()
+            msg.message_id = sent_counter[0]
+            return msg
+
+        bot.send_message.side_effect = fake_send_message
+
+        with patch("cctelegram.handlers.interactive_ui.tmux_manager") as mock_tmux:
+            window_mock = MagicMock()
+            window_mock.window_id = "@multi"
+            mock_tmux.find_window_by_id = AsyncMock(return_value=window_mock)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+
+            with patch(
+                "cctelegram.handlers.interactive_ui.session_manager"
+            ) as mock_sm:
+                mock_sm.resolve_chat_id = MagicMock(return_value=12345)
+                mock_sm.resolve_session_for_window = AsyncMock(return_value=None)
+                with patch(
+                    "cctelegram.handlers.interactive_ui.session_id_for_window",
+                    return_value="sess-1",
+                ):
+                    result = await handle_interactive_ui(
+                        bot, user_id=7, window_id="@multi", thread_id=42
+                    )
+
+        assert result is True
+        # 3 cards sent (one per question).
+        assert bot.send_message.call_count == 3
+        # Session recorded all 3 message_ids.
+        session = _multi_tab_sessions.get((7, 42))
+        assert session is not None
+        assert len(session.message_ids) == 3
+        assert session.current_tab_idx == 0
+        # Current tab (card 0) has reply_markup; others don't.
+        calls = bot.send_message.call_args_list
+        # First call: current tab → reply_markup present.
+        assert calls[0].kwargs.get("reply_markup") is not None
+        # Subsequent cards: no markup.
+        assert calls[1].kwargs.get("reply_markup") is None
+        assert calls[2].kwargs.get("reply_markup") is None
+
+
+class TestClearInteractiveMsgWalksBothMaps:
+    @pytest.mark.asyncio
+    async def test_clear_walks_multi_tab_message_ids(self):
+        from cctelegram.handlers.interactive_ui import (
+            _MultiTabSession,
+            _interactive_msgs,
+            _multi_tab_sessions,
+            _route_locks,
+            clear_interactive_msg,
+        )
+
+        # Seed both maps for one route.
+        _interactive_msgs.clear()
+        _multi_tab_sessions.clear()
+        _route_locks.clear()
+        _interactive_msgs[(42, 7)] = 50
+        _multi_tab_sessions[(42, 7)] = _MultiTabSession(
+            window_id="@1",
+            shape_digest="x",
+            message_ids=[100, 101, 102],
+            current_tab_idx=1,
+        )
+
+        bot = AsyncMock()
+        deleted_ids: list[int] = []
+
+        async def fake_delete_message(chat_id, message_id, **kwargs):
+            deleted_ids.append(message_id)
+
+        bot.delete_message.side_effect = fake_delete_message
+
+        with patch("cctelegram.handlers.interactive_ui.session_manager") as mock_sm:
+            mock_sm.resolve_chat_id = MagicMock(return_value=12345)
+            with patch("cctelegram.handlers.interactive_ui.attention") as mock_att:
+                mock_att.dismiss = AsyncMock()
+                await clear_interactive_msg(42, bot, 7)
+
+        # Single card AND all 3 multi-tab cards deleted.
+        assert sorted(deleted_ids) == [50, 100, 101, 102]
+        # Both maps cleared.
+        assert (42, 7) not in _interactive_msgs
+        assert (42, 7) not in _multi_tab_sessions
+
+        _route_locks.clear()

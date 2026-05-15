@@ -134,10 +134,10 @@ from .handlers.interactive_ui import (
     clear_interactive_mode,
     clear_interactive_msg,
     consume_pick_token,
-    get_interactive_msg_id,
-    get_interactive_window,
     forget_ask_tool_input,
+    get_interactive_window,
     handle_interactive_ui,
+    has_interactive_surface,
     remember_ask_tool_input,
     set_interactive_mode,
 )
@@ -2959,7 +2959,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await tmux_manager.send_keys(w.window_id, "Enter", enter=False, literal=False)
         await query.answer(f"{entry.option_number}. {entry.option_label[:32]}")
         await asyncio.sleep(0.5)
-        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        # PR 3: snapshot the JSONL cache digest BEFORE re-rendering. If a
+        # concurrent ``tool_result`` clears the cache between this point
+        # and ``handle_interactive_ui`` reacquiring the route lock, the
+        # re-render sees the guard mismatch and aborts — no orphan card
+        # posted after the prompt has already advanced.
+        from .handlers.interactive_ui import _ask_tool_input_digest
+
+        rerender_guard = _ask_tool_input_digest(resolve_ask_tool_input(window_id))
+        await handle_interactive_ui(
+            context.bot,
+            user.id,
+            window_id,
+            thread_id,
+            rerender_guard=rerender_guard,
+        )
 
     # Screenshot quick keys: send key to tmux window
     elif data.startswith(CB_KEYS_PREFIX):
@@ -3112,8 +3126,11 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 # UI not rendered — clear the early-set mode
                 clear_interactive_mode(user_id, thread_id)
 
-        # Any non-interactive message means the interaction is complete — delete the UI message
-        if get_interactive_msg_id(user_id, thread_id):
+        # Any non-interactive message means the interaction is complete — delete
+        # all UI cards (single OR multi-tab). PR 3 added ``has_interactive_surface``
+        # to cover both maps; ``get_interactive_msg_id`` alone missed multi-tab
+        # sessions and left their cards orphaned in chat.
+        if has_interactive_surface(user_id, thread_id):
             await clear_interactive_msg(user_id, bot, thread_id)
             forget_ask_tool_input(wid)
 

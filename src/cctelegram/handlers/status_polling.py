@@ -41,9 +41,9 @@ from . import busy_indicator
 from .busy_indicator import RunState
 from .interactive_ui import (
     clear_interactive_msg,
-    get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
+    has_interactive_surface,
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_content_queue
@@ -207,14 +207,18 @@ async def update_status_message(
         # the eventual card send would clear the just-published mode with
         # ``msg_id=None`` and drop the card to plain-text fallback. Skip this
         # cycle until the render has actually published a message id.
-        if get_interactive_msg_id(user_id, thread_id) is None:
+        # PR 3: gate on ``has_interactive_surface`` (covers both
+        # single-card ``_interactive_msgs`` and multi-tab
+        # ``_multi_tab_sessions``). ``get_interactive_msg_id`` alone
+        # missed multi-tab sessions and left their cards orphaned.
+        if not has_interactive_surface(user_id, thread_id):
             return
         await clear_interactive_msg(user_id, bot, thread_id)
         should_check_new_ui = False
     elif interactive_window is not None:
         # User is in interactive mode for a DIFFERENT window (window switched).
-        # Same guard as above: only clear if a real interactive message exists.
-        if get_interactive_msg_id(user_id, thread_id) is None:
+        # Same gate as above.
+        if not has_interactive_surface(user_id, thread_id):
             return
         await clear_interactive_msg(user_id, bot, thread_id)
 
