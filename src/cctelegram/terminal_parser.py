@@ -932,6 +932,32 @@ def resolve_ask_form(
         return pane_form
 
     if len(jsonl_form.questions) <= 1:
+        # Single-question review screen: pane is authoritative, same as the
+        # multi-question short-circuit below. Claude Code's single-question
+        # AUQ TUI has two steps — picker then Submit/Cancel confirmation;
+        # the picker's JSONL options are the original answers, but the
+        # confirmation step's pane shows ``1. Submit answers`` /
+        # ``2. Cancel``. Without this branch, the single-question resolver
+        # always returned the original answer options grafted onto
+        # ``is_review_screen=True``, producing a mislabelled card AND a
+        # wrong-action-class bug: clicking the rendered "option 2" would
+        # dispatch ``2 + Enter`` against the live Submit/Cancel picker
+        # (Cancel) while the button reads as one of the original answers.
+        # ``current_question_title`` stays from JSONL so single-question
+        # review fingerprints don't collapse onto a single canonical repr
+        # (``_canonical_repr`` omits QS:/INF: for len(questions) <= 1, so
+        # the title is the only remaining identity carrier here).
+        if pane_form is not None and pane_form.is_review_screen:
+            return AskUserQuestionForm(
+                tabs=pane_form.tabs,
+                current_question_title=jsonl_form.current_question_title,
+                options=pane_form.options,
+                is_review_screen=True,
+                is_free_text=pane_form.is_free_text,
+                pane_excerpt=pane_form.pane_excerpt,
+                questions=jsonl_form.questions,
+                current_tab_inferred=False,
+            )
         # Single-question: keep the JSONL-derived shape but graft live pane
         # state (cursor on the right option, free-text / review-screen
         # flags). Without the pane overlay the form would always claim

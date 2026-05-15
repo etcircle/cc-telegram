@@ -1172,6 +1172,139 @@ class TestResolveAskForm:
         assert form.current_tab_inferred is False
         assert form.current_question_title == "Pick approach."
 
+    # ── Single-question review-screen short-circuit ─────────────────────
+
+    def _single_q_input(self, title: str = "Fix the P1s how?") -> dict:
+        return {
+            "questions": [
+                {
+                    "question": title,
+                    "header": "Fix path",
+                    "options": [
+                        {"label": "Send findings back to Hermes (Recommended)"},
+                        {"label": "I fix the P1s directly"},
+                        {"label": "Merge as-is, file P1s as follow-up issues"},
+                        {"label": "Fix P1s + P2s together"},
+                    ],
+                }
+            ]
+        }
+
+    def _single_q_review_pane(self, cursor_row: int = 1) -> str:
+        # Claude Code's single-question AUQ has a Submit/Cancel confirmation
+        # step after the picker. No tabstrip (single question), but the same
+        # "Review your answers" / "Ready to submit your answers?" markers.
+        c1 = "❯ " if cursor_row == 1 else "  "
+        c2 = "❯ " if cursor_row == 2 else "  "
+        return (
+            "Review your answers\n"
+            "Ready to submit your answers?\n"
+            "\n"
+            f"{c1}1. Submit answers\n"
+            f"{c2}2. Cancel\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+
+    def test_single_q_review_screen_returns_submit_cancel_not_originals(self):
+        # The bug: with single-question JSONL on the review screen, the
+        # resolver used to graft pane's is_review_screen=True onto the
+        # original 4 answer options. Worst case: clicking the rendered
+        # "option 2" would dispatch '2 + Enter' into the live Submit/Cancel
+        # picker → Cancel, while the button label reads as one of the
+        # original answer options. Wrong-action-class for any non-row-1 row.
+        form = resolve_ask_form(self._single_q_input(), self._single_q_review_pane())
+        assert form is not None
+        assert form.is_review_screen is True
+        # Pane is authoritative: options come from the live Submit/Cancel
+        # picker, not the JSONL answer matrix.
+        assert [o.label for o in form.options] == ["Submit answers", "Cancel"]
+        # No original answer labels leak into the rendered options.
+        assert all(
+            "Send findings back to Hermes" not in o.label
+            and "I fix the P1s" not in o.label
+            for o in form.options
+        )
+        # Mint-suppression flag mirrors the multi-question branch. Single-q
+        # forms don't gate on it today (mint suppressor is len(questions) > 1),
+        # but keeping it consistent guards against future gate changes.
+        assert form.current_tab_inferred is False
+        # ``questions`` matrix preserved so canonical_repr stays identifiable.
+        assert len(form.questions) == 1
+        assert form.questions[0].title == "Fix the P1s how?"
+
+    def test_single_q_review_fingerprint_parity_render_vs_validate(self):
+        # Render and pick-token validator both call resolve_ask_form against
+        # the same JSONL + pane; canonical reprs must match or the staleness
+        # check would 404 the user's own click on a freshly rendered card.
+        a = resolve_ask_form(self._single_q_input(), self._single_q_review_pane())
+        b = resolve_ask_form(self._single_q_input(), self._single_q_review_pane())
+        assert a is not None and b is not None
+        assert a._canonical_repr() == b._canonical_repr()
+        canonical = a._canonical_repr()
+        assert "RVW:1" in canonical
+
+    def test_single_q_review_fingerprint_non_collision_across_inputs(self):
+        # Two different single-question tool inputs that share the same
+        # review pane MUST produce different fingerprints. With
+        # current_question_title cleared (a simpler fix variant), every
+        # single-question review screen with cursor on Submit would collapse
+        # to the same canonical_repr — stale-card protection would silently
+        # weaken. Keeping ``current_question_title`` from JSONL is what
+        # makes this test pass.
+        a = resolve_ask_form(
+            self._single_q_input("Fix the P1s how?"), self._single_q_review_pane()
+        )
+        b = resolve_ask_form(
+            self._single_q_input("Pick the next slice?"), self._single_q_review_pane()
+        )
+        assert a is not None and b is not None
+        assert a.fingerprint() != b.fingerprint()
+
+    def test_single_q_review_cursor_on_cancel(self):
+        # Catches "row 1 is always cursor-selected" assumptions. If the user
+        # navigated the keystroke fallback to Cancel, the pane cursor is on
+        # row 2 — the renderer / mint must reflect that, otherwise a Submit
+        # button could end up marked as the chosen row.
+        form = resolve_ask_form(
+            self._single_q_input(), self._single_q_review_pane(cursor_row=2)
+        )
+        assert form is not None
+        assert form.is_review_screen is True
+        assert [o.label for o in form.options] == ["Submit answers", "Cancel"]
+        # Cursor lands on Cancel (option 2).
+        assert form.options[0].cursor is False
+        assert form.options[1].cursor is True
+
+    def test_single_q_picker_unchanged_no_review_short_circuit(self):
+        # Regression guard: on the picker step (NOT the review screen) the
+        # single-question branch must still overlay JSONL options + pane
+        # cursor as before. Only the review-screen pane triggers the
+        # pane-authoritative path.
+        picker_pane = (
+            "Fix the P1s how?\n"
+            "\n"
+            "❯ 1. Send findings back to Hermes (Recommended)\n"
+            "  2. I fix the P1s directly\n"
+            "  3. Merge as-is, file P1s as follow-up issues\n"
+            "  4. Fix P1s + P2s together\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(self._single_q_input(), picker_pane)
+        assert form is not None
+        assert form.is_review_screen is False
+        # Original JSONL options preserved (not Submit/Cancel). The
+        # "(Recommended)" suffix is stripped into the ``recommended`` flag
+        # by build_form_from_tool_input.
+        labels = [o.label for o in form.options]
+        assert "Send findings back to Hermes" in labels
+        assert form.options[0].recommended is True
+        assert "Submit answers" not in labels
+        # Cursor overlaid from pane onto option 1.
+        assert form.options[0].cursor is True
+        assert form.current_tab_inferred is True
+
     # ── CB6 — Strong-match requirement before overlay ─────────────────────
 
     def test_drift_pane_question_outside_jsonl_no_overlay(self):
