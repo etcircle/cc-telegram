@@ -73,7 +73,9 @@ class TestStatusPollerSettingsDetection:
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
 
-            mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
+            mock_handle_ui.assert_called_once_with(
+                mock_bot, 1, window_id, 42, from_poller=True
+            )
 
     @pytest.mark.asyncio
     async def test_idle_clears_stale_busy_after_delay(self, mock_bot: AsyncMock):

@@ -231,7 +231,12 @@ async def update_status_message(
             window_id,
             thread_id,
         )
-        await handle_interactive_ui(bot, user_id, window_id, thread_id)
+        # P1.4: tag this as the poller call path so handle_interactive_ui
+        # can defer when the JSONL tool_use cache hasn't caught up yet
+        # (avoids rendering a partial card that's missing options 1-N).
+        await handle_interactive_ui(
+            bot, user_id, window_id, thread_id, from_poller=True
+        )
         return
 
     # Compute active-state up front so the typing indicator fires even
