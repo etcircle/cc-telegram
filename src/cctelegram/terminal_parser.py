@@ -79,6 +79,18 @@ UI_PATTERNS: list[UIPattern] = [
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=1,
     ),
+    # Plain single-select AskUserQuestion (no checkbox glyphs). Claude Code
+    # renders simple A/B/C/D questions as numbered options + ``Enter to select``
+    # footer, with no leading ☐/✔/☒. The two patterns above only match the
+    # multi-select / multi-tab variants. This pattern catches the rest.
+    # Top anchor is a numbered option line; the cursor prefix varies across
+    # Claude Code versions (❯, ›, ▶, *, ), >) or may be plain indent.
+    UIPattern(
+        name="AskUserQuestion",
+        top=(re.compile(r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S"),),
+        bottom=(re.compile(r"^\s*Enter to select"),),
+        min_gap=0,
+    ),
     UIPattern(
         name="RestoreCheckpoint",
         top=(re.compile(r"^\s*Restore the code"),),

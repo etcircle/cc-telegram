@@ -157,6 +157,34 @@ class TestExtractInteractiveContent:
         assert result.name == "AskUserQuestion"
         assert "Enter to select" in result.content
 
+    def test_ask_user_plain_no_checkbox(self):
+        """Simple A/B/C/D AskUserQuestion (no ☐/✔/☒ glyphs) must still match.
+
+        Regression: Claude Code renders single-select AskUserQuestion as a
+        numbered options block + ``Enter to select`` footer with no checkbox
+        glyphs. The original single-tab pattern required a leading
+        ``[☐✔☒]`` which left this variant undetected; the bot then fell
+        through to plain-text delivery and the user saw no button keyboard.
+        """
+        pane = (
+            "Mobile drawer: chip labels or no labels?\n"
+            "\n"
+            "❯ 1. Stay with no labels (your original choice)\n"
+            "   Subtle visual grouping only.\n"
+            " 2. Add tiny 'paper' / 'digital' chips\n"
+            "   9px lowercase muted mono chips above each group.\n"
+            " 3. Type something.\n"
+            "─\n"
+            " 4. Chat about this\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+        assert "Enter to select" in result.content
+        assert "1. Stay with no labels" in result.content
+
     def test_permission_prompt_no_longer_detected(self, sample_pane_permission: str):
         # Wave 2: PermissionPrompt is dead code under
         # ``--dangerously-skip-permissions`` (the deployment's mode), so the
