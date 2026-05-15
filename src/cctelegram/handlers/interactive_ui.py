@@ -196,7 +196,7 @@ class _MultiTabSession:
     """
 
     window_id: str
-    shape_digest: str            # sha1 over titles + ordered labels + counts
+    shape_digest: str  # sha1 over titles + ordered labels + counts
     message_ids: list[int | None] = field(default_factory=list)
     current_tab_idx: int = 0
     # Incremented by cleanup. In-flight render/edit coroutines re-acquire
@@ -646,9 +646,7 @@ def _build_pick_button_rows(
     # only allocated for these; the keystroke fallback still reaches the
     # rest. 1-9 cap applies here.
     pickable = [
-        opt
-        for opt in form.options
-        if opt.number is not None and 1 <= opt.number <= 9
+        opt for opt in form.options if opt.number is not None and 1 <= opt.number <= 9
     ]
     if not pickable:
         return []

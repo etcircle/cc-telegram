@@ -1187,9 +1187,7 @@ class TestMultiTabPostN:
             mock_tmux.find_window_by_id = AsyncMock(return_value=window_mock)
             mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
 
-            with patch(
-                "cctelegram.handlers.interactive_ui.session_manager"
-            ) as mock_sm:
+            with patch("cctelegram.handlers.interactive_ui.session_manager") as mock_sm:
                 mock_sm.resolve_chat_id = MagicMock(return_value=12345)
                 mock_sm.resolve_session_for_window = AsyncMock(return_value=None)
                 with patch(

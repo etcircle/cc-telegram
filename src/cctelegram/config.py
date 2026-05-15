@@ -190,6 +190,15 @@ class Config:
             os.getenv("CC_TELEGRAM_REPLY_CONTEXT", "true").lower() != "false"
         )
 
+        # P1.5: when True (default), a reply quoting a message from a
+        # previous Claude session renders an annotated cross-session marker
+        # into the prompt instead of silently dropping the quote. Set
+        # ``CC_TELEGRAM_REPLY_CROSS_SESSION=false`` to revert to the
+        # pre-P1.5 silent-drop behaviour without redeploying.
+        self.reply_context_cross_session_enabled = (
+            os.getenv("CC_TELEGRAM_REPLY_CROSS_SESSION", "true").lower() != "false"
+        )
+
         # Upper bound on the quoted-text excerpt injected into Claude's
         # prompt. The full original text still lives in the Telegram message,
         # and Stage 5.c will keep a SQLite copy for rehydration; this cap just

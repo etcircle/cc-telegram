@@ -1041,15 +1041,32 @@ async def _apply_reply_context(
         and reply_ctx.session_id != current_sid
     )
     if stale_quote:
+        # P1.5: render the quote with a cross-session marker rather than
+        # dropping silently. The §2.5.4 routing rule still applies — the
+        # topic's current window binding remains the routing authority;
+        # the marker only tells Claude the quoted body is from a prior
+        # session so it doesn't treat it as part of this conversation's
+        # transcript. Kill switch ``CC_TELEGRAM_REPLY_CROSS_SESSION=false``
+        # restores the pre-P1.5 silent-drop behaviour.
+        if not config.reply_context_cross_session_enabled:
+            logger.info(
+                "Dropping reply context (cross-session kill switch on): "
+                "quoted session %s != current %s (window=%s, thread=%s)",
+                reply_ctx.session_id,
+                current_sid,
+                bound_wid,
+                thread_id,
+            )
+            return text
         logger.info(
-            "Dropping reply context: quoted session %s != current %s "
-            "(window=%s, thread=%s)",
+            "Rendering cross-session reply context: quoted session %s != "
+            "current %s (window=%s, thread=%s)",
             reply_ctx.session_id,
             current_sid,
             bound_wid,
             thread_id,
         )
-        return text
+        return render_for_claude(text, reply_ctx, cross_session=True)
     return render_for_claude(text, reply_ctx)
 
 
