@@ -285,6 +285,68 @@ class TestIsInteractiveUI:
         assert is_interactive_ui("") is False
 
 
+# ── CB1 + CB5: visible_pane_liveness ─────────────────────────────────────
+
+
+class TestVisiblePaneLiveness:
+    """Three-state liveness predicate over the *visible* pane."""
+
+    def test_empty_pane_is_unknown_not_absent(self):
+        # CB1: tmux can return empty during alt-screen mode or redraw races.
+        # Treating empty as ABSENT lets a destructive clear erase a live
+        # picker the very next frame brings back.
+        from cctelegram.terminal_parser import visible_pane_liveness
+
+        assert visible_pane_liveness("") == "unknown"
+        assert visible_pane_liveness("   \n  \n") == "unknown"
+        assert visible_pane_liveness(None) == "unknown"
+
+    def test_picker_visible_is_present(self):
+        from cctelegram.terminal_parser import visible_pane_liveness
+
+        pane = (
+            "Pick one.\n"
+            "\n"
+            "❯ 1. A\n"
+            "  2. B\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        assert visible_pane_liveness(pane) == "present"
+
+    def test_shell_prompt_is_absent(self):
+        from cctelegram.terminal_parser import visible_pane_liveness
+
+        pane = "$ ls\nfile1.txt  file2.txt\n$ \n"
+        assert visible_pane_liveness(pane) == "absent"
+
+    def test_long_question_with_footer_at_bottom_is_present(self):
+        # CB5: the question prose pushes the top anchor (option block / tab
+        # header) above the visible region, but the picker footer stays at
+        # the visible bottom. is_interactive_ui(visible) returns False here
+        # (no top anchor), but visible_pane_liveness recovers via the
+        # picker-anchor fallback.
+        from cctelegram.terminal_parser import visible_pane_liveness
+
+        # 60 lines of question prose, no top anchor, footer at the bottom.
+        prose = "\n".join(
+            f"Line {i} of the long question explanation." for i in range(60)
+        )
+        pane = prose + "\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+        assert visible_pane_liveness(pane) == "present"
+
+    def test_exit_plan_mode_footer_anchors_too(self):
+        from cctelegram.terminal_parser import visible_pane_liveness
+
+        # Only the bottom of an ExitPlanMode picker visible.
+        pane = (
+            "line of plan text\n"
+            "more plan text\n"
+            "ctrl-g to edit in the editor · Esc to cancel\n"
+        )
+        assert visible_pane_liveness(pane) == "present"
+
+
 # ── strip_pane_chrome ───────────────────────────────────────────────────
 
 

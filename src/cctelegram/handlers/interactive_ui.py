@@ -34,9 +34,9 @@ from ..terminal_parser import (
     AskUserQuestionForm,
     build_form_from_tool_input,
     extract_interactive_content,
-    is_interactive_ui,
     parse_ask_user_question,
     resolve_ask_form,
+    visible_pane_liveness,
 )
 from ..tmux_manager import tmux_manager
 from . import attention
@@ -446,6 +446,105 @@ def clear_interactive_mode(user_id: int, thread_id: int | None = None) -> None:
     """Clear interactive mode for a user (without deleting message)."""
     logger.debug("Clear interactive mode: user=%d, thread=%s", user_id, thread_id)
     _interactive_mode.pop((user_id, thread_id or 0), None)
+
+
+# Sentinel returned by ``assert_nav_dispatchable`` for the ESC-on-stale branch:
+# ESC must still call ``clear_interactive_msg`` even when the picker is gone;
+# all other nav callbacks just short-circuit. Use a Literal so pyright can
+# narrow ``w is None`` / ``w == NAV_ESC_CLEAR`` cleanly in callers.
+from typing import Literal, overload  # noqa: E402
+
+from ..tmux_manager import TmuxWindow  # noqa: E402
+
+NAV_ESC_CLEAR: Literal["__esc_clear__"] = "__esc_clear__"
+
+
+@overload
+async def assert_nav_dispatchable(
+    query,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    *,
+    is_esc: Literal[False] = False,
+) -> TmuxWindow | None: ...
+
+
+@overload
+async def assert_nav_dispatchable(
+    query,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    *,
+    is_esc: Literal[True],
+) -> TmuxWindow | Literal["__esc_clear__"] | None: ...
+
+
+async def assert_nav_dispatchable(
+    query,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    *,
+    is_esc: bool = False,
+) -> TmuxWindow | Literal["__esc_clear__"] | None:
+    """Guard a nav-keystroke callback before it dispatches keys to tmux.
+
+    P1.1 + P1.3 + CB1 + CB5 + F1 + F2 + F3, all collapsed into one helper
+    called from every CB_ASK_* nav callback in ``bot.py``. Returns:
+
+      * a live ``tmux.Window`` — caller proceeds with ``send_keys`` /
+        ``handle_interactive_ui``.
+      * ``NAV_ESC_CLEAR`` — ESC carve-out (F2): the picker is closed but
+        ESC was tapped; the user wants the card gone. Caller runs
+        ``clear_interactive_msg`` to reap the Telegram artefact.
+      * ``None`` — non-ESC nav callback against a non-live surface, or
+        any guard failure. Caller has already had a ``query.answer``
+        explanation; just ``return``.
+
+    Guards, in order (cheapest first; short-circuit on first failure):
+      1. Route owns an interactive surface (``has_interactive_surface``).
+      2. The callback's window matches this route's active interactive
+         window (``get_interactive_window``).
+      3. ``find_window_by_id`` resolves to a live tmux window.
+      4. **Visible-only** capture (scrollback=0) → three-state liveness
+         (``visible_pane_liveness``). PRESENT proceeds; ABSENT short-
+         circuits; UNKNOWN proceeds (CB1: empty/mid-redraw capture must
+         NOT destructively clear a live picker).
+
+    The visible-only capture is critical (P1.3): scrollback can contain
+    stale historical pickers that match ``is_interactive_ui``, so a
+    scrollback-fed liveness check returns True even when the user is
+    back at the shell. CB5 (long-question case) is handled inside
+    ``visible_pane_liveness`` via the picker-anchor fallback.
+    """
+    if not has_interactive_surface(user_id, thread_id):
+        if is_esc:
+            # Cleanup is idempotent and what ESC wants.
+            return NAV_ESC_CLEAR
+        await query.answer("No live interactive UI")
+        return None
+    if get_interactive_window(user_id, thread_id) != window_id:
+        if is_esc:
+            return NAV_ESC_CLEAR
+        await query.answer("Window changed")
+        return None
+    w = await tmux_manager.find_window_by_id(window_id)
+    if w is None:
+        if is_esc:
+            return NAV_ESC_CLEAR
+        await query.answer("Window not found")
+        return None
+    visible = await tmux_manager.capture_pane(w.window_id, scrollback_lines=0)
+    state = visible_pane_liveness(visible)
+    if state == "absent":
+        if is_esc:
+            return NAV_ESC_CLEAR
+        await query.answer("Picker closed, refreshing")
+        return None
+    # PRESENT or UNKNOWN: proceed. UNKNOWN explicitly continues per CB1.
+    return w
 
 
 def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | None:
@@ -1415,23 +1514,35 @@ async def handle_interactive_ui(
     if not w:
         return False
 
-    # Capture plain text (no ANSI colors). Include 100 lines of scrollback
-    # so long AskUserQuestion text that pushes early options off the top
-    # of the visible pane doesn't break detection / option-pick rendering.
-    # The other capture sites (status-line parser, busy indicator) still
-    # use visible-only via the default ``scrollback_lines=0``.
+    # P1.3 two-phase capture: liveness uses visible-only (no scrollback) so
+    # historical pickers still sitting in the buffer can't fake a live UI.
+    # Once the visible pane confirms a picker IS on screen, capture again
+    # WITH scrollback for the structured parse — long AskUserQuestion text
+    # can push early options out of the visible region, and the structured
+    # parser needs them.
+    #
+    # CB1: empty/whitespace visible capture is UNKNOWN, not ABSENT —
+    # ``visible_pane_liveness`` distinguishes the two. UNKNOWN here means
+    # "tmux probably mid-redraw"; bail without rendering so we don't post
+    # a partial card, but ALSO don't destructively clear (callers gate
+    # cleanup on ``has_interactive_surface``, which we don't touch).
+    visible = await tmux_manager.capture_pane(w.window_id, scrollback_lines=0)
+    state = visible_pane_liveness(visible)
+    if state != "present":
+        logger.debug(
+            "Interactive UI liveness=%s for window_id %s (last 3 visible: %s)",
+            state,
+            window_id,
+            (visible or "").strip().split("\n")[-3:],
+        )
+        return False
+
+    # Picker confirmed live. Now capture with scrollback for the structured
+    # parse — long AskUserQuestion text pushes early options off the top of
+    # the visible pane, and the parser needs them.
     pane_text = await tmux_manager.capture_pane(w.window_id, scrollback_lines=100)
     if not pane_text:
         logger.debug("No pane text captured for window_id %s", window_id)
-        return False
-
-    # Quick check if it looks like an interactive UI
-    if not is_interactive_ui(pane_text):
-        logger.debug(
-            "No interactive UI detected in window_id %s (last 3 lines: %s)",
-            window_id,
-            pane_text.strip().split("\n")[-3:],
-        )
         return False
 
     # Extract content between separators

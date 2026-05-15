@@ -188,6 +188,66 @@ def is_interactive_ui(pane_text: str) -> bool:
     return extract_interactive_content(pane_text) is not None
 
 
+# Picker bottom-border markers that anchor on the *visible pane*. When the
+# question prose is long enough to push the picker top anchor off the visible
+# slice (~50 lines), ``extract_interactive_content`` over the visible pane
+# alone returns None even though the picker IS live. The footer/border lives
+# at the picker bottom — which always stays on the visible pane — so checking
+# the last few visible lines for these markers is a robust "is the picker
+# still on screen right now" predicate.
+_PICKER_ANCHOR_MARKERS = (
+    re.compile(r"Enter to select"),  # AskUserQuestion / RestoreCheckpoint footer
+    re.compile(r"Enter to confirm"),  # Settings footer
+    re.compile(r"ctrl-g to edit"),  # ExitPlanMode footer
+    re.compile(r"Esc to (cancel|exit)"),  # generic dismiss footer
+    re.compile(r"╰─"),  # picker frame bottom-left corner
+)
+
+
+def is_picker_anchor_visible(visible_pane: str, *, window_lines: int = 5) -> bool:
+    """True when the last ``window_lines`` of ``visible_pane`` contain a
+    picker footer/border anchor.
+
+    Used as the CB5 fallback in liveness checks: when ``is_interactive_ui``
+    over the visible pane returns False on a long-question case (top
+    anchor pushed off screen), this check still returns True if the picker
+    footer sits at the visible bottom.
+    """
+    if not visible_pane:
+        return False
+    tail = visible_pane.rstrip("\n").split("\n")[-window_lines:]
+    return any(p.search(line) for line in tail for p in _PICKER_ANCHOR_MARKERS)
+
+
+def visible_pane_liveness(visible_pane: str | None) -> str:
+    """Three-state liveness predicate over the *visible* tmux pane (no scrollback).
+
+    Returns one of:
+      * ``"present"`` — an interactive UI is on screen now. Safe to dispatch
+        nav keystrokes; do not destructively clear.
+      * ``"absent"`` — no interactive UI on screen. Safe to clear / refresh /
+        bail out of nav dispatch.
+      * ``"unknown"`` — empty / whitespace-only capture (alt-screen mode,
+        tmux redraw race, terminal cleared mid-cycle). MUST NOT be treated
+        as absent: a destructive clear here can erase a live picker the
+        very next frame brings back.
+
+    Implementation:
+      1. Empty/whitespace → ``"unknown"``.
+      2. ``is_interactive_ui(visible)`` → ``"present"``.
+      3. ``is_picker_anchor_visible(visible)`` → ``"present"`` (CB5 long-
+         question fallback — top anchor scrolled off but footer is visible).
+      4. Otherwise → ``"absent"``.
+    """
+    if not visible_pane or not visible_pane.strip():
+        return "unknown"
+    if is_interactive_ui(visible_pane):
+        return "present"
+    if is_picker_anchor_visible(visible_pane):
+        return "present"
+    return "absent"
+
+
 # ── AskUserQuestion structured parser ───────────────────────────────────
 #
 # Background: ``extract_interactive_content`` above answers "is there an

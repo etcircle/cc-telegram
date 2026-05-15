@@ -131,6 +131,8 @@ from .handlers.inbound_aggregator import (
 )
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
+    NAV_ESC_CLEAR,
+    assert_nav_dispatchable,
     clear_interactive_mode,
     clear_interactive_msg,
     consume_pick_token,
@@ -2759,11 +2761,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        w = await assert_nav_dispatchable(query, user.id, thread_id, window_id)
+        if w is None:
+            return
+        await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Down arrow
@@ -2772,13 +2775,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Down", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        w = await assert_nav_dispatchable(query, user.id, thread_id, window_id)
+        if w is None:
+            return
+        await tmux_manager.send_keys(w.window_id, "Down", enter=False, literal=False)
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Left arrow
@@ -2787,13 +2789,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Left", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        w = await assert_nav_dispatchable(query, user.id, thread_id, window_id)
+        if w is None:
+            return
+        await tmux_manager.send_keys(w.window_id, "Left", enter=False, literal=False)
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Right arrow
@@ -2802,13 +2803,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Right", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        w = await assert_nav_dispatchable(query, user.id, thread_id, window_id)
+        if w is None:
+            return
+        await tmux_manager.send_keys(w.window_id, "Right", enter=False, literal=False)
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Escape
@@ -2817,12 +2817,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Escape", enter=False, literal=False
-            )
+        # F2: ESC carve-out. On a stale picker, still reap the Telegram card.
+        w = await assert_nav_dispatchable(
+            query, user.id, thread_id, window_id, is_esc=True
+        )
+        if w == NAV_ESC_CLEAR:
             await clear_interactive_msg(user.id, context.bot, thread_id)
+            await query.answer("⎋ Esc")
+            return
+        if w is None:
+            return
+        await tmux_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
+        await clear_interactive_msg(user.id, context.bot, thread_id)
         await query.answer("⎋ Esc")
 
     # Interactive UI: Enter
@@ -2831,13 +2837,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Enter", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        w = await assert_nav_dispatchable(query, user.id, thread_id, window_id)
+        if w is None:
+            return
+        await tmux_manager.send_keys(w.window_id, "Enter", enter=False, literal=False)
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("⏎ Enter")
 
     # Interactive UI: Space
@@ -2846,13 +2851,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(
-                w.window_id, "Space", enter=False, literal=False
-            )
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        w = await assert_nav_dispatchable(query, user.id, thread_id, window_id)
+        if w is None:
+            return
+        await tmux_manager.send_keys(w.window_id, "Space", enter=False, literal=False)
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("␣ Space")
 
     # Interactive UI: Tab
@@ -2861,18 +2865,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
-        w = await tmux_manager.find_window_by_id(window_id)
-        if w:
-            await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
-            await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        w = await assert_nav_dispatchable(query, user.id, thread_id, window_id)
+        if w is None:
+            return
+        await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
+        await asyncio.sleep(0.5)
+        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("⇥ Tab")
 
-    # Interactive UI: refresh display
+    # Interactive UI: refresh display (F1: included in the nav-guard family)
     elif data.startswith(CB_ASK_REFRESH):
         window_id = data[len(CB_ASK_REFRESH) :]
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
+            return
+        w = await assert_nav_dispatchable(query, user.id, thread_id, window_id)
+        if w is None:
             return
         await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("🔄")

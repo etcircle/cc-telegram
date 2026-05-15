@@ -812,6 +812,156 @@ class TestPeekPickTokenIsNonDestructive:
         assert _pick_token_cache.get(cache_key) == [t1, t2]
 
 
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestAssertNavDispatchable:
+    """P1.1 + P1.3 + CB1 + CB5 + F2 — nav-callback guard helper.
+
+    These tests pin the public contract of ``assert_nav_dispatchable``:
+    return values and per-branch behaviour. They mock the tmux + helper
+    surface so we can drive each branch deterministically.
+    """
+
+    def _query(self) -> AsyncMock:
+        q = AsyncMock()
+        q.answer = AsyncMock()
+        return q
+
+    @pytest.mark.asyncio
+    async def test_no_interactive_surface_short_circuits(self):
+        from cctelegram.handlers.interactive_ui import assert_nav_dispatchable
+
+        q = self._query()
+        result = await assert_nav_dispatchable(q, 42, 7, "@0")
+        assert result is None
+        q.answer.assert_awaited_once_with("No live interactive UI")
+
+    @pytest.mark.asyncio
+    async def test_no_interactive_surface_esc_returns_clear_sentinel(self):
+        # F2: ESC carve-out — picker is gone, but ESC should still proceed
+        # to the cleanup branch in the caller.
+        from cctelegram.handlers.interactive_ui import (
+            NAV_ESC_CLEAR,
+            assert_nav_dispatchable,
+        )
+
+        q = self._query()
+        result = await assert_nav_dispatchable(q, 42, 7, "@0", is_esc=True)
+        assert result == NAV_ESC_CLEAR
+        # ESC carve-out doesn't answer the query (the caller does after
+        # running clear_interactive_msg).
+        q.answer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_window_mismatch_short_circuits(self):
+        from cctelegram.handlers import interactive_ui as iui
+
+        # has_interactive_surface checks _interactive_msgs OR
+        # _multi_tab_sessions, not _interactive_mode. Set both so we reach
+        # the window-mismatch guard rather than tripping the surface guard
+        # first.
+        iui._interactive_msgs[(42, 7)] = 999
+        iui.set_interactive_mode(42, "@otherwindow", 7)
+        q = self._query()
+        result = await iui.assert_nav_dispatchable(q, 42, 7, "@requested")
+        assert result is None
+        q.answer.assert_awaited_once_with("Window changed")
+
+    @pytest.mark.asyncio
+    async def test_visible_pane_absent_short_circuits(self):
+        # User left the picker, terminal is back at shell. visible_pane
+        # returns shell output → liveness=absent → short-circuit.
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._interactive_msgs[(42, 7)] = 999
+        iui.set_interactive_mode(42, "@0", 7)
+        q = self._query()
+        fake_window = MagicMock()
+        fake_window.window_id = "@0"
+        with (
+            patch.object(
+                iui.tmux_manager,
+                "find_window_by_id",
+                new_callable=AsyncMock,
+                return_value=fake_window,
+            ),
+            patch.object(
+                iui.tmux_manager,
+                "capture_pane",
+                new_callable=AsyncMock,
+                return_value="$ ls\nfile.txt\n$ \n",
+            ),
+        ):
+            result = await iui.assert_nav_dispatchable(q, 42, 7, "@0")
+        assert result is None
+        q.answer.assert_awaited_once_with("Picker closed, refreshing")
+
+    @pytest.mark.asyncio
+    async def test_visible_pane_unknown_proceeds(self):
+        # CB1: empty visible capture (alt-screen / redraw race) is UNKNOWN.
+        # MUST NOT short-circuit — that would destroy a live picker the
+        # very next frame brings back.
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._interactive_msgs[(42, 7)] = 999
+        iui.set_interactive_mode(42, "@0", 7)
+        q = self._query()
+        fake_window = MagicMock()
+        fake_window.window_id = "@0"
+        with (
+            patch.object(
+                iui.tmux_manager,
+                "find_window_by_id",
+                new_callable=AsyncMock,
+                return_value=fake_window,
+            ),
+            patch.object(
+                iui.tmux_manager,
+                "capture_pane",
+                new_callable=AsyncMock,
+                return_value="",  # empty visible
+            ),
+        ):
+            result = await iui.assert_nav_dispatchable(q, 42, 7, "@0")
+        # Proceed: returns the live window object, no short-circuit answer.
+        assert result is fake_window
+        q.answer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_picker_present_returns_window(self):
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._interactive_msgs[(42, 7)] = 999
+        iui.set_interactive_mode(42, "@0", 7)
+        q = self._query()
+        fake_window = MagicMock()
+        fake_window.window_id = "@0"
+        pane = (
+            "Pick.\n"
+            "\n"
+            "❯ 1. A\n"
+            "  2. B\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        with (
+            patch.object(
+                iui.tmux_manager,
+                "find_window_by_id",
+                new_callable=AsyncMock,
+                return_value=fake_window,
+            ),
+            patch.object(
+                iui.tmux_manager,
+                "capture_pane",
+                new_callable=AsyncMock,
+                return_value=pane,
+            ),
+        ):
+            result = await iui.assert_nav_dispatchable(q, 42, 7, "@0")
+        assert result is fake_window
+        q.answer.assert_not_called()
+
+
 @pytest.mark.usefixtures("_clear_pick_tokens")
 class TestClearInteractiveMsgPrunesTokens:
     """P2.2 — clear_interactive_msg must drop pick-tokens for the cleared route."""
