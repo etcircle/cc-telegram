@@ -1087,6 +1087,17 @@ async def _multi_tab_post_n(
             anchor = ReplyParameters(message_id=anchor_id)
     interactive_session_id = session_id_for_window(window_id)
 
+    # Partial-bundle policy (lessons from live testing 2026-05-15):
+    # ``topic_send`` can time out under Telegram backend latency, returning
+    # ``sent=None`` mid-bundle. We used to raise ``_RenderCancelled`` and
+    # tear down the whole bundle — but combined with the caller's
+    # ``has_interactive_surface`` cleanup chain, that produced "Q1 appears
+    # then vanishes" UX. Better: keep what we sent, log the gap, and
+    # return True so the caller doesn't tear down the partial state.
+    # Future re-renders against the same shape_digest will see message_ids
+    # shorter than tab_count and edit_advance's bounds check fails-soft.
+    # ``_RenderCancelled`` is still raised on the generation guard path —
+    # that one really does require rollback, since cleanup *did* fire.
     try:
         for idx in range(tab_count):
             body = _render_multi_tab_card_body(form, idx, tab_count)
@@ -1127,13 +1138,17 @@ async def _multi_tab_post_n(
 
             sent, _outcome = await topic_send(bot, **send_kwargs)
             if sent is None:
-                logger.info(
-                    "Multi-tab card send failed at idx=%d (user=%d window=%s); aborting bundle",
+                logger.warning(
+                    "Multi-tab card send failed at idx=%d (user=%d window=%s); keeping partial bundle and continuing",
                     idx,
                     user_id,
                     window_id,
                 )
-                raise _RenderCancelled()
+                # Skip this index but don't tear down — try the rest of
+                # the cards. Worst case the user gets cards [0, 2, 3]
+                # with idx=1 missing, which is a degraded but functional
+                # UX (keystroke nav still works on the visible cards).
+                continue
 
             # Commit the message_id under the lock, with the generation
             # re-check. If cleanup bumped the generation between the
@@ -1145,6 +1160,8 @@ async def _multi_tab_post_n(
                     raise _RenderCancelled()
                 current.message_ids.append(sent.message_id)
     except _RenderCancelled:
+        # Generation guard fired — cleanup ran while we were posting.
+        # Roll back any orphans (committed-then-stranded message_ids).
         for msg_id in orphans:
             try:
                 await topic_delete(
@@ -1158,6 +1175,24 @@ async def _multi_tab_post_n(
                 )
             except Exception as exc:
                 logger.debug("Orphan rollback delete failed (benign): %s", exc)
+        return False
+
+    # Return True even on partial bundles. The session state reflects what
+    # actually landed; ``has_interactive_surface`` correctly reports the
+    # partial session as live so cleanup on tool_result still walks it.
+    async with lock:
+        current = _multi_tab_sessions.get(ikey)
+        sent_count = len(current.message_ids) if current is not None else 0
+    if sent_count == 0:
+        # Total failure — no cards landed. Drop the empty session so the
+        # caller doesn't think a surface exists.
+        async with lock:
+            existing_for_cleanup = _multi_tab_sessions.get(ikey)
+            if (
+                existing_for_cleanup is not None
+                and existing_for_cleanup.generation == generation_at_entry
+            ):
+                _multi_tab_sessions.pop(ikey, None)
         return False
     return True
 
@@ -1202,12 +1237,16 @@ async def _multi_tab_edit_advance(
         )
 
     if old_msg_id is None or new_msg_id is None:
+        # Partial bundle (some cards failed to post). Session is still
+        # live; keystroke nav continues to work. Return True so the
+        # caller doesn't tear down the surviving cards via
+        # ``has_interactive_surface`` cleanup chain.
         logger.warning(
-            "Multi-tab edit_advance: missing message_ids (old=%s new=%s); skipping",
+            "Multi-tab edit_advance: missing message_ids (old=%s new=%s); keeping partial session live",
             old_msg_id,
             new_msg_id,
         )
-        return False
+        return True
 
     # Build the new keyboard for the new current tab (outside the lock).
     if form.current_tab_inferred:
