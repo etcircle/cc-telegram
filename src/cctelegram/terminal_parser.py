@@ -546,14 +546,25 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
             tab_header_idx = i
             break
 
-    # Detect picker footer or review-screen markers anywhere in the last
-    # ~25 lines — the live picker stays near the bottom of the pane.
-    tail = lines[-25:]
-    has_footer = any(_RE_PICKER_FOOTER.search(line) for line in tail)
-    is_review = any(_RE_REVIEW_HEADER.match(line) for line in tail) and any(
-        _RE_SUBMIT_PROMPT.match(line) for line in tail
+    # Locate the picker footer ("Enter to select") near the bottom of the pane.
+    # The single-tab options block sits immediately above this line. Scan
+    # bottom-up so a stale footer earlier in the scrollback can't shadow
+    # the live one, and search the entire captured buffer (scrollback may
+    # extend far above the visible region for long question text).
+    footer_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _RE_PICKER_FOOTER.search(lines[i]):
+            footer_idx = i
+            break
+    has_footer = footer_idx is not None
+
+    # Review-screen + free-text markers stay scoped to the last 25 lines —
+    # they only matter for the live picker state, not historic scrollback.
+    recent_tail = lines[-25:]
+    is_review = any(_RE_REVIEW_HEADER.match(line) for line in recent_tail) and any(
+        _RE_SUBMIT_PROMPT.match(line) for line in recent_tail
     )
-    is_free_text = any(_RE_FREE_TEXT_OPTION.search(line) for line in tail)
+    is_free_text = any(_RE_FREE_TEXT_OPTION.search(line) for line in recent_tail)
 
     if tab_header_idx is None and not has_footer and not is_review:
         return None
@@ -565,9 +576,10 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
             return None
         tabs = parsed_tabs
 
-    # Collect options below the tab header (multi-tab) or in the tail
-    # window (single-tab). For multi-tab, options live between the header
-    # and the next separator / next tab header / picker footer.
+    # Collect options below the tab header (multi-tab) or in the picker
+    # region above the footer (single-tab). For multi-tab, options live
+    # between the header and the next separator / next tab header /
+    # picker footer.
     if tab_header_idx is not None:
         end_idx = len(lines)
         for j in range(tab_header_idx + 1, len(lines)):
@@ -580,8 +592,41 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
                 end_idx = j
                 break
         options_region = lines[tab_header_idx + 1 : end_idx]
+    elif footer_idx is not None:
+        # Scan upward from the footer to find the contiguous numbered-options
+        # block. Walk backward until we hit a line that's clearly not part
+        # of the options block (anything other than a numbered option, a
+        # description continuation, a blank line, or a separator). This
+        # captures option 1 even when the question text is long enough to
+        # push it well above the last 25 lines.
+        start_idx = footer_idx
+        for j in range(footer_idx - 1, -1, -1):
+            line = lines[j]
+            stripped = line.strip()
+            if not stripped:
+                start_idx = j
+                continue
+            if _RE_NUMBERED_OPTION.match(line):
+                start_idx = j
+                continue
+            # Separator line (only ─ chars).
+            if all(c == "─" for c in stripped):
+                start_idx = j
+                continue
+            # Description continuation — non-empty indented text after at
+            # least one numbered option already collected. Allow up to
+            # ~5 such lines per option (heuristic — Claude Code rarely
+            # exceeds 3-line descriptions per option).
+            if line.startswith(("  ", "\t")) and any(
+                _RE_NUMBERED_OPTION.match(lines[k])
+                for k in range(j + 1, min(j + 8, footer_idx + 1))
+            ):
+                start_idx = j
+                continue
+            break
+        options_region = lines[start_idx : footer_idx + 1]
     else:
-        options_region = tail
+        options_region = recent_tail
 
     options = _parse_numbered_options(options_region)
 
