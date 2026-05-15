@@ -478,6 +478,37 @@ _PANE_SINGLE_TAB = (
 
 
 class TestParseAskUserQuestion:
+    def test_plain_picker_with_multiline_descriptions(self):
+        """Plain A/B/C question with multi-line indented descriptions between
+        options. Regression: the original parser broke on any unmatched line
+        once it had started collecting, so descriptions or pros/cons bullets
+        after the first option dropped every subsequent option from the form.
+        Also pins the off-screen-option-1 case: when the visible region is
+        scrolled past option 1, the parser must still keep options 2..N.
+        """
+        pane = (
+            "  2. B) Still no buttons — dig deeper\n"
+            "    I still only see plain text, no tappable options.\n"
+            "\n"
+            "      ✅ Honest signal that there's another layer to debug.\n"
+            "      ❌ Need to keep investigating; possibly the queue timing.\n"
+            "  3. C) Buttons appeared but tapping them did nothing\n"
+            "    The card landed with buttons but the dispatch broke.\n"
+            "\n"
+            "      ✅ Tells me detection works.\n"
+            "      ❌ Different layer of bug to chase.\n"
+            "  4. Type something.\n"
+            "─\n"
+            "  5. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert [opt.number for opt in form.options] == [2, 3, 4, 5]
+        assert form.options[0].label.startswith("B) Still no buttons")
+        assert form.options[1].label.startswith("C) Buttons appeared")
+
     def test_multitab_approach_returns_tabs_and_options(self):
         form = parse_ask_user_question(_PANE_MULTITAB_APPROACH)
         assert form is not None

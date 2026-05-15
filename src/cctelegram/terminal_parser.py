@@ -226,7 +226,7 @@ _RE_TAB_HEADER = re.compile(r"^\s*←\s+(?P<body>.*?)\s*→\s*$")
 # Matches a numbered option: ``❯ 1. Some option label`` or ``  2. Another``.
 # Cursor markers Claude Code uses: ❯, ›, ▶, * .
 _RE_NUMBERED_OPTION = re.compile(
-    r"^(?P<cursor>[❯›▶*]\s+|\s{2,})(?P<num>\d+)\.\s+(?P<label>.+?)\s*$"
+    r"^(?P<cursor>[❯›▶*)>]\s*|\s+)(?P<num>\d+)\.\s+(?P<label>.+?)\s*$"
 )
 
 # Matches the picker's "Enter to select / Tab / Esc" footer.
@@ -385,16 +385,18 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
         m = _RE_NUMBERED_OPTION.match(line)
         if m is None:
             if options:
-                # Allow a trailing blank or description line only if we
-                # haven't started collecting; once we start, the block must
-                # be contiguous.
                 stripped = line.strip()
                 if not stripped:
                     continue
-                if stripped.startswith(("·", "—", "-", "▸")):
-                    # description continuation for the previous option
-                    continue
-                break
+                # Picker footer ends the option block.
+                if _RE_PICKER_FOOTER.search(line) or _RE_TAB_HEADER.match(line):
+                    break
+                # Anything else (description text, separator runs, pros/cons
+                # bullets) is treated as continuation of the previous option
+                # and silently skipped. Earlier the loop broke on any
+                # non-numbered line, which dropped every option past the
+                # first when Claude Code rendered multi-line descriptions.
+                continue
             continue
         try:
             num = int(m.group("num"))
@@ -413,17 +415,22 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
                 number=num,
             )
         )
-    # Contiguity guard: trim the block to the prefix that runs 1..N without
-    # gaps. The picker doesn't skip numbers within a question, but trailing
-    # special rows like ``0. Dismiss`` (Claude Code's feedback survey) break
-    # the numeric run — those are dropped from the structured view so PR 2
-    # can render options 1..N cleanly. The keystroke fallback (Enter/digit
-    # keys) still reaches them.
+    # Contiguity guard: keep only the longest monotonic +1 prefix starting at
+    # whichever number the first option uses. The pane's visible region can
+    # scroll past option 1 (questions with long descriptions push earlier
+    # options off the top), so anchoring strictly at 1 dropped the entire
+    # block. Trailing special rows like ``0. Dismiss`` (Claude Code's feedback
+    # survey) still break the numeric run and get dropped from the structured
+    # view; the keystroke fallback (Enter/digit keys) still reaches them.
+    if not options or options[0].number is None:
+        return ()
     kept: list[AskOption] = []
-    for expected, opt in enumerate(options, start=1):
+    expected: int = options[0].number
+    for opt in options:
         if opt.number != expected:
             break
         kept.append(opt)
+        expected += 1
     return tuple(kept)
 
 

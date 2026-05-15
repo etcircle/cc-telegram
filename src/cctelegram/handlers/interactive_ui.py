@@ -648,14 +648,13 @@ async def handle_interactive_ui(
             TopicSendOutcome.MESSAGE_NOT_MODIFIED,
         ):
             _interactive_mode[ikey] = window_id
-            await attention.notify_waiting(
-                bot,
-                user_id=user_id,
-                thread_id=thread_id,
-                window_id=window_id,
-                prompt_text=text,
-                kind="interactive_ui",
-            )
+            # The interactive card edit landed in the topic. The separate
+            # "🔔 waiting for input" attention card is suppressed here: it
+            # was a duplicate of the same content, in the same topic, with
+            # a self-pointing link. Telegram's own notification on the
+            # edited card already covers the "ping the user" use case; the
+            # attention card is reserved for the topic-send-failed branch
+            # below where the user genuinely doesn't see the card.
             return True
         # Edit failed — fall through to fresh send while keeping the old id
         # so we can delete it after a new one lands.
@@ -732,14 +731,10 @@ async def handle_interactive_ui(
         return False
     _interactive_msgs[ikey] = sent.message_id
     _interactive_mode[ikey] = window_id
-    await attention.notify_waiting(
-        bot,
-        user_id=user_id,
-        thread_id=thread_id,
-        window_id=window_id,
-        prompt_text=text,
-        kind="interactive_ui",
-    )
+    # See note above: the interactive card landed in the topic, so the
+    # duplicate "🔔 waiting for input" attention card is suppressed. The
+    # send-failed branch still fires notify_waiting because that's the
+    # only signal the user gets when the topic-send couldn't deliver.
     # New message sent successfully — now safe to delete the old one
     if existing_msg_id:
         await topic_delete(
