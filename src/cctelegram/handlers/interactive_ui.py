@@ -185,11 +185,19 @@ class _MultiTabSession:
     One session per route. Mutually exclusive with ``_interactive_msgs[key]``
     — the first-time multi-tab render clears the single-card entry, and
     cleanup drops both maps atomically.
+
+    ``message_ids`` is a fixed-size list aligned with the questions
+    matrix: ``message_ids[i]`` is the Telegram message_id for tab ``i``,
+    or ``None`` when that tab's card failed to send (partial bundle).
+    PR 3.2 changed this from append-only to fixed-size to fix the
+    index-misalignment bug: if Q1's send failed and Q2's succeeded,
+    the append-only list put Q2's id at message_ids[0], and
+    ``edit_advance`` then targeted the wrong message.
     """
 
     window_id: str
     shape_digest: str            # sha1 over titles + ordered labels + counts
-    message_ids: list[int] = field(default_factory=list)
+    message_ids: list[int | None] = field(default_factory=list)
     current_tab_idx: int = 0
     # Incremented by cleanup. In-flight render/edit coroutines re-acquire
     # the lock, compare their captured ``generation_at_entry`` against the
@@ -855,6 +863,8 @@ async def _multi_tab_teardown(
     correct.
     """
     for msg_id in session.message_ids:
+        if msg_id is None:
+            continue  # PR 3.2: tabs that failed to post leave None slots
         try:
             await topic_delete(
                 bot,
@@ -944,10 +954,13 @@ async def _handle_multi_tab_ask(
             # — at most one of _interactive_msgs/_multi_tab_sessions is
             # set per route).
             teardown_single_msg_id = _interactive_msgs.pop(ikey, None)
+            # PR 3.2: pre-size message_ids to tab_count so indices align
+            # with the questions matrix (was: append-only, broke on
+            # partial bundles).
             session = _MultiTabSession(
                 window_id=window_id,
                 shape_digest=shape_digest,
-                message_ids=[],
+                message_ids=[None] * tab_count,
                 current_tab_idx=current_idx,
                 generation=0,
             )
@@ -960,7 +973,7 @@ async def _handle_multi_tab_ask(
             session = _MultiTabSession(
                 window_id=window_id,
                 shape_digest=shape_digest,
-                message_ids=[],
+                message_ids=[None] * tab_count,
                 current_tab_idx=current_idx,
                 # Bump generation so any in-flight edit on the old session
                 # rolls back its work.
@@ -1087,17 +1100,21 @@ async def _multi_tab_post_n(
             anchor = ReplyParameters(message_id=anchor_id)
     interactive_session_id = session_id_for_window(window_id)
 
-    # Partial-bundle policy (lessons from live testing 2026-05-15):
-    # ``topic_send`` can time out under Telegram backend latency, returning
-    # ``sent=None`` mid-bundle. We used to raise ``_RenderCancelled`` and
-    # tear down the whole bundle — but combined with the caller's
-    # ``has_interactive_surface`` cleanup chain, that produced "Q1 appears
-    # then vanishes" UX. Better: keep what we sent, log the gap, and
-    # return True so the caller doesn't tear down the partial state.
-    # Future re-renders against the same shape_digest will see message_ids
-    # shorter than tab_count and edit_advance's bounds check fails-soft.
-    # ``_RenderCancelled`` is still raised on the generation guard path —
-    # that one really does require rollback, since cleanup *did* fire.
+    # Partial-bundle policy (PR 3.2, revised after live testing exposed
+    # PR 3.1 regressions):
+    #
+    # The append-only message_ids list in PR 3.1 broke index alignment:
+    # if Q1's send failed and Q2's succeeded, message_ids became [Q2_id]
+    # and edit_advance treated index 0 as Q1, dispatching keystrokes to
+    # the wrong card. PR 3.2 makes message_ids fixed-size and writes
+    # by tab index, preserving alignment under partial bundles.
+    #
+    # The current-tab card is special: if its send fails, NO card has
+    # the pick keyboard and the user can't click anything. Tear down
+    # the session in that case so the next render starts clean. Other
+    # tabs' failures are non-fatal — the user can still click the
+    # current tab's button and proceed.
+    current_tab_failed = False
     try:
         for idx in range(tab_count):
             body = _render_multi_tab_card_body(form, idx, tab_count)
@@ -1138,31 +1155,51 @@ async def _multi_tab_post_n(
 
             sent, _outcome = await topic_send(bot, **send_kwargs)
             if sent is None:
+                if idx == current_idx:
+                    logger.warning(
+                        "Multi-tab CURRENT-TAB card send failed at idx=%d (user=%d window=%s); tearing down — no card has the keyboard",
+                        idx,
+                        user_id,
+                        window_id,
+                    )
+                    current_tab_failed = True
+                    raise _RenderCancelled()
                 logger.warning(
-                    "Multi-tab card send failed at idx=%d (user=%d window=%s); keeping partial bundle and continuing",
+                    "Multi-tab non-current card send failed at idx=%d (user=%d window=%s); leaving slot empty",
                     idx,
                     user_id,
                     window_id,
                 )
-                # Skip this index but don't tear down — try the rest of
-                # the cards. Worst case the user gets cards [0, 2, 3]
-                # with idx=1 missing, which is a degraded but functional
-                # UX (keystroke nav still works on the visible cards).
                 continue
 
             # Commit the message_id under the lock, with the generation
             # re-check. If cleanup bumped the generation between the
-            # send and this point, this id is an orphan.
+            # send and this point, this id is an orphan. Write by index
+            # — message_ids is pre-sized so this preserves alignment
+            # with the questions matrix.
             async with lock:
                 current = _multi_tab_sessions.get(ikey)
                 if current is None or current.generation != generation_at_entry:
                     orphans.append(sent.message_id)
                     raise _RenderCancelled()
-                current.message_ids.append(sent.message_id)
+                current.message_ids[idx] = sent.message_id
     except _RenderCancelled:
-        # Generation guard fired — cleanup ran while we were posting.
-        # Roll back any orphans (committed-then-stranded message_ids).
-        for msg_id in orphans:
+        # Generation guard fired OR current-tab failed. Roll back any
+        # orphans (committed-then-stranded message_ids from the slots
+        # we did write) AND any non-current cards we already posted in
+        # this bundle (they belong to a torn-down session).
+        all_to_delete = list(orphans)
+        async with lock:
+            current = _multi_tab_sessions.get(ikey)
+            if current is not None and current.generation == generation_at_entry:
+                # Collect what we did write before the failure.
+                for mid in current.message_ids:
+                    if mid is not None:
+                        all_to_delete.append(mid)
+                # Drop the session — caller should not see a half-built
+                # state as a live surface.
+                _multi_tab_sessions.pop(ikey, None)
+        for msg_id in all_to_delete:
             try:
                 await topic_delete(
                     bot,
@@ -1177,23 +1214,24 @@ async def _multi_tab_post_n(
                 logger.debug("Orphan rollback delete failed (benign): %s", exc)
         return False
 
-    # Return True even on partial bundles. The session state reflects what
-    # actually landed; ``has_interactive_surface`` correctly reports the
-    # partial session as live so cleanup on tool_result still walks it.
+    # Total failure (every send returned None somehow without raising)?
+    # Drop the empty session.
     async with lock:
         current = _multi_tab_sessions.get(ikey)
-        sent_count = len(current.message_ids) if current is not None else 0
-    if sent_count == 0:
-        # Total failure — no cards landed. Drop the empty session so the
-        # caller doesn't think a surface exists.
-        async with lock:
+        landed = (
+            sum(1 for m in current.message_ids if m is not None)
+            if current is not None
+            else 0
+        )
+        if landed == 0:
             existing_for_cleanup = _multi_tab_sessions.get(ikey)
             if (
                 existing_for_cleanup is not None
                 and existing_for_cleanup.generation == generation_at_entry
             ):
                 _multi_tab_sessions.pop(ikey, None)
-        return False
+            return False
+    _ = current_tab_failed  # reserved for diagnostic surfacing later
     return True
 
 
@@ -1219,7 +1257,10 @@ async def _multi_tab_edit_advance(
     ikey = (user_id, thread_id or 0)
     lock = _get_route_lock(user_id, thread_id)
 
-    # Snapshot the old current index under the lock.
+    # Snapshot the old current index under the lock. PR 3.2: message_ids
+    # is now a fixed-size list[int | None] aligned with the questions
+    # matrix; indices are stable, None means that tab's card failed to
+    # send during post_n.
     async with lock:
         session = _multi_tab_sessions.get(ikey)
         if session is None or session.generation != generation_at_entry:
@@ -1620,6 +1661,8 @@ async def clear_interactive_msg(
         )
 
     for msg_id in multi_msg_ids:
+        if msg_id is None:
+            continue  # PR 3.2: tabs that failed to post leave None slots
         try:
             await topic_delete(
                 bot,
