@@ -2888,15 +2888,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Window not found", show_alert=True)
             return
 
-        # Staleness check: re-capture the pane and re-parse before dispatching
+        # Staleness check: re-capture the pane and re-resolve before dispatching
         # any key. If the form has shifted under us (user navigated, skill
         # advanced, Claude Code redrew, /clear fired), the minted fingerprint
         # won't match and we MUST NOT send a digit — picking "1" on a new
         # form could submit the wrong answer.
-        from .terminal_parser import parse_ask_user_question
+        #
+        # PR 2: use ``resolve_ask_form`` with the same cached JSONL payload
+        # the render path saw (via ``resolve_ask_tool_input``). Without
+        # this, a multi-tab form rendered with the JSONL overlay would
+        # mint fingerprints the pane-only re-parse here could never match,
+        # bouncing every click to "Form changed, refreshing".
+        from .handlers.interactive_ui import resolve_ask_tool_input
+        from .terminal_parser import resolve_ask_form
 
         pane = await tmux_manager.capture_pane(w.window_id)
-        current_form = parse_ask_user_question(pane) if pane else None
+        cached_input = resolve_ask_tool_input(window_id)
+        current_form = resolve_ask_form(cached_input, pane) if pane else None
         if current_form is None or current_form.fingerprint() != entry.fingerprint:
             logger.info(
                 "Pick-token staleness reject: user=%d window=%s opt=%d "

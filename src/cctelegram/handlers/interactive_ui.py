@@ -29,6 +29,7 @@ from ..terminal_parser import (
     extract_interactive_content,
     is_interactive_ui,
     parse_ask_user_question,
+    resolve_ask_form,
 )
 from ..tmux_manager import tmux_manager
 from . import attention
@@ -88,6 +89,22 @@ def _resolve_ask_tool_input(window_id: str, explicit: dict | None) -> dict | Non
     """Pick the freshest tool_input available for an AskUserQuestion render."""
     if explicit is not None:
         return explicit
+    return _latest_ask_tool_input.get(window_id)
+
+
+# Public sibling-imported alias for use by ``bot.py`` callback handlers.
+# ``_resolve_ask_tool_input`` is module-internal by convention (underscore
+# prefix), but the pick-token callback at ``bot.py:2896`` needs the same
+# cache to achieve fingerprint parity between render and validate (FA4 in
+# the plan). Exposing it under a public name keeps the import boundary
+# honest.
+def resolve_ask_tool_input(window_id: str) -> dict | None:
+    """Return the cached AskUserQuestion ``tool_use.input`` for ``window_id``.
+
+    Used by the pick-token callback validator in ``bot.py`` to feed
+    ``resolve_ask_form`` the same JSONL payload the render path saw, so
+    the two paths produce byte-identical fingerprints.
+    """
     return _latest_ask_tool_input.get(window_id)
 
 
@@ -326,6 +343,58 @@ async def _notify_waiting_dm(
         logger.debug("Failed to send interactive waiting DM to %d: %s", user_id, e)
 
 
+# Per-option description cap. The plan (v5 §Card layout) sets 250 chars so
+# the worst-case 6-option × 6-tab body stays comfortably under 4096 even
+# with header / labels / footer. Truncation is hard with a trailing
+# ellipsis so the reader knows there's more.
+_DESCRIPTION_CHAR_CAP = 250
+
+# Hard cap on rendered card body. Matches the message_queue.py merge limit
+# so the renderer can never produce a body that the send layer would have
+# to split (we don't split interactive cards — splitting breaks the
+# message_ids list invariant the multi-tab state machine relies on).
+_CARD_BODY_CHAR_CAP = 3800
+
+
+def _truncate_description(description: str) -> str:
+    """Shorten a per-option description for inline display.
+
+    Hard cap at ``_DESCRIPTION_CHAR_CAP`` chars; collapse multi-line
+    descriptions to a single line so the cap is meaningful. Returns an
+    empty string for empty input so callers can skip the indent line.
+    """
+    if not description:
+        return ""
+    # Collapse internal newlines + runs of whitespace so the cap counts
+    # against visible characters, not layout noise.
+    flat = " ".join(description.split())
+    if len(flat) <= _DESCRIPTION_CHAR_CAP:
+        return flat
+    return flat[: _DESCRIPTION_CHAR_CAP - 1].rstrip() + "…"
+
+
+def _clip_card_body(body: str) -> str:
+    """Hard-clip rendered card body to ``_CARD_BODY_CHAR_CAP`` chars.
+
+    Defense in depth: ``_truncate_description`` keeps individual options
+    short, but a question with many options + very long question text
+    could still push the body over the cap. We clip on a line boundary
+    so the truncation doesn't land mid-sentence; final line marks the cut.
+    """
+    if len(body) <= _CARD_BODY_CHAR_CAP:
+        return body
+    # Reserve room for a "[…body truncated]" marker.
+    marker = "\n\n[…body truncated; use keystroke nav to scroll the terminal]"
+    budget = _CARD_BODY_CHAR_CAP - len(marker)
+    if budget <= 0:
+        return body[:_CARD_BODY_CHAR_CAP]
+    clipped = body[:budget]
+    cut = clipped.rfind("\n")
+    if cut > 0:
+        clipped = clipped[:cut]
+    return clipped + marker
+
+
 def _render_ask_user_question(form: AskUserQuestionForm) -> str:
     """Render a structured AskUserQuestion form into Telegram-friendly text.
 
@@ -363,7 +432,7 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
                 cursor = "❯ " if opt.cursor else "  "
                 rec = " (Recommended)" if opt.recommended else ""
                 lines.append(f"{cursor}{opt.number}. {opt.label}{rec}")
-        return "\n".join(lines).rstrip()
+        return _clip_card_body("\n".join(lines).rstrip())
 
     # Picker layout — tabs (if any) → question title → options
     if form.tabs:
@@ -387,12 +456,22 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
             cursor = "❯ " if opt.cursor else "  "
             rec = " (Recommended)" if opt.recommended else ""
             lines.append(f"{cursor}{opt.number}. {opt.label}{rec}")
+            # PR 2: inline per-option reasoning text from the JSONL payload
+            # when available. The pane parser doesn't populate
+            # ``description`` (it can't reliably attribute description
+            # lines to specific options), so this branch only fires for
+            # forms that came from ``resolve_ask_form`` with a JSONL
+            # overlay. Capped at 250 chars per option; collapses
+            # multi-line descriptions.
+            desc = _truncate_description(opt.description)
+            if desc:
+                lines.append(f"    {desc}")
         if form.is_free_text:
             lines.append("")
             lines.append("  (Type something — send a regular message to free-text)")
         lines.append("")
         lines.append("Enter to select · Tab/Arrow keys to navigate · Esc to cancel")
-        return "\n".join(lines).rstrip()
+        return _clip_card_body("\n".join(lines).rstrip())
 
     # No options extracted (mid-redraw, or a layout the parser only partially
     # recognized). Caller falls back to the raw pane excerpt — return an
@@ -652,19 +731,36 @@ async def handle_interactive_ui(
     text = content.content
     pick_rows: list[list[InlineKeyboardButton]] | None = None
     if content.name == "AskUserQuestion":
-        # Prefer the JSONL tool_use.input over pane scrape: it carries the
-        # full option list even when the question text scrolled option 1
-        # off the top of the visible pane. Fall back to the pane parser
-        # only when tool_input is absent or doesn't yield options.
+        # Unified resolver (PR 1) feeds both render and validate paths the
+        # same form. Combines JSONL tool_input (full option list with
+        # descriptions, plus the multi-question matrix) with pane state
+        # (cursor / free-text / review-screen flags + current-tab
+        # inference). On multi-tab forms the resolver tracks
+        # ``current_tab_inferred``; if False, PR 3 will gate pick buttons.
+        # For PR 2 the render path is still single-card only, so the flag
+        # is informational here — multi-question pick buttons stay
+        # disabled until PR 3 ships the multi-tab state machine.
         resolved_input = _resolve_ask_tool_input(window_id, tool_input)
-        form: AskUserQuestionForm | None = build_form_from_tool_input(resolved_input)
+        form: AskUserQuestionForm | None = resolve_ask_form(resolved_input, pane_text)
         if form is None:
-            form = parse_ask_user_question(pane_text)
+            # Belt-and-braces fallback. resolve_ask_form already tries
+            # pane parse internally; this only fires when both inputs
+            # are useless.
+            form = build_form_from_tool_input(resolved_input)
+            if form is None:
+                form = parse_ask_user_question(pane_text)
         if form is not None:
             structured = _render_ask_user_question(form)
             if structured:
                 text = structured
-            built = _build_pick_button_rows(user_id, thread_id, window_id, form)
+            # PR 2 invariant: for multi-tab forms we don't yet ship the
+            # state machine, so suppress pick buttons (the user would
+            # only see Q1 with no idea Q2..Qn exist). PR 3 lifts this.
+            # Single-question forms get pick buttons as before.
+            if len(form.questions) > 1:
+                built = []
+            else:
+                built = _build_pick_button_rows(user_id, thread_id, window_id, form)
             if built:
                 pick_rows = built
 

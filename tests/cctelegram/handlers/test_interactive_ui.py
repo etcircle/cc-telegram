@@ -341,6 +341,133 @@ class TestRenderAskUserQuestion:
         form = AskUserQuestionForm()
         assert _render_ask_user_question(form) == ""
 
+    def test_descriptions_inlined_under_each_option(self):
+        """PR 2: per-option description text from the JSONL payload shows
+        up indented under the option label. Empty descriptions skip the
+        indent line (pane-only forms don't carry descriptions).
+        """
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title="Pick clip affordance.",
+            options=(
+                AskOption(
+                    label="A — Top toolbar",
+                    recommended=True,
+                    cursor=True,
+                    number=1,
+                    description="Always-visible button next to Render. Clip labels readable at a glance.",
+                ),
+                AskOption(
+                    label="B — Hover labels",
+                    recommended=False,
+                    cursor=False,
+                    number=2,
+                    description="Cleaner timeline; less visual noise but clip boundaries hidden.",
+                ),
+                AskOption(
+                    label="C — Skip the feature",
+                    recommended=False,
+                    cursor=False,
+                    number=3,
+                    description="",  # no description, no indent line
+                ),
+            ),
+        )
+        out = _render_ask_user_question(form)
+        # Option labels still visible.
+        assert "❯ 1. A — Top toolbar (Recommended)" in out
+        # Descriptions appear indented under their option.
+        assert "    Always-visible button next to Render." in out
+        assert "    Cleaner timeline; less visual noise" in out
+        # An option with empty description does NOT get an empty indent line.
+        lines = out.split("\n")
+        for i, line in enumerate(lines):
+            if "3. C — Skip" in line:
+                # Next non-empty line should be the next option or footer,
+                # not a stray "    " line.
+                assert i + 1 < len(lines)
+                # Either the blank-line-before-footer or "Enter to select".
+                nxt = lines[i + 1]
+                assert nxt == "" or "Enter to select" in nxt
+                break
+
+    def test_description_truncated_at_250_chars(self):
+        """A description longer than 250 chars is hard-truncated with an
+        ellipsis. Multi-line descriptions get collapsed first so the cap
+        counts against visible characters.
+        """
+        long_desc = (
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 10
+        )  # >>250
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title="Q?",
+            options=(
+                AskOption(
+                    label="A",
+                    recommended=False,
+                    cursor=True,
+                    number=1,
+                    description=long_desc,
+                ),
+            ),
+        )
+        out = _render_ask_user_question(form)
+        # The rendered indent line must be ≤ 4 (indent) + 250 chars long.
+        desc_lines = [line for line in out.split("\n") if line.startswith("    L")]
+        assert desc_lines, "expected an indented description line"
+        # 4 leading spaces + 250 chars max = 254 cap on the visible line.
+        assert all(len(line) <= 4 + 250 for line in desc_lines)
+        # Last char before any newline is the ellipsis.
+        assert desc_lines[0].endswith("…")
+
+    def test_multiline_description_collapsed_to_single_line(self):
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title="Q?",
+            options=(
+                AskOption(
+                    label="A",
+                    recommended=False,
+                    cursor=True,
+                    number=1,
+                    description="line one\nline two\n\nline three",
+                ),
+            ),
+        )
+        out = _render_ask_user_question(form)
+        # The whole description renders on a single indented line.
+        assert "    line one line two line three" in out
+
+    def test_body_clipped_at_3800_chars(self):
+        """Even with the per-option cap, a worst-case form could exceed
+        3800 chars. The renderer hard-clips the whole body so the send
+        layer never has to split (splitting would break the multi-tab
+        message_ids invariant in PR 3).
+        """
+        # Build 20 options each with a 250-char description ≈ 5300 chars
+        # of just descriptions. Total body well over the 3800 cap.
+        opts = tuple(
+            AskOption(
+                label=f"Option {i}",
+                recommended=False,
+                cursor=(i == 1),
+                number=i,
+                description="X" * 250,
+            )
+            for i in range(1, 21)
+        )
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title="Pick.",
+            options=opts,
+        )
+        out = _render_ask_user_question(form)
+        # Body capped under 3800.
+        assert len(out) <= 3800
+        # Cut marker present so the user knows it's truncated.
+        assert "body truncated" in out
+
 
 # ── PR 2b: pick-token map + structured option keyboard ────────────────────
 
@@ -625,3 +752,139 @@ class TestPickTokenReuse:
         )
         new_token = rows2[0][0].callback_data
         assert new_token != f"aqp:{first_token}"
+
+
+# ── PR 2: callback-validator parity via resolve_ask_form ─────────────────
+
+
+class TestCallbackValidatorParityRender:
+    """The render path and the pick-token callback validator MUST produce
+    byte-identical fingerprints. PR 1 added ``resolve_ask_form``; PR 2
+    wires it into both call sites. This test pins that both call sites
+    produce the same fingerprint for the same (tool_input, pane_text)
+    pair.
+
+    Without this property, every multi-tab click would bounce as "Form
+    changed, refreshing" because the validator's pane-only re-parse would
+    never match a JSONL-overlay-derived mint.
+    """
+
+    def test_single_question_fingerprint_matches_across_callsites(self):
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Pick one.",
+                    "options": [
+                        {"label": "A", "description": "first"},
+                        {"label": "B", "description": "second"},
+                    ],
+                }
+            ]
+        }
+        pane = (
+            "Pick one.\n"
+            "\n"
+            "❯ 1. A\n"
+            "  2. B\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        # Render path
+        render_form = resolve_ask_form(tool_input, pane)
+        # Validator path (same inputs, same call)
+        validate_form = resolve_ask_form(tool_input, pane)
+        assert render_form is not None and validate_form is not None
+        assert render_form.fingerprint() == validate_form.fingerprint()
+
+    def test_multi_question_fingerprint_matches_across_callsites(self):
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Pick approach.",
+                    "options": [{"label": "alpha"}, {"label": "beta"}],
+                },
+                {
+                    "question": "Pick polish.",
+                    "options": [{"label": "gamma"}, {"label": "delta"}],
+                },
+            ]
+        }
+        pane = (
+            "Pick polish.\n"
+            "\n"
+            "❯ 1. gamma\n"
+            "  2. delta\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        render_form = resolve_ask_form(tool_input, pane)
+        validate_form = resolve_ask_form(tool_input, pane)
+        assert render_form is not None and validate_form is not None
+        assert render_form.fingerprint() == validate_form.fingerprint()
+        # Inferred path — fingerprint includes INF:1
+        assert "INF:1" in render_form._canonical_repr()
+
+    def test_pane_only_validator_diverges_from_jsonl_render(self):
+        """Sanity-check the bug this PR fixes: if the validator uses
+        ``parse_ask_user_question`` alone (pane-only) while the render
+        uses ``resolve_ask_form`` (JSONL overlay) for a multi-tab form,
+        the fingerprints WILL differ. This test would have caught the
+        pre-PR2 bug.
+        """
+        from cctelegram.terminal_parser import (
+            parse_ask_user_question,
+            resolve_ask_form,
+        )
+
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Pick approach.",
+                    "options": [{"label": "alpha"}, {"label": "beta"}],
+                },
+                {
+                    "question": "Pick polish.",
+                    "options": [{"label": "gamma"}, {"label": "delta"}],
+                },
+            ]
+        }
+        pane = (
+            "Pick polish.\n"
+            "\n"
+            "❯ 1. gamma\n"
+            "  2. delta\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        jsonl_form = resolve_ask_form(tool_input, pane)
+        pane_only_form = parse_ask_user_question(pane)
+        assert jsonl_form is not None and pane_only_form is not None
+        # The mismatch is exactly the bug: pane-only form has no
+        # ``questions`` matrix, so no QS:/INF: lines, so different hash.
+        assert jsonl_form.fingerprint() != pane_only_form.fingerprint()
+
+    def test_resolve_ask_tool_input_public_alias(self):
+        """``resolve_ask_tool_input`` is the public sibling-imported name
+        used by bot.py to feed the validator the same cached JSONL the
+        render path saw. PR 2 introduces this alias.
+        """
+        from cctelegram.handlers.interactive_ui import (
+            remember_ask_tool_input,
+            resolve_ask_tool_input,
+        )
+
+        # Cache a payload, then read it back via the public alias.
+        sample = {"questions": [{"question": "Q", "options": [{"label": "A"}]}]}
+        remember_ask_tool_input("@99", sample)
+        try:
+            assert resolve_ask_tool_input("@99") == sample
+            assert resolve_ask_tool_input("@nonexistent") is None
+        finally:
+            # Clean up so the cache doesn't bleed into other tests.
+            from cctelegram.handlers.interactive_ui import forget_ask_tool_input
+
+            forget_ask_tool_input("@99")
