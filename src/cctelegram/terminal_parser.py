@@ -21,9 +21,12 @@ parse_status_line(), strip_pane_chrome(), extract_bash_output().
 """
 
 import hashlib
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -1017,6 +1020,26 @@ def resolve_ask_form(
         if pane_form is not None and inferred
         else current_q.options
     )
+    # Diagnostic: when inference fails on a multi-question form, the FA5+
+    # guard in ``_build_pick_button_rows`` suppresses pick buttons and the
+    # user is left with keystroke nav only. Log the inputs so future repros
+    # tell us whether (a) pane_form was None, (b) options weren't extracted,
+    # (c) title didn't match, or (d) strong-match demoted. Only log on the
+    # failure path to keep noise low; the success path is the common case.
+    if not inferred:
+        pane_title = (
+            (pane_form.current_question_title or "<none>") if pane_form else "<no pane>"
+        )
+        pane_opts = len(pane_form.options) if pane_form else -1
+        jsonl_titles = [q.title for q in jsonl_form.questions]
+        logger.info(
+            "resolve_ask_form multi-q inference FAILED: questions=%d pane_opts=%d "
+            "pane_title=%r jsonl_titles=%r",
+            len(jsonl_form.questions),
+            pane_opts,
+            pane_title[:80] if isinstance(pane_title, str) else pane_title,
+            [t[:80] for t in jsonl_titles],
+        )
     return AskUserQuestionForm(
         tabs=pane_form.tabs if pane_form is not None else (),
         current_question_title=current_q.title or None,
