@@ -253,6 +253,26 @@ class AskOption:
     recommended: bool  # True if "(Recommended)" suffix present
     cursor: bool  # True if this option is the current selection (❯ / › prefix)
     number: int | None  # 1-9 numeric shortcut, or None when not rendered
+    # Per-option reasoning text from the JSONL tool_use.input. Empty for
+    # pane-only parses (the pane scrape doesn't reliably attribute description
+    # lines to specific options). Used by the renderer to inline reasoning
+    # under each label. Excluded from the fingerprint canonical (descriptions
+    # can vary cosmetically across redraws and shouldn't invalidate tokens).
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class AskQuestion:
+    """One question inside a multi-question AskUserQuestion form.
+
+    Mirrors the JSONL ``tool_use.input.questions[i]`` shape. ``options`` here
+    is the full ordered list from the structured payload — independent of
+    pane visibility.
+    """
+
+    title: str  # the human-readable question text (``question`` field in JSONL)
+    header: str  # short label used for tab cells (``header`` field in JSONL)
+    options: tuple[AskOption, ...]
 
 
 @dataclass(frozen=True)
@@ -263,6 +283,25 @@ class AskTab:
     answered: bool  # ☒ filled (question has an answer)
     is_submit: bool  # ✔ marker — the synthetic "Submit" cell
     is_current: bool  # the tab the user is currently viewing
+
+
+def _questions_digest(questions: tuple["AskQuestion", ...]) -> str:
+    """Stable digest over the multi-question matrix for the fingerprint.
+
+    Covers question titles + per-question ordered option labels + option
+    counts. A label rename, an option reorder, or a count change all flip
+    the digest → ``handle_interactive_ui`` tears down stale cards and
+    re-renders. Descriptions are excluded (cosmetic-only redraws shouldn't
+    invalidate live tokens). Uses ``\\x1f`` (unit separator) as a delimiter
+    that cannot appear in JSONL-derived text — naive ``"|".join`` would
+    collide on labels containing ``|``.
+    """
+    parts: list[str] = []
+    for q in questions:
+        labels = "\x1f".join(o.label for o in q.options)
+        parts.append(f"{q.title}\x1e{len(q.options)}\x1e{labels}")
+    payload = "\x1d".join(parts)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
 @dataclass(frozen=True)
@@ -290,6 +329,20 @@ class AskUserQuestionForm:
     is_review_screen: bool = False
     is_free_text: bool = False
     pane_excerpt: str = ""
+    # Multi-question matrix from the JSONL ``tool_use.input.questions`` list.
+    # Empty for single-question forms (the existing ``options`` / ``current_question_title``
+    # fields carry the same data and the renderer / fingerprint stay on the
+    # single-tab path). Populated by ``resolve_ask_form`` when JSONL carries
+    # ``len(questions) > 1``.
+    questions: tuple[AskQuestion, ...] = ()
+    # True when ``current_tab_idx`` was successfully matched from pane content
+    # against the JSONL questions matrix. False means the resolver fell through
+    # to ``current_tab_idx = 0`` because neither title-match nor option-overlap
+    # could pin a tab — typically a corrupt or scrolled-back pane. When False,
+    # the renderer MUST NOT mint option-pick buttons (FA5+ safety rule): the
+    # pane parse and JSONL render share the same defaulted state, fingerprint
+    # parity would pass, and dispatching a digit could answer the wrong tab.
+    current_tab_inferred: bool = True
     # Source-of-truth fields used in fingerprinting are above this line.
     # Anything appended below MUST be excluded from ``_canonical_repr`` so
     # adding diagnostic state doesn't break callback tokens minted by
@@ -303,6 +356,13 @@ class AskUserQuestionForm:
         redraw) and ``_meta`` (diagnostic). Order is fixed; if you add a
         field that should influence callback freshness, append a new line
         here — don't reorder existing ones.
+
+        Single-question forms (``len(questions) <= 1``) produce the exact
+        5-line canonical that pre-multi-tab code did, so callback tokens
+        minted against single-question forms keep validating across the
+        deploy that introduces ``questions`` / ``current_tab_inferred``.
+        The ``QS:`` and ``INF:`` lines only appear for multi-tab forms,
+        where there is no live single-question token to invalidate.
         """
         tabs_str = "|".join(
             f"{t.label}:{'A' if t.answered else 'E'}"
@@ -316,15 +376,17 @@ class AskUserQuestionForm:
             f":{'C' if o.cursor else '_'}"
             for o in self.options
         )
-        return "\n".join(
-            [
-                f"TABS:{tabs_str}",
-                f"Q:{self.current_question_title or ''}",
-                f"OPTS:{opts_str}",
-                f"RVW:{'1' if self.is_review_screen else '0'}",
-                f"FT:{'1' if self.is_free_text else '0'}",
-            ]
-        )
+        lines = [
+            f"TABS:{tabs_str}",
+            f"Q:{self.current_question_title or ''}",
+            f"OPTS:{opts_str}",
+            f"RVW:{'1' if self.is_review_screen else '0'}",
+            f"FT:{'1' if self.is_free_text else '0'}",
+        ]
+        if len(self.questions) > 1:
+            lines.append(f"QS:{_questions_digest(self.questions)}")
+            lines.append(f"INF:{'1' if self.current_tab_inferred else '0'}")
+        return "\n".join(lines)
 
     def fingerprint(self) -> str:
         """Stable 16-char hex digest over the structured form state.
@@ -435,6 +497,45 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
     return tuple(kept)
 
 
+def _parse_question_options(options_input: Any) -> tuple[AskOption, ...]:
+    """Build a tuple of ``AskOption`` from one JSONL ``question.options`` list.
+
+    Skips entries that aren't strings or dicts, and drops entries whose label
+    is empty. The returned tuple preserves source order; ``number`` is the
+    1-based index. ``description`` carries the per-option reasoning text
+    when the JSONL payload provides it; ``""`` otherwise.
+    """
+    if not isinstance(options_input, list):
+        return ()
+    options: list[AskOption] = []
+    for idx, opt in enumerate(options_input, start=1):
+        if isinstance(opt, str):
+            label, description = opt, ""
+        elif isinstance(opt, dict):
+            raw_label = opt.get("label")
+            label = raw_label if isinstance(raw_label, str) else ""
+            raw_desc = opt.get("description")
+            description = raw_desc if isinstance(raw_desc, str) else ""
+        else:
+            continue
+        label = label.strip()
+        if not label:
+            continue
+        recommended = bool(_RE_RECOMMENDED.search(label))
+        if recommended:
+            label = _RE_RECOMMENDED.sub("", label).rstrip()
+        options.append(
+            AskOption(
+                label=label,
+                recommended=recommended,
+                cursor=False,
+                number=idx,
+                description=description.strip(),
+            )
+        )
+    return tuple(options)
+
+
 def build_form_from_tool_input(
     tool_input: dict[str, Any] | None,
 ) -> AskUserQuestionForm | None:
@@ -455,9 +556,16 @@ def build_form_from_tool_input(
         {
           "questions": [
             {"question": "...", "header": "...", "multiSelect": false,
-             "options": [{"label": "...", "description": "..."}, ...]}
+             "options": [{"label": "...", "description": "..."}, ...]},
+            ...
           ]
         }
+
+    Multi-question forms populate ``form.questions`` with the full matrix.
+    The legacy single-question fields (``current_question_title``, ``options``)
+    mirror ``questions[0]`` so the existing renderer + fingerprint paths
+    keep working without conditionals at every call site — ``resolve_ask_form``
+    overlays the correct current-tab focus on top for multi-question forms.
 
     The picker UI also appends a "Type something" / "Chat about this" pair
     at the bottom — those are picker-internal and not part of the tool_use
@@ -466,51 +574,49 @@ def build_form_from_tool_input(
     """
     if not isinstance(tool_input, dict):
         return None
-    questions = tool_input.get("questions")
-    if not isinstance(questions, list) or not questions:
-        return None
-    q = questions[0]
-    if not isinstance(q, dict):
-        return None
-    title = q.get("question") or q.get("header")
-    options_input = q.get("options")
-    if not isinstance(options_input, list):
+    questions_raw = tool_input.get("questions")
+    if not isinstance(questions_raw, list) or not questions_raw:
         return None
 
-    options: list[AskOption] = []
-    for idx, opt in enumerate(options_input, start=1):
-        if isinstance(opt, str):
-            label = opt
-        elif isinstance(opt, dict):
-            raw_label = opt.get("label")
-            label = raw_label if isinstance(raw_label, str) else ""
-        else:
+    parsed_questions: list[AskQuestion] = []
+    for q in questions_raw:
+        if not isinstance(q, dict):
             continue
-        label = label.strip()
-        if not label:
+        title = q.get("question") or q.get("header") or ""
+        header = q.get("header") or ""
+        options = _parse_question_options(q.get("options"))
+        if not options:
+            # A question without parseable options is dropped — same as v1
+            # behaviour for the single-question case. The render still
+            # surfaces the other tabs; an empty tab would just produce a
+            # body with no actionable options.
             continue
-        recommended = bool(_RE_RECOMMENDED.search(label))
-        if recommended:
-            label = _RE_RECOMMENDED.sub("", label).rstrip()
-        options.append(
-            AskOption(
-                label=label,
-                recommended=recommended,
-                cursor=False,
-                number=idx,
+        parsed_questions.append(
+            AskQuestion(
+                title=title.strip() if isinstance(title, str) else "",
+                header=header.strip() if isinstance(header, str) else "",
+                options=options,
             )
         )
 
-    if not options:
+    if not parsed_questions:
         return None
 
+    first = parsed_questions[0]
     return AskUserQuestionForm(
         tabs=(),
-        current_question_title=str(title).strip() if isinstance(title, str) else None,
-        options=tuple(options),
+        current_question_title=first.title or None,
+        options=first.options,
         is_review_screen=False,
         is_free_text=False,
         pane_excerpt="",
+        questions=tuple(parsed_questions),
+        # No pane context here — defer to ``resolve_ask_form`` to decide
+        # whether the current tab can be inferred. When this helper is
+        # called in isolation (tests, legacy single-question callers),
+        # default to True for back-compat with the single-question render
+        # path (which never gates on this flag).
+        current_tab_inferred=True,
     )
 
 
@@ -664,6 +770,176 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
         is_review_screen=is_review,
         is_free_text=is_free_text,
         pane_excerpt=pane_excerpt,
+    )
+
+
+def _infer_current_tab_idx(
+    questions: tuple[AskQuestion, ...],
+    pane_form: AskUserQuestionForm | None,
+) -> tuple[int, bool]:
+    """Match pane-visible content against the JSONL questions matrix.
+
+    Returns ``(idx, inferred)``. ``inferred`` is True when at least one
+    matcher pinned a single tab; False when every matcher tied or no signal
+    was available, in which case ``idx`` defaults to 0 and the caller must
+    suppress option-pick buttons (FA5+ safety: dispatching a digit against a
+    defaulted tab can answer the wrong tab in the live TUI).
+
+    Match order:
+      1. Primary — exact title match (pane's ``current_question_title`` ==
+         a question's ``title`` OR ``header``). Falls through on ambiguity
+         (two questions share the same title) or on truncated/wrapped pane
+         titles.
+      2. Secondary — option-label overlap. Score each question by how many
+         of its option labels appear in the pane form's options. Unique
+         winner wins; tie → fall through.
+      3. Fallback — return ``(0, False)``.
+    """
+    if pane_form is None or not questions:
+        return 0, False
+
+    # Primary: exact title match.
+    pane_title = (pane_form.current_question_title or "").strip()
+    if pane_title:
+        title_matches: list[int] = []
+        for i, q in enumerate(questions):
+            if pane_title == q.title.strip() or pane_title == q.header.strip():
+                title_matches.append(i)
+        if len(title_matches) == 1:
+            return title_matches[0], True
+
+    # Secondary: option-label overlap. The pane carries the visible labels
+    # for the current tab only; whichever question has the most labels in
+    # the pane form's options is the active one.
+    pane_labels = {o.label for o in pane_form.options if o.label}
+    if pane_labels:
+        scored: list[tuple[int, int]] = []
+        for i, q in enumerate(questions):
+            q_labels = {o.label for o in q.options if o.label}
+            scored.append((i, len(pane_labels & q_labels)))
+        # Drop zero scores so a pane with no overlap with any question
+        # doesn't accidentally pick idx 0 as the "winner".
+        scored = [(i, s) for (i, s) in scored if s > 0]
+        if scored:
+            scored.sort(key=lambda pair: pair[1], reverse=True)
+            top_score = scored[0][1]
+            top = [i for (i, s) in scored if s == top_score]
+            if len(top) == 1:
+                return top[0], True
+
+    return 0, False
+
+
+def resolve_ask_form(
+    tool_input: dict[str, Any] | None,
+    pane_text: str,
+) -> AskUserQuestionForm | None:
+    """Unified AskUserQuestion form resolution.
+
+    Used by both the render path (``handle_interactive_ui``) and the
+    pick-token callback validator. Returning byte-identical forms from
+    both call sites is what makes the fingerprint staleness check sound
+    for multi-tab forms — if render uses the JSONL overlay but validate
+    re-parses only the pane, fingerprints will never match on multi-tab.
+
+    Inputs:
+      * ``tool_input``: JSONL ``tool_use.input`` dict, or None when the
+        cache has been evicted (post-restart, post-tool_result).
+      * ``pane_text``: live tmux pane capture.
+
+    Output shapes:
+
+    1. Single-question JSONL: returns the legacy single-tab form (same
+       canonical_repr as today). Pane is consulted only for cursor /
+       free-text / review-screen flags.
+    2. Multi-question JSONL + pane parses: ``questions`` matrix populated
+       from JSONL; ``current_question_title`` + ``options`` overlay the
+       matched tab; ``current_tab_inferred`` reflects whether matching
+       succeeded.
+    3. Multi-question JSONL + pane fails: ``current_tab_idx = 0`` and
+       ``current_tab_inferred = False`` — the renderer MUST NOT mint pick
+       buttons under this state.
+    4. JSONL missing: fall back to ``parse_ask_user_question(pane_text)``
+       — preserves the pane-only path for sessions where the JSONL cache
+       was lost.
+    5. Both missing: returns None.
+    """
+    pane_form = parse_ask_user_question(pane_text) if pane_text else None
+
+    jsonl_form = build_form_from_tool_input(tool_input)
+    if jsonl_form is None:
+        # No JSONL — pure pane fallback.
+        return pane_form
+
+    if len(jsonl_form.questions) <= 1:
+        # Single-question: keep the JSONL-derived shape but graft live pane
+        # state (cursor on the right option, free-text / review-screen
+        # flags). Without the pane overlay the form would always claim
+        # cursor on option 1, breaking the existing single-tab behaviour.
+        if pane_form is not None:
+            return AskUserQuestionForm(
+                tabs=jsonl_form.tabs,
+                current_question_title=jsonl_form.current_question_title,
+                options=_overlay_cursor(jsonl_form.options, pane_form.options),
+                is_review_screen=pane_form.is_review_screen,
+                is_free_text=pane_form.is_free_text,
+                pane_excerpt=pane_form.pane_excerpt,
+                questions=jsonl_form.questions,
+                current_tab_inferred=True,
+            )
+        return jsonl_form
+
+    # Multi-question: infer the current tab from pane content.
+    current_idx, inferred = _infer_current_tab_idx(jsonl_form.questions, pane_form)
+    current_q = jsonl_form.questions[current_idx]
+    # Overlay the live cursor onto the chosen tab's options when available.
+    options = (
+        _overlay_cursor(current_q.options, pane_form.options)
+        if pane_form is not None
+        else current_q.options
+    )
+    return AskUserQuestionForm(
+        tabs=pane_form.tabs if pane_form is not None else (),
+        current_question_title=current_q.title or None,
+        options=options,
+        is_review_screen=pane_form.is_review_screen if pane_form is not None else False,
+        is_free_text=pane_form.is_free_text if pane_form is not None else False,
+        pane_excerpt=pane_form.pane_excerpt if pane_form is not None else "",
+        questions=jsonl_form.questions,
+        current_tab_inferred=inferred,
+    )
+
+
+def _overlay_cursor(
+    jsonl_options: tuple[AskOption, ...],
+    pane_options: tuple[AskOption, ...],
+) -> tuple[AskOption, ...]:
+    """Apply the pane's cursor signal to the JSONL options by index.
+
+    The JSONL payload doesn't carry cursor state; the pane parse does.
+    When the pane has options at the same numeric positions, copy the
+    cursor flag onto the JSONL option so the renderer can highlight the
+    selected row. Labels stay from JSONL (authoritative for order /
+    spelling); cursor flips per pane.
+    """
+    if not pane_options:
+        return jsonl_options
+    cursor_at: int | None = None
+    for opt in pane_options:
+        if opt.cursor and opt.number is not None:
+            cursor_at = opt.number
+            break
+    if cursor_at is None:
+        return jsonl_options
+    return tuple(
+        AskOption(
+            label=o.label,
+            recommended=o.recommended,
+            cursor=(o.number == cursor_at),
+            number=o.number,
+            description=o.description,
+        )
+        for o in jsonl_options
     )
 
 

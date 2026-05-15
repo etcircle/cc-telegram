@@ -668,3 +668,373 @@ class TestParseAskUserQuestion:
         # them later gains a diagnostic note.
         form2 = AskUserQuestionForm(tabs=(tab,), options=(opt,))
         assert form == form2
+
+
+# ── PR 1 (multi-tab resolver + INF/QS fingerprint gates) ────────────────
+
+
+from cctelegram.terminal_parser import (  # noqa: E402
+    AskQuestion,
+    _questions_digest,
+    build_form_from_tool_input,
+    resolve_ask_form,
+)
+
+
+# Frozen single-question form used for the byte-identical fingerprint
+# golden. If you change ``_canonical_repr`` in a way that affects single-
+# question canonical output, this test FAILS — that's the safety net.
+# The hash is computed from the canonical_repr produced before the multi-
+# tab fields existed; recomputing it requires conscious approval (and a
+# matching update to the comment in ``_canonical_repr``).
+_SINGLE_QUESTION_GOLDEN_FORM = AskUserQuestionForm(
+    tabs=(),
+    current_question_title="Pick one.",
+    options=(
+        AskOption(label="A) First", recommended=False, cursor=True, number=1),
+        AskOption(label="B) Second", recommended=False, cursor=False, number=2),
+        AskOption(label="C) Third", recommended=True, cursor=False, number=3),
+    ),
+    is_review_screen=False,
+    is_free_text=False,
+    pane_excerpt="",
+)
+
+
+class TestSingleQuestionFingerprintGolden:
+    """Lock down the single-question canonical fingerprint.
+
+    The plan (FA3) commits to byte-identical canonical_repr output for
+    single-question forms across the multi-tab rollout. If anyone changes
+    canonical line set or order without bumping the golden hash, this
+    test fires loudly.
+    """
+
+    def test_canonical_repr_lines_unchanged(self):
+        # Single-question form produces exactly 5 lines: TABS / Q / OPTS /
+        # RVW / FT. No QS:, no INF:. Anything else means the multi-tab
+        # gates fired on a single-question form — bug.
+        repr_str = _SINGLE_QUESTION_GOLDEN_FORM._canonical_repr()
+        lines = repr_str.split("\n")
+        assert len(lines) == 5
+        assert lines[0].startswith("TABS:")
+        assert lines[1].startswith("Q:")
+        assert lines[2].startswith("OPTS:")
+        assert lines[3].startswith("RVW:")
+        assert lines[4].startswith("FT:")
+        assert not any(line.startswith("QS:") for line in lines)
+        assert not any(line.startswith("INF:") for line in lines)
+
+    def test_single_question_fingerprint_golden(self):
+        # Pinned SHA-1 of the canonical above. Update this constant ONLY
+        # if you intentionally changed single-question canonical output
+        # AND you've considered the rolling-deploy impact on live tokens.
+        expected = "6651ea1b8174f879"
+        assert _SINGLE_QUESTION_GOLDEN_FORM.fingerprint() == expected
+
+
+class TestMultiTabFingerprintGates:
+    """QS: and INF: lines must appear ONLY for multi-tab forms."""
+
+    def _two_q_form(self, inferred: bool = True) -> AskUserQuestionForm:
+        q1 = AskQuestion(
+            title="Q1?",
+            header="Approach",
+            options=(
+                AskOption(label="A", recommended=False, cursor=False, number=1),
+                AskOption(label="B", recommended=False, cursor=False, number=2),
+            ),
+        )
+        q2 = AskQuestion(
+            title="Q2?",
+            header="Polish",
+            options=(
+                AskOption(label="X", recommended=False, cursor=False, number=1),
+                AskOption(label="Y", recommended=False, cursor=False, number=2),
+            ),
+        )
+        return AskUserQuestionForm(
+            tabs=(),
+            current_question_title="Q1?",
+            options=q1.options,
+            questions=(q1, q2),
+            current_tab_inferred=inferred,
+        )
+
+    def test_qs_and_inf_lines_present_for_multi_tab(self):
+        form = self._two_q_form(inferred=True)
+        lines = form._canonical_repr().split("\n")
+        assert any(line.startswith("QS:") for line in lines)
+        assert any(line == "INF:1" for line in lines)
+
+    def test_inferred_false_changes_fingerprint(self):
+        a = self._two_q_form(inferred=True)
+        b = self._two_q_form(inferred=False)
+        assert a.fingerprint() != b.fingerprint()
+        b_lines = b._canonical_repr().split("\n")
+        assert any(line == "INF:0" for line in b_lines)
+
+    def test_qs_digest_changes_on_label_rename(self):
+        a = self._two_q_form()
+        # Same titles + counts, different label — digest must differ so a
+        # stale card gets torn down on re-render.
+        q1_renamed = AskQuestion(
+            title="Q1?",
+            header="Approach",
+            options=(
+                AskOption(label="A renamed", recommended=False, cursor=False, number=1),
+                AskOption(label="B", recommended=False, cursor=False, number=2),
+            ),
+        )
+        b = AskUserQuestionForm(
+            tabs=a.tabs,
+            current_question_title=a.current_question_title,
+            options=a.options,
+            questions=(q1_renamed, a.questions[1]),
+        )
+        assert a.fingerprint() != b.fingerprint()
+
+    def test_qs_digest_handles_pipe_in_label(self):
+        # Naive ``"|".join(labels)`` would collide on labels containing
+        # ``|``. The digest must use a separator that can't appear in
+        # JSONL-derived text.
+        q_pipe = AskQuestion(
+            title="Q?",
+            header="H",
+            options=(
+                AskOption(label="A|B", recommended=False, cursor=False, number=1),
+                AskOption(label="C", recommended=False, cursor=False, number=2),
+            ),
+        )
+        q_split = AskQuestion(
+            title="Q?",
+            header="H",
+            options=(
+                AskOption(label="A", recommended=False, cursor=False, number=1),
+                AskOption(label="B|C", recommended=False, cursor=False, number=2),
+            ),
+        )
+        # These two have the same naive ``"A|B|C"`` flat string but
+        # different option boundaries — they MUST hash differently.
+        d1 = _questions_digest((q_pipe, q_pipe))
+        d2 = _questions_digest((q_split, q_split))
+        assert d1 != d2
+
+
+class TestBuildFormFromToolInputMultiQuestion:
+    """``build_form_from_tool_input`` walks all questions and captures descriptions."""
+
+    def test_two_questions_populated(self):
+        form = build_form_from_tool_input(
+            {
+                "questions": [
+                    {
+                        "question": "Pick approach.",
+                        "header": "Approach",
+                        "options": [
+                            {"label": "A", "description": "first option"},
+                            {"label": "B", "description": "second option"},
+                        ],
+                    },
+                    {
+                        "question": "Pick polish.",
+                        "header": "Polish",
+                        "options": [
+                            {"label": "X", "description": "xdesc"},
+                            {"label": "Y", "description": "ydesc"},
+                        ],
+                    },
+                ]
+            }
+        )
+        assert form is not None
+        assert len(form.questions) == 2
+        assert form.questions[0].title == "Pick approach."
+        assert form.questions[0].header == "Approach"
+        assert form.questions[0].options[0].description == "first option"
+        assert form.questions[1].options[1].label == "Y"
+        # Legacy fields mirror Q1 so existing single-tab consumers keep
+        # working without conditionals.
+        assert form.current_question_title == "Pick approach."
+        assert [o.label for o in form.options] == ["A", "B"]
+
+    def test_description_captured_single_question(self):
+        form = build_form_from_tool_input(
+            {
+                "questions": [
+                    {
+                        "question": "Pick one.",
+                        "options": [
+                            {"label": "A", "description": "first"},
+                            {"label": "B (Recommended)", "description": "second"},
+                        ],
+                    }
+                ]
+            }
+        )
+        assert form is not None
+        assert form.options[0].description == "first"
+        assert form.options[1].description == "second"
+        # Recommended suffix still stripped from label as before.
+        assert form.options[1].label == "B"
+        assert form.options[1].recommended is True
+
+
+class TestResolveAskForm:
+    """``resolve_ask_form`` is the unified resolver for render + validate paths.
+
+    Behaviour matrix mirrors §Resolver in
+    docs/plans/2026-05-15-askuserquestion-multi-tab-cards.md.
+    """
+
+    def _multi_q_input(self) -> dict:
+        return {
+            "questions": [
+                {
+                    "question": "Pick approach.",
+                    "header": "Approach",
+                    "options": [
+                        {"label": "A — option A label", "description": "reason A"},
+                        {"label": "B — option B label", "description": "reason B"},
+                    ],
+                },
+                {
+                    "question": "Pick polish.",
+                    "header": "Polish",
+                    "options": [
+                        {"label": "X — option X label", "description": "reason X"},
+                        {"label": "Y — option Y label", "description": "reason Y"},
+                    ],
+                },
+            ]
+        }
+
+    def test_returns_none_when_neither_source(self):
+        assert resolve_ask_form(None, "") is None
+
+    def test_single_question_jsonl_no_pane(self):
+        # Single-question JSONL + no pane → JSONL form, current_tab_inferred=True,
+        # no QS/INF in canonical.
+        form = resolve_ask_form(
+            {
+                "questions": [
+                    {
+                        "question": "Pick one.",
+                        "options": [{"label": "A"}, {"label": "B"}],
+                    }
+                ]
+            },
+            "",
+        )
+        assert form is not None
+        assert len(form.questions) == 1
+        # Canonical stays single-tab shape (5 lines).
+        assert len(form._canonical_repr().split("\n")) == 5
+
+    def test_multi_question_with_matching_pane_infers_current(self):
+        # Pane shows Q2's title + Q2's options → resolver picks idx 1.
+        pane = (
+            "Pick polish.\n"
+            "\n"
+            "❯ 1. X — option X label\n"
+            "  2. Y — option Y label\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(self._multi_q_input(), pane)
+        assert form is not None
+        assert form.current_tab_inferred is True
+        assert form.current_question_title == "Pick polish."
+        # The current tab's options are surfaced; cursor overlaid from pane.
+        assert form.options[0].label == "X — option X label"
+        assert form.options[0].cursor is True
+
+    def test_multi_question_corrupt_pane_defaults_to_zero(self):
+        # Pane has no recognizable picker → resolver defaults to tab 0
+        # AND marks current_tab_inferred=False. Renderer (PR 3) MUST NOT
+        # mint pick buttons in this state.
+        pane = "garbage that doesn't look like a picker at all\n"
+        form = resolve_ask_form(self._multi_q_input(), pane)
+        assert form is not None
+        assert form.current_tab_inferred is False
+        # Defaults to first question.
+        assert form.current_question_title == "Pick approach."
+        # INF:0 line present.
+        lines = form._canonical_repr().split("\n")
+        assert any(line == "INF:0" for line in lines)
+
+    def test_jsonl_missing_falls_back_to_pane(self):
+        # No tool_input → pure pane fallback (legacy behaviour).
+        pane = (
+            "Pick one.\n"
+            "\n"
+            "❯ 1. A — first\n"
+            "  2. B — second\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(None, pane)
+        assert form is not None
+        # questions tuple is empty (legacy pane path doesn't carry it).
+        assert form.questions == ()
+        assert [o.number for o in form.options] == [1, 2]
+
+    def test_ambiguous_titles_secondary_match_via_options(self):
+        # Two questions share a title; option-label overlap disambiguates.
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Pick.",
+                    "options": [{"label": "alpha"}, {"label": "beta"}],
+                },
+                {
+                    "question": "Pick.",
+                    "options": [{"label": "gamma"}, {"label": "delta"}],
+                },
+            ]
+        }
+        pane = (
+            "Pick.\n"
+            "\n"
+            "❯ 1. gamma\n"
+            "  2. delta\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(tool_input, pane)
+        assert form is not None
+        assert form.current_tab_inferred is True
+        # Option-overlap pinned the second question.
+        assert form.options[0].label == "gamma"
+
+    def test_identical_options_across_tabs_defaults(self):
+        # Every tab has the same option labels (e.g. "Yes / No / Skip" pattern).
+        # Neither title-exact nor option-overlap can disambiguate → must
+        # default to (0, False) safely rather than picking arbitrarily.
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q1?",
+                    "options": [{"label": "Yes"}, {"label": "No"}],
+                },
+                {
+                    "question": "Q2?",
+                    "options": [{"label": "Yes"}, {"label": "No"}],
+                },
+            ]
+        }
+        # Pane title doesn't match either question's title verbatim
+        # (wrapped / truncated scenario).
+        pane = (
+            "Q something else?\n"
+            "\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(tool_input, pane)
+        assert form is not None
+        # Both questions tied on the option-overlap score → defaulted.
+        assert form.current_tab_inferred is False
+        assert form.current_question_title == "Q1?"
