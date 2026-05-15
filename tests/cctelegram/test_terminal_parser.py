@@ -477,6 +477,52 @@ _PANE_SINGLE_TAB = (
 )
 
 
+class TestBuildFormFromToolInput:
+    """Building the AskUserQuestionForm directly from the JSONL tool_use input.
+
+    Pane scrape misses options when long question text scrolls them off the
+    top of the visible region. The JSONL payload carries the full option
+    list and is order-stable, so this path is preferred for AskUserQuestion
+    dispatch when the input dict is available.
+    """
+
+    def test_full_payload(self):
+        from cctelegram.terminal_parser import build_form_from_tool_input
+
+        form = build_form_from_tool_input(
+            {
+                "questions": [
+                    {
+                        "question": "Pick one.",
+                        "header": "Approach",
+                        "multiSelect": False,
+                        "options": [
+                            {"label": "A) First", "description": "x"},
+                            {"label": "B) Second", "description": "y"},
+                            {"label": "C) Third (Recommended)", "description": "z"},
+                        ],
+                    }
+                ]
+            }
+        )
+        assert form is not None
+        assert form.current_question_title == "Pick one."
+        assert [o.number for o in form.options] == [1, 2, 3]
+        assert form.options[0].label == "A) First"
+        assert form.options[2].recommended is True
+        assert form.options[2].label == "C) Third"
+
+    def test_none_or_malformed_returns_none(self):
+        from cctelegram.terminal_parser import build_form_from_tool_input
+
+        assert build_form_from_tool_input(None) is None
+        assert build_form_from_tool_input({}) is None
+        assert build_form_from_tool_input({"questions": []}) is None
+        assert build_form_from_tool_input({"questions": "nope"}) is None
+        assert build_form_from_tool_input({"questions": [{"options": []}]}) is None
+        assert build_form_from_tool_input({"questions": [{"options": "x"}]}) is None
+
+
 class TestParseAskUserQuestion:
     def test_plain_picker_with_multiline_descriptions(self):
         """Plain A/B/C question with multi-line indented descriptions between

@@ -3078,7 +3078,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 await queue.join()
             # Wait briefly for Claude Code to render the question UI
             await asyncio.sleep(0.3)
-            handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
+            handled = await handle_interactive_ui(
+                bot, user_id, wid, thread_id, tool_input=msg.tool_input
+            )
             if handled:
                 # Update user's read offset
                 session = await session_manager.resolve_session_for_window(wid)

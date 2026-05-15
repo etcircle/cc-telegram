@@ -23,6 +23,7 @@ parse_status_line(), strip_pane_chrome(), extract_bash_output().
 import hashlib
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -432,6 +433,85 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
         kept.append(opt)
         expected += 1
     return tuple(kept)
+
+
+def build_form_from_tool_input(
+    tool_input: dict[str, Any] | None,
+) -> AskUserQuestionForm | None:
+    """Build an ``AskUserQuestionForm`` directly from a JSONL ``tool_use`` input.
+
+    The tmux pane scrape captures only the visible region, so long question
+    text pushes earlier options off the top of the screen — the user sees
+    options 2..N and option 1 is gone. The structured ``tool_use.input`` in
+    the session JSONL carries the complete option list and is order-stable.
+    Prefer this over ``parse_ask_user_question`` for AskUserQuestion dispatch
+    when the input dict is available.
+
+    Returns ``None`` when the input is missing, malformed, or contains no
+    parseable options. Callers should fall back to the pane parser.
+
+    The structured payload Claude Code emits for AskUserQuestion is shaped:
+
+        {
+          "questions": [
+            {"question": "...", "header": "...", "multiSelect": false,
+             "options": [{"label": "...", "description": "..."}, ...]}
+          ]
+        }
+
+    The picker UI also appends a "Type something" / "Chat about this" pair
+    at the bottom — those are picker-internal and not part of the tool_use
+    payload. We mint pick buttons only for the structured options; the
+    keystroke fallback still reaches the picker-internal entries.
+    """
+    if not isinstance(tool_input, dict):
+        return None
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    q = questions[0]
+    if not isinstance(q, dict):
+        return None
+    title = q.get("question") or q.get("header")
+    options_input = q.get("options")
+    if not isinstance(options_input, list):
+        return None
+
+    options: list[AskOption] = []
+    for idx, opt in enumerate(options_input, start=1):
+        if isinstance(opt, str):
+            label = opt
+        elif isinstance(opt, dict):
+            raw_label = opt.get("label")
+            label = raw_label if isinstance(raw_label, str) else ""
+        else:
+            continue
+        label = label.strip()
+        if not label:
+            continue
+        recommended = bool(_RE_RECOMMENDED.search(label))
+        if recommended:
+            label = _RE_RECOMMENDED.sub("", label).rstrip()
+        options.append(
+            AskOption(
+                label=label,
+                recommended=recommended,
+                cursor=False,
+                number=idx,
+            )
+        )
+
+    if not options:
+        return None
+
+    return AskUserQuestionForm(
+        tabs=(),
+        current_question_title=str(title).strip() if isinstance(title, str) else None,
+        options=tuple(options),
+        is_review_screen=False,
+        is_free_text=False,
+        pane_excerpt="",
+    )
 
 
 def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:

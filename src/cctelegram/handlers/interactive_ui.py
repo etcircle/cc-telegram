@@ -25,6 +25,7 @@ from ..config import config
 from ..session import session_id_for_window, session_manager
 from ..terminal_parser import (
     AskUserQuestionForm,
+    build_form_from_tool_input,
     extract_interactive_content,
     is_interactive_ui,
     parse_ask_user_question,
@@ -564,12 +565,22 @@ async def handle_interactive_ui(
     user_id: int,
     window_id: str,
     thread_id: int | None = None,
+    *,
+    tool_input: dict | None = None,
 ) -> bool:
     """Capture terminal and send interactive UI content to user.
 
     Handles AskUserQuestion, ExitPlanMode, Permission Prompt, and
     RestoreCheckpoint UIs. Returns True if UI was detected and sent,
     False otherwise.
+
+    ``tool_input`` is the raw JSONL ``tool_use.input`` dict when available.
+    For AskUserQuestion, this carries the complete option list independent
+    of the tmux pane's visible region. The pane scrape sees only what's
+    on screen, so long question text pushes early options off the top —
+    using the structured payload here is order-stable and complete. The
+    pane is still captured for the verbatim text excerpt and the keystroke
+    fallback path.
     """
     ikey = (user_id, thread_id or 0)
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
@@ -610,7 +621,13 @@ async def handle_interactive_ui(
     text = content.content
     pick_rows: list[list[InlineKeyboardButton]] | None = None
     if content.name == "AskUserQuestion":
-        form = parse_ask_user_question(pane_text)
+        # Prefer the JSONL tool_use.input over pane scrape: it carries the
+        # full option list even when the question text scrolled option 1
+        # off the top of the visible pane. Fall back to the pane parser
+        # only when tool_input is absent or doesn't yield options.
+        form: AskUserQuestionForm | None = build_form_from_tool_input(tool_input)
+        if form is None:
+            form = parse_ask_user_question(pane_text)
         if form is not None:
             structured = _render_ask_user_question(form)
             if structured:
