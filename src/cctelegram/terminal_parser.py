@@ -889,13 +889,46 @@ def resolve_ask_form(
             )
         return jsonl_form
 
+    # Multi-question: detect review screen FIRST. On a review screen, the
+    # pane's visible options are Submit/Cancel — not Q1's options — and
+    # overlaying them onto Q1's labels mints buttons whose label disagrees
+    # with the action that the cursor will dispatch (wrong-action class).
+    # Pane is authoritative for the review screen's options + cursor; the
+    # JSONL `questions` matrix stays for tab-strip context only.
+    if pane_form is not None and pane_form.is_review_screen:
+        return AskUserQuestionForm(
+            tabs=pane_form.tabs,
+            current_question_title=None,
+            options=pane_form.options,
+            is_review_screen=True,
+            is_free_text=pane_form.is_free_text,
+            pane_excerpt=pane_form.pane_excerpt,
+            questions=jsonl_form.questions,
+            # No inference happened — the pane authoritatively says "review".
+            # Suppress pick-button mint (mint gate honours this) so we don't
+            # mislabel the Submit/Cancel buttons against JSONL labels; the
+            # keystroke nav keyboard still lets the user submit / cancel.
+            current_tab_inferred=False,
+        )
+
     # Multi-question: infer the current tab from pane content.
     current_idx, inferred = _infer_current_tab_idx(jsonl_form.questions, pane_form)
+    # Strong-match requirement before overlay: even if _infer_current_tab_idx
+    # returned (idx, True) on a single matching option, demote to inferred=False
+    # unless we have a non-trivial title substring match OR ≥50% option-label
+    # overlap. This prevents minting Q1's buttons when the pane is actually
+    # showing Q2 with one coincidentally-shared option label.
+    if inferred and pane_form is not None:
+        if not _strong_match(jsonl_form.questions[current_idx], pane_form):
+            inferred = False
     current_q = jsonl_form.questions[current_idx]
-    # Overlay the live cursor onto the chosen tab's options when available.
+    # Overlay the live cursor onto the chosen tab's options only when the
+    # match is strong. On weak/no inference we keep JSONL options as-is so
+    # the validator and renderer see a stable shape; pick buttons are
+    # suppressed downstream because current_tab_inferred is False.
     options = (
         _overlay_cursor(current_q.options, pane_form.options)
-        if pane_form is not None
+        if pane_form is not None and inferred
         else current_q.options
     )
     return AskUserQuestionForm(
@@ -908,6 +941,42 @@ def resolve_ask_form(
         questions=jsonl_form.questions,
         current_tab_inferred=inferred,
     )
+
+
+def _strong_match(q: AskQuestion, pane_form: AskUserQuestionForm) -> bool:
+    """Stricter inference check than ``_infer_current_tab_idx``.
+
+    The inference helper accepts any unique winner, including the degenerate
+    case "one label happened to match." That can mint Q1's buttons against
+    a pane showing Q2 if Q1 and Q2 share one option label. Require:
+
+      * the question title is a non-trivial substring of the pane title
+        (or vice versa) — case-insensitive, ≥8 chars or full title length, OR
+      * ≥50% of the pane's option labels appear in the question's options.
+
+    Reject if neither holds. Caller demotes ``inferred`` to False; the mint
+    code then suppresses pick buttons and keystroke nav stays available.
+    """
+    q_title = q.title.strip().lower()
+    pane_title = (pane_form.current_question_title or "").strip().lower()
+    if q_title and pane_title:
+        # Substring match in either direction; reject trivially-short overlaps
+        # (e.g., "Pick." in any pane title would otherwise pass).
+        shorter = min(q_title, pane_title, key=len)
+        threshold = min(8, len(shorter))
+        if threshold > 0 and (
+            (q_title in pane_title or pane_title in q_title)
+            and len(shorter) >= threshold
+        ):
+            return True
+
+    pane_labels = {o.label for o in pane_form.options if o.label}
+    if not pane_labels:
+        return False
+    q_labels = {o.label for o in q.options if o.label}
+    overlap = len(pane_labels & q_labels)
+    # ≥50% of pane labels recognized in this question's option set.
+    return overlap * 2 >= len(pane_labels)
 
 
 def _overlay_cursor(
