@@ -134,6 +134,7 @@ from .handlers.interactive_ui import (
     clear_interactive_mode,
     clear_interactive_msg,
     consume_pick_token,
+    peek_pick_token,
     forget_ask_tool_input,
     get_interactive_window,
     handle_interactive_ui,
@@ -2879,7 +2880,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: structured option pick (PR 2b)
     elif data.startswith(CB_ASK_PICK):
         token = data[len(CB_ASK_PICK) :]
-        entry = consume_pick_token(token)
+        # CB3: peek BEFORE consume. The old consume_pick_token-only flow
+        # destroyed the token + its sibling cache row even on user-id
+        # mismatch, letting a wrong user click another user's button and
+        # burn the legitimate owner's tokens. Validate ownership first,
+        # consume only after.
+        entry = peek_pick_token(token)
         if entry is None:
             # Token never existed, was already used, or has aged past the
             # 5-minute TTL. Refresh the card so the user sees the live form
@@ -2892,11 +2898,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         thread_id = entry.thread_id
         window_id = entry.window_id
-        # Wrong user clicking another user's card — refuse without leaking
-        # what the click would have done.
+        # Wrong user clicking another user's card — refuse WITHOUT
+        # consuming the token (CB3). The legitimate owner's click still
+        # lands. Telegram answers the same way ("Not your card.") so no
+        # information leaks about whether the token was valid.
         if entry.user_id != user.id:
             await query.answer("Not your card.", show_alert=False)
             return
+        # Ownership confirmed — now consume atomically. From here on,
+        # ``entry`` is the canonical reference; the token + its siblings
+        # are gone, so any concurrent click on a stale button hits the
+        # "Card expired" branch above.
+        consume_pick_token(token)
         if await reject_stale_window_callback(window_id):
             await query.answer("Window gone, refreshing.")
             return

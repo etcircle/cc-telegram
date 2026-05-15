@@ -152,17 +152,43 @@ def _ask_tool_input_digest(payload: dict | None) -> str | None:
     return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
 
 
-# ── PR 3: per-route asyncio.Lock + multi-tab session state ──────────────
+# ── Per-route asyncio.Lock ───────────────────────────────────────────────
 #
-# Lock contract (plan v5 §Interactive route lock):
-#   * Held around STATE MUTATIONS (read/write of _multi_tab_sessions,
-#     _interactive_msgs, _pick_token_cache, _pick_tokens, _interactive_mode,
-#     _latest_ask_tool_input).
-#   * RELEASED across Telegram I/O awaits — serializing those would stall
-#     multi-route concurrency.
-#   * Non-reentrant: the pick-token callback handler MUST NOT hold the
-#     lock across ``await handle_interactive_ui(...)``. Build a guard
-#     digest under the lock, release, then call.
+# Lock contract (rewritten for P2.1 — honest version after multi-tab was
+# disabled in PR #14; the original aspirational contract claimed coverage
+# the actual single-card code never honoured):
+#
+#   ACTUALLY PROTECTED by ``_get_route_lock`` today:
+#     * ``_multi_tab_sessions`` — dormant infra (multi-tab dispatch is
+#       gate-off in ``handle_interactive_ui``). The lock matters here only
+#       because in-flight render coroutines re-check generation under it.
+#     * ``_pick_token_cache`` / ``_pick_tokens`` — pruned under the lock in
+#       ``clear_interactive_msg`` (P2.2) so a concurrent ``handle_interactive_ui``
+#       (which awaits between pane capture and mint) can't post a card whose
+#       tokens point at a cache row the cleanup just dropped.
+#
+#   NOT PROTECTED today (single-producer in practice, single-event-loop
+#   means sync dict writes don't interleave with other coroutines'
+#   sync dict writes):
+#     * ``_interactive_msgs`` — written by ``handle_interactive_ui`` and
+#       ``clear_interactive_msg``; the read-then-write inside
+#       ``handle_interactive_ui`` happens after the last await, so a
+#       concurrent clear can't tear it.
+#     * ``_interactive_mode`` — same shape as ``_interactive_msgs``.
+#     * ``_latest_ask_tool_input`` — written by ``session_monitor``
+#       (single writer) and read everywhere; dict ops are atomic enough.
+#
+#   RELEASED across Telegram I/O awaits — serializing those would stall
+#   multi-route concurrency.
+#
+#   Non-reentrant: the pick-token callback handler MUST NOT hold the lock
+#   across ``await handle_interactive_ui(...)``. Validate, release, then
+#   call.
+#
+# TO RE-ENABLE MULTI-TAB: re-wrap ``_interactive_msgs`` / ``_interactive_mode``
+# reads/writes in this lock — single-producer assumption breaks once a form
+# has N cards across N tabs in flight. The original contract above is the
+# target shape; git blame this comment for the pre-PR-#14 history.
 #
 # ``_route_locks`` are created on demand and never cleaned up. The keyspace
 # is bounded by (user_id × thread_id) pairs the bot has seen — small in
@@ -330,6 +356,26 @@ def _mint_pick_token(entry: _PickTokenEntry) -> str:
     raise RuntimeError("Unable to mint a unique pick token")
 
 
+def peek_pick_token(token: str) -> _PickTokenEntry | None:
+    """Look up a token WITHOUT consuming it. Returns the entry or None.
+
+    P1.5/CB3: callbacks MUST validate ``entry.user_id`` against the click
+    sender's ID before consuming. Looking up + consuming in one step (the
+    old ``consume_pick_token``-only API) made it possible for a wrong user
+    to click another user's button, hit the "not your card" reject, and
+    still burn the token + its sibling cache row. The legitimate owner's
+    next click then 404'd with "Card expired, refreshing."
+
+    Use this for the validate phase; call ``consume_pick_token`` only after
+    user/window/fingerprint checks pass.
+
+    Expired tokens are pruned as a side effect so the caller can treat a
+    None return as "definitely gone" without re-checking expiry.
+    """
+    _prune_expired_pick_tokens()
+    return _pick_tokens.get(token)
+
+
 def consume_pick_token(token: str) -> _PickTokenEntry | None:
     """Pop a token (single-use). Returns the entry or None if missing/expired.
 
@@ -339,6 +385,10 @@ def consume_pick_token(token: str) -> _PickTokenEntry | None:
     against the new fingerprint anyway. Leaving the cache populated would
     keep handing out the just-consumed token (which would then 404 on
     click).
+
+    SECURITY (CB3): this mutates state. Callers MUST validate ownership via
+    ``peek_pick_token`` first before calling this — otherwise a wrong-user
+    click destroys the legitimate owner's token + sibling cache row.
     """
     _prune_expired_pick_tokens()
     entry = _pick_tokens.pop(token, None)
@@ -1617,7 +1667,13 @@ async def clear_interactive_msg(
     lock = _get_route_lock(user_id, thread_id)
     async with lock:
         single_msg_id = _interactive_msgs.pop(ikey, None)
-        _interactive_mode.pop(ikey, None)
+        # P2.2: capture the active window for this route BEFORE popping
+        # ``_interactive_mode`` so we can scope token pruning correctly.
+        # Multiple windows can never share a route (1 topic = 1 window),
+        # but the pruning still wants to scope to the cleared window to
+        # avoid touching unrelated routes that share a (user, thread)
+        # key in ``_pick_tokens``.
+        cleared_window_id = _interactive_mode.pop(ikey, None)
         multi_session = _multi_tab_sessions.pop(ikey, None)
         if multi_session is not None:
             # Bump generation so any in-flight render coroutine fails its
@@ -1626,6 +1682,37 @@ async def clear_interactive_msg(
             multi_msg_ids = list(multi_session.message_ids)
         else:
             multi_msg_ids = []
+
+        # P2.2: prune pick-tokens for this route. Without this, a deleted
+        # interactive card leaves its tokens live until the 5-minute TTL,
+        # which combined with stale-scrollback liveness checks (P1.3)
+        # would let a stale callback validate against a closed picker.
+        # Scope by (user_id, thread_id, window_id) so concurrent
+        # interactive surfaces on other routes are untouched. The token
+        # entries carry the route fields directly, so we can match
+        # cheaply by iterating the small dict.
+        if cleared_window_id is not None:
+            stale_tokens = [
+                tok
+                for tok, e in _pick_tokens.items()
+                if e.user_id == user_id
+                and (e.thread_id or 0) == (thread_id or 0)
+                and e.window_id == cleared_window_id
+            ]
+            for tok in stale_tokens:
+                _pick_tokens.pop(tok, None)
+            # Cache rows for this route point at the same fingerprint
+            # set; drop them so a future mint doesn't reuse a row whose
+            # tokens we just invalidated.
+            stale_cache_keys = [
+                key
+                for key in _pick_token_cache
+                if key[0] == user_id
+                and key[1] == (thread_id or 0)
+                and key[2] == cleared_window_id
+            ]
+            for key in stale_cache_keys:
+                _pick_token_cache.pop(key, None)
 
     logger.debug(
         "Clear interactive: user=%d thread=%s single=%s multi_count=%d",

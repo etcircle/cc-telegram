@@ -477,8 +477,13 @@ from cctelegram.handlers.interactive_ui import (  # noqa: E402
     _build_pick_button_rows,
     _PickTokenEntry,
     _mint_pick_token,
+    _pick_token_cache,
+    _pick_tokens,
+    clear_interactive_msg,
     consume_pick_token,
+    peek_pick_token,
     reset_pick_tokens_for_tests,
+    set_interactive_mode,
 )
 
 
@@ -752,6 +757,133 @@ class TestPickTokenReuse:
         )
         new_token = rows2[0][0].callback_data
         assert new_token != f"aqp:{first_token}"
+
+
+@pytest.mark.usefixtures("_clear_pick_tokens")
+class TestPeekPickTokenIsNonDestructive:
+    """CB3 — wrong-user clicks must NOT destroy the legitimate owner's token."""
+
+    def _entry(self, user_id: int = 42) -> _PickTokenEntry:
+        return _PickTokenEntry(
+            window_id="@1",
+            user_id=user_id,
+            thread_id=7,
+            fingerprint="fp1",
+            option_number=1,
+            option_label="A",
+            is_review_submit=False,
+            expires_at=time.monotonic() + 60,
+        )
+
+    def test_peek_returns_entry_without_consuming(self):
+        token = _mint_pick_token(self._entry())
+        # Peek N times → same entry every time, token still alive.
+        for _ in range(3):
+            got = peek_pick_token(token)
+            assert got is not None
+            assert got.user_id == 42
+        # The real consume still works after peeks.
+        consumed = consume_pick_token(token)
+        assert consumed is not None
+        # Now actually gone.
+        assert peek_pick_token(token) is None
+        assert consume_pick_token(token) is None
+
+    def test_peek_does_not_drop_sibling_cache(self):
+        # Mint two tokens in the same cache row (same fingerprint).
+        e1 = self._entry()
+        e2 = _PickTokenEntry(
+            window_id=e1.window_id,
+            user_id=e1.user_id,
+            thread_id=e1.thread_id,
+            fingerprint=e1.fingerprint,
+            option_number=2,
+            option_label="B",
+            is_review_submit=False,
+            expires_at=e1.expires_at,
+        )
+        t1 = _mint_pick_token(e1)
+        t2 = _mint_pick_token(e2)
+        cache_key = (e1.user_id, e1.thread_id or 0, e1.window_id, e1.fingerprint)
+        _pick_token_cache[cache_key] = [t1, t2]
+        # Peek t1 — neither t2 nor the cache row should be touched.
+        assert peek_pick_token(t1) is e1
+        assert peek_pick_token(t2) is e2
+        assert _pick_token_cache.get(cache_key) == [t1, t2]
+
+
+@pytest.mark.usefixtures("_clear_pick_tokens")
+class TestClearInteractiveMsgPrunesTokens:
+    """P2.2 — clear_interactive_msg must drop pick-tokens for the cleared route."""
+
+    @pytest.mark.asyncio
+    async def test_clear_drops_tokens_for_active_window(self):
+        user_id, thread_id, window_id = 42, 7, "@1"
+        # Set up interactive mode so clear_interactive_msg sees the route.
+        set_interactive_mode(user_id, window_id, thread_id)
+        entry = _PickTokenEntry(
+            window_id=window_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            fingerprint="fp1",
+            option_number=1,
+            option_label="A",
+            is_review_submit=False,
+            expires_at=time.monotonic() + 60,
+        )
+        token = _mint_pick_token(entry)
+        cache_key = (user_id, thread_id, window_id, "fp1")
+        _pick_token_cache[cache_key] = [token]
+        assert token in _pick_tokens
+        # bot=None → no Telegram I/O; the prune still runs.
+        await clear_interactive_msg(user_id, bot=None, thread_id=thread_id)
+        assert token not in _pick_tokens
+        assert cache_key not in _pick_token_cache
+
+    @pytest.mark.asyncio
+    async def test_clear_leaves_other_routes_alone(self):
+        # Two routes for the same user but different threads / windows.
+        user_id = 42
+        set_interactive_mode(user_id, "@1", 7)
+        set_interactive_mode(user_id, "@2", 8)
+        e1 = _PickTokenEntry(
+            window_id="@1",
+            user_id=user_id,
+            thread_id=7,
+            fingerprint="fp1",
+            option_number=1,
+            option_label="A",
+            is_review_submit=False,
+            expires_at=time.monotonic() + 60,
+        )
+        e2 = _PickTokenEntry(
+            window_id="@2",
+            user_id=user_id,
+            thread_id=8,
+            fingerprint="fp2",
+            option_number=1,
+            option_label="A",
+            is_review_submit=False,
+            expires_at=time.monotonic() + 60,
+        )
+        t1 = _mint_pick_token(e1)
+        t2 = _mint_pick_token(e2)
+        _pick_token_cache[(user_id, 7, "@1", "fp1")] = [t1]
+        _pick_token_cache[(user_id, 8, "@2", "fp2")] = [t2]
+        # Clear thread 7 only.
+        await clear_interactive_msg(user_id, bot=None, thread_id=7)
+        assert t1 not in _pick_tokens
+        assert (user_id, 7, "@1", "fp1") not in _pick_token_cache
+        # Thread 8 untouched.
+        assert t2 in _pick_tokens
+        assert (user_id, 8, "@2", "fp2") in _pick_token_cache
+
+    @pytest.mark.asyncio
+    async def test_clear_no_active_window_is_noop(self):
+        # No prior set_interactive_mode → _interactive_mode pop returns None.
+        # Clear must not raise; the prune loop just doesn't fire.
+        await clear_interactive_msg(99, bot=None, thread_id=1)
+        # No tokens to assert about; this is just a non-crash check.
 
 
 # ── PR 2: callback-validator parity via resolve_ask_form ─────────────────
