@@ -348,12 +348,24 @@ class TmuxManager:
             logger.debug("Window not found by id: %s", window_id)
         return w
 
-    async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
+    async def capture_pane(
+        self,
+        window_id: str,
+        with_ansi: bool = False,
+        scrollback_lines: int = 0,
+    ) -> str | None:
         """Capture the visible text content of a window's active pane.
 
         Args:
             window_id: The window ID to capture
             with_ansi: If True, capture with ANSI color codes
+            scrollback_lines: If > 0, include this many lines of history
+                above the visible region. Useful for AskUserQuestion
+                rendering where a long question pushes early options off
+                the top of the visible pane; capturing 100+ lines of
+                history brings them back. Default 0 = visible only,
+                matching the legacy behavior callers like status-line
+                parsing depend on.
 
         Returns:
             The captured text, or None on failure.
@@ -362,6 +374,8 @@ class TmuxManager:
         args: list[str] = [tmux_bin, "capture-pane"]
         if with_ansi:
             args.append("-e")
+        if scrollback_lines > 0:
+            args.extend(["-S", f"-{scrollback_lines}"])
         args.extend(["-p", "-t", window_id])
         try:
             proc = await asyncio.create_subprocess_exec(

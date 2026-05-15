@@ -615,8 +615,12 @@ async def handle_interactive_ui(
     if not w:
         return False
 
-    # Capture plain text (no ANSI colors)
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    # Capture plain text (no ANSI colors). Include 100 lines of scrollback
+    # so long AskUserQuestion text that pushes early options off the top
+    # of the visible pane doesn't break detection / option-pick rendering.
+    # The other capture sites (status-line parser, busy indicator) still
+    # use visible-only via the default ``scrollback_lines=0``.
+    pane_text = await tmux_manager.capture_pane(w.window_id, scrollback_lines=100)
     if not pane_text:
         logger.debug("No pane text captured for window_id %s", window_id)
         return False
