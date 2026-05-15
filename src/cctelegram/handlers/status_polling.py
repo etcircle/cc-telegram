@@ -41,6 +41,7 @@ from . import busy_indicator
 from .busy_indicator import RunState
 from .interactive_ui import (
     clear_interactive_msg,
+    get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
 )
@@ -199,13 +200,22 @@ async def update_status_message(
         if is_interactive_ui(pane_text):
             # Interactive UI still showing — skip status update (user is interacting)
             return
-        # Interactive UI gone — clear interactive mode, fall through to status check.
-        # Don't re-check for new UI this cycle (the old one just disappeared).
+        # Interactive UI gone — but only clear if a real interactive message was
+        # actually rendered. Without this guard, a 1Hz tick that lands between
+        # ``set_interactive_mode`` (published in ``bot.handle_new_message`` BEFORE
+        # the queue-drain + sleep + ``handle_interactive_ui`` render path) and
+        # the eventual card send would clear the just-published mode with
+        # ``msg_id=None`` and drop the card to plain-text fallback. Skip this
+        # cycle until the render has actually published a message id.
+        if get_interactive_msg_id(user_id, thread_id) is None:
+            return
         await clear_interactive_msg(user_id, bot, thread_id)
         should_check_new_ui = False
     elif interactive_window is not None:
-        # User is in interactive mode for a DIFFERENT window (window switched)
-        # Clear stale interactive mode
+        # User is in interactive mode for a DIFFERENT window (window switched).
+        # Same guard as above: only clear if a real interactive message exists.
+        if get_interactive_msg_id(user_id, thread_id) is None:
+            return
         await clear_interactive_msg(user_id, bot, thread_id)
 
     # Check for permission prompt (interactive UI not triggered via JSONL)

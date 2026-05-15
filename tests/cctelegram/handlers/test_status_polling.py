@@ -385,6 +385,116 @@ class TestStatusPollerSettingsDetection:
         attention.reset_for_tests()
 
 
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestInteractiveModeRaceGuard:
+    """The 1Hz poller must not clear a just-published interactive mode that
+    has not yet rendered a Telegram message. ``bot.handle_new_message``
+    sets ``_interactive_mode`` BEFORE awaiting the route's content queue
+    and ``handle_interactive_ui``; the poller can tick during that window
+    and would otherwise call ``clear_interactive_msg`` with ``msg_id=None``,
+    dropping the AskUserQuestion card to plain-text fallback.
+    """
+
+    @pytest.mark.asyncio
+    async def test_poll_does_not_clear_pending_interactive_mode(
+        self, mock_bot: AsyncMock
+    ):
+        """Mode set but no msg_id yet → poller must skip the clear path."""
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@24"
+        user_id = 1
+        thread_id = 42
+        ikey = (user_id, thread_id)
+
+        _interactive_mode[ikey] = window_id
+        assert _interactive_msgs.get(ikey) is None
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        non_interactive_pane = (
+            "some output\n"
+            "✻ Reading file\n"
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "  [Opus 4.6] Context: 50%\n"
+        )
+
+        with (
+            patch("cctelegram.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "cctelegram.handlers.status_polling.clear_interactive_msg",
+                new_callable=AsyncMock,
+            ) as mock_clear,
+            patch(
+                "cctelegram.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle,
+            patch(
+                "cctelegram.handlers.status_polling.enqueue_status_update",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=non_interactive_pane)
+
+            await status_polling.update_status_message(
+                mock_bot, user_id=user_id, window_id=window_id, thread_id=thread_id
+            )
+
+            mock_clear.assert_not_called()
+            mock_handle.assert_not_called()
+
+        assert _interactive_mode.get(ikey) == window_id
+
+    @pytest.mark.asyncio
+    async def test_poll_clears_when_interactive_msg_already_rendered(
+        self, mock_bot: AsyncMock
+    ):
+        """Mode set AND msg_id present → poller clears as before."""
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@24"
+        user_id = 1
+        thread_id = 42
+        ikey = (user_id, thread_id)
+
+        _interactive_mode[ikey] = window_id
+        _interactive_msgs[ikey] = 12345
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        non_interactive_pane = "some output\n❯ \n  [Opus 4.6] Context: 50%\n"
+
+        with (
+            patch("cctelegram.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "cctelegram.handlers.status_polling.clear_interactive_msg",
+                new_callable=AsyncMock,
+            ) as mock_clear,
+            patch(
+                "cctelegram.handlers.status_polling.enqueue_status_update",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=non_interactive_pane)
+
+            await status_polling.update_status_message(
+                mock_bot, user_id=user_id, window_id=window_id, thread_id=thread_id
+            )
+
+            mock_clear.assert_called_once_with(user_id, mock_bot, thread_id)
+
+
 # ── Topic existence probe (status_poll_loop) ────────────────────────────────
 
 
