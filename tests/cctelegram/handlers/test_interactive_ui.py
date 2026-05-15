@@ -1113,6 +1113,11 @@ class TestMultiTabPostN:
         _latest_ask_tool_input.clear()
         _route_locks.clear()
 
+    @pytest.mark.skip(
+        reason="Multi-tab dispatch disabled in handle_interactive_ui (2026-05-15) — "
+        "user preferred the legacy single-card flow. The state-machine code remains "
+        "in place; re-enable the dispatch in handle_interactive_ui to revive this test."
+    )
     @pytest.mark.asyncio
     async def test_post_n_cards_for_multi_question(self, _clear_multi_state):
         """Multi-tab form posts N cards; current tab carries pick buttons,

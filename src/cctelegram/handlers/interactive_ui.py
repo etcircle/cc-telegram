@@ -1422,30 +1422,24 @@ async def handle_interactive_ui(
             form = build_form_from_tool_input(resolved_input)
             if form is None:
                 form = parse_ask_user_question(pane_text)
-        # PR 3: multi-tab AskUserQuestion forms branch to the dedicated
-        # state machine (post N cards, edit-on-tab-advance, generation
-        # guarded cleanup). The review-screen variant (is_review_screen
-        # is True for the trailing Submit/Cancel screen) is treated as a
-        # single-card render — its body is just the Submit/Cancel choice,
-        # and the per-tab cards from the prior phase are torn down by the
-        # state machine when it sees the shape mutation. So this branch
-        # only catches the "actively picking" multi-tab phase.
-        if (
-            form is not None
-            and len(form.questions) > 1
-            and not form.is_review_screen
-        ):
-            return await _handle_multi_tab_ask(
-                bot,
-                user_id=user_id,
-                thread_id=thread_id,
-                chat_id=chat_id,
-                window_id=window_id,
-                form=form,
-                ui_name=content.name,
-                rerender_guard=rerender_guard,
-            )
-
+        # Multi-tab dispatch DISABLED at user request (2026-05-15):
+        # PRs #11/12/13 shipped a per-tab card state machine. Live
+        # testing surfaced enough rough edges (timeout cascades,
+        # fingerprint drift, partial-bundle alignment) that the user
+        # explicitly preferred the legacy single-card behaviour, which
+        # they confirmed "works much better" — one rolling card that
+        # updates body+keyboard as the picker advances tab-by-tab.
+        #
+        # The multi-tab state-machine code (``_handle_multi_tab_ask``
+        # and friends) stays in place as dormant infrastructure but is
+        # never reached. Single-card flow below handles every variant,
+        # including multi-question forms: ``resolve_ask_form`` populates
+        # ``current_question_title`` + ``options`` from the inferred
+        # current tab, ``_render_ask_user_question`` renders that tab's
+        # descriptions, and pick buttons + keystroke nav let the user
+        # walk through tabs. To re-enable multi-tab, restore the
+        # ``_handle_multi_tab_ask`` dispatch here after addressing the
+        # live-testing issues.
         if form is not None:
             structured = _render_ask_user_question(form)
             if structured:
