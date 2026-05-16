@@ -811,11 +811,27 @@ def _build_pick_button_rows(
         visible in the body but are picked via keystroke nav.
     """
     if not form.options:
+        logger.info(
+            "_build_pick_button_rows SUPPRESSED gate=no_options questions=%d "
+            "current_tab_inferred=%s is_review_screen=%s question_title=%r",
+            len(form.questions),
+            form.current_tab_inferred,
+            form.is_review_screen,
+            (form.current_question_title or "<none>")[:80],
+        )
         return []
 
     # FA5+: multi-tab form without confirmed current-tab inference.
     # Suppress pick buttons entirely — keystroke nav remains.
     if len(form.questions) > 1 and not form.current_tab_inferred:
+        logger.info(
+            "_build_pick_button_rows SUPPRESSED gate=fa5_guard questions=%d "
+            "options=%d is_review_screen=%s question_title=%r",
+            len(form.questions),
+            len(form.options),
+            form.is_review_screen,
+            (form.current_question_title or "<none>")[:80],
+        )
         return []
 
     fingerprint = form.fingerprint()
@@ -828,6 +844,15 @@ def _build_pick_button_rows(
         opt for opt in form.options if opt.number is not None and 1 <= opt.number <= 9
     ]
     if not pickable:
+        logger.info(
+            "_build_pick_button_rows SUPPRESSED gate=no_pickable questions=%d "
+            "options=%d numbers=%r is_review_screen=%s question_title=%r",
+            len(form.questions),
+            len(form.options),
+            [opt.number for opt in form.options],
+            form.is_review_screen,
+            (form.current_question_title or "<none>")[:80],
+        )
         return []
 
     cache_key = (user_id, thread_id or 0, window_id, fingerprint)
