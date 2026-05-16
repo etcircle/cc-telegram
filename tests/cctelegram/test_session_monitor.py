@@ -651,3 +651,325 @@ class TestSidechainTailing:
         # Caches scrubbed for the removed keys only.
         assert f"sub:{parent_a}:agent-1" not in monitor._file_mtimes
         assert f"sub:{parent_a}:agent-2" not in monitor._pending_tools
+
+
+def _auq_tool_use_entry(tool_use_id: str, n_questions: int = 1) -> dict:
+    """Build an assistant message with an AskUserQuestion tool_use block."""
+    questions = [
+        {
+            "question": f"Question {i + 1}?",
+            "header": f"Q{i + 1}",
+            "options": [{"label": f"opt-{i}-a"}, {"label": f"opt-{i}-b"}],
+        }
+        for i in range(n_questions)
+    ]
+    return {
+        "type": "assistant",
+        "timestamp": "2026-05-16T13:00:00.000Z",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "AskUserQuestion",
+                    "input": {"questions": questions},
+                }
+            ],
+        },
+    }
+
+
+def _tool_result_entry(tool_use_id: str) -> dict:
+    """Build a user message carrying a tool_result for the given tool_use_id."""
+    return {
+        "type": "user",
+        "timestamp": "2026-05-16T13:01:00.000Z",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": [{"type": "text", "text": "answered"}],
+                }
+            ],
+        },
+    }
+
+
+def _write_jsonl(path, entries):
+    """Write an iterable of dict entries as a JSONL file."""
+    path.write_text(
+        "".join(json.dumps(e) + "\n" for e in entries),
+        encoding="utf-8",
+    )
+
+
+class TestFindLatestPendingAuq:
+    """Tests for SessionMonitor._find_latest_pending_auq (tail scan core)."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_missing_file(self, monitor, tmp_path):
+        result = await monitor._find_latest_pending_auq(tmp_path / "nope.jsonl")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_empty_file(self, monitor, tmp_path):
+        f = tmp_path / "empty.jsonl"
+        f.write_text("", encoding="utf-8")
+        result = await monitor._find_latest_pending_auq(f)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unanswered_auq_is_hydrated(self, monitor, tmp_path):
+        # Single pending AUQ at the end of the JSONL — the hydration path.
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(
+            f,
+            [
+                {"type": "user", "message": {"role": "user", "content": "hi"}},
+                _auq_tool_use_entry("auq_1", n_questions=2),
+            ],
+        )
+        result = await monitor._find_latest_pending_auq(f)
+        assert result is not None
+        assert len(result["questions"]) == 2
+        assert result["questions"][0]["header"] == "Q1"
+
+    @pytest.mark.asyncio
+    async def test_answered_auq_is_not_hydrated(self, monitor, tmp_path):
+        # AUQ followed by a matching tool_result: nothing pending → None.
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(
+            f,
+            [
+                _auq_tool_use_entry("auq_1"),
+                _tool_result_entry("auq_1"),
+            ],
+        )
+        result = await monitor._find_latest_pending_auq(f)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_latest_pending_wins_over_older_answered(self, monitor, tmp_path):
+        # Two AUQs: older one is answered, newer one is still pending.
+        # Hydration must surface the newer pending input, not the older one.
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(
+            f,
+            [
+                _auq_tool_use_entry("auq_old", n_questions=1),
+                _tool_result_entry("auq_old"),
+                _auq_tool_use_entry("auq_new", n_questions=3),
+            ],
+        )
+        result = await monitor._find_latest_pending_auq(f)
+        assert result is not None
+        assert len(result["questions"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_lines_are_skipped(self, monitor, tmp_path):
+        # A partial trailing write shouldn't abort the whole scan.
+        f = tmp_path / "session.jsonl"
+        entries_text = (
+            json.dumps(_auq_tool_use_entry("auq_1")) + "\n{not-valid-json\n\n    \n"
+        )
+        f.write_text(entries_text, encoding="utf-8")
+        result = await monitor._find_latest_pending_auq(f)
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_preserves_first_full_line_when_tail_lands_on_line_boundary(
+        self, monitor, tmp_path
+    ):
+        # Hermes review P2 on PR #24: if prefer_start lands exactly on a line
+        # boundary (the byte after a previous line's '\n'), the partial-line
+        # drop must NOT discard the first line — it's a complete line and
+        # may be the only pending AUQ. The fix peeks one byte earlier and
+        # only drops when that byte is not '\n'.
+        f = tmp_path / "boundary.jsonl"
+        first_entry = _auq_tool_use_entry("auq_before", n_questions=1)
+        first_entry_with_result = [
+            first_entry,
+            _tool_result_entry("auq_before"),
+        ]
+        second_entry = _auq_tool_use_entry("auq_after_boundary", n_questions=3)
+        _write_jsonl(f, first_entry_with_result + [second_entry])
+
+        # Compute the byte offset that lands exactly at the start of the
+        # final entry (the only pending AUQ).
+        prefix_text = "".join(json.dumps(e) + "\n" for e in first_entry_with_result)
+        boundary_offset = len(prefix_text.encode("utf-8"))
+        size = f.stat().st_size
+        # Tail-bytes value that produces prefer_start == boundary_offset.
+        monkey_tail = size - boundary_offset
+        original_tail = monitor._AUQ_HYDRATE_TAIL_BYTES
+        monitor.__class__._AUQ_HYDRATE_TAIL_BYTES = monkey_tail
+        try:
+            result = await monitor._find_latest_pending_auq(f)
+        finally:
+            monitor.__class__._AUQ_HYDRATE_TAIL_BYTES = original_tail
+
+        # The pending AUQ is auq_after_boundary (3 questions). Without the
+        # peek-byte fix this would return None because the only pending AUQ
+        # line would have been dropped.
+        assert result is not None
+        assert len(result["questions"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_drops_partial_first_line_when_seeking_past_zero(
+        self, monitor, tmp_path
+    ):
+        # When the tail-bytes window starts mid-line of an earlier entry,
+        # the first partial line must be discarded (it would fail json.loads
+        # anyway) without preventing the trailing valid AUQ from being
+        # found. Tail-bytes is sized to clip into the first entry but leave
+        # the second one intact so we have a concrete pending AUQ to find.
+        f = tmp_path / "big.jsonl"
+        first_entry = _auq_tool_use_entry("auq_first", n_questions=1)
+        second_entry = _auq_tool_use_entry("auq_tail", n_questions=2)
+        _write_jsonl(f, [first_entry, second_entry])
+        # Place the tail-bytes cap such that the read starts inside the
+        # first entry's JSON but the entire second entry is included.
+        first_bytes = len(json.dumps(first_entry).encode("utf-8")) + 1  # +"\n"
+        second_bytes = len(json.dumps(second_entry).encode("utf-8")) + 1
+        # Want prefer_start to fall in the middle of the first entry.
+        monkey_tail = second_bytes + (first_bytes // 2)
+        original_tail = monitor._AUQ_HYDRATE_TAIL_BYTES
+        monitor.__class__._AUQ_HYDRATE_TAIL_BYTES = monkey_tail
+        try:
+            result = await monitor._find_latest_pending_auq(f)
+        finally:
+            monitor.__class__._AUQ_HYDRATE_TAIL_BYTES = original_tail
+        # auq_first's JSON was clipped; partial-line drop discarded the
+        # clipped chunk; auq_tail was wholly visible → that's what we get.
+        assert result is not None
+        assert len(result["questions"]) == 2
+
+
+class TestAuqCacheHydration:
+    """Tests for SessionMonitor._hydrate_ask_tool_input_cache (orchestrator)."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_hydrates_cache_for_bound_window_with_pending_auq(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        # End-to-end: a bound window's session has a pending AUQ; after
+        # hydration, the public resolve_ask_tool_input returns its input.
+        from cctelegram.handlers import interactive_ui
+
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(jsonl, [_auq_tool_use_entry("auq_hydrate")])
+        sessions = [SessionInfo(session_id="sid-1", file_path=jsonl)]
+
+        async def fake_scan_projects():
+            return sessions
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+        # Start from a clean cache to avoid cross-test bleed.
+        interactive_ui._latest_ask_tool_input.pop("@7", None)
+
+        await monitor._hydrate_ask_tool_input_cache({"@7": "sid-1"})
+
+        cached = interactive_ui.resolve_ask_tool_input("@7")
+        assert cached is not None
+        assert isinstance(cached.get("questions"), list)
+        # Clean up for downstream tests.
+        interactive_ui._latest_ask_tool_input.pop("@7", None)
+
+    @pytest.mark.asyncio
+    async def test_skips_subagent_session_keys(self, monitor, tmp_path, monkeypatch):
+        # Defense in depth: ``sub:<parent>:agent-…`` keys in current_map are
+        # not supposed to exist (session_map only stores parent sessions),
+        # but if one ever slipped in, hydrating it under a parent window
+        # would mis-label pick buttons. Must be skipped silently.
+        from cctelegram.handlers import interactive_ui
+
+        jsonl = tmp_path / "subagent.jsonl"
+        _write_jsonl(jsonl, [_auq_tool_use_entry("auq_sub")])
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id="sub:parent-abc:agent-xyz", file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+        interactive_ui._latest_ask_tool_input.pop("@8", None)
+
+        await monitor._hydrate_ask_tool_input_cache({"@8": "sub:parent-abc:agent-xyz"})
+
+        # Cache untouched.
+        assert interactive_ui.resolve_ask_tool_input("@8") is None
+
+    @pytest.mark.asyncio
+    async def test_empty_map_is_a_noop(self, monitor):
+        # Bot started before any window is bound: no-op, no exception.
+        await monitor._hydrate_ask_tool_input_cache({})
+
+    @pytest.mark.asyncio
+    async def test_no_path_for_session_is_skipped(self, monitor, tmp_path, monkeypatch):
+        # scan_projects returns nothing for the bound session_id (e.g.
+        # JSONL hasn't been written yet, or the cwd isn't active right
+        # now). Must not raise, must not hydrate.
+        from cctelegram.handlers import interactive_ui
+
+        async def fake_scan_projects():
+            return []
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+        interactive_ui._latest_ask_tool_input.pop("@9", None)
+
+        await monitor._hydrate_ask_tool_input_cache({"@9": "sid-unknown"})
+        assert interactive_ui.resolve_ask_tool_input("@9") is None
+
+
+class TestAuqCacheClearOnSessionChange:
+    """Tests that _detect_and_cleanup_changes clears the AUQ cache for windows
+    whose session_id flipped (e.g. /clear in tmux). Without this, the cache
+    keyed only by window_id would survive across the session swap and the
+    next render would overlay dead-AUQ labels onto the new session's pane."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_flip_clears_auq_cache_for_changed_window(
+        self, monitor, monkeypatch
+    ):
+        from cctelegram.handlers import interactive_ui
+
+        # Seed the AUQ cache as if a render had captured an input for @11.
+        interactive_ui.remember_ask_tool_input(
+            "@11", {"questions": [{"options": [{"label": "x"}]}]}
+        )
+        assert interactive_ui.resolve_ask_tool_input("@11") is not None
+
+        monitor._last_session_map = {"@11": "session-old"}
+
+        async def fake_load_current_map():
+            return {"@11": "session-new"}
+
+        monkeypatch.setattr(monitor, "_load_current_session_map", fake_load_current_map)
+
+        await monitor._detect_and_cleanup_changes()
+
+        # /clear flipped the session under window @11 → cached AUQ tool_input
+        # belongs to the dead session and must be dropped.
+        assert interactive_ui.resolve_ask_tool_input("@11") is None

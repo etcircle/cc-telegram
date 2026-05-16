@@ -826,6 +826,7 @@ class SessionMonitor:
         if changed_window_ids:
             from .session import session_manager
             from .handlers import busy_indicator
+            from .handlers.interactive_ui import forget_ask_tool_input
 
             for user_id, thread_id, wid in session_manager.iter_thread_bindings():
                 if wid in changed_window_ids:
@@ -837,11 +838,194 @@ class SessionMonitor:
                         thread_id,
                         wid,
                     )
+            # The AUQ tool_input cache is keyed only by window_id (not by
+            # session_id), so a /clear that rebinds the same window to a new
+            # session would leave the old session's cached tool_input in
+            # place. Render path would then overlay options from the dead
+            # AUQ onto the new session's pane — a wrong-action class shape.
+            # Drop the cache for any window whose session_id changed.
+            for wid in changed_window_ids:
+                forget_ask_tool_input(wid)
 
         # Update last known map
         self._last_session_map = current_map
 
         return current_map
+
+    # Bounds for the startup AUQ-cache hydration JSONL tail read. Most live
+    # sessions are well under 1MB at the relevant tail; we read 1MB first and
+    # fall back to the whole file when smaller. The hard cap stops a
+    # pathologically long single-session JSONL from blocking startup. Class
+    # attributes so tests can monkey-patch them without reaching into method
+    # locals.
+    _AUQ_HYDRATE_TAIL_BYTES = 1 * 1024 * 1024
+    _AUQ_HYDRATE_HARD_CAP = 16 * 1024 * 1024
+
+    async def _hydrate_ask_tool_input_cache(self, current_map: dict[str, str]) -> None:
+        """Pre-populate the AskUserQuestion ``tool_input`` cache for windows
+        whose Claude session still has a pending AUQ on startup.
+
+        Bot restart wipes ``handlers.interactive_ui._latest_ask_tool_input``
+        and ``check_for_updates`` resumes from the persisted byte offset, so
+        a tool_use line consumed pre-restart never re-emits. Without this
+        hydration the poller's render path falls through to JSONL-missing →
+        pane-only, which renders a partial card when long option
+        descriptions push options 1-N off the visible pane region.
+
+        For each (window_id, session_id) in ``current_map``, locate the
+        session's JSONL via ``scan_projects`` and walk the tail looking for
+        the most recent AskUserQuestion tool_use whose tool_use_id has no
+        matching tool_result. Hydrate the cache for that window if found.
+        """
+        # Deferred import to avoid the circular: interactive_ui imports
+        # terminal_parser which imports session_monitor indirectly.
+        from .handlers.interactive_ui import remember_ask_tool_input
+
+        if not current_map:
+            return
+
+        # Build session_id → file_path from the active project scan rather
+        # than monitor_state alone — a corrupt or missing monitor_state would
+        # otherwise silently skip hydration even though the JSONL is
+        # discoverable on disk.
+        try:
+            sessions = await self.scan_projects()
+        except Exception as e:
+            logger.warning("AUQ hydrate: scan_projects failed: %s", e)
+            return
+        paths = {s.session_id: s.file_path for s in sessions}
+
+        for window_id, session_id in current_map.items():
+            # ``session_map.json`` is hook-written and only contains parent
+            # sessions, but defend explicitly against ``sub:<parent>:agent-*``
+            # keys: parent panes can't render subagent AUQs, and a wrong
+            # tool_input hydrated under a parent window would mis-label the
+            # pick buttons.
+            if session_id.startswith("sub:"):
+                continue
+
+            jsonl_path = paths.get(session_id)
+            if jsonl_path is None or not jsonl_path.exists():
+                continue
+
+            try:
+                tool_input = await self._find_latest_pending_auq(jsonl_path)
+            except Exception as e:
+                logger.warning(
+                    "AUQ hydrate: scan failed for window %s session %s: %s",
+                    window_id,
+                    session_id[:8],
+                    e,
+                )
+                continue
+
+            if tool_input is not None:
+                remember_ask_tool_input(window_id, tool_input)
+                logger.info(
+                    "AUQ cache hydrated for window %s session %s — "
+                    "%d question(s) from %s",
+                    window_id,
+                    session_id[:8],
+                    len(tool_input.get("questions", []))
+                    if isinstance(tool_input.get("questions"), list)
+                    else 0,
+                    jsonl_path.name,
+                )
+
+    async def _find_latest_pending_auq(self, jsonl_path: Path) -> dict | None:
+        """Return the ``tool_use.input`` of the most recent AskUserQuestion in
+        ``jsonl_path`` that has no matching ``tool_result``, or None.
+
+        Reads the JSONL tail (up to ``_AUQ_HYDRATE_TAIL_BYTES``; capped at
+        ``_AUQ_HYDRATE_HARD_CAP`` from the end). When mid-line at the read
+        start, the first partial line is dropped. Invalid JSON lines are
+        skipped silently — a partial trailing write isn't worth aborting the
+        whole scan.
+
+        Pairing semantics match ``transcript_parser``'s tool_use_id model:
+        an AUQ is "pending" iff its tool_use.id never appears as a sibling
+        ``tool_result.tool_use_id`` anywhere in the scanned region.
+        """
+        try:
+            stat = jsonl_path.stat()
+        except OSError:
+            return None
+        size = stat.st_size
+        if size == 0:
+            return None
+
+        prefer_start = max(0, size - min(size, self._AUQ_HYDRATE_TAIL_BYTES))
+        # Defensive hard cap: don't read more than HARD_CAP bytes even if the
+        # file is huge and the tail bytes constant is misconfigured.
+        prefer_start = max(prefer_start, size - self._AUQ_HYDRATE_HARD_CAP)
+
+        # Read one byte earlier so we can disambiguate "started mid-line" from
+        # "started exactly on a line boundary." Without this peek a tail window
+        # that lands on a newline would discard the first full line — silently
+        # missing the only pending AUQ if it happened to align with the cap.
+        read_start = max(0, prefer_start - 1) if prefer_start > 0 else 0
+
+        try:
+            async with aiofiles.open(jsonl_path, "rb") as f:
+                if read_start > 0:
+                    await f.seek(read_start)
+                buf = await f.read()
+        except OSError as e:
+            logger.debug("AUQ hydrate: read %s failed: %s", jsonl_path, e)
+            return None
+
+        if read_start > 0:
+            # buf[0] is the byte at (prefer_start - 1) on disk.
+            if buf[:1] == b"\n":
+                # prefer_start is a line boundary — drop only the terminator,
+                # keep the line that starts at prefer_start.
+                buf = buf[1:]
+            else:
+                # prefer_start landed mid-line — drop everything up to and
+                # including the next newline so we resume at the next full
+                # line.
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    return None
+                buf = buf[nl + 1 :]
+
+        answered_ids: set[str] = set()
+        candidates: list[dict] = []
+
+        for raw_line in buf.split(b"\n"):
+            if not raw_line.strip():
+                continue
+            try:
+                entry = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(entry, dict):
+                continue
+            msg = entry.get("message")
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                ctype = c.get("type")
+                if ctype == "tool_use" and c.get("name") == "AskUserQuestion":
+                    tid = c.get("id")
+                    inp = c.get("input")
+                    if isinstance(tid, str) and isinstance(inp, dict):
+                        candidates.append({"id": tid, "input": inp})
+                elif ctype == "tool_result":
+                    rid = c.get("tool_use_id")
+                    if isinstance(rid, str):
+                        answered_ids.add(rid)
+
+        # Most recent unanswered AUQ wins.
+        for cand in reversed(candidates):
+            if cand["id"] not in answered_ids:
+                return cand["input"]
+        return None
 
     async def _monitor_loop(self) -> None:
         """Background loop for checking session updates.
@@ -857,6 +1041,16 @@ class SessionMonitor:
         await self._cleanup_all_stale_sessions()
         # Initialize last known session_map
         self._last_session_map = await self._load_current_session_map()
+
+        # Hydrate the AskUserQuestion tool_input cache from the JSONL tail of
+        # each currently-bound (window_id, session_id). Bot restart wipes the
+        # in-memory cache in handlers.interactive_ui, and ``check_for_updates``
+        # resumes from the persisted byte offset — so an AUQ tool_use line
+        # already consumed pre-restart never re-emits, and a still-pending
+        # AUQ on the pane renders as a partial pane-only card. Run after
+        # cleanup + map load so we don't hydrate from stale bindings, and
+        # before the polling loop so the first tick has a populated cache.
+        await self._hydrate_ask_tool_input_cache(self._last_session_map)
 
         while self._running:
             try:
