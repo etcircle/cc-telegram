@@ -1333,9 +1333,15 @@ class TestResolveAskForm:
         # firmly-below-threshold case.)
         assert form.is_review_screen is False
 
-    def test_drift_below_strong_match_threshold_demotes_inferred(self):
+    def test_drift_below_strong_match_threshold_falls_back_to_pane(self):
         # Stronger drift: pane shows 4 options; only 1 overlaps with Q1.
-        # 1/4 = 25% < 50% strong-match threshold → demote inferred=False.
+        # 1/4 = 25% < 50% strong-match threshold AND title doesn't substring.
+        # No JSONL question strong-matches the pane — JSONL is stale (e.g.,
+        # Claude has emitted a fresh AskUserQuestion tool_use that hasn't
+        # been flushed to the JSONL file yet). Fall back to pane-only so the
+        # renderer mints pick buttons against the labels the user actually
+        # sees, instead of suppressing buttons (or worse, dispatching JSONL-
+        # labelled buttons against the pane's different question).
         tool_input = {
             "questions": [
                 {
@@ -1366,14 +1372,13 @@ class TestResolveAskForm:
         )
         form = resolve_ask_form(tool_input, pane)
         assert form is not None
-        # _infer_current_tab_idx scored Q1=1, Q2=0 → unique winner Q1,
-        # inferred=True. Strong-match (CB6) then demotes because:
-        #   - title substring: "Pick approach." not in pane title
-        #   - option overlap: 1/4 = 25% < 50%
-        # Result: current_tab_inferred=False, options stay as JSONL Q1
-        # (no overlay), pick buttons suppressed.
-        assert form.current_tab_inferred is False
-        assert [o.label for o in form.options] == ["alpha", "beta"]
+        # JSONL-stale fallback: pane wins entirely. The result is a
+        # single-tab form whose options match the live pane.
+        assert form.questions == ()
+        assert [o.label for o in form.options] == ["alpha", "zeta", "eta", "theta"]
+        # Cursor preserved from pane parse.
+        assert form.options[0].cursor is True
+        assert all(o.cursor is False for o in form.options[1:])
 
     def test_title_substring_match_passes_strong_match(self):
         # Wrapped/truncated pane title is still a substring of the JSONL
@@ -1403,3 +1408,173 @@ class TestResolveAskForm:
         # Title substring is well above the 8-char floor; CB6 keeps inferred=True.
         assert form.current_tab_inferred is True
         assert form.current_question_title.startswith("Pick approach")
+
+    def test_jsonl_stale_etvideo_repro_falls_back_to_pane(self):
+        # Real 2026-05-16 repro from the etvideo-editor session. JSONL's
+        # latest AUQ tool_use was the 2-question "Test video" / "Paid calls"
+        # form. The pane meanwhile had advanced to a brand-new AUQ
+        # ("Video scope", 3 visible options about MediaProvider framework)
+        # whose tool_use had not yet been flushed to JSONL. The renderer
+        # previously suppressed pick buttons via FA5+ (multi-q inference
+        # failed because no JSONL question strong-matched the pane), leaving
+        # the user with a card showing the OLD question's options and no
+        # working controls. New behaviour: fall back to pane-only so pick
+        # buttons render against the labels the user actually sees.
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Which source video should the end-to-end run use?",
+                    "header": "Test video",
+                    "options": [
+                        {"label": "temp/WIN_20260513...Pro.mp4"},
+                        {"label": "Reuse an existing workspace"},
+                        {"label": "temp/smoke-source.mp4"},
+                    ],
+                },
+                {
+                    "question": (
+                        "For the sound-regeneration step, are paid "
+                        "providers (xAI TTS) authorized for this test?"
+                    ),
+                    "header": "Paid calls",
+                    "options": [
+                        {"label": "Mock only (free)"},
+                        {"label": "xAI authorized for this run"},
+                    ],
+                },
+            ]
+        }
+        # Pane is on a completely different AUQ — different title, no option
+        # labels in common with either JSONL question.
+        pane = (
+            "How much of the video-generation pipeline should this "
+            "program build now?\n"
+            "\n"
+            "  1. Framework + migrate 3 pipelines\n"
+            "❯ 2. Above + a real video provider\n"
+            "  3. Framework + 1 proof pipeline\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(tool_input, pane)
+        assert form is not None
+        # Pane-only fallback: single-tab shape, pane's options + cursor.
+        assert form.questions == ()
+        assert [o.label for o in form.options] == [
+            "Framework + migrate 3 pipelines",
+            "Above + a real video provider",
+            "Framework + 1 proof pipeline",
+        ]
+        assert form.options[1].cursor is True
+        # current_tab_inferred is True for pane-only (set by
+        # parse_ask_user_question); FA5+ guard doesn't fire because
+        # len(questions) <= 1.
+        assert form.current_tab_inferred is True
+
+    def test_jsonl_stale_single_q_drift_falls_back_to_pane(self):
+        # Sub-case of the same bug class for single-question JSONL: pane
+        # shows a different AUQ entirely. Without the stale check the
+        # renderer would graft pane.options' cursor onto JSONL labels,
+        # producing a wrong-action class bug — buttons read as the OLD
+        # answers but a click dispatches the digit against the live pane's
+        # different question.
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Pick a color.",
+                    "options": [
+                        {"label": "red"},
+                        {"label": "green"},
+                        {"label": "blue"},
+                    ],
+                }
+            ]
+        }
+        pane = (
+            "Pick a fruit.\n"
+            "\n"
+            "❯ 1. apple\n"
+            "  2. banana\n"
+            "  3. cherry\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(tool_input, pane)
+        assert form is not None
+        # Fall back to pane: labels match what the user sees.
+        assert [o.label for o in form.options] == ["apple", "banana", "cherry"]
+        assert form.options[0].cursor is True
+
+    def test_jsonl_stale_skipped_on_review_screen(self):
+        # On a review screen the pane's visible options are Submit/Cancel,
+        # which never strong-match a JSONL question's answer labels. The
+        # stale check must NOT fire here — the existing review-screen
+        # branches (line 953 single-q, line 987 multi-q) handle this
+        # correctly by preserving the JSONL questions matrix for tab-strip
+        # context while using pane options for the Submit/Cancel buttons.
+        pane = (
+            "Review your answers\n"
+            "Ready to submit your answers?\n"
+            "\n"
+            "❯ 1. Submit answers\n"
+            "  2. Cancel\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(self._multi_q_input(), pane)
+        assert form is not None
+        # Review-screen branch took over (not the stale fallback). JSONL
+        # questions are still attached for tab-strip rendering.
+        assert form.is_review_screen is True
+        assert len(form.questions) == 2
+
+    def test_jsonl_stale_skipped_at_overlap_boundary_unrelated_title(self):
+        # Mid-redraw guard at the 50% boundary, exercising the OVERLAP
+        # branch of _strong_match in isolation: pane title is unrelated to
+        # any JSONL question title (so the title branch cannot pass), but
+        # exactly 1 of 2 pane labels matches Q1 (1/2 = 50% which IS ≥50%).
+        # _strong_match returns True via the overlap branch; JSONL stale
+        # gate must NOT fire. This pins the 50% boundary semantics —
+        # without it the prior test passed via title match and a refactor
+        # of ``overlap * 2 >= len(pane_labels)`` could silently break the
+        # gate (Hermes review P2 on PR #23).
+        pane = (
+            "Some unrelated picker title 12345678\n"  # ≥8 chars, no JSONL match
+            "\n"
+            "❯ 1. A — option A label\n"  # exact label from Q1
+            "  2. mid-redraw-garbage\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(self._multi_q_input(), pane)
+        assert form is not None
+        # Overlap branch passed → JSONL Q1 is current tab, NOT pane-only.
+        assert len(form.questions) == 2
+        # The existing path overlays JSONL Q1's title.
+        assert form.current_question_title == "Pick approach."
+
+    def test_jsonl_stale_falls_back_below_overlap_boundary_unrelated_title(self):
+        # Companion to the boundary test: below the 50% overlap threshold
+        # AND with no title match, _strong_match returns False for every
+        # JSONL question → JSONL is stale → pane-only fallback. Pins the
+        # below-boundary half of the gate (Hermes review P2 on PR #23).
+        pane = (
+            "Some unrelated picker title 12345678\n"  # no JSONL title match
+            "\n"
+            "❯ 1. A — option A label\n"  # 1 match
+            "  2. mid-redraw-garbage\n"  # 0
+            "  3. another-unrelated-label\n"  # 0
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        # 1 of 3 pane labels overlaps Q1 (33%), 0 overlaps Q2 → no strong
+        # match anywhere → stale fallback.
+        form = resolve_ask_form(self._multi_q_input(), pane)
+        assert form is not None
+        assert form.questions == ()
+        assert [o.label for o in form.options] == [
+            "A — option A label",
+            "mid-redraw-garbage",
+            "another-unrelated-label",
+        ]
+        assert form.options[0].cursor is True

@@ -934,6 +934,43 @@ def resolve_ask_form(
         # No JSONL — pure pane fallback.
         return pane_form
 
+    # JSONL-stale detection. Claude buffers an assistant turn before
+    # writing it to JSONL, so a fresh AskUserQuestion tool_use can be
+    # live on the pane while ``tool_input`` still points at the
+    # *previous* AUQ. The render then overlays a pane that doesn't
+    # reconcile with the cached questions:
+    #
+    #   * single-q stale → wrong-action class: pick buttons render
+    #     JSONL labels but a click dispatches the digit against the
+    #     pane's different question (e.g. clicking "1. Old answer A"
+    #     submits "Option 1 of the new question").
+    #   * multi-q stale → FA5+ guard suppresses pick buttons (correct
+    #     defense, but the user is stuck with no working surface).
+    #
+    # Detection: pane has non-empty options AND no JSONL question
+    # ``_strong_match``-es the pane. Skip on review screens (pane is
+    # already authoritative there and the existing branches preserve
+    # the JSONL questions matrix for tab-strip context). Falling back
+    # to ``pane_form`` gives the renderer a clean single-tab shape
+    # whose option labels match the live pane — pick buttons dispatch
+    # against the right question, and the cursor overlay works.
+    if (
+        pane_form is not None
+        and not pane_form.is_review_screen
+        and pane_form.options
+        and not any(_strong_match(q, pane_form) for q in jsonl_form.questions)
+    ):
+        logger.info(
+            "resolve_ask_form JSONL STALE: pane has %d options that don't "
+            "match any of %d JSONL questions; falling back to pane-only. "
+            "pane_title=%r jsonl_titles=%r",
+            len(pane_form.options),
+            len(jsonl_form.questions),
+            (pane_form.current_question_title or "<none>")[:80],
+            [q.title[:80] for q in jsonl_form.questions],
+        )
+        return pane_form
+
     if len(jsonl_form.questions) <= 1:
         # Single-question review screen: pane is authoritative, same as the
         # multi-question short-circuit below. Claude Code's single-question
