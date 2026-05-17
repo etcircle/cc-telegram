@@ -865,7 +865,7 @@ class SessionMonitor:
         """Pre-populate the AskUserQuestion ``tool_input`` cache for windows
         whose Claude session still has a pending AUQ on startup.
 
-        Bot restart wipes ``handlers.interactive_ui._latest_ask_tool_input``
+        Bot restart wipes ``handlers.interactive_ui._last_completed_ask_tool_input``
         and ``check_for_updates`` resumes from the persisted byte offset, so
         a tool_use line consumed pre-restart never re-emits. Without this
         hydration the poller's render path falls through to JSONL-missing →

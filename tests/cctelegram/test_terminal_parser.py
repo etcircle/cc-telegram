@@ -209,6 +209,45 @@ class TestExtractInteractiveContent:
         assert "Live A" in result.content
         assert "Old A" not in result.content
 
+    def test_ask_user_mixed_pattern_shadow_old_checkbox_above_live_plain(self):
+        # P1 trap (Hermes review of bc6eaed): the single-tab checkbox AUQ
+        # pattern (top=``☐``, bottom=``Enter to select``) runs BEFORE the
+        # plain-numbered pattern in UI_PATTERNS. With bottom_up the
+        # checkbox pattern's walk-back from the LIVE plain-numbered
+        # footer can find a ``☐`` line in the OLD checkbox picker above,
+        # returning a region that starts in the stale checkbox and ends
+        # in the live plain-numbered options. The fix: when the walk-back
+        # crosses an OLDER instance of pattern.bottom, bail so a later
+        # pattern can try.
+        pane = (
+            "Stale multi-select question?\n"
+            "\n"
+            "  ☐ Old Alpha\n"
+            "  ☐ Old Beta\n"
+            "  ☐ Old Gamma\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+            "\n"
+            "intervening tool output and scrollback\n"
+            "\n"
+            "Live numbered question?\n"
+            "\n"
+            "❯ 1. Live A\n"
+            "  2. Live B\n"
+            "  3. Live C\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+        # Must extract the LIVE plain-numbered region, not shadow with
+        # the stale checkbox top.
+        assert "Live A" in result.content
+        assert "Old Alpha" not in result.content
+        assert "Old Beta" not in result.content
+        assert "Old Gamma" not in result.content
+
     def test_permission_prompt_no_longer_detected(self, sample_pane_permission: str):
         # Wave 2: PermissionPrompt is dead code under
         # ``--dangerously-skip-permissions`` (the deployment's mode), so the

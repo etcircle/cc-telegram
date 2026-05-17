@@ -2940,13 +2940,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         from .handlers.interactive_ui import resolve_ask_tool_input
         from .terminal_parser import resolve_ask_form
 
-        # PR 3.2: capture with the SAME scrollback as the render path
-        # (handlers/interactive_ui.py uses scrollback_lines=100). Default
-        # scrollback_lines=0 produced a different pane slice → different
-        # ``current_tab_inferred`` / ``current_question_title`` / options
-        # → different fingerprint at validate vs mint, causing every
-        # multi-tab tap to bounce with "Form changed, refreshing".
-        pane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=100)
+        # Capture with the SAME scrollback as the render path
+        # (handlers/interactive_ui.py uses scrollback_lines=500). A
+        # smaller scrollback here produces a different pane slice from
+        # what render saw → different ``current_tab_inferred`` /
+        # ``current_question_title`` / options → fingerprint mismatch at
+        # validate vs mint, causing taps on long pickers (where options
+        # were only recoverable in the 500-line capture) to bounce with
+        # "Form changed, refreshing".
+        pane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
         cached_input = resolve_ask_tool_input(window_id)
         current_form = resolve_ask_form(cached_input, pane) if pane else None
         if current_form is None or current_form.fingerprint() != entry.fingerprint:

@@ -165,7 +165,12 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
         if bottom_idx is None:
             return None
         found_top = False
-        for i in range(bottom_idx, -1, -1):
+        # Walk back from bottom_idx - 1: the bottom line itself can't be
+        # the top, and starting one above lets us bail cleanly when we
+        # cross an OLDER instance of the bottom marker (which would
+        # indicate that the top we're about to find belongs to a stale
+        # picker, not the live one).
+        for i in range(bottom_idx - 1, -1, -1):
             if any(p.search(lines[i]) for p in pattern.top):
                 top_idx = i
                 found_top = True
@@ -179,6 +184,20 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
                 ):
                     continue
                 break
+            # Pre-top-found bail: when walking back from the live footer
+            # to find a matching top, encountering an OLDER instance of
+            # the same bottom marker means there's a complete prior
+            # picker between bottom_idx and any candidate top above. The
+            # earlier picker's footer is at lines[i]; whatever top we'd
+            # find above it belongs to the OLDER picker, not the live
+            # one anchored at bottom_idx. Bail so a later pattern in
+            # UI_PATTERNS can try (e.g. plain-numbered after
+            # single-tab-checkbox). Without this guard, a checkbox AUQ
+            # in scrollback above a live plain-numbered AUQ shadowed
+            # the live picker — the checkbox pattern walked past the
+            # live plain-numbered options to find an old ☐ top.
+            if pattern.bottom and any(p.search(lines[i]) for p in pattern.bottom):
+                return None
     else:
         for i, line in enumerate(lines):
             if top_idx is None:
@@ -1020,13 +1039,13 @@ def resolve_ask_form(
             (pane_form.current_question_title or "<none>")[:80],
             [q.title[:80] for q in jsonl_form.questions],
         )
-        # Tag the form so the renderer's defer / pick-suppression gate can
-        # tell "pane-only because no JSONL was ever cached" (cache_empty)
-        # apart from "pane-only because the JSONL cache held a DIFFERENT
-        # question" (cache stale). Both cases share the same hazard when
-        # the pane shows only a tail of the option list (first option
-        # number > 1): minting pick buttons on the visible 2-3 options
-        # ships a partial card that hides the real choices. ``_meta`` is
+        # Tag the form so the renderer can distinguish "pane-only
+        # because no JSONL was ever cached" (cache_empty) from
+        # "pane-only because the JSONL cache held a DIFFERENT question"
+        # (cache stale). The contiguous-from-1 mint gate downstream
+        # protects both cases when the pane shows only a tail of the
+        # option list, but the tag remains useful for diagnostic logs
+        # and the callback-rerender notice path. ``_meta`` is
         # ``compare=False`` and excluded from ``_canonical_repr`` /
         # ``fingerprint``, so this tag doesn't invalidate live pick-token
         # callbacks minted against earlier renders.
