@@ -72,62 +72,32 @@ _interactive_msgs: dict[tuple[int, int], int] = {}
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
 
-# Cache of the most recent AskUserQuestion ``tool_use.input`` payload keyed by
-# window_id. JSONL dispatch (``bot.handle_new_message``) passes ``tool_input``
-# directly to ``handle_interactive_ui``; the status-poller dispatch (which is
-# the safety-net path for stale events or restart replays) has only the pane
-# text. Reading the cached input here lets the poller render the same
-# structured option list as the JSONL path instead of falling back to a
-# scrollback-truncated pane parse.
-_latest_ask_tool_input: dict[str, dict] = {}
-
-# P1.4: poller-driven render defer state. When the status poller detects an
-# AskUserQuestion in the pane before session_monitor parses the matching
-# tool_use JSONL entry, we defer the render until the cache catches up. If
-# the cache never arrives (session_monitor stall, file rotation, etc.),
-# bounded-wait kicks in after RENDER_FALLBACK_TIMEOUT_S and we force-render
-# with the pane form only. Key is window_id; value is the monotonic
-# timestamp of the FIRST defer for that window in the current cycle.
-_render_deferred_since: dict[str, float] = {}
-_RENDER_FALLBACK_TIMEOUT_S: float = 8.0  # env-overridable via config
-
-
-def _clear_render_defer(window_id: str) -> None:
-    """Reset the poller-defer state for ``window_id`` (cache arrived or pane left)."""
-    _render_deferred_since.pop(window_id, None)
-
-
-def _reset_render_defer_for_tests() -> None:
-    """Test-only: clear all defer state."""
-    _render_deferred_since.clear()
-
-
-def _clear_render_defer_on_cache(window_id: str) -> None:
-    """P1.4: clear the poller-defer marker when JSONL arrives."""
-    _render_deferred_since.pop(window_id, None)
+# Replay cache of the last completed/JSONL-visible AskUserQuestion
+# ``tool_use.input`` payload keyed by window_id. This is NOT a live source
+# for a currently pending AUQ: Claude Code writes the AUQ ``tool_use`` line
+# to JSONL only after the user answers. The active picker's source of truth
+# is the tmux pane. This cache is only an enhancement for explicit JSONL
+# dispatches and narrow restart/replay hydration cases where a completed
+# AUQ payload is available but the Telegram card still needs rendering.
+_last_completed_ask_tool_input: dict[str, dict] = {}
 
 
 def remember_ask_tool_input(window_id: str, tool_input: dict | None) -> None:
     """Store the latest AskUserQuestion ``tool_use.input`` for a window."""
     if isinstance(tool_input, dict):
-        _latest_ask_tool_input[window_id] = tool_input
-        # P1.4: cache just arrived → drop any pending defer marker so the
-        # next poller / monitor render uses the JSONL-overlay path.
-        _clear_render_defer_on_cache(window_id)
+        _last_completed_ask_tool_input[window_id] = tool_input
 
 
 def forget_ask_tool_input(window_id: str) -> None:
     """Drop the cached AskUserQuestion input for a window (e.g. on tool_result)."""
-    _latest_ask_tool_input.pop(window_id, None)
-    # P1.4: stale defer state on tool_result has no business persisting.
-    _clear_render_defer_on_cache(window_id)
+    _last_completed_ask_tool_input.pop(window_id, None)
 
 
 def _resolve_ask_tool_input(window_id: str, explicit: dict | None) -> dict | None:
     """Pick the freshest tool_input available for an AskUserQuestion render."""
     if explicit is not None:
         return explicit
-    return _latest_ask_tool_input.get(window_id)
+    return _last_completed_ask_tool_input.get(window_id)
 
 
 # Public sibling-imported alias for use by ``bot.py`` callback handlers.
@@ -143,7 +113,7 @@ def resolve_ask_tool_input(window_id: str) -> dict | None:
     ``resolve_ask_form`` the same JSONL payload the render path saw, so
     the two paths produce byte-identical fingerprints.
     """
-    return _latest_ask_tool_input.get(window_id)
+    return _last_completed_ask_tool_input.get(window_id)
 
 
 # ── PR 3: rerender_guard sentinel + digest helper ────────────────────────
@@ -205,8 +175,9 @@ def _ask_tool_input_digest(payload: dict | None) -> str | None:
 #       ``handle_interactive_ui`` happens after the last await, so a
 #       concurrent clear can't tear it.
 #     * ``_interactive_mode`` — same shape as ``_interactive_msgs``.
-#     * ``_latest_ask_tool_input`` — written by ``session_monitor``
-#       (single writer) and read everywhere; dict ops are atomic enough.
+#     * ``_last_completed_ask_tool_input`` — replay cache written by
+#       ``session_monitor`` (single writer) and read everywhere; dict ops
+#       are atomic enough. It is not a live pending-AUQ source.
 #
 #   RELEASED across Telegram I/O awaits — serializing those would stall
 #   multi-route concurrency.
@@ -821,6 +792,18 @@ def _build_pick_button_rows(
         )
         return []
 
+    if not form.options_contiguous_from_one():
+        logger.info(
+            "_build_pick_button_rows SUPPRESSED gate=non_contiguous_from_one "
+            "questions=%d options=%d numbers=%r is_review_screen=%s question_title=%r",
+            len(form.questions),
+            len(form.options),
+            [opt.number for opt in form.options],
+            form.is_review_screen,
+            (form.current_question_title or "<none>")[:80],
+        )
+        return []
+
     # FA5+: multi-tab form without confirmed current-tab inference.
     # Suppress pick buttons entirely — keystroke nav remains.
     if len(form.questions) > 1 and not form.current_tab_inferred:
@@ -1139,7 +1122,7 @@ async def _handle_multi_tab_ask(
         # the callback path from the monitor path.
         if rerender_guard is not _NO_GUARD:
             current_digest = _ask_tool_input_digest(
-                _latest_ask_tool_input.get(window_id)
+                _last_completed_ask_tool_input.get(window_id)
             )
             if current_digest != rerender_guard:
                 logger.info(
@@ -1548,16 +1531,15 @@ async def handle_interactive_ui(
     RestoreCheckpoint UIs. Returns True if UI was detected and sent,
     False otherwise.
 
-    ``tool_input`` is the raw JSONL ``tool_use.input`` dict when available.
-    For AskUserQuestion, this carries the complete option list independent
-    of the tmux pane's visible region. The pane scrape sees only what's
-    on screen, so long question text pushes early options off the top —
-    using the structured payload here is order-stable and complete. The
-    pane is still captured for the verbatim text excerpt and the keystroke
-    fallback path.
+    ``tool_input`` is the raw JSONL ``tool_use.input`` dict when explicitly
+    available from JSONL dispatch/replay. For a live pending AskUserQuestion,
+    JSONL is not authoritative because Claude Code buffers the ``tool_use``
+    line until the user answers; the tmux pane is the active source of truth.
+    The pane is captured for structured AUQ parsing, verbatim text excerpt,
+    and the keystroke fallback path.
 
     ``rerender_guard`` (PR 3, plan v5 §Re-render guard) is a content digest
-    snapshot of ``_latest_ask_tool_input[window_id]`` taken before the
+    snapshot of ``_last_completed_ask_tool_input[window_id]`` taken before the
     caller (the pick-token callback handler) released the route lock. The
     handler compares it against the current cache value; if the cache was
     cleared or replaced between callback exit and re-render entry, abort
@@ -1596,7 +1578,7 @@ async def handle_interactive_ui(
     # Picker confirmed live. Now capture with scrollback for the structured
     # parse — long AskUserQuestion text pushes early options off the top of
     # the visible pane, and the parser needs them.
-    pane_text = await tmux_manager.capture_pane(w.window_id, scrollback_lines=100)
+    pane_text = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
     if not pane_text:
         logger.debug("No pane text captured for window_id %s", window_id)
         return False
@@ -1638,110 +1620,43 @@ async def handle_interactive_ui(
             if form is None:
                 form = parse_ask_user_question(pane_text)
 
-        # P1.4 — poller/JSONL race deferral.
-        #
-        # The status poller can detect an interactive UI in the pane
-        # BEFORE session_monitor has parsed the matching tool_use JSONL
-        # entry and called ``remember_ask_tool_input``. With the cache
-        # empty, ``resolve_ask_form`` falls back to a pane-only parse and
-        # the pane scrape can miss options 1-N if the visible region only
-        # shows the picker trailer ("Type something" / "Chat about this").
-        # Rendering a card with options 4-5 only is the worst case — the
-        # user sees a partial picker and can't access the real choices.
-        #
-        # Same-session AUQ-to-AUQ race: when one AUQ resolves and Claude
-        # immediately fires another, the cache still holds the previous
-        # AUQ's tool_input until session_monitor parses the new tool_use.
-        # ``resolve_ask_form`` detects the JSONL/pane mismatch and tags
-        # the returned form with ``_meta["stale_fallback"]="1"``; treat
-        # that the same as cache-empty here (cache is non-None but
-        # unusable for the live pane). Without this branch, the partial
-        # 2-option card from the example bug ships through.
-        #
-        # Defer policy:
-        #   - (Cache empty OR stale fallback) + first visible option > 1
-        #     + we got here from the poller → record/check defer timestamp;
-        #     bail unless bounded-wait elapsed.
-        #   - Cache empty/stale + first option == 1 → pane is the complete
-        #     picker (no JSONL yet, or the new question happens to fit) —
-        #     render normally.
-        #   - Cache populated AND fresh → clear any defer timestamp, render.
-        #   - Non-poller path (callback rerender) + stale fallback + partial
-        #     → no defer (we don't want to stall an interactive callback),
-        #     but suppress pick-button mint so we never dispatch the visible
-        #     digits against a question whose other options are off-screen.
+        # Active AUQs do not have a live JSONL payload: Claude Code buffers
+        # the AskUserQuestion ``tool_use`` line until the user answers. The
+        # pane parse is therefore authoritative while the picker is pending.
+        # If the pane starts at option >1, earlier choices are scrolled off;
+        # render the visible structured text immediately, suppress unsafe
+        # pick buttons, and tell the user to use manual navigation/text.
+        p14_suppress_picks = False
+        partial_options_notice: str | None = None
         if form is not None and form.options:
-            cache_empty = resolved_input is None
             stale_fallback_form = form._meta.get("stale_fallback") == "1"
-            cache_unusable = cache_empty or stale_fallback_form
             first_num = form.options[0].number or 0
+            last_num = form.options[-1].number or first_num
             partial_pane = first_num > 1
-            if from_poller and cache_unusable and partial_pane:
-                first_seen = _render_deferred_since.get(window_id)
-                now = time.monotonic()
-                if first_seen is None:
-                    _render_deferred_since[window_id] = now
-                    logger.info(
-                        "P1.4 deferring poller render for window %s — JSONL %s, "
-                        "pane shows partial options (first=%d)",
-                        window_id,
-                        "stale" if stale_fallback_form else "empty",
-                        first_num,
-                    )
-                    return False
-                elapsed = now - first_seen
-                timeout = float(getattr(config, "render_fallback_timeout_s", 8.0))
-                if elapsed < timeout:
-                    logger.debug(
-                        "P1.4 still deferring window %s — elapsed %.1fs < %.1fs",
-                        window_id,
-                        elapsed,
-                        timeout,
-                    )
-                    return False
-                # Bounded-wait exceeded: force-render with what we have.
-                # Clear the defer timestamp so subsequent ticks don't keep
-                # logging this as "first time." Mint code already sees an
-                # empty ``questions`` tuple on pane-only forms; we don't
-                # need to flip current_tab_inferred because mint already
-                # falls through to the keystroke keyboard when there are
-                # no JSONL-known options. But to be safe against future
-                # mint-code changes, suppress pick-button mint explicitly
-                # for this branch via a separate flag.
-                logger.warning(
-                    "P1.4 bounded-wait elapsed (%.1fs) for window %s — "
-                    "force-rendering pane-only form without pick buttons",
-                    elapsed,
-                    window_id,
-                )
-                _clear_render_defer(window_id)
-                # Mark the form so the mint gate suppresses pick buttons
-                # below. Setting an explicit flag is more robust than
-                # relying on ``current_tab_inferred`` (single-card forms
-                # don't gate on it) or ``len(questions) > 1`` (a pure
-                # pane-only form has questions=()).
+            if partial_pane:
                 p14_suppress_picks = True
-            elif from_poller and not cache_unusable:
-                _clear_render_defer(window_id)
-                p14_suppress_picks = False
-            elif not from_poller and stale_fallback_form and partial_pane:
-                # Callback rerender path (no fresh tool_input passed): the
-                # picker advanced on the pane while the JSONL cache still
-                # holds the previous AUQ. Render the card so the user
-                # sees updated state without stalling, but don't mint pick
-                # buttons against options whose numbering belongs to the
-                # OLD question. Keystroke nav (Tab/arrows/Enter/Esc) stays
-                # available so the user can drive the picker manually.
+                partial_options_notice = (
+                    f"Only options {first_num}-{last_num} are visible; "
+                    "use ↑/↓/Tab below or send your answer as text."
+                )
                 logger.info(
-                    "stale_fallback + partial_pane on non-poller render for "
-                    "window %s — suppressing pick buttons (keystroke nav available)",
+                    "AskUserQuestion partial pane for window %s — visible "
+                    "options %d-%d; suppressing pick buttons",
+                    window_id,
+                    first_num,
+                    last_num,
+                )
+            elif stale_fallback_form:
+                # A stale replay cache cannot safely mint direct option picks
+                # even if the visible pane starts at 1; keystroke navigation
+                # remains available and the next explicit JSONL dispatch can
+                # upgrade the card.
+                p14_suppress_picks = True
+                logger.info(
+                    "AskUserQuestion stale replay cache for window %s — "
+                    "rendering immediately without pick buttons",
                     window_id,
                 )
-                p14_suppress_picks = True
-            else:
-                p14_suppress_picks = False
-        else:
-            p14_suppress_picks = False
         # Multi-tab dispatch DISABLED at user request (2026-05-15):
         # PRs #11/12/13 shipped a per-tab card state machine. Live
         # testing surfaced enough rough edges (timeout cascades,
@@ -1764,9 +1679,8 @@ async def handle_interactive_ui(
             structured = _render_ask_user_question(form)
             if structured:
                 text = structured
-            # P1.4: skip the mint entirely on bounded-wait force-render —
-            # keystroke nav stays available so the user can scroll the
-            # picker and pick manually until the JSONL upgrade arrives.
+            if partial_options_notice:
+                text = f"{text}\n\n{partial_options_notice}"
             if not p14_suppress_picks:
                 built = _build_pick_button_rows(user_id, thread_id, window_id, form)
                 if built:

@@ -231,9 +231,9 @@ async def update_status_message(
             window_id,
             thread_id,
         )
-        # P1.4: tag this as the poller call path so handle_interactive_ui
-        # can defer when the JSONL tool_use cache hasn't caught up yet
-        # (avoids rendering a partial card that's missing options 1-N).
+        # Tag this as the poller call path so handle_interactive_ui can
+        # apply AUQ pane-only safety rules when JSONL replay data is absent
+        # or stale (render immediately, but suppress unsafe pick buttons).
         await handle_interactive_ui(
             bot, user_id, window_id, thread_id, from_poller=True
         )

@@ -185,6 +185,30 @@ class TestExtractInteractiveContent:
         assert "Enter to select" in result.content
         assert "1. Stay with no labels" in result.content
 
+    def test_ask_user_extracts_bottom_region_when_scrollback_has_old_picker(self):
+        pane = (
+            "Old question?\n"
+            "\n"
+            "❯ 1. Old A\n"
+            "  2. Old B\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+            "\n"
+            "tool output and conversation scrollback\n"
+            "\n"
+            "Live question?\n"
+            "\n"
+            "❯ 1. Live A\n"
+            "  2. Live B\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+        assert "Live A" in result.content
+        assert "Old A" not in result.content
+
     def test_permission_prompt_no_longer_detected(self, sample_pane_permission: str):
         # Wave 2: PermissionPrompt is dead code under
         # ``--dangerously-skip-permissions`` (the deployment's mode), so the

@@ -199,18 +199,6 @@ class Config:
             os.getenv("CC_TELEGRAM_REPLY_CROSS_SESSION", "true").lower() != "false"
         )
 
-        # P1.4: how long the poller-driven render path defers when the
-        # JSONL tool_use cache hasn't caught up yet. After this elapses,
-        # the renderer force-renders with whatever the pane shows and
-        # does NOT mint pick buttons (manual nav only). The session_monitor
-        # may still upgrade the card on the next JSONL parse cycle.
-        try:
-            self.render_fallback_timeout_s = float(
-                os.getenv("CC_TELEGRAM_RENDER_FALLBACK_TIMEOUT_S", "8.0")
-            )
-        except ValueError:
-            self.render_fallback_timeout_s = 8.0
-
         # Upper bound on the quoted-text excerpt injected into Claude's
         # prompt. The full original text still lives in the Telegram message,
         # and Stage 5.c will keep a SQLite copy for rehydration; this cap just

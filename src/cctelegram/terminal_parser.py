@@ -41,12 +41,15 @@ class InteractiveUIContent:
 class UIPattern:
     """A text-marker pair that delimits an interactive UI region.
 
-    Extraction scans lines top-down: the first line matching any `top` pattern
-    marks the start, the first subsequent line matching any `bottom` pattern
-    marks the end.  Both boundary lines are included in the extracted content.
+    Extraction normally scans lines top-down: the first line matching any
+    `top` pattern marks the start, the first subsequent line matching any
+    `bottom` pattern marks the end. Both boundary lines are included in the
+    extracted content. Patterns with ``bottom_up=True`` scan from the live
+    footer/bottom marker upward so old scrollback regions cannot shadow the
+    currently visible picker.
 
     ``top`` and ``bottom`` are tuples of compiled regexes — any single match
-    is sufficient.  This accommodates wording changes across Claude Code
+    is sufficient. This accommodates wording changes across Claude Code
     versions (e.g. a reworded confirmation prompt).
     """
 
@@ -54,6 +57,7 @@ class UIPattern:
     top: tuple[re.Pattern[str], ...]
     bottom: tuple[re.Pattern[str], ...]
     min_gap: int = 2  # minimum lines between top and bottom (inclusive)
+    bottom_up: bool = False  # scan bottom marker first, then matching top upward
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
@@ -76,12 +80,14 @@ UI_PATTERNS: list[UIPattern] = [
         top=(re.compile(r"^\s*←\s+[☐✔☒]"),),  # Multi-tab: no bottom needed
         bottom=(),
         min_gap=1,
+        bottom_up=True,
     ),
     UIPattern(
         name="AskUserQuestion",
         top=(re.compile(r"^\s*[☐✔☒]"),),  # Single-tab: bottom required
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=1,
+        bottom_up=True,
     ),
     # Plain single-select AskUserQuestion (no checkbox glyphs). Claude Code
     # renders simple A/B/C/D questions as numbered options + ``Enter to select``
@@ -94,6 +100,7 @@ UI_PATTERNS: list[UIPattern] = [
         top=(re.compile(r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S"),),
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=0,
+        bottom_up=True,
     ),
     UIPattern(
         name="RestoreCheckpoint",
@@ -136,30 +143,58 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
 
     When ``pattern.bottom`` is empty, the region extends from the top marker
     to the last non-empty line (used for multi-tab AskUserQuestion where the
-    bottom delimiter varies by tab).
+    bottom delimiter varies by tab). ``bottom_up`` patterns find the live
+    footer/bottom boundary first and then walk backward to the nearest top
+    marker, preventing historic scrollback pickers from shadowing the active
+    one after larger AUQ captures.
     """
     top_idx: int | None = None
     bottom_idx: int | None = None
 
-    for i, line in enumerate(lines):
-        if top_idx is None:
-            if any(p.search(line) for p in pattern.top):
+    if pattern.bottom_up:
+        if pattern.bottom:
+            for i in range(len(lines) - 1, -1, -1):
+                if any(p.search(lines[i]) for p in pattern.bottom):
+                    bottom_idx = i
+                    break
+        else:
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].strip():
+                    bottom_idx = i
+                    break
+        if bottom_idx is None:
+            return None
+        found_top = False
+        for i in range(bottom_idx, -1, -1):
+            if any(p.search(lines[i]) for p in pattern.top):
                 top_idx = i
-        elif pattern.bottom and any(p.search(line) for p in pattern.bottom):
-            bottom_idx = i
-            break
-
-    if top_idx is None:
-        return None
-
-    # No bottom patterns → use last non-empty line as boundary
-    if not pattern.bottom:
-        for i in range(len(lines) - 1, top_idx, -1):
-            if lines[i].strip():
+                found_top = True
+                continue
+            if found_top:
+                stripped = lines[i].strip()
+                if (
+                    not stripped
+                    or all(c == "─" for c in stripped)
+                    or lines[i].startswith((" ", "\t"))
+                ):
+                    continue
+                break
+    else:
+        for i, line in enumerate(lines):
+            if top_idx is None:
+                if any(p.search(line) for p in pattern.top):
+                    top_idx = i
+            elif pattern.bottom and any(p.search(line) for p in pattern.bottom):
                 bottom_idx = i
                 break
 
-    if bottom_idx is None or bottom_idx - top_idx < pattern.min_gap:
+        if top_idx is not None and not pattern.bottom:
+            for i in range(len(lines) - 1, top_idx, -1):
+                if lines[i].strip():
+                    bottom_idx = i
+                    break
+
+    if top_idx is None or bottom_idx is None or bottom_idx - top_idx < pattern.min_gap:
         return None
 
     content = "\n".join(lines[top_idx : bottom_idx + 1]).rstrip()
@@ -460,6 +495,12 @@ class AskUserQuestionForm:
             lines.append(f"QS:{_questions_digest(self.questions)}")
             lines.append(f"INF:{'1' if self.current_tab_inferred else '0'}")
         return "\n".join(lines)
+
+    def options_contiguous_from_one(self) -> bool:
+        """True when visible option numbers are exactly 1..len(options)."""
+        if not self.options:
+            return False
+        return [o.number for o in self.options] == list(range(1, len(self.options) + 1))
 
     def fingerprint(self) -> str:
         """Stable 16-char hex digest over the structured form state.

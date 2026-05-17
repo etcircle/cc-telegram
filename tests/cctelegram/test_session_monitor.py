@@ -882,7 +882,7 @@ class TestAuqCacheHydration:
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
         # Start from a clean cache to avoid cross-test bleed.
-        interactive_ui._latest_ask_tool_input.pop("@7", None)
+        interactive_ui._last_completed_ask_tool_input.pop("@7", None)
 
         await monitor._hydrate_ask_tool_input_cache({"@7": "sid-1"})
 
@@ -890,7 +890,7 @@ class TestAuqCacheHydration:
         assert cached is not None
         assert isinstance(cached.get("questions"), list)
         # Clean up for downstream tests.
-        interactive_ui._latest_ask_tool_input.pop("@7", None)
+        interactive_ui._last_completed_ask_tool_input.pop("@7", None)
 
     @pytest.mark.asyncio
     async def test_skips_subagent_session_keys(self, monitor, tmp_path, monkeypatch):
@@ -907,7 +907,7 @@ class TestAuqCacheHydration:
             return [SessionInfo(session_id="sub:parent-abc:agent-xyz", file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
-        interactive_ui._latest_ask_tool_input.pop("@8", None)
+        interactive_ui._last_completed_ask_tool_input.pop("@8", None)
 
         await monitor._hydrate_ask_tool_input_cache({"@8": "sub:parent-abc:agent-xyz"})
 
@@ -930,7 +930,7 @@ class TestAuqCacheHydration:
             return []
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
-        interactive_ui._latest_ask_tool_input.pop("@9", None)
+        interactive_ui._last_completed_ask_tool_input.pop("@9", None)
 
         await monitor._hydrate_ask_tool_input_cache({"@9": "sid-unknown"})
         assert interactive_ui.resolve_ask_tool_input("@9") is None
