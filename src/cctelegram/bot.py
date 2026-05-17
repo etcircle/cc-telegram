@@ -3378,39 +3378,14 @@ async def post_init(application: Application) -> None:
             ]
             await busy_indicator.on_transcript_event(event, routes)
 
-            # §2.6 narrow trigger: missed end-of-turn questions.
-            # Gate on the predicate first so the per-route fan-out doesn't
-            # walk every state lookup + topic send for normal assistant text.
-            for user_id, wid, thread_id in active:
-                route = (user_id, thread_id or 0, wid)
-                if not attention.is_end_of_turn_question(
-                    event, busy_indicator.state(route)
-                ):
-                    continue
-                excerpt = attention.final_paragraph(event.text)
-                cap = config.attention_question_preview_chars
-                if len(excerpt) > cap:
-                    excerpt = excerpt[: cap - 1].rstrip() + "…"
-                display = session_manager.get_display_name(wid) or wid or "Claude"
-                card_body = f'🔔 Awaiting your reply — {display}\n"{excerpt}"'
-                try:
-                    await attention.notify_waiting(
-                        application.bot,
-                        user_id=user_id,
-                        thread_id=thread_id,
-                        window_id=wid,
-                        prompt_text=card_body,
-                        kind="end_of_turn_question",
-                    )
-                except Exception as e:
-                    logger.error(
-                        "end-of-turn-question notify_waiting failed user=%d "
-                        "thread=%s window=%s: %s",
-                        user_id,
-                        thread_id,
-                        wid,
-                        e,
-                    )
+            # End-of-turn-question "🔔 Awaiting your reply" card with Yes/No
+            # quick-replies removed 2026-05-17 at user request: it fired on
+            # any assistant turn that ended with ``?``, producing a Yes/No
+            # presumption that was misleading for list-selection questions
+            # ("Which of those would you change?"). Real AskUserQuestion
+            # tool calls still surface as full interactive pickers via
+            # ``handle_interactive_ui``; plain-text questions no longer get
+            # a half-card with the wrong action shape.
 
         monitor.set_event_callback(event_callback)
 
