@@ -1184,6 +1184,218 @@ class TestP14PollerJsonlRaceDeferral:
         # No defer marker because we never went through the poller branch.
         assert window_id not in iui._render_deferred_since
 
+    @pytest.mark.asyncio
+    async def test_poller_defers_when_cache_stale_and_pane_partial(self, mock_bot):
+        """Stale cache (different question) + partial pane → defer like cache_empty.
+
+        Regression scenario from the production log: a previous AUQ's
+        tool_input still sits in ``_latest_ask_tool_input`` when Claude
+        fires a NEW AUQ. ``resolve_ask_form`` tags the form with
+        ``_meta["stale_fallback"]="1"`` and the defer guard must treat
+        that the same as cache_empty — otherwise a partial 2-option card
+        ships before the new tool_use lands in JSONL.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        # Cache holds the PREVIOUS AUQ — totally different question and
+        # option labels from what the pane is now showing.
+        iui.remember_ask_tool_input(
+            window_id,
+            {
+                "questions": [
+                    {
+                        "question": "How should the v3 manifest model the timeline?",
+                        "options": [
+                            {"label": "multi-track"},
+                            {"label": "single-track"},
+                        ],
+                    }
+                ]
+            },
+        )
+
+        # Live pane shows a NEW AUQ. Options 1-2 scrolled off the top
+        # because the question prose is long; only options 3-4 are
+        # captured. The strong-match check fails (no overlap with cached
+        # labels), so resolve_ask_form tags stale_fallback and returns the
+        # pane-only form.
+        visible_pane = (
+            "Fastest path to the CEO review you queued next; effort spent only "
+            "where it actually moves the needle.\n"
+            "\n"
+            "❯ 3. Type something\n"
+            "  4. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+
+        with (
+            patch("cctelegram.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("cctelegram.handlers.interactive_ui.session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=visible_pane)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            result = await iui.handle_interactive_ui(
+                mock_bot,
+                user_id=1,
+                window_id=window_id,
+                thread_id=42,
+                from_poller=True,
+            )
+
+        # Deferred: no card sent, defer state recorded for next tick.
+        assert result is False
+        mock_bot.send_message.assert_not_called()
+        assert window_id in iui._render_deferred_since
+
+    @pytest.mark.asyncio
+    async def test_poller_renders_stale_after_timeout_without_pick_buttons(
+        self, mock_bot
+    ):
+        """Stale + partial + bounded-wait elapsed → force-render, NO pick buttons."""
+        import time as _t
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        iui.remember_ask_tool_input(
+            window_id,
+            {
+                "questions": [
+                    {
+                        "question": "How should the v3 manifest model the timeline?",
+                        "options": [
+                            {"label": "multi-track"},
+                            {"label": "single-track"},
+                        ],
+                    }
+                ]
+            },
+        )
+
+        visible_pane = (
+            "Fastest path to the CEO review.\n"
+            "❯ 3. Type something\n"
+            "  4. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+
+        # Backdate the defer timestamp past the timeout.
+        iui._render_deferred_since[window_id] = _t.monotonic() - 100.0
+
+        with (
+            patch("cctelegram.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("cctelegram.handlers.interactive_ui.session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=visible_pane)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            result = await iui.handle_interactive_ui(
+                mock_bot,
+                user_id=1,
+                window_id=window_id,
+                thread_id=42,
+                from_poller=True,
+            )
+
+        assert result is True
+        assert window_id not in iui._render_deferred_since
+        mock_bot.send_message.assert_called()
+        last_kw = mock_bot.send_message.call_args.kwargs
+        markup = last_kw.get("reply_markup")
+        if markup is not None:
+            all_buttons = [b for row in markup.inline_keyboard for b in row]
+            assert not any(
+                getattr(b, "callback_data", "").startswith("aqp:") for b in all_buttons
+            ), "Force-render of stale_fallback must not mint pick buttons"
+
+    @pytest.mark.asyncio
+    async def test_non_poller_stale_partial_renders_without_pick_buttons(
+        self, mock_bot
+    ):
+        """Callback rerender path: stale cache + partial pane → no defer, no picks.
+
+        The pick-button callback dispatches a keystroke, sleeps 500ms, and
+        re-invokes handle_interactive_ui without ``tool_input=`` so it falls
+        through to the cached ``_latest_ask_tool_input``. If the next AUQ
+        is already live on the pane but JSONL hasn't flushed yet, the
+        cached input is stale. We don't want to stall the rerender (the
+        user is mid-interaction and expects feedback) but we MUST NOT
+        mint pick buttons against an option list whose visible digits
+        belong to the OLD question.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        iui.remember_ask_tool_input(
+            window_id,
+            {
+                "questions": [
+                    {
+                        "question": "How should the v3 manifest model the timeline?",
+                        "options": [
+                            {"label": "multi-track"},
+                            {"label": "single-track"},
+                        ],
+                    }
+                ]
+            },
+        )
+
+        visible_pane = (
+            "Fastest path to the CEO review.\n"
+            "❯ 3. Type something\n"
+            "  4. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+
+        with (
+            patch("cctelegram.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("cctelegram.handlers.interactive_ui.session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=visible_pane)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            # Default from_poller=False — the callback rerender path.
+            result = await iui.handle_interactive_ui(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+        # Renders (don't stall callback feedback) but no pick buttons.
+        assert result is True
+        # Non-poller path never records defer state.
+        assert window_id not in iui._render_deferred_since
+        mock_bot.send_message.assert_called()
+        last_kw = mock_bot.send_message.call_args.kwargs
+        markup = last_kw.get("reply_markup")
+        if markup is not None:
+            all_buttons = [b for row in markup.inline_keyboard for b in row]
+            assert not any(
+                getattr(b, "callback_data", "").startswith("aqp:") for b in all_buttons
+            ), "Callback rerender on stale_fallback must not mint pick buttons"
+
 
 @pytest.mark.usefixtures("_clear_pick_tokens")
 class TestClearInteractiveMsgPrunesTokens:

@@ -1379,6 +1379,53 @@ class TestResolveAskForm:
         # Cursor preserved from pane parse.
         assert form.options[0].cursor is True
         assert all(o.cursor is False for o in form.options[1:])
+        # The stale-fallback path tags the form so the renderer's defer /
+        # pick-suppression gate can tell it apart from cache-empty pane-only.
+        assert form._meta.get("stale_fallback") == "1"
+
+    def test_non_stale_resolve_does_not_set_stale_fallback_meta(self):
+        # Sanity: when JSONL strong-matches the pane (normal path), the
+        # returned form must NOT carry the stale_fallback tag. Otherwise
+        # the renderer would erroneously suppress pick buttons on a clean
+        # render.
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Pick approach.",
+                    "options": [
+                        {"label": "alpha"},
+                        {"label": "beta"},
+                    ],
+                }
+            ]
+        }
+        pane = (
+            "Pick approach.\n"
+            "\n"
+            "❯ 1. alpha\n"
+            "  2. beta\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(tool_input, pane)
+        assert form is not None
+        assert form._meta.get("stale_fallback") != "1"
+
+    def test_pane_only_no_jsonl_does_not_set_stale_fallback_meta(self):
+        # Pure pane fallback (jsonl_form is None) must also leave the tag
+        # unset — there's no stale cache to confuse, just no cache at all.
+        # The renderer's cache_empty branch already handles this case.
+        pane = (
+            "Pick approach.\n"
+            "\n"
+            "❯ 1. alpha\n"
+            "  2. beta\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(None, pane)
+        assert form is not None
+        assert form._meta.get("stale_fallback") != "1"
 
     def test_title_substring_match_passes_strong_match(self):
         # Wrapped/truncated pane title is still a substring of the JSONL

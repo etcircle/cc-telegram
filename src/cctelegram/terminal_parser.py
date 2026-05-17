@@ -969,6 +969,17 @@ def resolve_ask_form(
             (pane_form.current_question_title or "<none>")[:80],
             [q.title[:80] for q in jsonl_form.questions],
         )
+        # Tag the form so the renderer's defer / pick-suppression gate can
+        # tell "pane-only because no JSONL was ever cached" (cache_empty)
+        # apart from "pane-only because the JSONL cache held a DIFFERENT
+        # question" (cache stale). Both cases share the same hazard when
+        # the pane shows only a tail of the option list (first option
+        # number > 1): minting pick buttons on the visible 2-3 options
+        # ships a partial card that hides the real choices. ``_meta`` is
+        # ``compare=False`` and excluded from ``_canonical_repr`` /
+        # ``fingerprint``, so this tag doesn't invalidate live pick-token
+        # callbacks minted against earlier renders.
+        pane_form._meta["stale_fallback"] = "1"
         return pane_form
 
     if len(jsonl_form.questions) <= 1:

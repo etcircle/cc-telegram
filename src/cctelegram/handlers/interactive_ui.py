@@ -1649,26 +1649,43 @@ async def handle_interactive_ui(
         # Rendering a card with options 4-5 only is the worst case — the
         # user sees a partial picker and can't access the real choices.
         #
+        # Same-session AUQ-to-AUQ race: when one AUQ resolves and Claude
+        # immediately fires another, the cache still holds the previous
+        # AUQ's tool_input until session_monitor parses the new tool_use.
+        # ``resolve_ask_form`` detects the JSONL/pane mismatch and tags
+        # the returned form with ``_meta["stale_fallback"]="1"``; treat
+        # that the same as cache-empty here (cache is non-None but
+        # unusable for the live pane). Without this branch, the partial
+        # 2-option card from the example bug ships through.
+        #
         # Defer policy:
-        #   - Cache empty + first visible option number > 1 + we got here
-        #     from the poller → record/check defer timestamp; bail unless
-        #     bounded-wait elapsed.
-        #   - Cache empty + first option == 1 → the pane is the complete
-        #     picker (just no JSONL yet) — render normally.
-        #   - Cache populated → clear any defer timestamp, render normally.
-        if from_poller and form is not None and form.options:
+        #   - (Cache empty OR stale fallback) + first visible option > 1
+        #     + we got here from the poller → record/check defer timestamp;
+        #     bail unless bounded-wait elapsed.
+        #   - Cache empty/stale + first option == 1 → pane is the complete
+        #     picker (no JSONL yet, or the new question happens to fit) —
+        #     render normally.
+        #   - Cache populated AND fresh → clear any defer timestamp, render.
+        #   - Non-poller path (callback rerender) + stale fallback + partial
+        #     → no defer (we don't want to stall an interactive callback),
+        #     but suppress pick-button mint so we never dispatch the visible
+        #     digits against a question whose other options are off-screen.
+        if form is not None and form.options:
             cache_empty = resolved_input is None
+            stale_fallback_form = form._meta.get("stale_fallback") == "1"
+            cache_unusable = cache_empty or stale_fallback_form
             first_num = form.options[0].number or 0
             partial_pane = first_num > 1
-            if cache_empty and partial_pane:
+            if from_poller and cache_unusable and partial_pane:
                 first_seen = _render_deferred_since.get(window_id)
                 now = time.monotonic()
                 if first_seen is None:
                     _render_deferred_since[window_id] = now
                     logger.info(
-                        "P1.4 deferring poller render for window %s — JSONL cache "
-                        "empty, pane shows partial options (first=%d)",
+                        "P1.4 deferring poller render for window %s — JSONL %s, "
+                        "pane shows partial options (first=%d)",
                         window_id,
+                        "stale" if stale_fallback_form else "empty",
                         first_num,
                     )
                     return False
@@ -1704,9 +1721,23 @@ async def handle_interactive_ui(
                 # don't gate on it) or ``len(questions) > 1`` (a pure
                 # pane-only form has questions=()).
                 p14_suppress_picks = True
-            elif not cache_empty:
+            elif from_poller and not cache_unusable:
                 _clear_render_defer(window_id)
                 p14_suppress_picks = False
+            elif not from_poller and stale_fallback_form and partial_pane:
+                # Callback rerender path (no fresh tool_input passed): the
+                # picker advanced on the pane while the JSONL cache still
+                # holds the previous AUQ. Render the card so the user
+                # sees updated state without stalling, but don't mint pick
+                # buttons against options whose numbering belongs to the
+                # OLD question. Keystroke nav (Tab/arrows/Enter/Esc) stays
+                # available so the user can drive the picker manually.
+                logger.info(
+                    "stale_fallback + partial_pane on non-poller render for "
+                    "window %s — suppressing pick buttons (keystroke nav available)",
+                    window_id,
+                )
+                p14_suppress_picks = True
             else:
                 p14_suppress_picks = False
         else:
