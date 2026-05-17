@@ -682,6 +682,47 @@ class TestBuildPickButtonRows:
         assert entry.expires_at > time.monotonic()
         assert entry.expires_at <= time.monotonic() + _PICK_TOKEN_TTL_SECONDS + 1
 
+    def test_multi_question_review_screen_still_mints_submit_cancel(self):
+        # Regression: the FA5 guard suppressed pick buttons on every
+        # multi-tab form with ``current_tab_inferred=False``. The
+        # multi-question review-screen branch in resolve_ask_form
+        # legitimately sets ``current_tab_inferred=False`` (no tab
+        # inference happens — pane is authoritatively "review"), but the
+        # ``options`` come directly from the live pane (Submit / Cancel)
+        # so labels and dispatch are sound. Suppressing was hiding the
+        # Submit answers / Cancel buttons mid-AUQ workflow.
+        from cctelegram.terminal_parser import AskQuestion
+
+        form = AskUserQuestionForm(
+            current_question_title=None,
+            options=(
+                AskOption(
+                    label="Submit answers",
+                    recommended=False,
+                    cursor=True,
+                    number=1,
+                ),
+                AskOption(label="Cancel", recommended=False, cursor=False, number=2),
+            ),
+            is_review_screen=True,
+            # Multi-question: ``questions`` matrix populated even on the
+            # review screen so the tab strip context is preserved.
+            questions=(
+                AskQuestion(title="Approach?", header="Approach", options=()),
+                AskQuestion(title="Positioning?", header="Positioning", options=()),
+            ),
+            current_tab_inferred=False,
+        )
+        rows = _build_pick_button_rows(
+            user_id=42, thread_id=7, window_id="@9", form=form
+        )
+        assert len(rows) == 1
+        assert len(rows[0]) == 2
+        # Submit button gets the review-submit treatment.
+        assert rows[0][0].text.startswith("✅ ")
+        # Both buttons carry aqp: pick tokens.
+        assert all(b.callback_data.startswith("aqp:") for b in rows[0])
+
 
 @pytest.mark.usefixtures("_clear_pick_tokens")
 class TestPickTokenReuse:
@@ -1097,6 +1138,59 @@ class TestAskUserQuestionPaneOnlySafety:
         )
 
         assert iui._build_pick_button_rows(1, 42, "@5", form) == []
+
+    @pytest.mark.asyncio
+    async def test_stale_cache_plus_complete_contiguous_pane_mints_pick_buttons(
+        self, mock_bot
+    ):
+        # Regression (2026-05-17 13:43 incident): a previous AUQ sat in
+        # ``_last_completed_ask_tool_input`` for window @5 while a brand new
+        # AUQ rendered on the pane with a complete contiguous option list
+        # starting at 1. ``resolve_ask_form`` correctly tagged the form
+        # with ``_meta["stale_fallback"]="1"`` (cached question != pane
+        # question). The earlier defensive ``elif stale_fallback_form:
+        # p14_suppress_picks = True`` branch then dropped pick buttons,
+        # leaving the user with only the keystroke nav keyboard. The
+        # contiguous-from-1 gate in ``_build_pick_button_rows`` plus
+        # pane-derived labels in the stale-fallback form make pick mint
+        # safe here — labels and dispatch agree because both come from
+        # the live pane, and Hermes confirmed (2026-05-17) that the
+        # validator captures with the same 500-line scrollback so the
+        # callback path stays sound.
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui.remember_ask_tool_input(
+            "@5",
+            {
+                "questions": [
+                    {
+                        "question": "Previous, completed question?",
+                        "options": [{"label": "Old A"}, {"label": "Old B"}],
+                    }
+                ]
+            },
+        )
+        # Live pane shows a NEW AUQ with complete 1..3 options. The
+        # stale cache's question text is unrelated to the pane content,
+        # so resolve_ask_form takes the stale-fallback branch.
+        pane = (
+            "A brand-new question?\n"
+            "\n"
+            "❯ 1. Fresh A\n"
+            "  2. Fresh B\n"
+            "  3. Fresh C\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+
+        result = await self._render(mock_bot, pane, from_poller=True)
+
+        assert result is True
+        sent = mock_bot.send_message.call_args.kwargs
+        assert "Only options" not in sent["text"]
+        # Pick buttons MUST mint — stale cache alone is no longer a
+        # suppression reason.
+        assert self._aqp_buttons(sent.get("reply_markup"))
 
 
 @pytest.mark.usefixtures("_clear_pick_tokens")

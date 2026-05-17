@@ -806,7 +806,19 @@ def _build_pick_button_rows(
 
     # FA5+: multi-tab form without confirmed current-tab inference.
     # Suppress pick buttons entirely — keystroke nav remains.
-    if len(form.questions) > 1 and not form.current_tab_inferred:
+    # Exception: review screens (Submit/Cancel confirmation) are
+    # pane-authoritative — the options come directly from the live
+    # pane (resolver returns ``pane_form.options`` at
+    # ``terminal_parser.py`` multi-q review branch), so labels and
+    # dispatch numbers agree with what the user sees on screen even
+    # though ``current_tab_inferred`` is False (no tab inference
+    # happens on a review screen). Suppressing here was hiding the
+    # Submit answers / Cancel buttons mid-AUQ workflow.
+    if (
+        len(form.questions) > 1
+        and not form.current_tab_inferred
+        and not form.is_review_screen
+    ):
         logger.info(
             "_build_pick_button_rows SUPPRESSED gate=fa5_guard questions=%d "
             "options=%d is_review_screen=%s question_title=%r",
@@ -1629,7 +1641,6 @@ async def handle_interactive_ui(
         p14_suppress_picks = False
         partial_options_notice: str | None = None
         if form is not None and form.options:
-            stale_fallback_form = form._meta.get("stale_fallback") == "1"
             first_num = form.options[0].number or 0
             last_num = form.options[-1].number or first_num
             partial_pane = first_num > 1
@@ -1646,17 +1657,16 @@ async def handle_interactive_ui(
                     first_num,
                     last_num,
                 )
-            elif stale_fallback_form:
-                # A stale replay cache cannot safely mint direct option picks
-                # even if the visible pane starts at 1; keystroke navigation
-                # remains available and the next explicit JSONL dispatch can
-                # upgrade the card.
-                p14_suppress_picks = True
-                logger.info(
-                    "AskUserQuestion stale replay cache for window %s — "
-                    "rendering immediately without pick buttons",
-                    window_id,
-                )
+            # Stale replay cache (``form._meta["stale_fallback"] == "1"``)
+            # is no longer treated as a pick-suppression condition: the
+            # resolver returns ``pane_form`` in that branch (pane-derived
+            # labels), the contiguous-from-1 gate in
+            # ``_build_pick_button_rows`` is the actual defense against
+            # wrong-action dispatches, and dispatch is a literal digit
+            # keystroke against the live pane — so labels and dispatch
+            # agree regardless of cache freshness. Suppressing on
+            # stale_fallback alone dropped buttons on legitimate complete
+            # contiguous pickers when an earlier AUQ sat in the cache.
         # Multi-tab dispatch DISABLED at user request (2026-05-15):
         # PRs #11/12/13 shipped a per-tab card state machine. Live
         # testing surfaced enough rough edges (timeout cascades,
