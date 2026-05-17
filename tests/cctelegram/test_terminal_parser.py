@@ -346,6 +346,45 @@ class TestVisiblePaneLiveness:
         )
         assert visible_pane_liveness(pane) == "present"
 
+    def test_submit_answers_options_only_visible_is_present(self):
+        # Regression: production log 2026-05-17 12:31 — multi-question AUQ
+        # advanced to the Submit/Cancel confirmation screen. The tab
+        # header and "Ready to submit your answers?" prompt scrolled
+        # above the visible region; the last 3 lines of the pane were
+        # `['', '❯ 1. Submit answers', '  2. Cancel']`. None of the
+        # legacy anchors (Enter to select / Esc to / ╰─) appear on the
+        # Submit screen, so liveness returned "absent" and the
+        # interactive card was destructively cleared — leaving the user
+        # with no way to submit. Adding "Submit answers" as an anchor
+        # keeps the card alive until the user picks Submit or Cancel.
+        from cctelegram.terminal_parser import visible_pane_liveness
+
+        pane = "\n❯ 1. Submit answers\n  2. Cancel\n"
+        assert visible_pane_liveness(pane) == "present"
+
+    def test_ready_to_submit_prompt_visible_is_present(self):
+        # Alternative anchor: the "Ready to submit your answers?" prompt
+        # also appears on the Submit screen. When terminal height is
+        # large enough that the prompt sits within the visible bottom 5
+        # lines, it should anchor the liveness check too.
+        from cctelegram.terminal_parser import visible_pane_liveness
+
+        pane = "Ready to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n"
+        assert visible_pane_liveness(pane) == "present"
+
+    def test_submit_answers_substring_outside_tail_is_absent(self):
+        # Negative case: if "Submit answers" appears far up in the pane
+        # (e.g. earlier session output) but the visible bottom 5 lines
+        # are a shell prompt, the anchor must NOT trigger — otherwise we
+        # leak presence across a fully cleared terminal.
+        from cctelegram.terminal_parser import visible_pane_liveness
+
+        prose = "\n".join(
+            f"Line {i} Submit answers somewhere in history" for i in range(30)
+        )
+        pane = prose + "\n$ ls\nfile1.txt  file2.txt\n$ \n"
+        assert visible_pane_liveness(pane) == "absent"
+
 
 # ── strip_pane_chrome ───────────────────────────────────────────────────
 

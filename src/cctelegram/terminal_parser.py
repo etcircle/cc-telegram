@@ -204,6 +204,16 @@ _PICKER_ANCHOR_MARKERS = (
     re.compile(r"ctrl-g to edit"),  # ExitPlanMode footer
     re.compile(r"Esc to (cancel|exit)"),  # generic dismiss footer
     re.compile(r"╰─"),  # picker frame bottom-left corner
+    # Multi-question AUQ Submit-confirmation screen has none of the above
+    # — no Enter/Esc footer, no ╰─ border. When the tab header and the
+    # "Ready to submit" prompt scroll above the visible bottom 5 lines,
+    # only the numbered Submit/Cancel options stay anchored. Match the
+    # ``1. Submit answers`` line itself (cursor-aware) and the prompt
+    # above it. Without these anchors, the visible-only liveness check
+    # returns "absent" on the Submit screen and the card gets cleared
+    # mid-AUQ workflow, leaving the user with no way to commit answers.
+    re.compile(r"Ready to submit your answers"),
+    re.compile(r"^\s*[❯›▶*)>\s]?\s*\d+\.\s+Submit answers\s*$"),
 )
 
 
