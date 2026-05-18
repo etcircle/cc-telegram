@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from cctelegram import bot as bot_module
+from cctelegram.handlers import inbound_telegram as inbound_module
 from tests.conftest import ScenarioHarness, _make_message, _make_user
 
 
@@ -83,7 +84,9 @@ async def test_document_in_bound_topic_offers_to_aggregator(
     ) -> None:
         offered.append((route, path, caption, media_group_id))
 
-    monkeypatch.setattr(bot_module, "aggregator_offer_document", fake_offer_document)
+    monkeypatch.setattr(
+        inbound_module, "aggregator_offer_document", fake_offer_document
+    )
 
     update = _make_document_update(thread_id=42, caption="check this")
     await bot_module.document_handler(update, scenario.context)

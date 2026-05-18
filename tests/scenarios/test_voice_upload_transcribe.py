@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from cctelegram import bot as bot_module
+from cctelegram.handlers import inbound_telegram as inbound_module
 from tests.conftest import ScenarioHarness, _make_message, _make_user
 
 
@@ -44,9 +45,12 @@ async def test_voice_message_transcribes_and_offers_to_aggregator(
 ) -> None:
     wid = scenario.add_window(window_name="repo", cwd="/repo")
     scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
-    # OpenAI substrate stub: return a known transcription.
+    # OpenAI substrate stub: return a known transcription. ``transcribe_voice``
+    # is resolved through ``inbound_telegram``'s namespace at call time, so the
+    # patch must land there (the legacy ``bot_module`` alias still re-exports
+    # the same callable, but that re-export wouldn't reach ``voice_handler``).
     monkeypatch.setattr(
-        bot_module, "transcribe_voice", AsyncMock(return_value="hello voice")
+        inbound_module, "transcribe_voice", AsyncMock(return_value="hello voice")
     )
     # Aggregator offer (substrate to inbound aggregator) — record the call.
     offered: list[tuple[tuple[int, int, str], str]] = []
@@ -54,7 +58,7 @@ async def test_voice_message_transcribes_and_offers_to_aggregator(
     async def fake_offer(route: tuple[int, int, str], text: str) -> None:
         offered.append((route, text))
 
-    monkeypatch.setattr(bot_module, "aggregator_offer_voice", fake_offer)
+    monkeypatch.setattr(inbound_module, "aggregator_offer_voice", fake_offer)
     # Pretend we have an OpenAI key configured.
     monkeypatch.setattr(bot_module.config, "openai_api_key", "sk-fake")
 

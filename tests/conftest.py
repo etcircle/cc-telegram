@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from cctelegram import bot as bot_module
+from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram import route_runtime, transcript_event_adapter
 from cctelegram.session import session_manager as _real_sm
 from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
@@ -810,7 +811,12 @@ def scenario(
     nuke ``window_states[*].session_id`` mid-test (the real path opens an
     on-disk transcript file we don't write in scenarios).
     """
+    # `is_user_allowed` is canonically defined in
+    # ``cctelegram.handlers.inbound_telegram`` and re-exported from ``bot``.
+    # Patch both modules so allowlist bypass takes effect regardless of which
+    # module's namespace the caller resolves through.
     monkeypatch.setattr(bot_module, "is_user_allowed", lambda _uid: True)
+    monkeypatch.setattr(inbound_module, "is_user_allowed", lambda _uid: True)
 
     from cctelegram.session import ClaudeSession
 

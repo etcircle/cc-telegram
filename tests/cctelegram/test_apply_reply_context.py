@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cctelegram import bot as bot_module
+from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram.handlers.reply_context import ReplyContext
 
 
@@ -34,7 +35,7 @@ async def test_same_session_quote_renders_normally() -> None:
     current_session.session_id = "sess-current"
 
     with (
-        patch.object(bot_module, "extract_reply_context", return_value=ctx),
+        patch.object(inbound_module, "extract_reply_context", return_value=ctx),
         patch.object(
             bot_module.reply_context_mod,
             "resolve",
@@ -76,7 +77,7 @@ async def test_cross_session_quote_renders_with_marker_by_default() -> None:
     current_session.session_id = "sess-NEW"
 
     with (
-        patch.object(bot_module, "extract_reply_context", return_value=ctx),
+        patch.object(inbound_module, "extract_reply_context", return_value=ctx),
         patch.object(
             bot_module.reply_context_mod,
             "resolve",
@@ -119,7 +120,7 @@ async def test_kill_switch_restores_silent_drop() -> None:
     current_session.session_id = "sess-NEW"
 
     with (
-        patch.object(bot_module, "extract_reply_context", return_value=ctx),
+        patch.object(inbound_module, "extract_reply_context", return_value=ctx),
         patch.object(
             bot_module.reply_context_mod,
             "resolve",
@@ -154,7 +155,7 @@ async def test_master_kill_switch_off_skips_entire_path() -> None:
 
     with (
         patch.object(bot_module.config, "reply_context_enabled", False),
-        patch.object(bot_module, "extract_reply_context") as mock_extract,
+        patch.object(inbound_module, "extract_reply_context") as mock_extract,
     ):
         rendered = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
@@ -169,7 +170,7 @@ async def test_no_reply_returns_text_unchanged() -> None:
     message = _make_message_with_reply()
     with (
         patch.object(bot_module.config, "reply_context_enabled", True),
-        patch.object(bot_module, "extract_reply_context", return_value=None),
+        patch.object(inbound_module, "extract_reply_context", return_value=None),
     ):
         rendered = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
@@ -194,7 +195,7 @@ async def test_unknown_session_treats_as_non_stale() -> None:
     )
 
     with (
-        patch.object(bot_module, "extract_reply_context", return_value=ctx),
+        patch.object(inbound_module, "extract_reply_context", return_value=ctx),
         patch.object(
             bot_module.reply_context_mod,
             "resolve",

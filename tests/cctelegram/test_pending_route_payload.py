@@ -8,15 +8,17 @@ must be rejected without acting on or deleting the active pending owner.
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telegram import CallbackQuery, User
 
 from cctelegram import bot as bot_module
-
+from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram.handlers.callback_data import (
     CB_DIR_BIND_EXISTING,
     CB_DIR_CANCEL,
@@ -44,6 +46,63 @@ from cctelegram.handlers.directory_browser import (
     UNBOUND_WINDOWS_KEY,
 )
 from cctelegram.session import ClaudeSession
+
+
+@contextmanager
+def _patch_both(name: str, *args, **kwargs) -> Iterator[object]:
+    """Patch ``name`` on both ``bot_module`` and ``inbound_module``.
+
+    Wave C.1 split inbound handlers into ``handlers.inbound_telegram``.
+    Names fall into three groups after the split:
+
+    1. **Shared aliases** still re-exported from ``bot`` AND defined in
+       ``inbound_telegram`` (``safe_edit``, ``safe_reply``,
+       ``is_user_allowed``, ``_apply_reply_context``, ``_list_unbound_windows``,
+       ``aggregator_offer_photo``/``_document``/``_voice``/``_text``,
+       ``aggregator_replay_payload``, ``_create_and_bind_window``,
+       ``build_directory_browser``). Callers in either module resolve
+       through their own globals; this helper patches both to the same
+       mock so ``assert_called_once_with(...)`` sees calls from either side.
+    2. **Inbound-only** (no longer aliased from ``bot``):
+       ``_IMAGES_DIR``/``_FILES_DIR``, ``clear_status_msg_info``,
+       ``set_route_last_user_message``, ``aggregator_clear_route``.
+       Only the inbound patch is installed; the helper returns the
+       inbound-side mock so ``as mock_X`` still binds.
+    3. **Bot-only** (``session_monitor``, ``clear_topic_state``): the
+       test sites use ``patch.object(bot_module, ...)`` directly — this
+       helper is not called for them.
+    """
+    # Build one shared mock so test assertions on the returned mock pick up
+    # calls from either module's namespace. Without a shared instance, the
+    # two `patch.object` calls would auto-create separate MagicMocks and
+    # ``mock.assert_called_once_with(...)`` would miss the inbound side
+    # (where the moved handler actually does the lookup).
+    # Skip if the caller already passed `new` (positional or keyword) —
+    # ``_patch_both("_IMAGES_DIR", media_dir)`` treats ``media_dir`` itself
+    # as the patch value for both modules.
+    if not args and "new" not in kwargs:
+        new_callable = kwargs.pop("new_callable", None) or MagicMock
+        mock = new_callable()
+        for cfg_key in ("return_value", "side_effect"):
+            if cfg_key in kwargs:
+                setattr(mock, cfg_key, kwargs.pop(cfg_key))
+        kwargs["new"] = mock
+    with ExitStack() as stack:
+        result = None
+        if hasattr(bot_module, name):
+            result = stack.enter_context(
+                patch.object(bot_module, name, *args, **kwargs)
+            )
+        if hasattr(inbound_module, name):
+            inbound_result = stack.enter_context(
+                patch.object(inbound_module, name, *args, **kwargs)
+            )
+            # If the name lives only on ``inbound_module`` (e.g. helpers no
+            # longer aliased from ``bot``), return the inbound-side mock so
+            # ``as mock_X`` still binds something assertable.
+            if result is None:
+                result = inbound_result
+        yield result
 
 
 def _attachment(path: Path) -> bot_module.PendingAttachment:
@@ -124,7 +183,7 @@ async def test_topic_close_unbound_matching_pending_file_deletes_and_clears_stat
     update = _make_topic_closed_update(thread_id=10)
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
         ) as mock_get_window,
@@ -158,7 +217,7 @@ async def test_topic_close_bound_matching_pending_attachments_deletes_and_clears
     window.window_id = "@0"
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value="@0"
         ),
@@ -204,7 +263,7 @@ async def test_topic_close_different_thread_preserves_active_pending_payload(
     update = _make_topic_closed_update(thread_id=10)
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
         ),
@@ -276,7 +335,7 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
             bot_module.session_manager, "get_window_state"
         ) as get_window_state,
         patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as safe_edit,
+        _patch_both("safe_edit", new_callable=AsyncMock) as safe_edit,
         patch.object(CallbackQuery, "answer", new_callable=AsyncMock) as answer,
     ):
         await bot_module._create_and_bind_window(
@@ -322,7 +381,7 @@ async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
             return_value=False,
         ) as kill_window,
         patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as safe_edit,
+        _patch_both("safe_edit", new_callable=AsyncMock) as safe_edit,
         patch.object(CallbackQuery, "answer", new_callable=AsyncMock) as answer,
     ):
         await bot_module._create_and_bind_window(
@@ -373,13 +432,12 @@ async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_windo
         ),
         patch.object(bot_module.session_manager, "_save_state") as save_state,
         patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
-        patch.object(
-            bot_module,
+        _patch_both(
             "_flush_pending_route_payload",
             new_callable=AsyncMock,
             return_value=None,
         ),
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as safe_edit,
+        _patch_both("safe_edit", new_callable=AsyncMock) as safe_edit,
         patch.object(CallbackQuery, "answer", new_callable=AsyncMock),
     ):
         await bot_module._create_and_bind_window(
@@ -554,9 +612,9 @@ async def test_picker_cancel_clears_pending_attachments_and_deletes_file(
     update = _make_callback_update(callback_data, thread_id=10)
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_safe_edit,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_safe_edit,
     ):
         await bot_module.callback_handler(update, context)
 
@@ -580,11 +638,9 @@ async def test_stale_session_picker_mismatch_preserves_pending_attachments(
     update = _make_callback_update(CB_SESSION_NEW, thread_id=99)
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(
-            bot_module, "_create_and_bind_window", new_callable=AsyncMock
-        ) as mock_create,
+        _patch_both("_create_and_bind_window", new_callable=AsyncMock) as mock_create,
     ):
         await bot_module.callback_handler(update, context)
 
@@ -619,9 +675,9 @@ async def test_stale_directory_browser_callbacks_preserve_pending_attachments(
     update = _make_callback_update(callback_data, thread_id=99)
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_safe_edit,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_safe_edit,
     ):
         await bot_module.callback_handler(update, context)
 
@@ -657,21 +713,18 @@ async def test_photo_from_new_topic_clears_cross_topic_picker_state_and_opens_pi
     media_dir = tmp_path / "images"
 
     with (
-        patch.object(bot_module, "_IMAGES_DIR", media_dir),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("_IMAGES_DIR", media_dir),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
         ),
-        patch.object(
-            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
-        ),
-        patch.object(
-            bot_module,
+        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
+        _patch_both(
             "build_directory_browser",
             return_value=("picker", MagicMock(), ["new-dir"]),
         ) as mock_build_picker,
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock) as mock_reply,
+        _patch_both("safe_reply", new_callable=AsyncMock) as mock_reply,
     ):
         await bot_module.photo_handler(update, context)
 
@@ -720,21 +773,18 @@ async def test_document_from_new_topic_clears_cross_topic_picker_state_and_opens
     media_dir = tmp_path / "files"
 
     with (
-        patch.object(bot_module, "_FILES_DIR", media_dir),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("_FILES_DIR", media_dir),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
         ),
-        patch.object(
-            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
-        ),
-        patch.object(
-            bot_module,
+        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
+        _patch_both(
             "build_directory_browser",
             return_value=("picker", MagicMock(), ["new-dir"]),
         ) as mock_build_picker,
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock) as mock_reply,
+        _patch_both("safe_reply", new_callable=AsyncMock) as mock_reply,
     ):
         await bot_module.document_handler(update, context)
 
@@ -774,9 +824,9 @@ async def test_unbound_photo_caption_reply_context_is_stashed_rendered(
     media_dir = tmp_path / "images"
 
     with (
-        patch.object(bot_module, "_IMAGES_DIR", media_dir),
+        _patch_both("_IMAGES_DIR", media_dir),
         patch.object(bot_module.config, "reply_context_enabled", True),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
@@ -787,15 +837,12 @@ async def test_unbound_photo_caption_reply_context_is_stashed_rendered(
         patch.object(
             bot_module.reply_context_mod, "resolve", new_callable=AsyncMock
         ) as mock_resolve,
-        patch.object(
-            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
-        ),
-        patch.object(
-            bot_module,
+        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
+        _patch_both(
             "build_directory_browser",
             return_value=("picker", MagicMock(), []),
         ),
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+        _patch_both("safe_reply", new_callable=AsyncMock),
     ):
         mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
         await bot_module.photo_handler(update, context)
@@ -823,9 +870,9 @@ async def test_unbound_document_caption_reply_context_is_stashed_rendered(
     media_dir = tmp_path / "files"
 
     with (
-        patch.object(bot_module, "_FILES_DIR", media_dir),
+        _patch_both("_FILES_DIR", media_dir),
         patch.object(bot_module.config, "reply_context_enabled", True),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
@@ -836,15 +883,12 @@ async def test_unbound_document_caption_reply_context_is_stashed_rendered(
         patch.object(
             bot_module.reply_context_mod, "resolve", new_callable=AsyncMock
         ) as mock_resolve,
-        patch.object(
-            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
-        ),
-        patch.object(
-            bot_module,
+        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
+        _patch_both(
             "build_directory_browser",
             return_value=("picker", MagicMock(), []),
         ),
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+        _patch_both("safe_reply", new_callable=AsyncMock),
     ):
         mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
         await bot_module.document_handler(update, context)
@@ -880,9 +924,9 @@ async def test_unbound_photo_media_group_caption_guard_avoids_duplicate_context(
     media_dir = tmp_path / "images"
 
     with (
-        patch.object(bot_module, "_IMAGES_DIR", media_dir),
+        _patch_both("_IMAGES_DIR", media_dir),
         patch.object(bot_module.config, "reply_context_enabled", True),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
@@ -893,15 +937,12 @@ async def test_unbound_photo_media_group_caption_guard_avoids_duplicate_context(
         patch.object(
             bot_module.reply_context_mod, "resolve", new_callable=AsyncMock
         ) as mock_resolve,
-        patch.object(
-            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
-        ),
-        patch.object(
-            bot_module,
+        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
+        _patch_both(
             "build_directory_browser",
             return_value=("picker", MagicMock(), []),
         ),
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+        _patch_both("safe_reply", new_callable=AsyncMock),
     ):
         mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
         await bot_module.photo_handler(first, context)
@@ -939,9 +980,9 @@ async def test_unbound_document_media_group_caption_guard_avoids_duplicate_conte
     media_dir = tmp_path / "files"
 
     with (
-        patch.object(bot_module, "_FILES_DIR", media_dir),
+        _patch_both("_FILES_DIR", media_dir),
         patch.object(bot_module.config, "reply_context_enabled", True),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
@@ -952,15 +993,12 @@ async def test_unbound_document_media_group_caption_guard_avoids_duplicate_conte
         patch.object(
             bot_module.reply_context_mod, "resolve", new_callable=AsyncMock
         ) as mock_resolve,
-        patch.object(
-            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
-        ),
-        patch.object(
-            bot_module,
+        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
+        _patch_both(
             "build_directory_browser",
             return_value=("picker", MagicMock(), []),
         ),
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+        _patch_both("safe_reply", new_callable=AsyncMock),
     ):
         mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
         await bot_module.document_handler(first, context)
@@ -988,8 +1026,8 @@ async def test_bound_photo_caption_still_uses_apply_reply_context(
     window = MagicMock()
 
     with (
-        patch.object(bot_module, "_IMAGES_DIR", media_dir),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("_IMAGES_DIR", media_dir),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value="@0"
@@ -1000,15 +1038,11 @@ async def test_bound_photo_caption_still_uses_apply_reply_context(
             new_callable=AsyncMock,
             return_value=window,
         ),
-        patch.object(bot_module, "clear_status_msg_info"),
-        patch.object(bot_module, "set_route_last_user_message"),
-        patch.object(
-            bot_module, "_apply_reply_context", new_callable=AsyncMock
-        ) as mock_apply,
-        patch.object(
-            bot_module, "aggregator_offer_photo", new_callable=AsyncMock
-        ) as mock_offer,
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+        _patch_both("clear_status_msg_info"),
+        _patch_both("set_route_last_user_message"),
+        _patch_both("_apply_reply_context", new_callable=AsyncMock) as mock_apply,
+        _patch_both("aggregator_offer_photo", new_callable=AsyncMock) as mock_offer,
+        _patch_both("safe_reply", new_callable=AsyncMock),
     ):
         mock_apply.return_value = "rendered bound caption"
         await bot_module.photo_handler(update, context)
@@ -1030,8 +1064,8 @@ async def test_bound_document_caption_still_uses_apply_reply_context(
     window = MagicMock()
 
     with (
-        patch.object(bot_module, "_FILES_DIR", media_dir),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("_FILES_DIR", media_dir),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value="@0"
@@ -1042,15 +1076,11 @@ async def test_bound_document_caption_still_uses_apply_reply_context(
             new_callable=AsyncMock,
             return_value=window,
         ),
-        patch.object(bot_module, "clear_status_msg_info"),
-        patch.object(bot_module, "set_route_last_user_message"),
-        patch.object(
-            bot_module, "_apply_reply_context", new_callable=AsyncMock
-        ) as mock_apply,
-        patch.object(
-            bot_module, "aggregator_offer_document", new_callable=AsyncMock
-        ) as mock_offer,
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+        _patch_both("clear_status_msg_info"),
+        _patch_both("set_route_last_user_message"),
+        _patch_both("_apply_reply_context", new_callable=AsyncMock) as mock_apply,
+        _patch_both("aggregator_offer_document", new_callable=AsyncMock) as mock_offer,
+        _patch_both("safe_reply", new_callable=AsyncMock),
     ):
         mock_apply.return_value = "rendered bound caption"
         await bot_module.document_handler(update, context)
@@ -1090,21 +1120,18 @@ async def test_replaced_topic_stale_callback_does_not_clear_new_photo_payload(
     media_dir = tmp_path / "images"
 
     with (
-        patch.object(bot_module, "_IMAGES_DIR", media_dir),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("_IMAGES_DIR", media_dir),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
         ),
-        patch.object(
-            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
-        ),
-        patch.object(
-            bot_module,
+        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
+        _patch_both(
             "build_directory_browser",
             return_value=("picker", MagicMock(), ["new-dir"]),
         ),
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+        _patch_both("safe_reply", new_callable=AsyncMock),
     ):
         await bot_module.photo_handler(_make_photo_update(thread_id=99), context)
 
@@ -1116,13 +1143,11 @@ async def test_replaced_topic_stale_callback_does_not_clear_new_photo_payload(
 
     stale_callback = _make_callback_update(callback_data, thread_id=10)
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock) as mock_reply,
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
-        patch.object(
-            bot_module, "_create_and_bind_window", new_callable=AsyncMock
-        ) as mock_create,
+        _patch_both("safe_reply", new_callable=AsyncMock) as mock_reply,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
+        _patch_both("_create_and_bind_window", new_callable=AsyncMock) as mock_create,
     ):
         await bot_module.callback_handler(stale_callback, context)
 
@@ -1150,24 +1175,19 @@ async def test_text_replaced_topic_stale_cancel_does_not_clear_new_text_photo_pa
     media_dir = tmp_path / "images"
 
     with (
-        patch.object(bot_module, "_IMAGES_DIR", media_dir),
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("_IMAGES_DIR", media_dir),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager, "get_window_for_thread", return_value=None
         ),
-        patch.object(
-            bot_module, "_apply_reply_context", new_callable=AsyncMock
-        ) as apply_reply,
-        patch.object(
-            bot_module, "_list_unbound_windows", new_callable=AsyncMock, return_value=[]
-        ),
-        patch.object(
-            bot_module,
+        _patch_both("_apply_reply_context", new_callable=AsyncMock) as apply_reply,
+        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
+        _patch_both(
             "build_directory_browser",
             return_value=("picker", MagicMock(), ["new-dir"]),
         ),
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock),
+        _patch_both("safe_reply", new_callable=AsyncMock),
     ):
         apply_reply.side_effect = lambda _message, _user_id, _thread_id, text: text
         await bot_module.text_handler(
@@ -1187,14 +1207,12 @@ async def test_text_replaced_topic_stale_cancel_does_not_clear_new_text_photo_pa
 
     stale_callback = _make_callback_update(CB_DIR_CANCEL, thread_id=10)
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
-        patch.object(bot_module, "safe_reply", new_callable=AsyncMock) as mock_reply,
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
-        patch.object(
-            bot_module, "_create_and_bind_window", new_callable=AsyncMock
-        ) as mock_create,
+        _patch_both("safe_reply", new_callable=AsyncMock) as mock_reply,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
+        _patch_both("_create_and_bind_window", new_callable=AsyncMock) as mock_create,
     ):
         await bot_module.callback_handler(stale_callback, context)
 
@@ -1225,7 +1243,7 @@ async def test_dir_confirm_without_pending_owner_rejects_without_create_or_bind(
     update = _make_callback_update(CB_DIR_CONFIRM, thread_id=10)
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(
             bot_module.session_manager,
@@ -1236,8 +1254,8 @@ async def test_dir_confirm_without_pending_owner_rejects_without_create_or_bind(
         patch.object(
             bot_module.tmux_manager, "create_window", new_callable=AsyncMock
         ) as mock_create_window,
-        patch.object(
-            bot_module, "_create_and_bind_window", new_callable=AsyncMock
+        _patch_both(
+            "_create_and_bind_window", new_callable=AsyncMock
         ) as mock_create_and_bind,
     ):
         await bot_module.callback_handler(update, context)
@@ -1263,14 +1281,14 @@ async def test_session_new_without_pending_owner_does_not_recover_from_topic(
     update = _make_callback_update(CB_SESSION_NEW, thread_id=10)
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
         patch.object(
             bot_module.tmux_manager, "create_window", new_callable=AsyncMock
         ) as mock_create_window,
-        patch.object(
-            bot_module, "_create_and_bind_window", new_callable=AsyncMock
+        _patch_both(
+            "_create_and_bind_window", new_callable=AsyncMock
         ) as mock_create_and_bind,
     ):
         await bot_module.callback_handler(update, context)
@@ -1294,12 +1312,10 @@ async def test_session_select_without_pending_owner_rejects(tmp_path: Path):
     update = _make_callback_update(f"{CB_SESSION_SELECT}0", thread_id=10)
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
-        patch.object(
-            bot_module, "_create_and_bind_window", new_callable=AsyncMock
-        ) as mock_create,
+        _patch_both("_create_and_bind_window", new_callable=AsyncMock) as mock_create,
     ):
         await bot_module.callback_handler(update, context)
 
@@ -1329,11 +1345,9 @@ async def test_session_new_double_click_after_pending_owner_cleared_is_rejected(
         context.user_data.clear()
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(
-            bot_module, "_create_and_bind_window", new_callable=AsyncMock
-        ) as mock_create,
+        _patch_both("_create_and_bind_window", new_callable=AsyncMock) as mock_create,
     ):
         mock_create.side_effect = clear_pending_after_first_click
         await bot_module.callback_handler(first_update, context)
@@ -1354,9 +1368,9 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
     cancel_update = _make_callback_update(CB_DIR_CANCEL, thread_id=10)
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock),
+        _patch_both("safe_edit", new_callable=AsyncMock),
     ):
         await bot_module.callback_handler(cancel_update, context)
 
@@ -1371,7 +1385,7 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
     window.window_name = "window one"
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
         patch.object(
@@ -1380,16 +1394,13 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
             new_callable=AsyncMock,
             return_value=window,
         ) as mock_find,
-        patch.object(
-            bot_module,
+        _patch_both(
             "_list_unbound_windows",
             new_callable=AsyncMock,
             return_value=[("window-1", "window one", "/tmp")],
         ) as mock_list_unbound,
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
-        patch.object(
-            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
-        ) as mock_replay,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
+        _patch_both("aggregator_replay_payload", new_callable=AsyncMock) as mock_replay,
     ):
         await bot_module.callback_handler(bind_update, context)
 
@@ -1457,10 +1468,8 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
             bot_module.session_manager, "get_window_state"
         ) as get_window_state,
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
-        patch.object(
-            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
-        ) as mock_replay,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
+        _patch_both("aggregator_replay_payload", new_callable=AsyncMock) as mock_replay,
     ):
         await bot_module._create_and_bind_window(
             query, context, user, str(tmp_path), pending_thread_id=10
@@ -1505,7 +1514,7 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
         return [("@0", "existing-window", str(tmp_path))]
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
         patch.object(
@@ -1514,16 +1523,13 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
             new_callable=AsyncMock,
             return_value=window,
         ),
-        patch.object(
-            bot_module,
+        _patch_both(
             "_list_unbound_windows",
             new_callable=AsyncMock,
             side_effect=replace_owner_during_unbound_list,
         ),
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
-        patch.object(
-            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
-        ) as mock_replay,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
+        _patch_both("aggregator_replay_payload", new_callable=AsyncMock) as mock_replay,
     ):
         await bot_module.callback_handler(update, context)
 
@@ -1550,10 +1556,8 @@ async def test_flush_pending_route_payload_owner_mismatch_preserves_new_payload(
     user_data = _pending_user_data(payload, thread_id=99)
 
     with (
-        patch.object(
-            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
-        ) as mock_replay,
-        patch.object(bot_module, "aggregator_clear_route") as mock_clear_route,
+        _patch_both("aggregator_replay_payload", new_callable=AsyncMock) as mock_replay,
+        _patch_both("aggregator_clear_route") as mock_clear_route,
     ):
         delivered = await bot_module._flush_pending_route_payload(
             (1, 10, "@old"), user_data
@@ -1607,11 +1611,9 @@ async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_clea
             return_value=window_state,
         ),
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
-        patch.object(
-            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
-        ) as mock_replay,
-        patch.object(bot_module, "aggregator_clear_route") as mock_clear_route,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
+        _patch_both("aggregator_replay_payload", new_callable=AsyncMock) as mock_replay,
+        _patch_both("aggregator_clear_route") as mock_clear_route,
     ):
         if isinstance(flush_failure, BaseException):
             mock_replay.side_effect = flush_failure
@@ -1660,7 +1662,7 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
     window.window_name = "existing-window"
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
         patch.object(
@@ -1669,17 +1671,14 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
             new_callable=AsyncMock,
             return_value=window,
         ),
-        patch.object(
-            bot_module,
+        _patch_both(
             "_list_unbound_windows",
             new_callable=AsyncMock,
             return_value=[("@0", "existing-window", str(tmp_path))],
         ),
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
-        patch.object(
-            bot_module, "aggregator_replay_payload", new_callable=AsyncMock
-        ) as mock_replay,
-        patch.object(bot_module, "aggregator_clear_route") as mock_clear_route,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
+        _patch_both("aggregator_replay_payload", new_callable=AsyncMock) as mock_replay,
+        _patch_both("aggregator_clear_route") as mock_clear_route,
     ):
         if isinstance(flush_failure, BaseException):
             mock_replay.side_effect = flush_failure
@@ -1722,7 +1721,7 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
     window.window_name = "existing-window"
 
     with (
-        patch.object(bot_module, "is_user_allowed", return_value=True),
+        _patch_both("is_user_allowed", return_value=True),
         patch.object(bot_module.session_manager, "set_group_chat_id"),
         patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
         patch.object(
@@ -1731,15 +1730,13 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
             new_callable=AsyncMock,
             return_value=window,
         ),
-        patch.object(
-            bot_module,
+        _patch_both(
             "_list_unbound_windows",
             new_callable=AsyncMock,
             return_value=[("@0", "existing-window", str(tmp_path))],
         ),
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_edit,
-        patch.object(
-            bot_module,
+        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
+        _patch_both(
             "aggregator_replay_payload",
             new_callable=AsyncMock,
             return_value=True,
