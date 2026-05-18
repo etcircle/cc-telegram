@@ -3,7 +3,7 @@
 Provides the public `cc-telegram` command with three modes:
   1. no subcommand — start the Telegram polling bot;
   2. `hook` — process/install the Claude Code SessionStart hook;
-  3. `doctor` — report or perform one-shot state migration.
+  3. `doctor` — report health checks for the local install.
 """
 
 import argparse
@@ -28,14 +28,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Install or rewrite the SessionStart hook in ~/.claude/settings.json.",
     )
 
-    doctor = subparsers.add_parser(
+    subparsers.add_parser(
         "doctor",
-        help="Check or migrate CC Telegram state/config directory.",
-    )
-    doctor.add_argument(
-        "--migrate",
-        action="store_true",
-        help="Copy ~/.ccbot contents into ~/.cc-telegram when needed.",
+        help="Check the CC Telegram local install health.",
     )
     return parser
 
@@ -45,10 +40,6 @@ def _run_bot() -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.WARNING,
     )
-
-    from .doctor import preflight_or_exit
-
-    preflight_or_exit()
 
     try:
         from .config import config
@@ -95,8 +86,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "doctor":
         from .doctor import doctor_main
 
-        doctor_args = ["--migrate"] if args.migrate else []
-        raise SystemExit(doctor_main(doctor_args))
+        raise SystemExit(doctor_main([]))
 
     _run_bot()
 

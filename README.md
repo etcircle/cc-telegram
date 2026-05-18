@@ -47,32 +47,6 @@ cd cc-telegram
 uv sync --all-extras
 ```
 
-## After upgrading from ccbot
-
-The runtime uses `~/.cc-telegram` only. It does not silently dual-read `~/.ccbot`. If both `~/.ccbot` and `~/.cc-telegram` already exist, `doctor --migrate` refuses to copy so it cannot overwrite or hide existing state. The bot start path refuses to run if `~/.ccbot` exists and `~/.cc-telegram` is missing, unless you explicitly set `CC_TELEGRAM_DIR`.
-
-When moving from a `ccbot` install:
-
-1. Copy state into the new dir. Retry safe: stages into a temp dir and atomic-renames on success.
-
-   ```bash
-   cc-telegram doctor --migrate
-   ```
-
-2. Refresh the Claude Code `SessionStart` hook. Rewrites any legacy `ccbot hook` entry in `~/.claude/settings.json`.
-
-   ```bash
-   cc-telegram hook --install
-   ```
-
-3. Restart the launchd service.
-
-   ```bash
-   launchctl kickstart -k gui/$(id -u)/com.cc-telegram
-   ```
-
-`cc-telegram doctor` (no flag) prints the post-migration health readout.
-
 ## Configure
 
 Create `~/.cc-telegram/.env`:
@@ -117,6 +91,16 @@ Useful behavior knobs:
 - `CC_TELEGRAM_MESSAGE_REFS_DB_PATH` — SQLite path; default `$CC_TELEGRAM_DIR/message_refs.db`.
 - `CC_TELEGRAM_MESSAGE_REF_TEXT_MAX_CHARS` — stored body cap; default `4000`.
 
+## Voice transcription
+
+Voice notes are transcribed via a standard OpenAI `POST $OPENAI_BASE_URL/audio/transcriptions` call with `Authorization: Bearer $OPENAI_API_KEY`. Point `OPENAI_BASE_URL` at anything that speaks that shape:
+
+- `https://api.openai.com/v1` — the default.
+- `https://openrouter.ai/api/v1` — OpenRouter exposes whisper-1 over the same API.
+- A local LiteLLM, vLLM, or other OpenAI-compatible gateway.
+
+If your backend doesn't natively speak OpenAI's STT shape (e.g., a local `whisper.cpp` server with its `/inference` endpoint), front it with a small shape-translating proxy. A 130-line stdlib-only example lives next to this repo as [`whisper-openai-proxy/`](../whisper-openai-proxy) — clone or copy, point `OPENAI_BASE_URL` at it.
+
 ## Install the Claude Code hook
 
 ```bash
@@ -138,8 +122,6 @@ This writes/updates `~/.claude/settings.json` with:
   }
 }
 ```
-
-Legacy `ccbot hook` entries are rewritten in place.
 
 ## Run
 
@@ -174,8 +156,6 @@ CC_TELEGRAM_DIR=/path/to/state cc-telegram
 ```
 
 Useful for testing or running multiple profiles against the same install.
-
-Setting `CC_TELEGRAM_DIR` bypasses the migration preflight guard. `cc-telegram doctor` emits a warning if the override points at a legacy-looking dir (e.g., the name contains `.ccbot`, or its `session_map.json` keys use the `ccbot:` prefix).
 
 ## Recommended daily-driver `.env`
 

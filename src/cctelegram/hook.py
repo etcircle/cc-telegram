@@ -26,9 +26,8 @@ logger = logging.getLogger(__name__)
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 _CURRENT_HOOK_COMMAND_SUFFIX = "cc-telegram hook"
-_LEGACY_HOOK_COMMAND_SUFFIX = "ccbot hook"
 _HOOK_PATH_PREFIX_RE = re.compile(r"^[A-Za-z0-9_./~@+-]+$")
-HookStatus = Literal["current", "legacy", "mixed", "missing"]
+HookStatus = Literal["current", "missing"]
 
 
 def _command_matches(cmd: str, suffix: str) -> bool:
@@ -38,9 +37,8 @@ def _command_matches(cmd: str, suffix: str) -> bool:
     owns the simple commands it writes itself: ``cc-telegram hook`` and
     path-qualified variants such as ``/opt/bin/cc-telegram hook``. Requiring
     the path prefix to be the whole command, and to contain only ordinary path
-    characters, prevents wrapper/comment strings like ``echo /opt/bin/ccbot
-    hook`` or ``true&&/opt/bin/ccbot hook`` from being treated as managed
-    hooks.
+    characters, prevents wrapper/comment strings like
+    ``echo /opt/bin/cc-telegram hook`` from being treated as managed hooks.
     """
     if cmd == suffix:
         return True
@@ -51,17 +49,6 @@ def _command_matches(cmd: str, suffix: str) -> bool:
 
     path_prefix = cmd[: -len(path_suffix)]
     return _HOOK_PATH_PREFIX_RE.fullmatch(path_prefix) is not None
-
-
-def _command_contains_legacy_hook(cmd: str) -> bool:
-    """Return whether cmd is a managed legacy hook command.
-
-    Legacy cleanup intentionally mirrors current-hook matching: only exact
-    ``ccbot hook`` commands or path-qualified ``.../ccbot hook`` commands are
-    considered legacy. Wrapper shell snippets that merely mention the legacy
-    hook are user-owned and must not be rewritten or removed.
-    """
-    return _command_matches(cmd, _LEGACY_HOOK_COMMAND_SUFFIX)
 
 
 def _find_cc_telegram_path() -> str:
@@ -78,12 +65,10 @@ def _find_cc_telegram_path() -> str:
 
 
 def _is_hook_installed(settings: dict) -> HookStatus:
-    """Return whether the settings contain current, legacy, or no hook."""
+    """Return whether the settings contain the current hook command."""
     hooks = settings.get("hooks", {})
     session_start = hooks.get("SessionStart", [])
 
-    saw_current = False
-    saw_legacy = False
     for entry in session_start:
         if not isinstance(entry, dict):
             continue
@@ -95,74 +80,12 @@ def _is_hook_installed(settings: dict) -> HookStatus:
             if not isinstance(cmd, str):
                 continue
             if _command_matches(cmd, _CURRENT_HOOK_COMMAND_SUFFIX):
-                saw_current = True
-            if _command_contains_legacy_hook(cmd):
-                saw_legacy = True
-    if saw_current and saw_legacy:
-        return "mixed"
-    if saw_current:
-        return "current"
-    return "legacy" if saw_legacy else "missing"
-
-
-def _rewrite_legacy_hooks(
-    settings: dict, hook_command: str, *, rewrite_first: bool = True
-) -> tuple[int, int]:
-    """Clean legacy ccbot hook commands in-place.
-
-    When no current hook exists, rewrite the first legacy hook to the current
-    command so existing hook placement is preserved. Remove any remaining
-    legacy hooks to avoid creating duplicate current commands.
-    """
-    rewrites = 0
-    removals = 0
-    rewrote = False
-    session_start = settings.get("hooks", {}).get("SessionStart", [])
-    if not isinstance(session_start, list):
-        return rewrites, removals
-
-    cleaned_session_start = []
-    for entry in session_start:
-        if not isinstance(entry, dict):
-            cleaned_session_start.append(entry)
-            continue
-        inner_hooks = entry.get("hooks", [])
-        if not isinstance(inner_hooks, list):
-            cleaned_session_start.append(entry)
-            continue
-
-        cleaned_inner_hooks = []
-        removed_from_entry = False
-        for h in inner_hooks:
-            if not isinstance(h, dict):
-                cleaned_inner_hooks.append(h)
-                continue
-            cmd = h.get("command", "")
-            if not isinstance(cmd, str) or not _command_contains_legacy_hook(cmd):
-                cleaned_inner_hooks.append(h)
-                continue
-
-            if rewrite_first and not rewrote:
-                h["command"] = hook_command
-                h.setdefault("type", "command")
-                h.setdefault("timeout", 5)
-                rewrites += 1
-                rewrote = True
-                cleaned_inner_hooks.append(h)
-            else:
-                removals += 1
-                removed_from_entry = True
-
-        if cleaned_inner_hooks or not removed_from_entry:
-            entry["hooks"] = cleaned_inner_hooks
-            cleaned_session_start.append(entry)
-
-    settings["hooks"]["SessionStart"] = cleaned_session_start
-    return rewrites, removals
+                return "current"
+    return "missing"
 
 
 def _install_hook(settings_file: Path = _CLAUDE_SETTINGS_FILE) -> int:
-    """Install or rewrite the CC Telegram hook in Claude settings.json."""
+    """Install the CC Telegram hook in Claude settings.json."""
     settings_file.parent.mkdir(parents=True, exist_ok=True)
 
     settings: dict = {}
@@ -174,34 +97,17 @@ def _install_hook(settings_file: Path = _CLAUDE_SETTINGS_FILE) -> int:
             print(f"Error reading {settings_file}: {e}", file=sys.stderr)
             return 1
 
-    hook_command = f"{_find_cc_telegram_path()} hook"
-    status = _is_hook_installed(settings)
-    if status == "current":
+    if _is_hook_installed(settings) == "current":
         logger.info("Hook already installed in %s", settings_file)
         print(f"Hook already installed in {settings_file}")
         return 0
 
-    if status in {"legacy", "mixed"}:
-        rewrites, removals = _rewrite_legacy_hooks(
-            settings,
-            hook_command,
-            rewrite_first=status == "legacy",
-        )
-        logger.info("Rewrote %d legacy hook(s) in %s", rewrites, settings_file)
-        if removals:
-            action = (
-                f"Rewrote {rewrites} legacy hook(s) and removed {removals} "
-                f"duplicate legacy hook(s) in {settings_file}"
-            )
-        else:
-            action = f"Rewrote {rewrites} legacy hook(s) in {settings_file}"
-    else:
-        hook_config = {"type": "command", "command": hook_command, "timeout": 5}
-        settings.setdefault("hooks", {}).setdefault("SessionStart", []).append(
-            {"hooks": [hook_config]}
-        )
-        logger.info("Installing hook command: %s", hook_command)
-        action = f"Hook installed successfully in {settings_file}"
+    hook_command = f"{_find_cc_telegram_path()} hook"
+    hook_config = {"type": "command", "command": hook_command, "timeout": 5}
+    settings.setdefault("hooks", {}).setdefault("SessionStart", []).append(
+        {"hooks": [hook_config]}
+    )
+    logger.info("Installing hook command: %s", hook_command)
 
     try:
         settings_file.write_text(
@@ -212,7 +118,7 @@ def _install_hook(settings_file: Path = _CLAUDE_SETTINGS_FILE) -> int:
         print(f"Error writing {settings_file}: {e}", file=sys.stderr)
         return 1
 
-    print(action)
+    print(f"Hook installed successfully in {settings_file}")
     return 0
 
 

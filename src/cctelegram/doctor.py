@@ -1,182 +1,16 @@
-"""Doctor and migration preflight for CC Telegram.
+"""Doctor health checks for CC Telegram.
 
-Owns the retry-safe one-shot migration from ~/.ccbot to ~/.cc-telegram, the
-bot-start guard that prevents accidental fresh-state startup, and the
-fresh-setup health checks emitted by ``cc-telegram doctor``.
+Reports the state of the local install: required env vars, tmux + claude on
+PATH, the Claude Code SessionStart hook, and the config directory.
 """
 
 import argparse
 import json
 import os
-import shlex
 import shutil
-import sys
 from pathlib import Path
 
 from .utils import app_dir
-
-LEGACY_DIR_NAME = ".ccbot"
-NEW_DIR_NAME = ".cc-telegram"
-OBVIOUS_STATE_FILES = (
-    "state.json",
-    "session_map.json",
-    "monitor_state.json",
-    "message_refs.db",
-)
-REQUIRED_MIGRATION_FILES = (
-    "state.json",
-    "session_map.json",
-    "message_refs.db",
-)
-MIGRATION_SENTINEL = ".migration-complete"
-STAGING_PREFIX = ".cc-telegram.migrating."
-LEGACY_SESSION_KEY_PREFIX = "ccbot:"
-
-
-def _default_legacy_dir() -> Path:
-    return Path.home() / LEGACY_DIR_NAME
-
-
-def migration_command(
-    legacy_dir: Path | None = None, new_dir: Path | None = None
-) -> str:
-    """Return the explicit shell command for copying legacy state."""
-    legacy = legacy_dir or _default_legacy_dir()
-    target = new_dir or app_dir()
-    return f"mkdir -p {shlex.quote(str(target))} && cp -R {shlex.quote(str(legacy))}/. {shlex.quote(str(target))}/"
-
-
-def migration_needed(
-    legacy_dir: Path | None = None, new_dir: Path | None = None
-) -> bool:
-    """Return True when legacy state exists and the new app dir is absent."""
-    legacy = legacy_dir or _default_legacy_dir()
-    target = new_dir or app_dir()
-    return legacy.exists() and not target.exists()
-
-
-def _looks_like_legacy_state(target: Path) -> bool:
-    if LEGACY_DIR_NAME in target.name:
-        return True
-    session_map = target / "session_map.json"
-    if not session_map.is_file():
-        return False
-    try:
-        data = json.loads(session_map.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    return any(
-        isinstance(k, str) and k.startswith(LEGACY_SESSION_KEY_PREFIX) for k in data
-    )
-
-
-def preflight_or_exit(
-    legacy_dir: Path | None = None,
-    new_dir: Path | None = None,
-) -> None:
-    """Abort bot startup if legacy state needs an explicit migration.
-
-    Setting CC_TELEGRAM_DIR is treated as an explicit operator choice and skips
-    the legacy-dir guard. A one-line warning is emitted when the override
-    points at legacy-looking state. Hook and doctor subcommands never call
-    this function.
-    """
-    if os.environ.get("CC_TELEGRAM_DIR"):
-        target = new_dir or app_dir()
-        if _looks_like_legacy_state(target):
-            print(
-                f"Warning: CC_TELEGRAM_DIR={target} resolves to legacy-looking "
-                "state. Run `cc-telegram doctor --migrate` to migrate.",
-                file=sys.stderr,
-            )
-        return
-    legacy = legacy_dir or _default_legacy_dir()
-    target = new_dir or app_dir()
-    if not migration_needed(legacy, target):
-        return
-    print(
-        "State migration required.\n\n"
-        "Run:\n"
-        "  cc-telegram doctor --migrate\n\n"
-        "Manual fallback:\n"
-        f"  {migration_command(legacy, target)}\n\n"
-        "Or point at a different config dir with CC_TELEGRAM_DIR=/path.",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-
-def _copy_tree_contents(src: Path, dst: Path) -> None:
-    dst.mkdir(parents=True, exist_ok=True)
-    for child in src.iterdir():
-        target = dst / child.name
-        if child.is_dir():
-            shutil.copytree(child, target, dirs_exist_ok=True)
-        else:
-            shutil.copy2(child, target)
-
-
-def _describe_target_state_files(target: Path) -> list[str]:
-    """Return human-readable status lines for well-known target state files."""
-    return [
-        f"  - {name}: {'present' if (target / name).exists() else 'missing'}"
-        for name in OBVIOUS_STATE_FILES
-    ]
-
-
-def _cleanup_orphan_staging_dirs(home: Path, target: Path) -> None:
-    parent = target.parent
-    for child in parent.iterdir():
-        if child.name.startswith(STAGING_PREFIX) and child.is_dir():
-            shutil.rmtree(child, ignore_errors=True)
-    if home != parent:
-        for child in home.iterdir():
-            if child.name.startswith(STAGING_PREFIX) and child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
-
-
-def _stage_and_finalize_migration(legacy: Path, target: Path) -> tuple[bool, str]:
-    """Stage legacy contents into a sibling dir, validate, atomic-rename.
-
-    Returns (ok, message). On failure the staging dir is cleaned up.
-    """
-    staging = target.parent / f"{STAGING_PREFIX}{os.getpid()}"
-    if staging.exists():
-        shutil.rmtree(staging, ignore_errors=True)
-    try:
-        _copy_tree_contents(legacy, staging)
-    except OSError as e:
-        shutil.rmtree(staging, ignore_errors=True)
-        return False, f"ERROR: failed to stage migration into {staging}: {e}"
-
-    missing = [
-        name for name in REQUIRED_MIGRATION_FILES if not (staging / name).exists()
-    ]
-    if missing:
-        shutil.rmtree(staging, ignore_errors=True)
-        return (
-            False,
-            "ERROR: staged migration is missing required files: "
-            + ", ".join(missing)
-            + f"\n  staged from: {legacy}\n  Cleaned up staging dir.",
-        )
-
-    sentinel = staging / MIGRATION_SENTINEL
-    try:
-        sentinel.write_text("ok\n", encoding="utf-8")
-    except OSError as e:
-        shutil.rmtree(staging, ignore_errors=True)
-        return False, f"ERROR: failed to write sentinel into staging dir: {e}"
-
-    try:
-        os.rename(staging, target)
-    except OSError as e:
-        shutil.rmtree(staging, ignore_errors=True)
-        return False, f"ERROR: failed to finalize migration to {target}: {e}"
-
-    return True, f"Migrated {legacy} -> {target}"
 
 
 def _check_env_value(name: str, app_dir_path: Path) -> str:
@@ -307,62 +141,16 @@ def _run_health_checks(target: Path) -> tuple[int, int, int]:
 
 
 def doctor_main(argv: list[str] | None = None) -> int:
-    """Run migration diagnostics and fresh-setup health checks."""
+    """Run fresh-setup health checks."""
     parser = argparse.ArgumentParser(
         prog="cc-telegram doctor",
-        description="Check CC Telegram config/state migration status and health.",
+        description="Check CC Telegram config/health.",
     )
-    parser.add_argument(
-        "--migrate",
-        action="store_true",
-        help="Copy ~/.ccbot contents into ~/.cc-telegram if migration is needed.",
-    )
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
 
-    legacy = _default_legacy_dir()
     target = app_dir()
-    home = Path.home()
-
-    sentinel = target / MIGRATION_SENTINEL
-
-    if args.migrate:
-        if sentinel.exists():
-            print("Migration already complete.")
-            return 0
-        if not legacy.exists():
-            print(f"No legacy state at {legacy}; nothing to migrate.")
-            return 0
-        if target.exists():
-            print("ERROR: migration skipped because target state dir already exists.")
-            print(f"  legacy: {legacy}")
-            print(f"  target: {target}")
-            print("Target obvious state files:")
-            for line in _describe_target_state_files(target):
-                print(line)
-            print("\nNo files were copied to avoid overwriting existing state.")
-            print("Review both directories, then migrate manually if intended:")
-            print(f"  {migration_command(legacy, target)}")
-            return 1
-        _cleanup_orphan_staging_dirs(home, target)
-        ok, message = _stage_and_finalize_migration(legacy, target)
-        print(message)
-        return 0 if ok else 1
-
-    if migration_needed(legacy, target):
-        print("Migration available:")
-        print(f"  legacy: {legacy}")
-        print(f"  target: {target}")
-        print("Run:")
-        print(f"  {migration_command(legacy, target)}")
-        print("Or run: cc-telegram doctor --migrate")
-        print()
-    elif legacy.exists() and target.exists():
-        print(f"OK: both legacy and new state dirs exist ({legacy}, {target}).")
-        print("Runtime uses only the new state dir unless CC_TELEGRAM_DIR is set.")
-        print()
-    else:
-        print(f"OK: CC Telegram state dir is {target}")
-        print()
+    print(f"OK: CC Telegram state dir is {target}")
+    print()
 
     _, _, fail = _run_health_checks(target)
     return 0 if fail == 0 else 1

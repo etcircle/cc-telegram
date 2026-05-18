@@ -69,4 +69,5 @@ venv.bak/
 # Project specific
 .uv/
 uv.lock
-docs/handovers/
+temp/
+.clawpatch/
