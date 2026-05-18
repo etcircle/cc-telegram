@@ -68,10 +68,18 @@
 └────────────────────────┘
 
 Additional modules:
-  screenshot.py       ─ Terminal text → PNG rendering (ANSI color, font fallback)
-  transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
-  main.py             ─ CLI entry point
-  utils.py            ─ Shared utilities (app_dir, atomic_write_json)
+  screenshot.py               ─ Terminal text → PNG rendering (ANSI color, font fallback)
+  transcribe.py               ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
+  main.py                     ─ CLI entry point
+  utils.py                    ─ Shared utilities (app_dir, atomic_write_json)
+  route_runtime.py            ─ Wave B per-route snapshot state machine (active when
+                                CC_TELEGRAM_ROUTE_RUNTIME_V2=true). Subsumes
+                                busy_indicator + status_polling._idle_state into a
+                                lock-protected RouteRuntimeSnapshot interface.
+  transcript_event_adapter.py ─ Translates session_monitor.TranscriptEvent →
+                                route_runtime.TranscriptLifecycleEvent and fans out
+                                per-route. 150-250 LoC budget (Wave B kill signal
+                                at 250 — beyond that it's Transcript Stream).
 
 Handler modules (handlers/):
   message_sender.py   ─ safe_reply/safe_edit/safe_send + rate_limit_send
@@ -100,3 +108,4 @@ State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
 - Only sessions registered in `session_map.json` (via hook) are monitored.
 - Notifications delivered to users via thread bindings (topic → window_id → session).
 - **Startup re-resolution** — Window IDs reset on tmux server restart. On startup, `resolve_stale_ids()` matches persisted display names against live windows to re-map IDs. Old state.json files keyed by window name are auto-migrated.
+- **RouteRuntime concurrency contract (Wave B, behind `CC_TELEGRAM_ROUTE_RUNTIME_V2`)** — `route_runtime` exposes a single per-route state machine via `ingest_transcript_event(route, event)`, `mark_*(route)`, and `snapshot(route)`. Per-route `asyncio.Lock` serialises mutations within a route; independent routes do not serialise. Observers fan out **after** lock release, against the committed `RouteRuntimeSnapshot` (frozen, monotonic-seq-tagged). Pane snapshots (`mark_pane_idle`) are reconciliation events with lower authority than transcript lifecycle: they preserve `WAITING_ON_USER` and `BROKEN_TOPIC`, only clear `RUNNING` / `RUNNING_TOOL`. No new `register_*_callback` fan-out — that pattern (which produced bug c313657) is precisely what `RouteRuntime` replaces.

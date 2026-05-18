@@ -32,6 +32,45 @@ status / interactive prompts in another.)
 
 **Deduplication**: The worker compares `last_text` when processing status updates; identical content skips the edit, reducing API calls.
 
+## Run-state and idle reconciliation
+
+Two parallel implementations live during the Wave B soak:
+
+**Legacy (`busy_indicator` + `status_polling._idle_state`)** — the dual
+state machine that predates Wave B. `busy_indicator._run_state`,
+`_open_tools`, `_context_usage`, and `_pre_broken_state` track lifecycle
+state; `status_polling._idle_state` debounces "🟡 Busy" card clears
+after `IDLE_CLEAR_DELAY_SECONDS` of confirmed pane idle. Activity from
+either source re-arms idle clearing via
+`busy_indicator.register_activity_callback`. **Active when
+`CC_TELEGRAM_ROUTE_RUNTIME_V2=false` (Wave B default).**
+
+**Wave B `route_runtime`** — a single per-route state machine that
+exposes immutable `RouteRuntimeSnapshot` reads. Every mutation
+(`ingest_transcript_event`, `mark_*`) acquires a per-route
+`asyncio.Lock`, applies the transition, freezes a snapshot, and fires
+observers **after** commit. Snapshot fields: `run_state`,
+`open_tools`, `waiting_on_user_tools`, `context_usage`,
+`last_event_at`, `idle_clear_at`, `typing_eligible`,
+`status_card_visible`, `status_card_msg_id`, `broken_topic`,
+`monotonic_seq`. The plan target: post-soak, the legacy paths are
+deleted and consumers (typing_action_loop, activity-digest renderer,
+status-card lifecycle in `message_queue`) read only from
+`route_runtime.snapshot(route)`. **Active when
+`CC_TELEGRAM_ROUTE_RUNTIME_V2=true`** — set the env var manually,
+observe for ≥48h, then ship the legacy deletion as a follow-up commit.
+Rollback during soak is `kickstart` + env flip, not `git revert`.
+
+**`message_queue` boundary** — `message_queue` remains the only
+sender/editor of status cards. Under `route_runtime_v2=true` it still
+owns `_status_msg_info[skey]` as the send-layer cache but mirrors
+`mark_status_card_published(route, msg_id)` /
+`mark_status_card_cleared(route)` into `route_runtime` so the snapshot's
+`status_card_visible` flag is accurate for external consumers. If
+Wave B implementation ever needs to mutate `message_queue` internals
+beyond that boundary, the plan's kill criterion fires — promote a
+Route Outbox slice now.
+
 ## Rate Limiting
 
 - `AIORateLimiter(max_retries=5)` on the Application (30/s global)

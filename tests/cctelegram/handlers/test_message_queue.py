@@ -1385,6 +1385,12 @@ class TestActivityDigestHeader:
         from cctelegram.config import config as cfg
 
         monkeypatch.setattr(cfg, "busy_indicator_v2", True)
+        # Pin route_runtime_v2 to False so these tests stay on the
+        # legacy busy_indicator activity-digest path even when an
+        # outer process sets CC_TELEGRAM_ROUTE_RUNTIME_V2=true.
+        # Coverage for the route_runtime path lives in
+        # tests/scenarios/test_route_runtime_snapshot.py.
+        monkeypatch.setattr(cfg, "route_runtime_v2", False)
         monkeypatch.setattr(cfg, "context_pct_threshold", 80)
 
     def test_legacy_path_unchanged_when_flag_off(self, monkeypatch: pytest.MonkeyPatch):

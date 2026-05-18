@@ -125,6 +125,21 @@ class Config:
             os.getenv("CC_TELEGRAM_BUSY_INDICATOR_V2", "true").lower() == "true"
         )
 
+        # Wave B RouteRuntime: per-route snapshot state machine that
+        # subsumes busy_indicator + status_polling's idle-clear state +
+        # message_queue's status-card visibility into one lock-protected
+        # interface. Default False during soak; flip to True manually,
+        # observe for ≥48h, then a follow-up commit deletes the legacy
+        # ``busy_indicator.register_state_callback`` /
+        # ``register_activity_callback`` fan-out and the ``_idle_state``
+        # backstop. Asymmetry with ``busy_indicator_v2`` (default True)
+        # is intentional — Wave B ships off-by-default so the legacy path
+        # continues to drive production until the snapshot interface has
+        # had real load.
+        self.route_runtime_v2 = (
+            os.getenv("CC_TELEGRAM_ROUTE_RUNTIME_V2", "false").lower() == "true"
+        )
+
         # Context-window indicator threshold (percent). The activity-digest
         # header appends "· ctx NN%" when the cached value crosses this; at
         # ≥95 it prepends a warning glyph. Below threshold or unknown: no

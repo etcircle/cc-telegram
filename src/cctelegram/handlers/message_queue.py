@@ -33,6 +33,7 @@ from telegram import Bot, ReplyParameters
 from telegram.error import RetryAfter
 
 from ..config import config
+from .. import route_runtime
 from ..session import session_id_for_window, session_manager
 from ..terminal_parser import is_status_active, parse_status_line
 from ..tmux_manager import tmux_manager
@@ -1148,9 +1149,25 @@ def _render_activity_digest(
     """
     display = _display_name(state.window_id)
     if config.busy_indicator_v2 and route is not None:
-        run = busy_indicator.state(route)
+        if config.route_runtime_v2:
+            # Wave B: route_runtime is authoritative under v2. Read the
+            # snapshot once so run_state + context_usage come from the
+            # same committed transition.
+            snap = route_runtime.snapshot(route)
+            run = snap.run_state
+            pct: int | None = None
+            if snap.context_usage and snap.context_usage.max_tokens > 0:
+                raw = int(
+                    round(
+                        snap.context_usage.tokens * 100 / snap.context_usage.max_tokens
+                    )
+                )
+                pct = max(0, min(100, raw))
+        else:
+            run = busy_indicator.state(route)
+            pct = busy_indicator.context_pct(route)
         status = _RUN_STATE_HEADER.get(run, "🟡 Busy")
-        suffix = _context_pct_suffix(busy_indicator.context_pct(route))
+        suffix = _context_pct_suffix(pct)
     else:
         if waiting:
             status = "🔔 Waiting on you"
@@ -2441,6 +2458,11 @@ async def _convert_status_to_content(
         return None
 
     msg_id, stored_wid, _ = info
+    if config.route_runtime_v2:
+        # The card is being repurposed as a content message — from
+        # route_runtime's perspective the status card is no longer
+        # visible (mq has no record of an editable status surface).
+        route_runtime.mark_status_card_cleared((user_id, thread_id_or_0, stored_wid))
     thread_id = thread_id_or_0 if thread_id_or_0 != 0 else None
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
     if stored_wid != window_id:
@@ -2543,8 +2565,14 @@ async def _process_status_update_task(
             )
             if outcome is TopicSendOutcome.OK:
                 _status_msg_info[skey] = (msg_id, wid, status_text)
+                if config.route_runtime_v2:
+                    route_runtime.mark_status_card_published(
+                        (user_id, tid, wid), msg_id
+                    )
             else:
                 _status_msg_info.pop(skey, None)
+                if config.route_runtime_v2:
+                    route_runtime.mark_status_card_cleared((user_id, tid, wid))
                 await _do_send_status_message(bot, user_id, tid, wid, status_text)
     else:
         # No existing status message, send new
@@ -2566,6 +2594,8 @@ async def _do_send_status_message(
     # This catches edge cases where tracking was cleared without deleting the message.
     old = _status_msg_info.pop(skey, None)
     if old:
+        if config.route_runtime_v2:
+            route_runtime.mark_status_card_cleared((user_id, thread_id_or_0, old[1]))
         await topic_delete(
             bot,
             op="status",
@@ -2593,6 +2623,10 @@ async def _do_send_status_message(
     )
     if sent is not None:
         _status_msg_info[skey] = (sent.message_id, window_id, text)
+        if config.route_runtime_v2:
+            route_runtime.mark_status_card_published(
+                (user_id, thread_id_or_0, window_id), sent.message_id
+            )
         return
     if thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
         await _emergency_dm(
@@ -2616,6 +2650,10 @@ async def _do_clear_status_message(
     info = _status_msg_info.pop(skey, None)
     if info:
         msg_id, stored_wid, _ = info
+        if config.route_runtime_v2:
+            route_runtime.mark_status_card_cleared(
+                (user_id, thread_id_or_0, stored_wid)
+            )
         thread_id = thread_id_or_0 if thread_id_or_0 != 0 else None
         chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
         await topic_delete(
@@ -2773,7 +2811,10 @@ async def enqueue_status_update(
 def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
     """Clear status message tracking for a user (and optionally a specific thread)."""
     skey = (user_id, thread_id or 0)
-    _status_msg_info.pop(skey, None)
+    info = _status_msg_info.pop(skey, None)
+    if config.route_runtime_v2 and info is not None:
+        _msg_id, stored_wid, _last_text = info
+        route_runtime.mark_status_card_cleared((user_id, thread_id or 0, stored_wid))
 
 
 def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:
@@ -2859,6 +2900,8 @@ async def teardown_route(route: Route, *, drop_pending: bool) -> None:
         # route can't reply-to a Telegram message_id from the old session.
         _route_last_user_message.pop(route, None)
         busy_indicator.clear_route(route)
+        if config.route_runtime_v2:
+            route_runtime.clear_route(route)
         # Cancel any pending activity-digest debounce so we don't fire an
         # edit against a torn-down route. Also drop the upsert lock — a
         # fresh route gets a fresh lock.

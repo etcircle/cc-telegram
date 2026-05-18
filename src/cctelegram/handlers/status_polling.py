@@ -29,6 +29,7 @@ from telegram import Bot
 from telegram.constants import ChatAction
 
 from ..config import config
+from .. import route_runtime
 from ..session import session_manager
 from ..terminal_parser import (
     is_interactive_ui,
@@ -209,10 +210,18 @@ async def update_status_message(
             latest = read_latest_usage(session.file_path)
             if latest is not None:
                 busy_indicator.update_context_usage(route, latest.tokens, latest.model)
+                if config.route_runtime_v2:
+                    route_runtime.update_context_usage(
+                        route, latest.tokens, latest.model
+                    )
             else:
                 busy_indicator.update_context_usage(route, None, None)
+                if config.route_runtime_v2:
+                    route_runtime.update_context_usage(route, None, None)
         else:
             busy_indicator.update_context_usage(route, None, None)
+            if config.route_runtime_v2:
+                route_runtime.update_context_usage(route, None, None)
 
     should_check_new_ui = True
 
@@ -356,6 +365,8 @@ async def update_status_message(
     # ``handle_interactive_ui`` — that branch already returned early above.
     if config.busy_indicator_v2:
         await busy_indicator.mark_pane_idle((user_id, thread_id or 0, window_id))
+    if config.route_runtime_v2:
+        await route_runtime.mark_pane_idle((user_id, thread_id or 0, window_id))
     await enqueue_status_update(
         bot,
         user_id,
@@ -401,6 +412,8 @@ async def _process_idle_clear_only(
     _idle_state[key] = "cleared"
     if config.busy_indicator_v2:
         await busy_indicator.mark_pane_idle((user_id, thread_id or 0, window_id))
+    if config.route_runtime_v2:
+        await route_runtime.mark_pane_idle((user_id, thread_id or 0, window_id))
     await enqueue_status_update(
         bot,
         user_id,
@@ -513,9 +526,17 @@ async def typing_action_loop(bot: Bot) -> None:
             bindings = list(session_manager.iter_thread_bindings())
             sends: list = []
             for user_id, thread_id, wid in bindings:
-                run = busy_indicator.state((user_id, thread_id or 0, wid))
-                if run not in (RunState.RUNNING, RunState.RUNNING_TOOL):
-                    continue
+                route = (user_id, thread_id or 0, wid)
+                if config.route_runtime_v2:
+                    # Wave B: route_runtime is authoritative under v2.
+                    # ``typing_eligible`` already covers the
+                    # RUNNING / RUNNING_TOOL discrimination.
+                    if not route_runtime.snapshot(route).typing_eligible:
+                        continue
+                else:
+                    run = busy_indicator.state(route)
+                    if run not in (RunState.RUNNING, RunState.RUNNING_TOOL):
+                        continue
                 sends.append(_send_typing_action(bot, user_id, thread_id, wid))
             if sends:
                 await asyncio.gather(*sends, return_exceptions=True)

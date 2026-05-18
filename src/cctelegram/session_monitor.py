@@ -827,10 +827,21 @@ class SessionMonitor:
             from .session import session_manager
             from .handlers import busy_indicator
             from .handlers.interactive_ui import forget_ask_tool_input
+            from . import route_runtime
 
             for user_id, thread_id, wid in session_manager.iter_thread_bindings():
                 if wid in changed_window_ids:
                     busy_indicator.clear_route((user_id, thread_id or 0, wid))
+                    if config.route_runtime_v2:
+                        # Same intent as busy_indicator.clear_route, but
+                        # routed through ``mark_session_reset`` so the
+                        # snapshot transitions visibly (IDLE_CLEARED with
+                        # ``status_card_msg_id`` preserved). Lets
+                        # subscribers observe the reset instead of
+                        # silently dropping route state.
+                        await route_runtime.mark_session_reset(
+                            (user_id, thread_id or 0, wid)
+                        )
                     logger.info(
                         "Cleared busy_indicator route after session change: "
                         "user=%d thread=%s window=%s",
