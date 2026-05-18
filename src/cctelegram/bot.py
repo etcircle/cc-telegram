@@ -236,6 +236,7 @@ CC_COMMANDS: dict[str, str] = {
     "compact": "↗ Compact conversation context",
     "cost": "↗ Show token/cost usage",
     "model": "↗ Switch AI model",
+    "effort": "↗ Set reasoning effort level",
 }
 
 
