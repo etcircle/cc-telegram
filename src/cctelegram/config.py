@@ -136,9 +136,28 @@ class Config:
         # is intentional — Wave B ships off-by-default so the legacy path
         # continues to drive production until the snapshot interface has
         # had real load.
+        #
+        # Requires ``busy_indicator_v2=true``. The event-callback wiring
+        # in ``bot.py`` is gated on busy_indicator_v2, so flipping
+        # route_runtime_v2 on while busy_indicator_v2 is off would leave
+        # route_runtime never receiving transcript events. A startup
+        # warning fires below; the v2 reads still fall back gracefully
+        # (snapshot returns IDLE_CLEARED for unseeded routes), so the
+        # misconfiguration manifests as "indicator never lights" rather
+        # than a crash.
         self.route_runtime_v2 = (
             os.getenv("CC_TELEGRAM_ROUTE_RUNTIME_V2", "false").lower() == "true"
         )
+        if self.route_runtime_v2 and not self.busy_indicator_v2:
+            logger.warning(
+                "CC_TELEGRAM_ROUTE_RUNTIME_V2=true requires "
+                "CC_TELEGRAM_BUSY_INDICATOR_V2=true — the transcript "
+                "event callback is gated on busy_indicator_v2. "
+                "RouteRuntime will be reachable only via direct "
+                "mark_* calls (e.g. mark_inbound_sent); it will not "
+                "receive on_transcript_event fan-out. Enable both flags "
+                "or disable route_runtime_v2."
+            )
 
         # Context-window indicator threshold (percent). The activity-digest
         # header appends "· ctx NN%" when the cached value crosses this; at

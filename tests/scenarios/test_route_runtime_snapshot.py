@@ -264,3 +264,104 @@ async def test_monotonic_seq_visible_to_subscribers(
 
     assert observed_seqs == sorted(observed_seqs)
     assert len(set(observed_seqs)) == 3
+
+
+@pytest.mark.asyncio
+async def test_event_callback_wiring_drives_both_paths(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Integration: bot.py's ``event_callback`` body resolves routes via
+    ``session_manager.find_users_for_session`` and feeds both
+    ``busy_indicator.on_transcript_event`` and
+    ``transcript_event_adapter.dispatch_transcript_event``. The plan's
+    "v2 ships in parallel during soak" guarantee depends on this — we
+    verify both observers arrive at compatible state.
+
+    This is the integration shape that ``test_route_busy_lifecycle``
+    only covers for the legacy path. Wave B asserts the parallel
+    feed.
+    """
+    from cctelegram import bot as bot_module
+    from cctelegram.config import config
+    from cctelegram.handlers import busy_indicator
+    from cctelegram.session import session_manager
+
+    # Both flags on — production-soak configuration.
+    monkeypatch.setattr(config, "busy_indicator_v2", True)
+    monkeypatch.setattr(config, "route_runtime_v2", True)
+
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
+    # Bind the session_id so ``find_users_for_session`` returns this
+    # route. ``get_window_state`` lazily creates the WindowState slot
+    # which session_id can then be written into directly — same shape
+    # ``load_session_map`` uses.
+    session_manager.get_window_state(wid).session_id = "sess-int-1"
+
+    # Replicate ``bot.py::create_bot``'s event_callback body. The
+    # original is a closure inside ``create_bot``; the diff at
+    # bot.py:3322-3346 is what we're testing the integration of.
+    async def event_callback(
+        event: route_runtime.TranscriptLifecycleEvent | object,
+    ) -> None:
+        active = await session_manager.find_users_for_session(event.session_id)  # type: ignore[attr-defined]
+        if not active:
+            return
+        routes = [(user_id, thread_id or 0, wid) for user_id, wid, thread_id in active]
+        await busy_indicator.on_transcript_event(event, routes)  # type: ignore[arg-type]
+        if config.route_runtime_v2:
+            await transcript_event_adapter.dispatch_transcript_event(
+                event,
+                routes,  # type: ignore[arg-type]
+            )
+
+    await event_callback(
+        _event(
+            session_id="sess-int-1",
+            block_type="tool_use",
+            tool_use_id="int-1",
+            tool_name="Bash",
+            stop_reason="tool_use",
+        )
+    )
+
+    route: route_runtime.Route = (scenario.user_id, 42, wid)
+    # Both paths agree the route is RUNNING_TOOL.
+    assert busy_indicator.state(route) is RunState.RUNNING_TOOL
+    snap = route_runtime.snapshot(route)
+    assert snap.run_state is RunState.RUNNING_TOOL
+    assert snap.open_tools == frozenset({"int-1"})
+
+    # End the turn — both paths should arrive at IDLE_RECENT after
+    # tool_result + end_turn.
+    await event_callback(
+        _event(
+            session_id="sess-int-1",
+            role="user",
+            block_type="tool_result",
+            tool_use_id="int-1",
+        )
+    )
+    await event_callback(
+        _event(
+            session_id="sess-int-1",
+            block_type="text",
+            stop_reason="end_turn",
+        )
+    )
+    assert busy_indicator.state(route) is RunState.IDLE_RECENT
+    assert route_runtime.snapshot(route).run_state is RunState.IDLE_RECENT
+
+    # message_queue's activity-digest renderer, when route_runtime_v2 is
+    # on, reads from route_runtime — verify it picks up the same state.
+    from cctelegram.handlers import message_queue
+
+    state = message_queue.ActivityDigestState(message_id=0, window_id=wid)
+    state.tool_count = 1
+    state.completed_count = 1
+    state.done = False
+    rendered = message_queue._render_activity_digest(state, route=route)
+    assert rendered.startswith("✅ Done")  # IDLE_RECENT → "✅ Done"
+
+    # Silence the unused import.
+    _ = bot_module

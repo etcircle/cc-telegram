@@ -37,6 +37,7 @@ didn't.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable
 
@@ -92,13 +93,22 @@ async def dispatch_transcript_event(
 ) -> list[RouteRuntimeSnapshot]:
     """Ingest ``event`` into ``route_runtime`` for each route in ``routes``.
 
-    Returns the per-route committed snapshots — useful for callers that
-    want to chain immediate side-effects off the new state (e.g. a
-    status-card refresh that needs the post-commit ``run_state``).
+    Concurrency: per-route ingests run **concurrently** under
+    ``asyncio.gather`` so independent route locks don't serialise on the
+    adapter side. Within a route, ``route_runtime.ingest_transcript_event``
+    still holds the per-route lock across mutation + freeze; observer
+    fan-out then runs after lock release. The plan's "independent routes
+    do not serialise" invariant holds at the adapter level — a slow
+    observer on route A does NOT delay route B seeing the same event.
+
+    Returns the per-route committed snapshots in input order — useful
+    for callers that want to chain immediate side-effects off the new
+    state (e.g. a status-card refresh that needs the post-commit
+    ``run_state``).
 
     Robustness:
       - Per-route ingest failures are logged at warning level once per
-        session; the rest of the routes still get the event.
+        session; other routes still get their snapshot.
       - ``to_lifecycle_event`` returning ``None`` causes a no-op dispatch
         with no snapshot mutation. Callers can ignore the empty result.
     """
@@ -111,11 +121,10 @@ async def dispatch_transcript_event(
             event.block_type,
         )
         return []
-    snapshots: list[RouteRuntimeSnapshot] = []
-    for route in routes:
+
+    async def _ingest_one(route: Route) -> RouteRuntimeSnapshot | None:
         try:
-            snap = await route_runtime.ingest_transcript_event(route, lifecycle)
-            snapshots.append(snap)
+            return await route_runtime.ingest_transcript_event(route, lifecycle)
         except Exception as e:
             _warn_once(
                 event.session_id,
@@ -123,7 +132,10 @@ async def dispatch_transcript_event(
                 route,
                 e,
             )
-    return snapshots
+            return None
+
+    results = await asyncio.gather(*(_ingest_one(r) for r in routes))
+    return [snap for snap in results if snap is not None]
 
 
 def dispatch_context_usage(

@@ -41,10 +41,22 @@ What it does **not** replace in Wave B:
 Concurrency contract:
 
   - One per-route ``asyncio.Lock``. Independent routes do not serialize.
-  - ``_apply_*`` mutates internal state under the lock.
-  - The lock is released **before** observer fan-out. Observer callbacks
-    can therefore call back into ``snapshot(other_route)`` /
-    ``ingest_*`` without deadlocking.
+  - Async mutators (``ingest_transcript_event``, ``mark_inbound_sent``,
+    ``mark_topic_broken`` / ``mark_topic_recovered``, ``mark_pane_idle``,
+    ``mark_session_reset``) acquire the route's lock, mutate, freeze a
+    snapshot, **then** release the lock before fanning observers out
+    against the committed snapshot. Observers can therefore call back
+    into ``snapshot(other_route)`` / ``ingest_*`` without deadlocking.
+  - **Synchronous side-band writes** (``mark_status_card_published`` /
+    ``mark_status_card_cleared``, ``update_context_usage``,
+    ``seed_open_tools``, ``clear_route``) intentionally bypass the
+    lock. They are bookkeeping for read-side flags — they don't change
+    ``run_state`` (no transition table runs), don't fire observers
+    (no fan-out), and don't await between their initial read of
+    ``_state`` and the field write. Safe under Python's single-threaded
+    asyncio scheduling because no suspension point separates the read
+    from the write. **Do not call these from a thread** — they assume
+    event-loop-thread execution.
   - Every committed transition increments ``_global_seq``; the snapshot
     carries ``monotonic_seq`` so subscribers can dedupe / detect drops.
   - Pane snapshots (``mark_pane_idle``) are reconciliation events with
