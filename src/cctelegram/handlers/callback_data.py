@@ -54,5 +54,9 @@ CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
 CB_SESSION_NEW = "rs:new"  # start a new session
 CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
+# Effort level picker (intercepts bare `/effort` in Telegram)
+# window_id is embedded so a stale button after topic rebind is rejected.
+CB_EFFORT = "eff:"  # eff:<level>:<window_id>  e.g. eff:xhigh:@28
+
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>

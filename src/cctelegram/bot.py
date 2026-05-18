@@ -89,6 +89,7 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
+    CB_EFFORT,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
@@ -792,6 +793,40 @@ _KEY_LABELS: dict[str, str] = {
 }
 
 
+# Effort levels accepted by Claude Code's /effort command. Source of truth:
+# `claude --help` lists `--effort <level>` with these exact strings. Keep
+# in sync if Claude Code changes them.
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+EFFORT_LABELS: dict[str, str] = {
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "xhigh": "Extra High",
+    "max": "Max",
+}
+
+
+def _build_effort_keyboard(window_id: str) -> InlineKeyboardMarkup:
+    """Inline keyboard for /effort level selection.
+
+    callback_data embeds the window_id so a stale button after topic rebind
+    is rejected by ``reject_stale_window_callback`` in callback_handler.
+    """
+
+    def btn(level: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            EFFORT_LABELS[level],
+            callback_data=f"{CB_EFFORT}{level}:{window_id}",
+        )
+
+    return InlineKeyboardMarkup(
+        [
+            [btn("low"), btn("medium"), btn("high")],
+            [btn("xhigh"), btn("max")],
+        ]
+    )
+
+
 def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
     """Build inline keyboard for screenshot: control keys + refresh."""
 
@@ -937,6 +972,20 @@ async def forward_command_handler(
     if not w:
         display = session_manager.get_display_name(wid)
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        return
+
+    # Intercept bare `/effort` (no args) and show an inline picker instead of
+    # forwarding. Claude Code's TUI menu for /effort is invisible in Telegram,
+    # so a Telegram-native picker is the only sane UX. `/effort low` etc.
+    # still forwards via the normal path.
+    parts_text = cmd_text.strip().split(None, 1)
+    base = parts_text[0].split("@")[0] if parts_text else ""
+    if base == "/effort" and len(parts_text) == 1:
+        await safe_reply(
+            update.message,
+            "Choose effort level:",
+            reply_markup=_build_effort_keyboard(wid),
+        )
         return
 
     display = session_manager.get_display_name(wid)
@@ -2597,6 +2646,45 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception as e:
             logger.error(f"Failed to refresh screenshot: {e}")
             await query.answer("Failed to refresh", show_alert=True)
+
+    # Effort level picker — set Claude Code reasoning effort for the session.
+    # callback_data: eff:<level>:<window_id>.  window_id is embedded so a
+    # stale button after topic rebind hits reject_stale_window_callback.
+    elif data.startswith(CB_EFFORT):
+        rest = data[len(CB_EFFORT) :]
+        try:
+            level, window_id = rest.split(":", 1)
+        except ValueError:
+            await query.answer("Invalid data")
+            return
+        if level not in EFFORT_LEVELS:
+            await query.answer("Invalid level")
+            return
+        if await reject_stale_window_callback(window_id):
+            return
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            await query.answer("Window no longer exists", show_alert=True)
+            return
+        label = EFFORT_LABELS[level]
+        # Disable markup before dispatch — guards against rapid double-tap
+        # under PTB concurrent_updates. The same edit also stands in for a
+        # "sending" toast.
+        await safe_edit(query, f"⏳ Setting effort to {label}…", reply_markup=None)
+        await query.answer()
+        # Mirror forward_command_handler's send sequence so /effort follows
+        # the same per-route ordering as a regular slash command.
+        route = (user.id, cb_thread_id or 0, window_id)
+        await aggregator_flush_route(route)
+        success, send_msg = await session_manager.send_to_window(
+            window_id, f"/effort {level}"
+        )
+        if success:
+            if config.busy_indicator_v2:
+                await busy_indicator.mark_inbound_sent(route)
+            await safe_edit(query, f"✓ Effort set to {label}", reply_markup=None)
+        else:
+            await safe_edit(query, f"❌ {send_msg}", reply_markup=None)
 
     elif data == "noop":
         await query.answer()
