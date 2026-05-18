@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from cctelegram import bot as bot_module
+from cctelegram.handlers import inbound_telegram as inbound_module
 from tests.conftest import ScenarioHarness, _make_message, _make_user
 
 
@@ -76,7 +77,7 @@ async def test_media_group_coalesces_caption_and_paths(
     ) -> None:
         offered.append((route, path, caption, media_group_id))
 
-    monkeypatch.setattr(bot_module, "aggregator_offer_photo", fake_offer_photo)
+    monkeypatch.setattr(inbound_module, "aggregator_offer_photo", fake_offer_photo)
 
     # First photo carries the caption.
     upd1 = _make_photo_update(
