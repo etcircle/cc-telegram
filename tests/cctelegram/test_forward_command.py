@@ -79,6 +79,30 @@ class TestForwardCommand:
             mock_sm.send_to_window.assert_called_once_with("@5", "/cost")
 
     @pytest.mark.asyncio
+    async def test_bot_mention_preserves_args(self):
+        """/effort@botname max → forwards "/effort max" (args survive mention)."""
+        update = _make_update("/effort@felixclaudecode_bot max")
+        context = _make_context()
+
+        with (
+            patch("cctelegram.bot.is_user_allowed", return_value=True),
+            patch("cctelegram.bot._get_thread_id", return_value=42),
+            patch("cctelegram.bot.session_manager") as mock_sm,
+            patch("cctelegram.bot.tmux_manager") as mock_tmux,
+            patch("cctelegram.bot.safe_reply", new_callable=AsyncMock),
+        ):
+            mock_sm.resolve_window_for_thread.return_value = "@5"
+            mock_sm.get_display_name.return_value = "project"
+            mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
+            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+
+            from cctelegram.bot import forward_command_handler
+
+            await forward_command_handler(update, context)
+
+            mock_sm.send_to_window.assert_called_once_with("@5", "/effort max")
+
+    @pytest.mark.asyncio
     async def test_clear_clears_session(self):
         """/clear → send_to_window + clear_window_session."""
         update = _make_update("/clear")

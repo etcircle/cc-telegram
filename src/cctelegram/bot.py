@@ -961,8 +961,12 @@ async def forward_command_handler(
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     cmd_text = update.message.text or ""
-    # The full text is already a slash command like "/clear" or "/compact foo"
-    cc_slash = cmd_text.split("@")[0]  # strip bot mention
+    # The full text is already a slash command like "/clear" or "/compact foo".
+    # Strip @botname from the command token only — preserving any trailing
+    # args. e.g. "/effort@mybot max" -> "/effort max", not "/effort".
+    parts_text = cmd_text.strip().split(None, 1)
+    base = parts_text[0].split("@")[0] if parts_text else ""
+    cc_slash = base + (" " + parts_text[1] if len(parts_text) > 1 else "")
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
         await safe_reply(update.message, "❌ No session bound to this topic.")
@@ -978,8 +982,6 @@ async def forward_command_handler(
     # forwarding. Claude Code's TUI menu for /effort is invisible in Telegram,
     # so a Telegram-native picker is the only sane UX. `/effort low` etc.
     # still forwards via the normal path.
-    parts_text = cmd_text.strip().split(None, 1)
-    base = parts_text[0].split("@")[0] if parts_text else ""
     if base == "/effort" and len(parts_text) == 1:
         await safe_reply(
             update.message,
