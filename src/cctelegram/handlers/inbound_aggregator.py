@@ -186,6 +186,10 @@ async def _send_bundle(route: Route, bundle: _PendingBundle) -> bool:
         from . import busy_indicator
 
         await busy_indicator.mark_inbound_sent(route)
+    if config.route_runtime_v2:
+        from .. import route_runtime
+
+        await route_runtime.mark_inbound_sent(route)
     return True
 
 

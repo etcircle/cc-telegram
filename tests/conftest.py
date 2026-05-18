@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from cctelegram import bot as bot_module
+from cctelegram import route_runtime, transcript_event_adapter
 from cctelegram.session import session_manager as _real_sm
 from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
 from cctelegram.handlers import (
@@ -667,6 +668,8 @@ def _reset_interactive_ui() -> None:
 
 def _reset_all_handler_state() -> None:
     busy_indicator.reset_for_tests()
+    route_runtime.reset_for_tests()
+    transcript_event_adapter.reset_for_tests()
     attention.reset_for_tests()
     _reset_message_queue()
     _reset_aggregator()

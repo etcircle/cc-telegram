@@ -76,6 +76,7 @@ Useful behavior knobs:
 - `CC_TELEGRAM_SHOW_HIDDEN_DIRS` — show dot-directories in picker; default `false`.
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` — max input shown in `**Tool**(...)`; default `40`.
 - `CC_TELEGRAM_BUSY_INDICATOR_V2` — event-driven run-state/digest path; default `true`.
+- `CC_TELEGRAM_ROUTE_RUNTIME_V2` — Wave B `route_runtime` snapshot state machine; default `false`. Flip to `true` to drive the new path; observe for ≥48h before a follow-up commit deletes the legacy `busy_indicator` callbacks. Rollback during soak: env var flip + `launchctl kickstart`, not `git revert`.
 - `CC_TELEGRAM_ATTENTION_BUTTONS` — inline buttons on attention cards; default `true`.
 - `CC_TELEGRAM_ATTENTION_BUTTON_TTL_SECONDS` — attention token TTL; default `86400`.
 - `CC_TELEGRAM_ATTENTION_QUESTION_PREVIEW_CHARS` — question card excerpt; default `200`.
@@ -204,9 +205,11 @@ src/cctelegram/handlers/            Telegram interaction layer
   directory_browser.py              directory + session picker
   history.py                        /history paginator
   cleanup.py                        centralized topic teardown
-src/cctelegram/message_refs.py       SQLite provenance table
-src/cctelegram/session_monitor.py    JSONL tail + TranscriptEvent dispatch
-src/cctelegram/transcript_parser.py  JSONL → ParsedEntry / TranscriptEvent
+src/cctelegram/message_refs.py            SQLite provenance table
+src/cctelegram/session_monitor.py         JSONL tail + TranscriptEvent dispatch
+src/cctelegram/transcript_parser.py       JSONL → ParsedEntry / TranscriptEvent
+src/cctelegram/route_runtime.py           Wave B per-route snapshot state machine
+src/cctelegram/transcript_event_adapter.py  TranscriptEvent → route_runtime adapter
 tests/                              pytest suite
 tests/scenarios/                    black-box behavior floor (@pytest.mark.scenario)
 bin/post-wave-check.sh              repo-health diff for the architecture campaign

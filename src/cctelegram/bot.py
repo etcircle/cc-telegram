@@ -166,6 +166,7 @@ from .handlers.message_sender import (
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop, typing_action_loop
+from . import route_runtime, transcript_event_adapter
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor, TranscriptEvent
@@ -1014,11 +1015,21 @@ async def forward_command_handler(
         # pane interactive UI is detected later.
         if config.busy_indicator_v2:
             await busy_indicator.mark_inbound_sent(route)
+        if config.route_runtime_v2:
+            await route_runtime.mark_inbound_sent(route)
         # If /clear command was sent, clear the session association
         # so we can detect the new session after first message
         if cc_slash.strip().lower() == "/clear":
             logger.info("Clearing session for window %s after /clear", display)
             session_manager.clear_window_session(wid)
+            # /clear rotates the session_id — drop any in-flight
+            # open_tools / context_usage that belong to the dead session.
+            # busy_indicator's clear_route happens later via the
+            # session_monitor change-detection path, but route_runtime
+            # exposes the intent directly so consumers see IDLE_CLEARED
+            # immediately rather than waiting for the next poll cycle.
+            if config.route_runtime_v2:
+                await route_runtime.mark_session_reset(route)
 
         # Interactive commands (e.g. /model) render a terminal-based UI
         # with no JSONL tool_use entry.  The status poller already detects
@@ -2684,6 +2695,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if success:
             if config.busy_indicator_v2:
                 await busy_indicator.mark_inbound_sent(route)
+            if config.route_runtime_v2:
+                await route_runtime.mark_inbound_sent(route)
             await safe_edit(query, f"✓ Effort set to {label}", reply_markup=None)
         else:
             await safe_edit(query, f"❌ {send_msg}", reply_markup=None)
@@ -3041,6 +3054,8 @@ async def _build_context_footer(
 
     route = (user_id, thread_id or 0, window_id)
     busy_indicator.update_context_usage(route, latest.tokens, latest.model)
+    if config.route_runtime_v2:
+        route_runtime.update_context_usage(route, latest.tokens, latest.model)
     usage = busy_indicator.context_usage(route)
     if usage is None:
         return None
@@ -3313,6 +3328,13 @@ async def post_init(application: Application) -> None:
                 (user_id, thread_id or 0, wid) for user_id, wid, thread_id in active
             ]
             await busy_indicator.on_transcript_event(event, routes)
+            if config.route_runtime_v2:
+                # Wave B parallel path: drive route_runtime from the same
+                # event stream. The adapter normalises ``TranscriptEvent`` →
+                # ``TranscriptLifecycleEvent`` and fans out per route. Any
+                # per-route failure is logged once-per-session and the
+                # remaining routes still get the event.
+                await transcript_event_adapter.dispatch_transcript_event(event, routes)
             # End-of-turn-question "🔔 Awaiting your reply" card with Yes/No
             # quick-replies removed 2026-05-17 at user request: it fired on
             # any assistant turn that ended with ``?``, producing a Yes/No
@@ -3342,6 +3364,8 @@ async def post_init(application: Application) -> None:
             for user_id, wid, thread_id in active:
                 route: busy_indicator.Route = (user_id, thread_id or 0, wid)
                 busy_indicator.seed_open_tools(route, pending)
+                if config.route_runtime_v2:
+                    route_runtime.seed_open_tools(route, pending)
                 seeded_routes += 1
         if seeded_routes:
             logger.info(
