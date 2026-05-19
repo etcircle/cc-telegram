@@ -61,7 +61,7 @@ async def test_safe_answer_swallows_query_is_too_old(
 ) -> None:
     query = FakeQuery(BadRequest("Query is too old and response timeout expired"))
 
-    with caplog.at_level("INFO", logger="cctelegram.callback_dispatcher"):
+    with caplog.at_level("INFO", logger="cctelegram.handlers.message_sender"):
         result = await safe_answer(query)
 
     assert result is False
@@ -74,7 +74,22 @@ async def test_safe_answer_swallows_query_id_invalid(
 ) -> None:
     query = FakeQuery(BadRequest("query id is invalid"))
 
-    with caplog.at_level("INFO", logger="cctelegram.callback_dispatcher"):
+    with caplog.at_level("INFO", logger="cctelegram.handlers.message_sender"):
+        result = await safe_answer(query)
+
+    assert result is False
+    assert "safe_answer skipped stale callback" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_safe_answer_swallows_capitalized_query_id_invalid(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Case-folded substring match tolerates PTB capitalization variants
+    like 'Query id is invalid' (capital Q) vs 'query id is invalid'."""
+    query = FakeQuery(BadRequest("Bad Request: Query id is invalid"))
+
+    with caplog.at_level("INFO", logger="cctelegram.handlers.message_sender"):
         result = await safe_answer(query)
 
     assert result is False

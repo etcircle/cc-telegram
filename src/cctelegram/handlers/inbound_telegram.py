@@ -96,6 +96,7 @@ from .message_queue import (
 )
 from .message_sender import (
     NO_LINK_PREVIEW,
+    safe_answer,
     safe_edit,
     safe_reply,
     send_with_fallback,
@@ -1185,7 +1186,7 @@ async def _abort_created_window_after_pending_owner_change(
         "⚠️ This picker is stale because another topic now owns the pending "
         f"message.{cleanup_note}",
     )
-    await query.answer("Stale picker", show_alert=show_alert)
+    await safe_answer(query, "Stale picker", show_alert=show_alert)
 
 
 async def _create_and_bind_window(
@@ -1216,7 +1217,7 @@ async def _create_and_bind_window(
             pending_thread_id,
             _pending_thread_id(context.user_data),
         )
-        await query.answer("Stale picker", show_alert=True)
+        await safe_answer(query, "Stale picker", show_alert=True)
         return
 
     success, message, created_wname, created_wid = await tmux_mgr.create_window(
@@ -1303,7 +1304,8 @@ async def _create_and_bind_window(
                 context.user_data, pending_thread_id
             ):
                 _clear_pending_route_payload(context.user_data, delete_files=True)
-            await query.answer(
+            await safe_answer(
+                query,
                 "Hook timeout" if cleanup_ok else "Hook timeout; cleanup failed",
                 show_alert=not cleanup_ok,
             )
@@ -1366,7 +1368,7 @@ async def _create_and_bind_window(
                     context.user_data, pending_thread_id
                 ):
                     _clear_pending_route_payload(context.user_data, delete_files=True)
-                await query.answer("Hook timeout")
+                await safe_answer(query, "Hook timeout")
                 return
 
             # session_monitor lives in bot.py (mutated in post_init); look it
@@ -1425,7 +1427,9 @@ async def _create_and_bind_window(
                     f"✅ {message}\n\n{status}, but the first message failed to send. "
                     "The pending payload was cleared; please resend it here.",
                 )
-                await query.answer(f"{status}; first message failed", show_alert=True)
+                await safe_answer(
+                    query, f"{status}; first message failed", show_alert=True
+                )
                 return
 
             first_turn_note = (
@@ -1446,4 +1450,4 @@ async def _create_and_bind_window(
             and _pending_owner_matches(context.user_data, pending_thread_id)
         ):
             _clear_pending_route_payload(context.user_data, delete_files=True)
-    await query.answer("Created" if success else "Failed")
+    await safe_answer(query, "Created" if success else "Failed")

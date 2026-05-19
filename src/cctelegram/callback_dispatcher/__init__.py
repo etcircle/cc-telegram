@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from telegram import Update
-from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 
@@ -46,30 +45,12 @@ WRONG_USER_PICK_TEXT = "This control isn't yours."
 logger = logging.getLogger(__name__)
 
 
-async def safe_answer(
-    query: Any,
-    text: str | None = None,
-    *,
-    show_alert: bool = False,
-) -> bool:
-    """Answer a callback query, swallowing stale-query errors.
-
-    Returns True when the answer reached Telegram; False on stale-query
-    rejection. Callers can branch on the return value when they need to
-    skip follow-up edits, but most call sites can ignore it.
-    """
-    try:
-        if text is None:
-            await query.answer()
-        else:
-            await query.answer(text, show_alert=show_alert)
-        return True
-    except BadRequest as exc:
-        msg = str(exc)
-        if "Query is too old" in msg or "query id is invalid" in msg:
-            logger.info("safe_answer skipped stale callback: %s", msg)
-            return False
-        raise
+# safe_answer is owned by cctelegram.handlers.message_sender (alongside
+# safe_edit / safe_send / safe_reply). We re-export it here so existing
+# `from . import safe_answer` imports in family modules keep working without
+# creating a callback_dispatcher → handlers/inbound_telegram → ... → dispatcher
+# cycle when handlers/inbound_telegram needs the helper too.
+from cctelegram.handlers.message_sender import safe_answer  # noqa: F401, E402
 
 
 @dataclass(frozen=True)

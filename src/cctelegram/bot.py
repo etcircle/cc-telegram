@@ -133,6 +133,7 @@ from .handlers.message_queue import (
 )
 from . import message_refs
 from .handlers.message_sender import (
+    safe_answer,
     safe_edit,  # noqa: F401 - re-exported for callback dispatcher override tests
     safe_reply,
 )
@@ -162,11 +163,14 @@ _typing_action_task: asyncio.Task | None = None
 async def _telegram_error_handler(update: object, context: object) -> None:
     err = getattr(context, "error", None)
     msg = str(err) if err else ""
+    # Case-fold the substring match so PTB capitalization variants
+    # ("Query id is invalid" vs "query id is invalid") all route to INFO.
+    folded = msg.casefold()
     if isinstance(err, BadRequest) and (
-        "Query is too old" in msg
-        or "query id is invalid" in msg
-        or "Message is not modified" in msg
-        or "message to edit not found" in msg
+        "query is too old" in folded
+        or "query id is invalid" in folded
+        or "message is not modified" in folded
+        or "message to edit not found" in folded
     ):
         logger.info("telegram_stale_callback: %s", msg)
         return
@@ -260,7 +264,7 @@ async def _answer_stale_pending_thread_mismatch(
             clear_browse_state(user_data)
         if user_data is not None:
             _clear_pending_route_payload(user_data, delete_files=True)
-    await query.answer(answer_text, show_alert=True)
+    await safe_answer(query, answer_text, show_alert=True)
 
 
 _PICKER_STALE_TOPIC_MISMATCH = "topic_mismatch"
@@ -299,7 +303,7 @@ async def _answer_invalid_pending_picker_callback(
     answer_text: str,
 ) -> None:
     """Answer a stale picker callback without mutating pending picker state."""
-    await query.answer(answer_text, show_alert=True)
+    await safe_answer(query, answer_text, show_alert=True)
 
 
 def _callback_window_is_current(

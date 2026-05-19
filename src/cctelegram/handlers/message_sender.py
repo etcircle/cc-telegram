@@ -263,6 +263,36 @@ async def safe_send(
             logger.error(f"Failed to send message to {chat_id}: {e}")
 
 
+async def safe_answer(
+    query: Any,
+    text: str | None = None,
+    *,
+    show_alert: bool = False,
+) -> bool:
+    """Answer a callback query, swallowing stale-query errors.
+
+    Returns True when the answer reached Telegram; False on stale-query
+    rejection. Callers can branch on the return value when they need to
+    skip follow-up edits, but most call sites can ignore it.
+
+    Stale-query detection uses case-folded substring matching to tolerate
+    Telegram/PTB capitalization variants ("Query id is invalid" vs
+    "query id is invalid").
+    """
+    try:
+        if text is None:
+            await query.answer()
+        else:
+            await query.answer(text, show_alert=show_alert)
+        return True
+    except BadRequest as exc:
+        folded = str(exc).casefold()
+        if "query is too old" in folded or "query id is invalid" in folded:
+            logger.info("safe_answer skipped stale callback: %s", exc)
+            return False
+        raise
+
+
 # ── Topic-targeted operation primitives ────────────────────────────────────
 
 

@@ -58,6 +58,18 @@ async def test_handler_suppresses_message_to_edit_not_found(
     await _handle(BadRequest("message to edit not found"), caplog, "INFO")
 
     assert "telegram_stale_callback" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_handler_suppresses_capitalized_query_id_invalid(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Case-folded match tolerates PTB capitalization variants like
+    'Bad Request: Query id is invalid'."""
+    await _handle(BadRequest("Bad Request: Query id is invalid"), caplog, "INFO")
+
+    assert "telegram_stale_callback" in caplog.text
+    assert "Traceback" not in caplog.text
     assert "Traceback" not in caplog.text
 
 
