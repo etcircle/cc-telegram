@@ -55,6 +55,7 @@ from .callback_data import (
 from .message_sender import (
     NO_LINK_PREVIEW,
     TopicSendOutcome,
+    safe_answer,
     topic_delete,
     topic_edit,
     topic_edit_reply_markup,
@@ -529,25 +530,25 @@ async def assert_nav_dispatchable(
         if is_esc:
             # Cleanup is idempotent and what ESC wants.
             return NAV_ESC_CLEAR
-        await query.answer("No live interactive UI")
+        await safe_answer(query, "No live interactive UI")
         return None
     if get_interactive_window(user_id, thread_id) != window_id:
         if is_esc:
             return NAV_ESC_CLEAR
-        await query.answer("Window changed")
+        await safe_answer(query, "Window changed")
         return None
     w = await tmux_mgr.find_window_by_id(window_id)
     if w is None:
         if is_esc:
             return NAV_ESC_CLEAR
-        await query.answer("Window not found")
+        await safe_answer(query, "Window not found")
         return None
     visible = await tmux_mgr.capture_pane(w.window_id, scrollback_lines=0)
     state = visible_pane_liveness(visible)
     if state == "absent":
         if is_esc:
             return NAV_ESC_CLEAR
-        await query.answer("Picker closed, refreshing")
+        await safe_answer(query, "Picker closed, refreshing")
         return None
     # PRESENT or UNKNOWN: proceed. UNKNOWN explicitly continues per CB1.
     return w

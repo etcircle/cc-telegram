@@ -44,6 +44,7 @@ from . import (
     _answer_invalid_pending_picker_callback,
     _validate_pending_picker_callback,
     owner_matches,
+    safe_answer,
     window_lease,
 )
 
@@ -100,7 +101,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )
-        await query.answer()
+        await safe_answer(query)
 
     # Interactive UI: Down arrow
     elif data.startswith(CB_ASK_DOWN):
@@ -123,7 +124,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )
-        await query.answer()
+        await safe_answer(query)
 
     # Interactive UI: Left arrow
     elif data.startswith(CB_ASK_LEFT):
@@ -146,7 +147,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )
-        await query.answer()
+        await safe_answer(query)
 
     # Interactive UI: Right arrow
     elif data.startswith(CB_ASK_RIGHT):
@@ -169,7 +170,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )
-        await query.answer()
+        await safe_answer(query)
 
     # Interactive UI: Escape
     elif data.startswith(CB_ASK_ESC):
@@ -185,7 +186,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             await clear_interactive_msg(
                 user.id, context.bot, thread_id, session_mgr=adapters.session_manager
             )
-            await query.answer("⎋ Esc")
+            await safe_answer(query, "⎋ Esc")
             return
         if w is None:
             return
@@ -193,7 +194,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         await clear_interactive_msg(
             user.id, context.bot, thread_id, session_mgr=adapters.session_manager
         )
-        await query.answer("⎋ Esc")
+        await safe_answer(query, "⎋ Esc")
 
     # Interactive UI: Enter
     elif data.startswith(CB_ASK_ENTER):
@@ -216,7 +217,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )
-        await query.answer("⏎ Enter")
+        await safe_answer(query, "⏎ Enter")
 
     # Interactive UI: Space
     elif data.startswith(CB_ASK_SPACE):
@@ -239,7 +240,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )
-        await query.answer("␣ Space")
+        await safe_answer(query, "␣ Space")
 
     # Interactive UI: Tab
     elif data.startswith(CB_ASK_TAB):
@@ -262,7 +263,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )
-        await query.answer("⇥ Tab")
+        await safe_answer(query, "⇥ Tab")
 
     # Interactive UI: refresh display (F1: included in the nav-guard family)
     elif data.startswith(CB_ASK_REFRESH):
@@ -283,7 +284,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )
-        await query.answer("🔄")
+        await safe_answer(query, "🔄")
 
     # Interactive UI: structured option pick (PR 2b)
     elif data.startswith(CB_ASK_PICK):
@@ -298,7 +299,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             # Token never existed, was already used, or has aged past the
             # 5-minute TTL. Refresh the card so the user sees the live form
             # state and can click a fresh button.
-            await query.answer("Card expired, refreshing.", show_alert=False)
+            await safe_answer(query, "Card expired, refreshing.", show_alert=False)
             thread_id = _get_thread_id(update)
             window_id = get_interactive_window(user.id, thread_id) or ""
             if window_id:
@@ -318,14 +319,14 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # windows without consuming or double-answering, and only consume
         # immediately before dispatch on a fresh owner click.
         if not owner_matches(entry, user.id):
-            await query.answer(WRONG_USER_PICK_TEXT, show_alert=True)
+            await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
             return
         if await reject_stale_window_callback(window_id):
             return
         consume_pick_token(token)
         w = await tmux_manager.find_window_by_id(window_id)
         if not w:
-            await query.answer("Window not found", show_alert=True)
+            await safe_answer(query, "Window not found", show_alert=True)
             return
 
         # Staleness check: re-capture the pane and re-resolve before dispatching
@@ -364,7 +365,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 entry.fingerprint,
                 current_form.fingerprint() if current_form else "none",
             )
-            await query.answer("Form changed, refreshing.", show_alert=False)
+            await safe_answer(query, "Form changed, refreshing.", show_alert=False)
             await handle_interactive_ui(
                 context.bot,
                 user.id,
@@ -397,7 +398,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                     user.id,
                     window_id,
                 )
-                await query.answer("Review screen moved, refreshing.", show_alert=False)
+                await safe_answer(
+                    query, "Review screen moved, refreshing.", show_alert=False
+                )
                 await handle_interactive_ui(
                     context.bot,
                     user.id,
@@ -420,7 +423,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         await asyncio.sleep(0.5)
         await tmux_manager.send_keys(w.window_id, "Enter", enter=False, literal=False)
-        await query.answer(f"{entry.option_number}. {entry.option_label[:32]}")
+        await safe_answer(query, f"{entry.option_number}. {entry.option_label[:32]}")
         await asyncio.sleep(0.5)
         # PR 3: snapshot the JSONL cache digest BEFORE re-rendering. If a
         # concurrent ``tool_result`` clears the cache between this point

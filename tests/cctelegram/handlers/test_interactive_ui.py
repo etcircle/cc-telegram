@@ -873,7 +873,7 @@ class TestAssertNavDispatchable:
         q = self._query()
         result = await assert_nav_dispatchable(q, 42, 7, "@0")
         assert result is None
-        q.answer.assert_awaited_once_with("No live interactive UI")
+        q.answer.assert_awaited_once_with("No live interactive UI", show_alert=False)
 
     @pytest.mark.asyncio
     async def test_no_interactive_surface_esc_returns_clear_sentinel(self):
@@ -904,7 +904,7 @@ class TestAssertNavDispatchable:
         q = self._query()
         result = await iui.assert_nav_dispatchable(q, 42, 7, "@requested")
         assert result is None
-        q.answer.assert_awaited_once_with("Window changed")
+        q.answer.assert_awaited_once_with("Window changed", show_alert=False)
 
     @pytest.mark.asyncio
     async def test_visible_pane_absent_short_circuits(self):
@@ -933,7 +933,7 @@ class TestAssertNavDispatchable:
         ):
             result = await iui.assert_nav_dispatchable(q, 42, 7, "@0")
         assert result is None
-        q.answer.assert_awaited_once_with("Picker closed, refreshing")
+        q.answer.assert_awaited_once_with("Picker closed, refreshing", show_alert=False)
 
     @pytest.mark.asyncio
     async def test_visible_pane_unknown_proceeds(self):

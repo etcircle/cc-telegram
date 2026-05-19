@@ -23,7 +23,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaDocum
 from cctelegram.handlers.callback_data import CB_KEYS_PREFIX, CB_SCREENSHOT_REFRESH
 from cctelegram.screenshot import text_to_image
 
-from . import checked_callback_data, window_lease
+from . import checked_callback_data, safe_answer, window_lease
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +95,12 @@ async def execute_screenshot_callback(authorized: Any, adapters: Any) -> None:
             return
         w = await tmux_manager.find_window_by_id(window_id)
         if not w:
-            await query.answer("Window no longer exists", show_alert=True)
+            await safe_answer(query, "Window no longer exists", show_alert=True)
             return
 
         text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
         if not text:
-            await query.answer("Failed to capture pane", show_alert=True)
+            await safe_answer(query, "Failed to capture pane", show_alert=True)
             return
 
         png_bytes = await text_to_image(text, with_ansi=True)
@@ -112,7 +112,7 @@ async def execute_screenshot_callback(authorized: Any, adapters: Any) -> None:
                 ),
                 reply_markup=keyboard,
             )
-            await query.answer("Refreshed")
+            await safe_answer(query, "Refreshed")
         except Exception as e:
             logger.error(f"Failed to refresh screenshot: {e}")
-            await query.answer("Failed to refresh", show_alert=True)
+            await safe_answer(query, "Failed to refresh", show_alert=True)

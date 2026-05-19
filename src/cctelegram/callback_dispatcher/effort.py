@@ -22,7 +22,7 @@ from cctelegram.handlers.callback_data import CB_EFFORT
 from cctelegram.handlers.inbound_aggregator import aggregator_flush_route
 from cctelegram.handlers.message_sender import safe_edit
 
-from . import window_lease
+from . import safe_answer, window_lease
 
 EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 EFFORT_LABELS: dict[str, str] = {
@@ -72,23 +72,23 @@ async def execute_effort_callback(authorized: Any, adapters: Any) -> None:
         try:
             level, window_id = rest.split(":", 1)
         except ValueError:
-            await query.answer("Invalid data")
+            await safe_answer(query, "Invalid data")
             return
         if level not in EFFORT_LEVELS:
-            await query.answer("Invalid level")
+            await safe_answer(query, "Invalid level")
             return
         if await reject_stale_window_callback(window_id):
             return
         w = await tmux_manager.find_window_by_id(window_id)
         if not w:
-            await query.answer("Window no longer exists", show_alert=True)
+            await safe_answer(query, "Window no longer exists", show_alert=True)
             return
         label = EFFORT_LABELS[level]
         # Disable markup before dispatch — guards against rapid double-tap
         # under PTB concurrent_updates. The same edit also stands in for a
         # "sending" toast.
         await safe_edit(query, f"⏳ Setting effort to {label}…", reply_markup=None)
-        await query.answer()
+        await safe_answer(query)
         # Mirror forward_command_handler's send sequence so /effort follows
         # the same per-route ordering as a regular slash command.
         route = (user.id, cb_thread_id or 0, window_id)
