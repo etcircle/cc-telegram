@@ -1787,7 +1787,7 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
     )
     edit_text = mock_edit.await_args.args[1]
     assert edit_text == "✅ Bound to window `existing-window`\n\nFirst message sent."
-    update.callback_query.answer.assert_awaited_once_with("Bound")
+    update.callback_query.answer.assert_awaited_once_with("Bound", show_alert=False)
     assert "_pending_thread_text" not in context.user_data
     assert "_pending_thread_attachments" not in context.user_data
     assert "_pending_thread_id" not in context.user_data

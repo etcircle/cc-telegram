@@ -42,6 +42,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -156,6 +157,36 @@ _status_poll_task: asyncio.Task | None = None
 # so its cadence stays under Telegram's 5s typing TTL regardless of how many
 # bindings exist or how slow tmux capture_pane is.
 _typing_action_task: asyncio.Task | None = None
+
+
+async def _telegram_error_handler(update: object, context: object) -> None:
+    err = getattr(context, "error", None)
+    msg = str(err) if err else ""
+    if isinstance(err, BadRequest) and (
+        "Query is too old" in msg
+        or "query id is invalid" in msg
+        or "Message is not modified" in msg
+        or "message to edit not found" in msg
+    ):
+        logger.info("telegram_stale_callback: %s", msg)
+        return
+    if isinstance(err, Forbidden):
+        # User blocked the bot, or bot kicked from the chat. Not actionable
+        # from our side — log at INFO for forensic visibility, do not retry.
+        logger.info("telegram_forbidden: %s", msg)
+        return
+    if isinstance(err, Conflict):
+        # Another bot instance is polling the same token. This is a real ops
+        # bug (the duplicate-restart.sh incident shape) — surface loudly so
+        # we notice fast.
+        logger.critical("telegram_conflict_multiple_pollers: %s", msg, exc_info=err)
+        return
+    if isinstance(err, NetworkError) and not isinstance(err, BadRequest):
+        logger.warning("telegram_network_error: %s", msg)
+        return
+    # Unknown — log with traceback like today
+    logger.error("telegram_unhandled_error: %s", err, exc_info=err)
+
 
 # §2.5.3 Stage 5.c: daily GC pass for the message_refs SQLite table.
 _message_refs_gc_task: asyncio.Task | None = None
@@ -1182,6 +1213,8 @@ def create_bot() -> Application:
         .post_shutdown(post_shutdown)
         .build()
     )
+
+    application.add_error_handler(_telegram_error_handler)
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))

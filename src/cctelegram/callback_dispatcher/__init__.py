@@ -11,10 +11,12 @@ Key components: parse(), authorize_initial(), execute(), DispatcherAdapters.
 from __future__ import annotations
 
 import importlib
+import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 
@@ -40,6 +42,34 @@ from cctelegram.handlers.inbound_telegram import (  # noqa: E402
 
 STALE_CALLBACK_TEXT = "This button is stale for this topic — refresh the picker."
 WRONG_USER_PICK_TEXT = "This control isn't yours."
+
+logger = logging.getLogger(__name__)
+
+
+async def safe_answer(
+    query: Any,
+    text: str | None = None,
+    *,
+    show_alert: bool = False,
+) -> bool:
+    """Answer a callback query, swallowing stale-query errors.
+
+    Returns True when the answer reached Telegram; False on stale-query
+    rejection. Callers can branch on the return value when they need to
+    skip follow-up edits, but most call sites can ignore it.
+    """
+    try:
+        if text is None:
+            await query.answer()
+        else:
+            await query.answer(text, show_alert=show_alert)
+        return True
+    except BadRequest as exc:
+        msg = str(exc)
+        if "Query is too old" in msg or "query id is invalid" in msg:
+            logger.info("safe_answer skipped stale callback: %s", msg)
+            return False
+        raise
 
 
 @dataclass(frozen=True)
@@ -150,11 +180,11 @@ async def dispatch_callback(
         return CallbackResult(False)
     command = parse(query.data.encode("utf-8"))
     if isinstance(command, InvalidCallback):
-        await query.answer("Invalid data", show_alert=True)
+        await safe_answer(query, "Invalid data", show_alert=True)
         return CallbackResult(False)
     user = update.effective_user
     if not user or not is_user_allowed_func(user.id):
-        await query.answer("Not authorized")
+        await safe_answer(query, "Not authorized")
         return CallbackResult(False)
     thread_id = _get_thread_id(update)
     chat = update.effective_chat
@@ -200,7 +230,7 @@ async def execute(
     if isinstance(authorized, Rejected):
         return CallbackResult(False)
     if authorized.command.data == "noop":
-        await authorized.ctx.query.answer()
+        await safe_answer(authorized.ctx.query)
         return CallbackResult(True)
     executor = _resolve_executor(authorized.command.data)
     if executor is None:
@@ -235,7 +265,7 @@ async def _answer_stale_pending_thread_mismatch(
             clear_browse_state(user_data)
         if user_data is not None:
             _clear_pending_route_payload(user_data, delete_files=True)
-    await query.answer(answer_text, show_alert=True)
+    await safe_answer(query, answer_text, show_alert=True)
 
 
 _PICKER_STALE_TOPIC_MISMATCH = "topic_mismatch"
@@ -262,7 +292,7 @@ def _validate_pending_picker_callback(
 
 async def _answer_invalid_pending_picker_callback(query: Any, answer_text: str) -> None:
     """Answer a stale picker callback without mutating pending picker state."""
-    await query.answer(answer_text, show_alert=True)
+    await safe_answer(query, answer_text, show_alert=True)
 
 
 async def revalidate_before_mutation(
@@ -288,7 +318,7 @@ async def revalidate_before_tmux_send(
     """Revalidate topic/window ownership before looking up or sending to tmux."""
     if _callback_window_is_current(session_manager, user_id, thread_id, window_id):
         return True
-    await query.answer(STALE_CALLBACK_TEXT, show_alert=True)
+    await safe_answer(query, STALE_CALLBACK_TEXT, show_alert=True)
     return False
 
 

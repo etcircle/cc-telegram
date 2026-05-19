@@ -56,6 +56,8 @@ from cctelegram.handlers.inbound_telegram import (
 )
 from cctelegram.handlers.message_sender import safe_edit
 
+from . import safe_answer
+
 from . import (
     _answer_invalid_pending_picker_callback,
     _validate_pending_picker_callback,
@@ -105,7 +107,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         try:
             idx = int(data[len(CB_DIR_SELECT) :])
         except ValueError:
-            await query.answer("Invalid data")
+            await safe_answer(query, "Invalid data")
             return
 
         # Look up dir name from cached subdirs
@@ -113,8 +115,8 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             context.user_data.get(BROWSE_DIRS_KEY, []) if context.user_data else []
         )
         if idx < 0 or idx >= len(cached_dirs):
-            await query.answer(
-                "Directory list changed, please refresh", show_alert=True
+            await safe_answer(
+                query, "Directory list changed, please refresh", show_alert=True
             )
             return
         subdir_name = cached_dirs[idx]
@@ -128,7 +130,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         new_path = (Path(current_path) / subdir_name).resolve()
 
         if not new_path.exists() or not new_path.is_dir():
-            await query.answer("Directory not found", show_alert=True)
+            await safe_answer(query, "Directory not found", show_alert=True)
             return
 
         new_path_str = str(new_path)
@@ -156,7 +158,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         if context.user_data is not None:
             context.user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
-        await query.answer()
+        await safe_answer(query)
 
     elif data == CB_DIR_UP:
         stale, _pending_tid = await reject_invalid_pending_picker(
@@ -190,7 +192,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         if context.user_data is not None:
             context.user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
-        await query.answer()
+        await safe_answer(query)
 
     elif data.startswith(CB_DIR_PAGE):
         stale, _pending_tid = await reject_invalid_pending_picker(
@@ -201,7 +203,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         try:
             pg = int(data[len(CB_DIR_PAGE) :])
         except ValueError:
-            await query.answer("Invalid data")
+            await safe_answer(query, "Invalid data")
             return
         default_path = str(Path.cwd())
         current_path = (
@@ -223,7 +225,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         if context.user_data is not None:
             context.user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
-        await query.answer()
+        await safe_answer(query)
 
     elif data == CB_DIR_CONFIRM:
         stale, pending_thread_id = await reject_invalid_pending_picker(
@@ -258,7 +260,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
                 context.user_data["_selected_path"] = selected_path
             text, keyboard = build_session_picker(sessions)
             await safe_edit(query, text, reply_markup=keyboard)
-            await query.answer()
+            await safe_answer(query)
             return
 
         # No existing sessions — create new window directly
@@ -282,7 +284,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         if context.user_data is not None:
             _clear_pending_route_payload(context.user_data, delete_files=True)
         await safe_edit(query, "Cancelled")
-        await query.answer("Cancelled")
+        await safe_answer(query, "Cancelled")
 
     # Session picker: resume existing session
     elif data.startswith(CB_SESSION_SELECT):
@@ -294,14 +296,14 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         try:
             idx = int(data[len(CB_SESSION_SELECT) :])
         except ValueError:
-            await query.answer("Invalid data")
+            await safe_answer(query, "Invalid data")
             return
 
         cached_sessions = (
             context.user_data.get(SESSIONS_KEY, []) if context.user_data else []
         )
         if idx < 0 or idx >= len(cached_sessions):
-            await query.answer("Session not found")
+            await safe_answer(query, "Session not found")
             return
 
         session = cached_sessions[idx]
@@ -360,7 +362,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         if context.user_data is not None:
             _clear_pending_route_payload(context.user_data, delete_files=True)
         await safe_edit(query, "Cancelled")
-        await query.answer("Cancelled")
+        await safe_answer(query, "Cancelled")
 
     # Window picker: bind existing window
     elif data.startswith(CB_WIN_BIND):
@@ -372,14 +374,16 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         try:
             idx = int(data[len(CB_WIN_BIND) :])
         except ValueError:
-            await query.answer("Invalid data")
+            await safe_answer(query, "Invalid data")
             return
 
         cached_windows: list[str] = (
             context.user_data.get(UNBOUND_WINDOWS_KEY, []) if context.user_data else []
         )
         if idx < 0 or idx >= len(cached_windows):
-            await query.answer("Window list changed, please retry", show_alert=True)
+            await safe_answer(
+                query, "Window list changed, please retry", show_alert=True
+            )
             return
         selected_wid = cached_windows[idx]
 
@@ -387,12 +391,14 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         w = await tmux_manager.find_window_by_id(selected_wid)
         if not w:
             display = session_manager.get_display_name(selected_wid)
-            await query.answer(f"Window '{display}' no longer exists", show_alert=True)
+            await safe_answer(
+                query, f"Window '{display}' no longer exists", show_alert=True
+            )
             return
 
         thread_id = _get_thread_id(update)
         if thread_id is None:
-            await query.answer("Not in a topic", show_alert=True)
+            await safe_answer(query, "Not in a topic", show_alert=True)
             return
 
         current_unbound_ids = {
@@ -402,8 +408,8 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             )
         }
         if selected_wid not in current_unbound_ids:
-            await query.answer(
-                "Window is no longer unbound, please retry", show_alert=True
+            await safe_answer(
+                query, "Window is no longer unbound, please retry", show_alert=True
             )
             return
 
@@ -437,7 +443,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
                 "⚠️ First message failed to send. The pending payload was "
                 "cleared; please resend it here.",
             )
-            await query.answer("Bound; first message failed", show_alert=True)
+            await safe_answer(query, "Bound; first message failed", show_alert=True)
             return
 
         first_turn_note = "\n\nFirst message sent." if pending_delivered is True else ""
@@ -445,7 +451,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             query,
             f"✅ Bound to window `{display}`{first_turn_note}",
         )
-        await query.answer("Bound")
+        await safe_answer(query, "Bound")
 
     # Window picker: new session → transition to directory browser
     elif data == CB_WIN_NEW:
@@ -477,7 +483,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             context.user_data[BROWSE_DIRS_KEY] = subdirs
             context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
         await safe_edit(query, msg_text, reply_markup=keyboard)
-        await query.answer()
+        await safe_answer(query)
 
     # Directory browser: opt-in pivot to window picker
     elif data == CB_DIR_BIND_EXISTING:
@@ -490,7 +496,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             adapters.tmux_manager, adapters.session_manager
         )
         if not unbound:
-            await query.answer("No unbound windows available", show_alert=True)
+            await safe_answer(query, "No unbound windows available", show_alert=True)
             return
         msg_text, keyboard, win_ids = build_window_picker(unbound)
         # Swap state from browse → picker. Keep pending thread/text/attachments
@@ -500,7 +506,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
             context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
         await safe_edit(query, msg_text, reply_markup=keyboard)
-        await query.answer()
+        await safe_answer(query)
 
     # Window picker: cancel
     elif data == CB_WIN_CANCEL:
@@ -513,4 +519,4 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         if context.user_data is not None:
             _clear_pending_route_payload(context.user_data, delete_files=True)
         await safe_edit(query, "Cancelled")
-        await query.answer("Cancelled")
+        await safe_answer(query, "Cancelled")

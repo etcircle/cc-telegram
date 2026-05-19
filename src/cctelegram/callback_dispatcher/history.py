@@ -22,6 +22,7 @@ from . import (
     _answer_invalid_pending_picker_callback,
     _callback_window_is_current,
     _validate_pending_picker_callback,
+    safe_answer,
     window_lease,
 )
 
@@ -72,13 +73,13 @@ async def execute_history_callback(authorized: Any, adapters: Any) -> None:
                 window_id = ":".join(parts[1:-2])
             offset = int(offset_str)
         except (ValueError, IndexError):
-            await query.answer("Invalid data")
+            await safe_answer(query, "Invalid data")
             return
 
         if not _callback_window_is_current(
             session_manager, user.id, cb_thread_id, window_id
         ):
-            await query.answer(STALE_CALLBACK_TEXT, show_alert=True)
+            await safe_answer(query, STALE_CALLBACK_TEXT, show_alert=True)
             return
 
         w = await tmux_manager.find_window_by_id(window_id)
@@ -95,4 +96,4 @@ async def execute_history_callback(authorized: Any, adapters: Any) -> None:
             )
         else:
             await safe_edit(query, "Window no longer exists.")
-        await query.answer("Page updated")
+        await safe_answer(query, "Page updated")

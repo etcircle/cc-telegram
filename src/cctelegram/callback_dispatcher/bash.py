@@ -20,7 +20,7 @@ from telegram import InputMediaDocument
 from cctelegram.handlers.callback_data import CB_KEYS_PREFIX
 from cctelegram.screenshot import text_to_image
 
-from . import window_lease
+from . import safe_answer, window_lease
 from .screenshot import KEY_LABELS, KEYS_SEND_MAP, build_screenshot_keyboard
 
 
@@ -38,14 +38,14 @@ async def execute_bash_callback(authorized: Any, adapters: Any) -> None:
         rest = data[len(CB_KEYS_PREFIX) :]
         colon_idx = rest.find(":")
         if colon_idx < 0:
-            await query.answer("Invalid data")
+            await safe_answer(query, "Invalid data")
             return
         key_id = rest[:colon_idx]
         window_id = rest[colon_idx + 1 :]
 
         key_info = KEYS_SEND_MAP.get(key_id)
         if not key_info:
-            await query.answer("Unknown key")
+            await safe_answer(query, "Unknown key")
             return
 
         tmux_key, enter, literal = key_info
@@ -53,13 +53,13 @@ async def execute_bash_callback(authorized: Any, adapters: Any) -> None:
             return
         w = await tmux_manager.find_window_by_id(window_id)
         if not w:
-            await query.answer("Window not found", show_alert=True)
+            await safe_answer(query, "Window not found", show_alert=True)
             return
 
         await tmux_manager.send_keys(
             w.window_id, tmux_key, enter=enter, literal=literal
         )
-        await query.answer(KEY_LABELS.get(key_id, key_id))
+        await safe_answer(query, KEY_LABELS.get(key_id, key_id))
 
         # Refresh screenshot after key press
         await asyncio.sleep(0.5)
