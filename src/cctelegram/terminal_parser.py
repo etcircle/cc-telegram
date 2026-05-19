@@ -368,8 +368,12 @@ _RE_SUBMIT_PROMPT = re.compile(r"^\s*Ready to submit your answers\?\s*$")
 # type free text instead of picking a numbered option).
 _RE_FREE_TEXT_OPTION = re.compile(r"Type something")
 
-# Matches ``(Recommended)`` suffix on an option label.
-_RE_RECOMMENDED = re.compile(r"\(Recommended\)\s*$")
+# Matches ``(Recommended)`` suffix on an option label. Case-insensitive
+# because Claude Code (and skill prompts) sometimes emit the tag lowercase
+# — observed 2026-05-19 in cgc-fork's "Query core grill 2a" AUQ where the
+# JSONL labels carried ``(recommended)``. Without IGNORECASE the flag
+# never set and the literal text leaked into the pick-button label.
+_RE_RECOMMENDED = re.compile(r"\(Recommended\)\s*$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -852,13 +856,26 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
             if all(c == "─" for c in stripped):
                 start_idx = j
                 continue
-            # Description continuation — non-empty indented text after at
-            # least one numbered option already collected. Allow up to
-            # ~5 such lines per option (heuristic — Claude Code rarely
-            # exceeds 3-line descriptions per option).
-            if line.startswith(("  ", "\t")) and any(
-                _RE_NUMBERED_OPTION.match(lines[k])
-                for k in range(j + 1, min(j + 8, footer_idx + 1))
+            # Description continuation — non-empty indented text within
+            # ~7 lines (in either direction) of a numbered option. The
+            # symmetric scan handles the LAST option's descriptions,
+            # which only have a numbered option ABOVE them in file
+            # order (the footer is below). Without the upward arm the
+            # walk-back terminated at the last desc line, leaving
+            # ``pane_opts=0`` and forcing ``_build_pick_button_rows``'s
+            # ``fa5_guard`` to suppress option buttons on multi-Q AUQs
+            # that Claude Code renders without a multi-tab header.
+            # Bounded distance still rejects stale indented scrollback
+            # that has no nearby option.
+            if line.startswith(("  ", "\t")) and (
+                any(
+                    _RE_NUMBERED_OPTION.match(lines[k])
+                    for k in range(j + 1, min(j + 8, footer_idx + 1))
+                )
+                or any(
+                    _RE_NUMBERED_OPTION.match(lines[k])
+                    for k in range(max(0, j - 7), j)
+                )
             ):
                 start_idx = j
                 continue

@@ -719,6 +719,57 @@ class TestParseAskUserQuestion:
         assert form.options[0].label.startswith("B) Still no buttons")
         assert form.options[1].label.startswith("C) Buttons appeared")
 
+    def test_plain_picker_last_option_with_description(self):
+        """Footer-based scan must extract all options when the LAST option
+        has a multi-line description and no multi-tab header is rendered.
+
+        Captured live on 2026-05-19 13:41 in the cgc-fork topic (window @37,
+        thread 10636): a 2-question AUQ rendered without a tab strip; every
+        poll cycle logged ``resolve_ask_form multi-q inference FAILED:
+        questions=2 pane_opts=0 pane_title='Enter to select · …'`` and the
+        renderer fell back to the generic keystroke keyboard. The footer-
+        based upward walk-back's description-continuation rule only looked
+        BELOW for a numbered option (within 8 lines), so the LAST option's
+        descriptions broke the walk: nothing below them except the footer.
+        Fix: symmetric ABOVE-or-BELOW lookahead in parse_ask_user_question.
+        """
+        pane = (
+            "Query core grill 2a — how wide is the dialect seam inside the builder?\n"
+            "\n"
+            "  1. Narrow seam, built now (recommended)\n"
+            "     The private builder emits openCypher; a DialectAdapter supplies\n"
+            "     only the divergent fragments (fulltext search, path-extraction).\n"
+            "  2. Full query translation\n"
+            "     The builder emits a dialect-neutral query representation (IR/AST).\n"
+            "     Most correct, biggest build.\n"
+            "  3. Kuzu-only, defer the seam\n"
+            "     Builder emits openCypher for Kuzu. No DialectAdapter in v1 at all.\n"
+            "     One adapter = hypothetical seam — build it only when Neo4j needs.\n"
+            "     Lightest v1.\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert [opt.number for opt in form.options] == [1, 2, 3]
+        assert form.options[0].label.startswith("Narrow seam")
+        assert form.options[0].recommended is True
+        assert form.options[1].label.startswith("Full query translation")
+        assert form.options[2].label.startswith("Kuzu-only")
+        # The Recommended suffix detection is case-insensitive: Claude Code
+        # emitted ``(recommended)`` lowercase in cgc-fork's JSONL labels.
+        # Without IGNORECASE the literal text leaks into the pick-button
+        # label; with IGNORECASE the flag sets and the suffix is stripped.
+        # Pre-fix the title heuristic mis-assigned the footer text as the
+        # question title because options_region collapsed to ``[blank,
+        # footer]``. Post-fix start_idx walks up past every option, so
+        # the footer is no longer the first non-empty line. None is
+        # acceptable here — ``_strong_match`` falls through to the
+        # label-overlap path and matches Q1's JSONL options.
+        assert form.current_question_title != (
+            "Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel"
+        )
+
     def test_multitab_approach_returns_tabs_and_options(self):
         form = parse_ask_user_question(_PANE_MULTITAB_APPROACH)
         assert form is not None
