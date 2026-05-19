@@ -33,11 +33,13 @@ def _clear_interactive_state():
     _interactive_mode.clear()
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
+    status_polling._last_published_ui_hash.clear()
     status_polling._idle_state.clear()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
+    status_polling._last_published_ui_hash.clear()
     status_polling._idle_state.clear()
 
 
@@ -653,3 +655,150 @@ class TestActivityCallbackReArmsIdleState:
 
         busy_indicator.reset_for_tests()
         status_polling._idle_state.clear()
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestInteractiveUiTransitionRefresh:
+    """Back-to-back AskUserQuestion (Q2 → Q3) must refresh Telegram via the
+    poller path even when interactive_mode is already set for the route.
+
+    Background: Claude Code buffers AskUserQuestion ``tool_use`` JSONL lines
+    until the user answers, so when Q2 transitions to Q3 the bot can't
+    rely on the JSONL-driven dispatch path to publish Q3. The poller has
+    to detect the pane content change and refresh. Without the content-
+    hash dedup added by this regression, the in-interactive-mode early-
+    return would keep the stale Q2 keyboard pinned to Telegram while Q3
+    is already live on the pane — exactly the bug observed in production
+    on 2026-05-19 (CodeGraphAgent topic, 18-minute Q3 delivery delay).
+    """
+
+    _Q2_PANE = (
+        "Q2 — Status Quo: pick every pain that bites\n"
+        " > 1. Tool-surface bloat\n"
+        "   2. Infra friction\n"
+        "   3. Output bloat\n"
+        "   4. Repo handling\n"
+        "\n"
+        " Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+    )
+    _Q3_PANE = (
+        "Q3 — Desperate Specificity: name the human\n"
+        " > 1. Agent power-user\n"
+        "   2. Legacy-codebase inheritor\n"
+        "   3. Agent-harness builder\n"
+        "\n"
+        " Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+    )
+
+    @pytest.mark.asyncio
+    async def test_pane_content_change_refires_handle_interactive_ui(
+        self, mock_bot: AsyncMock
+    ):
+        """Two consecutive ticks: first shows Q2, second shows Q3.
+        handle_interactive_ui must be called BOTH times so Telegram gets the
+        new question. interactive_mode is pre-set to simulate the live state
+        after Q2 was already published.
+        """
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@7"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        # Simulate: Q2 already published, interactive_mode set, msg id known.
+        _interactive_mode[(1, 42)] = window_id
+        _interactive_msgs[(1, 42)] = 12345
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ) as mock_handle_ui,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_handle_ui.return_value = True
+
+            # Tick 1: pane shows Q2. Hash not yet stored → publish.
+            mock_tmux.capture_pane = AsyncMock(return_value=self._Q2_PANE)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_handle_ui.await_count == 1
+
+            # Tick 2: pane STILL shows Q2. Hash matches → no republish.
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_handle_ui.await_count == 1
+
+            # Tick 3: pane transitioned to Q3. Hash differs → republish.
+            mock_tmux.capture_pane = AsyncMock(return_value=self._Q3_PANE)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_handle_ui.await_count == 2
+
+            # Tick 4: still Q3. Hash matches the just-stored Q3 → no
+            # republish (regression guard against an unconditional refresh
+            # turning every tick into an edit).
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_handle_ui.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_ui_clear_drops_stored_hash(self, mock_bot: AsyncMock):
+        """When the pane transitions from interactive UI to no UI, the stored
+        hash is dropped so a subsequent UI is treated as fresh, not stale."""
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@7"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        route = (1, 42, window_id)
+
+        _interactive_mode[(1, 42)] = window_id
+        _interactive_msgs[(1, 42)] = 12345
+
+        no_ui_pane = (
+            "──────────────────────────────────────\n"
+            "❯ \n"
+            "──────────────────────────────────────\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ) as mock_handle_ui,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ),
+            patch.object(status_polling, "has_interactive_surface", return_value=True),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_handle_ui.return_value = True
+
+            # Tick 1: Q2 shown, hash gets stored.
+            mock_tmux.capture_pane = AsyncMock(return_value=self._Q2_PANE)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert route in status_polling._last_published_ui_hash
+
+            # Tick 2: pane goes UI-less. interactive_mode still set for the
+            # window so the clear-path runs; hash must be dropped.
+            mock_tmux.capture_pane = AsyncMock(return_value=no_ui_pane)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert route not in status_polling._last_published_ui_hash
