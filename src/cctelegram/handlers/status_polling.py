@@ -21,6 +21,7 @@ Key components:
 """
 
 import asyncio
+import hashlib
 import logging
 import time
 from typing import Literal
@@ -32,7 +33,7 @@ from ..config import config
 from .. import route_runtime
 from ..session import session_manager
 from ..terminal_parser import (
-    is_interactive_ui,
+    extract_interactive_content,
     is_status_active,
     parse_status_line,
 )
@@ -107,6 +108,16 @@ _idle_state: dict[tuple[int, int], float | Literal["cleared"]] = {}
 # restarts.
 _last_pane_capture: dict[tuple[int, int, str], float] = {}
 
+# Per-route content-hash of the last interactive UI the poller refreshed to
+# Telegram, keyed by ``(user_id, thread_id_or_0, window_id)``. Used to detect
+# back-to-back AskUserQuestion transitions (Q2 → Q3) where the pane never
+# leaves the interactive-UI state but the question and options change. Without
+# this hash, the in-interactive-mode early-return below would keep the stale
+# Q2 keyboard live in Telegram while the user is staring at Q3 in the pane —
+# and Claude Code buffers the new tool_use JSONL line until the user answers,
+# so the JSONL-driven dispatch can't recover until after the fact.
+_last_published_ui_hash: dict[tuple[int, int, str], str] = {}
+
 
 def reset_idle_counter(user_id: int, thread_id: int | None) -> None:
     """Drop the idle state for a route.
@@ -168,6 +179,7 @@ async def update_status_message(
             )
         # Drop the watchdog entry so a re-bind starts fresh.
         _last_pane_capture.pop((user_id, thread_id or 0, window_id), None)
+        _last_published_ui_hash.pop((user_id, thread_id or 0, window_id), None)
         return
 
     # Adaptive pane-capture gate. The 1Hz loop still runs (so cleanup,
@@ -225,10 +237,40 @@ async def update_status_message(
 
     should_check_new_ui = True
 
+    # Extract the interactive UI content once so both the in-interactive-mode
+    # dedup hash (below) and the new-UI dispatch path (further below) share a
+    # single regex pass over the pane.
+    ui_content = extract_interactive_content(pane_text)
+
     if interactive_window == window_id:
         # User is in interactive mode for THIS window
-        if is_interactive_ui(pane_text):
-            # Interactive UI still showing — skip status update (user is interacting)
+        if ui_content is not None:
+            # Interactive UI still on the pane. Compare the content hash to
+            # the last published one to detect Q2 → Q3 transitions: both pass
+            # ``is_interactive_ui`` so a naive early-return here would leave
+            # Telegram pinned to the stale Q2 keyboard. JSONL recovery is also
+            # blocked because Claude Code buffers the new AUQ ``tool_use``
+            # line until the user answers, so the poller is the only chance
+            # to refresh in real time.
+            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            if ui_hash == _last_published_ui_hash.get(route):
+                # Same UI as last publish — user is mid-interaction, skip.
+                return
+            # New UI content. Store the new hash BEFORE the await so a
+            # concurrent tick on the same route doesn't fire a duplicate
+            # publish, then refresh via ``handle_interactive_ui`` (which
+            # edits the existing Telegram card in place).
+            _last_published_ui_hash[route] = ui_hash
+            logger.debug(
+                "Interactive UI content changed (user=%d, window=%s, thread=%s) — "
+                "refreshing keyboard",
+                user_id,
+                window_id,
+                thread_id,
+            )
+            await handle_interactive_ui(
+                bot, user_id, window_id, thread_id, from_poller=True
+            )
             return
         # Interactive UI gone — but only clear if a real interactive message was
         # actually rendered. Without this guard, a 1Hz tick that lands between
@@ -244,6 +286,7 @@ async def update_status_message(
         if not has_interactive_surface(user_id, thread_id):
             return
         await clear_interactive_msg(user_id, bot, thread_id)
+        _last_published_ui_hash.pop(route, None)
         should_check_new_ui = False
     elif interactive_window is not None:
         # User is in interactive mode for a DIFFERENT window (window switched).
@@ -251,10 +294,11 @@ async def update_status_message(
         if not has_interactive_surface(user_id, thread_id):
             return
         await clear_interactive_msg(user_id, bot, thread_id)
+        _last_published_ui_hash.pop(route, None)
 
     # Check for permission prompt (interactive UI not triggered via JSONL)
     # ALWAYS check UI, regardless of skip_status
-    if should_check_new_ui and is_interactive_ui(pane_text):
+    if should_check_new_ui and ui_content is not None:
         logger.debug(
             "Interactive UI detected in polling (user=%d, window=%s, thread=%s)",
             user_id,
@@ -264,6 +308,10 @@ async def update_status_message(
         # Tag this as the poller call path so handle_interactive_ui can
         # apply AUQ pane-only safety rules when JSONL replay data is absent
         # or stale (render immediately, but suppress unsafe pick buttons).
+        # Store the hash before the await for the same reason as above.
+        _last_published_ui_hash[route] = hashlib.sha256(
+            ui_content.content.encode("utf-8")
+        ).hexdigest()
         await handle_interactive_ui(
             bot, user_id, window_id, thread_id, from_poller=True
         )
