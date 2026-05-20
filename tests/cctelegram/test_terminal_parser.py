@@ -248,6 +248,143 @@ class TestExtractInteractiveContent:
         assert "Old Beta" not in result.content
         assert "Old Gamma" not in result.content
 
+    def test_ask_user_multi_tab_stale_header_in_deep_scrollback(self):
+        """Regression — cga incident, 2026-05-20 13:38:25:
+
+        A previous multi-tab AUQ was answered/dismissed; Claude Code kept its
+        tab header line in scrollback (``←  ☐ X  ☐ Y  ✔ Submit  →``) while
+        collapsing the rest of the picker. ~100 lines of subsequent tool
+        output and assistant text followed, then a NEW single-tab AUQ
+        rendered live at the visible bottom with ``Enter to select``.
+
+        Pre-fix: the multi-tab pattern's ``bottom=()`` used the last
+        non-empty line as the bottom anchor, so the walk-back from the live
+        ``Enter to select`` line found the stale multi-tab tab header at the
+        top and extracted everything in between — combining the OLD picker's
+        question text with the NEW picker's footer. ``handle_interactive_ui``
+        rendered the Telegram card with the stale question's options
+        against a live picker, and the hash-dedup cache locked in the bad
+        content (the visible-only ``ui_content`` and the scrollback-fed
+        render disagreed, so subsequent polls never refreshed).
+
+        Fix: ``bail_markers=(_RE_COLLAPSED_REGION,)`` on the AUQ
+        patterns. While walking back from the live ``Enter to select``
+        line, the pre-top-found path now also bails on the standalone
+        ``… +N lines (ctrl+o to expand)`` line — Claude Code's TUI
+        signal that a previous picker's content was collapsed. The
+        multi-tab pattern returns None, the single-tab pattern then
+        matches the live picker via its own ``☐ Graph mode`` top
+        anchored on the live ``Enter to select`` footer.
+        """
+        mid_traffic = "\n".join(
+            f"  trace line {i:03d}: assistant text or tool output"
+            for i in range(1, 100)
+        )
+        pane = (
+            "⏺ Earlier assistant turn\n"
+            "─────\n"
+            "←  ☐ Comparison  ☐ Graph reset  ✔ Submit  →\n"
+            "\n"
+            "Which CGC-vs-CGA comparison do you actually want?\n"
+            "\n"
+            "     … +17 lines (ctrl+o to expand)\n"
+            "\n"
+            "⏺ User declined to answer questions\n"
+            "  ⎿  · Which CGC-vs-CGA comparison do you actually want?\n"
+            f"\n{mid_traffic}\n"
+            "─────\n"
+            "☐ Graph mode\n"
+            "\n"
+            "Wipe + re-index the live CGC/Neo4j di-copilot graph, or do it on a side path?\n"
+            "\n"
+            "❯ 1. Wipe live di-copilot, re-index, restore\n"
+            "2. Clone to /tmp and index that\n"
+            "3. Type something.\n"
+            "─────\n"
+            "4. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+        # Must be the LIVE single-tab picker, not the stale multi-tab.
+        assert "Graph mode" in result.content
+        assert "Wipe + re-index" in result.content
+        assert "Comparison" not in result.content
+        assert "Which CGC-vs-CGA" not in result.content
+
+    def test_ask_user_collapsed_marker_inside_option_description_does_not_bail(
+        self,
+    ):
+        """Regression — codex P2 v2 (2026-05-20):
+
+        The stale-scrollback bail marker matches the standalone collapsed
+        TUI line (``… +N lines (ctrl+o to expand)``). A model-supplied
+        option description that QUOTES this text inline must not trigger
+        the bail — the regex is anchored to the whole line so embedded
+        occurrences are ignored.
+        """
+        pane = (
+            "⏺ Earlier text\n"
+            "\n"
+            "─────\n"
+            "←  ☐ A  ☐ B  ✔ Submit  →\n"
+            "\n"
+            "Pick an approach:\n"
+            "\n"
+            "❯ 1. Option Alpha\n"
+            "   See the note (… +17 lines (ctrl+o to expand) shows up when\n"
+            "   Claude collapses output) for more context on this option.\n"
+            "  2. Option Beta\n"
+            "   Just an alternative.\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+        assert "Option Alpha" in result.content
+        assert "Option Beta" in result.content
+
+    def test_ask_user_multi_tab_submit_confirmation_still_detected(self):
+        """Regression — codex P1 (2026-05-20 review of the stale-scrollback fix):
+
+        The Submit confirmation screen of a multi-Q AUQ contains both
+        ``Ready to submit your answers?`` AND ``❯ 1. Submit answers``. A
+        previous attempt added both as bottom markers on the multi-tab
+        pattern; the pre-top-found bail then saw the higher marker as a
+        stale footer and returned None, breaking detection of the LIVE
+        submit screen.
+
+        The current shape: multi-tab keeps ``bottom=()`` (last-non-empty)
+        and uses bail_markers for stale rejection. This test pins the
+        Submit-screen detection so the regression cannot recur.
+        """
+        pane = (
+            "⏺ Earlier text\n"
+            "\n"
+            "─────\n"
+            "←  ☒ Approach  ☒ Positioning  ✔ Submit  →\n"
+            "\n"
+            "Review your answers\n"
+            "\n"
+            " ● Approach\n"
+            "   → Iterative\n"
+            " ● Positioning\n"
+            "   → Aggressive\n"
+            "\n"
+            "Ready to submit your answers?\n"
+            "\n"
+            "❯ 1. Submit answers\n"
+            "  2. Cancel\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "AskUserQuestion"
+        assert "Review your answers" in result.content
+        assert "Submit answers" in result.content
+
     def test_permission_prompt_no_longer_detected(self, sample_pane_permission: str):
         # Wave 2: PermissionPrompt is dead code under
         # ``--dangerously-skip-permissions`` (the deployment's mode), so the

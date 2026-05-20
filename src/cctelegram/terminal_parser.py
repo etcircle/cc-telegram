@@ -58,6 +58,34 @@ class UIPattern:
     bottom: tuple[re.Pattern[str], ...]
     min_gap: int = 2  # minimum lines between top and bottom (inclusive)
     bottom_up: bool = False  # scan bottom marker first, then matching top upward
+    # Additional pre-top-found bail markers. While walking back from
+    # ``bottom_idx`` to find a top anchor, encountering any of these is
+    # treated as evidence of a stale picker between the current top
+    # candidate (above) and the live bottom (below) — bail with None so
+    # the next pattern in UI_PATTERNS can try. The existing
+    # ``pattern.bottom``-based bail catches the case where the OLDER
+    # picker still has its footer intact; this extra list catches the
+    # case where Claude Code has collapsed the older picker into a
+    # ``… +N lines (ctrl+o to expand)`` placeholder (cga incident,
+    # 2026-05-20 13:38:25: multi-tab AUQ #A's tab header at scrollback
+    # line 130 combined with AUQ #B's live ``Enter to select`` near line
+    # 220 because AUQ #A's footer had been collapsed; the bot rendered
+    # AUQ #A's options on the live card).
+    bail_markers: tuple[re.Pattern[str], ...] = ()
+
+
+# Marks a collapsed Claude Code TUI region — Bash output, file reads, or an
+# answered/dismissed AskUserQuestion picker. The token appears at the spot the
+# original content used to occupy and is rendered on its OWN line with this
+# exact shape: ``     … +17 lines (ctrl+o to expand)``. For a LIVE picker, the
+# collapse placeholder never appears as a standalone line inside the picker
+# region (the user needs to see options to interact). Anchoring the regex
+# with ``^`` … ``$`` rejects matches embedded inside model-supplied option
+# descriptions (codex P2, 2026-05-20: a description quoting this text would
+# otherwise be misread as a stale-picker boundary and bail detection).
+_RE_COLLAPSED_REGION = re.compile(
+    r"^\s*(?:…|\.\.\.)\s+\+\d+\s+lines?\s+\(ctrl[+-]o\s+to\s+expand\)\s*$"
+)
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
@@ -81,6 +109,7 @@ UI_PATTERNS: list[UIPattern] = [
         bottom=(),
         min_gap=1,
         bottom_up=True,
+        bail_markers=(_RE_COLLAPSED_REGION,),
     ),
     UIPattern(
         name="AskUserQuestion",
@@ -88,6 +117,7 @@ UI_PATTERNS: list[UIPattern] = [
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=1,
         bottom_up=True,
+        bail_markers=(_RE_COLLAPSED_REGION,),
     ),
     # Plain single-select AskUserQuestion (no checkbox glyphs). Claude Code
     # renders simple A/B/C/D questions as numbered options + ``Enter to select``
@@ -101,6 +131,7 @@ UI_PATTERNS: list[UIPattern] = [
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=0,
         bottom_up=True,
+        bail_markers=(_RE_COLLAPSED_REGION,),
     ),
     UIPattern(
         name="RestoreCheckpoint",
@@ -197,6 +228,15 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
             # the live picker — the checkbox pattern walked past the
             # live plain-numbered options to find an old ☐ top.
             if pattern.bottom and any(p.search(lines[i]) for p in pattern.bottom):
+                return None
+            # Same bail, broader marker set: Claude Code may collapse an
+            # OLDER picker's footer into ``… +N lines (ctrl+o to expand)``
+            # so the bottom-pattern bail above can't see it. Detecting the
+            # collapse placeholder anywhere on the walk-back path closes
+            # that gap (cga incident, 2026-05-20 13:38:25).
+            if pattern.bail_markers and any(
+                p.search(lines[i]) for p in pattern.bail_markers
+            ):
                 return None
     else:
         for i, line in enumerate(lines):
