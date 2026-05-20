@@ -34,12 +34,14 @@ def _clear_interactive_state():
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
+    status_polling._absent_streak.clear()
     status_polling._idle_state.clear()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
+    status_polling._absent_streak.clear()
     status_polling._idle_state.clear()
 
 
@@ -459,7 +461,10 @@ class TestInteractiveModeRaceGuard:
     async def test_poll_clears_when_interactive_msg_already_rendered(
         self, mock_bot: AsyncMock
     ):
-        """Mode set AND msg_id present → poller clears as before."""
+        """Mode set AND msg_id present → poller clears after the absent streak
+        threshold is reached. The first ABSENT_STREAK_THRESHOLD-1 ticks must
+        defer the clear (hysteresis); the threshold-th tick fires the delete.
+        """
         from cctelegram.handlers import status_polling
         from cctelegram.handlers.interactive_ui import (
             _interactive_mode,
@@ -492,9 +497,17 @@ class TestInteractiveModeRaceGuard:
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=non_interactive_pane)
 
-            await status_polling.update_status_message(
-                mock_bot, user_id=user_id, window_id=window_id, thread_id=thread_id
-            )
+            # Drive THRESHOLD consecutive absent polls; only the last fires the
+            # clear. Sub-threshold ticks must defer.
+            for tick in range(status_polling.ABSENT_STREAK_THRESHOLD):
+                await status_polling.update_status_message(
+                    mock_bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    thread_id=thread_id,
+                )
+                if tick + 1 < status_polling.ABSENT_STREAK_THRESHOLD:
+                    mock_clear.assert_not_called()
 
             mock_clear.assert_called_once_with(user_id, mock_bot, thread_id)
 
@@ -795,10 +808,367 @@ class TestInteractiveUiTransitionRefresh:
             )
             assert route in status_polling._last_published_ui_hash
 
-            # Tick 2: pane goes UI-less. interactive_mode still set for the
-            # window so the clear-path runs; hash must be dropped.
+            # Ticks 2 → THRESHOLD: pane goes UI-less. interactive_mode still
+            # set for the window so the clear-path runs, but hysteresis defers
+            # until the streak threshold is reached. The hash is dropped on
+            # the same poll that fires the clear, not before.
             mock_tmux.capture_pane = AsyncMock(return_value=no_ui_pane)
-            await status_polling.update_status_message(
-                mock_bot, user_id=1, window_id=window_id, thread_id=42
-            )
+            for _ in range(status_polling.ABSENT_STREAK_THRESHOLD):
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
             assert route not in status_polling._last_published_ui_hash
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestAbsentStreakHysteresis:
+    """Regression: a transient single-tick absent observation must not destroy
+    a still-live interactive card. The 2026-05-19 22:30 → 2026-05-20 00:15:23
+    cgc-fork incident proved that a long multi-Q AskUserQuestion on the
+    Submit-confirmation step can render one redraw frame where
+    ``extract_interactive_content`` returns None (visible-only capture, top
+    tab anchor + bottom picker footer both off-screen) — and the prior
+    fire-on-first-absent code path deleted msg 32835 ~3 minutes BEFORE the
+    JSONL ``tool_result`` was flushed, leaving the user staring at a live
+    picker on the pane with no Telegram card to dispatch from.
+    """
+
+    _LIVE_AUQ_PANE = (
+        " Q1 — Default value for Config.calls_batch_size?\n"
+        " ❯ 1. 2000 (recommended)\n"
+        "   2. 5000\n"
+        "   3. 500\n"
+        " Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+    )
+    _BAD_FRAME_PANE = (
+        # Bottom-of-pane mid-redraw: TaskList rows visible, picker anchors gone.
+        # This is the exact shape observed at 2026-05-20 00:15:22.993 on @37.
+        "  ◻ Implement batched _create_function_calls › blocked by #2\n"
+        "  ◻ Update tests to cover semantic equivalence  › blocked by #3\n"
+        "  ◻ Re-run proving runs, record v1.1 baseline   › blocked by #4\n"
+    )
+
+    @pytest.mark.asyncio
+    async def test_single_absent_poll_does_not_clear_card(self, mock_bot: AsyncMock):
+        """One bad-frame poll → defer, do NOT call ``clear_interactive_msg``."""
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@37"
+        user_id = 6427984308
+        thread_id = 10636
+        ikey = (user_id, thread_id)
+        route = (user_id, thread_id, window_id)
+        _interactive_mode[ikey] = window_id
+        _interactive_msgs[ikey] = 32835  # the destroyed card in the real incident
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ) as mock_clear,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=self._BAD_FRAME_PANE)
+
+            await status_polling.update_status_message(
+                mock_bot, user_id=user_id, window_id=window_id, thread_id=thread_id
+            )
+
+            mock_clear.assert_not_called()
+            assert status_polling._absent_streak.get(route) == 1
+
+    @pytest.mark.asyncio
+    async def test_absent_streak_resets_on_pane_recovery(self, mock_bot: AsyncMock):
+        """absent → live → absent → absent → live: streak must reset on every
+        live observation so transient flickers can't accumulate toward a false
+        clear.
+        """
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@37"
+        user_id = 6427984308
+        thread_id = 10636
+        ikey = (user_id, thread_id)
+        route = (user_id, thread_id, window_id)
+        _interactive_mode[ikey] = window_id
+        _interactive_msgs[ikey] = 32835
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ) as mock_clear,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ) as mock_handle_ui,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_handle_ui.return_value = True
+
+            # Tick 1: bad frame → streak=1.
+            mock_tmux.capture_pane = AsyncMock(return_value=self._BAD_FRAME_PANE)
+            await status_polling.update_status_message(
+                mock_bot, user_id=user_id, window_id=window_id, thread_id=thread_id
+            )
+            assert status_polling._absent_streak.get(route) == 1
+
+            # Tick 2: pane recovers → streak reset.
+            mock_tmux.capture_pane = AsyncMock(return_value=self._LIVE_AUQ_PANE)
+            await status_polling.update_status_message(
+                mock_bot, user_id=user_id, window_id=window_id, thread_id=thread_id
+            )
+            assert route not in status_polling._absent_streak
+
+            # Tick 3 + 4: two more bad frames — still below threshold because
+            # the recovery on tick 2 reset the counter.
+            mock_tmux.capture_pane = AsyncMock(return_value=self._BAD_FRAME_PANE)
+            for _ in range(status_polling.ABSENT_STREAK_THRESHOLD - 1):
+                await status_polling.update_status_message(
+                    mock_bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    thread_id=thread_id,
+                )
+
+            mock_clear.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_streak_dropped_on_external_clear_callback(self, mock_bot: AsyncMock):
+        """Codex P2 (2026-05-20 review, 2nd pass): the external clear path
+        (``clear_interactive_msg`` from callback dispatcher / JSONL
+        ``tool_result`` handler) must drop ``_absent_streak`` synchronously
+        via the registered clear callback. Lazy reset on the next poll
+        (`interactive_window != window_id`) is not sufficient because the
+        external-clear → new-lifecycle transition can complete entirely
+        between two polls, leaving zero opportunity for the lazy branch to
+        fire before the new lifecycle's first absent observation.
+        """
+        from cctelegram.handlers import interactive_ui, status_polling
+
+        window_id = "@37"
+        user_id = 6427984308
+        thread_id = 10636
+        route = (user_id, thread_id, window_id)
+
+        # Pre-populate streak as if a prior lifecycle had built one up.
+        status_polling._absent_streak[route] = 2
+
+        # Fire the callback directly — this is what ``clear_interactive_msg``
+        # invokes via ``_fire_clear`` after popping the lock.
+        interactive_ui._fire_clear(user_id, thread_id, window_id)
+
+        assert route not in status_polling._absent_streak
+
+    @pytest.mark.asyncio
+    async def test_streak_does_not_survive_external_clear(self, mock_bot: AsyncMock):
+        """Codex P2 (2026-05-20 review): if a prior interactive lifecycle ends
+        via an external path (callback dispatcher / JSONL ``tool_result`` →
+        ``clear_interactive_msg``) while ``_absent_streak`` is mid-build, the
+        next lifecycle on the same route+window must NOT inherit that count.
+        Inheritance would let a single bad-frame poll reach the threshold and
+        delete the new live card — defeating the hysteresis this patch adds.
+        """
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@37"
+        user_id = 6427984308
+        thread_id = 10636
+        ikey = (user_id, thread_id)
+        route = (user_id, thread_id, window_id)
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ) as mock_clear,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=self._BAD_FRAME_PANE)
+
+            # Lifecycle 1: AUQ live, one bad-frame poll accumulates streak=1.
+            _interactive_mode[ikey] = window_id
+            _interactive_msgs[ikey] = 32835
+            await status_polling.update_status_message(
+                mock_bot,
+                user_id=user_id,
+                window_id=window_id,
+                thread_id=thread_id,
+            )
+            assert status_polling._absent_streak.get(route) == 1
+            mock_clear.assert_not_called()
+
+            # External clear (e.g. callback dispatcher fires Submit after
+            # accumulating answers). Both mode and msg_id reset by the
+            # external code path; the poller does NOT see this transition.
+            _interactive_mode.pop(ikey, None)
+            _interactive_msgs.pop(ikey, None)
+
+            # One poll lands while no interactive surface owns the route —
+            # the cleanup branch must drop the stale streak.
+            await status_polling.update_status_message(
+                mock_bot,
+                user_id=user_id,
+                window_id=window_id,
+                thread_id=thread_id,
+            )
+            assert route not in status_polling._absent_streak
+
+            # Lifecycle 2: a fresh AUQ arrives on the same route+window.
+            # Without the codex fix, the streak would already be 1, so two
+            # more bad-frame polls would fire ``clear_interactive_msg`` on a
+            # brand-new card. With the fix, the streak is 0 and only the
+            # threshold-th absent poll triggers the clear.
+            _interactive_mode[ikey] = window_id
+            _interactive_msgs[ikey] = 99999  # fresh card id
+            for _ in range(status_polling.ABSENT_STREAK_THRESHOLD - 1):
+                await status_polling.update_status_message(
+                    mock_bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    thread_id=thread_id,
+                )
+
+            mock_clear.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_streak_does_not_survive_publish_race(self, mock_bot: AsyncMock):
+        """Variant of the codex P2 case where the external clear happens just
+        before a fresh ``set_interactive_mode`` but before the new card is
+        published. The poll lands in the publish race (mode set, msg_id
+        unset). The leftover streak must be cleared on that race tick so the
+        eventual threshold count starts from zero.
+        """
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@37"
+        user_id = 6427984308
+        thread_id = 10636
+        ikey = (user_id, thread_id)
+        route = (user_id, thread_id, window_id)
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=self._BAD_FRAME_PANE)
+
+            # Seed a leftover streak from a prior lifecycle, simulating a
+            # callback-dispatch external clear that didn't go through the
+            # poller (which would otherwise reset the counter).
+            status_polling._absent_streak[route] = 2
+
+            # New lifecycle starts mid-publish: mode set, no msg_id yet.
+            _interactive_mode[ikey] = window_id
+            assert _interactive_msgs.get(ikey) is None
+
+            await status_polling.update_status_message(
+                mock_bot,
+                user_id=user_id,
+                window_id=window_id,
+                thread_id=thread_id,
+            )
+
+            # The publish-race early return must drop the stale streak.
+            assert route not in status_polling._absent_streak
+
+    @pytest.mark.asyncio
+    async def test_window_switch_clears_immediately_no_hysteresis(
+        self, mock_bot: AsyncMock
+    ):
+        """User in interactive mode on window A; the poller ticks for window
+        B (window switch). That branch must clear without hysteresis because
+        the route ownership has unambiguously moved.
+        """
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        live_window = "@37"
+        polling_window = "@29"
+        user_id = 6427984308
+        thread_id_for_poll = 3207
+        ikey = (user_id, thread_id_for_poll)
+
+        # Mode set for live_window, but we're polling polling_window.
+        _interactive_mode[ikey] = live_window
+        _interactive_msgs[ikey] = 32835
+
+        mock_window = MagicMock()
+        mock_window.window_id = polling_window
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ) as mock_clear,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(
+                return_value="some random non-interactive pane\n❯ \n"
+            )
+
+            await status_polling.update_status_message(
+                mock_bot,
+                user_id=user_id,
+                window_id=polling_window,
+                thread_id=thread_id_for_poll,
+            )
+
+            mock_clear.assert_called_once_with(user_id, mock_bot, thread_id_for_poll)

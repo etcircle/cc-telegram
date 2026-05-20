@@ -23,6 +23,7 @@ import json
 import logging
 import secrets
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
@@ -444,10 +445,51 @@ def set_interactive_mode(
     _interactive_mode[(user_id, thread_id or 0)] = window_id
 
 
+# Callback registry: fired when an interactive lifecycle ends, so per-lifecycle
+# state owned by other modules (e.g. ``status_polling._absent_streak``) can be
+# dropped synchronously instead of waiting for a later poll to notice the
+# transition. Codex P2 (2026-05-20): without this hook, an external clear via
+# the JSONL tool_result handler in ``bot.handle_new_message`` can land between
+# polls and leave the next lifecycle inheriting a stale counter, defeating the
+# hysteresis that protects the live picker. Callback signature:
+# ``(user_id, thread_id_or_0, cleared_window_id_or_none)``.
+ClearCallback = Callable[[int, int, str | None], None]
+_clear_callbacks: list[ClearCallback] = []
+
+
+def register_clear_callback(callback: ClearCallback) -> None:
+    """Register a synchronous callback fired when an interactive lifecycle
+    ends (both ``clear_interactive_mode`` and ``clear_interactive_msg``).
+
+    Registrations are process-lifetime; identity dedupe guards against
+    accidental double-registration on bot reload. Exceptions in one callback
+    do not prevent the next from running.
+    """
+    if callback in _clear_callbacks:
+        return
+    _clear_callbacks.append(callback)
+
+
+def _fire_clear(user_id: int, thread_id: int, window_id: str | None) -> None:
+    """Notify all registered clear callbacks for a route lifecycle end."""
+    for cb in list(_clear_callbacks):
+        try:
+            cb(user_id, thread_id, window_id)
+        except Exception as e:
+            logger.error(
+                "clear callback error user=%d thread=%d window=%s: %s",
+                user_id,
+                thread_id,
+                window_id,
+                e,
+            )
+
+
 def clear_interactive_mode(user_id: int, thread_id: int | None = None) -> None:
     """Clear interactive mode for a user (without deleting message)."""
     logger.debug("Clear interactive mode: user=%d, thread=%s", user_id, thread_id)
-    _interactive_mode.pop((user_id, thread_id or 0), None)
+    cleared_window_id = _interactive_mode.pop((user_id, thread_id or 0), None)
+    _fire_clear(user_id, thread_id or 0, cleared_window_id)
 
 
 # Sentinel returned by ``assert_nav_dispatchable`` for the ESC-on-stale branch:
@@ -1948,6 +1990,12 @@ async def clear_interactive_msg(
         single_msg_id,
         len(multi_msg_ids),
     )
+
+    # Fire lifecycle-end hooks BEFORE Telegram I/O so subscribers (e.g.
+    # ``status_polling._absent_streak``) drop their per-lifecycle state even
+    # if the bot.delete_message call below fails. Lock has already released
+    # so callbacks can re-enter interactive_ui safely.
+    _fire_clear(user_id, thread_id or 0, cleared_window_id)
 
     if bot is None:
         return

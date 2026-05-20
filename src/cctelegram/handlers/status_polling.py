@@ -46,6 +46,7 @@ from .interactive_ui import (
     get_interactive_window,
     handle_interactive_ui,
     has_interactive_surface,
+    register_clear_callback,
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_content_queue
@@ -118,6 +119,22 @@ _last_pane_capture: dict[tuple[int, int, str], float] = {}
 # so the JSONL-driven dispatch can't recover until after the fact.
 _last_published_ui_hash: dict[tuple[int, int, str], str] = {}
 
+# Hysteresis on the clear path for in-interactive routes. A single 1Hz poll
+# that lands during a Claude Code redraw frame can come up empty even while
+# the picker is genuinely live — long multi-Q AskUserQuestion forms on the
+# Submit-confirmation step are the canonical case: when ``extract_interactive_content``
+# runs over a visible-only capture and the top tab anchor + the bottom picker
+# footer are both off-screen for one frame, the predicate returns None and the
+# legacy single-tick clear would destroy the still-live card. Observed once on
+# 2026-05-19 22:30 → 2026-05-20 00:15:23 (cgc-fork @37 / msg 32835): the AUQ
+# stayed live for ~1h45m, the JSONL tool_result didn't flush until 00:18:46,
+# but the card was deleted at 00:15:23 because one poll saw the visible-bottom
+# as TaskList rows instead of the picker footer. Require ABSENT_STREAK_THRESHOLD
+# consecutive absent polls before clearing so transient single-frame redraws
+# can't kill a live picker; reset to 0 on any non-None UI observation.
+ABSENT_STREAK_THRESHOLD = 3  # ~3s at STATUS_POLL_INTERVAL=1.0
+_absent_streak: dict[tuple[int, int, str], int] = {}
+
 
 def reset_idle_counter(user_id: int, thread_id: int | None) -> None:
     """Drop the idle state for a route.
@@ -147,6 +164,28 @@ async def _on_busy_activity(route: busy_indicator.Route) -> None:
 
 
 busy_indicator.register_activity_callback(_on_busy_activity)
+
+
+def _on_interactive_clear(
+    user_id: int, thread_id_or_0: int, window_id: str | None
+) -> None:
+    """Drop ``_absent_streak[(user, thread, window)]`` synchronously when an
+    interactive lifecycle ends (codex P2, 2026-05-20). Without this hook the
+    streak survives external clears (callback dispatcher / JSONL tool_result
+    routing) and is inherited by the next lifecycle on the same route+window,
+    so a single bad-frame poll on the new card could reach
+    ``ABSENT_STREAK_THRESHOLD`` instantly and delete a freshly-published
+    picker — exactly the failure mode the hysteresis was added to prevent.
+    Lazy reset on the next poll's ``interactive_window != window_id`` branch
+    is not sufficient: the external-clear → new-lifecycle transition can
+    happen entirely between polls, so the cleanup window collapses.
+    """
+    if window_id is None:
+        return
+    _absent_streak.pop((user_id, thread_id_or_0, window_id), None)
+
+
+register_clear_callback(_on_interactive_clear)
 
 
 async def update_status_message(
@@ -188,6 +227,17 @@ async def update_status_message(
     # WATCHDOG_INTERVAL above for the criteria.
     route = (user_id, thread_id or 0, window_id)
     interactive_window = get_interactive_window(user_id, thread_id)
+    if interactive_window != window_id:
+        # ``_absent_streak`` is meaningful only while THIS route+window owns
+        # the active interactive lifecycle. When the route's interactive has
+        # been retired (external clear via callback dispatcher / JSONL
+        # tool_result routing) or moved to a different window, drop any
+        # accumulated streak so the next lifecycle doesn't inherit a stale
+        # counter (codex P2, 2026-05-20 review). Done BEFORE the watchdog
+        # gate so the cleanup runs even on ticks where we skip the pane
+        # capture — ``_absent_streak`` doesn't depend on pane content, only
+        # on interactive lifecycle ownership.
+        _absent_streak.pop(route, None)
     in_interactive = interactive_window == window_id
     now_mono = time.monotonic()
     last_capture = _last_pane_capture.get(route)
@@ -252,6 +302,7 @@ async def update_status_message(
             # blocked because Claude Code buffers the new AUQ ``tool_use``
             # line until the user answers, so the poller is the only chance
             # to refresh in real time.
+            _absent_streak.pop(route, None)
             ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
             if ui_hash == _last_published_ui_hash.get(route):
                 # Same UI as last publish — user is mid-interaction, skip.
@@ -284,17 +335,37 @@ async def update_status_message(
         # ``_multi_tab_sessions``). ``get_interactive_msg_id`` alone
         # missed multi-tab sessions and left their cards orphaned.
         if not has_interactive_surface(user_id, thread_id):
+            # Publish race: mode set but no card yet. Drop any leftover
+            # streak so the new lifecycle starts from zero once published.
+            _absent_streak.pop(route, None)
+            return
+        # Hysteresis: a single absent poll can be a transient redraw frame on
+        # a still-live picker (see ``ABSENT_STREAK_THRESHOLD`` docstring).
+        # Require N consecutive absent polls before destroying the card.
+        streak = _absent_streak.get(route, 0) + 1
+        if streak < ABSENT_STREAK_THRESHOLD:
+            _absent_streak[route] = streak
+            logger.debug(
+                "Interactive UI absent (streak=%d/%d) for window_id %s — "
+                "deferring clear",
+                streak,
+                ABSENT_STREAK_THRESHOLD,
+                window_id,
+            )
             return
         await clear_interactive_msg(user_id, bot, thread_id)
         _last_published_ui_hash.pop(route, None)
+        _absent_streak.pop(route, None)
         should_check_new_ui = False
     elif interactive_window is not None:
         # User is in interactive mode for a DIFFERENT window (window switched).
-        # Same gate as above.
+        # Same gate as above. No hysteresis — the user has unambiguously moved
+        # focus, so the old card is dead by definition.
         if not has_interactive_surface(user_id, thread_id):
             return
         await clear_interactive_msg(user_id, bot, thread_id)
         _last_published_ui_hash.pop(route, None)
+        _absent_streak.pop(route, None)
 
     # Check for permission prompt (interactive UI not triggered via JSONL)
     # ALWAYS check UI, regardless of skip_status
