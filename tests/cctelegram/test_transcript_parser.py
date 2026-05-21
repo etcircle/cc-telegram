@@ -390,6 +390,63 @@ class TestParseEntries:
         assert tool_result_entries[0].tool_use_id == "t1"
         assert not pending
 
+    def test_tool_result_carries_tool_name_from_pending_tools(
+        self,
+        make_jsonl_entry,
+        make_tool_use_block,
+        make_tool_result_block,
+    ):
+        """Regression — codex P1 (2026-05-21): ``tool_result`` ParsedEntry
+        must carry ``tool_name`` so downstream callers
+        (``bot.handle_new_message`` AUQ cache invalidation, future per-tool
+        result classifiers) can identify which tool resolved without
+        maintaining a separate id set. Pre-fix this field defaulted to None
+        on every tool_result entry, and the bug-#2 AUQ cache leak fix
+        silently no-op'd in production.
+
+        AskUserQuestion is the load-bearing case: bug #2 ships an
+        invalidation branch in ``bot.py`` keyed on
+        ``msg.tool_name == "AskUserQuestion" and msg.content_type ==
+        "tool_result"``. Without this propagation that branch never fires.
+        """
+        entries = [
+            make_jsonl_entry(
+                "assistant",
+                [
+                    make_tool_use_block(
+                        "t-auq-1",
+                        "AskUserQuestion",
+                        {
+                            "questions": [
+                                {
+                                    "question": "Pick one",
+                                    "header": "Decide",
+                                    "options": [{"label": "A"}, {"label": "B"}],
+                                }
+                            ]
+                        },
+                    )
+                ],
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t-auq-1", "Your questions have been answered.")],
+            ),
+        ]
+        result, pending = TranscriptParser.parse_entries(entries)
+        tool_use_entries = [e for e in result if e.content_type == "tool_use"]
+        tool_result_entries = [e for e in result if e.content_type == "tool_result"]
+        assert len(tool_use_entries) == 1
+        assert tool_use_entries[0].tool_name == "AskUserQuestion"
+        assert len(tool_result_entries) == 1
+        assert tool_result_entries[0].tool_use_id == "t-auq-1"
+        assert tool_result_entries[0].tool_name == "AskUserQuestion", (
+            "tool_result must inherit tool_name from the matching pending "
+            "tool_use; without this the bot's AUQ cache invalidation branch "
+            "(keyed on msg.tool_name) never fires in production and the "
+            "cache leak from 2026-05-21 09:30:21 recurs"
+        )
+
     def test_thinking_block(self, make_jsonl_entry, make_thinking_block):
         entries = [
             make_jsonl_entry("assistant", [make_thinking_block("reasoning here")])

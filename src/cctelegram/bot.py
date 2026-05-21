@@ -898,6 +898,28 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 user_id, bot, thread_id, session_mgr=session_manager
             )
             forget_ask_tool_input(wid)
+        # AUQ ``tool_result`` always invalidates the cached ``tool_input``,
+        # even when no card is live to clear. The branch above is gated on
+        # ``has_interactive_surface``, so a card that status_polling's
+        # absent-streak hysteresis cleared BEFORE the JSONL ``tool_result``
+        # arrives leaves the cache pointing at the just-completed AUQ.
+        # The NEXT AUQ's render then overlays the new pane onto the
+        # completed question's options and pick-buttons get suppressed via
+        # ``current_tab_inferred=False`` — the user sees the wrong card
+        # (2026-05-21 09:30:21 incident on @40 / msg 34563: D1+D2 multi-Q
+        # was answered at 09:29:16, hysteresis-cleared the card at
+        # 09:29:16, the D1+D2 ``tool_result`` JSONL line then arrived at
+        # 09:29:31 with no surface so the cache stayed; the next AUQ
+        # appearing at 09:30:21 rendered as stale-D1 verbatim text and
+        # the user couldn't see the live D3 picker without /screenshot).
+        # ``forget_ask_tool_input`` is ``dict.pop(key, None)`` — re-call
+        # is safe when the branch above also fired.
+        if (
+            msg.role == "assistant"
+            and msg.tool_name == "AskUserQuestion"
+            and msg.content_type == "tool_result"
+        ):
+            forget_ask_tool_input(wid)
 
         # Skip tool call notifications when CC_TELEGRAM_SHOW_TOOL_CALLS=false
         if not config.show_tool_calls and msg.content_type in (

@@ -235,9 +235,13 @@ _todo_flush_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
 # within the debounce window collapse to "render the most recent only".
 _todo_pending_snapshot: dict[tuple[int, int], list[dict[str, object]]] = {}
 # tool_use_ids that came from a parent ``TodoWrite``. Tracked per-route so
-# the matching ``tool_result`` (which carries no tool_name) can be dropped
-# from the activity digest path; otherwise the result line leaks into the
-# activity card as "**TodoWrite** — applied" noise duplicating the digest.
+# the matching ``tool_result`` can be dropped from the activity digest
+# path; otherwise the result line leaks into the activity card as
+# "**TodoWrite** — applied" noise duplicating the digest. (Historic note:
+# this set was added when ``tool_result`` ParsedEntries carried no
+# ``tool_name``; transcript_parser now propagates it on tool_result too,
+# but the id-set lookup remains the authoritative identity for
+# routed-through-digest results.)
 #
 # Bounded LRU because the entry is only removed on (a) the matching
 # tool_result landing or (b) ``teardown_route``. A TodoWrite whose
@@ -1680,9 +1684,13 @@ def _is_todo_tool_use(task: MessageTask) -> bool:
 def _is_todo_tool_result(task: MessageTask, user_id: int) -> bool:
     """tool_result for an id we've already routed through the todo digest.
 
-    tool_result tasks don't carry tool_name, so the per-route id set is
-    the only way to identify them. Identification is required so the
-    result doesn't leak into the activity digest as a duplicate line.
+    transcript_parser now propagates ``tool_name`` to tool_result entries
+    when ``pending_tools`` has recovered it, so a name-based check on
+    tool_result is theoretically possible. The per-route id set stays
+    authoritative here because (a) it pins the routing decision made at
+    tool_use time, not what the parser happened to recover, and (b) the
+    pre-existing identification path is the contract this digest relies
+    on for replay/restart correctness.
     """
     if (
         task.task_type != "content"

@@ -52,7 +52,14 @@ class ParsedEntry:
     tool_use_id: str | None = None
     timestamp: str | None = None  # ISO timestamp from JSONL
     tool_name: str | None = (
-        None  # For tool_use entries, the tool name (e.g. "AskUserQuestion")
+        # For tool_use entries, the tool name (e.g. "AskUserQuestion") parsed
+        # from the JSONL block. Also propagated to the matching tool_result
+        # entry when ``pending_tools`` has recovered the name from the tool_use
+        # — required by downstream consumers (e.g. ``bot.handle_new_message``)
+        # that need to invalidate per-tool caches on result arrival without
+        # tracking a separate id set. None when the originating tool_use is
+        # outside the scanned region (transcript truncation / restart replay).
+        None
     )
     image_data: list[tuple[str, bytes]] | None = (
         None  # For tool_result entries with images: (media_type, raw_bytes)
@@ -779,6 +786,7 @@ class TranscriptParser:
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
                                     timestamp=entry_timestamp,
+                                    tool_name=tool_name,
                                     tool_input=tool_input_data
                                     if isinstance(tool_input_data, dict)
                                     else None,
@@ -812,6 +820,7 @@ class TranscriptParser:
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
                                     timestamp=entry_timestamp,
+                                    tool_name=tool_name,
                                     image_data=result_images,
                                     tool_input=tool_input_data
                                     if isinstance(tool_input_data, dict)
@@ -862,6 +871,7 @@ class TranscriptParser:
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
                                     timestamp=entry_timestamp,
+                                    tool_name=tool_name,
                                     image_data=result_images,
                                     tool_input=tool_input_data
                                     if isinstance(tool_input_data, dict)
@@ -881,6 +891,7 @@ class TranscriptParser:
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
                                     timestamp=entry_timestamp,
+                                    tool_name=tool_name,
                                     image_data=result_images,
                                     tool_input=tool_input_data
                                     if isinstance(tool_input_data, dict)
