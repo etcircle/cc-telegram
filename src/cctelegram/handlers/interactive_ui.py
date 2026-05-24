@@ -198,11 +198,24 @@ def remember_ask_tool_input(
     that only care about the input dict), but production callers
     in ``bot.py`` and ``session_monitor._hydrate_ask_tool_input_cache``
     pass it so the AUQ context-message gate can dedup per AUQ.
+
+    When a NEW ``tool_use_id`` replaces a different prior id for the
+    same window, the context-post marker is also cleared: a new AUQ
+    has started in the same window and the next ``claim`` must succeed.
+    Under the presence-based dedup contract (the form-source v5 fix),
+    leaving the prior marker in place would silently suppress the new
+    AUQ's context message.
     """
     if isinstance(tool_input, dict):
         _last_completed_ask_tool_input[window_id] = tool_input
         if isinstance(tool_use_id, str):
+            prior_id = _last_auq_tool_use_id.get(window_id)
             _last_auq_tool_use_id[window_id] = tool_use_id
+            if prior_id is not None and prior_id != tool_use_id:
+                # New AUQ id replaced an old one for the same window —
+                # drop the stale context-post marker so the next claim
+                # succeeds for the new AUQ.
+                _auq_context_posted.pop(window_id, None)
         else:
             # Caller doesn't have a tool_use_id (test helper or legacy
             # path). Drop any stale ID + posted state so the context
@@ -226,14 +239,25 @@ def forget_ask_tool_input(window_id: str) -> None:
         _persist_interactive_state()
 
 
-def claim_auq_context_post(window_id: str) -> bool:
+def claim_auq_context_post(window_id: str, dedup_key: str) -> bool:
     """Atomic check-and-set for the AUQ context-message gate.
 
-    Returns ``True`` iff the caller owns the right to send the AUQ
-    context message (i.e. an AUQ is cached for this window AND its
-    ``tool_use.id`` has not yet been context-posted). On ``True``,
-    the slot is immediately claimed so concurrent callers see
-    ``False`` and skip the duplicate post.
+    Presence-based dedup: returns ``True`` only when no prior context
+    message has been posted for the current AUQ lifecycle on this
+    window. On ``True``, stores ``dedup_key`` so concurrent / later
+    callers — even with a DIFFERENT key (e.g. a JSONL ``tool_use_id``
+    arriving after a form-fingerprint claim) — see the marker as set
+    and skip.
+
+    ``dedup_key`` must be a non-empty string. Pass the JSONL
+    ``tool_use_id`` when available; fall back to
+    ``f"form:{form.fingerprint()}"`` for live AUQs where Claude Code
+    hasn't flushed the ``tool_use`` line yet. The stored value is
+    informational (persisted for debug visibility); the dedup decision
+    is purely presence-based, so callers must clear the marker via
+    ``forget_ask_tool_input`` (on ``tool_result``) or by passing a
+    fresh ``tool_use_id`` to ``remember_ask_tool_input`` (which auto-
+    resets the marker when the id changes).
 
     Synchronous — relies on asyncio's single-thread semantics for
     atomicity between the read and the write. The function does not
@@ -244,12 +268,11 @@ def claim_auq_context_post(window_id: str) -> bool:
     so a ``launchctl kickstart`` between claim and the next render
     doesn't re-fire the context message for an already-posted AUQ.
     """
-    current_id = _last_auq_tool_use_id.get(window_id)
-    if current_id is None:
+    if not dedup_key:
         return False
-    if _auq_context_posted.get(window_id) == current_id:
+    if _auq_context_posted.get(window_id) is not None:
         return False
-    _auq_context_posted[window_id] = current_id
+    _auq_context_posted[window_id] = dedup_key
     _persist_interactive_state()
     return True
 
@@ -1122,8 +1145,8 @@ def _truncate_description(description: str) -> str:
     return flat[: _DESCRIPTION_CHAR_CAP - 1].rstrip() + "…"
 
 
-def _should_post_auq_context(tool_input: dict | None) -> bool:
-    """True iff the AUQ has at least one question with renderable text.
+def _should_post_auq_context(source: dict | AskUserQuestionForm | None) -> bool:
+    """True iff the AUQ source has at least one question with renderable text.
 
     User invariant 2026-05-22: always post a separate "📋 AskUserQuestion
     — full details" info message alongside the picker for every AUQ
@@ -1134,12 +1157,17 @@ def _should_post_auq_context(tool_input: dict | None) -> bool:
     claim and post a header-only message (the "convergent
     overengineering" risk Codex flagged on v2).
 
-    Returns False only for malformed input (not a dict, no questions
-    list, every question missing both ``question`` and ``header`` text).
+    Accepts EITHER a JSONL ``tool_use.input`` dict OR an
+    ``AskUserQuestionForm`` (the pane-derived fallback for live AUQs
+    where Claude Code hasn't flushed the ``tool_use`` line yet). Returns
+    False only for malformed input (not a dict/form, no usable
+    title/header text, no labeled options).
     """
-    if not isinstance(tool_input, dict):
+    if isinstance(source, AskUserQuestionForm):
+        return _form_has_postable_content(source)
+    if not isinstance(source, dict):
         return False
-    questions = tool_input.get("questions")
+    questions = source.get("questions")
     if not isinstance(questions, list):
         return False
     for q in questions:
@@ -1151,8 +1179,30 @@ def _should_post_auq_context(tool_input: dict | None) -> bool:
     return False
 
 
-def _format_auq_context_message(tool_input: dict) -> str:
-    """Render the JSONL AUQ ``tool_use.input`` as a readable context dump.
+def _form_has_postable_content(form: AskUserQuestionForm) -> bool:
+    """Predicate for the form-source path of _should_post_auq_context.
+
+    True when the formatter would produce more than just the header
+    line — i.e. at least one of:
+      * a non-empty multi-question matrix title/header,
+      * a non-empty ``current_question_title`` / ``pane_walkback_title``,
+      * a single labeled option (the form fallback is intentionally
+        looser than the JSONL gate: pane parses frequently lack
+        descriptions, so labels alone still carry real context value).
+    """
+    for q in form.questions:
+        if (q.title or q.header or "").strip():
+            return True
+    if (form.current_question_title or form.pane_walkback_title or "").strip():
+        return True
+    for opt in form.options:
+        if (opt.label or "").strip():
+            return True
+    return False
+
+
+def _format_auq_context_message(source: dict | AskUserQuestionForm) -> str:
+    """Render an AUQ source as a readable context dump.
 
     Output shape:
 
@@ -1173,8 +1223,16 @@ def _format_auq_context_message(tool_input: dict) -> str:
     Plain text only — no markdown to convert later. The send layer's
     ``build_response_parts`` chunks on the 3000-char boundary and adds
     ``[i/N]`` markers when the message exceeds the limit.
+
+    Accepts EITHER a JSONL ``tool_use.input`` dict (rich source: full
+    multi-question matrix with per-option descriptions) OR an
+    ``AskUserQuestionForm`` (pane fallback for live AUQs — title and
+    visible option labels; descriptions usually empty because Claude
+    Code only writes them to JSONL after the user answers).
     """
-    questions_raw = tool_input.get("questions") or []
+    if isinstance(source, AskUserQuestionForm):
+        return _format_auq_context_message_from_form(source)
+    questions_raw = source.get("questions") or []
     questions = [q for q in questions_raw if isinstance(q, dict)]
     parts: list[str] = ["📋 AskUserQuestion — full details"]
     if len(questions) > 1:
@@ -1211,6 +1269,84 @@ def _format_auq_context_message(tool_input: dict) -> str:
     return "\n".join(parts).rstrip()
 
 
+def _format_auq_context_message_from_form(form: AskUserQuestionForm) -> str:
+    """Render a pane-derived ``AskUserQuestionForm`` as a context dump.
+
+    Output shape mirrors the dict path so users see consistent
+    formatting whether JSONL or pane is the source. Differences from
+    the dict path:
+
+      * Per-option descriptions are usually empty (pane parses don't
+        carry them) — the formatter omits the description indent line
+        when missing.
+      * Single-tab forms with only ``pane_walkback_title`` get rendered
+        with that title as the question line (display-only fallback
+        when ``current_question_title`` hasn't been pinned yet).
+      * Multi-question matrix (rare for pure pane parse, possible when
+        the resolver merged JSONL into the form) takes the multi-Q
+        layout; single-tab takes the bare title layout.
+
+    Returns ``""`` when the form has no renderable content
+    (header-only would be misleading). ``_should_post_auq_context``
+    callers already gate on this in practice.
+    """
+    parts: list[str] = ["📋 AskUserQuestion — full details"]
+    multi_question = len(form.questions) > 1
+    if multi_question:
+        parts.append("(Picker below answers each question one at a time.)")
+    parts.append("")
+    if multi_question:
+        for q_idx, q in enumerate(form.questions, start=1):
+            qtext = (q.title or q.header or "").strip()
+            if not qtext:
+                continue
+            parts.append(f"Q{q_idx}. {qtext}")
+            parts.append("")
+            for opt_idx, label, description in _labeled_options_from_ask(q.options):
+                parts.append(f"{opt_idx}. {label}")
+                if description:
+                    for line in description.splitlines() or [description]:
+                        parts.append(f"   {line}")
+                parts.append("")
+    else:
+        title = (form.current_question_title or form.pane_walkback_title or "").strip()
+        if title:
+            parts.append(title)
+            parts.append("")
+        for opt_idx, label, description in _labeled_options_from_ask(form.options):
+            parts.append(f"{opt_idx}. {label}")
+            if description:
+                for line in description.splitlines() or [description]:
+                    parts.append(f"   {line}")
+            parts.append("")
+    rendered = "\n".join(parts).rstrip()
+    # Header-only output (no questions, no title, no options) is
+    # misleading — return empty so the send layer / gate caller skip.
+    if rendered == "📋 AskUserQuestion — full details":
+        return ""
+    return rendered
+
+
+def _labeled_options_from_ask(options) -> list[tuple[int, str, str]]:
+    """Filter + re-number a tuple of ``AskOption`` for context rendering.
+
+    Skips options with empty labels; re-enumerates the survivors
+    starting from 1 so the context message shows a clean 1..N list
+    even when the pane parse contains gap-numbered options. This is
+    safe because the context message is informational — actionable
+    numbers live on the picker card itself (which preserves the
+    pane's original numbering).
+    """
+    labeled: list[tuple[int, str, str]] = []
+    for opt in options:
+        label = (getattr(opt, "label", "") or "").strip()
+        if not label:
+            continue
+        description = (getattr(opt, "description", "") or "").strip()
+        labeled.append((len(labeled) + 1, label, description))
+    return labeled
+
+
 async def _send_auq_context_message(
     bot: Bot,
     *,
@@ -1218,9 +1354,14 @@ async def _send_auq_context_message(
     thread_id: int | None,
     chat_id: int,
     window_id: str,
-    tool_input: dict,
+    source: dict | AskUserQuestionForm,
 ) -> _ContextSendResult:
     """Format and send the AUQ context message (multi-part if needed).
+
+    ``source`` is either the JSONL ``tool_use.input`` dict (rich path)
+    or the pane-derived ``AskUserQuestionForm`` (live-AUQ fallback,
+    added by the v5 fix on 2026-05-24). The formatter dispatches on
+    type.
 
     Returns a tri-state outcome (Wave A, Codex v2→v3 P2 #3):
       * ``FULL_SENT`` — every chunk landed.
@@ -1248,7 +1389,7 @@ async def _send_auq_context_message(
     from .message_queue import peek_route_last_user_message
     from .response_builder import build_response_parts
 
-    text = _format_auq_context_message(tool_input)
+    text = _format_auq_context_message(source)
     if not text.strip():
         # Codex v4→v5 P2 #2: explicit NONE_SENT so caller's
         # ``if result is NONE_SENT`` rollback branch fires.
@@ -2304,6 +2445,11 @@ async def handle_interactive_ui(
     # text reply.
     text = content.content
     pick_rows: list[list[InlineKeyboardButton]] | None = None
+    # Hoisted so the context-message gate site below can read it under the
+    # route lock without an unbound-variable risk when content.name isn't
+    # AskUserQuestion (the gate site short-circuits on name, but pyright
+    # narrows on declarations, not control flow across blocks).
+    form: AskUserQuestionForm | None = None
     if content.name == "AskUserQuestion":
         # Unified resolver (PR 1) feeds both render and validate paths the
         # same form. Combines JSONL tool_input (full option list with
@@ -2315,7 +2461,7 @@ async def handle_interactive_ui(
         # is informational here — multi-question pick buttons stay
         # disabled until PR 3 ships the multi-tab state machine.
         resolved_input = _resolve_ask_tool_input(window_id, tool_input)
-        form: AskUserQuestionForm | None = resolve_ask_form(resolved_input, pane_text)
+        form = resolve_ask_form(resolved_input, pane_text)
         if form is None:
             # Belt-and-braces fallback. resolve_ask_form already tries
             # pane parse internally; this only fires when both inputs
@@ -2432,21 +2578,46 @@ async def handle_interactive_ui(
     # this does not stall other routes.
     async with lock:
         if content.name == "AskUserQuestion":
+            # Source-of-truth selection (v5 fix, 2026-05-24): JSONL when
+            # available (richer — full multi-question matrix with
+            # descriptions), pane-derived form otherwise. Claude Code
+            # buffers the AUQ ``tool_use`` line until the user answers,
+            # so live AUQs created after bot start have no JSONL until
+            # then — the form-source path is what makes the context
+            # message actually fire for the common case.
             ctx_input = _resolve_ask_tool_input(window_id, tool_input)
+            ctx_source: dict | AskUserQuestionForm | None = ctx_input
+            cached_tool_use_id = _last_auq_tool_use_id.get(window_id)
+            if ctx_input is not None and cached_tool_use_id:
+                dedup_key = cached_tool_use_id
+            elif form is not None:
+                ctx_source = form
+                dedup_key = f"form:{form.fingerprint()}"
+            else:
+                dedup_key = ""
             logger.info(
                 "AUQ context gate eval: window=%s from_poller=%s "
                 "explicit_input=%s cached_input=%s tool_use_id=%s "
-                "should_post=%s already_posted=%s",
+                "ctx_source=%s dedup_key=%s should_post=%s "
+                "already_posted=%s",
                 window_id,
                 from_poller,
                 tool_input is not None,
                 _last_completed_ask_tool_input.get(window_id) is not None,
-                _last_auq_tool_use_id.get(window_id),
-                _should_post_auq_context(ctx_input),
+                cached_tool_use_id,
+                (
+                    "dict"
+                    if isinstance(ctx_source, dict)
+                    else ("form" if ctx_source is not None else "none")
+                ),
+                dedup_key or "<empty>",
+                _should_post_auq_context(ctx_source),
                 _auq_context_posted.get(window_id) is not None,
             )
-            if _should_post_auq_context(ctx_input) and claim_auq_context_post(
-                window_id
+            if (
+                ctx_source is not None
+                and _should_post_auq_context(ctx_source)
+                and claim_auq_context_post(window_id, dedup_key)
             ):
                 ctx_result = await _send_auq_context_message(
                     bot,
@@ -2454,7 +2625,7 @@ async def handle_interactive_ui(
                     thread_id=thread_id,
                     chat_id=chat_id,
                     window_id=window_id,
-                    tool_input=ctx_input,  # type: ignore[arg-type]
+                    source=ctx_source,
                 )
                 # Codex v2→v3 P2 #3: rollback the claim ONLY when nothing
                 # landed. PARTIAL_SENT keeps the claim — re-sending would

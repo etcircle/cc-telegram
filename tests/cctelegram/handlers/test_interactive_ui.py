@@ -496,6 +496,265 @@ class TestFormatAuqContextMessage:
         assert "1. Real" in out  # numbering still 1-based
 
 
+class TestAuqContextFromForm:
+    """v5 fix (2026-05-24): pane-derived ``AskUserQuestionForm`` is an
+    accepted source for the context-message gate, so live AUQs (no
+    JSONL) still post a "📋 — full details" prelude before the picker.
+
+    The four tests here cover the matrix of cases listed in the
+    handoff: gate predicate, form formatter, dedup across mixed
+    sources, and the integration through ``handle_interactive_ui``
+    when only the status-polling path is feeding the renderer."""
+
+    def setup_method(self):
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._last_completed_ask_tool_input.clear()
+        iui._last_auq_tool_use_id.clear()
+        iui._auq_context_posted.clear()
+
+    def test_should_post_auq_context_from_form_when_jsonl_absent(self):
+        """Predicate accepts an AskUserQuestionForm and returns True
+        when the form has any renderable content. The form path is
+        intentionally looser than the JSONL path — pane parses
+        commonly lack option descriptions, and a labeled option list
+        still carries real context value."""
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+        from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
+
+        # Has only options (no title) — labels alone are enough on the
+        # form path because the picker may have truncated the option
+        # labels and the user benefits from seeing them in full prose
+        # context.
+        form_options_only = AskUserQuestionForm(
+            options=(
+                AskOption(
+                    label="Drop the flag", recommended=False, cursor=False, number=1
+                ),
+            ),
+        )
+        assert _should_post_auq_context(form_options_only) is True
+
+        # Has pane_walkback_title only — the live AUQ before Claude
+        # Code flushes JSONL: this is the most common live-AUQ shape.
+        form_title_only = AskUserQuestionForm(
+            pane_walkback_title="Pick the migration strategy",
+        )
+        assert _should_post_auq_context(form_title_only) is True
+
+        # current_question_title set (resolver may pin this from pane
+        # parse even without JSONL).
+        form_current_title_only = AskUserQuestionForm(
+            current_question_title="Confirm migration?",
+        )
+        assert _should_post_auq_context(form_current_title_only) is True
+
+        # Empty form → nothing to render → False.
+        form_empty = AskUserQuestionForm()
+        assert _should_post_auq_context(form_empty) is False
+
+    def test_format_auq_context_message_from_form_uses_pane_walkback(self):
+        """Formatter renders the pane fallback shape: walkback title as
+        the question line, visible options with labels (descriptions
+        usually empty since pane parses don't carry them)."""
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+        from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
+
+        form = AskUserQuestionForm(
+            pane_walkback_title="Pick the migration strategy that minimises blast radius.",
+            options=(
+                AskOption(
+                    label="Drop the flag",
+                    recommended=False,
+                    cursor=True,
+                    number=1,
+                ),
+                AskOption(
+                    label="Keep the flag",
+                    recommended=True,
+                    cursor=False,
+                    number=2,
+                ),
+                AskOption(
+                    label="Roll forward with a probe",
+                    recommended=False,
+                    cursor=False,
+                    number=3,
+                ),
+            ),
+        )
+        out = _format_auq_context_message(form)
+        assert out.startswith("📋 AskUserQuestion — full details")
+        assert "Pick the migration strategy" in out
+        # Options renumbered 1..N in display order, regardless of
+        # pane numbering.
+        assert "1. Drop the flag" in out
+        assert "2. Keep the flag" in out
+        assert "3. Roll forward with a probe" in out
+        # Single-tab form → no multi-Q hint.
+        assert "Picker below answers each question" not in out
+
+    def test_format_auq_context_message_from_form_prefers_current_title(self):
+        """When both ``current_question_title`` and ``pane_walkback_title``
+        are set, the formatter prefers the authoritative
+        ``current_question_title`` (mirrors the picker renderer's
+        precedence)."""
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+        from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
+
+        form = AskUserQuestionForm(
+            current_question_title="Authoritative title",
+            pane_walkback_title="Walked-back title",
+            options=(AskOption(label="A", recommended=False, cursor=False, number=1),),
+        )
+        out = _format_auq_context_message(form)
+        assert "Authoritative title" in out
+        assert "Walked-back title" not in out
+
+    def test_claim_auq_context_post_dedupes_across_form_and_jsonl_keys(self):
+        """The live-AUQ scenario the v5 fix is designed for: form-key
+        claims first (no JSONL available yet), then the JSONL
+        ``tool_use_id`` arrives (after the user answers / status_polling
+        re-fires with both data). The second claim with a different key
+        must STILL return False — the marker is set and we don't want a
+        duplicate context message."""
+        from cctelegram.handlers.interactive_ui import claim_auq_context_post
+
+        # Live AUQ → form fingerprint claim succeeds.
+        assert claim_auq_context_post("@42", "form:deadbeefcafe1234") is True
+        # JSONL arrives → different key but marker is set → False.
+        assert claim_auq_context_post("@42", "toolu_abc") is False
+
+    @pytest.mark.asyncio
+    async def test_live_auq_posts_context_via_status_polling_path(self, monkeypatch):
+        """Integration: status_polling drives ``handle_interactive_ui``
+        with ``tool_input=None`` (the live-AUQ shape). The handler
+        should still post the context message from the form fallback
+        before sending the picker card.
+
+        Builds a multi-tab AskUserQuestion pane (ETVoiceScribe shape
+        from the 2026-05-24 screenshot) and confirms that:
+          1. ``topic_send`` is called at least twice — once for the
+             context message (assistant role) and once for the picker
+             (tool role).
+          2. The first send carries the "📋 AskUserQuestion — full
+             details" header.
+          3. ``_auq_context_posted[@40]`` is marked with a form-key
+             dedup tag after the send."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@40"
+        user_id = 1
+        thread_id = 42
+        chat_id = 100
+
+        # Pane text crafted to drive the parser into a multi-tab live
+        # AUQ shape (3 tabs, one current). The exact parser-detected
+        # output is verified indirectly via the formatter dispatch —
+        # we just need ``content.name == "AskUserQuestion"`` + a
+        # non-trivial form to come out of ``resolve_ask_form``. The
+        # ``------`` separators are how
+        # ``extract_interactive_content`` finds the block.
+        pane_text = (
+            "some scrollback ...\n"
+            "│ Pick the safety patch so we can ship the Mac fix tonight.    │\n"
+            "------\n"
+            "AskUserQuestion\n"
+            "    ☐ Mac patch    ☐ Dev keypair    ☐ Other prep\n"
+            "\n"
+            "  ❯ 1. Drop the flag\n"
+            "    2. Keep the flag\n"
+            "    3. Other\n"
+            "  Enter to select\n"
+            "------\n"
+        )
+
+        # Build mocks — MagicMock spec=SessionManager (4eabc64) so the
+        # handler's ``resolve_chat_id`` / window-resolution calls work.
+        from cctelegram.session import SessionManager
+        from cctelegram.tmux_manager import TmuxWindow
+
+        mock_window = MagicMock(spec=TmuxWindow)
+        mock_window.window_id = window_id
+
+        mock_tmux = MagicMock()
+        mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+        mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+
+        mock_sm = MagicMock(spec=SessionManager)
+        mock_sm.resolve_chat_id.return_value = chat_id
+        mock_sm.window_states = {}
+
+        # Stub the picker liveness check + parser to ensure the pane is
+        # treated as "present" with an AUQ block. We rely on the real
+        # parser elsewhere — here we just need the gate to reach the
+        # context-message step.
+        monkeypatch.setattr(
+            iui,
+            "visible_pane_liveness",
+            lambda _pane: "present",
+        )
+
+        # Sent messages captured here so we can assert on order +
+        # content.
+        sent_messages: list[dict] = []
+
+        async def fake_topic_send(_bot, **kwargs):
+            sent_messages.append(kwargs)
+            sm = MagicMock()
+            sm.message_id = 1000 + len(sent_messages)
+            return sm, iui.TopicSendOutcome.OK
+
+        monkeypatch.setattr(iui, "topic_send", fake_topic_send)
+        monkeypatch.setattr(
+            iui,
+            "session_id_for_window",
+            lambda _wid: "sess-abc",
+        )
+        # Block the "anchor reply to last user message" path so the
+        # test doesn't have to seed message_queue state.
+        monkeypatch.setattr(
+            "cctelegram.handlers.message_queue.peek_route_last_user_message",
+            lambda *_a, **_kw: None,
+        )
+
+        mock_bot = AsyncMock()
+        result = await iui.handle_interactive_ui(
+            mock_bot,
+            user_id=user_id,
+            window_id=window_id,
+            thread_id=thread_id,
+            tool_input=None,
+            from_poller=True,
+            tmux_mgr=mock_tmux,
+            session_mgr=mock_sm,
+        )
+
+        # The handler returns True on a successful send. If the parser
+        # didn't pin an AUQ at all (e.g. test fixture mismatch), we'd
+        # get False — surface that explicitly so the failure mode is
+        # legible.
+        assert result is True, (
+            "handle_interactive_ui returned False — pane fixture may not "
+            "have parsed as an AskUserQuestion. sent_messages="
+            f"{sent_messages!r}"
+        )
+
+        # Context message went out first, picker card second.
+        assert len(sent_messages) >= 2, sent_messages
+        first = sent_messages[0]
+        assert "📋 AskUserQuestion — full details" in first.get("text", "")
+        assert first.get("role") == "assistant"
+        # Picker card lands with role=tool.
+        picker_sends = [m for m in sent_messages if m.get("content_type") == "tool_use"]
+        assert picker_sends, sent_messages
+
+        # Marker tagged with a form-fingerprint key.
+        marker = iui._auq_context_posted.get(window_id)
+        assert marker is not None
+        assert marker.startswith("form:"), marker
+
+
 class TestClaimAuqContextPost:
     """Atomic check-and-set for the AUQ context-post gate."""
 
@@ -506,24 +765,34 @@ class TestClaimAuqContextPost:
         iui._last_auq_tool_use_id.clear()
         iui._auq_context_posted.clear()
 
-    def test_no_auq_cached_returns_false(self):
+    def test_empty_dedup_key_returns_false(self):
+        """v5 (2026-05-24): claim() rejects an empty dedup_key.
+
+        Under the new presence-based contract, ``dedup_key`` is the
+        caller's responsibility. Passing "" means the caller couldn't
+        compute either a JSONL ``tool_use_id`` or a form fingerprint —
+        the gate site should not be calling claim() in that case.
+        Treat as an obvious bug and return False so a stray invocation
+        can't accidentally set the marker."""
         from cctelegram.handlers.interactive_ui import claim_auq_context_post
 
-        assert claim_auq_context_post("@99") is False
+        assert claim_auq_context_post("@99", "") is False
 
     def test_first_claim_succeeds_second_fails(self):
-        from cctelegram.handlers.interactive_ui import (
-            claim_auq_context_post,
-            remember_ask_tool_input,
-        )
+        from cctelegram.handlers.interactive_ui import claim_auq_context_post
 
-        remember_ask_tool_input(
-            "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
-        )
-        assert claim_auq_context_post("@5") is True
-        assert claim_auq_context_post("@5") is False
+        assert claim_auq_context_post("@5", "toolu_1") is True
+        assert claim_auq_context_post("@5", "toolu_1") is False
 
     def test_new_tool_use_id_resets_claim(self):
+        """When remember_ask_tool_input sees a NEW tool_use_id replacing
+        an old one for the same window, the context-post marker is
+        auto-cleared so the new AUQ can claim a fresh post.
+
+        Under the v5 presence-based dedup, the marker doesn't reset on
+        its own (different value still counts as "set"); the reset is
+        wired into ``remember_ask_tool_input`` for the JSONL path. The
+        test exercises that wiring end-to-end."""
         from cctelegram.handlers.interactive_ui import (
             claim_auq_context_post,
             remember_ask_tool_input,
@@ -532,13 +801,14 @@ class TestClaimAuqContextPost:
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
         )
-        assert claim_auq_context_post("@5") is True
-        # Same window, new AUQ tool_use_id → claim resets.
+        assert claim_auq_context_post("@5", "toolu_1") is True
+        # Same window, new AUQ tool_use_id → remember() drops the
+        # marker; the new id can claim a fresh post.
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "B"}]}]}, "toolu_2"
         )
-        assert claim_auq_context_post("@5") is True
-        assert claim_auq_context_post("@5") is False
+        assert claim_auq_context_post("@5", "toolu_2") is True
+        assert claim_auq_context_post("@5", "toolu_2") is False
 
     def test_forget_drops_post_state(self):
         from cctelegram.handlers.interactive_ui import (
@@ -550,36 +820,22 @@ class TestClaimAuqContextPost:
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
         )
-        assert claim_auq_context_post("@5") is True
+        assert claim_auq_context_post("@5", "toolu_1") is True
         forget_ask_tool_input("@5")
         # After tool_result clears the cache, a fresh re-cache (e.g. via
         # hydrate after restart) should be claimable again.
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
         )
-        assert claim_auq_context_post("@5") is True
+        assert claim_auq_context_post("@5", "toolu_1") is True
 
-    def test_missing_tool_use_id_blocks_claim(self):
-        """If remember_ask_tool_input is called WITHOUT a tool_use_id
-        (e.g. a legacy test path or unmigrated caller), the claim gate
-        returns False — we can't dedup without an ID, and over-posting
-        would be more harmful than under-posting."""
-        from cctelegram.handlers.interactive_ui import (
-            claim_auq_context_post,
-            remember_ask_tool_input,
-        )
-
-        remember_ask_tool_input("@5", {"questions": [{"options": [{"label": "A"}]}]})
-        assert claim_auq_context_post("@5") is False
-
-    def test_remember_without_id_clears_stale_id_state(self):
-        """Hermes P3 hardening (2026-05-22 diff review): if an earlier
-        call left a tool_use_id + posted state in place and a later
-        caller invokes remember_ask_tool_input WITHOUT a tool_use_id
-        (e.g. a test helper or unmigrated legacy path), the stale ID
-        must be cleared so the no-id caller's "no claim" guarantee
-        holds. Otherwise the old ID + posted state could mark a fresh
-        AUQ as 'already context-posted' just because the IDs match."""
+    def test_remember_without_id_clears_stale_marker(self):
+        """Hermes P3 hardening (2026-05-22): if an earlier call left a
+        tool_use_id + posted state in place and a later caller invokes
+        ``remember_ask_tool_input`` WITHOUT a ``tool_use_id`` (e.g. a
+        test helper or unmigrated legacy path), the stale ID + marker
+        must be cleared. Under the v5 form-source design the next
+        claim() can then proceed with a form-fingerprint dedup_key."""
         from cctelegram.handlers.interactive_ui import (
             claim_auq_context_post,
             remember_ask_tool_input,
@@ -588,11 +844,11 @@ class TestClaimAuqContextPost:
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_old"
         )
-        assert claim_auq_context_post("@5") is True  # posted
-        # Caller without an ID overwrites the cache. Stale ID + posted
-        # state should be wiped.
+        assert claim_auq_context_post("@5", "toolu_old") is True
+        # Caller without an ID overwrites the cache + clears the
+        # marker, so a form-fingerprint claim succeeds next.
         remember_ask_tool_input("@5", {"questions": [{"options": [{"label": "B"}]}]})
-        assert claim_auq_context_post("@5") is False  # no ID to claim
+        assert claim_auq_context_post("@5", "form:abc123") is True
 
 
 class TestSendAuqContextMessage:
@@ -625,7 +881,7 @@ class TestSendAuqContextMessage:
                 thread_id=None,
                 chat_id=1,
                 window_id="@5",
-                tool_input={
+                source={
                     "questions": [
                         {
                             "question": "Q?",
@@ -683,7 +939,7 @@ class TestSendAuqContextMessage:
             thread_id=None,
             chat_id=1,
             window_id="@5",
-            tool_input=tool_input,
+            source=tool_input,
         )
 
         # Two send attempts: chunk 1 ok, chunk 2 failed, stop.
@@ -2389,8 +2645,7 @@ class TestInteractiveStatePersistence:
 
         from cctelegram.handlers import interactive_ui as iui
 
-        iui._last_auq_tool_use_id["@5"] = "toolu_xyz"
-        claimed = iui.claim_auq_context_post("@5")
+        claimed = iui.claim_auq_context_post("@5", "toolu_xyz")
         assert claimed is True
         data = _json.loads(_isolated_interactive_state_file.read_text())
         assert data["auq_context_posted"]["@5"] == "toolu_xyz"
@@ -2402,8 +2657,7 @@ class TestInteractiveStatePersistence:
 
         from cctelegram.handlers import interactive_ui as iui
 
-        iui._last_auq_tool_use_id["@5"] = "toolu_xyz"
-        iui.claim_auq_context_post("@5")
+        iui.claim_auq_context_post("@5", "toolu_xyz")
         iui.forget_ask_tool_input("@5")
         data = _json.loads(_isolated_interactive_state_file.read_text())
         assert data["auq_context_posted"] == {}
@@ -2769,7 +3023,7 @@ class TestSendAuqContextMessageTriState:
             thread_id=None,
             chat_id=1,
             window_id="@5",
-            tool_input={"questions": []},
+            source={"questions": []},
         )
         assert result is iui._ContextSendResult.NONE_SENT
 
@@ -2788,7 +3042,7 @@ class TestSendAuqContextMessageTriState:
             thread_id=None,
             chat_id=1,
             window_id="@5",
-            tool_input={"questions": [{"question": "Q?"}]},
+            source={"questions": [{"question": "Q?"}]},
         )
         assert result is iui._ContextSendResult.NONE_SENT
 
@@ -2809,7 +3063,7 @@ class TestSendAuqContextMessageTriState:
             thread_id=None,
             chat_id=1,
             window_id="@5",
-            tool_input={"questions": [{"question": "Q?"}]},
+            source={"questions": [{"question": "Q?"}]},
         )
         assert result is iui._ContextSendResult.FULL_SENT
 
@@ -2828,7 +3082,7 @@ class TestSendAuqContextMessageTriState:
             thread_id=None,
             chat_id=1,
             window_id="@5",
-            tool_input={"questions": [{"question": "Q?"}]},
+            source={"questions": [{"question": "Q?"}]},
         )
         assert result is iui._ContextSendResult.NONE_SENT
 
@@ -2870,7 +3124,7 @@ class TestSendAuqContextMessageTriState:
             thread_id=None,
             chat_id=1,
             window_id="@5",
-            tool_input=tool_input,
+            source=tool_input,
         )
         assert result is iui._ContextSendResult.PARTIAL_SENT
 
@@ -2910,7 +3164,7 @@ class TestSendAuqContextMessageTriState:
             thread_id=None,
             chat_id=1,
             window_id="@5",
-            tool_input=tool_input,
+            source=tool_input,
         )
         assert result is iui._ContextSendResult.PARTIAL_SENT
 
@@ -2929,7 +3183,7 @@ class TestSendAuqContextMessageTriState:
             thread_id=None,
             chat_id=1,
             window_id="@5",
-            tool_input={"questions": [{"question": "Q?"}]},
+            source={"questions": [{"question": "Q?"}]},
         )
         assert result is iui._ContextSendResult.NONE_SENT
 
