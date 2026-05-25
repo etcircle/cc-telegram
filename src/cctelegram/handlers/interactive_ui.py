@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -35,7 +36,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParam
 
 from ..callback_dispatcher import checked_callback_data
 from ..config import config
-from ..session import session_id_for_window, session_manager
+from ..session import peek_session_id_for_window, session_id_for_window, session_manager
 from ..terminal_parser import (
     AskUserQuestionForm,
     build_form_from_tool_input,
@@ -777,10 +778,42 @@ class PreToolAskRecord:
 _pretool_ask_records: dict[str, PreToolAskRecord] = {}
 
 _PRETOOL_TTL_SECONDS = 300  # 5 minutes (v4 plan; lowered from v2's 10)
+# Codex chunk-3 P1: future-timestamp guard. A side file with
+# ``written_at`` far in the future (clock skew, time tamper) would
+# otherwise stay valid indefinitely because ``time.time() - written_at``
+# is negative and the ``age > TTL`` check passes. Reject anything more
+# than this many seconds ahead of the bot's clock.
+_PRETOOL_FUTURE_SKEW_SECONDS = 30
 _PRETOOL_SCHEMA_VERSION = 1
 
+# Codex chunk-3 P2 (path-traversal defense in depth): require the
+# session_id used to construct ``auq_pending/<session_id>.json`` to
+# be a canonical UUID. The hook validates this upstream, and the bot
+# only resolves session_id via ``session_id_for_window`` which returns
+# whatever the session map stored — but defense-in-depth keeps a
+# corrupt/maliciously-edited session_map from constructing a side-file
+# path outside the pending directory.
+_SESSION_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+# Codex chunk-3 P1: ``input_fingerprint`` is read from the side file
+# (UNTRUSTED) and previously logged as-is. A malformed or malicious
+# write could inject question text. Recompute the fingerprint from
+# the validated tool_input before logging — never trust the stored
+# value. Defense-in-depth: also reject anything that isn't a strict
+# 12-char hex digest before it enters the log surface.
+_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{12}$")
 
-def _pretool_side_file_path(session_id: str) -> Path:
+
+def _pretool_side_file_path(session_id: str) -> Path | None:
+    """Resolve the side-file path for ``session_id`` after UUID validation.
+
+    Returns ``None`` if ``session_id`` isn't a canonical UUID — defense
+    in depth against a corrupt session_map that ever stored e.g. ``../x``
+    in the session_id field.
+    """
+    if not _SESSION_ID_RE.match(session_id):
+        return None
     return app_dir() / "auq_pending" / f"{session_id}.json"
 
 
@@ -788,11 +821,26 @@ def _read_pretool_side_file(session_id: str) -> PreToolAskRecord | None:
     """Read and parse the AUQ PreToolUse side file for ``session_id``.
 
     Returns ``None`` on missing file (silent — hook hasn't fired yet or
-    already cleaned up), JSON parse error, schema_version mismatch, or
-    shape mismatch. Does NOT validate TTL or pane compatibility — those
-    happen in ``_resolve_pretool_record`` against the live pane.
+    already cleaned up), invalid session_id (path-traversal defense in
+    depth), JSON parse error, schema_version mismatch, or shape mismatch.
+
+    Codex chunk-3 P1 fix: the ``input_fingerprint`` carried in the
+    PreToolAskRecord is RECOMPUTED from the validated tool_input — never
+    trusted from the file. The stored value could otherwise be poisoned
+    by a malformed write and leak through the rejection-reason logs.
+
+    Does NOT validate TTL or pane compatibility — those happen in
+    ``_resolve_pretool_record`` against the live pane.
     """
     path = _pretool_side_file_path(session_id)
+    if path is None:
+        # session_id failed UUID validation — refuse to construct a
+        # path that could escape auq_pending/.
+        logger.warning(
+            "Pretool side file: refusing to resolve non-UUID session_id=%r",
+            session_id,
+        )
+        return None
     try:
         raw = path.read_text()
     except FileNotFoundError:
@@ -823,12 +871,30 @@ def _read_pretool_side_file(session_id: str) -> PreToolAskRecord | None:
         written_at = float(rec.get("written_at", 0))
     except (TypeError, ValueError):
         return None
+
+    # Recompute the fingerprint from the validated tool_input — never
+    # trust the stored value (codex chunk-3 P1). If pairs extraction
+    # fails, the side file is malformed; reject.
+    from ..terminal_parser import (
+        questions_content_digest,
+        questions_content_pairs_from_tool_input,
+    )
+
+    pairs = questions_content_pairs_from_tool_input(tool_input)
+    if pairs is None:
+        logger.warning(
+            "Pretool side file tool_input failed shape validation for %s",
+            session_id,
+        )
+        return None
+    fingerprint = questions_content_digest(pairs)
+
     return PreToolAskRecord(
         tool_input=tool_input,
         session_id=str(rec.get("session_id", "") or session_id),
         tool_use_id=str(rec.get("tool_use_id", "") or ""),
         written_at=written_at,
-        input_fingerprint=str(rec.get("input_fingerprint", "") or ""),
+        input_fingerprint=fingerprint,
     )
 
 
@@ -976,7 +1042,10 @@ def _resolve_pretool_record(
     and we don't want to flood the log). Question text is NEVER logged
     here; only the reason code + the record's fingerprint.
     """
-    session_id = session_id_for_window(window_id)
+    # Codex chunk-3 P2: peek (read-only) — never mutate session_manager
+    # state by auto-creating a WindowState on miss. session_id_for_window
+    # via get_window_state would have that side-effect for unknown windows.
+    session_id = peek_session_id_for_window(window_id)
     if not session_id:
         logger.debug("Pretool resolve window=%s reason=missing_map", window_id)
         _pretool_ask_records.pop(window_id, None)
@@ -988,14 +1057,34 @@ def _resolve_pretool_record(
         _pretool_ask_records.pop(window_id, None)
         return None
 
-    # TTL check.
+    # Defense-in-depth: only log fingerprints that match the strict
+    # hex shape. The reader recomputed it from validated tool_input,
+    # so this should always be true, but guard against future drift.
+    safe_fp = (
+        record.input_fingerprint
+        if _FINGERPRINT_RE.match(record.input_fingerprint)
+        else "<invalid>"
+    )
+
+    # TTL check + future-skew guard (codex chunk-3 P1). Negative age
+    # (timestamp in the future) is rejected to prevent a tampered or
+    # clock-skewed file from staying valid indefinitely.
     age = time.time() - record.written_at
+    if age < -_PRETOOL_FUTURE_SKEW_SECONDS:
+        logger.debug(
+            "Pretool resolve window=%s reason=future_skew age=%.1fs fp=%s",
+            window_id,
+            age,
+            safe_fp,
+        )
+        _pretool_ask_records.pop(window_id, None)
+        return None
     if age > _PRETOOL_TTL_SECONDS:
         logger.debug(
             "Pretool resolve window=%s reason=stale age=%.1fs fp=%s",
             window_id,
             age,
-            record.input_fingerprint,
+            safe_fp,
         )
         _pretool_ask_records.pop(window_id, None)
         return None
@@ -1007,7 +1096,7 @@ def _resolve_pretool_record(
             "Pretool resolve window=%s reason=%s fp=%s",
             window_id,
             reason,
-            record.input_fingerprint,
+            safe_fp,
         )
         _pretool_ask_records.pop(window_id, None)
         return None

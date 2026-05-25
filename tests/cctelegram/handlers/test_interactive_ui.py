@@ -4316,6 +4316,115 @@ class TestResolvePretoolRecord:
         assert rec2 is None
         assert "@9006" not in _pretool_ask_records
 
+    def test_future_written_at_evicts_record(self, _cc_telegram_dir):
+        # Codex chunk-3 P1: a side file with written_at in the future
+        # (clock skew or tampering) MUST be rejected, not stay valid
+        # indefinitely. The reader uses a -30s skew window.
+        from cctelegram.handlers.interactive_ui import (
+            _PRETOOL_FUTURE_SKEW_SECONDS,
+        )
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        # Bind window. Use the real session_manager (NOT iui's patch).
+        from cctelegram.session import WindowState, session_manager
+
+        session_manager.window_states["@skew1"] = WindowState(
+            cwd="/tmp/cwd", session_id=sid
+        )
+        try:
+            _write_pretool_side_file(
+                _cc_telegram_dir,
+                session_id=sid,
+                written_at=time.time() + _PRETOOL_FUTURE_SKEW_SECONDS + 60,
+            )
+            form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+            assert _resolve_pretool_record("@skew1", form) is None
+        finally:
+            session_manager.window_states.pop("@skew1", None)
+
+    def test_recent_future_within_skew_window_accepted(self, _cc_telegram_dir):
+        # A tiny clock drift within the skew window must still accept
+        # (NTP can momentarily produce 1-2s of future-drift).
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        from cctelegram.session import WindowState, session_manager
+
+        session_manager.window_states["@skew2"] = WindowState(
+            cwd="/tmp/cwd", session_id=sid
+        )
+        try:
+            _write_pretool_side_file(
+                _cc_telegram_dir, session_id=sid, written_at=time.time() + 2
+            )
+            form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+            assert _resolve_pretool_record("@skew2", form) is not None
+        finally:
+            session_manager.window_states.pop("@skew2", None)
+
+    def test_non_uuid_session_id_refused(self, _cc_telegram_dir, caplog):
+        # Codex chunk-3 P2: defense-in-depth against a corrupt
+        # session_map storing a non-UUID session_id that could escape
+        # auq_pending/ via path traversal.
+        import logging as _logging
+
+        from cctelegram.handlers.interactive_ui import _read_pretool_side_file
+
+        with caplog.at_level(
+            _logging.WARNING, logger="cctelegram.handlers.interactive_ui"
+        ):
+            assert _read_pretool_side_file("../etc/passwd") is None
+        assert any(
+            "refusing to resolve non-UUID" in r.getMessage() for r in caplog.records
+        )
+
+    def test_fingerprint_is_recomputed_not_trusted_from_file(
+        self, _cc_telegram_dir, tmp_path
+    ):
+        # Codex chunk-3 P1: an attacker (or a malformed write) could
+        # poison the stored input_fingerprint with question text. The
+        # reader MUST recompute the fingerprint from the validated
+        # tool_input and never trust the stored value.
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        # Hand-craft a file with a poisoned input_fingerprint.
+        pending_dir = tmp_path / "auq_pending"
+        pending_dir.mkdir(exist_ok=True)
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ]
+        }
+        rec = {
+            "schema_version": _PRETOOL_SCHEMA_VERSION,
+            "session_id": sid,
+            "tool_use_id": "tu",
+            "tool_input": tool_input,
+            "written_at": time.time(),
+            "input_fingerprint": "SECRET_QUESTION_TEXT_LEAK",
+        }
+        (pending_dir / f"{sid}.json").write_text(_json.dumps(rec))
+        from cctelegram.handlers.interactive_ui import _read_pretool_side_file
+
+        loaded = _read_pretool_side_file(sid)
+        assert loaded is not None
+        # Recomputed → strict 12-hex, NOT the poisoned value.
+        assert loaded.input_fingerprint != "SECRET_QUESTION_TEXT_LEAK"
+        assert len(loaded.input_fingerprint) == 12
+        assert all(c in "0123456789abcdef" for c in loaded.input_fingerprint)
+
+    def test_peek_does_not_create_window_state(self):
+        # Codex chunk-3 P2: peek must NOT auto-create a WindowState
+        # for an unknown window. _resolve_pretool_record uses peek
+        # so probing for an unknown window doesn't mutate state.
+        from cctelegram.session import peek_session_id_for_window, session_manager
+
+        bogus = "@no-such-window-test"
+        assert bogus not in session_manager.window_states
+        assert peek_session_id_for_window(bogus) is None
+        # Crucially: peek did NOT create an entry.
+        assert bogus not in session_manager.window_states
+
     def test_rejection_log_omits_question_text(self, _cc_telegram_dir, caplog):
         # Privacy: rejection reason logs must NOT include question/option
         # text. Trigger a pane-mismatch rejection and verify the log only
