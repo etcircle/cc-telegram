@@ -1297,33 +1297,40 @@ def _ask_tool_input_digest(payload: dict | None) -> str | None:
 
 # ── Per-route asyncio.Lock ───────────────────────────────────────────────
 #
-# Lock contract:
+# Lock contract — what the route lock actually does today:
 #
-#   PROTECTED by ``_get_route_lock``:
+#   PROTECTED by ``_get_route_lock`` (state held atomically across the
+#   relevant work):
 #     * ``_pick_token_cache`` / ``_pick_tokens`` — pruned under the lock in
-#       ``clear_interactive_msg`` (P2.2) so a concurrent ``handle_interactive_ui``
-#       (which awaits between pane capture and mint) can't post a card whose
-#       tokens point at a cache row the cleanup just dropped.
-#     * The AUQ context-message post in ``handle_interactive_ui`` — held
-#       under the lock so concurrent callers (status_polling tick vs
-#       JSONL-dispatched render) serialize: the first wins context-post +
-#       picker-send order, the second skips context and edits the existing
-#       picker. Without the lock, the picker could land before the context
-#       message in chat order.
+#       ``clear_interactive_msg``'s Phase 1 so a concurrent
+#       ``handle_interactive_ui`` (which awaits between pane capture and
+#       mint) can't post a card whose tokens point at a cache row the
+#       cleanup just dropped.
+#     * The AUQ render path in ``handle_interactive_ui`` — context-post +
+#       picker send/edit + attention fallback all run inside the same
+#       ``async with lock`` block. Holding the lock across this Telegram
+#       I/O is intentional: it guarantees that on a single route the
+#       context message lands before the picker, and that two concurrent
+#       callers (status_polling tick vs JSONL-dispatched render) don't
+#       interleave two pickers / two context posts. Cross-route concurrency
+#       is preserved because the lock is per (user_id, thread_id_or_0).
 #
 #   NOT PROTECTED (single-event-loop means sync dict writes don't
 #   interleave with other coroutines' sync dict writes):
-#     * ``_interactive_msgs`` — written by ``handle_interactive_ui`` and
-#       ``clear_interactive_msg``; the read-then-write inside
-#       ``handle_interactive_ui`` happens after the last await, so a
-#       concurrent clear can't tear it.
-#     * ``_interactive_mode`` — same shape as ``_interactive_msgs``.
+#     * ``_interactive_mode`` — written by ``handle_interactive_ui`` and
+#       ``clear_interactive_msg``; dict ops are atomic and the only
+#       observable ordering is the one the lock above already enforces
+#       for the AUQ render path.
 #     * ``_last_completed_ask_tool_input`` — replay cache written by
 #       ``session_monitor`` (single writer) and read everywhere; dict ops
 #       are atomic enough. It is not a live pending-AUQ source.
 #
-#   RELEASED across Telegram I/O awaits — serializing those would stall
-#   multi-route concurrency.
+#   RELEASED between phases:
+#     * ``clear_interactive_msg`` runs Phase 1 (snapshot + drop state +
+#       prune pick-tokens) inside the lock, then releases before Phase 2
+#       (Telegram deletes / tombstone edit / attention dismiss). Phase 2
+#       I/O failures can't strand in-memory state because the drop already
+#       committed.
 #
 #   Non-reentrant: the pick-token callback handler MUST NOT hold the lock
 #   across ``await handle_interactive_ui(...)``. Validate, release, then

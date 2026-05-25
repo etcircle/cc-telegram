@@ -2230,12 +2230,12 @@ class TestHasInteractiveSurface:
 
 
 class TestPickButtonRowsFA5Gate:
-    """FA5+ safety: multi-tab forms with current_tab_inferred=False MUST
-    NOT mint pick buttons. The dispatched digit could answer the wrong
-    tab in the live TUI.
+    """FA5+ safety: multi-question forms with current_tab_inferred=False
+    MUST NOT mint pick buttons. The dispatched digit could answer the
+    wrong tab in the live TUI.
     """
 
-    def _multi_tab_form(self, inferred: bool):
+    def _multi_question_form(self, inferred: bool):
         from cctelegram.terminal_parser import (
             AskOption,
             AskQuestion,
@@ -2270,7 +2270,7 @@ class TestPickButtonRowsFA5Gate:
         from cctelegram.handlers.interactive_ui import _build_pick_button_rows
 
         rows = _build_pick_button_rows(
-            user_id=1, thread_id=2, window_id="@1", form=self._multi_tab_form(True)
+            user_id=1, thread_id=2, window_id="@1", form=self._multi_question_form(True)
         )
         assert rows  # non-empty
 
@@ -2278,15 +2278,19 @@ class TestPickButtonRowsFA5Gate:
         from cctelegram.handlers.interactive_ui import _build_pick_button_rows
 
         rows = _build_pick_button_rows(
-            user_id=1, thread_id=2, window_id="@1", form=self._multi_tab_form(False)
+            user_id=1,
+            thread_id=2,
+            window_id="@1",
+            form=self._multi_question_form(False),
         )
         assert rows == []
 
     def test_single_question_form_ignores_inferred_flag(self):
         # Single-question forms always carry current_tab_inferred=True
-        # by default; FA5+ only applies to multi-tab. Sanity-check that
-        # a single-question form with inferred=False (artificial) still
-        # gets buttons — the gate only fires for multi-tab.
+        # by default; FA5+ only applies to multi-question forms. Sanity-
+        # check that a single-question form with inferred=False
+        # (artificial) still gets buttons — the gate only fires when
+        # ``len(form.questions) > 1``.
         from cctelegram.handlers.interactive_ui import _build_pick_button_rows
         from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
 
