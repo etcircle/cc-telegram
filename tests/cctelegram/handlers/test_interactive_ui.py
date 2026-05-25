@@ -4749,3 +4749,255 @@ class TestContextGateRouting:
             break
         else:
             pytest.fail("Did not find AUQ context gate eval log line")
+
+
+# ── Cleanup paths (chunk 5) ───────────────────────────────────────────────
+
+
+class TestPretoolCleanup:
+    """Cleanup of AUQ PreToolUse side files via the lifecycle hooks."""
+
+    def _bind(self, window_id: str, session_id: str) -> None:
+        from cctelegram.session import WindowState, session_manager
+
+        session_manager.window_states[window_id] = WindowState(
+            cwd="/tmp/cwd", session_id=session_id
+        )
+
+    def _unbind(self, window_id: str) -> None:
+        from cctelegram.session import session_manager
+
+        session_manager.window_states.pop(window_id, None)
+
+    def test_forget_ask_tool_input_unlinks_side_file_for_current_session(
+        self, _cc_telegram_dir
+    ):
+        from cctelegram.handlers.interactive_ui import forget_ask_tool_input
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind("@cleanup1", sid)
+        try:
+            target = _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+            assert target.exists()
+            forget_ask_tool_input("@cleanup1")
+            assert not target.exists()
+        finally:
+            self._unbind("@cleanup1")
+
+    def test_forget_ask_tool_input_clears_pretool_cache(self, _cc_telegram_dir):
+        from cctelegram.handlers.interactive_ui import (
+            _pretool_ask_records,
+            _resolve_pretool_record,
+            forget_ask_tool_input,
+        )
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind("@cleanup2", sid)
+        try:
+            _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+            form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+            _resolve_pretool_record("@cleanup2", form)
+            assert "@cleanup2" in _pretool_ask_records
+            forget_ask_tool_input("@cleanup2")
+            assert "@cleanup2" not in _pretool_ask_records
+        finally:
+            self._unbind("@cleanup2")
+
+    def test_unlink_for_session_handles_non_uuid_session_id(self, _cc_telegram_dir):
+        # Defense: a corrupt session_id should not raise — the helper
+        # is best-effort and silently no-ops on non-UUID input.
+        from cctelegram.handlers.interactive_ui import (
+            _unlink_pretool_side_file_for_session,
+        )
+
+        # Should not raise.
+        _unlink_pretool_side_file_for_session("../etc/passwd")
+        _unlink_pretool_side_file_for_session("")
+
+    def test_unlink_for_session_silently_skips_missing_file(self, _cc_telegram_dir):
+        # No file written yet — unlink is silent.
+        from cctelegram.handlers.interactive_ui import (
+            _unlink_pretool_side_file_for_session,
+        )
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        _unlink_pretool_side_file_for_session(sid)
+        # No file created either.
+        assert not (_cc_telegram_dir / "auq_pending" / f"{sid}.json").exists()
+
+
+class TestPretoolStartupGC:
+    """Bot-startup garbage collection of stale side files."""
+
+    def test_deletes_files_older_than_1h(self, _cc_telegram_dir):
+        from cctelegram.handlers.interactive_ui import (
+            _PRETOOL_GC_AGE_SECONDS,
+            gc_stale_pretool_side_files,
+        )
+
+        old_sid = "11111111-1111-1111-1111-111111111111"
+        fresh_sid = "22222222-2222-2222-2222-222222222222"
+        old_file = _write_pretool_side_file(_cc_telegram_dir, session_id=old_sid)
+        fresh_file = _write_pretool_side_file(_cc_telegram_dir, session_id=fresh_sid)
+        # Backdate the old file's mtime past the GC cutoff.
+        old_mtime = time.time() - _PRETOOL_GC_AGE_SECONDS - 60
+        import os as _os
+
+        _os.utime(old_file, (old_mtime, old_mtime))
+
+        deleted = gc_stale_pretool_side_files()
+        assert deleted == 1
+        assert not old_file.exists()
+        assert fresh_file.exists()
+
+    def test_no_dir_no_action(self, tmp_path, monkeypatch):
+        # GC must not crash if auq_pending/ doesn't exist yet.
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        from cctelegram.handlers.interactive_ui import gc_stale_pretool_side_files
+
+        assert gc_stale_pretool_side_files() == 0
+
+    def test_ignores_non_uuid_filenames(self, _cc_telegram_dir):
+        # An entry that doesn't match <uuid>.json (e.g. a leftover
+        # temp file) is left alone, even if older than the cutoff.
+        from cctelegram.handlers.interactive_ui import (
+            _PRETOOL_GC_AGE_SECONDS,
+            gc_stale_pretool_side_files,
+        )
+
+        pending_dir = _cc_telegram_dir / "auq_pending"
+        pending_dir.mkdir(exist_ok=True)
+        non_uuid = pending_dir / "not-a-uuid.json"
+        non_uuid.write_text("{}")
+        old_mtime = time.time() - _PRETOOL_GC_AGE_SECONDS - 60
+        import os as _os
+
+        _os.utime(non_uuid, (old_mtime, old_mtime))
+
+        gc_stale_pretool_side_files()
+        # Non-UUID file untouched.
+        assert non_uuid.exists()
+
+
+class TestPretoolMissingHookWarning:
+    """Bot-startup warning when PreToolUse hook entry is missing."""
+
+    def test_warns_when_settings_file_missing(self, tmp_path, caplog):
+        import logging as _logging
+
+        from cctelegram.handlers.interactive_ui import (
+            warn_if_pre_tool_use_hook_missing,
+        )
+
+        with caplog.at_level(
+            _logging.WARNING, logger="cctelegram.handlers.interactive_ui"
+        ):
+            warned = warn_if_pre_tool_use_hook_missing(
+                tmp_path / "missing-settings.json"
+            )
+        assert warned is True
+        assert any(
+            "cc-telegram hook --install" in r.getMessage() for r in caplog.records
+        )
+
+    def test_warns_when_pretool_entry_missing(self, tmp_path, caplog):
+        import logging as _logging
+
+        from cctelegram.handlers.interactive_ui import (
+            warn_if_pre_tool_use_hook_missing,
+        )
+
+        settings = {
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "cc-telegram hook"}]}
+                ]
+            }
+        }
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(_json.dumps(settings))
+        with caplog.at_level(
+            _logging.WARNING, logger="cctelegram.handlers.interactive_ui"
+        ):
+            warned = warn_if_pre_tool_use_hook_missing(settings_file)
+        assert warned is True
+        assert any(
+            "cc-telegram hook --install" in r.getMessage() for r in caplog.records
+        )
+
+    def test_no_warn_when_pretool_entry_present(self, tmp_path, caplog):
+        import logging as _logging
+
+        from cctelegram.handlers.interactive_ui import (
+            warn_if_pre_tool_use_hook_missing,
+        )
+
+        settings = {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "AskUserQuestion",
+                        "hooks": [{"type": "command", "command": "cc-telegram hook"}],
+                    }
+                ]
+            }
+        }
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(_json.dumps(settings))
+        with caplog.at_level(
+            _logging.WARNING, logger="cctelegram.handlers.interactive_ui"
+        ):
+            warned = warn_if_pre_tool_use_hook_missing(settings_file)
+        assert warned is False
+
+
+class TestSessionMonitorClearRace:
+    """Verify the /clear cleanup unlinks the OLD session's side file
+    (codex R2 finding: forget_ask_tool_input runs after session_id swap
+    and would otherwise miss the file)."""
+
+    def test_session_change_unlinks_old_side_file(self, _cc_telegram_dir):
+        # Simulate the cleanup path directly. session_monitor calls
+        # _unlink_pretool_side_file_for_session(old_sid) BEFORE
+        # forget_ask_tool_input(window_id) so the OLD session's file
+        # gets cleaned even though the window's WindowState now points
+        # to the new session.
+        from cctelegram.handlers.interactive_ui import (
+            _unlink_pretool_side_file_for_session,
+        )
+
+        old_sid = "11111111-1111-1111-1111-111111111111"
+        new_sid = "22222222-2222-2222-2222-222222222222"
+        old_file = _write_pretool_side_file(_cc_telegram_dir, session_id=old_sid)
+        # Bind window to NEW session (simulating /clear swap).
+        from cctelegram.session import WindowState, session_manager
+
+        session_manager.window_states["@race1"] = WindowState(
+            cwd="/tmp/cwd", session_id=new_sid
+        )
+        try:
+            assert old_file.exists()
+            _unlink_pretool_side_file_for_session(old_sid)
+            assert not old_file.exists()
+        finally:
+            session_manager.window_states.pop("@race1", None)
+
+
+class TestGateDedupAcrossPretoolToJsonl:
+    """Codex chunk-3+4 P2 delta: directly verify the gate's dedup-key
+    transition. A `pretool:<fp>` claim must block a subsequent JSONL
+    `tool_use_id` claim — no duplicate post."""
+
+    def test_pretool_claim_blocks_subsequent_jsonl_claim(self, _cc_telegram_dir):
+        from cctelegram.handlers.interactive_ui import (
+            _auq_context_posted,
+            claim_auq_context_post,
+        )
+
+        window_id = "@dedup1"
+        _auq_context_posted.pop(window_id, None)
+        # First: pretool claim with fingerprint-based key.
+        assert claim_auq_context_post(window_id, "pretool:abc123") is True
+        # Second: JSONL tool_use_id arrives (different key) → blocked.
+        assert claim_auq_context_post(window_id, "toolu_jsonl_id") is False
+        _auq_context_posted.pop(window_id, None)

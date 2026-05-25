@@ -334,13 +334,157 @@ def forget_ask_tool_input(window_id: str) -> None:
     ``_auq_context_msgs`` state so a subsequent restart doesn't carry
     forward a stale claim marker or an upgrade record for a resolved
     AUQ.
+
+    AUQ PreToolUse hook integration (v4 plan): also clears the in-memory
+    pretool record cache for this window and unlinks the side file for
+    the window's CURRENT session_id. The ``/clear`` race (where
+    ``session_monitor._detect_and_cleanup_changes`` runs BEFORE this and
+    swaps the session_id under us) is handled separately in
+    session_monitor — that path uses the OLD session_id, which is no
+    longer reachable from here.
     """
     _last_completed_ask_tool_input.pop(window_id, None)
     _last_auq_tool_use_id.pop(window_id, None)
+    _pretool_ask_records.pop(window_id, None)
+    _unlink_pretool_side_file_for_window(window_id)
     had_marker = _auq_context_posted.pop(window_id, None) is not None
     had_record = _auq_context_msgs.pop(window_id, None) is not None
     if had_marker or had_record:
         _persist_interactive_state()
+
+
+def _unlink_pretool_side_file_for_window(window_id: str) -> None:
+    """Best-effort unlink of the side file for ``window_id``'s current session.
+
+    Used by ``forget_ask_tool_input`` (tool_result clean-up) and by
+    ``session_monitor._detect_and_cleanup_changes`` (with the OLD
+    session_id when a window's session_id changes — the /clear race).
+    Silent on missing file. Errors are logged at debug level only —
+    the cleanup is opportunistic; the bot-startup GC will catch
+    anything that escapes.
+    """
+    session_id = peek_session_id_for_window(window_id)
+    if not session_id:
+        return
+    _unlink_pretool_side_file_for_session(session_id)
+
+
+def _unlink_pretool_side_file_for_session(session_id: str) -> None:
+    """Best-effort unlink of the side file for ``session_id``.
+
+    Public-ish helper used by session_monitor when the OLD session_id
+    is known at /clear time (the current ``WindowState.session_id``
+    has already been swapped to the new session by then). Silent on
+    missing file / non-UUID session_id.
+    """
+    path = _pretool_side_file_path(session_id)
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        logger.debug(
+            "Pretool side file unlink for session=%s failed: %s",
+            session_id,
+            e,
+        )
+
+
+_PRETOOL_GC_AGE_SECONDS = 3600  # 1h — bot startup cleanup
+_CLAUDE_SETTINGS_FILE_FOR_WARN = Path.home() / ".claude" / "settings.json"
+
+
+def gc_stale_pretool_side_files() -> int:
+    """Delete AUQ side files older than ``_PRETOOL_GC_AGE_SECONDS``.
+
+    Best-effort. Called on bot startup. Returns the number of files
+    deleted (useful for tests; the bot's startup log doesn't need it).
+    Anything older than 1h is presumed stale — TTL on the read path is
+    only 5min, so a 1h file definitely cannot be served. Crashes /
+    kickstart-between-AUQs are the typical sources of these orphans.
+    """
+    pending_dir = app_dir() / "auq_pending"
+    if not pending_dir.is_dir():
+        return 0
+    cutoff = time.time() - _PRETOOL_GC_AGE_SECONDS
+    deleted = 0
+    try:
+        entries = list(pending_dir.iterdir())
+    except OSError as e:
+        logger.warning("Pretool GC: iterdir on %s failed: %s", pending_dir, e)
+        return 0
+    for entry in entries:
+        # Skip non-regular files; reject anything that doesn't match the
+        # canonical "<uuid>.json" name to avoid touching unexpected files.
+        if not entry.is_file():
+            continue
+        if not entry.name.endswith(".json"):
+            continue
+        stem = entry.stem
+        if not _SESSION_ID_RE.fullmatch(stem):
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            continue
+        try:
+            entry.unlink()
+            deleted += 1
+        except OSError as e:
+            logger.debug("Pretool GC: unlink %s failed: %s", entry, e)
+    if deleted:
+        logger.info("Pretool GC: deleted %d stale side file(s)", deleted)
+    return deleted
+
+
+def warn_if_pre_tool_use_hook_missing(
+    settings_file: Path = _CLAUDE_SETTINGS_FILE_FOR_WARN,
+) -> bool:
+    """Warn (via log) if the PreToolUse hook entry is missing from
+    Claude Code's settings.json.
+
+    The bot will still work without it — AUQ context messages will
+    fall back to form-source (labels only). But the user loses the
+    descriptions-at-pick-time win that justifies this whole wave.
+    Surfacing this at startup with the exact install command is the
+    actionable nudge.
+
+    Returns True if a warning was emitted, False if the hook is current.
+    """
+    if not settings_file.exists():
+        logger.warning(
+            "Claude Code settings file not found at %s — run "
+            "'cc-telegram hook --install' to enable AUQ descriptions",
+            settings_file,
+        )
+        return True
+    try:
+        settings = json.loads(settings_file.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(
+            "Claude Code settings file unreadable (%s); "
+            "AUQ descriptions may be disabled: %s",
+            settings_file,
+            e,
+        )
+        return True
+    # Reuse the hook module's own check so we have a single source of
+    # truth for "what counts as installed".
+    from ..hook import _is_pre_tool_use_installed
+
+    if _is_pre_tool_use_installed(settings) == "missing":
+        logger.warning(
+            "PreToolUse(AskUserQuestion) hook not registered in %s; "
+            "AUQ descriptions will fall back to labels-only. "
+            "Run 'cc-telegram hook --install' to enable.",
+            settings_file,
+        )
+        return True
+    return False
 
 
 def claim_auq_context_post(window_id: str, dedup_key: str) -> bool:
@@ -792,9 +936,11 @@ _PRETOOL_SCHEMA_VERSION = 1
 # only resolves session_id via ``session_id_for_window`` which returns
 # whatever the session map stored — but defense-in-depth keeps a
 # corrupt/maliciously-edited session_map from constructing a side-file
-# path outside the pending directory.
+# path outside the pending directory. Use ``fullmatch()`` (codex P3 —
+# chunks 3+4) to reject trailing-newline edge cases that ``$`` would
+# tolerate.
 _SESSION_ID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
 # Codex chunk-3 P1: ``input_fingerprint`` is read from the side file
 # (UNTRUSTED) and previously logged as-is. A malformed or malicious
@@ -802,7 +948,7 @@ _SESSION_ID_RE = re.compile(
 # the validated tool_input before logging — never trust the stored
 # value. Defense-in-depth: also reject anything that isn't a strict
 # 12-char hex digest before it enters the log surface.
-_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{12}$")
+_FINGERPRINT_RE = re.compile(r"[0-9a-f]{12}")
 
 
 def _pretool_side_file_path(session_id: str) -> Path | None:
@@ -812,7 +958,7 @@ def _pretool_side_file_path(session_id: str) -> Path | None:
     in depth against a corrupt session_map that ever stored e.g. ``../x``
     in the session_id field.
     """
-    if not _SESSION_ID_RE.match(session_id):
+    if not _SESSION_ID_RE.fullmatch(session_id):
         return None
     return app_dir() / "auq_pending" / f"{session_id}.json"
 
@@ -1062,7 +1208,7 @@ def _resolve_pretool_record(
     # so this should always be true, but guard against future drift.
     safe_fp = (
         record.input_fingerprint
-        if _FINGERPRINT_RE.match(record.input_fingerprint)
+        if _FINGERPRINT_RE.fullmatch(record.input_fingerprint)
         else "<invalid>"
     )
 
