@@ -3795,3 +3795,115 @@ class TestCodexP2Fixes:
         )
         # The new lifecycle's cache is in place.
         assert iui._last_auq_tool_use_id["@5"] == "toolu_NEW"
+
+    def test_hydrate_prunes_auq_context_msgs_on_session_mismatch(self, monkeypatch):
+        """Codex round 4 P2 #1: a persisted auq_context_msgs record
+        for window @5 with session sess-OLD must be pruned at hydrate
+        when @5 now binds to sess-NEW (e.g. /clear). Otherwise
+        maybe_upgrade would edit OLD message ids with NEW question text."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        state = {
+            "interactive_msgs": {},
+            "auq_context_posted": {},
+            "auq_context_msgs": {
+                "@5": {
+                    "message_ids": [201],
+                    "source": "form",
+                    "dedup_key": "form:abc",
+                    "tool_use_id": None,
+                    "render_sha1": "deadbeef",
+                    "user_id": 1,
+                    "chat_id": -100,
+                    "thread_id": 42,
+                    "session_id": "sess-OLD",
+                    "created_at": "2026-05-25T07:00:00+00:00",
+                }
+            },
+        }
+        import json as _json
+
+        path = iui._interactive_state_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(state))
+
+        session_mgr = MagicMock()
+        session_mgr.window_states = {"@5": MagicMock(session_id="sess-NEW")}
+        session_mgr.resolve_window_for_thread = MagicMock(return_value=None)
+        monkeypatch.setattr(
+            iui,
+            "session_id_for_window",
+            lambda wid: "sess-NEW" if wid == "@5" else None,
+        )
+
+        iui.hydrate_interactive_state(session_mgr)
+
+        # The record was pruned — session mismatch.
+        assert "@5" not in iui._auq_context_msgs
+
+    @pytest.mark.asyncio
+    async def test_upgrade_preserves_appended_ids_on_partial_append(self, monkeypatch):
+        """Codex round 4 P2 #2: partial append must persist the
+        already-landed appended_ids on the record so the next retry
+        doesn't duplicate them. Form-source render had 1 chunk, dict
+        needs 3 chunks. Edit chunk 1 OK; append chunk 2 OK; append
+        chunk 3 fails. Record must update to message_ids=(101, 202),
+        source still 'form' for retry."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._auq_context_msgs["@5"] = iui._ContextMsgRecord(
+            message_ids=(101,),
+            source="form",
+            dedup_key="form:abc",
+            tool_use_id=None,
+            render_sha1="form-only-sha",
+            user_id=1,
+            chat_id=-100,
+            thread_id=42,
+            session_id="sess-1",
+            created_at="2026-05-25T07:00:00+00:00",
+        )
+        # Long descriptions → multiple dict chunks
+        big = "Y" * 2500
+        iui._last_completed_ask_tool_input["@5"] = {
+            "questions": [
+                {
+                    "question": "Pick scope",
+                    "options": [
+                        {"label": "A", "description": big},
+                        {"label": "B", "description": big},
+                        {"label": "C", "description": big},
+                    ],
+                }
+            ]
+        }
+        iui._last_auq_tool_use_id["@5"] = "toolu_01XYZ"
+
+        async def _fake_edit(bot, **kwargs):
+            return iui.TopicSendOutcome.OK
+
+        append_call = {"n": 0}
+
+        async def _fake_send(bot, **kwargs):
+            append_call["n"] += 1
+            if append_call["n"] == 1:
+                msg = MagicMock()
+                msg.message_id = 202
+                return msg, iui.TopicSendOutcome.OK
+            raise RuntimeError("transient failure on chunk 3")
+
+        monkeypatch.setattr(iui, "topic_edit", _fake_edit)
+        monkeypatch.setattr(iui, "topic_send", _fake_send)
+
+        result = await iui.maybe_upgrade_auq_context_message(
+            bot=MagicMock(), window_id="@5"
+        )
+
+        assert result is False
+        rec = iui._auq_context_msgs["@5"]
+        # source stays "form" — upgrade incomplete.
+        assert rec.source == "form"
+        # message_ids updated to include the appended chunk that DID land.
+        assert rec.message_ids == (101, 202), (
+            f"expected (101, 202), got {rec.message_ids}"
+        )

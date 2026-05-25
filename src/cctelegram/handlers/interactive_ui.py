@@ -683,6 +683,26 @@ def hydrate_interactive_state(session_mgr) -> None:
             if rec is None:
                 pruned_ctx_msg_any = True
                 continue
+            # Codex P2 round 4 #1 (2026-05-25): apply the same
+            # session_id staleness check the interactive_msg sidecar
+            # already does (see line ~575). A window that still exists
+            # but now belongs to a different session (e.g. /clear ran)
+            # would otherwise carry the record forward, and a later
+            # maybe_upgrade_auq_context_message call would edit the
+            # OLD session's Telegram message ids with the NEW session's
+            # AUQ text.
+            cur_session_for_ctx = session_id_for_window(remapped_wid)
+            if (cur_session_for_ctx or "") != (rec.session_id or ""):
+                logger.info(
+                    "AUQ hydrate: pruning auq_context_msgs record for "
+                    "window %s on session mismatch "
+                    "(persisted_session=%s current_session=%s)",
+                    remapped_wid,
+                    (rec.session_id[:8] if rec.session_id else "<empty>"),
+                    (cur_session_for_ctx[:8] if cur_session_for_ctx else "<none>"),
+                )
+                pruned_ctx_msg_any = True
+                continue
             if remapped_wid != wid:
                 logger.info(
                     "AUQ hydrate: remapping auq_context_msgs key %s → %s",
@@ -1929,21 +1949,40 @@ async def maybe_upgrade_auq_context_message(
             appended_ids.append(int(sent.message_id))
 
         if append_partial or len(appended_ids) < expected_appends:
-            # Codex P2 round 3 #1: partial append. Do NOT commit —
-            # otherwise tail chunks of the rich render are lost
-            # forever (source="dict" short-circuits future retries).
-            # The already-edited chunks remain edited (their content
-            # is dict-source rich text) and the appended chunks that
-            # landed remain visible — slightly noisy, but next retry
-            # re-edits and re-appends and the noise resolves once
-            # the full upgrade succeeds (extras would render as the
-            # same text Telegram already shows → MESSAGE_NOT_MODIFIED).
+            # Codex P2 round 3 #1: partial append. Do NOT commit
+            # source="dict" — that would short-circuit retries and
+            # tail chunks would be lost forever.
+            #
+            # Codex P2 round 4 #2 (2026-05-25): if some appended_ids
+            # DID land before the failure, persist them onto the
+            # record (source still "form") so the next retry's edit
+            # phase covers them idempotently (MESSAGE_NOT_MODIFIED on
+            # already-correct text) and the append phase only re-runs
+            # for the unlanded tail. Without this, the next retry
+            # would re-append the already-landed chunk and the user
+            # would see duplicate context chunks in the chat.
+            if appended_ids:
+                _auq_context_msgs[window_id] = _ContextMsgRecord(
+                    message_ids=tuple(list(rec.message_ids) + appended_ids),
+                    source="form",  # still incomplete — keep form for retry
+                    dedup_key=rec.dedup_key,
+                    tool_use_id=rec.tool_use_id,
+                    render_sha1=rec.render_sha1,
+                    user_id=rec.user_id,
+                    chat_id=rec.chat_id,
+                    thread_id=rec.thread_id,
+                    session_id=rec.session_id,
+                    created_at=rec.created_at,
+                )
+                _persist_interactive_state()
             logger.info(
                 "AUQ context-message upgrade: partial append "
-                "(window=%s, appended %d/%d) — record unchanged for retry",
+                "(window=%s, appended %d/%d) — record unchanged for retry "
+                "(landed_ids preserved=%d)",
                 window_id,
                 len(appended_ids),
                 expected_appends,
+                len(appended_ids),
             )
             return False
 
