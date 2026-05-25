@@ -1782,7 +1782,18 @@ async def maybe_upgrade_auq_context_message(
 
         existing_ids = list(rec.message_ids)
         # Edit phase — overwrite chunks that already exist.
+        # Codex P2 round 2 (2026-05-25): a partial edit failure (e.g.
+        # chunk 1 edits OK, chunk 2 returns TOPIC_CLOSED / FORBIDDEN /
+        # gets a transient exception) MUST NOT commit the upgrade.
+        # Otherwise the user sees mixed chunks (chunk 1 with rich
+        # text, chunk 2 with form-only text) while the record claims
+        # source="dict" so no retry ever fires. Track an "all edits
+        # succeeded" predicate: if False, abort without committing —
+        # next poll re-attempts the full edit (already-edited chunks
+        # short-circuit with MESSAGE_NOT_MODIFIED, which is harmless).
+        expected_edits = min(len(existing_ids), len(new_parts))
         edited_ids: list[int] = []
+        edit_partial = False
         for idx, (msg_id, chunk) in enumerate(zip(existing_ids, new_parts), start=1):
             try:
                 outcome = await topic_edit(
@@ -1807,8 +1818,7 @@ async def maybe_upgrade_auq_context_message(
                     len(new_parts),
                     exc,
                 )
-                # Stop — partial upgrade is acceptable; we'll keep
-                # whatever chunks we managed to edit.
+                edit_partial = True
                 break
             # MESSAGE_NOT_MODIFIED is fine — count as a successful edit.
             # Codex P2 #1 (2026-05-25): outcome check MUST gate the
@@ -1829,8 +1839,25 @@ async def maybe_upgrade_auq_context_message(
                     idx,
                     len(new_parts),
                 )
+                edit_partial = True
                 break
             edited_ids.append(msg_id)
+
+        if edit_partial or len(edited_ids) < expected_edits:
+            # Codex P2 round 2: at least one existing chunk still
+            # shows form-source text. Do NOT commit — leave record as
+            # source="form" so the next poll retries the full upgrade.
+            # Already-edited chunks (with dict text) become a transient
+            # mixed render until the retry succeeds; acceptable, since
+            # the alternative is permanent stale chunks with no retry.
+            logger.info(
+                "AUQ context-message upgrade: partial edit "
+                "(window=%s, edited %d/%d) — record unchanged for retry",
+                window_id,
+                len(edited_ids),
+                expected_edits,
+            )
+            return False
 
         # Append phase — if the rich render is longer than the form
         # render, send the extra chunks. New chunks land at the end of

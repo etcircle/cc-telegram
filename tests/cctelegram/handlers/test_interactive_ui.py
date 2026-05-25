@@ -3692,3 +3692,60 @@ class TestCodexP2Fixes:
         rec = iui._auq_context_msgs[new_window]
         assert rec.message_ids == (201, 202)
         assert rec.source == "form"
+
+    @pytest.mark.asyncio
+    async def test_upgrade_does_not_commit_on_partial_multi_chunk_failure(
+        self, monkeypatch
+    ):
+        """Codex round 2 P2: form-source record has 2 chunks. First
+        edit succeeds, second fails (e.g. TOPIC_CLOSED). Must NOT
+        commit source='dict' — that would leave chunk 2 permanently
+        stuck on form-source text with no retry path."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._auq_context_msgs["@5"] = iui._ContextMsgRecord(
+            message_ids=(101, 102),  # two chunks
+            source="form",
+            dedup_key="form:abc",
+            tool_use_id=None,
+            render_sha1="old-sha",
+            user_id=1,
+            chat_id=-100,
+            thread_id=42,
+            session_id="sess-1",
+            created_at="2026-05-25T07:00:00+00:00",
+        )
+        # Make a dict source that renders into ≥2 chunks (long descriptions)
+        big = "X" * 2500
+        iui._last_completed_ask_tool_input["@5"] = {
+            "questions": [
+                {
+                    "question": "Pick scope",
+                    "options": [
+                        {"label": "A", "description": big},
+                        {"label": "B", "description": big},
+                    ],
+                }
+            ]
+        }
+        iui._last_auq_tool_use_id["@5"] = "toolu_01XYZ"
+
+        call_count = {"n": 0}
+
+        async def _fake_edit(bot, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return iui.TopicSendOutcome.OK
+            return iui.TopicSendOutcome.TOPIC_CLOSED
+
+        monkeypatch.setattr(iui, "topic_edit", _fake_edit)
+
+        result = await iui.maybe_upgrade_auq_context_message(
+            bot=MagicMock(), window_id="@5"
+        )
+
+        assert result is False
+        rec = iui._auq_context_msgs["@5"]
+        # Must NOT have committed — source stays "form" for retry.
+        assert rec.source == "form"
+        assert rec.message_ids == (101, 102)
