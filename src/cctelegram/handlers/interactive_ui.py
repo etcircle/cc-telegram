@@ -526,6 +526,13 @@ def hydrate_interactive_state(session_mgr) -> None:
 
     state_mutated_any = False
     pruned_ctx_any = False
+    # Codex P2 #2 (2026-05-25): collect (old → new) window-id remaps
+    # from the interactive_msgs loop and re-apply them when hydrating
+    # auq_context_msgs. Without this, a tmux server restart that
+    # renumbers @12 → @13 would prune the upgrade record (because the
+    # old key isn't in known_windows) even though the owning picker
+    # card was kept under the new window id.
+    window_remaps: dict[str, str] = {}
 
     raw_ctx_for_load = data.get("auq_context_posted")
     ctx_markers: dict[str, str] = {}
@@ -592,6 +599,7 @@ def hydrate_interactive_state(session_mgr) -> None:
                     thread_id,
                 )
                 old_window_id = rec.window_id
+                window_remaps[old_window_id] = current_window
                 rec = _InteractiveMsgMeta(
                     msg_id=rec.msg_id,
                     window_id=current_window,
@@ -640,6 +648,11 @@ def hydrate_interactive_state(session_mgr) -> None:
     # window is unknown to session_mgr — the picker that anchored them
     # is gone, no upgrade is possible. Backward compat: missing key is
     # the pre-upgrade-feature shape; treat as empty.
+    #
+    # Codex P2 #2 (2026-05-25): re-apply window-id remaps collected
+    # during the interactive_msgs loop. Without this, @12 → @13 on
+    # tmux restart would prune the upgrade record by old key even
+    # though the owning interactive card was kept under the new key.
     raw_ctx_msgs = data.get("auq_context_msgs")
     pruned_ctx_msg_any = False
     if isinstance(raw_ctx_msgs, dict):
@@ -647,10 +660,12 @@ def hydrate_interactive_state(session_mgr) -> None:
             if not isinstance(wid, str) or not isinstance(payload, dict):
                 pruned_ctx_msg_any = True
                 continue
-            if wid not in known_windows:
+            remapped_wid = window_remaps.get(wid, wid)
+            if remapped_wid not in known_windows:
                 logger.debug(
-                    "AUQ hydrate: pruning stale auq_context_msgs record for "
-                    "unknown window %s",
+                    "AUQ hydrate: pruning stale auq_context_msgs record "
+                    "for unknown window %s (persisted_key=%s)",
+                    remapped_wid,
                     wid,
                 )
                 pruned_ctx_msg_any = True
@@ -659,7 +674,14 @@ def hydrate_interactive_state(session_mgr) -> None:
             if rec is None:
                 pruned_ctx_msg_any = True
                 continue
-            _auq_context_msgs[wid] = rec
+            if remapped_wid != wid:
+                logger.info(
+                    "AUQ hydrate: remapping auq_context_msgs key %s → %s",
+                    wid,
+                    remapped_wid,
+                )
+                pruned_ctx_msg_any = True  # forces re-persist with new key
+            _auq_context_msgs[remapped_wid] = rec
 
     logger.info(
         "AUQ hydrate: %d interactive_msg entries, %d context-posted markers, "
@@ -1788,21 +1810,27 @@ async def maybe_upgrade_auq_context_message(
                 # Stop — partial upgrade is acceptable; we'll keep
                 # whatever chunks we managed to edit.
                 break
-            edited_ids.append(msg_id)
             # MESSAGE_NOT_MODIFIED is fine — count as a successful edit.
+            # Codex P2 #1 (2026-05-25): outcome check MUST gate the
+            # append. Otherwise TOPIC_CLOSED / TOPIC_NOT_FOUND /
+            # FORBIDDEN / OTHER would still flip the record source to
+            # ``"dict"`` (because ``final_ids`` is non-empty), and the
+            # original form-source post would never get a retry.
             if outcome not in (
                 TopicSendOutcome.OK,
                 TopicSendOutcome.MESSAGE_NOT_MODIFIED,
             ):
                 logger.warning(
                     "AUQ context-message upgrade edit unexpected outcome=%s "
-                    "(window=%s, part %d/%d)",
+                    "(window=%s, part %d/%d) — keeping form-source record "
+                    "for retry",
                     outcome,
                     window_id,
                     idx,
                     len(new_parts),
                 )
                 break
+            edited_ids.append(msg_id)
 
         # Append phase — if the rich render is longer than the form
         # render, send the extra chunks. New chunks land at the end of

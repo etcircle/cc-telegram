@@ -3558,3 +3558,137 @@ class TestMaybeUpgradeAuqContextMessage:
         rec = iui._auq_context_msgs["@5"]
         assert rec.source == "dict"
         assert rec.tool_use_id == "toolu_01XYZ"
+
+
+@pytest.mark.usefixtures("_isolated_interactive_state_file")
+class TestCodexP2Fixes:
+    """Codex review (2026-05-25) flagged two correctness gaps in the
+    initial edit-on-upgrade impl. Both fixed; these tests pin them."""
+
+    @pytest.mark.asyncio
+    async def test_upgrade_does_not_commit_on_edit_failure(self, monkeypatch):
+        """P2 #1: if topic_edit returns a non-OK outcome (TOPIC_CLOSED,
+        FORBIDDEN, OTHER, …) the record must NOT flip to source="dict".
+        Earlier code appended msg_id before the outcome check, leaving
+        future calls short-circuiting as "already upgraded" while the
+        Telegram message still showed the form-only render."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._auq_context_msgs["@5"] = iui._ContextMsgRecord(
+            message_ids=(101,),
+            source="form",
+            dedup_key="form:abc",
+            tool_use_id=None,
+            render_sha1="form-only-sha",
+            user_id=1,
+            chat_id=-100,
+            thread_id=42,
+            session_id="sess-1",
+            created_at="2026-05-25T07:00:00+00:00",
+        )
+        iui._last_completed_ask_tool_input["@5"] = {
+            "questions": [
+                {
+                    "question": "Pick scope",
+                    "options": [
+                        {
+                            "label": "All tabs",
+                            "description": "Patch every extraction tab.",
+                        }
+                    ],
+                }
+            ]
+        }
+        iui._last_auq_tool_use_id["@5"] = "toolu_01XYZ"
+
+        async def _fake_edit_topic_closed(bot, **kwargs):
+            return iui.TopicSendOutcome.TOPIC_CLOSED
+
+        monkeypatch.setattr(iui, "topic_edit", _fake_edit_topic_closed)
+
+        result = await iui.maybe_upgrade_auq_context_message(
+            bot=MagicMock(), window_id="@5"
+        )
+
+        # Edit failed → no upgrade — record stays form-source so a
+        # future call can retry.
+        assert result is False
+        rec = iui._auq_context_msgs["@5"]
+        assert rec.source == "form", (
+            "edit failure must not flip source to 'dict' — that would "
+            "permanently suppress retries"
+        )
+        assert rec.message_ids == (101,)
+
+    def test_hydrate_remaps_auq_context_msgs_window_id(self, monkeypatch):
+        """P2 #2: tmux server restart can renumber @12 → @13. The
+        interactive_msgs loop already remaps. The auq_context_msgs
+        sidecar must follow the same remap, not get pruned."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        # Persisted state: AUQ context msg was posted under @12 (which
+        # the new tmux server has renumbered to @13 with same session).
+        old_window = "@12"
+        new_window = "@13"
+        session_id = "sess-1"
+
+        state = {
+            "interactive_msgs": {
+                "1:42": {
+                    "msg_id": 12345,
+                    "window_id": old_window,
+                    "session_id": session_id,
+                    "tool_use_id": None,
+                    "created_at": "2026-05-25T07:00:00+00:00",
+                },
+            },
+            "auq_context_posted": {},
+            "auq_context_msgs": {
+                old_window: {
+                    "message_ids": [201, 202],
+                    "source": "form",
+                    "dedup_key": "form:abc",
+                    "tool_use_id": None,
+                    "render_sha1": "deadbeef",
+                    "user_id": 1,
+                    "chat_id": -100,
+                    "thread_id": 42,
+                    "session_id": session_id,
+                    "created_at": "2026-05-25T07:00:00+00:00",
+                }
+            },
+        }
+        import json as _json
+
+        path = iui._interactive_state_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(state))
+
+        # SessionManager surface that the hydrate path consults.
+        session_mgr = MagicMock()
+        session_mgr.window_states = {new_window: MagicMock(session_id=session_id)}
+        session_mgr.resolve_window_for_thread = MagicMock(return_value=new_window)
+
+        # session_id_for_window is module-level — patch it for the
+        # remap check.
+        monkeypatch.setattr(
+            iui,
+            "session_id_for_window",
+            lambda wid: session_id if wid == new_window else None,
+        )
+
+        iui.hydrate_interactive_state(session_mgr)
+
+        # The interactive_msgs entry remaps from @12 → @13.
+        assert iui._interactive_msgs[(1, 42)] == 12345
+        assert iui._interactive_msg_meta[(1, 42)].window_id == new_window
+
+        # The auq_context_msgs record MUST follow the same remap, not
+        # get pruned because @12 isn't in known_windows anymore.
+        assert new_window in iui._auq_context_msgs, (
+            "auq_context_msgs must be remapped from @12 to @13, not pruned"
+        )
+        assert old_window not in iui._auq_context_msgs
+        rec = iui._auq_context_msgs[new_window]
+        assert rec.message_ids == (201, 202)
+        assert rec.source == "form"
