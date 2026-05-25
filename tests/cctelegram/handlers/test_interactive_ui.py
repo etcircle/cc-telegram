@@ -3907,3 +3907,441 @@ class TestCodexP2Fixes:
         assert rec.message_ids == (101, 202), (
             f"expected (101, 202), got {rec.message_ids}"
         )
+
+
+# ── AUQ PreToolUse-hook reader (chunk 3) ──────────────────────────────────
+
+
+import json as _json  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+from cctelegram.handlers.interactive_ui import (  # noqa: E402
+    PreToolAskRecord,
+    _PRETOOL_SCHEMA_VERSION,
+    _PRETOOL_TTL_SECONDS,
+    _labels_are_subsequence,
+    _pretool_ask_records,
+    _read_pretool_side_file,
+    _record_consistent_with_pane,
+    _resolve_pretool_record,
+)
+from cctelegram.terminal_parser import (  # noqa: E402,F811
+    questions_content_digest,
+    questions_content_pairs_from_tool_input,
+)
+
+
+def _write_pretool_side_file(
+    tmp_path: _Path,
+    *,
+    session_id: str = "550e8400-e29b-41d4-a716-446655440000",
+    tool_use_id: str = "toolu_017abcdef01234567890ab",
+    questions: list[dict] | None = None,
+    written_at: float | None = None,
+    schema_version: int = 1,
+) -> _Path:
+    """Write a PreToolUse side file under tmp_path/auq_pending/.
+
+    Returns the path. Tests pass tmp_path as the cc-telegram dir via
+    CC_TELEGRAM_DIR env var so app_dir() resolves to it.
+    """
+    if questions is None:
+        questions = [
+            {
+                "question": "Pick a fruit",
+                "options": [
+                    {"label": "Apple", "description": "red"},
+                    {"label": "Banana", "description": "yellow"},
+                ],
+            }
+        ]
+    tool_input = {"questions": questions}
+    pairs = questions_content_pairs_from_tool_input(tool_input)
+    assert pairs is not None
+    record = {
+        "schema_version": schema_version,
+        "session_id": session_id,
+        "tool_use_id": tool_use_id,
+        "tool_input": tool_input,
+        "written_at": written_at if written_at is not None else time.time(),
+        "input_fingerprint": questions_content_digest(pairs),
+        "transcript_path": "/tmp/transcript.jsonl",
+        "cwd": "/tmp/cwd",
+    }
+    pending_dir = tmp_path / "auq_pending"
+    pending_dir.mkdir(exist_ok=True)
+    target = pending_dir / f"{session_id}.json"
+    target.write_text(_json.dumps(record))
+    return target
+
+
+def _make_form_single_question(
+    title: str, labels: list[str], *, current_tab_inferred: bool = True
+) -> AskUserQuestionForm:
+    """Build an AskUserQuestionForm representing a single-question pane parse."""
+    options = tuple(
+        AskOption(label=lab, recommended=False, cursor=(i == 0), number=i + 1)
+        for i, lab in enumerate(labels)
+    )
+    return AskUserQuestionForm(
+        options=options,
+        current_question_title=title,
+        current_tab_inferred=current_tab_inferred,
+    )
+
+
+@pytest.fixture
+def _cc_telegram_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+    # Clear in-memory cache before AND after — keeps tests isolated.
+    _pretool_ask_records.clear()
+    yield tmp_path
+    _pretool_ask_records.clear()
+
+
+class TestReadPretoolSideFile:
+    def test_returns_none_when_file_missing(self, _cc_telegram_dir):
+        assert _read_pretool_side_file("not-a-session") is None
+
+    def test_reads_well_formed_file(self, _cc_telegram_dir):
+        _write_pretool_side_file(_cc_telegram_dir)
+        rec = _read_pretool_side_file("550e8400-e29b-41d4-a716-446655440000")
+        assert rec is not None
+        assert rec.tool_use_id == "toolu_017abcdef01234567890ab"
+        assert rec.tool_input["questions"][0]["question"] == "Pick a fruit"
+        assert len(rec.input_fingerprint) == 12
+
+    def test_rejects_unknown_schema_version(self, _cc_telegram_dir):
+        _write_pretool_side_file(_cc_telegram_dir, schema_version=999)
+        rec = _read_pretool_side_file("550e8400-e29b-41d4-a716-446655440000")
+        assert rec is None
+
+    def test_rejects_malformed_json(self, _cc_telegram_dir):
+        pending_dir = _cc_telegram_dir / "auq_pending"
+        pending_dir.mkdir()
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        (pending_dir / f"{sid}.json").write_text("{not valid json")
+        assert _read_pretool_side_file(sid) is None
+
+    def test_rejects_non_dict_top_level(self, _cc_telegram_dir):
+        pending_dir = _cc_telegram_dir / "auq_pending"
+        pending_dir.mkdir()
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        (pending_dir / f"{sid}.json").write_text("[1, 2, 3]")
+        assert _read_pretool_side_file(sid) is None
+
+    def test_rejects_non_dict_tool_input(self, _cc_telegram_dir):
+        pending_dir = _cc_telegram_dir / "auq_pending"
+        pending_dir.mkdir()
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        (pending_dir / f"{sid}.json").write_text(
+            _json.dumps(
+                {"schema_version": _PRETOOL_SCHEMA_VERSION, "tool_input": "nope"}
+            )
+        )
+        assert _read_pretool_side_file(sid) is None
+
+
+class TestLabelsAreSubsequence:
+    def test_empty_visible_false(self):
+        assert _labels_are_subsequence((), ("A", "B")) is False
+
+    def test_full_match(self):
+        assert _labels_are_subsequence(("A", "B"), ("A", "B")) is True
+
+    def test_visible_longer_than_full_false(self):
+        assert _labels_are_subsequence(("A", "B", "C"), ("A", "B")) is False
+
+    def test_visible_is_prefix(self):
+        assert _labels_are_subsequence(("A",), ("A", "B", "C")) is True
+
+    def test_visible_is_suffix(self):
+        assert _labels_are_subsequence(("B", "C"), ("A", "B", "C")) is True
+
+    def test_visible_in_middle(self):
+        assert _labels_are_subsequence(("B", "C"), ("A", "B", "C", "D")) is True
+
+    def test_non_contiguous_rejected(self):
+        # A and C visible but not B → must reject (the contract is
+        # contiguous subsequence, not subset).
+        assert _labels_are_subsequence(("A", "C"), ("A", "B", "C")) is False
+
+    def test_different_label_rejected(self):
+        assert _labels_are_subsequence(("X",), ("A", "B")) is False
+
+
+class TestRecordConsistentWithPane:
+    def _single_q_record(self, labels: list[str], title: str = "Q"):
+        tool_input = {
+            "questions": [
+                {
+                    "question": title,
+                    "options": [{"label": lab, "description": "d"} for lab in labels],
+                }
+            ]
+        }
+        pairs = questions_content_pairs_from_tool_input(tool_input)
+        assert pairs is not None
+        return PreToolAskRecord(
+            tool_input=tool_input,
+            session_id="sess",
+            tool_use_id="tu",
+            written_at=time.time(),
+            input_fingerprint=questions_content_digest(pairs),
+        )
+
+    def test_no_pane_form(self):
+        rec = self._single_q_record(["A", "B"])
+        ok, reason = _record_consistent_with_pane(rec, None)
+        assert ok is False
+        assert reason == "no_pane_form"
+
+    def test_empty_pane_options(self):
+        rec = self._single_q_record(["A", "B"])
+        form = AskUserQuestionForm()  # no options
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is False
+        assert reason == "no_pane_form"
+
+    def test_single_question_full_match_accepted(self):
+        rec = self._single_q_record(["Apple", "Banana"])
+        form = _make_form_single_question("Q", ["Apple", "Banana"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_pane_label_mismatch_rejected(self):
+        rec = self._single_q_record(["Apple", "Banana"])
+        form = _make_form_single_question("Q", ["Apple", "Cherry"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is False
+        assert reason == "label_mismatch"
+
+    def test_pane_title_missing_accepted_when_labels_match(self):
+        # Hermes edge case: long descriptions push title off-pane.
+        # Reader must STILL accept the record if labels match.
+        rec = self._single_q_record(["Apple", "Banana"], title="Pick a fruit")
+        form = _make_form_single_question("", ["Apple", "Banana"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_pane_shows_subsequence_of_options_accepted(self):
+        # Pane scrolled — only options 2..N visible, option 1 off-screen.
+        rec = self._single_q_record(["Apple", "Banana", "Cherry"])
+        form = _make_form_single_question("Q", ["Banana", "Cherry"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_pane_title_prefix_match_accepted(self):
+        # Pane truncates long question title; record carries full string.
+        # Each must be a prefix of the other.
+        rec = self._single_q_record(
+            ["A"], title="A long question that the pane truncated"
+        )
+        form = _make_form_single_question("A long question that the pane", ["A"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_pane_title_differs_substantively_rejected(self):
+        rec = self._single_q_record(["A"], title="Pick a fruit")
+        form = _make_form_single_question("Choose your favorite color", ["A"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is False
+        assert reason == "title_mismatch"
+
+    def test_multi_question_current_tab_inferred_match(self):
+        # Multi-tab record + reliable tab → match by title.
+        tool_input = {
+            "questions": [
+                {"question": "Q1: fruit", "options": [{"label": "A"}, {"label": "B"}]},
+                {
+                    "question": "Q2: color",
+                    "options": [{"label": "Red"}, {"label": "Blue"}],
+                },
+            ]
+        }
+        pairs = questions_content_pairs_from_tool_input(tool_input)
+        assert pairs is not None
+        rec = PreToolAskRecord(
+            tool_input=tool_input,
+            session_id="sess",
+            tool_use_id="tu",
+            written_at=time.time(),
+            input_fingerprint=questions_content_digest(pairs),
+        )
+        # Pane is on Q2.
+        form = _make_form_single_question(
+            "Q2: color", ["Red", "Blue"], current_tab_inferred=True
+        )
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_multi_question_uninferred_tab_falls_through_to_label_match(self):
+        # current_tab_inferred=False → predicate accepts any question
+        # whose labels match the visible labels.
+        tool_input = {
+            "questions": [
+                {"question": "Q1", "options": [{"label": "A"}, {"label": "B"}]},
+                {"question": "Q2", "options": [{"label": "Red"}, {"label": "Blue"}]},
+            ]
+        }
+        pairs = questions_content_pairs_from_tool_input(tool_input)
+        assert pairs is not None
+        rec = PreToolAskRecord(
+            tool_input=tool_input,
+            session_id="sess",
+            tool_use_id="tu",
+            written_at=time.time(),
+            input_fingerprint=questions_content_digest(pairs),
+        )
+        form = _make_form_single_question(
+            "", ["Red", "Blue"], current_tab_inferred=False
+        )
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+
+    def test_does_not_use_form_fingerprint_for_acceptance(self):
+        # Cursor on different option ⇒ form.fingerprint() differs but
+        # _record_consistent_with_pane must still accept (Codex R3 ask:
+        # NEVER use AskUserQuestionForm.fingerprint() in the predicate).
+        rec = self._single_q_record(["Apple", "Banana"])
+        form_cur_a = _make_form_single_question("Q", ["Apple", "Banana"])
+        form_cur_b = AskUserQuestionForm(
+            options=(
+                AskOption(label="Apple", recommended=False, cursor=False, number=1),
+                AskOption(label="Banana", recommended=False, cursor=True, number=2),
+            ),
+            current_question_title="Q",
+            current_tab_inferred=True,
+        )
+        assert form_cur_a.fingerprint() != form_cur_b.fingerprint()
+        ok_a, _ = _record_consistent_with_pane(rec, form_cur_a)
+        ok_b, _ = _record_consistent_with_pane(rec, form_cur_b)
+        assert ok_a is True and ok_b is True
+
+
+class TestResolvePretoolRecord:
+    def _bind_window_to_session(self, window_id: str, session_id: str):
+        # Drive session_manager state so session_id_for_window resolves.
+        from cctelegram.session import session_manager
+
+        session_manager.window_states.setdefault(
+            window_id,
+            type(
+                session_manager.window_states.get(window_id, None)
+                or type("WS", (), {})()
+            )(),
+        )
+        # Easier: use the public API to ensure mapping.
+        # session_manager has a set_session_id or similar — fall back to
+        # touching window_states directly.
+        ws = session_manager.window_states.get(window_id)
+        if ws is None:
+            from cctelegram.session import WindowState
+
+            ws = WindowState(window_id=window_id, cwd="/tmp/cwd", session_id=session_id)
+            session_manager.window_states[window_id] = ws
+        else:
+            object.__setattr__(ws, "session_id", session_id)
+
+    def test_returns_none_when_no_session_mapping(self, _cc_telegram_dir):
+        # No window→session map → reader returns None.
+        form = _make_form_single_question("Q", ["A"])
+        # Use a window_id that isn't in session_manager.
+        assert _resolve_pretool_record("@no-such-window", form) is None
+
+    def test_returns_none_when_side_file_missing(self, _cc_telegram_dir):
+        self._bind_window_to_session("@9001", "11111111-1111-1111-1111-111111111111")
+        form = _make_form_single_question("Q", ["A"])
+        assert _resolve_pretool_record("@9001", form) is None
+
+    def test_happy_path_returns_record(self, _cc_telegram_dir):
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9002", sid)
+        _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        rec = _resolve_pretool_record("@9002", form)
+        assert rec is not None
+        assert rec.tool_use_id == "toolu_017abcdef01234567890ab"
+
+    def test_caches_after_first_resolve(self, _cc_telegram_dir):
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9003", sid)
+        _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        _resolve_pretool_record("@9003", form)
+        assert "@9003" in _pretool_ask_records
+
+    def test_ttl_expiry_evicts_and_returns_none(self, _cc_telegram_dir):
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9004", sid)
+        _write_pretool_side_file(
+            _cc_telegram_dir,
+            session_id=sid,
+            written_at=time.time() - _PRETOOL_TTL_SECONDS - 1,
+        )
+        form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        assert _resolve_pretool_record("@9004", form) is None
+        assert "@9004" not in _pretool_ask_records
+
+    def test_pane_drift_evicts_cached_record(self, _cc_telegram_dir):
+        # Cache invariant: a cached record that no longer matches the
+        # live pane is evicted on next call, not stale-served.
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9005", sid)
+        _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        form_initial = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        rec1 = _resolve_pretool_record("@9005", form_initial)
+        assert rec1 is not None
+        # Pane drifts to a different label set (user moved on).
+        form_drifted = _make_form_single_question("Other Q", ["Cherry", "Date"])
+        rec2 = _resolve_pretool_record("@9005", form_drifted)
+        assert rec2 is None
+        assert "@9005" not in _pretool_ask_records
+
+    def test_corrupt_file_evicts_cached_record(self, _cc_telegram_dir):
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9006", sid)
+        _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        rec1 = _resolve_pretool_record("@9006", form)
+        assert rec1 is not None
+        # Now corrupt the file on disk.
+        (_cc_telegram_dir / "auq_pending" / f"{sid}.json").write_text("{garbage")
+        rec2 = _resolve_pretool_record("@9006", form)
+        assert rec2 is None
+        assert "@9006" not in _pretool_ask_records
+
+    def test_rejection_log_omits_question_text(self, _cc_telegram_dir, caplog):
+        # Privacy: rejection reason logs must NOT include question/option
+        # text. Trigger a pane-mismatch rejection and verify the log only
+        # has the reason code + fingerprint.
+        import logging as _logging
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9007", sid)
+        _write_pretool_side_file(
+            _cc_telegram_dir,
+            session_id=sid,
+            questions=[
+                {
+                    "question": "ULTRA_SECRET_QUESTION_TEXT",
+                    "options": [
+                        {"label": "ULTRA_SECRET_LABEL_1"},
+                        {"label": "ULTRA_SECRET_LABEL_2"},
+                    ],
+                }
+            ],
+        )
+        form = _make_form_single_question("Different Q", ["Different Label"])
+        with caplog.at_level(
+            _logging.DEBUG, logger="cctelegram.handlers.interactive_ui"
+        ):
+            rec = _resolve_pretool_record("@9007", form)
+        assert rec is None
+        for record in caplog.records:
+            assert "ULTRA_SECRET" not in record.getMessage()

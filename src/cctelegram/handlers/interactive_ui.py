@@ -45,7 +45,7 @@ from ..terminal_parser import (
     visible_pane_liveness,
 )
 from ..tmux_manager import tmux_manager
-from ..utils import atomic_write_json
+from ..utils import app_dir, atomic_write_json
 from . import attention
 from .callback_data import (
     CB_ASK_DOWN,
@@ -745,6 +745,275 @@ def resolve_ask_tool_input(window_id: str) -> dict | None:
     the two paths produce byte-identical fingerprints.
     """
     return _last_completed_ask_tool_input.get(window_id)
+
+
+# ── AUQ PreToolUse-hook reader (v4 plan) ────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PreToolAskRecord:
+    """A PreToolUse-hook AUQ side-file record.
+
+    Carries the structured ``tool_input`` from the AUQ tool_use payload
+    PLUS provenance fields (session_id, tool_use_id, written_at,
+    input_fingerprint) so the context gate (next chunk) can distinguish
+    this source from JSONL-derived cache entries. Acceptance into the
+    cache requires passing the projection predicate in
+    ``_record_consistent_with_pane`` — NOT digest equality. The
+    fingerprint is only a logging/integrity field.
+    """
+
+    tool_input: dict[str, Any]
+    session_id: str
+    tool_use_id: str  # may be "" if hook payload didn't carry one
+    written_at: float
+    input_fingerprint: str
+
+
+# Per-window in-memory cache of accepted PreToolAskRecord. Populated by
+# ``_resolve_pretool_record`` on each gate use; revalidated on every call
+# (no stale-serve). Cleared by ``forget_ask_tool_input`` (chunk 5) when
+# the AUQ resolves.
+_pretool_ask_records: dict[str, PreToolAskRecord] = {}
+
+_PRETOOL_TTL_SECONDS = 300  # 5 minutes (v4 plan; lowered from v2's 10)
+_PRETOOL_SCHEMA_VERSION = 1
+
+
+def _pretool_side_file_path(session_id: str) -> Path:
+    return app_dir() / "auq_pending" / f"{session_id}.json"
+
+
+def _read_pretool_side_file(session_id: str) -> PreToolAskRecord | None:
+    """Read and parse the AUQ PreToolUse side file for ``session_id``.
+
+    Returns ``None`` on missing file (silent — hook hasn't fired yet or
+    already cleaned up), JSON parse error, schema_version mismatch, or
+    shape mismatch. Does NOT validate TTL or pane compatibility — those
+    happen in ``_resolve_pretool_record`` against the live pane.
+    """
+    path = _pretool_side_file_path(session_id)
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        logger.debug("Pretool side file unreadable for %s: %s", session_id, e)
+        return None
+    try:
+        rec = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning("Pretool side file malformed JSON for %s: %s", session_id, e)
+        return None
+    if not isinstance(rec, dict):
+        logger.warning("Pretool side file is not a dict: %s", session_id)
+        return None
+    if rec.get("schema_version") != _PRETOOL_SCHEMA_VERSION:
+        logger.warning(
+            "Pretool side file schema_version=%r unknown for %s",
+            rec.get("schema_version"),
+            session_id,
+        )
+        return None
+    tool_input = rec.get("tool_input")
+    if not isinstance(tool_input, dict):
+        logger.warning("Pretool side file tool_input invalid for %s", session_id)
+        return None
+    try:
+        written_at = float(rec.get("written_at", 0))
+    except (TypeError, ValueError):
+        return None
+    return PreToolAskRecord(
+        tool_input=tool_input,
+        session_id=str(rec.get("session_id", "") or session_id),
+        tool_use_id=str(rec.get("tool_use_id", "") or ""),
+        written_at=written_at,
+        input_fingerprint=str(rec.get("input_fingerprint", "") or ""),
+    )
+
+
+def _safe_record_labels(question: dict) -> tuple[str, ...] | None:
+    """Extract ordered option labels from a tool_input question dict.
+
+    Returns ``None`` on shape mismatch. Mirrors
+    ``terminal_parser.questions_content_pairs_from_tool_input`` validation
+    so the predicate fails closed on malformed records.
+    """
+    options = question.get("options")
+    if not isinstance(options, list):
+        return None
+    labels: list[str] = []
+    for o in options:
+        if not isinstance(o, dict):
+            return None
+        label = o.get("label")
+        if not isinstance(label, str):
+            return None
+        labels.append(label)
+    return tuple(labels)
+
+
+def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> bool:
+    """True if ``visible`` is a contiguous subsequence of ``full``.
+
+    The pane may render only the visible region; earlier options can be
+    pushed off the top by long descriptions. We still accept the record
+    if whatever IS visible matches the corresponding contiguous slice of
+    the record's labels.
+    """
+    if not visible:
+        return False
+    if len(visible) > len(full):
+        return False
+    for start in range(len(full) - len(visible) + 1):
+        if full[start : start + len(visible)] == visible:
+            return True
+    return False
+
+
+def _record_consistent_with_pane(
+    record: PreToolAskRecord,
+    pane_form: AskUserQuestionForm | None,
+) -> tuple[bool, str]:
+    """v4 plan step 5: projection-based structural predicate.
+
+    Returns ``(accepted, reason_code)``. On accept: ``(True, "ok")``.
+    On reject: ``(False, code)`` where ``code`` is one of:
+    ``no_pane_form``, ``no_candidate``, ``title_mismatch``,
+    ``label_mismatch``, ``count_sanity``.
+
+    Acceptance is structural — NOT digest equality. We compare projected
+    fields one at a time so each edge case (title-missing,
+    walkback-only-title, multi-tab subset) has a principled answer.
+    NEVER computes ``AskUserQuestionForm.fingerprint()`` here — that
+    includes cursor/recommended/tab state and would reject valid records.
+    """
+    if pane_form is None or not pane_form.options:
+        return False, "no_pane_form"
+
+    raw_questions = record.tool_input.get("questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        return False, "no_candidate"
+
+    pane_labels = tuple(o.label for o in pane_form.options)
+    pane_title = (pane_form.current_question_title or "").strip()
+    candidate: dict | None = None
+
+    # Step 5.a — pick a candidate record-question.
+    if len(raw_questions) == 1 and isinstance(raw_questions[0], dict):
+        candidate = raw_questions[0]
+    elif pane_form.current_tab_inferred and pane_title:
+        for q in raw_questions:
+            if not isinstance(q, dict):
+                continue
+            qt = (q.get("question") or "").strip()
+            if not qt:
+                continue
+            if qt.startswith(pane_title) or pane_title.startswith(qt):
+                candidate = q
+                break
+
+    if candidate is None:
+        # Multi-tab fallthrough (current_tab_inferred=False, or no title
+        # match): accept the FIRST question whose labels match the
+        # visible labels as a subsequence.
+        for q in raw_questions:
+            if not isinstance(q, dict):
+                continue
+            q_labels = _safe_record_labels(q)
+            if q_labels is None:
+                continue
+            if _labels_are_subsequence(pane_labels, q_labels):
+                candidate = q
+                break
+    if candidate is None:
+        return False, "no_candidate"
+
+    # Step 5.b — TITLE check (conditional).
+    # Skip when:
+    #   - pane title empty
+    #   - pane title sourced from walkback only (current_question_title is
+    #     empty, pane_walkback_title may be set but is unreliable per the
+    #     parser's docstring — DON'T use it for acceptance)
+    #   - candidate has no question title
+    candidate_title = (candidate.get("question") or "").strip()
+    if pane_title and candidate_title:
+        if not (
+            candidate_title.startswith(pane_title)
+            or pane_title.startswith(candidate_title)
+        ):
+            return False, "title_mismatch"
+
+    # Step 5.c — LABEL check (mandatory).
+    candidate_labels = _safe_record_labels(candidate)
+    if candidate_labels is None:
+        return False, "no_candidate"
+    if not _labels_are_subsequence(pane_labels, candidate_labels):
+        return False, "label_mismatch"
+
+    # Step 5.d — option-count sanity for full match.
+    if pane_labels == candidate_labels:
+        if not pane_form.options_contiguous_from_one():
+            return False, "count_sanity"
+
+    return True, "ok"
+
+
+def _resolve_pretool_record(
+    window_id: str,
+    pane_form: AskUserQuestionForm | None,
+) -> PreToolAskRecord | None:
+    """Return the PreToolUse side-file record for ``window_id`` if it is
+    consistent with the live pane parse, else ``None``.
+
+    The cache invariant is revalidate-on-every-call: a record that no
+    longer matches the pane (user navigated, picker advanced, label set
+    drifted) MUST be evicted at the next call, not stale-served. This
+    keeps wrong-action class bugs out of the cache layer.
+
+    Reason codes for rejection are logged at DEBUG level (not INFO — the
+    reader runs on every status-poll iteration when an AUQ is visible,
+    and we don't want to flood the log). Question text is NEVER logged
+    here; only the reason code + the record's fingerprint.
+    """
+    session_id = session_id_for_window(window_id)
+    if not session_id:
+        logger.debug("Pretool resolve window=%s reason=missing_map", window_id)
+        _pretool_ask_records.pop(window_id, None)
+        return None
+
+    record = _read_pretool_side_file(session_id)
+    if record is None:
+        # Missing or malformed — evict any stale cache.
+        _pretool_ask_records.pop(window_id, None)
+        return None
+
+    # TTL check.
+    age = time.time() - record.written_at
+    if age > _PRETOOL_TTL_SECONDS:
+        logger.debug(
+            "Pretool resolve window=%s reason=stale age=%.1fs fp=%s",
+            window_id,
+            age,
+            record.input_fingerprint,
+        )
+        _pretool_ask_records.pop(window_id, None)
+        return None
+
+    # Pane-compatibility predicate (revalidated every call).
+    consistent, reason = _record_consistent_with_pane(record, pane_form)
+    if not consistent:
+        logger.debug(
+            "Pretool resolve window=%s reason=%s fp=%s",
+            window_id,
+            reason,
+            record.input_fingerprint,
+        )
+        _pretool_ask_records.pop(window_id, None)
+        return None
+
+    _pretool_ask_records[window_id] = record
+    return record
 
 
 # ── PR 3: rerender_guard sentinel + digest helper ────────────────────────
