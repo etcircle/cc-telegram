@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -111,7 +112,18 @@ def _is_session_start_installed(settings: dict) -> HookStatus:
 
 def _is_pre_tool_use_installed(settings: dict) -> HookStatus:
     """Return whether PreToolUse contains a managed entry matching
-    ``AskUserQuestion``."""
+    ``AskUserQuestion``.
+
+    The check is intentionally loose: any managed-command entry under
+    matcher ``AskUserQuestion`` counts as ``current``, regardless of
+    ``type`` / ``timeout``. This preserves idempotency — install never
+    duplicates an existing managed entry — at the cost of NOT
+    auto-refreshing a stale timeout config. Codex P2 round 2 flagged
+    this; the trade-off favors idempotency since the install command is
+    append-only and an in-place replacement would risk clobbering
+    user-edited entries. Users who need a config refresh can edit
+    ~/.claude/settings.json directly.
+    """
     for entry in settings.get("hooks", {}).get("PreToolUse", []) or []:
         if not isinstance(entry, dict):
             continue
@@ -345,12 +357,21 @@ def _handle_pre_tool_use(payload: dict) -> int:
 
     # mkdir(mode=...) only applies to newly created dirs; chmod
     # unconditionally to recover from a pre-existing loose-mode dir.
+    # Fail-closed (codex P2 round 2 — chunk 2): if we can't tighten the
+    # dir to 0o700, we MUST NOT write the side file. AUQ tool_input can
+    # carry sensitive context (skill prompts that mention infra, plan
+    # decisions, etc.); a world-readable side file is a privacy
+    # regression, and the existing post-hoc form-source fallback gives
+    # the user a working — if less rich — experience either way.
     try:
         os.chmod(pending_dir, 0o700)
     except OSError as e:
-        # Non-fatal — keep writing but log. World-readable side files
-        # are still less bad than no AUQ context message at all.
-        logger.warning("PreToolUse AUQ: chmod 0700 on %s failed: %s", pending_dir, e)
+        logger.error(
+            "PreToolUse AUQ: chmod 0700 on %s failed; refusing to write: %s",
+            pending_dir,
+            e,
+        )
+        return 0
 
     target = pending_dir / f"{session_id}.json"
     record = {
@@ -384,7 +405,7 @@ def _handle_pre_tool_use(payload: dict) -> int:
     return 0
 
 
-_EVENT_HANDLERS: dict[str, "callable"] = {  # type: ignore[type-arg]
+_EVENT_HANDLERS: dict[str, Callable[[dict], int]] = {
     "SessionStart": _handle_session_start,
     "PreToolUse": _handle_pre_tool_use,
 }

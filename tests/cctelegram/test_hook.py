@@ -263,7 +263,7 @@ class TestInstallHookDual:
         ss_entry = data["hooks"]["SessionStart"][0]["hooks"][0]
         assert ss_entry["timeout"] == _SESSION_START_TIMEOUT_S
 
-    def test_partial_install_only_adds_missing_event(
+    def test_partial_install_only_adds_missing_event_session_current(
         self, tmp_path, monkeypatch
     ) -> None:
         # SessionStart current, PreToolUse missing → only PreToolUse added.
@@ -284,6 +284,45 @@ class TestInstallHookDual:
         # SessionStart NOT duplicated.
         assert _session_start_commands(data) == ["cc-telegram hook"]
         # PreToolUse newly added.
+        pre_entries = _pre_tool_use_entries(data)
+        assert len(pre_entries) == 1
+        assert pre_entries[0]["matcher"] == "AskUserQuestion"
+
+    def test_partial_install_only_adds_missing_event_pretool_current(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Inverse partial (codex P2 round 2): PreToolUse current,
+        # SessionStart missing → only SessionStart added; PreToolUse
+        # entry preserved untouched.
+        settings = {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "AskUserQuestion",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "cc-telegram hook",
+                                "timeout": 2,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(settings))
+        monkeypatch.setattr(
+            "cctelegram.hook._find_cc_telegram_path", lambda: "cc-telegram"
+        )
+        assert _install_hook(settings_file=settings_file) == 0
+        data = json.loads(settings_file.read_text())
+        # SessionStart freshly added with timeout 5.
+        ss_entries = data["hooks"]["SessionStart"]
+        assert len(ss_entries) == 1
+        assert ss_entries[0]["hooks"][0]["timeout"] == _SESSION_START_TIMEOUT_S
+        assert ss_entries[0]["hooks"][0]["command"] == "cc-telegram hook"
+        # PreToolUse NOT duplicated, original entry preserved.
         pre_entries = _pre_tool_use_entries(data)
         assert len(pre_entries) == 1
         assert pre_entries[0]["matcher"] == "AskUserQuestion"
