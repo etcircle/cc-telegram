@@ -2369,6 +2369,13 @@ class TestQuestionsContentDigest:
         assert len(d) == 12
         assert all(c in "0123456789abcdef" for c in d)
 
+    def test_digest_golden_fixture(self):
+        # Pin encoding stability: an exact known digest for a fixed input.
+        # If this changes, every persisted side file from prior versions
+        # has a stale fingerprint — important to know before merging.
+        pairs = (("Pick a fruit", ("Apple", "Banana")),)
+        assert questions_content_digest(pairs) == "148a9ef06267"
+
     def test_digest_changes_when_label_renamed(self):
         d1 = questions_content_digest((("Q", ("A", "B")),))
         d2 = questions_content_digest((("Q", ("A", "B-renamed")),))
@@ -2456,6 +2463,20 @@ class TestQuestionsContentPairsFromToolInput:
         bad = {"questions": [{"question": "Q", "options": "nope"}]}
         assert questions_content_pairs_from_tool_input(bad) is None
 
+    def test_none_when_question_missing_question_key(self):
+        # Codex P2 round 1: missing required key must NOT silently become
+        # an empty string — caller expects None.
+        bad = {"questions": [{"options": [{"label": "A"}]}]}
+        assert questions_content_pairs_from_tool_input(bad) is None
+
+    def test_none_when_question_missing_options_key(self):
+        bad = {"questions": [{"question": "Q"}]}
+        assert questions_content_pairs_from_tool_input(bad) is None
+
+    def test_none_when_option_missing_label_key(self):
+        bad = {"questions": [{"question": "Q", "options": [{"description": "d"}]}]}
+        assert questions_content_pairs_from_tool_input(bad) is None
+
 
 class TestQuestionsContentPairsFromForm:
     """The reader side — extract pairs from a parsed AskUserQuestionForm.
@@ -2530,6 +2551,50 @@ class TestDigestSymmetryToolInputVsForm:
     and an equivalent ``AskUserQuestionForm`` parsed from the same TUI
     rendering produce identical digests when the full form is visible.
     """
+
+    def test_multi_question_digest_matches_via_build_form(self):
+        """Strict symmetry via ``build_form_from_tool_input`` — the form has
+        ``form.questions`` populated (multi-question matrix from JSONL), so
+        the read-side pair extractor walks that and the digest must equal
+        the write-side digest byte-for-byte. No early-exit fallback.
+
+        Codex P2 round 1 ask: the single-question symmetry test allows a
+        title-skip fallback; this test pins the strict byte-for-byte case.
+        """
+        from cctelegram.terminal_parser import build_form_from_tool_input
+
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q1: choose a fruit",
+                    "header": "Fruit",
+                    "multiSelect": False,
+                    "options": [
+                        {"label": "Apple", "description": "red"},
+                        {"label": "Banana", "description": "yellow"},
+                    ],
+                },
+                {
+                    "question": "Q2: choose a color",
+                    "header": "Color",
+                    "multiSelect": False,
+                    "options": [
+                        {"label": "Red", "description": "warm"},
+                        {"label": "Blue", "description": "cool"},
+                    ],
+                },
+            ]
+        }
+        form = build_form_from_tool_input(tool_input)
+        assert form is not None
+        assert form.questions  # multi-question matrix populated
+        input_pairs = questions_content_pairs_from_tool_input(tool_input)
+        form_pairs = questions_content_pairs_from_form(form)
+        assert input_pairs is not None and form_pairs is not None
+        # Strict byte-for-byte: same payload → same digest, no fallback path.
+        assert questions_content_digest(input_pairs) == questions_content_digest(
+            form_pairs
+        )
 
     def test_single_question_digest_matches_tool_input(self):
         tool_input = {

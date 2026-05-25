@@ -490,6 +490,17 @@ def _questions_digest(questions: tuple["AskQuestion", ...]) -> str:
 #
 # Encoding mirrors ``_questions_digest`` so future readers can compare
 # the two surfaces side-by-side.
+#
+# Separator-collision note (codex P2 round 1): the encoding uses
+# ASCII unit/record/group separators ``\x1f`` / ``\x1e`` / ``\x1d``.
+# JSON string values CAN legally carry these escaped control bytes —
+# i.e. ``("A\x1fB", "C")`` and ``("A", "B\x1fC")`` would produce the
+# same encoded payload. In practice, AskUserQuestion labels round-
+# trip through Claude Code's TUI renderer which strips control bytes,
+# so the collision risk is theoretical, not practical. The digest is
+# a logging/cache identifier (NOT the side-file acceptance criterion;
+# acceptance is the projection predicate in handlers/interactive_ui.py),
+# so even a theoretical collision wouldn't cause wrong-action dispatch.
 def questions_content_digest(
     pairs: tuple[tuple[str, tuple[str, ...]], ...],
 ) -> str:
@@ -508,8 +519,12 @@ def questions_content_pairs_from_tool_input(
     """Extract content pairs from a JSONL/hook AskUserQuestion ``tool_input``.
 
     Shape expected: ``{"questions": [{"question": str, "options":
-    [{"label": str, "description": str?}, ...]}, ...]}``. Returns ``None``
-    on any shape mismatch.
+    [{"label": str, "description": str?}, ...]}, ...]}``. Required keys
+    (``question`` on each question, ``options`` array on each question,
+    ``label`` on each option) must be present AND well-typed; missing
+    keys are treated as shape errors, not silently coerced to empty
+    strings (codex P2 round 1: tightened to match the docstring contract).
+    Returns ``None`` on any shape mismatch.
     """
     if not isinstance(tool_input, dict):
         return None
@@ -520,20 +535,18 @@ def questions_content_pairs_from_tool_input(
     for q in raw_questions:
         if not isinstance(q, dict):
             return None
-        title = q.get("question", "")
-        if not isinstance(title, str):
+        if "question" not in q or not isinstance(q["question"], str):
             return None
-        options = q.get("options", [])
-        if not isinstance(options, list):
+        title = q["question"]
+        if "options" not in q or not isinstance(q["options"], list):
             return None
         labels: list[str] = []
-        for o in options:
+        for o in q["options"]:
             if not isinstance(o, dict):
                 return None
-            label = o.get("label", "")
-            if not isinstance(label, str):
+            if "label" not in o or not isinstance(o["label"], str):
                 return None
-            labels.append(label)
+            labels.append(o["label"])
         pairs.append((title, tuple(labels)))
     return tuple(pairs)
 
