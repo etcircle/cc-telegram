@@ -817,6 +817,12 @@ class SessionMonitor:
         current_windows = set(current_map.keys())
         deleted_windows = old_windows - current_windows
 
+        # Deleted windows: track their session_ids for AUQ side-file
+        # cleanup alongside sessions_to_remove. Codex P2 (chunk 5): even
+        # though the reader can't serve these (no window binding), the
+        # side files carry AUQ tool_input text and shouldn't linger
+        # until the next bot-startup GC.
+        deleted_session_ids: list[str] = []
         for window_id in deleted_windows:
             old_session_id = self._last_session_map[window_id]
             logger.info(
@@ -825,6 +831,7 @@ class SessionMonitor:
                 old_session_id,
             )
             sessions_to_remove.add(old_session_id)
+            deleted_session_ids.append(old_session_id)
 
         # Perform cleanup
         if sessions_to_remove:
@@ -890,6 +897,17 @@ class SessionMonitor:
                 if old_sid:
                     _unlink_pretool_side_file_for_session(old_sid)
                 forget_ask_tool_input(wid)
+
+        # Codex P2 (chunk 5): unlink side files for deleted windows
+        # too. Outside the ``if changed_window_ids`` block because a
+        # cycle with only deletes (no changes) still needs cleanup.
+        if deleted_session_ids:
+            from .handlers.interactive_ui import (
+                _unlink_pretool_side_file_for_session,
+            )
+
+            for sid in deleted_session_ids:
+                _unlink_pretool_side_file_for_session(sid)
 
         # Update last known map
         self._last_session_map = current_map

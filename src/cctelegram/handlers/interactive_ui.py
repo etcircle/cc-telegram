@@ -431,6 +431,17 @@ def gc_stale_pretool_side_files() -> int:
             continue
         if mtime >= cutoff:
             continue
+        # Codex P2 (chunk 5): re-check mtime just before unlink. The
+        # hook may have replaced this side file (atomic temp+rename)
+        # between our initial stat and now; if so, skip — deleting a
+        # fresh file would force fallback to labels-only for the
+        # next AUQ on this session.
+        try:
+            current_mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if current_mtime >= cutoff:
+            continue
         try:
             entry.unlink()
             deleted += 1

@@ -4857,6 +4857,59 @@ class TestPretoolStartupGC:
 
         assert gc_stale_pretool_side_files() == 0
 
+    def test_gc_skips_unlink_when_file_replaced_during_scan(
+        self, _cc_telegram_dir, monkeypatch
+    ):
+        # Codex P2 (chunk 5): GC re-stats mtime right before unlink to
+        # close the TOCTOU window. Simulate the race by patching the
+        # second stat to return a fresh mtime — file must survive.
+        from pathlib import Path as _PPath
+
+        from cctelegram.handlers.interactive_ui import (
+            _PRETOOL_GC_AGE_SECONDS,
+            gc_stale_pretool_side_files,
+        )
+
+        sid = "11111111-1111-1111-1111-111111111111"
+        target = _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        import os as _os
+
+        old_mtime = time.time() - _PRETOOL_GC_AGE_SECONDS - 60
+        _os.utime(target, (old_mtime, old_mtime))
+
+        real_stat = _PPath.stat
+        call_count = {"n": 0}
+
+        def flipping_stat(self, *args, **kwargs):
+            res = real_stat(self, *args, **kwargs)
+            if self.name == f"{sid}.json":
+                call_count["n"] += 1
+                if call_count["n"] >= 2:
+                    # Second stat (re-check) sees a fresh mtime —
+                    # GC must back off and leave the file.
+                    return os.stat_result(
+                        (
+                            res.st_mode,
+                            res.st_ino,
+                            res.st_dev,
+                            res.st_nlink,
+                            res.st_uid,
+                            res.st_gid,
+                            res.st_size,
+                            res.st_atime,
+                            time.time(),  # fresh mtime
+                            res.st_ctime,
+                        )
+                    )
+            return res
+
+        import os
+
+        monkeypatch.setattr(_PPath, "stat", flipping_stat)
+        deleted = gc_stale_pretool_side_files()
+        assert deleted == 0
+        assert target.exists()
+
     def test_ignores_non_uuid_filenames(self, _cc_telegram_dir):
         # An entry that doesn't match <uuid>.json (e.g. a leftover
         # temp file) is left alone, even if older than the cutoff.
