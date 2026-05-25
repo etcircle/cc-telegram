@@ -475,6 +475,96 @@ def _questions_digest(questions: tuple["AskQuestion", ...]) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
+# AUQ PreToolUse hook content-digest surface.
+#
+# Used by the PreToolUse hook (``hook.py``) to write a content-only
+# fingerprint into the AUQ side file, and by the bot's pretool reader
+# (``handlers/interactive_ui.py``) as a logging identifier + a self-
+# integrity check on the file (recomputed digest must match the stored
+# ``input_fingerprint``).
+#
+# NOT the acceptance criterion. Side-file acceptance is the projection-
+# based predicate in ``_record_consistent_with_pane`` (handlers/
+# interactive_ui.py) — it compares projected fields, not hashes, so the
+# title-skip / multi-tab-subset edge cases each have a principled answer.
+#
+# Encoding mirrors ``_questions_digest`` so future readers can compare
+# the two surfaces side-by-side.
+def questions_content_digest(
+    pairs: tuple[tuple[str, tuple[str, ...]], ...],
+) -> str:
+    """Content-only digest over ordered (question_title, option_labels) pairs."""
+    parts: list[str] = []
+    for title, labels in pairs:
+        joined = "\x1f".join(labels)
+        parts.append(f"{title}\x1e{len(labels)}\x1e{joined}")
+    payload = "\x1d".join(parts)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def questions_content_pairs_from_tool_input(
+    tool_input: Any,
+) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
+    """Extract content pairs from a JSONL/hook AskUserQuestion ``tool_input``.
+
+    Shape expected: ``{"questions": [{"question": str, "options":
+    [{"label": str, "description": str?}, ...]}, ...]}``. Returns ``None``
+    on any shape mismatch.
+    """
+    if not isinstance(tool_input, dict):
+        return None
+    raw_questions = tool_input.get("questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        return None
+    pairs: list[tuple[str, tuple[str, ...]]] = []
+    for q in raw_questions:
+        if not isinstance(q, dict):
+            return None
+        title = q.get("question", "")
+        if not isinstance(title, str):
+            return None
+        options = q.get("options", [])
+        if not isinstance(options, list):
+            return None
+        labels: list[str] = []
+        for o in options:
+            if not isinstance(o, dict):
+                return None
+            label = o.get("label", "")
+            if not isinstance(label, str):
+                return None
+            labels.append(label)
+        pairs.append((title, tuple(labels)))
+    return tuple(pairs)
+
+
+def questions_content_pairs_from_form(
+    form: "AskUserQuestionForm",
+) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
+    """Extract content pairs from a parsed ``AskUserQuestionForm``.
+
+    For multi-question forms (``form.questions`` non-empty — set by
+    ``resolve_ask_form`` when JSONL is available), emits one pair per
+    question.
+
+    For single-question forms (the pane-only parse case, which is what
+    the PreToolUse-hook reader sees pre-JSONL), uses
+    ``form.current_question_title`` (or empty string if missing) plus
+    ``form.options[].label``.
+
+    Returns ``None`` when the form carries no visible options at all.
+    """
+    if form.questions:
+        pairs: list[tuple[str, tuple[str, ...]]] = []
+        for q in form.questions:
+            pairs.append((q.title, tuple(o.label for o in q.options)))
+        return tuple(pairs) if pairs else None
+    if not form.options:
+        return None
+    title = form.current_question_title or ""
+    return ((title, tuple(o.label for o in form.options)),)
+
+
 @dataclass(frozen=True)
 class AskUserQuestionForm:
     """Structured snapshot of the AskUserQuestion picker visible in a pane.
