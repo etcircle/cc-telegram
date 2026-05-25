@@ -4243,7 +4243,7 @@ class TestResolvePretoolRecord:
         if ws is None:
             from cctelegram.session import WindowState
 
-            ws = WindowState(window_id=window_id, cwd="/tmp/cwd", session_id=session_id)
+            ws = WindowState(cwd="/tmp/cwd", session_id=session_id)
             session_manager.window_states[window_id] = ws
         else:
             object.__setattr__(ws, "session_id", session_id)
@@ -4345,3 +4345,298 @@ class TestResolvePretoolRecord:
         assert rec is None
         for record in caplog.records:
             assert "ULTRA_SECRET" not in record.getMessage()
+
+
+# ── Gate routing (chunk 4): the R2 P1 fix verification ───────────────────
+
+
+@pytest.fixture
+def _pretool_gate_setup(tmp_path, monkeypatch):
+    """Set up CC_TELEGRAM_DIR + clean caches before each gate test."""
+    from cctelegram.handlers import interactive_ui as iui
+
+    monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+    iui._pretool_ask_records.clear()
+    iui._last_completed_ask_tool_input.clear()
+    iui._last_auq_tool_use_id.clear()
+    iui._auq_context_posted.clear()
+    iui._auq_context_msgs.clear()
+    iui._interactive_msgs.clear()
+    iui._interactive_mode.clear()
+    yield tmp_path
+    iui._pretool_ask_records.clear()
+    iui._last_completed_ask_tool_input.clear()
+    iui._last_auq_tool_use_id.clear()
+    iui._auq_context_posted.clear()
+    iui._auq_context_msgs.clear()
+    iui._interactive_msgs.clear()
+    iui._interactive_mode.clear()
+
+
+def _auq_pane_text(*, title: str, labels: list[str]) -> str:
+    """Render a numbered-options AUQ pane (no box-drawing) that the
+    real parse_ask_user_question accepts."""
+    lines = [title, ""]
+    for i, lab in enumerate(labels, start=1):
+        cursor = "❯" if i == 1 else " "
+        lines.append(f"{cursor} {i}. {lab}")
+    lines.append("")
+    lines.append("Enter to select · ↑/↓ to navigate · Esc to cancel")
+    return "\n".join(lines) + "\n"
+
+
+def _bind_window(window_id: str, session_id: str, cwd: str = "/tmp/cwd") -> None:
+    """Bind window_id → session_id in session_manager (sync API)."""
+    from cctelegram.session import WindowState, session_manager
+
+    ws = session_manager.window_states.get(window_id)
+    if ws is None:
+        ws = WindowState(cwd=cwd, session_id=session_id)
+        session_manager.window_states[window_id] = ws
+    else:
+        object.__setattr__(ws, "session_id", session_id)
+
+
+def _extract_gate_source_tag(caplog) -> str | None:
+    """Pull the ``ctx_source=...`` value from the latest gate-eval log."""
+    for record in reversed(caplog.records):
+        msg = record.getMessage()
+        if "AUQ context gate eval" not in msg:
+            continue
+        marker = "ctx_source="
+        idx = msg.find(marker)
+        if idx == -1:
+            continue
+        rest = msg[idx + len(marker) :]
+        end = rest.find(" ")
+        return rest[:end] if end != -1 else rest
+    return None
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestContextGateRouting:
+    """The R2 P1 fix: when a PreToolUse-hook record is present for a
+    live AUQ that hasn't flushed tool_use to JSONL yet, the gate must
+    route ctx_source to ``dict_via_hook`` — not fall through to form.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gate_routes_dict_via_hook_when_pretool_present_no_tool_use_id(
+        self, mock_bot: AsyncMock, _pretool_gate_setup, caplog
+    ):
+        import logging as _logging
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@h1"
+        session_id = "550e8400-e29b-41d4-a716-446655440000"
+        labels = ["Apple", "Banana", "Cherry"]
+        title = "Pick a fruit"
+        _bind_window(window_id, session_id)
+        _write_pretool_side_file(
+            _pretool_gate_setup,
+            session_id=session_id,
+            questions=[
+                {
+                    "question": title,
+                    "options": [
+                        {"label": lab, "description": f"about {lab}"} for lab in labels
+                    ],
+                }
+            ],
+        )
+
+        pane_text = _auq_pane_text(title=title, labels=labels)
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(iui, "tmux_manager") as mock_tmux,
+            patch.object(iui, "session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.window_states = {
+                window_id: type(
+                    "WS",
+                    (),
+                    {
+                        "window_id": window_id,
+                        "session_id": session_id,
+                        "cwd": "/tmp/cwd",
+                    },
+                )()
+            }
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+
+            with caplog.at_level(
+                _logging.INFO, logger="cctelegram.handlers.interactive_ui"
+            ):
+                # NOTE: _last_auq_tool_use_id is INTENTIONALLY empty —
+                # this is the R2 P1 scenario. Pre-fix, the gate would
+                # have routed to "form" here.
+                await handle_interactive_ui(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+        source_tag = _extract_gate_source_tag(caplog)
+        assert source_tag == "dict_via_hook", (
+            f"expected dict_via_hook, got {source_tag!r}. "
+            f"This is the R2 P1 regression test — failure means the gate "
+            f"is silently falling back to form despite a valid hook record."
+        )
+
+    @pytest.mark.asyncio
+    async def test_gate_routes_to_form_when_no_pretool_record(
+        self, mock_bot: AsyncMock, _pretool_gate_setup, caplog
+    ):
+        # No side file written. Today's default behavior — form-source
+        # fallback. Must still work post-patch (regression check).
+        import logging as _logging
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@h2"
+        session_id = "550e8400-e29b-41d4-a716-446655440000"
+        _bind_window(window_id, session_id)
+        pane_text = _auq_pane_text(title="Q", labels=["A", "B"])
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        with (
+            patch.object(iui, "tmux_manager") as mock_tmux,
+            patch.object(iui, "session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.window_states = {}
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            with caplog.at_level(
+                _logging.INFO, logger="cctelegram.handlers.interactive_ui"
+            ):
+                await handle_interactive_ui(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+        source_tag = _extract_gate_source_tag(caplog)
+        assert source_tag == "form"
+
+    @pytest.mark.asyncio
+    async def test_gate_routes_dict_via_jsonl_when_both_present(
+        self, mock_bot: AsyncMock, _pretool_gate_setup, caplog
+    ):
+        # JSONL cache present + pretool record present → JSONL wins
+        # (it's authoritative and carries the JSONL tool_use_id used by
+        # downstream dedup/upgrade paths).
+        import logging as _logging
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@h3"
+        session_id = "550e8400-e29b-41d4-a716-446655440000"
+        _bind_window(window_id, session_id)
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ]
+        }
+        # Prime BOTH:
+        iui._last_completed_ask_tool_input[window_id] = tool_input
+        iui._last_auq_tool_use_id[window_id] = "toolu_jsonl_id"
+        _write_pretool_side_file(
+            _pretool_gate_setup,
+            session_id=session_id,
+            questions=tool_input["questions"],
+        )
+        pane_text = _auq_pane_text(title="Q", labels=["A", "B"])
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        with (
+            patch.object(iui, "tmux_manager") as mock_tmux,
+            patch.object(iui, "session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.window_states = {}
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            with caplog.at_level(
+                _logging.INFO, logger="cctelegram.handlers.interactive_ui"
+            ):
+                await handle_interactive_ui(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+        source_tag = _extract_gate_source_tag(caplog)
+        assert source_tag == "dict_via_jsonl"
+
+    @pytest.mark.asyncio
+    async def test_gate_dedup_key_uses_pretool_fingerprint_when_no_tool_use_id(
+        self, mock_bot: AsyncMock, _pretool_gate_setup, caplog
+    ):
+        # The dedup key when routed via hook: "pretool:<tool_use_id>" if
+        # the hook payload carried tool_use_id, else "pretool:<fp>".
+        # Verify the fingerprint variant.
+        import logging as _logging
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@h4"
+        session_id = "550e8400-e29b-41d4-a716-446655440000"
+        _bind_window(window_id, session_id)
+        # Write side file with empty tool_use_id so the gate falls back
+        # to fingerprint-based dedup key.
+        _write_pretool_side_file(
+            _pretool_gate_setup,
+            session_id=session_id,
+            tool_use_id="",
+            questions=[
+                {
+                    "question": "Q",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ],
+        )
+        pane_text = _auq_pane_text(title="Q", labels=["A", "B"])
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        with (
+            patch.object(iui, "tmux_manager") as mock_tmux,
+            patch.object(iui, "session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.window_states = {}
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            with caplog.at_level(
+                _logging.INFO, logger="cctelegram.handlers.interactive_ui"
+            ):
+                await handle_interactive_ui(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+        # Find the dedup_key value in the gate-eval log line.
+        for record in reversed(caplog.records):
+            msg = record.getMessage()
+            if "AUQ context gate eval" not in msg:
+                continue
+            assert "dedup_key=pretool:" in msg, (
+                f"expected dedup_key=pretool:<fp>, got log: {msg}"
+            )
+            break
+        else:
+            pytest.fail("Did not find AUQ context gate eval log line")

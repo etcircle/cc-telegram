@@ -3407,27 +3407,59 @@ async def handle_interactive_ui(
     # this does not stall other routes.
     async with lock:
         if content.name == "AskUserQuestion":
-            # Source-of-truth selection (v5 fix, 2026-05-24): JSONL when
-            # available (richer — full multi-question matrix with
-            # descriptions), pane-derived form otherwise. Claude Code
-            # buffers the AUQ ``tool_use`` line until the user answers,
-            # so live AUQs created after bot start have no JSONL until
-            # then — the form-source path is what makes the context
-            # message actually fire for the common case.
+            # Source-of-truth selection — v4 plan, tri-level:
+            #   1. JSONL via _resolve_ask_tool_input + _last_auq_tool_use_id
+            #      → ctx_source = dict; source_tag = "dict_via_jsonl"
+            #   2. PreToolUse-hook side file via _resolve_pretool_record
+            #      → ctx_source = dict; source_tag = "dict_via_hook";
+            #        dedup_key = "pretool:<tool_use_id>" (or
+            #        "pretool:<input_fingerprint>" when the hook payload
+            #        carried no tool_use_id).
+            #   3. Pane-derived form fallback (today's default for live
+            #      AUQs whose tool_use line has not yet flushed to JSONL)
+            #      → ctx_source = form; source_tag = "form".
+            #
+            # Codex/Hermes R2 P1 fix: the prior gate overwrote ctx_source
+            # with `form` whenever _last_auq_tool_use_id was unset, so the
+            # PreToolUse-hook dict would never have rendered. The new path
+            # routes through dict_via_hook before falling back to form.
             ctx_input = _resolve_ask_tool_input(window_id, tool_input)
-            ctx_source: dict | AskUserQuestionForm | None = ctx_input
             cached_tool_use_id = _last_auq_tool_use_id.get(window_id)
+
+            # Resolve the PreToolUse-hook record only when JSONL is silent
+            # (the common case for live AUQs). _resolve_pretool_record
+            # revalidates the cached record against the live pane on
+            # every call (v4 plan cache invariant).
+            pretool_record: PreToolAskRecord | None = (
+                _resolve_pretool_record(window_id, form) if ctx_input is None else None
+            )
+
+            ctx_source: dict | AskUserQuestionForm | None
+            source_tag: str
             if ctx_input is not None and cached_tool_use_id:
+                ctx_source = ctx_input
                 dedup_key = cached_tool_use_id
+                source_tag = "dict_via_jsonl"
+            elif pretool_record is not None:
+                ctx_source = pretool_record.tool_input
+                dedup_key = (
+                    f"pretool:{pretool_record.tool_use_id}"
+                    if pretool_record.tool_use_id
+                    else f"pretool:{pretool_record.input_fingerprint}"
+                )
+                source_tag = "dict_via_hook"
             elif form is not None:
                 ctx_source = form
                 dedup_key = f"form:{form.fingerprint()}"
+                source_tag = "form"
             else:
+                ctx_source = None
                 dedup_key = ""
+                source_tag = "none"
             logger.info(
                 "AUQ context gate eval: window=%s from_poller=%s "
                 "explicit_input=%s cached_input=%s tool_use_id=%s "
-                "ctx_source=%s dedup_key=%s should_post=%s "
+                "pretool=%s ctx_source=%s dedup_key=%s should_post=%s "
                 "already_posted=%s",
                 window_id,
                 from_poller,
@@ -3435,10 +3467,11 @@ async def handle_interactive_ui(
                 _last_completed_ask_tool_input.get(window_id) is not None,
                 cached_tool_use_id,
                 (
-                    "dict"
-                    if isinstance(ctx_source, dict)
-                    else ("form" if ctx_source is not None else "none")
+                    pretool_record.input_fingerprint
+                    if pretool_record is not None
+                    else "<none>"
                 ),
+                source_tag,
                 dedup_key or "<empty>",
                 _should_post_auq_context(ctx_source),
                 _auq_context_posted.get(window_id) is not None,
