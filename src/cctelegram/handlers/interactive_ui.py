@@ -1447,9 +1447,12 @@ def _prune_expired_pick_tokens(now: float | None = None) -> None:
 def _mint_pick_token(entry: _PickTokenEntry) -> str:
     """Register a token for an option button. Returns the token id.
 
-    Token is 12 hex chars from ``secrets.token_hex(6)``. The full callback
-    payload is ``aqp:<token>`` → 17 chars total, well under Telegram's
-    64-byte cap.
+    Token is 12 hex chars from ``secrets.token_hex(6)``. Since Wave 3,
+    the full callback payload is the keyed shape
+    ``aqp:<route_hash>:<fp8>:<opt>:<token>`` (~33-34 bytes; well under
+    Telegram's 64-byte cap). The ``aqp:<token>`` legacy shape (17 bytes)
+    is still parsed by the callback handler for one TTL window after
+    deploy so pre-Wave-3 rendered buttons keep working.
     """
     _prune_expired_pick_tokens()
     # 6 bytes = 12 hex chars. Collision space ~2^48; with at most a few
@@ -2757,6 +2760,17 @@ def _build_pick_button_rows(
         ]
         _pick_token_cache[cache_key] = tokens
 
+    # Wave 3: callback_data now carries (route_hash, fp8, opt, token) so
+    # the restart-safe ledger can reconstruct the stable key without
+    # needing the in-memory _pick_tokens table to survive process
+    # restart. ``fp8`` is an idempotency-key fragment, NOT a security
+    # primitive — authorization comes from the in-memory token + owner
+    # check + live pane revalidation in the callback handler.
+    from . import auq_ledger
+
+    route_hash = auq_ledger.make_route_hash(user_id, thread_id, window_id)
+    fp8 = fingerprint[:8]
+
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     # Telegram tolerates more than 5 buttons per row, but on a phone the
@@ -2778,7 +2792,12 @@ def _build_pick_button_rows(
         )
         star = " ★" if opt.recommended else ""
         text = f"{prefix}{truncated}{star}"
-        row.append(InlineKeyboardButton(text, callback_data=f"{CB_ASK_PICK}{token}"))
+        callback_payload = f"{CB_ASK_PICK}{route_hash}:{fp8}:{opt.number}:{token}"
+        row.append(
+            InlineKeyboardButton(
+                text, callback_data=checked_callback_data(callback_payload)
+            )
+        )
         if len(row) >= width:
             rows.append(row)
             row = []

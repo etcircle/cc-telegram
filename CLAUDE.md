@@ -42,6 +42,7 @@ cc-telegram hook --install            # Auto-install Claude Code SessionStart ho
   - `monitor_state.json` (JSONL byte offsets per tracked session)
   - `interactive_state.json` (persisted picker msg ids + AUQ context markers; survives `launchctl kickstart`)
   - `auq_pending/<session_id>.json` (`PreToolUse` side files; one per active AUQ; mode `0600` under directory mode `0700`; auto-GC'd on startup + on pick)
+  - `auq_action_ledger.jsonl` (Wave 3 append-only write-ahead ledger of AUQ option-pick lifecycle states keyed by `(route_hash, fp8, opt)`; mode `0600`; latest line per key wins; the callback handler reads it BEFORE the in-memory `_pick_tokens` table so a duplicate tap after `launchctl kickstart` answers "Action already received" instead of re-dispatching the digit to tmux)
   - `message_refs.db` (SQLite provenance index; path overridable via `CC_TELEGRAM_MESSAGE_REFS_DB_PATH`)
   - `log-archive/` (gzipped log rotations; only if the rotation LaunchAgent is installed)
 

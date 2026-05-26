@@ -90,18 +90,33 @@ Handler modules (handlers/):
   directory_browser.py─ Directory selection + session picker UI for new topics
   cleanup.py          ─ Topic state cleanup on close/delete
   callback_data.py    ─ Callback data constants
+  auq_ledger.py       ─ Wave 3 restart-safe write-ahead ledger for AUQ
+                        option-pick dispatches. JSONL at auq_action_ledger.jsonl
+                        keyed by (route_hash, fp8, opt). State machine:
+                        accepted → digit_sent → dispatched (or
+                        failed_before/after_digit terminals). ``lookup()``
+                        returns raw rows; the **callback handler**
+                        projects pre-restart accepted/digit_sent rows to
+                        ``unknown`` (via ``process_start_time()``) so it
+                        refreshes the card instead of re-dispatching.
 
 State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
-  state.json             ─ thread bindings + window states + display names + read offsets
-  session_map.json       ─ hook-generated window_id→session mapping (SessionStart)
-  monitor_state.json     ─ poll progress (byte offset) per JSONL file
-  interactive_state.json ─ persisted picker msg ids + AUQ context markers
-                           (survives launchctl kickstart)
-  auq_pending/<sid>.json ─ PreToolUse side files for AskUserQuestion;
-                           captures tool_input before Claude renders picker;
-                           dir mode 0700, files mode 0600; auto-GC'd
-  message_refs.db        ─ SQLite provenance index for reply-context resolution
-  log-archive/           ─ gzipped rotations (only if rotation LaunchAgent installed)
+  state.json               ─ thread bindings + window states + display names + read offsets
+  session_map.json         ─ hook-generated window_id→session mapping (SessionStart)
+  monitor_state.json       ─ poll progress (byte offset) per JSONL file
+  interactive_state.json   ─ persisted picker msg ids + AUQ context markers
+                             (survives launchctl kickstart)
+  auq_pending/<sid>.json   ─ PreToolUse side files for AskUserQuestion;
+                             captures tool_input before Claude renders picker;
+                             dir mode 0700, files mode 0600; auto-GC'd
+  auq_action_ledger.jsonl  ─ Wave 3 append-only ledger of AUQ option-pick
+                             lifecycle transitions (mode 0600). The callback
+                             handler consults this BEFORE the in-memory token
+                             table so a duplicate tap after process restart
+                             returns "Action already received" instead of
+                             re-dispatching the digit to tmux.
+  message_refs.db          ─ SQLite provenance index for reply-context resolution
+  log-archive/             ─ gzipped rotations (only if rotation LaunchAgent installed)
 ```
 
 ## Key Design Decisions
@@ -117,3 +132,4 @@ State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
 - Notifications delivered to users via thread bindings (topic → window_id → session).
 - **Startup re-resolution** — Window IDs reset on tmux server restart. On startup, `resolve_stale_ids()` matches persisted display names against live windows to re-map IDs. Old state.json files keyed by window name are auto-migrated.
 - **RouteRuntime concurrency contract (Wave B, behind `CC_TELEGRAM_ROUTE_RUNTIME_V2`)** — `route_runtime` exposes a single per-route state machine via `ingest_transcript_event(route, event)`, `mark_*(route)`, and `snapshot(route)`. Per-route `asyncio.Lock` serialises mutations within a route; independent routes do not serialise. Observers fan out **after** lock release, against the committed `RouteRuntimeSnapshot` (frozen, monotonic-seq-tagged). Pane snapshots (`mark_pane_idle`) are reconciliation events with lower authority than transcript lifecycle: they preserve `WAITING_ON_USER` and `BROKEN_TOPIC`, only clear `RUNNING` / `RUNNING_TOOL`. No new `register_*_callback` fan-out — that pattern (which produced bug c313657) is precisely what `RouteRuntime` replaces.
+- **Restart-safe AUQ pick dispatch (Wave 3)** — option-pick callback_data carries a stable `(route_hash, fp8, opt)` triplet in addition to the opaque token: `aqp:<route_hash>:<fp8>:<opt>:<token>`. The triplet is the key into `auq_action_ledger.jsonl` (append-only JSONL ledger). The callback handler consults the ledger BEFORE the in-memory `_pick_tokens` table, so a duplicate tap after `launchctl kickstart` answers "Action already received" instead of dispatching the digit to tmux twice. Authorization remains the in-memory token + owner check — the ledger is for *idempotency*, not authentication. v4 §7.2 contract: owner-mismatch lookups peek the live token map and fall through to the token path only when the clicker holds a live token reconstructing the same key (legitimate collision); otherwise return `WRONG_USER_PICK_TEXT`. Legacy `aqp:<token>` callbacks (rendered before deploy) still round-trip via the token-only path for one TTL window without ledger interaction.

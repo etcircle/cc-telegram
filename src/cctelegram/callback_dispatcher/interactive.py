@@ -15,7 +15,7 @@ from typing import Any
 
 import asyncio
 import logging
-from cctelegram.handlers import interactive_ui
+from cctelegram.handlers import auq_ledger, interactive_ui
 from cctelegram.handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -51,6 +51,54 @@ from . import (
 logger = logging.getLogger(__name__)
 resolve_ask_tool_input = interactive_ui.resolve_ask_tool_input
 _ask_tool_input_digest = interactive_ui._ask_tool_input_digest
+
+
+def _stable_key_of(entry: interactive_ui._PickTokenEntry) -> str:
+    """Reconstruct the Wave 3 ledger key from a live pick-token entry.
+
+    Used by the collision-defense branch in the pick callback to decide
+    whether a live token for the clicker maps to the same ledger key the
+    callback_data carries. Mirrors the mint-side construction in
+    ``interactive_ui._build_pick_button_rows``.
+    """
+    return auq_ledger.make_ledger_key(
+        auq_ledger.make_route_hash(entry.user_id, entry.thread_id, entry.window_id),
+        entry.fingerprint[:8],
+        entry.option_number,
+    )
+
+
+async def _refresh_pick_card(
+    query: Any,
+    context: Any,
+    update: Any,
+    user: Any,
+    tmux_manager: Any,
+    adapters: Any,
+    *,
+    text: str,
+    fallback_window_id: str | None = None,
+) -> None:
+    """Answer the callback with ``text`` and re-render the live picker card.
+
+    Used by every short-circuit branch in the pick handler (legacy/new
+    expired token, malformed callback_data, ledger projection that wants
+    the user to retry). Resolves the route's current window via
+    ``get_interactive_window``; falls back to ``fallback_window_id`` when
+    the ledger row pointed at a window that's no longer bound.
+    """
+    await safe_answer(query, text, show_alert=False)
+    thread_id = _get_thread_id(update)
+    window_id = get_interactive_window(user.id, thread_id) or fallback_window_id or ""
+    if window_id:
+        await handle_interactive_ui(
+            context.bot,
+            user.id,
+            window_id,
+            thread_id,
+            tmux_mgr=tmux_manager,
+            session_mgr=adapters.session_manager,
+        )
 
 
 async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
@@ -286,9 +334,150 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         await safe_answer(query, "🔄")
 
-    # Interactive UI: structured option pick (PR 2b)
+    # Interactive UI: structured option pick (PR 2b + Wave 3 ledger)
     elif data.startswith(CB_ASK_PICK):
-        token = data[len(CB_ASK_PICK) :]
+        payload = data[len(CB_ASK_PICK) :]
+        parts = payload.split(":")
+        # Parse shape:
+        #   len == 1 → legacy ``aqp:<token>`` (rendered pre-Wave-3; still
+        #              valid for up to the 5-minute pick-token TTL after deploy).
+        #   len == 4 → new keyed ``aqp:<route_hash>:<fp8>:<opt>:<token>``;
+        #              the leading triplet feeds the restart-safe ledger.
+        #   anything else → malformed → refresh card.
+        ledger_key: str | None = None
+        token: str
+        if len(parts) == 1:
+            token = parts[0]
+        elif len(parts) == 4:
+            route_hash, fp8, opt_str, token = parts
+            try:
+                opt_num = int(opt_str)
+            except ValueError:
+                await _refresh_pick_card(
+                    query,
+                    context,
+                    update,
+                    user,
+                    tmux_manager,
+                    adapters,
+                    text="Card expired, refreshing.",
+                )
+                return
+            ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, opt_num)
+        else:
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="Card expired, refreshing.",
+            )
+            return
+
+        # Ledger lookup FIRST (restart recovery). Wave 3 §7.2 contract:
+        # ledger consulted BEFORE token validate so a post-restart duplicate
+        # tap can be detected even when the in-memory _pick_tokens cache
+        # has been wiped.
+        existing = auq_ledger.lookup(ledger_key)
+
+        # v4 §7.2 owner-mismatch handling. Could be (a) wrong-user replay
+        # (owner already dispatched; another user in the topic clicks the
+        # same callback_data); or (b) legitimate live-token collision (two
+        # routes hashed to the same triplet AND the clicker owns a live
+        # pick token for the same stable key). Distinguish by peeking the
+        # current user's live token: if it reconstructs the same key, this
+        # is collision → clear ledger gate for this click, fall through to
+        # the in-process token path. Otherwise wrong-user → reject.
+        if existing is not None and existing.user_id != user.id:
+            live = peek_pick_token(token)
+            is_collision = (
+                live is not None
+                and live.user_id == user.id
+                and ledger_key is not None
+                and _stable_key_of(live) == ledger_key
+            )
+            if not is_collision:
+                await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+                return
+            # Plan v4 §7.2: "ledger entry from the other route stays put
+            # (its owner can still see 'Action already received' on
+            # retry)." Drop both the local gate AND the ledger_key so the
+            # follow-up dispatch writes go to nothing — otherwise the
+            # accepted/digit_sent/dispatched writes below would overwrite
+            # the owner's row at the same key.
+            existing = None
+            ledger_key = None
+
+        # Same-user defensive collision check: the route_hash matches but
+        # the stored window_id differs from this route's current binding.
+        # The hashes can collide across (user, thread, window) triplets;
+        # if the bound window has drifted, treat the ledger row as a
+        # collision, fall through to the token path, and likewise drop
+        # ledger_key so this dispatch doesn't clobber a row that legitimately
+        # belongs to a different window's lifecycle.
+        if existing is not None:
+            bound_window = get_interactive_window(user.id, _get_thread_id(update))
+            if bound_window and existing.window_id != bound_window:
+                existing = None
+                ledger_key = None
+
+        # Apply the §7.1 per-state behavior matrix.
+        if existing is not None:
+            proj_state = existing.state
+            if (
+                existing.state in ("accepted", "digit_sent")
+                and existing.accepted_at < auq_ledger.process_start_time()
+            ):
+                proj_state = "unknown"
+            if proj_state == "dispatched":
+                await safe_answer(
+                    query,
+                    f"Action already received: {existing.option_label[:32]}",
+                    show_alert=False,
+                )
+                return
+            if proj_state in ("accepted", "digit_sent"):
+                await safe_answer(query, "Action in progress", show_alert=False)
+                return
+            if proj_state == "unknown":
+                await _refresh_pick_card(
+                    query,
+                    context,
+                    update,
+                    user,
+                    tmux_manager,
+                    adapters,
+                    text="Action interrupted; please re-tap.",
+                    fallback_window_id=existing.window_id,
+                )
+                return
+            if proj_state == "failed_before_digit":
+                await _refresh_pick_card(
+                    query,
+                    context,
+                    update,
+                    user,
+                    tmux_manager,
+                    adapters,
+                    text="Action failed previously; refreshing.",
+                    fallback_window_id=existing.window_id,
+                )
+                return
+            if proj_state == "failed_after_digit":
+                await _refresh_pick_card(
+                    query,
+                    context,
+                    update,
+                    user,
+                    tmux_manager,
+                    adapters,
+                    text=("Action sent but interrupted; refreshing — verify in tmux."),
+                    fallback_window_id=existing.window_id,
+                )
+                return
+
         # CB3: peek BEFORE consume. The old consume_pick_token-only flow
         # destroyed the token + its sibling cache row even on user-id
         # mismatch, letting a wrong user click another user's button and
@@ -299,18 +488,15 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             # Token never existed, was already used, or has aged past the
             # 5-minute TTL. Refresh the card so the user sees the live form
             # state and can click a fresh button.
-            await safe_answer(query, "Card expired, refreshing.", show_alert=False)
-            thread_id = _get_thread_id(update)
-            window_id = get_interactive_window(user.id, thread_id) or ""
-            if window_id:
-                await handle_interactive_ui(
-                    context.bot,
-                    user.id,
-                    window_id,
-                    thread_id,
-                    tmux_mgr=tmux_manager,
-                    session_mgr=adapters.session_manager,
-                )
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="Card expired, refreshing.",
+            )
             return
         thread_id = entry.thread_id
         window_id = entry.window_id
@@ -337,9 +523,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         #
         # PR 2: use ``resolve_ask_form`` with the same cached JSONL payload
         # the render path saw (via ``resolve_ask_tool_input``). Without
-        # this, a multi-tab form rendered with the JSONL overlay would
-        # mint fingerprints the pane-only re-parse here could never match,
-        # bouncing every click to "Form changed, refreshing".
+        # this, a multi-question form rendered with the JSONL overlay
+        # would mint fingerprints the pane-only re-parse here could never
+        # match, bouncing every click to "Form changed, refreshing".
         # Capture with the SAME scrollback as the render path
         # (handlers/interactive_ui.py uses scrollback_lines=500). A
         # smaller scrollback here produces a different pane slice from
@@ -411,6 +597,21 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 )
                 return
 
+        # Write-ahead ledger BEFORE dispatch. Legacy callbacks (ledger_key
+        # is None) skip the ledger entirely — they retain pre-Wave-3
+        # behavior for the duration of the rolling 5-minute TTL window
+        # after deploy.
+        if ledger_key is not None:
+            auq_ledger.record(
+                ledger_key,
+                state="accepted",
+                user_id=user.id,
+                window_id=window_id,
+                full_fingerprint=entry.fingerprint,
+                option_number=entry.option_number,
+                option_label=entry.option_label,
+            )
+
         # Dispatch: send the literal digit. Claude Code's AskUserQuestion
         # picker accepts ``1``-``9`` as shortcuts; the digit moves the
         # cursor to that option and Enter submits. We send digit + Enter
@@ -418,11 +619,94 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # time to register the selection before the Enter key arrives.
         # 500ms matches the gap tmux_manager uses internally for the
         # literal-text-then-Enter path — boring beats flaky.
-        await tmux_manager.send_keys(
-            w.window_id, str(entry.option_number), enter=False, literal=True
-        )
-        await asyncio.sleep(0.5)
-        await tmux_manager.send_keys(w.window_id, "Enter", enter=False, literal=False)
+        #
+        # ``tmux_manager.send_keys`` returns ``False`` (does not raise) on
+        # missing session/window/pane or libtmux exceptions. Codex Wave 3
+        # P1: a silent False return used to fall through to
+        # ``auq_ledger.record(state="dispatched")``, which then made every
+        # subsequent retry tap answer "Action already received" even
+        # though tmux had never received the digit. Check both returns.
+        digit_landed = False
+        try:
+            digit_ok = await tmux_manager.send_keys(
+                w.window_id, str(entry.option_number), enter=False, literal=True
+            )
+            if not digit_ok:
+                if ledger_key is not None:
+                    auq_ledger.record(
+                        ledger_key,
+                        state="failed_before_digit",
+                        failed_reason="tmux send_keys(digit) returned False",
+                    )
+                logger.warning(
+                    "Pick-token dispatch: tmux send_keys(digit=%d) "
+                    "returned False for window=%s user=%d",
+                    entry.option_number,
+                    window_id,
+                    user.id,
+                )
+                await safe_answer(
+                    query, "Action failed; refreshing card.", show_alert=False
+                )
+                await handle_interactive_ui(
+                    context.bot,
+                    user.id,
+                    window_id,
+                    thread_id,
+                    tmux_mgr=tmux_manager,
+                    session_mgr=adapters.session_manager,
+                )
+                return
+            digit_landed = True
+            if ledger_key is not None:
+                auq_ledger.record(ledger_key, state="digit_sent")
+            await asyncio.sleep(0.5)
+            enter_ok = await tmux_manager.send_keys(
+                w.window_id, "Enter", enter=False, literal=False
+            )
+            if not enter_ok:
+                if ledger_key is not None:
+                    auq_ledger.record(
+                        ledger_key,
+                        state="failed_after_digit",
+                        failed_reason="tmux send_keys(Enter) returned False",
+                    )
+                logger.warning(
+                    "Pick-token dispatch: digit landed but tmux "
+                    "send_keys(Enter) returned False for window=%s user=%d",
+                    window_id,
+                    user.id,
+                )
+                await safe_answer(
+                    query,
+                    "Action sent but Enter failed; refreshing — verify in tmux.",
+                    show_alert=False,
+                )
+                await handle_interactive_ui(
+                    context.bot,
+                    user.id,
+                    window_id,
+                    thread_id,
+                    tmux_mgr=tmux_manager,
+                    session_mgr=adapters.session_manager,
+                )
+                return
+            if ledger_key is not None:
+                auq_ledger.record(ledger_key, state="dispatched")
+        except Exception as exc:
+            if ledger_key is not None:
+                auq_ledger.record(
+                    ledger_key,
+                    state=(
+                        "failed_after_digit" if digit_landed else "failed_before_digit"
+                    ),
+                    failed_reason=str(exc),
+                )
+            await safe_answer(
+                query, "Action failed; refreshing card.", show_alert=False
+            )
+            raise
+
         await safe_answer(query, f"{entry.option_number}. {entry.option_label[:32]}")
         await asyncio.sleep(0.5)
         # PR 3: snapshot the JSONL cache digest BEFORE re-rendering. If a
