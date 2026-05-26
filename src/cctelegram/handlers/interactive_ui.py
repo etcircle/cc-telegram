@@ -1447,9 +1447,12 @@ def _prune_expired_pick_tokens(now: float | None = None) -> None:
 def _mint_pick_token(entry: _PickTokenEntry) -> str:
     """Register a token for an option button. Returns the token id.
 
-    Token is 12 hex chars from ``secrets.token_hex(6)``. The full callback
-    payload is ``aqp:<token>`` → 17 chars total, well under Telegram's
-    64-byte cap.
+    Token is 12 hex chars from ``secrets.token_hex(6)``. Since Wave 3,
+    the full callback payload is the keyed shape
+    ``aqp:<route_hash>:<fp8>:<opt>:<token>`` (~33-34 bytes; well under
+    Telegram's 64-byte cap). The ``aqp:<token>`` legacy shape (17 bytes)
+    is still parsed by the callback handler for one TTL window after
+    deploy so pre-Wave-3 rendered buttons keep working.
     """
     _prune_expired_pick_tokens()
     # 6 bytes = 12 hex chars. Collision space ~2^48; with at most a few
