@@ -1377,7 +1377,9 @@ class TestBuildPickButtonRows:
         # Consume Cancel first — consuming a token now wipes its whole form
         # generation (sibling invalidation, see TestPickTokenReuse), so we
         # can't pop Submit then Cancel from the same render.
-        cancel_token = rows[0][1].callback_data[len("aqp:") :]
+        # Wave 3 callback_data shape: aqp:<route_hash>:<fp8>:<opt>:<token>;
+        # the token is always the last colon-separated component.
+        cancel_token = rows[0][1].callback_data.split(":")[-1]
         cancel_entry = consume_pick_token(cancel_token)
         assert cancel_entry is not None
         assert cancel_entry.is_review_submit is False
@@ -1385,7 +1387,7 @@ class TestBuildPickButtonRows:
         rows2 = _build_pick_button_rows(
             user_id=42, thread_id=7, window_id="@9", form=form
         )
-        submit_token = rows2[0][0].callback_data[len("aqp:") :]
+        submit_token = rows2[0][0].callback_data.split(":")[-1]
         submit_entry = consume_pick_token(submit_token)
         assert submit_entry is not None
         assert submit_entry.is_review_submit is True
@@ -1436,7 +1438,9 @@ class TestBuildPickButtonRows:
         rows = _build_pick_button_rows(
             user_id=42, thread_id=7, window_id="@9", form=form
         )
-        token = rows[0][0].callback_data[len("aqp:") :]
+        # Wave 3 callback_data shape: aqp:<route_hash>:<fp8>:<opt>:<token>;
+        # the token is the last colon-separated component.
+        token = rows[0][0].callback_data.split(":")[-1]
         entry = consume_pick_token(token)
         assert entry is not None
         # Everything the callback handler needs is on the entry.
@@ -1550,8 +1554,10 @@ class TestPickTokenReuse:
         rows = _build_pick_button_rows(
             user_id=42, thread_id=7, window_id="@1", form=form
         )
-        first_token = rows[0][0].callback_data[len("aqp:") :]
-        second_token = rows[0][1].callback_data[len("aqp:") :]
+        # Wave 3 callback_data shape: aqp:<route_hash>:<fp8>:<opt>:<token>;
+        # the token is the last colon-separated component.
+        first_token = rows[0][0].callback_data.split(":")[-1]
+        second_token = rows[0][1].callback_data.split(":")[-1]
         # Click the first button — the cache row for this fingerprint dies,
         # AND every sibling token in that row dies too (the form is about to
         # advance, so a stale sibling click is a bug to prevent).
@@ -1559,12 +1565,13 @@ class TestPickTokenReuse:
         assert consumed is not None
         # Sibling token no longer resolves.
         assert consume_pick_token(second_token) is None
-        # Next render against the same fingerprint mints fresh tokens.
+        # Next render against the same fingerprint mints fresh tokens — the
+        # whole callback_data changes (route_hash + fp8 + opt are stable but
+        # the token component is freshly minted).
         rows2 = _build_pick_button_rows(
             user_id=42, thread_id=7, window_id="@1", form=form
         )
-        new_token = rows2[0][0].callback_data
-        assert new_token != f"aqp:{first_token}"
+        assert rows2[0][0].callback_data != rows[0][0].callback_data
 
 
 @pytest.mark.usefixtures("_clear_pick_tokens")

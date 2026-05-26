@@ -102,6 +102,7 @@ Under `$CC_TELEGRAM_DIR` (default `~/.cc-telegram/`):
 - `monitor_state.json` — JSONL byte offsets per tracked session (incremental-read progress).
 - `interactive_state.json` — persisted picker message ids + AUQ context markers (survives bot restart so a `launchctl kickstart` doesn't lose interactive state).
 - `auq_pending/<session_id>.json` — `PreToolUse` side files (one per active AUQ; auto-cleaned after pick; mode `0600` under directory mode `0700`).
+- `auq_action_ledger.jsonl` — restart-safe write-ahead ledger for AUQ option-pick dispatches (mode `0600`; append-only JSONL; latest line per `(route_hash, fp8, opt)` key wins; the callback handler consults this to detect duplicate taps after a process restart so Claude doesn't receive the same digit twice).
 - `message_refs.db` — SQLite provenance index for safer reply-context resolution (path overridable via `CC_TELEGRAM_MESSAGE_REFS_DB_PATH`).
 - `log-archive/` — gzipped log rotations (only present if the rotation LaunchAgent is installed; see "Log rotation").
 

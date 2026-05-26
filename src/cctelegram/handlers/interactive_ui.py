@@ -2757,6 +2757,17 @@ def _build_pick_button_rows(
         ]
         _pick_token_cache[cache_key] = tokens
 
+    # Wave 3: callback_data now carries (route_hash, fp8, opt, token) so
+    # the restart-safe ledger can reconstruct the stable key without
+    # needing the in-memory _pick_tokens table to survive process
+    # restart. ``fp8`` is an idempotency-key fragment, NOT a security
+    # primitive — authorization comes from the in-memory token + owner
+    # check + live pane revalidation in the callback handler.
+    from . import auq_ledger
+
+    route_hash = auq_ledger.make_route_hash(user_id, thread_id, window_id)
+    fp8 = fingerprint[:8]
+
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     # Telegram tolerates more than 5 buttons per row, but on a phone the
@@ -2778,7 +2789,12 @@ def _build_pick_button_rows(
         )
         star = " ★" if opt.recommended else ""
         text = f"{prefix}{truncated}{star}"
-        row.append(InlineKeyboardButton(text, callback_data=f"{CB_ASK_PICK}{token}"))
+        callback_payload = f"{CB_ASK_PICK}{route_hash}:{fp8}:{opt.number}:{token}"
+        row.append(
+            InlineKeyboardButton(
+                text, callback_data=checked_callback_data(callback_payload)
+            )
+        )
         if len(row) >= width:
             rows.append(row)
             row = []
