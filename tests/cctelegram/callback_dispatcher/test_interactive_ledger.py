@@ -69,7 +69,10 @@ class FakeTmuxManager:
         self.find_window_by_id = AsyncMock(
             return_value=SimpleNamespace(window_id=_WINDOW_ID)
         )
-        self.send_keys = AsyncMock()
+        # Production send_keys returns True/False; default success here so
+        # the handler's Wave 3 return-value check doesn't short-circuit
+        # tests that exercise the dispatch path.
+        self.send_keys = AsyncMock(return_value=True)
         self.capture_pane = AsyncMock(return_value="pane")
 
 
@@ -331,63 +334,94 @@ class TestOwnerSecurity:
             assert _LABEL not in (text or "")
 
     @pytest.mark.asyncio
-    async def test_legitimate_live_token_collision_falls_through(
+    async def test_owner_mismatch_without_collision_returns_wrong_user(
+        self,
+    ) -> None:
+        """Realistic wrong-user replay (no key collision): owner's ledger
+        row is ``dispatched``; the intruder taps the same callback_data;
+        intruder's live token (if any) hashes to a DIFFERENT ledger key
+        because route_hash depends on user_id. ``is_collision`` evaluates
+        to False → handler returns WRONG_USER_PICK_TEXT, no label leak.
+
+        Documents the safe outcome when sha1 over
+        ``user_id:thread_id:window_id`` does NOT collide — the everyday
+        case.
+        """
+        route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, _WINDOW_ID)
+        fp8 = _FINGERPRINT[:8]
+        ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, _OPT)
+        _seed_ledger(ledger_key, "dispatched", user_id=_OWNER_ID)
+        # Intruder mints their own live token; route_hash differs from
+        # owner's because user_id is in the sha1 input.
+        b_callback_data, _ = _build_keyed_callback(user_id=_INTRUDER_ID)
+        b_token = b_callback_data.split(":")[-1]
+        forced_callback_data = f"{CB_ASK_PICK}{route_hash}:{fp8}:{_OPT}:{b_token}"
+        query = FakeQuery(forced_callback_data)
+        authorized = authorize_initial(
+            parse(query.data.encode()), _ctx(query, user_id=_INTRUDER_ID)
+        )
+        await execute(authorized, _adapters(FakeSessionManager(), FakeTmuxManager()))
+        assert query.answers == [("This control isn't yours.", True)]
+
+    @pytest.mark.asyncio
+    async def test_legitimate_collision_falls_through_to_token_dispatch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Two independent renders happen to hash to the same ledger key.
-        Owner A's ledger row is in ``dispatched``. User B taps with a live
-        token of B's that reconstructs the same key. The peek branch
-        detects this is a collision → clears the ledger gate and falls
-        through to the in-process token path; B's tap dispatches normally;
-        A's ledger row stays put.
+        """Forced true collision: monkeypatch ``_stable_key_of`` so the
+        clicker's live token reconstructs the owner's ledger key. The
+        handler's ``is_collision=True`` branch should clear the ledger
+        gate and fall through to the in-process token path; the clicker's
+        tap dispatches normally; the owner's ledger row stays intact.
+
+        Codex Wave 3 P2: the prior "collision" test exercised the
+        rejection path (because real sha1 collisions are astronomically
+        unlikely). This test forces the True branch via monkeypatch so
+        the code under ``interactive.py``'s ``existing = None`` clear is
+        actually executed.
         """
+        from cctelegram.callback_dispatcher import interactive as cb_interactive
+
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
         monkeypatch.setattr(
             "cctelegram.handlers.interactive_ui.resolve_ask_tool_input",
             lambda _wid: None,
         )
 
-        # Owner A: seed dispatched ledger row at the shared key.
-        # We synthesize the key by hand so we can prove B's live token
-        # reconstructs the same key independently.
+        # Seed owner's ledger row in ``dispatched``.
         route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, _WINDOW_ID)
         fp8 = _FINGERPRINT[:8]
         ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, _OPT)
         _seed_ledger(ledger_key, "dispatched", user_id=_OWNER_ID)
 
-        # User B mints their own live token that hashes to the same key
-        # (because the test forces matching user/thread/window/fp/opt — the
-        # collision is the path-of-execution, not the test setup).
-        b_callback_data, b_ledger_key = _build_keyed_callback(user_id=_INTRUDER_ID)
-        # Sanity: keys differ because the route_hash depends on user_id,
-        # so this won't actually collide. Force a collision: synthesize a
-        # callback_data that uses owner's key but contains B's live token
-        # value. That is the exact shape a real collision would have.
+        # Intruder mints their own live token (different real route_hash).
+        b_callback_data, _ = _build_keyed_callback(user_id=_INTRUDER_ID)
         b_token = b_callback_data.split(":")[-1]
+        # Intruder's callback data carries the OWNER'S key (collision shape).
         forced_callback_data = f"{CB_ASK_PICK}{route_hash}:{fp8}:{_OPT}:{b_token}"
-        # B's live token still resolves (it's keyed by token id, not
-        # callback_data shape), so peek_pick_token(b_token) hits.
+
+        # Force ``_stable_key_of(live)`` to return the owner's ledger key
+        # so the collision-defense predicate is True. In production this
+        # would require an actual sha1 collision; here we just make the
+        # path executable.
+        monkeypatch.setattr(cb_interactive, "_stable_key_of", lambda _entry: ledger_key)
 
         query = FakeQuery(forced_callback_data)
         authorized = authorize_initial(
             parse(query.data.encode()), _ctx(query, user_id=_INTRUDER_ID)
         )
-        # NOTE: B's pick-token entry has user_id=_INTRUDER_ID and the
-        # stable-key reconstruction at _stable_key_of(live) uses that
-        # entry's own fields. Since B's mint used (user=_INTRUDER_ID,
-        # thread=_THREAD_ID, window=_WINDOW_ID, fp=_FINGERPRINT), the
-        # route_hash there differs from owner's, so the reconstructed
-        # key WON'T match the owner's. The collision branch's
-        # is_collision predicate is False → handler returns
-        # WRONG_USER_PICK_TEXT. That is the correct outcome for this
-        # construction; this test documents that synthetic collision
-        # requires both routes to hash to the same key, which our key
-        # function makes user-bound by design (pre-image resistant).
         await execute(authorized, _adapters(FakeSessionManager(), FakeTmuxManager()))
-        # The synthetic mismatch flows through wrong-user replay. This is
-        # the SAFE outcome: a real collision would require an actual sha1
-        # collision on user_id:thread_id:window_id, which is astronomical.
-        assert query.answers == [("This control isn't yours.", True)]
+
+        # Intruder's tap dispatches normally — answer carries the option
+        # label.
+        assert query.answers == [(f"{_OPT}. {_LABEL}", False)]
+        # Plan v4 §7.2 contract: the owner's ledger row at this key MUST
+        # stay put — the collision branch drops `ledger_key` so the
+        # intruder's accepted/digit_sent/dispatched writes go to nothing.
+        # On the owner's retry, "Action already received" still works.
+        owner_row_after = auq_ledger.lookup(ledger_key)
+        assert owner_row_after is not None
+        assert owner_row_after.user_id == _OWNER_ID
+        assert owner_row_after.state == "dispatched"
 
 
 class TestLegacyAndMalformedCallbacks:
@@ -435,6 +469,23 @@ class TestLegacyAndMalformedCallbacks:
         )
         interactive_ui.set_interactive_mode(_OWNER_ID, _WINDOW_ID, _THREAD_ID)
         query = FakeQuery(f"{CB_ASK_PICK}foo:bar:baz")  # 3 parts, neither shape
+        authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
+        await execute(authorized, _adapters(FakeSessionManager(), FakeTmuxManager()))
+        assert query.answers == [("Card expired, refreshing.", False)]
+
+    @pytest.mark.asyncio
+    async def test_keyed_callback_with_non_int_opt_refreshes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hermes Wave 3 P2: a 4-part keyed callback whose ``opt`` slot
+        isn't a parseable integer must bounce "Card expired, refreshing"
+        — not crash on ``int()`` ValueError.
+        """
+        monkeypatch.setattr(
+            interactive_ui, "handle_interactive_ui", AsyncMock(return_value=True)
+        )
+        interactive_ui.set_interactive_mode(_OWNER_ID, _WINDOW_ID, _THREAD_ID)
+        query = FakeQuery(f"{CB_ASK_PICK}deadbeef:abcdef12:notint:deadbeefcafe")
         authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
         await execute(authorized, _adapters(FakeSessionManager(), FakeTmuxManager()))
         assert query.answers == [("Card expired, refreshing.", False)]
@@ -493,3 +544,71 @@ class TestAcceptedToDispatchedHappyPath:
         assert entry.option_label == _LABEL
         assert entry.digit_sent_at is not None
         assert entry.dispatched_at is not None
+
+
+class TestSendKeysFailureRecordsFailed:
+    """Codex Wave 3 P1: tmux send_keys returns False on missing session /
+    window / pane / libtmux exception. Handler MUST check the return and
+    record failed_before_digit / failed_after_digit instead of writing
+    dispatched. A silent False return used to convert a tmux failure
+    into a permanent "already received" — duplicate tap then locked the
+    user out of the action even though tmux never received the digit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_digit_send_returns_false_records_failed_before_digit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        monkeypatch.setattr(
+            "cctelegram.handlers.interactive_ui.resolve_ask_tool_input",
+            lambda _wid: None,
+        )
+        monkeypatch.setattr(
+            interactive_ui, "handle_interactive_ui", AsyncMock(return_value=True)
+        )
+        callback_data, ledger_key = _build_keyed_callback()
+        tmux = FakeTmuxManager()
+        # Digit send returns False.
+        tmux.send_keys = AsyncMock(return_value=False)
+        query = FakeQuery(callback_data)
+        authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
+        await execute(authorized, _adapters(FakeSessionManager(), tmux))
+        assert query.answers == [("Action failed; refreshing card.", False)]
+        entry = auq_ledger.lookup(ledger_key)
+        assert entry is not None
+        assert entry.state == "failed_before_digit"
+        assert entry.dispatched_at is None
+        # Only one send_keys call (the digit); Enter was never attempted.
+        assert tmux.send_keys.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_enter_send_returns_false_records_failed_after_digit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        monkeypatch.setattr(
+            "cctelegram.handlers.interactive_ui.resolve_ask_tool_input",
+            lambda _wid: None,
+        )
+        monkeypatch.setattr(
+            interactive_ui, "handle_interactive_ui", AsyncMock(return_value=True)
+        )
+        callback_data, ledger_key = _build_keyed_callback()
+        tmux = FakeTmuxManager()
+        # First call (digit) succeeds; second (Enter) fails.
+        tmux.send_keys = AsyncMock(side_effect=[True, False])
+        query = FakeQuery(callback_data)
+        authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
+        await execute(authorized, _adapters(FakeSessionManager(), tmux))
+        assert query.answers == [
+            (
+                "Action sent but Enter failed; refreshing — verify in tmux.",
+                False,
+            )
+        ]
+        entry = auq_ledger.lookup(ledger_key)
+        assert entry is not None
+        assert entry.state == "failed_after_digit"
+        assert entry.digit_sent_at is not None
+        assert entry.dispatched_at is None

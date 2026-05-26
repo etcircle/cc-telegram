@@ -60,7 +60,11 @@ class FakeSessionManager:
 class FakeTmuxManager:
     def __init__(self) -> None:
         self.find_window_by_id = AsyncMock(return_value=SimpleNamespace(window_id="@1"))
-        self.send_keys = AsyncMock()
+        # Production ``send_keys`` returns True on success / False on
+        # session/window/pane/libtmux failures. Default the mock to True
+        # so the Wave 3 callback handler's return-value check doesn't
+        # short-circuit every test that exercises the dispatch path.
+        self.send_keys = AsyncMock(return_value=True)
         self.capture_pane = AsyncMock(return_value="pane")
 
 

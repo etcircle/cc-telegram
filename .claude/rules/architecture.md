@@ -94,10 +94,11 @@ Handler modules (handlers/):
                         option-pick dispatches. JSONL at auq_action_ledger.jsonl
                         keyed by (route_hash, fp8, opt). State machine:
                         accepted → digit_sent → dispatched (or
-                        failed_before/after_digit terminals). Loader projects
-                        pre-restart accepted/digit_sent rows to ``unknown``
-                        so the callback handler refreshes the card instead
-                        of re-dispatching.
+                        failed_before/after_digit terminals). ``lookup()``
+                        returns raw rows; the **callback handler**
+                        projects pre-restart accepted/digit_sent rows to
+                        ``unknown`` (via ``process_start_time()``) so it
+                        refreshes the card instead of re-dispatching.
 
 State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
   state.json               ─ thread bindings + window states + display names + read offsets

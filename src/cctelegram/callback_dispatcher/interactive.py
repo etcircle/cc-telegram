@@ -401,17 +401,27 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             if not is_collision:
                 await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
                 return
+            # Plan v4 §7.2: "ledger entry from the other route stays put
+            # (its owner can still see 'Action already received' on
+            # retry)." Drop both the local gate AND the ledger_key so the
+            # follow-up dispatch writes go to nothing — otherwise the
+            # accepted/digit_sent/dispatched writes below would overwrite
+            # the owner's row at the same key.
             existing = None
+            ledger_key = None
 
         # Same-user defensive collision check: the route_hash matches but
         # the stored window_id differs from this route's current binding.
         # The hashes can collide across (user, thread, window) triplets;
         # if the bound window has drifted, treat the ledger row as a
-        # collision and fall through to the token path.
+        # collision, fall through to the token path, and likewise drop
+        # ledger_key so this dispatch doesn't clobber a row that legitimately
+        # belongs to a different window's lifecycle.
         if existing is not None:
             bound_window = get_interactive_window(user.id, _get_thread_id(update))
             if bound_window and existing.window_id != bound_window:
                 existing = None
+                ledger_key = None
 
         # Apply the §7.1 per-state behavior matrix.
         if existing is not None:
@@ -609,18 +619,78 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # time to register the selection before the Enter key arrives.
         # 500ms matches the gap tmux_manager uses internally for the
         # literal-text-then-Enter path — boring beats flaky.
+        #
+        # ``tmux_manager.send_keys`` returns ``False`` (does not raise) on
+        # missing session/window/pane or libtmux exceptions. Codex Wave 3
+        # P1: a silent False return used to fall through to
+        # ``auq_ledger.record(state="dispatched")``, which then made every
+        # subsequent retry tap answer "Action already received" even
+        # though tmux had never received the digit. Check both returns.
         digit_landed = False
         try:
-            await tmux_manager.send_keys(
+            digit_ok = await tmux_manager.send_keys(
                 w.window_id, str(entry.option_number), enter=False, literal=True
             )
+            if not digit_ok:
+                if ledger_key is not None:
+                    auq_ledger.record(
+                        ledger_key,
+                        state="failed_before_digit",
+                        failed_reason="tmux send_keys(digit) returned False",
+                    )
+                logger.warning(
+                    "Pick-token dispatch: tmux send_keys(digit=%d) "
+                    "returned False for window=%s user=%d",
+                    entry.option_number,
+                    window_id,
+                    user.id,
+                )
+                await safe_answer(
+                    query, "Action failed; refreshing card.", show_alert=False
+                )
+                await handle_interactive_ui(
+                    context.bot,
+                    user.id,
+                    window_id,
+                    thread_id,
+                    tmux_mgr=tmux_manager,
+                    session_mgr=adapters.session_manager,
+                )
+                return
             digit_landed = True
             if ledger_key is not None:
                 auq_ledger.record(ledger_key, state="digit_sent")
             await asyncio.sleep(0.5)
-            await tmux_manager.send_keys(
+            enter_ok = await tmux_manager.send_keys(
                 w.window_id, "Enter", enter=False, literal=False
             )
+            if not enter_ok:
+                if ledger_key is not None:
+                    auq_ledger.record(
+                        ledger_key,
+                        state="failed_after_digit",
+                        failed_reason="tmux send_keys(Enter) returned False",
+                    )
+                logger.warning(
+                    "Pick-token dispatch: digit landed but tmux "
+                    "send_keys(Enter) returned False for window=%s user=%d",
+                    window_id,
+                    user.id,
+                )
+                await safe_answer(
+                    query,
+                    "Action sent but Enter failed; refreshing — verify in tmux.",
+                    show_alert=False,
+                )
+                await handle_interactive_ui(
+                    context.bot,
+                    user.id,
+                    window_id,
+                    thread_id,
+                    tmux_mgr=tmux_manager,
+                    session_mgr=adapters.session_manager,
+                )
+                return
             if ledger_key is not None:
                 auq_ledger.record(ledger_key, state="dispatched")
         except Exception as exc:
