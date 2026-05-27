@@ -616,14 +616,24 @@ class TestAuqContextFromForm:
         claims first (no JSONL available yet), then the JSONL
         ``tool_use_id`` arrives (after the user answers / status_polling
         re-fires with both data). The second claim with a different key
-        must STILL return False — the marker is set and we don't want a
-        duplicate context message."""
-        from cctelegram.handlers.interactive_ui import claim_auq_context_post
+        must STILL fail — pending claim is in flight and we don't want
+        a duplicate context message.
+
+        Wave 1: the two-phase API replaces the bool with an opaque
+        claim_token (``str | None``); same-window second claim blocked
+        on either the in-flight pending entry OR the persisted dedup
+        marker after commit.
+        """
+        from cctelegram.handlers.interactive_ui import (
+            claim_auq_context_post_in_memory,
+        )
 
         # Live AUQ → form fingerprint claim succeeds.
-        assert claim_auq_context_post("@42", "form:deadbeefcafe1234") is True
-        # JSONL arrives → different key but marker is set → False.
-        assert claim_auq_context_post("@42", "toolu_abc") is False
+        assert (
+            claim_auq_context_post_in_memory("@42", "form:deadbeefcafe1234") is not None
+        )
+        # JSONL arrives → different key but pending claim is in flight → None.
+        assert claim_auq_context_post_in_memory("@42", "toolu_abc") is None
 
     @pytest.mark.asyncio
     async def test_live_auq_posts_context_via_status_polling_path(self, monkeypatch):
@@ -756,7 +766,12 @@ class TestAuqContextFromForm:
 
 
 class TestClaimAuqContextPost:
-    """Atomic check-and-set for the AUQ context-post gate."""
+    """Two-phase AUQ context-post gate (Wave 1).
+
+    ``claim_auq_context_post_in_memory`` returns an opaque
+    ``claim_token`` (``str``) on success or ``None`` if the window
+    already has a committed marker or a same-process pending claim.
+    """
 
     def setup_method(self):
         from cctelegram.handlers import interactive_ui as iui
@@ -764,55 +779,64 @@ class TestClaimAuqContextPost:
         iui._last_completed_ask_tool_input.clear()
         iui._last_auq_tool_use_id.clear()
         iui._auq_context_posted.clear()
+        iui._auq_context_post_pending.clear()
 
-    def test_empty_dedup_key_returns_false(self):
-        """v5 (2026-05-24): claim() rejects an empty dedup_key.
+    def test_empty_dedup_key_returns_none(self):
+        """Wave 1: claim_in_memory rejects an empty dedup_key.
 
-        Under the new presence-based contract, ``dedup_key`` is the
+        Under the presence-based contract, ``dedup_key`` is the
         caller's responsibility. Passing "" means the caller couldn't
         compute either a JSONL ``tool_use_id`` or a form fingerprint —
         the gate site should not be calling claim() in that case.
-        Treat as an obvious bug and return False so a stray invocation
-        can't accidentally set the marker."""
-        from cctelegram.handlers.interactive_ui import claim_auq_context_post
+        Treat as an obvious bug and return None so a stray invocation
+        can't accidentally seed a pending entry.
+        """
+        from cctelegram.handlers.interactive_ui import (
+            claim_auq_context_post_in_memory,
+        )
 
-        assert claim_auq_context_post("@99", "") is False
+        assert claim_auq_context_post_in_memory("@99", "") is None
 
-    def test_first_claim_succeeds_second_fails(self):
-        from cctelegram.handlers.interactive_ui import claim_auq_context_post
+    def test_first_claim_succeeds_second_blocked_on_pending(self):
+        from cctelegram.handlers.interactive_ui import (
+            claim_auq_context_post_in_memory,
+        )
 
-        assert claim_auq_context_post("@5", "toolu_1") is True
-        assert claim_auq_context_post("@5", "toolu_1") is False
+        token = claim_auq_context_post_in_memory("@5", "toolu_1")
+        assert isinstance(token, str) and len(token) == 16
+        # Pending in flight → second claim returns None.
+        assert claim_auq_context_post_in_memory("@5", "toolu_1") is None
 
     def test_new_tool_use_id_resets_claim(self):
         """When remember_ask_tool_input sees a NEW tool_use_id replacing
-        an old one for the same window, the context-post marker is
-        auto-cleared so the new AUQ can claim a fresh post.
+        an old one for the same window, the context-post marker AND
+        pending claim are auto-cleared so the new AUQ can claim a
+        fresh post.
 
-        Under the v5 presence-based dedup, the marker doesn't reset on
-        its own (different value still counts as "set"); the reset is
-        wired into ``remember_ask_tool_input`` for the JSONL path. The
-        test exercises that wiring end-to-end."""
+        Wave 1 added the pending-clear: without it, a fresh AUQ in the
+        same window would be blocked by the prior AUQ's pending entry
+        until 60s TTL elapses.
+        """
         from cctelegram.handlers.interactive_ui import (
-            claim_auq_context_post,
+            claim_auq_context_post_in_memory,
             remember_ask_tool_input,
         )
 
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
         )
-        assert claim_auq_context_post("@5", "toolu_1") is True
+        assert claim_auq_context_post_in_memory("@5", "toolu_1") is not None
         # Same window, new AUQ tool_use_id → remember() drops the
-        # marker; the new id can claim a fresh post.
+        # pending claim; the new id can claim a fresh post.
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "B"}]}]}, "toolu_2"
         )
-        assert claim_auq_context_post("@5", "toolu_2") is True
-        assert claim_auq_context_post("@5", "toolu_2") is False
+        assert claim_auq_context_post_in_memory("@5", "toolu_2") is not None
+        assert claim_auq_context_post_in_memory("@5", "toolu_2") is None
 
     def test_forget_drops_post_state(self):
         from cctelegram.handlers.interactive_ui import (
-            claim_auq_context_post,
+            claim_auq_context_post_in_memory,
             forget_ask_tool_input,
             remember_ask_tool_input,
         )
@@ -820,35 +844,38 @@ class TestClaimAuqContextPost:
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
         )
-        assert claim_auq_context_post("@5", "toolu_1") is True
+        assert claim_auq_context_post_in_memory("@5", "toolu_1") is not None
         forget_ask_tool_input("@5")
-        # After tool_result clears the cache, a fresh re-cache (e.g. via
-        # hydrate after restart) should be claimable again.
+        # After tool_result clears the cache, a fresh re-cache (e.g.
+        # via hydrate after restart) should be claimable again — the
+        # pending entry was dropped by forget.
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
         )
-        assert claim_auq_context_post("@5", "toolu_1") is True
+        assert claim_auq_context_post_in_memory("@5", "toolu_1") is not None
 
-    def test_remember_without_id_clears_stale_marker(self):
-        """Hermes P3 hardening (2026-05-22): if an earlier call left a
-        tool_use_id + posted state in place and a later caller invokes
-        ``remember_ask_tool_input`` WITHOUT a ``tool_use_id`` (e.g. a
-        test helper or unmigrated legacy path), the stale ID + marker
-        must be cleared. Under the v5 form-source design the next
-        claim() can then proceed with a form-fingerprint dedup_key."""
+    def test_remember_without_id_clears_stale_pending(self):
+        """Hermes P3 hardening (2026-05-22) + Wave 1: if an earlier
+        call left a tool_use_id + pending state in place and a later
+        caller invokes ``remember_ask_tool_input`` WITHOUT a
+        ``tool_use_id`` (test helper or unmigrated legacy path), the
+        stale ID + pending entry must be cleared. The next
+        claim_in_memory() can then proceed with a form-fingerprint
+        dedup_key.
+        """
         from cctelegram.handlers.interactive_ui import (
-            claim_auq_context_post,
+            claim_auq_context_post_in_memory,
             remember_ask_tool_input,
         )
 
         remember_ask_tool_input(
             "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_old"
         )
-        assert claim_auq_context_post("@5", "toolu_old") is True
+        assert claim_auq_context_post_in_memory("@5", "toolu_old") is not None
         # Caller without an ID overwrites the cache + clears the
-        # marker, so a form-fingerprint claim succeeds next.
+        # pending claim, so a form-fingerprint claim succeeds next.
         remember_ask_tool_input("@5", {"questions": [{"options": [{"label": "B"}]}]})
-        assert claim_auq_context_post("@5", "form:abc123") is True
+        assert claim_auq_context_post_in_memory("@5", "form:abc123") is not None
 
 
 class TestSendAuqContextMessage:
@@ -860,11 +887,17 @@ class TestSendAuqContextMessage:
         iui._last_completed_ask_tool_input.clear()
         iui._last_auq_tool_use_id.clear()
         iui._auq_context_posted.clear()
+        iui._auq_context_post_pending.clear()
 
     @pytest.mark.asyncio
     async def test_retry_after_propagates(self, monkeypatch):
         """Codex P2 (2026-05-22 diff review): RetryAfter must NOT be
-        swallowed — the outer flood-control machinery owns back-off."""
+        swallowed — the outer flood-control machinery owns back-off.
+
+        Wave 1: the pending claim IS settled (rolled back, since no
+        chunks landed) before re-raising; verified in
+        test_retry_after_rolls_back_on_no_landing below.
+        """
         from telegram.error import RetryAfter
 
         from cctelegram.handlers import interactive_ui as iui
@@ -874,6 +907,8 @@ class TestSendAuqContextMessage:
 
         monkeypatch.setattr(iui, "topic_send", _raise_retry_after)
 
+        token = iui.claim_auq_context_post_in_memory("@5", "t")
+        assert token is not None
         with pytest.raises(RetryAfter):
             await iui._send_auq_context_message(
                 None,  # type: ignore[arg-type]
@@ -894,7 +929,7 @@ class TestSendAuqContextMessage:
                         }
                     ]
                 },
-                dedup_key="t",
+                claim_token=token,
             )
 
     @pytest.mark.asyncio
@@ -934,6 +969,8 @@ class TestSendAuqContextMessage:
 
         monkeypatch.setattr(iui, "topic_send", _fail_second)
 
+        token = iui.claim_auq_context_post_in_memory("@5", "t")
+        assert token is not None
         await iui._send_auq_context_message(
             None,  # type: ignore[arg-type]
             user_id=1,
@@ -941,7 +978,7 @@ class TestSendAuqContextMessage:
             chat_id=1,
             window_id="@5",
             source=tool_input,
-            dedup_key="t",
+            claim_token=token,
         )
 
         # Two send attempts: chunk 1 ok, chunk 2 failed, stop.
@@ -2379,6 +2416,7 @@ def _isolated_interactive_state_file(tmp_path, monkeypatch):
     iui._interactive_msgs.clear()
     iui._interactive_msg_meta.clear()
     iui._auq_context_posted.clear()
+    iui._auq_context_post_pending.clear()
     iui._auq_context_msgs.clear()
     iui._last_completed_ask_tool_input.clear()
     iui._last_auq_tool_use_id.clear()
@@ -2386,6 +2424,7 @@ def _isolated_interactive_state_file(tmp_path, monkeypatch):
     iui._interactive_msgs.clear()
     iui._interactive_msg_meta.clear()
     iui._auq_context_posted.clear()
+    iui._auq_context_post_pending.clear()
     iui._auq_context_msgs.clear()
     iui._last_completed_ask_tool_input.clear()
     iui._last_auq_tool_use_id.clear()
@@ -2456,27 +2495,174 @@ class TestInteractiveStatePersistence:
             for r in caplog.records
         )
 
-    def test_claim_auq_context_persists(self, _isolated_interactive_state_file):
+    def test_claim_in_memory_does_not_persist(self, _isolated_interactive_state_file):
+        """Wave 1 invariant: phase 1 (claim_in_memory) writes nothing
+        to disk. Persistence is deferred to commit_auq_context_post
+        after at least one chunk lands on Telegram. A crash between
+        claim and the first chunk landing leaves no persisted state
+        — the next render claims again and re-posts.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+
+        token = iui.claim_auq_context_post_in_memory("@5", "toolu_xyz")
+        assert token is not None
+        # Phase 1 does NOT touch disk; the file may not even exist yet.
+        if _isolated_interactive_state_file.exists():
+            import json as _json
+
+            data_before = _json.loads(_isolated_interactive_state_file.read_text())
+            assert "@5" not in data_before.get("auq_context_posted", {})
+        # The pending claim lives in process memory.
+        assert "@5" in iui._auq_context_post_pending
+
+    def test_commit_auq_context_persists(self, _isolated_interactive_state_file):
+        """Wave 1 invariant: phase 2 (commit) writes both the dedup
+        marker and the chunked record to disk in a single atomic
+        update. After commit, ``_auq_context_post_pending`` is empty
+        and ``_auq_context_posted`` carries the dedup_key.
+        """
         import json as _json
 
         from cctelegram.handlers import interactive_ui as iui
 
-        claimed = iui.claim_auq_context_post("@5", "toolu_xyz")
-        assert claimed is True
+        token = iui.claim_auq_context_post_in_memory("@5", "toolu_xyz")
+        assert token is not None
+        committed = iui.commit_auq_context_post(
+            "@5",
+            token,
+            (12345,),
+            text="hello",
+            source={"questions": [{"question": "Q?"}]},
+            user_id=1,
+            chat_id=100,
+            thread_id=None,
+            session_id="sess-x",
+        )
+        assert committed is True
+        # Pending drained.
+        assert "@5" not in iui._auq_context_post_pending
+        # Persisted state.
         data = _json.loads(_isolated_interactive_state_file.read_text())
         assert data["auq_context_posted"]["@5"] == "toolu_xyz"
+        # Chunked record persisted too — restart-recovery anchor.
+        assert data["auq_context_msgs"]["@5"]["message_ids"] == [12345]
+
+    def test_rollback_auq_context_does_not_persist(
+        self, _isolated_interactive_state_file
+    ):
+        """Wave 1 invariant: rollback drops the in-memory pending
+        entry; no disk write. Next claim succeeds — restart-safe by
+        design.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+
+        token = iui.claim_auq_context_post_in_memory("@5", "toolu_xyz")
+        assert token is not None
+        rolled = iui.rollback_auq_context_post("@5", token)
+        assert rolled is True
+        # No disk write (file may not exist).
+        if _isolated_interactive_state_file.exists():
+            import json as _json
+
+            data = _json.loads(_isolated_interactive_state_file.read_text())
+            assert "@5" not in data.get("auq_context_posted", {})
+        # Pending drained → next claim succeeds.
+        assert iui.claim_auq_context_post_in_memory("@5", "toolu_xyz") is not None
+
+    def test_commit_with_wrong_token_is_noop(self, _isolated_interactive_state_file):
+        """Wave 1 invariant (hermes P3 #2): a stale or wrong
+        ``claim_token`` passed to ``commit_auq_context_post`` no-ops
+        without side effects — no disk write, no in-memory mutation,
+        the pending entry survives so the legitimate token-holder
+        can still commit.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+
+        real_token = iui.claim_auq_context_post_in_memory("@5", "toolu_xyz")
+        assert real_token is not None
+        committed = iui.commit_auq_context_post(
+            "@5",
+            "wrong-token-bogus",  # wrong token
+            (12345,),
+            text="hi",
+            source={"questions": [{"question": "Q?"}]},
+            user_id=1,
+            chat_id=100,
+            thread_id=None,
+            session_id="sess-x",
+        )
+        assert committed is False
+        # In-memory pending untouched; persisted dicts untouched.
+        assert "@5" in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") is None
+        assert iui._auq_context_msgs.get("@5") is None
+        if _isolated_interactive_state_file.exists():
+            import json as _json
+
+            data = _json.loads(_isolated_interactive_state_file.read_text())
+            assert "@5" not in data.get("auq_context_posted", {})
+        # Real token still works — wrong-token call did not consume.
+        assert (
+            iui.commit_auq_context_post(
+                "@5",
+                real_token,
+                (12345,),
+                text="hi",
+                source={"questions": [{"question": "Q?"}]},
+                user_id=1,
+                chat_id=100,
+                thread_id=None,
+                session_id="sess-x",
+            )
+            is True
+        )
+
+    def test_rollback_with_wrong_token_is_noop(self, _isolated_interactive_state_file):
+        """Wave 1 invariant (hermes P3 #2): a stale or wrong
+        ``claim_token`` passed to ``rollback_auq_context_post``
+        leaves the legitimate pending entry intact so the real
+        token-holder can still settle it.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+
+        real_token = iui.claim_auq_context_post_in_memory("@5", "toolu_xyz")
+        assert real_token is not None
+        rolled = iui.rollback_auq_context_post("@5", "wrong-token-bogus")
+        assert rolled is False
+        # Pending still in flight.
+        assert "@5" in iui._auq_context_post_pending
+        # Real token still works.
+        assert iui.rollback_auq_context_post("@5", real_token) is True
+        assert "@5" not in iui._auq_context_post_pending
 
     def test_forget_ask_tool_input_persists_drop(
         self, _isolated_interactive_state_file
     ):
+        """forget after commit drops the persisted marker (and the
+        in-memory pending entry, if any — Wave 1 cleanup hook).
+        """
         import json as _json
 
         from cctelegram.handlers import interactive_ui as iui
 
-        iui.claim_auq_context_post("@5", "toolu_xyz")
+        token = iui.claim_auq_context_post_in_memory("@5", "toolu_xyz")
+        assert token is not None
+        iui.commit_auq_context_post(
+            "@5",
+            token,
+            (12345,),
+            text="hello",
+            source={"questions": [{"question": "Q?"}]},
+            user_id=1,
+            chat_id=100,
+            thread_id=None,
+            session_id="sess-x",
+        )
         iui.forget_ask_tool_input("@5")
         data = _json.loads(_isolated_interactive_state_file.read_text())
         assert data["auq_context_posted"] == {}
+        # And forget clears any in-flight pending too (Wave 1 cleanup).
+        assert iui._auq_context_post_pending == {}
 
 
 @pytest.mark.usefixtures("_isolated_interactive_state_file")
@@ -2824,15 +3010,25 @@ class TestHydrateInteractiveState:
 
 @pytest.mark.usefixtures("_isolated_interactive_state_file")
 class TestSendAuqContextMessageTriState:
-    """v3 tri-state return values + v5 explicit NONE_SENT on no-op exits."""
+    """v3 tri-state return values + v5 explicit NONE_SENT on no-op exits.
+
+    Wave 1: ``_send_auq_context_message`` now takes a ``claim_token``
+    (from ``claim_auq_context_post_in_memory``) and is responsible
+    for calling commit/rollback before returning. The previous
+    ``dedup_key`` parameter is gone — dedup_key lives inside the
+    pending entry, retrieved by commit.
+    """
 
     @pytest.mark.asyncio
     async def test_no_renderable_text_returns_none_sent(self, monkeypatch):
         from cctelegram.handlers import interactive_ui as iui
 
+        token = iui.claim_auq_context_post_in_memory("@5", "t")
+        assert token is not None
         # Empty questions list → formatter returns just the header
         # (whitespace-only after strip). v5 must return NONE_SENT
-        # explicitly so caller's rollback fires.
+        # explicitly; Wave 1: rollback fires inside send so pending
+        # drains.
         result = await iui._send_auq_context_message(
             None,  # type: ignore[arg-type]
             user_id=1,
@@ -2840,9 +3036,12 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": []},
-            dedup_key="t",
+            claim_token=token,
         )
         assert result is iui._ContextSendResult.NONE_SENT
+        # Wave 1 invariant: rollback ran, pending drained, no commit.
+        assert "@5" not in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") is None
 
     @pytest.mark.asyncio
     async def test_no_parts_returns_none_sent(self, monkeypatch):
@@ -2853,6 +3052,8 @@ class TestSendAuqContextMessageTriState:
             "cctelegram.handlers.response_builder.build_response_parts",
             lambda *a, **kw: [],
         )
+        token = iui.claim_auq_context_post_in_memory("@5", "t")
+        assert token is not None
         result = await iui._send_auq_context_message(
             None,  # type: ignore[arg-type]
             user_id=1,
@@ -2860,9 +3061,11 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": [{"question": "Q?"}]},
-            dedup_key="t",
+            claim_token=token,
         )
         assert result is iui._ContextSendResult.NONE_SENT
+        assert "@5" not in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") is None
 
     @pytest.mark.asyncio
     async def test_full_send_returns_full_sent(self, monkeypatch):
@@ -2875,6 +3078,8 @@ class TestSendAuqContextMessageTriState:
             return Mock(message_id=100), TopicSendOutcome.OK
 
         monkeypatch.setattr(iui, "topic_send", _ok)
+        token = iui.claim_auq_context_post_in_memory("@5", "t")
+        assert token is not None
         result = await iui._send_auq_context_message(
             None,  # type: ignore[arg-type]
             user_id=1,
@@ -2882,9 +3087,13 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": [{"question": "Q?"}]},
-            dedup_key="t",
+            claim_token=token,
         )
         assert result is iui._ContextSendResult.FULL_SENT
+        # Wave 1 invariant: commit ran, pending drained, marker set.
+        assert "@5" not in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") == "t"
+        assert iui._auq_context_msgs["@5"].message_ids == (100,)
 
     @pytest.mark.asyncio
     async def test_first_chunk_fails_returns_none_sent(self, monkeypatch):
@@ -2895,6 +3104,8 @@ class TestSendAuqContextMessageTriState:
             return None, TopicSendOutcome.TOPIC_NOT_FOUND
 
         monkeypatch.setattr(iui, "topic_send", _fail)
+        token = iui.claim_auq_context_post_in_memory("@5", "t")
+        assert token is not None
         result = await iui._send_auq_context_message(
             None,  # type: ignore[arg-type]
             user_id=1,
@@ -2902,14 +3113,22 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": [{"question": "Q?"}]},
-            dedup_key="t",
+            claim_token=token,
         )
         assert result is iui._ContextSendResult.NONE_SENT
+        # Wave 1 invariant: first-chunk failure with no prior landing
+        # rolls back; pending drained, no persisted marker.
+        assert "@5" not in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") is None
 
     @pytest.mark.asyncio
     async def test_partial_send_returns_partial_sent(self, monkeypatch):
-        """First chunk lands, second fails → PARTIAL_SENT (caller MUST
-        keep the claim; rolling back would duplicate chunk 1)."""
+        """First chunk lands, second fails → PARTIAL_SENT.
+
+        Wave 1 invariant: commit fires with the truncated
+        ``sent_msg_ids`` so a restart finds the chunked record and
+        does NOT re-post. The dedup marker is also persisted.
+        """
         from unittest.mock import Mock
 
         from cctelegram.handlers import interactive_ui as iui
@@ -2938,6 +3157,8 @@ class TestSendAuqContextMessageTriState:
             return None, TopicSendOutcome.TOPIC_NOT_FOUND
 
         monkeypatch.setattr(iui, "topic_send", _ok_then_fail)
+        token = iui.claim_auq_context_post_in_memory("@5", "toolu_partial")
+        assert token is not None
         result = await iui._send_auq_context_message(
             None,  # type: ignore[arg-type]
             user_id=1,
@@ -2945,9 +3166,15 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source=tool_input,
-            dedup_key="t",
+            claim_token=token,
         )
         assert result is iui._ContextSendResult.PARTIAL_SENT
+        # Wave 1 invariant — restart-safety anchor for partial sends.
+        assert "@5" not in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") == "toolu_partial"
+        # Only chunk 1's msg_id persisted; restart sees this and skips
+        # re-post.
+        assert iui._auq_context_msgs["@5"].message_ids == (100,)
 
     @pytest.mark.asyncio
     async def test_exception_after_first_chunk_returns_partial(self, monkeypatch):
@@ -2979,6 +3206,8 @@ class TestSendAuqContextMessageTriState:
             raise RuntimeError("network blew up")
 
         monkeypatch.setattr(iui, "topic_send", _ok_then_raise)
+        token = iui.claim_auq_context_post_in_memory("@5", "t")
+        assert token is not None
         result = await iui._send_auq_context_message(
             None,  # type: ignore[arg-type]
             user_id=1,
@@ -2986,9 +3215,11 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source=tool_input,
-            dedup_key="t",
+            claim_token=token,
         )
         assert result is iui._ContextSendResult.PARTIAL_SENT
+        assert "@5" not in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") == "t"
 
     @pytest.mark.asyncio
     async def test_exception_before_any_chunk_returns_none(self, monkeypatch):
@@ -2999,6 +3230,8 @@ class TestSendAuqContextMessageTriState:
             raise RuntimeError("immediate failure")
 
         monkeypatch.setattr(iui, "topic_send", _raise)
+        token = iui.claim_auq_context_post_in_memory("@5", "t")
+        assert token is not None
         result = await iui._send_auq_context_message(
             None,  # type: ignore[arg-type]
             user_id=1,
@@ -3006,9 +3239,99 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": [{"question": "Q?"}]},
-            dedup_key="t",
+            claim_token=token,
         )
         assert result is iui._ContextSendResult.NONE_SENT
+        assert "@5" not in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") is None
+
+    @pytest.mark.asyncio
+    async def test_retry_after_with_prior_landing_commits_before_reraising(
+        self, monkeypatch
+    ):
+        """Wave 1: a RetryAfter mid-loop with at least one chunk
+        already landed must commit the partial state BEFORE re-raising
+        so the next render isn't blocked for the full 60s TTL while
+        AIORateLimiter's back-off runs upstream.
+        """
+        from unittest.mock import Mock
+
+        from telegram.error import RetryAfter
+
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        long_desc = ("paragraph " * 100).strip()
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q?",
+                    "options": [
+                        {"label": f"Option {i}", "description": long_desc}
+                        for i in range(1, 11)
+                    ],
+                }
+            ]
+        }
+
+        call_counter = {"n": 0}
+
+        async def _ok_then_retry(*args, **kwargs):
+            call_counter["n"] += 1
+            if call_counter["n"] == 1:
+                return Mock(message_id=100), TopicSendOutcome.OK
+            raise RetryAfter(retry_after=5)
+
+        monkeypatch.setattr(iui, "topic_send", _ok_then_retry)
+        token = iui.claim_auq_context_post_in_memory("@5", "toolu_retry")
+        assert token is not None
+        with pytest.raises(RetryAfter):
+            await iui._send_auq_context_message(
+                None,  # type: ignore[arg-type]
+                user_id=1,
+                thread_id=None,
+                chat_id=1,
+                window_id="@5",
+                source=tool_input,
+                claim_token=token,
+            )
+        # Pending drained → next renders are not blocked on this slot.
+        assert "@5" not in iui._auq_context_post_pending
+        # Persisted marker so restart-after-back-off does NOT duplicate.
+        assert iui._auq_context_posted.get("@5") == "toolu_retry"
+        assert iui._auq_context_msgs["@5"].message_ids == (100,)
+
+    @pytest.mark.asyncio
+    async def test_retry_after_with_no_landing_rolls_back_before_reraising(
+        self, monkeypatch
+    ):
+        """Wave 1: a RetryAfter on the first chunk (no chunks landed)
+        rolls back the pending slot BEFORE re-raising so the next
+        render (after back-off) can claim cleanly.
+        """
+        from telegram.error import RetryAfter
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        async def _retry(*args, **kwargs):
+            raise RetryAfter(retry_after=5)
+
+        monkeypatch.setattr(iui, "topic_send", _retry)
+        token = iui.claim_auq_context_post_in_memory("@5", "t")
+        assert token is not None
+        with pytest.raises(RetryAfter):
+            await iui._send_auq_context_message(
+                None,  # type: ignore[arg-type]
+                user_id=1,
+                thread_id=None,
+                chat_id=1,
+                window_id="@5",
+                source={"questions": [{"question": "Q?"}]},
+                claim_token=token,
+            )
+        # Pending drained, no persisted marker.
+        assert "@5" not in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") is None
 
 
 @pytest.mark.usefixtures("_isolated_interactive_state_file")
@@ -4851,18 +5174,26 @@ class TestSessionMonitorClearRace:
 class TestGateDedupAcrossPretoolToJsonl:
     """Codex chunk-3+4 P2 delta: directly verify the gate's dedup-key
     transition. A `pretool:<fp>` claim must block a subsequent JSONL
-    `tool_use_id` claim — no duplicate post."""
+    `tool_use_id` claim — no duplicate post.
+
+    Wave 1: the block still holds via the in-memory pending entry
+    (no commit yet) — same semantic, different mechanism.
+    """
 
     def test_pretool_claim_blocks_subsequent_jsonl_claim(self, _cc_telegram_dir):
         from cctelegram.handlers.interactive_ui import (
+            _auq_context_post_pending,
             _auq_context_posted,
-            claim_auq_context_post,
+            claim_auq_context_post_in_memory,
         )
 
         window_id = "@dedup1"
         _auq_context_posted.pop(window_id, None)
+        _auq_context_post_pending.pop(window_id, None)
         # First: pretool claim with fingerprint-based key.
-        assert claim_auq_context_post(window_id, "pretool:abc123") is True
-        # Second: JSONL tool_use_id arrives (different key) → blocked.
-        assert claim_auq_context_post(window_id, "toolu_jsonl_id") is False
+        assert claim_auq_context_post_in_memory(window_id, "pretool:abc123") is not None
+        # Second: JSONL tool_use_id arrives (different key) → blocked
+        # on the in-flight pending entry.
+        assert claim_auq_context_post_in_memory(window_id, "toolu_jsonl_id") is None
         _auq_context_posted.pop(window_id, None)
+        _auq_context_post_pending.pop(window_id, None)

@@ -89,7 +89,7 @@ _last_completed_ask_tool_input: dict[str, dict] = {}
 
 # Companion to ``_last_completed_ask_tool_input``: tracks the JSONL
 # ``tool_use.id`` for the currently-cached AUQ. Used by the AUQ context
-# message gate (``claim_auq_context_post``) to dedup per-AUQ posts.
+# message gate (``claim_auq_context_post_in_memory``) to dedup per-AUQ posts.
 # Separate dict (rather than extending the cache value) so existing
 # readers of ``_last_completed_ask_tool_input`` stay unchanged.
 _last_auq_tool_use_id: dict[str, str] = {}
@@ -101,7 +101,57 @@ _last_auq_tool_use_id: dict[str, str] = {}
 # Cleared by ``forget_ask_tool_input`` so the next AUQ in the same
 # window starts with a clean slate. Persisted alongside
 # ``_interactive_msg_meta`` to survive ``launchctl kickstart``.
+#
+# Wave 1 (plan §5) made this dict write-after-send: ``commit_auq_context_post``
+# writes here ONLY after at least one chunk lands on Telegram. The
+# pre-Wave-1 ``claim_auq_context_post`` wrote here BEFORE any chunk
+# landed, which made a crash between claim and the first chunk land
+# permanently suppress the context message (the persisted marker
+# survived restart even though Telegram never saw the post).
 _auq_context_posted: dict[str, str] = {}
+
+
+@dataclass(frozen=True)
+class _AuqContextPendingClaim:
+    """In-memory pending context-post claim — Wave 1 two-phase dedup.
+
+    Lives only in ``_auq_context_post_pending``; NOT persisted to
+    ``interactive_state.json``. A restart drops the pending claim by
+    design so the next render re-attempts the context message, instead
+    of carrying a stale persisted claim forward (the pre-Wave-1 bug).
+    """
+
+    dedup_key: str
+    claim_token: str
+    claimed_at: float  # monotonic seconds, read via ``_pending_claim_clock``
+
+
+# Wave 1 (plan §5.1): in-memory pending claims for the two-phase
+# context-post gate. ``claim_auq_context_post_in_memory`` writes here;
+# ``commit_auq_context_post`` and ``rollback_auq_context_post`` consume.
+# Never persisted — pending claims are process-lifetime-scoped on
+# purpose: a restarted bot cannot know whether the in-flight chunk
+# landed on Telegram, so re-rendering and re-posting is safer than
+# carrying a stale claim forward.
+_auq_context_post_pending: dict[str, _AuqContextPendingClaim] = {}
+
+
+# Wave 1: TTL (seconds) for same-process abandoned-claim recovery. A
+# pending claim older than this gets purged on the next
+# ``claim_auq_context_post_in_memory`` call so a hung coroutine that
+# never reached commit/rollback can't permanently block subsequent
+# claims for the same window. This is NOT crash recovery — restart
+# drops pending claims entirely (the dict is module-level state).
+_PENDING_CLAIM_TTL_SECONDS = 60.0
+
+
+def _pending_claim_clock() -> float:
+    """Monotonic-clock hook for tests to override.
+
+    Production reads ``time.monotonic()``; tests patch this module
+    attribute to fast-forward the TTL without sleeping.
+    """
+    return time.monotonic()
 
 
 @dataclass(frozen=True)
@@ -262,12 +312,20 @@ _interactive_msg_meta: dict[tuple[int, int], _InteractiveMsgMeta] = {}
 class _ContextSendResult(Enum):
     """Outcome of ``_send_auq_context_message``.
 
-    The caller in ``handle_interactive_ui`` uses this to decide
-    whether to roll back the ``claim_auq_context_post`` claim:
-    NONE_SENT means no chunks landed → rolling back is safe.
-    PARTIAL_SENT means chunk 1 (at least) landed → rolling back
-    would re-send chunk 1 on the next render and duplicate it.
-    FULL_SENT means all chunks landed → no rollback needed.
+    Reported back to the caller in ``handle_interactive_ui`` for
+    diagnostics only — Wave 1 made the send function itself
+    responsible for settling the pending claim before returning
+    (``rollback_auq_context_post`` on no-landing paths,
+    ``commit_auq_context_post`` on any-chunk-landed paths). The
+    caller no longer pops dedup state on NONE_SENT.
+
+    Semantics:
+      * NONE_SENT — no chunks landed; pending slot was rolled back;
+        the next render claims again and re-posts.
+      * PARTIAL_SENT — chunk 1 (at least) landed; commit ran with
+        the truncated ``sent_msg_ids`` so a restart finds the
+        chunked record and does NOT re-post.
+      * FULL_SENT — every chunk landed; commit ran with all msg_ids.
     """
 
     FULL_SENT = "full_sent"
@@ -305,6 +363,11 @@ def remember_ask_tool_input(
                 # drop the stale context-post marker so the next claim
                 # succeeds for the new AUQ.
                 _auq_context_posted.pop(window_id, None)
+                # Wave 1: also drop any in-flight pending claim. A
+                # rotation under us means the claim_token in flight is
+                # for the prior AUQ; rolling forward it would commit
+                # the wrong dedup_key.
+                _auq_context_post_pending.pop(window_id, None)
                 # Codex P2 round 3 #2 (2026-05-25): also drop the
                 # auq_context_msgs record from the prior lifecycle.
                 # Without this, maybe_upgrade_auq_context_message
@@ -321,6 +384,7 @@ def remember_ask_tool_input(
             # 2026-05-22 diff review.
             _last_auq_tool_use_id.pop(window_id, None)
             _auq_context_posted.pop(window_id, None)
+            _auq_context_post_pending.pop(window_id, None)
             _auq_context_msgs.pop(window_id, None)
 
 
@@ -344,6 +408,12 @@ def forget_ask_tool_input(window_id: str) -> None:
     _last_auq_tool_use_id.pop(window_id, None)
     _pretool_ask_records.pop(window_id, None)
     _unlink_pretool_side_file_for_window(window_id)
+    # Wave 1: drop any in-flight pending claim too. The AUQ lifecycle
+    # is ending (tool_result arrived); a pending claim from this AUQ
+    # is no longer valid and rolling it forward would commit a stale
+    # dedup_key for whatever AUQ comes next. No persist needed —
+    # pending is in-memory only.
+    _auq_context_post_pending.pop(window_id, None)
     had_marker = _auq_context_posted.pop(window_id, None) is not None
     had_record = _auq_context_msgs.pop(window_id, None) is not None
     if had_marker or had_record:
@@ -495,41 +565,167 @@ def warn_if_pre_tool_use_hook_missing(
     return False
 
 
-def claim_auq_context_post(window_id: str, dedup_key: str) -> bool:
-    """Atomic check-and-set for the AUQ context-message gate.
+def claim_auq_context_post_in_memory(window_id: str, dedup_key: str) -> str | None:
+    """Two-phase context-post gate, phase 1 (Wave 1, plan §5.1).
 
-    Presence-based dedup: returns ``True`` only when no prior context
-    message has been posted for the current AUQ lifecycle on this
-    window. On ``True``, stores ``dedup_key`` so concurrent / later
-    callers — even with a DIFFERENT key (e.g. a JSONL ``tool_use_id``
-    arriving after a form-fingerprint claim) — see the marker as set
-    and skip.
+    In-memory only — does NOT persist. Returns an opaque 16-hex-char
+    ``claim_token`` on success, or ``None`` if the window already has
+    a committed context message (persisted ``_auq_context_posted``
+    marker) or a same-process pending claim still in flight (younger
+    than ``_PENDING_CLAIM_TTL_SECONDS``).
+
+    The caller MUST pair a successful claim with exactly one of:
+      * ``commit_auq_context_post(window_id, claim_token, message_ids,
+        ...)`` — after at least one chunk landed on Telegram. Persists
+        ``_auq_context_posted[window_id] = dedup_key`` AND the chunked
+        record in ``_auq_context_msgs[window_id]`` in a single atomic
+        write; subsequent renders see the marker and skip.
+      * ``rollback_auq_context_post(window_id, claim_token)`` — when
+        zero chunks landed. Drops the pending entry; nothing hits
+        disk, so the next render re-attempts the context message.
+
+    Crash between claim and commit: the pending entry is in-memory
+    only, so a restart drops it. The next render claims again and
+    re-posts. This is intentional — without a chunk-landed record, the
+    restarted bot has no idea whether the prior context message
+    reached Telegram, so re-rendering is the safe default. Under the
+    pre-Wave-1 single-phase ``claim_auq_context_post`` the persisted
+    marker survived restart even when no chunk landed, silently
+    suppressing the context message forever.
+
+    Same-process abandoned-claim TTL: a pending claim older than
+    ``_PENDING_CLAIM_TTL_SECONDS`` (default 60s) is purged on the next
+    same-window claim attempt. This catches hung coroutines that
+    never reached commit/rollback. Tests inject a faster clock via
+    ``_pending_claim_clock``.
+
+    Synchronous; relies on the per-route ``asyncio.Lock`` held by the
+    caller in ``handle_interactive_ui`` (the ``async with lock:``
+    region that wraps the AUQ context-post + picker render) for
+    atomicity between the freshness check and the pending write
+    within a route. Cross-route writes are key-disjoint by the
+    topic-only invariant (1 topic = 1 window = 1 route).
 
     ``dedup_key`` must be a non-empty string. Pass the JSONL
-    ``tool_use_id`` when available; fall back to
-    ``f"form:{form.fingerprint()}"`` for live AUQs where Claude Code
-    hasn't flushed the ``tool_use`` line yet. The stored value is
-    informational (persisted for debug visibility); the dedup decision
-    is purely presence-based, so callers must clear the marker via
-    ``forget_ask_tool_input`` (on ``tool_result``) or by passing a
-    fresh ``tool_use_id`` to ``remember_ask_tool_input`` (which auto-
-    resets the marker when the id changes).
-
-    Synchronous — relies on asyncio's single-thread semantics for
-    atomicity between the read and the write. The function does not
-    cross an ``await`` boundary, so two coroutines for the same
-    window cannot interleave between the check and the set.
-
-    Persists the claim to ``interactive_state.json`` (write-through)
-    so a ``launchctl kickstart`` between claim and the next render
-    doesn't re-fire the context message for an already-posted AUQ.
+    ``tool_use_id`` when available; ``pretool:<tool_use_id>`` /
+    ``pretool:<input_fingerprint>`` for the PreToolUse-hook side-file
+    source; ``form:<fingerprint>`` for the pane-derived fallback.
     """
     if not dedup_key:
-        return False
+        return None
     if _auq_context_posted.get(window_id) is not None:
+        return None
+    existing = _auq_context_post_pending.get(window_id)
+    now = _pending_claim_clock()
+    if existing is not None:
+        if now - existing.claimed_at <= _PENDING_CLAIM_TTL_SECONDS:
+            return None
+        # Stale same-process pending — purge and continue. Only fires
+        # if some prior coroutine left a claim hanging past TTL.
+        _auq_context_post_pending.pop(window_id, None)
+    claim_token = secrets.token_hex(8)  # 16 hex chars
+    _auq_context_post_pending[window_id] = _AuqContextPendingClaim(
+        dedup_key=dedup_key,
+        claim_token=claim_token,
+        claimed_at=now,
+    )
+    return claim_token
+
+
+def commit_auq_context_post(
+    window_id: str,
+    claim_token: str,
+    message_ids: tuple[int, ...],
+    *,
+    text: str,
+    source: "dict | AskUserQuestionForm",
+    user_id: int,
+    chat_id: int,
+    thread_id: int | None,
+    session_id: str | None,
+) -> bool:
+    """Two-phase context-post gate, phase 2 (Wave 1, plan §5.1).
+
+    Persists the dedup marker (``_auq_context_posted[window_id]``)
+    AND the chunked-record sidecar (``_auq_context_msgs[window_id]``)
+    in a single atomic write, then drops the in-memory pending entry.
+    Called after at least one chunk landed on Telegram.
+
+    Idempotency contract — **first-call-wins**: the first valid
+    commit drains the pending entry; any subsequent call (with the
+    same or any token) finds no pending and returns False without
+    side effects. Plan v4 §5.1 sketched a "later calls overwrite
+    message_ids" semantic, but ``_send_auq_context_message`` (the
+    only production caller) invokes commit exactly once per claim
+    (the central ``_settle_pending`` helper guarantees this), so the
+    overwrite mode was never exercised; first-call-wins is simpler,
+    visibly correct, and matches what callers actually do. If a
+    future use case needs overwrite-mode, gate it on a fresh helper
+    rather than reinterpreting this one.
+
+    The returned bool distinguishes "wrote it" (True) from "no-op"
+    (False) for the caller's diagnostic logging.
+
+    ``claim_token`` must match the value returned by
+    ``claim_auq_context_post_in_memory``. A stale or wrong token
+    no-ops without side effects — defensive against test fixtures
+    that may synthesize tokens without claiming first.
+
+    Called from ``_send_auq_context_message`` after the chunk loop
+    completes (FULL_SENT) or after one or more chunks landed before
+    a later chunk failed (PARTIAL_SENT). On PARTIAL_SENT the
+    truncated ``sent_msg_ids`` get persisted so a restart finds the
+    record and does NOT re-post the context message — re-posting
+    would duplicate the chunks already on Telegram.
+    """
+    pending = _auq_context_post_pending.get(window_id)
+    if pending is None:
         return False
+    if pending.claim_token != claim_token:
+        return False
+    dedup_key = pending.dedup_key
     _auq_context_posted[window_id] = dedup_key
-    _persist_interactive_state()
+    _auq_context_post_pending.pop(window_id, None)
+    # ``_record_context_post`` writes ``_auq_context_msgs`` and calls
+    # ``_persist_interactive_state``, so both dicts hit disk together.
+    _record_context_post(
+        window_id=window_id,
+        text=text,
+        source=source,
+        dedup_key=dedup_key,
+        message_ids=message_ids,
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        session_id=session_id,
+    )
+    return True
+
+
+def rollback_auq_context_post(window_id: str, claim_token: str) -> bool:
+    """Two-phase context-post gate, phase 3 (Wave 1, plan §5.1).
+
+    Drops the in-memory pending entry when zero chunks landed on
+    Telegram. No persistence happens — the dedup marker is never
+    written, so the next render re-attempts the context message
+    from scratch.
+
+    Idempotent: no-op if the pending entry was already cleared
+    (commit landed, TTL purged it, or forget_ask_tool_input ran).
+    Returns True iff a pending entry was actually dropped — useful
+    for diagnostic logging.
+
+    Called from ``_send_auq_context_message`` on NONE_SENT outcomes
+    (empty formatter output, ``build_response_parts`` returned empty,
+    or the first chunk's ``topic_send`` failed without any prior
+    chunk landing).
+    """
+    pending = _auq_context_post_pending.get(window_id)
+    if pending is None:
+        return False
+    if pending.claim_token != claim_token:
+        return False
+    _auq_context_post_pending.pop(window_id, None)
     return True
 
 
@@ -2010,7 +2206,7 @@ async def _send_auq_context_message(
     chat_id: int,
     window_id: str,
     source: dict | AskUserQuestionForm,
-    dedup_key: str,
+    claim_token: str,
 ) -> _ContextSendResult:
     """Format and send the AUQ context message (multi-part if needed).
 
@@ -2019,15 +2215,22 @@ async def _send_auq_context_message(
     added by the v5 fix on 2026-05-24). The formatter dispatches on
     type.
 
+    Wave 1 (plan §5.1): the function takes a ``claim_token`` returned
+    by ``claim_auq_context_post_in_memory`` and is responsible for
+    pairing the claim with exactly one ``commit_auq_context_post`` (on
+    any chunk landing) or ``rollback_auq_context_post`` (on zero
+    chunks landing) before returning. The caller MUST NOT manually
+    pop ``_auq_context_posted`` / ``_auq_context_msgs`` on NONE_SENT
+    — those dicts are only populated by commit, and rollback
+    cleanly returns the pending slot.
+
     Returns a tri-state outcome (Wave A, Codex v2→v3 P2 #3):
-      * ``FULL_SENT`` — every chunk landed.
-      * ``NONE_SENT`` — zero chunks landed (pre-loop no-op exit, or the
-        first chunk failed). Caller may safely roll back the
-        ``claim_auq_context_post`` claim so the next render re-tries.
+      * ``FULL_SENT`` — every chunk landed; commit ran with all msg_ids.
+      * ``NONE_SENT`` — zero chunks landed (pre-loop no-op exit, or
+        the first chunk failed); rollback ran (no persistence).
       * ``PARTIAL_SENT`` — chunk 1 (at least) landed but a later chunk
-        failed. Caller MUST keep the claim — rolling back and
-        re-sending would duplicate the chunks that already reached
-        Telegram.
+        failed; commit ran with the truncated ``sent_msg_ids`` so a
+        restart finds the chunked record and does NOT re-post.
 
     Anchors the first chunk to the user's last prompt via
     ``peek_route_last_user_message`` (non-consuming). Subsequent chunks
@@ -2035,10 +2238,13 @@ async def _send_auq_context_message(
 
     ``RetryAfter`` from python-telegram-bot's flood control IS re-raised
     so the caller's flood-control contract is honored (the route lock
-    holds, the picker render inherits the back-off). Other exceptions
-    are caught and mapped to NONE_SENT/PARTIAL_SENT based on whether
-    any chunk landed (Hermes v3→v4 P2 #2 — preserve the existing
-    defensive catch).
+    holds, the picker render inherits the back-off). The pending claim
+    is settled BEFORE the re-raise — commit on partial landing,
+    rollback on no landing — so the in-memory slot doesn't sit until
+    the 60s TTL while subsequent renders are blocked. Other
+    exceptions are caught and mapped to NONE_SENT/PARTIAL_SENT based
+    on whether any chunk landed (Hermes v3→v4 P2 #2 — preserve the
+    existing defensive catch).
     """
     from telegram.error import RetryAfter
 
@@ -2048,10 +2254,12 @@ async def _send_auq_context_message(
     text = _format_auq_context_message(source)
     if not text.strip():
         # Codex v4→v5 P2 #2: explicit NONE_SENT so caller's
-        # ``if result is NONE_SENT`` rollback branch fires.
+        # rollback fires (Wave 1: handled inline here, not by caller).
+        rollback_auq_context_post(window_id, claim_token)
         return _ContextSendResult.NONE_SENT
     parts = build_response_parts(text, content_type="text", role="assistant")
     if not parts:
+        rollback_auq_context_post(window_id, claim_token)
         return _ContextSendResult.NONE_SENT
 
     anchor: ReplyParameters | None = None
@@ -2064,6 +2272,32 @@ async def _send_auq_context_message(
     total = len(parts)
     sent_any = False
     sent_msg_ids: list[int] = []
+
+    def _settle_pending(*, sent_any: bool) -> None:
+        """Commit or rollback the pending claim based on landing state.
+
+        Centralises the Wave 1 settlement so all three exit paths
+        (exception, sent-is-None, end-of-loop) stay consistent. On
+        ``sent_any`` True, commit with the (possibly truncated)
+        ``sent_msg_ids`` — restart-safety: a restart sees the
+        chunked record and does NOT re-post. On False, rollback —
+        nothing landed, the next render re-attempts cleanly.
+        """
+        if sent_any:
+            commit_auq_context_post(
+                window_id,
+                claim_token,
+                tuple(sent_msg_ids),
+                text=text,
+                source=source,
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                session_id=session_id,
+            )
+        else:
+            rollback_auq_context_post(window_id, claim_token)
+
     for idx, chunk in enumerate(parts, start=1):
         send_kwargs: dict = dict(
             op="interactive",
@@ -2082,6 +2316,11 @@ async def _send_auq_context_message(
         try:
             sent, _outcome = await topic_send(bot, **send_kwargs)
         except RetryAfter:
+            # Wave 1: settle the pending slot BEFORE re-raising so the
+            # next render isn't blocked for the full 60s TTL while
+            # AIORateLimiter's back-off runs upstream. Commit with the
+            # partial sent_msg_ids if any landed; rollback otherwise.
+            _settle_pending(sent_any=sent_any)
             raise
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning(
@@ -2091,18 +2330,7 @@ async def _send_auq_context_message(
                 total,
                 exc,
             )
-            if sent_any:
-                _record_context_post(
-                    window_id=window_id,
-                    text=text,
-                    source=source,
-                    dedup_key=dedup_key,
-                    message_ids=tuple(sent_msg_ids),
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_id=session_id,
-                )
+            _settle_pending(sent_any=sent_any)
             return (
                 _ContextSendResult.PARTIAL_SENT
                 if sent_any
@@ -2116,18 +2344,7 @@ async def _send_auq_context_message(
                 idx,
                 total,
             )
-            if sent_any:
-                _record_context_post(
-                    window_id=window_id,
-                    text=text,
-                    source=source,
-                    dedup_key=dedup_key,
-                    message_ids=tuple(sent_msg_ids),
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_id=session_id,
-                )
+            _settle_pending(sent_any=sent_any)
             return (
                 _ContextSendResult.PARTIAL_SENT
                 if sent_any
@@ -2135,17 +2352,7 @@ async def _send_auq_context_message(
             )
         sent_any = True
         sent_msg_ids.append(int(sent.message_id))
-    _record_context_post(
-        window_id=window_id,
-        text=text,
-        source=source,
-        dedup_key=dedup_key,
-        message_ids=tuple(sent_msg_ids),
-        user_id=user_id,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        session_id=session_id,
-    )
+    _settle_pending(sent_any=True)  # FULL_SENT path; sent_msg_ids is non-empty
     return _ContextSendResult.FULL_SENT
 
 
@@ -3067,12 +3274,13 @@ async def handle_interactive_ui(
     # picker card's per-option cap. Held under the same per-route lock
     # as the picker send/edit below so concurrent bot.py + status_polling
     # callers serialize on this route: the first claims the context-post
-    # slot via ``claim_auq_context_post``, posts context, then sends the
-    # picker; the second skips context (already posted) and edits the
-    # existing picker. Without the lock, the picker could land before
-    # the context message in the chat order (race flagged by hermes
-    # P1 on the 2026-05-22 design review). The lock is per-route so
-    # this does not stall other routes.
+    # slot via ``claim_auq_context_post_in_memory`` (Wave 1 two-phase
+    # gate), posts context, then sends the picker; the second skips
+    # context (already posted) and edits the existing picker. Without
+    # the lock, the picker could land before the context message in
+    # the chat order (race flagged by hermes P1 on the 2026-05-22
+    # design review). The lock is per-route so this does not stall
+    # other routes.
     async with lock:
         if content.name == "AskUserQuestion":
             # Source-of-truth selection — v4 plan, tri-level:
@@ -3144,29 +3352,27 @@ async def handle_interactive_ui(
                 _should_post_auq_context(ctx_source),
                 _auq_context_posted.get(window_id) is not None,
             )
-            if (
-                ctx_source is not None
-                and _should_post_auq_context(ctx_source)
-                and claim_auq_context_post(window_id, dedup_key)
-            ):
-                ctx_result = await _send_auq_context_message(
-                    bot,
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    chat_id=chat_id,
-                    window_id=window_id,
-                    source=ctx_source,
-                    dedup_key=dedup_key,
-                )
-                # Codex v2→v3 P2 #3: rollback the claim ONLY when nothing
-                # landed. PARTIAL_SENT keeps the claim — re-sending would
-                # duplicate the chunks that already reached Telegram.
-                # 2026-05-25: also drop any stale auq_context_msgs record
-                # — if no chunk landed, there's nothing to upgrade later.
-                if ctx_result is _ContextSendResult.NONE_SENT:
-                    _auq_context_posted.pop(window_id, None)
-                    _auq_context_msgs.pop(window_id, None)
-                    _persist_interactive_state()
+            if ctx_source is not None and _should_post_auq_context(ctx_source):
+                # Wave 1 (plan §5.1): two-phase context-post gate. Claim
+                # is in-memory only until at least one chunk lands; the
+                # send function pairs the token with exactly one
+                # commit/rollback before returning so the persisted
+                # dedup marker (``_auq_context_posted[window_id]``)
+                # never sits on disk without a matching chunked record
+                # on Telegram. NONE_SENT no longer requires a caller-
+                # side pop — rollback inside the send function cleaned
+                # the pending slot already.
+                claim_token = claim_auq_context_post_in_memory(window_id, dedup_key)
+                if claim_token is not None:
+                    await _send_auq_context_message(
+                        bot,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        chat_id=chat_id,
+                        window_id=window_id,
+                        source=ctx_source,
+                        claim_token=claim_token,
+                    )
 
         # Staleness gate (Wave A, Bug A): if the persisted msg id was
         # for a different session, treat the entry as stale and re-send.
