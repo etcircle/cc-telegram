@@ -600,8 +600,9 @@ def claim_auq_context_post_in_memory(window_id: str, dedup_key: str) -> str | No
     ``_pending_claim_clock``.
 
     Synchronous; relies on the per-route ``asyncio.Lock`` held by the
-    caller in ``handle_interactive_ui`` (line 3076 ``async with lock:``)
-    for atomicity between the freshness check and the pending write
+    caller in ``handle_interactive_ui`` (the ``async with lock:``
+    region that wraps the AUQ context-post + picker render) for
+    atomicity between the freshness check and the pending write
     within a route. Cross-route writes are key-disjoint by the
     topic-only invariant (1 topic = 1 window = 1 route).
 
@@ -650,10 +651,20 @@ def commit_auq_context_post(
     in a single atomic write, then drops the in-memory pending entry.
     Called after at least one chunk landed on Telegram.
 
-    Idempotent: a subsequent call (e.g. after a programming error or
-    a retry) finds no pending entry and is a no-op. The returned bool
-    distinguishes "wrote it" (True) from "no-op" (False) for the
-    caller's diagnostic logging.
+    Idempotency contract — **first-call-wins**: the first valid
+    commit drains the pending entry; any subsequent call (with the
+    same or any token) finds no pending and returns False without
+    side effects. Plan v4 §5.1 sketched a "later calls overwrite
+    message_ids" semantic, but ``_send_auq_context_message`` (the
+    only production caller) invokes commit exactly once per claim
+    (the central ``_settle_pending`` helper guarantees this), so the
+    overwrite mode was never exercised; first-call-wins is simpler,
+    visibly correct, and matches what callers actually do. If a
+    future use case needs overwrite-mode, gate it on a fresh helper
+    rather than reinterpreting this one.
+
+    The returned bool distinguishes "wrote it" (True) from "no-op"
+    (False) for the caller's diagnostic logging.
 
     ``claim_token`` must match the value returned by
     ``claim_auq_context_post_in_memory``. A stale or wrong token

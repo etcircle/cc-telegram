@@ -2569,6 +2569,72 @@ class TestInteractiveStatePersistence:
         # Pending drained → next claim succeeds.
         assert iui.claim_auq_context_post_in_memory("@5", "toolu_xyz") is not None
 
+    def test_commit_with_wrong_token_is_noop(self, _isolated_interactive_state_file):
+        """Wave 1 invariant (hermes P3 #2): a stale or wrong
+        ``claim_token`` passed to ``commit_auq_context_post`` no-ops
+        without side effects — no disk write, no in-memory mutation,
+        the pending entry survives so the legitimate token-holder
+        can still commit.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+
+        real_token = iui.claim_auq_context_post_in_memory("@5", "toolu_xyz")
+        assert real_token is not None
+        committed = iui.commit_auq_context_post(
+            "@5",
+            "wrong-token-bogus",  # wrong token
+            (12345,),
+            text="hi",
+            source={"questions": [{"question": "Q?"}]},
+            user_id=1,
+            chat_id=100,
+            thread_id=None,
+            session_id="sess-x",
+        )
+        assert committed is False
+        # In-memory pending untouched; persisted dicts untouched.
+        assert "@5" in iui._auq_context_post_pending
+        assert iui._auq_context_posted.get("@5") is None
+        assert iui._auq_context_msgs.get("@5") is None
+        if _isolated_interactive_state_file.exists():
+            import json as _json
+
+            data = _json.loads(_isolated_interactive_state_file.read_text())
+            assert "@5" not in data.get("auq_context_posted", {})
+        # Real token still works — wrong-token call did not consume.
+        assert (
+            iui.commit_auq_context_post(
+                "@5",
+                real_token,
+                (12345,),
+                text="hi",
+                source={"questions": [{"question": "Q?"}]},
+                user_id=1,
+                chat_id=100,
+                thread_id=None,
+                session_id="sess-x",
+            )
+            is True
+        )
+
+    def test_rollback_with_wrong_token_is_noop(self, _isolated_interactive_state_file):
+        """Wave 1 invariant (hermes P3 #2): a stale or wrong
+        ``claim_token`` passed to ``rollback_auq_context_post``
+        leaves the legitimate pending entry intact so the real
+        token-holder can still settle it.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+
+        real_token = iui.claim_auq_context_post_in_memory("@5", "toolu_xyz")
+        assert real_token is not None
+        rolled = iui.rollback_auq_context_post("@5", "wrong-token-bogus")
+        assert rolled is False
+        # Pending still in flight.
+        assert "@5" in iui._auq_context_post_pending
+        # Real token still works.
+        assert iui.rollback_auq_context_post("@5", real_token) is True
+        assert "@5" not in iui._auq_context_post_pending
+
     def test_forget_ask_tool_input_persists_drop(
         self, _isolated_interactive_state_file
     ):
