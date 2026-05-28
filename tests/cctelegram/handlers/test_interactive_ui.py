@@ -4061,6 +4061,8 @@ from cctelegram.handlers.interactive_ui import (  # noqa: E402
     _resolve_pretool_record,
 )
 from cctelegram.terminal_parser import (  # noqa: E402,F811
+    AskOption,
+    AskUserQuestionForm,
     questions_content_digest,
     questions_content_pairs_from_tool_input,
 )
@@ -4111,11 +4113,20 @@ def _write_pretool_side_file(
 
 
 def _make_form_single_question(
-    title: str, labels: list[str], *, current_tab_inferred: bool = True
+    title: str,
+    labels: list[str],
+    *,
+    current_tab_inferred: bool = True,
+    option_numbers: list[int | None] | None = None,
 ) -> AskUserQuestionForm:
     """Build an AskUserQuestionForm representing a single-question pane parse."""
+    if option_numbers is None:
+        option_numbers = [i + 1 for i in range(len(labels))]
+    assert len(option_numbers) == len(labels)
     options = tuple(
-        AskOption(label=lab, recommended=False, cursor=(i == 0), number=i + 1)
+        AskOption(
+            label=lab, recommended=False, cursor=(i == 0), number=option_numbers[i]
+        )
         for i, lab in enumerate(labels)
     )
     return AskUserQuestionForm(
@@ -4264,7 +4275,42 @@ class TestRecordConsistentWithPane:
     def test_pane_shows_subsequence_of_options_accepted(self):
         # Pane scrolled — only options 2..N visible, option 1 off-screen.
         rec = self._single_q_record(["Apple", "Banana", "Cherry"])
-        form = _make_form_single_question("Q", ["Banana", "Cherry"])
+        form = _make_form_single_question(
+            "Q", ["Banana", "Cherry"], option_numbers=[2, 3]
+        )
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_compressed_pane_rejects_stale_side_file_label_at_wrong_number(self):
+        # Codex P1: label-only matching would accept this stale side file
+        # because "Label C" exists, but the visible pane says it is option 3.
+        rec = self._single_q_record(["Label C", "Label B", "Other label"])
+        form = _make_form_single_question(
+            "Bogus wrapped description title", ["Label C"], option_numbers=[3]
+        )
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is False
+        assert reason == "label_mismatch"
+
+    def test_compressed_pane_accepts_side_file_label_at_visible_number(self):
+        # Compressed panes can have bogus titles; the preserved option number
+        # anchors the side-file label check.
+        rec = self._single_q_record(["Label A", "Label B", "Label C"])
+        form = _make_form_single_question(
+            "Bogus wrapped description title", ["Label C"], option_numbers=[3]
+        )
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_pane_without_option_numbers_falls_back_to_subsequence(self):
+        # Degenerate parser safety: if option numbers are absent, retain the
+        # old contiguous-label fallback because there is no stable slot to check.
+        rec = self._single_q_record(["Apple", "Banana", "Cherry"])
+        form = _make_form_single_question(
+            "Q", ["Banana", "Cherry"], option_numbers=[None, None]
+        )
         ok, reason = _record_consistent_with_pane(rec, form)
         assert ok is True
         assert reason == "ok"

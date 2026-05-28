@@ -1307,6 +1307,32 @@ def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> 
     return False
 
 
+def _pane_labels_match_candidate_by_number(
+    pane_form: AskUserQuestionForm,
+    candidate_labels: tuple[str, ...],
+) -> bool:
+    """True when every visible numbered pane option matches that candidate slot.
+
+    Compressed panes preserve option numbers even when earlier options are
+    off-screen, so a visible ``3. Label C`` must match ``candidate_labels[2]`` —
+    not just any occurrence of ``Label C``. If a future parser ever emits a
+    visible option without a number, fall back to the legacy contiguous
+    subsequence check because there is no stable slot to validate against.
+    """
+    pane_labels = tuple(o.label for o in pane_form.options)
+    if any(o.number is None for o in pane_form.options):
+        return _labels_are_subsequence(pane_labels, candidate_labels)
+
+    for option in pane_form.options:
+        assert option.number is not None
+        index = option.number - 1
+        if index < 0 or index >= len(candidate_labels):
+            return False
+        if candidate_labels[index] != option.label:
+            return False
+    return True
+
+
 def _record_consistent_with_pane(
     record: PreToolAskRecord,
     pane_form: AskUserQuestionForm | None,
@@ -1384,7 +1410,7 @@ def _record_consistent_with_pane(
     candidate_labels = _safe_record_labels(candidate)
     if candidate_labels is None:
         return False, "no_candidate"
-    if not _labels_are_subsequence(pane_labels, candidate_labels):
+    if not _pane_labels_match_candidate_by_number(pane_form, candidate_labels):
         return False, "label_mismatch"
 
     # Step 5.d — option-count sanity for full match.
