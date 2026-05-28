@@ -8,7 +8,7 @@ Each Telegram topic maps to one tmux window running one Claude Code process. The
 
 - **Topic-based sessions** — one Telegram topic = one tmux window = one Claude session.
 - **Hook-based session tracking** — Claude Code `SessionStart` writes `session_map.json`, so `/clear` and resumed sessions stay attached to the right topic.
-- **AskUserQuestion descriptions at pick-time** — a `PreToolUse` hook captures the structured `AskUserQuestion` payload before Claude renders the picker, so each option's full description shows in the Telegram context message right away (not after the user picks).
+- **AskUserQuestion descriptions and multi-select toggles** — a `PreToolUse` hook captures the structured `AskUserQuestion` payload before Claude renders the picker, so each option's full description shows in Telegram right away. Single-select options submit through the restart-safe `aqp:` pick flow; multi-select options toggle with non-ledgered `aqt:` bare-digit callbacks, then final Submit/Cancel reuses the review-screen `aqp:` flow.
 - **Streaming output** — assistant text, thinking, tool use/result summaries, interactive prompts, and local command output flow into Telegram.
 - **Per-route queues** — each `(user_id, thread_id, window_id)` has its own worker, so one noisy topic does not stall another.
 - **Run-state digest** — compact activity digests show tool activity, context-window percentage, and busy/waiting state.
@@ -101,7 +101,7 @@ Under `$CC_TELEGRAM_DIR` (default `~/.cc-telegram/`):
 - `session_map.json` — hook-generated `window_id → session` mapping (written by the `SessionStart` hook).
 - `monitor_state.json` — JSONL byte offsets per tracked session (incremental-read progress).
 - `interactive_state.json` — persisted picker message ids + AUQ context markers (survives bot restart so a `launchctl kickstart` doesn't lose interactive state).
-- `auq_pending/<session_id>.json` — `PreToolUse` side files (one per active AUQ; auto-cleaned after pick; mode `0600` under directory mode `0700`).
+- `auq_pending/<session_id>.json` — `PreToolUse` side files (one per active AUQ; mode `0600` under directory mode `0700`). Multi-select `aqt:` toggles keep the side file alive; it is cleaned when the AUQ `tool_result` runs `forget_ask_tool_input`, on session replacement, or by startup GC.
 - `auq_action_ledger.jsonl` — restart-safe write-ahead ledger for AUQ option-pick dispatches (mode `0600`; append-only JSONL; latest line per `(route_hash, fp8, opt)` key wins; the callback handler consults this to detect duplicate taps after a process restart so Claude doesn't receive the same digit twice).
 - `message_refs.db` — SQLite provenance index for safer reply-context resolution (path overridable via `CC_TELEGRAM_MESSAGE_REFS_DB_PATH`).
 - `log-archive/` — gzipped log rotations (only present if the rotation LaunchAgent is installed; see "Log rotation").
@@ -158,10 +158,13 @@ When Claude Code calls `AskUserQuestion`, the option descriptions are not visibl
 <CC_TELEGRAM_DIR>/auq_pending/<session_id>.json   (mode 0600; directory mode 0700)
 ```
 
-The bot reads the side file at picker render time so the Telegram context message shows each option's full description right away, not after-the-fact. Side files are:
+The bot reads the side file at picker render time so the Telegram context message shows each option's full description right away, not after-the-fact. Multi-select AUQs render selected/unchecked/off-screen state and use `aqt:` callbacks to send a bare digit to tmux for each toggle; those toggles are reversible and not written to the AUQ ledger. The user then presses Tab to Claude Code's review screen, where Submit/Cancel uses the existing `aqp:` pick path and restart-safe ledger.
+
+Side files are:
 
 - Auto-created on each AUQ; the directory and files are mode `0700`/`0600`.
-- Cleaned up after the user picks an option.
+- Preserved across multi-select `aqt:` toggles and final Submit keypresses.
+- Cleaned up when the AUQ `tool_result` lifecycle calls `forget_ask_tool_input`, when a session is replaced, or by startup GC.
 - Garbage-collected on bot startup (any stale entries older than the TTL).
 - Safe to delete the directory at any time; it is re-created on the next AUQ.
 

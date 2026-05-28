@@ -26,6 +26,7 @@ from cctelegram.handlers.callback_data import (
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
     CB_ASK_TAB,
+    CB_ASK_TOGGLE,
     CB_ASK_UP,
 )
 from cctelegram.handlers.inbound_telegram import _get_thread_id
@@ -333,6 +334,136 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             session_mgr=adapters.session_manager,
         )
         await safe_answer(query, "🔄")
+
+    # Interactive UI: multi-select toggle (digit-only, no ledger, token not consumed)
+    elif data.startswith(CB_ASK_TOGGLE):
+        payload = data[len(CB_ASK_TOGGLE) :]
+        parts = payload.split(":")
+        if len(parts) != 4:
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="Card expired, refreshing.",
+            )
+            return
+        _route_hash, _fp8, opt_str, token = parts
+        try:
+            opt_num = int(opt_str)
+        except ValueError:
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="Card expired, refreshing.",
+            )
+            return
+
+        entry = peek_pick_token(token)
+        if entry is None:
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="Card expired, refreshing.",
+            )
+            return
+        thread_id = entry.thread_id
+        window_id = entry.window_id
+        if not owner_matches(entry, user.id):
+            await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+            return
+        if opt_num != entry.option_number:
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="Card expired, refreshing.",
+                fallback_window_id=window_id,
+            )
+            return
+        if await reject_stale_window_callback(window_id):
+            return
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            await safe_answer(query, "Window not found", show_alert=True)
+            return
+
+        pane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+        resolved_input = interactive_ui._resolve_auq_source(window_id, None, pane or "")
+        current_form = (
+            adapters.terminal_parser.resolve_ask_form(resolved_input, pane)
+            if pane
+            else None
+        )
+        if (
+            current_form is None
+            or current_form.fingerprint() != entry.fingerprint
+            or current_form.select_mode != "multi"
+            or not current_form.options_complete
+        ):
+            logger.info(
+                "Toggle-token staleness reject: user=%d window=%s opt=%d minted_fp=%s current_fp=%s",
+                user.id,
+                window_id,
+                entry.option_number,
+                entry.fingerprint,
+                current_form.fingerprint() if current_form else "none",
+            )
+            await safe_answer(query, "Form changed, refreshing.", show_alert=False)
+            await handle_interactive_ui(
+                context.bot,
+                user.id,
+                window_id,
+                thread_id,
+                tmux_mgr=tmux_manager,
+                session_mgr=adapters.session_manager,
+            )
+            return
+
+        toggle_ok = await tmux_manager.send_keys(
+            w.window_id, str(entry.option_number), enter=False, literal=True
+        )
+        if not toggle_ok:
+            logger.warning(
+                "Toggle-token dispatch: tmux send_keys(digit=%d) returned False for window=%s user=%d",
+                entry.option_number,
+                window_id,
+                user.id,
+            )
+            await safe_answer(query, "toggle failed; refreshing", show_alert=False)
+            await handle_interactive_ui(
+                context.bot,
+                user.id,
+                window_id,
+                thread_id,
+                tmux_mgr=tmux_manager,
+                session_mgr=adapters.session_manager,
+            )
+            return
+
+        await asyncio.sleep(0.3)
+        await handle_interactive_ui(
+            context.bot,
+            user.id,
+            window_id,
+            thread_id,
+            tmux_mgr=tmux_manager,
+            session_mgr=adapters.session_manager,
+        )
+        await safe_answer(query, f"Toggled {entry.option_number}")
 
     # Interactive UI: structured option pick (PR 2b + Wave 3 ledger)
     elif data.startswith(CB_ASK_PICK):

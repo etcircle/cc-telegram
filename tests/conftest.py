@@ -32,8 +32,10 @@ from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram import route_runtime, transcript_event_adapter
 from cctelegram.session import session_manager as _real_sm
 from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
+from cctelegram.utils import app_dir
 from cctelegram.handlers import (
     attention,
+    auq_ledger,
     busy_indicator,
     inbound_aggregator,
     interactive_ui,
@@ -74,6 +76,7 @@ class FakeTmux:
     rename_calls: list[tuple[str, str]] = field(default_factory=list)
     create_calls: list[dict[str, Any]] = field(default_factory=list)
     create_response: tuple[bool, str] | None = None  # override for failure injection
+    send_keys_response: bool | None = None  # override for failure injection
     _next_id: int = 0
 
     # ── seeding helpers ────────────────────────────────────────────────
@@ -151,6 +154,8 @@ class FakeTmux:
         literal: bool = True,
     ) -> bool:
         self.sent_keys.append((window_id, keys, enter, literal))
+        if self.send_keys_response is not None:
+            return self.send_keys_response
         return window_id in self.windows
 
     async def capture_pane(
@@ -655,11 +660,17 @@ def _reset_status_polling() -> None:
 def _reset_interactive_ui() -> None:
     iu = interactive_ui
     for name in (
-        "_interactive_msg_ids",
-        "_interactive_modes",
-        "_ask_tool_inputs",
-        "_aqp_tokens",
-        "_aqe_tokens",
+        "_interactive_msgs",
+        "_interactive_mode",
+        "_interactive_msg_meta",
+        "_last_completed_ask_tool_input",
+        "_last_auq_tool_use_id",
+        "_pretool_ask_records",
+        "_pick_tokens",
+        "_pick_token_cache",
+        "_auq_context_posted",
+        "_auq_context_post_pending",
+        "_auq_context_msgs",
     ):
         attr = getattr(iu, name, None)
         if isinstance(attr, dict):
@@ -667,6 +678,16 @@ def _reset_interactive_ui() -> None:
 
 
 def _reset_all_handler_state() -> None:
+    ledger_path = app_dir() / auq_ledger.LEDGER_FILENAME
+    try:
+        ledger_path.unlink()
+    except FileNotFoundError:
+        pass
+    pending_dir = app_dir() / "auq_pending"
+    if pending_dir.is_dir():
+        for path in pending_dir.glob("*.json"):
+            path.unlink(missing_ok=True)
+    auq_ledger.reset_for_tests()
     busy_indicator.reset_for_tests()
     route_runtime.reset_for_tests()
     transcript_event_adapter.reset_for_tests()

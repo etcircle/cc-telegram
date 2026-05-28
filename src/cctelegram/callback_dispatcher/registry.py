@@ -23,6 +23,7 @@ from cctelegram.handlers.callback_data import (
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
     CB_ASK_TAB,
+    CB_ASK_TOGGLE,
     CB_ASK_UP,
     CB_DIR_BIND_EXISTING,
     CB_DIR_CANCEL,
@@ -239,6 +240,14 @@ CALLBACK_REGISTRY: tuple[CallbackRegistryEntry, ...] = (
         "cctelegram.handlers.interactive_ui",
         "cctelegram.callback_dispatcher.interactive",
         "tests/scenarios/test_interactive_prompt_safety.py",
+        "execute_interactive_callback",
+    ),
+    CallbackRegistryEntry(
+        CB_ASK_TOGGLE,
+        "InteractiveToggleCommand",
+        "cctelegram.handlers.interactive_ui",
+        "cctelegram.callback_dispatcher.interactive",
+        "tests/scenarios/test_auq_multi_select.py",
         "execute_interactive_callback",
     ),
     CallbackRegistryEntry(
