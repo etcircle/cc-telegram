@@ -1325,16 +1325,19 @@ def _pane_labels_match_candidate_by_number(
     if any(o.number is None for o in pane_form.options):
         return _labels_are_subsequence(pane_labels, candidate_labels)
 
+    checked_any = False
     for option in pane_form.options:
-        if is_affordance_label(option.label):
-            continue
         assert option.number is not None
         index = option.number - 1
-        if index < 0 or index >= len(candidate_labels):
+        if 0 <= index < len(candidate_labels):
+            if candidate_labels[index] != option.label:
+                return False
+            checked_any = True
+        else:
+            if is_affordance_label(option.label):
+                continue
             return False
-        if candidate_labels[index] != option.label:
-            return False
-    return True
+    return checked_any
 
 
 def _record_consistent_with_pane(
