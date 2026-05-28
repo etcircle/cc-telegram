@@ -1,0 +1,21 @@
+ ▐▛███▜▌   Claude Code v2.1.153
+▝▜█████▛▘  Sonnet 4.6 with high effort · Claude Max
+  ▘▘ ▝▝    ~/dev-workspaces/cc-telegram
+
+
+❯ Use the AskUserQuestion tool now. Ask: Pick two cc-telegram safeguards. Set multiSelect true. Options: A) Verify
+  cursor row before Space. B) Preserve side file through toggles. C) Suppress tabbed multi-question forms. D) Use
+  submit ledger for final Enter. Do not answer it yourself; leave the question open.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Safeguards  ✔ Submit  →
+
+Review your answers
+
+ ● Pick two cc-telegram safeguards.
+   → A) Verify cursor row before Space, B) Preserve side file through toggles
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel

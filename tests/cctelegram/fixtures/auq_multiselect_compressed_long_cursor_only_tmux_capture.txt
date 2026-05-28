@@ -1,0 +1,13 @@
+  field — label, description, option index — so no silent divergence exists between the two sources.
+↓ 3. [ ] C) Unknown-mode suppression
+  A scenario test or captured Telegram message log confirming that when the pane scraper cannot
+  confidently determine the picker state — for example because the tmux capture is mid-render, the
+  AUQ block is partially visible, or the side file is absent — the bot suppresses the picker card
+  entirely rather than posting a degraded label-only card. The artefact must show at least one
+  suppression event with the corresponding warning log line so the suppression is auditable and
+  distinguishable from a silent failure.
+     Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
