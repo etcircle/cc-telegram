@@ -4055,6 +4055,7 @@ from cctelegram.handlers.interactive_ui import (  # noqa: E402
     _PRETOOL_SCHEMA_VERSION,
     _PRETOOL_TTL_SECONDS,
     _labels_are_subsequence,
+    _pane_labels_match_candidate_by_number,
     _pretool_ask_records,
     _read_pretool_side_file,
     _record_consistent_with_pane,
@@ -4063,6 +4064,7 @@ from cctelegram.handlers.interactive_ui import (  # noqa: E402
 from cctelegram.terminal_parser import (  # noqa: E402,F811
     AskOption,
     AskUserQuestionForm,
+    is_affordance_label,
     parse_ask_user_question,
     questions_content_digest,
     questions_content_pairs_from_tool_input,
@@ -4217,6 +4219,14 @@ class TestLabelsAreSubsequence:
         assert _labels_are_subsequence(("X",), ("A", "B")) is False
 
 
+class TestAffordanceLabel:
+    def test_edge_cases(self):
+        assert is_affordance_label("Type something") is True
+        assert is_affordance_label("Type something.") is True
+        assert is_affordance_label("Chat about this") is True
+        assert is_affordance_label("Type a report") is False
+
+
 class TestRecordConsistentWithPane:
     def _single_q_record(self, labels: list[str], title: str = "Q"):
         tool_input = {
@@ -4337,6 +4347,38 @@ class TestRecordConsistentWithPane:
         options = tool_input["questions"][0]["options"]
         for option in options:
             assert option["description"] in out
+
+    def test_affordance_only_numbered_pane_rejected(self):
+        rec = self._single_q_record(["A", "B", "C"])
+        form = _make_form_single_question(
+            "Q", ["Type something.", "Chat about this"], option_numbers=[4, 5]
+        )
+
+        assert _pane_labels_match_candidate_by_number(form, ("A", "B", "C")) is False
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is False
+        assert reason == "label_mismatch"
+
+    def test_one_real_in_range_numbered_option_accepted(self):
+        rec = self._single_q_record(["A", "B", "C"])
+        form = _make_form_single_question("Q", ["B"], option_numbers=[2])
+
+        assert _pane_labels_match_candidate_by_number(form, ("A", "B", "C")) is True
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_in_range_real_option_named_type_something_is_not_skipped(self):
+        rec = self._single_q_record(["A", "Type something", "C"])
+        form = _make_form_single_question("Q", ["Type something"], option_numbers=[2])
+
+        assert (
+            _pane_labels_match_candidate_by_number(form, ("A", "Type something", "C"))
+            is True
+        )
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
 
     def test_pane_without_option_numbers_falls_back_to_subsequence(self):
         # Degenerate parser safety: if option numbers are absent, retain the
