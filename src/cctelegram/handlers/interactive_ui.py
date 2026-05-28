@@ -56,6 +56,7 @@ from .callback_data import (
     CB_ASK_RIGHT,
     CB_ASK_SPACE,
     CB_ASK_TAB,
+    CB_ASK_TOGGLE,
     CB_ASK_UP,
 )
 from .message_sender import (
@@ -1324,6 +1325,8 @@ def _pane_labels_match_candidate_by_number(
         return _labels_are_subsequence(pane_labels, candidate_labels)
 
     for option in pane_form.options:
+        if option.label in ("Type something", "Chat about this"):
+            continue
         assert option.number is not None
         index = option.number - 1
         if index < 0 or index >= len(candidate_labels):
@@ -2834,6 +2837,40 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
         lines.append("")
 
     if form.options:
+        if form.select_mode == "multi":
+            any_unknown = False
+            for opt in form.options:
+                if opt.selected is True:
+                    glyph = "☑"
+                elif opt.selected is False:
+                    glyph = "☐"
+                else:
+                    glyph = "·"
+                    any_unknown = True
+                cursor = "❯ " if opt.cursor else "  "
+                rec = " (Recommended)" if opt.recommended else ""
+                lines.append(f"{cursor}{glyph} {opt.number}. {opt.label}{rec}")
+                desc = _truncate_description(opt.description)
+                if desc:
+                    lines.append(f"    {desc}")
+            if form.is_free_text:
+                lines.append("")
+                lines.append("  (Type something — send a regular message to free-text)")
+            lines.append("")
+            if form.options_complete:
+                lines.append(
+                    "Tap a number to toggle · ⇥ Tab to review & submit · ⎋ Esc to cancel"
+                )
+            else:
+                lines.append(
+                    "full list unavailable; use ↑/↓ + Space then Tab in the keys below"
+                )
+            if any_unknown:
+                lines.append(
+                    "(· = selection state off-screen; tap to toggle, or scroll the tmux pane to confirm)"
+                )
+            return _clip_card_body("\n".join(lines).rstrip())
+
         for opt in form.options:
             cursor = "❯ " if opt.cursor else "  "
             rec = " (Recommended)" if opt.recommended else ""
@@ -2940,6 +2977,20 @@ def _build_pick_button_rows(
             (form.current_question_title or "<none>")[:80],
         )
         return []
+
+    if form.select_mode == "unknown":
+        logger.info("_build_pick_button_rows SUPPRESSED gate=select_mode_unknown")
+        return []
+    if form.select_mode == "multi" and len(form.questions) > 1:
+        logger.info(
+            "_build_pick_button_rows SUPPRESSED gate=multi_question_multi_select"
+        )
+        return []
+    if form.select_mode == "multi" and not form.options_complete:
+        logger.info("_build_pick_button_rows SUPPRESSED gate=incomplete_multi_select")
+        return []
+    if form.select_mode == "multi":
+        return _build_multi_toggle_rows(user_id, thread_id, window_id, form)
 
     fingerprint = form.fingerprint()
     deadline = time.monotonic() + _PICK_TOKEN_TTL_SECONDS
@@ -3056,6 +3107,84 @@ def _build_pick_button_rows(
             row = []
     if row:
         rows.append(row)
+    return rows
+
+
+def _build_multi_toggle_rows(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    form: AskUserQuestionForm,
+) -> list[list[InlineKeyboardButton]]:
+    """Build multi-select toggle buttons that dispatch a bare digit only."""
+    assert form.select_mode == "multi"
+    assert form.options_complete
+    assert len(form.questions) <= 1
+
+    fingerprint = form.fingerprint()
+    deadline = time.monotonic() + _PICK_TOKEN_TTL_SECONDS
+    pickable = [
+        opt for opt in form.options if opt.number is not None and 1 <= opt.number <= 9
+    ]
+    if not pickable:
+        return []
+
+    cache_key = (user_id, thread_id or 0, window_id, fingerprint)
+
+    def _mint(opt_number: int, label: str) -> str:
+        return _mint_pick_token(
+            _PickTokenEntry(
+                window_id=window_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                fingerprint=fingerprint,
+                option_number=opt_number,
+                option_label=label,
+                is_review_submit=False,
+                expires_at=deadline,
+            )
+        )
+
+    cached = _pick_token_cache.get(cache_key)
+    if (
+        cached is not None
+        and len(cached) == len(pickable)
+        and all(t in _pick_tokens for t in cached)
+    ):
+        tokens = cached
+    else:
+        tokens = [_mint(opt.number or 0, opt.label) for opt in pickable]
+        _pick_token_cache[cache_key] = tokens
+
+    from . import auq_ledger
+
+    route_hash = auq_ledger.make_route_hash(user_id, thread_id, window_id)
+    fp8 = fingerprint[:8]
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for opt, token in zip(pickable, tokens):
+        assert opt.number is not None
+        if opt.selected is True:
+            glyph = "☑"
+        elif opt.selected is False:
+            glyph = "☐"
+        else:
+            glyph = "·"
+        truncated = opt.label if len(opt.label) <= 24 else opt.label[:24] + "…"
+        text = f"{glyph} {opt.number}. {truncated}"
+        callback_payload = f"{CB_ASK_TOGGLE}{route_hash}:{fp8}:{opt.number}:{token}"
+        row.append(
+            InlineKeyboardButton(
+                text, callback_data=checked_callback_data(callback_payload)
+            )
+        )
+        if len(row) >= 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    # Optional discoverability button deliberately skipped: the existing ⇥ Tab
+    # key already sends users to the review screen without adding a second alias.
     return rows
 
 
@@ -3250,7 +3379,7 @@ async def handle_interactive_ui(
         # ``current_tab_inferred``; the FA5+ guard in
         # ``_build_pick_button_rows`` suppresses pick buttons when False so
         # we don't dispatch a digit against the wrong tab.
-        resolved_input = _resolve_ask_tool_input(window_id, tool_input)
+        resolved_input = _resolve_auq_source(window_id, tool_input, pane_text)
         form = resolve_ask_form(resolved_input, pane_text)
         if form is None:
             # Belt-and-braces fallback. resolve_ask_form already tries

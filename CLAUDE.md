@@ -41,7 +41,7 @@ cc-telegram hook --install            # Auto-install Claude Code SessionStart ho
   - `session_map.json` (hook-generated `window_id → session` mapping)
   - `monitor_state.json` (JSONL byte offsets per tracked session)
   - `interactive_state.json` (persisted picker msg ids + AUQ context markers; survives `launchctl kickstart`)
-  - `auq_pending/<session_id>.json` (`PreToolUse` side files; one per active AUQ; mode `0600` under directory mode `0700`; auto-GC'd on startup + on pick)
+  - `auq_pending/<session_id>.json` (`PreToolUse` side files; one per active AUQ; mode `0600` under directory mode `0700`; survives multi-select `aqt:` toggles; cleaned when AUQ `tool_result` calls `forget_ask_tool_input`, on session replacement, or by startup GC)
   - `auq_action_ledger.jsonl` (Wave 3 append-only write-ahead ledger of AUQ option-pick lifecycle states keyed by `(route_hash, fp8, opt)`; mode `0600`; latest line per key wins; the callback handler reads it BEFORE the in-memory `_pick_tokens` table so a duplicate tap after `launchctl kickstart` answers "Action already received" instead of re-dispatching the digit to tmux)
   - `message_refs.db` (SQLite provenance index; path overridable via `CC_TELEGRAM_MESSAGE_REFS_DB_PATH`)
   - `log-archive/` (gzipped log rotations; only if the rotation LaunchAgent is installed)
@@ -69,7 +69,7 @@ Or manually in `~/.claude/settings.json`:
 }
 ```
 
-`SessionStart` writes `session_map.json` (window ↔ session resolution). `PreToolUse` (matcher `AskUserQuestion`) captures the structured `tool_input` to `~/.cc-telegram/auq_pending/<session_id>.json` so the bot can render each option's full description in the Telegram picker at first render. The bot logs a one-time startup warning if `PreToolUse` is missing; re-run `cc-telegram hook --install` to repair.
+`SessionStart` writes `session_map.json` (window ↔ session resolution). `PreToolUse` (matcher `AskUserQuestion`) captures the structured `tool_input` to `~/.cc-telegram/auq_pending/<session_id>.json` so the bot can render each option's full description in the Telegram picker at first render. Multi-select AUQs use `aqt:` callbacks for non-ledgered bare-digit toggles; Tab reaches the review screen, where Submit/Cancel reuses the existing ledgered `aqp:` pick flow. The bot logs a one-time startup warning if `PreToolUse` is missing; re-run `cc-telegram hook --install` to repair.
 
 ## Documentation conventions
 
