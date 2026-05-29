@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable
 
 from . import route_runtime
 from .route_runtime import Route, RouteRuntimeSnapshot, TranscriptLifecycleEvent
@@ -188,38 +187,10 @@ def reset_for_tests() -> None:
     _warned_sessions.clear()
 
 
-# Re-export for callers that want to thread an observer through without
-# importing both modules. Hides the route_runtime symbol from callsites
-# that should only know about the adapter.
-subscribe: Callable[
-    [Route, Callable[[RouteRuntimeSnapshot], Awaitable[None]]],
-    Callable[[], None],
-] = route_runtime.subscribe
-snapshot: Callable[[Route], RouteRuntimeSnapshot] = route_runtime.snapshot
-mark_inbound_sent = route_runtime.mark_inbound_sent
-mark_topic_broken = route_runtime.mark_topic_broken
-mark_topic_recovered = route_runtime.mark_topic_recovered
-mark_pane_idle = route_runtime.mark_pane_idle
-mark_session_reset = route_runtime.mark_session_reset
-mark_status_card_published = route_runtime.mark_status_card_published
-mark_status_card_cleared = route_runtime.mark_status_card_cleared
-clear_route = route_runtime.clear_route
-
-
 __all__ = [
-    "clear_route",
     "dispatch_context_usage",
     "dispatch_seed_open_tools",
     "dispatch_transcript_event",
-    "mark_inbound_sent",
-    "mark_pane_idle",
-    "mark_session_reset",
-    "mark_status_card_cleared",
-    "mark_status_card_published",
-    "mark_topic_broken",
-    "mark_topic_recovered",
     "reset_for_tests",
-    "snapshot",
-    "subscribe",
     "to_lifecycle_event",
 ]

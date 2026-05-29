@@ -7,7 +7,7 @@ and a three-tier font fallback chain:
   2. Noto Sans Mono CJK SC — CJK characters
   3. Symbola — remaining special symbols
 
-Key function: text_to_image(text, font_size, with_ansi) → PNG bytes.
+Key function: text_to_image(text, font_size) → PNG bytes.
 """
 
 import asyncio
@@ -256,15 +256,12 @@ def _split_line_segments_plain(line: str) -> list[tuple[str, int]]:
     return segments
 
 
-async def text_to_image(
-    text: str, font_size: int = 28, with_ansi: bool = True
-) -> bytes:
+async def text_to_image(text: str, font_size: int = 28) -> bytes:
     """Render monospace text onto a dark-background image and return PNG bytes.
 
     Args:
         text: The text to render (may contain ANSI color codes)
         font_size: Font size in pixels
-        with_ansi: If True, parse and render ANSI color codes
 
     Returns:
         PNG image bytes
@@ -277,18 +274,7 @@ async def text_to_image(
         padding = 16
 
         # Parse lines into styled segments
-        if with_ansi:
-            line_segments = [_parse_ansi_line(line) for line in lines]
-        else:
-            # Legacy plain text mode
-            line_segments_plain = [_split_line_segments_plain(line) for line in lines]
-            line_segments = [
-                [
-                    StyledSegment(seg_text, TextStyle(), tier)
-                    for seg_text, tier in segments
-                ]
-                for segments in line_segments_plain
-            ]
+        line_segments = [_parse_ansi_line(line) for line in lines]
 
         # Measure text size
         dummy = Image.new("RGB", (1, 1))

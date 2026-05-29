@@ -1498,7 +1498,9 @@ def resolve_ask_form(
             return AskUserQuestionForm(
                 tabs=jsonl_form.tabs,
                 current_question_title=jsonl_form.current_question_title,
-                options=_overlay_cursor(jsonl_form.options, pane_form.options),
+                options=_overlay_cursor_and_selection(
+                    jsonl_form.options, pane_form.options
+                ),
                 is_review_screen=pane_form.is_review_screen,
                 is_free_text=pane_form.is_free_text,
                 pane_excerpt=pane_form.pane_excerpt,
@@ -1549,7 +1551,7 @@ def resolve_ask_form(
     # the validator and renderer see a stable shape; pick buttons are
     # suppressed downstream because current_tab_inferred is False.
     options = (
-        _overlay_cursor(current_q.options, pane_form.options)
+        _overlay_cursor_and_selection(current_q.options, pane_form.options)
         if pane_form is not None and inferred
         else current_q.options
     )
@@ -1661,14 +1663,6 @@ def _overlay_cursor_and_selection(
         )
         for o in jsonl_options
     )
-
-
-def _overlay_cursor(
-    jsonl_options: tuple[AskOption, ...],
-    pane_options: tuple[AskOption, ...],
-) -> tuple[AskOption, ...]:
-    """Backward-compatible cursor overlay helper."""
-    return _overlay_cursor_and_selection(jsonl_options, pane_options)
 
 
 def _jsonl_resolved_select_mode(

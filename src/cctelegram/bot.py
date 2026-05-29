@@ -378,7 +378,7 @@ async def screenshot_command(
         await safe_reply(update.message, "❌ Failed to capture pane content.")
         return
 
-    png_bytes = await text_to_image(text, with_ansi=True)
+    png_bytes = await text_to_image(text)
     keyboard = _build_screenshot_keyboard(wid)
     await update.message.reply_document(
         document=io.BytesIO(png_bytes),

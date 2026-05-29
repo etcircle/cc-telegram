@@ -65,7 +65,7 @@ async def execute_bash_callback(authorized: Any, adapters: Any) -> None:
         await asyncio.sleep(0.5)
         text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
         if text:
-            png_bytes = await text_to_image(text, with_ansi=True)
+            png_bytes = await text_to_image(text)
             keyboard = build_screenshot_keyboard(window_id)
             try:
                 await query.edit_message_media(
