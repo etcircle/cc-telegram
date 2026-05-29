@@ -885,16 +885,18 @@ class SessionMonitor:
             for user_id, thread_id, wid in session_manager.iter_thread_bindings():
                 if wid in changed_window_ids:
                     busy_indicator.clear_route((user_id, thread_id or 0, wid))
-                    if config.route_runtime_v2:
-                        # Same intent as busy_indicator.clear_route, but
-                        # routed through ``mark_session_reset`` so the
-                        # snapshot transitions visibly (IDLE_CLEARED with
-                        # ``status_card_msg_id`` preserved). Lets
-                        # subscribers observe the reset instead of
-                        # silently dropping route state.
-                        await route_runtime.mark_session_reset(
-                            (user_id, thread_id or 0, wid)
-                        )
+                    # Same intent as busy_indicator.clear_route, but routed
+                    # through ``mark_session_reset`` so the snapshot transitions
+                    # visibly (IDLE_CLEARED with ``status_card_msg_id``
+                    # preserved). Lets subscribers observe the reset instead of
+                    # silently dropping route state. Unconditional (8a): the
+                    # context footer reads route_runtime.context_usage in ALL
+                    # configs, so this reset (which drops that cache) must mirror
+                    # busy_indicator.clear_route in all configs — else the 1M
+                    # latch survives a session change in flag-off config.
+                    await route_runtime.mark_session_reset(
+                        (user_id, thread_id or 0, wid)
+                    )
                     logger.info(
                         "Cleared busy_indicator route after session change: "
                         "user=%d thread=%s window=%s",
