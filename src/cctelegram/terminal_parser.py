@@ -1238,18 +1238,19 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     # from this field, so we only populate it from a region anchored
     # by the tab header (a strong "this is the picker" signal).
     current_question_title: str | None = None
-    for line in options_region:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if _RE_NUMBERED_OPTION.match(line):
+    if tab_header_idx is not None:
+        for line in options_region:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _RE_NUMBERED_OPTION.match(line):
+                break
+            if _RE_TAB_HEADER.match(line):
+                continue
+            if all(c == "─" for c in stripped):
+                continue
+            current_question_title = stripped
             break
-        if _RE_TAB_HEADER.match(line):
-            continue
-        if all(c == "─" for c in stripped):
-            continue
-        current_question_title = stripped
-        break
 
     # ``pane_walkback_title`` (display only): walked-back title for the
     # single-tab path. Bounded gap (≤2 blanks between candidate and

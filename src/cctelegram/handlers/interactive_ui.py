@@ -1399,14 +1399,22 @@ def _record_consistent_with_pane(
         return False, "no_candidate"
 
     # Step 5.b — TITLE check (conditional).
-    # Skip when:
-    #   - pane title empty
+    # Skip only when:
+    #   - pane title empty (including compressed panes where the current
+    #     question has scrolled off-screen)
     #   - pane title sourced from walkback only (current_question_title is
     #     empty, pane_walkback_title may be set but is unreliable per the
     #     parser's docstring — DON'T use it for acceptance)
     #   - candidate has no question title
+    #
+    # Deliberately do NOT require contiguous-from-1 options here: compressed
+    # panes can still expose a reliable current_question_title, and accepting
+    # a stale side file on labels alone can dispatch the old digit against a
+    # different live question. Residual: if the pane title is genuinely
+    # unparseable and labels coincidentally match a stale not-overwritten side
+    # file within TTL, that edge remains irreducible without question text.
     candidate_title = (candidate.get("question") or "").strip()
-    if pane_title and candidate_title and pane_form.options_contiguous_from_one():
+    if pane_title and candidate_title:
         if not (
             candidate_title.startswith(pane_title)
             or pane_title.startswith(candidate_title)
