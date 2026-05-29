@@ -470,16 +470,15 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         payload = data[len(CB_ASK_PICK) :]
         parts = payload.split(":")
         # Parse shape:
-        #   len == 1 → legacy ``aqp:<token>`` (rendered pre-Wave-3; still
-        #              valid for up to the 5-minute pick-token TTL after deploy).
-        #   len == 4 → new keyed ``aqp:<route_hash>:<fp8>:<opt>:<token>``;
+        #   len == 4 → keyed ``aqp:<route_hash>:<fp8>:<opt>:<token>``;
         #              the leading triplet feeds the restart-safe ledger.
         #   anything else → malformed → refresh card.
+        # ``ledger_key`` stays ``str | None`` because the collision-suppression
+        # paths below (wrong-user/live-token collision and same-user route/window
+        # drift) reset it to ``None`` to avoid clobbering another route's row.
         ledger_key: str | None = None
         token: str
-        if len(parts) == 1:
-            token = parts[0]
-        elif len(parts) == 4:
+        if len(parts) == 4:
             route_hash, fp8, opt_str, token = parts
             try:
                 opt_num = int(opt_str)
@@ -729,10 +728,15 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 )
                 return
 
-        # Write-ahead ledger BEFORE dispatch. Legacy callbacks (ledger_key
-        # is None) skip the ledger entirely — they retain pre-Wave-3
-        # behavior for the duration of the rolling 5-minute TTL window
-        # after deploy.
+        # Write-ahead ledger BEFORE dispatch. ``ledger_key`` is None ONLY on a
+        # collision-suppression fall-through (set above at the wrong-user/
+        # live-token and same-user window-drift checks): the ledger row belongs
+        # to a DIFFERENT route, so we must NOT write to that key here or we'd
+        # clobber the rightful owner's lifecycle. These guards therefore
+        # protect collision suppression — do not remove them. (The legacy
+        # one-part ``aqp:<token>`` callback shape that also used to leave
+        # ledger_key None was removed in Wave 4; only the collision path
+        # remains.)
         if ledger_key is not None:
             auq_ledger.record(
                 ledger_key,

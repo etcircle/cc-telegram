@@ -26,7 +26,7 @@ from cctelegram.handlers.callback_data import (
     CB_DIR_SELECT,
     CB_KEYS_PREFIX,
 )
-from cctelegram.handlers import interactive_ui
+from cctelegram.handlers import auq_ledger, interactive_ui
 from cctelegram.handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PATH_KEY,
@@ -101,6 +101,17 @@ def _mint_test_pick_token(user_id: int, *, window_id: str = "@1") -> str:
     )
 
 
+def _keyed_pick_callback(token: str, *, user_id: int = 1, window_id: str = "@1") -> str:
+    """Build the Wave 3 keyed ``aqp:<route_hash>:<fp8>:<opt>:<token>`` shape.
+
+    Mirrors the minted entry (thread_id=10, fingerprint="fp", option 1). The
+    keyed triplet is the only callback shape the dispatcher parses since the
+    legacy ``aqp:<token>`` shape was retired.
+    """
+    route_hash = auq_ledger.make_route_hash(user_id, 10, window_id)
+    return f"{CB_ASK_PICK}{route_hash}:fp:1:{token}"
+
+
 def _ctx(query: FakeQuery, user_id: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         update=SimpleNamespace(
@@ -162,7 +173,7 @@ async def test_execute_rejects_stale_window_before_tmux_lookup() -> None:
 @pytest.mark.asyncio
 async def test_wrong_user_pick_does_not_consume_token() -> None:
     token = _mint_test_pick_token(user_id=1)
-    query = FakeQuery(f"{CB_ASK_PICK}{token}")
+    query = FakeQuery(_keyed_pick_callback(token, user_id=1))
     authorized = authorize_initial(parse(query.data.encode()), _ctx(query, user_id=2))
 
     await execute(authorized, _adapters(FakeSessionManager(), FakeTmuxManager()))
@@ -174,7 +185,7 @@ async def test_wrong_user_pick_does_not_consume_token() -> None:
 @pytest.mark.asyncio
 async def test_stale_owner_pick_does_not_consume_token() -> None:
     token = _mint_test_pick_token(user_id=1, window_id="@1")
-    query = FakeQuery(f"{CB_ASK_PICK}{token}")
+    query = FakeQuery(_keyed_pick_callback(token, user_id=1, window_id="@1"))
     authorized = authorize_initial(parse(query.data.encode()), _ctx(query, user_id=1))
 
     await execute(
@@ -188,7 +199,7 @@ async def test_stale_owner_pick_does_not_consume_token() -> None:
 @pytest.mark.asyncio
 async def test_stale_owner_pick_answers_exactly_once() -> None:
     token = _mint_test_pick_token(user_id=1, window_id="@1")
-    query = FakeQuery(f"{CB_ASK_PICK}{token}")
+    query = FakeQuery(_keyed_pick_callback(token, user_id=1, window_id="@1"))
     authorized = authorize_initial(parse(query.data.encode()), _ctx(query, user_id=1))
 
     await execute(
@@ -200,20 +211,27 @@ async def test_stale_owner_pick_answers_exactly_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_double_pick_second_click_is_expired_after_first_consumes(
+async def test_double_pick_second_click_is_already_received_after_first_dispatch(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
 ) -> None:
+    # Scope the keyed-shape ledger to a tmp file so the dispatch row from
+    # the first click doesn't leak into real state.
+    auq_ledger.reset_for_tests(
+        path=tmp_path / "auq_action_ledger.jsonl",
+        start_time=time.time(),
+    )
     token = _mint_test_pick_token(user_id=1)
     monkeypatch.setattr(
         "cctelegram.handlers.interactive_ui.resolve_ask_tool_input", lambda _wid: None
     )
     monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
-    query1 = FakeQuery(f"{CB_ASK_PICK}{token}")
+    query1 = FakeQuery(_keyed_pick_callback(token, user_id=1))
     authorized1 = authorize_initial(
         parse(query1.data.encode()), _ctx(query1, user_id=1)
     )
-    query2 = FakeQuery(f"{CB_ASK_PICK}{token}")
+    query2 = FakeQuery(_keyed_pick_callback(token, user_id=1))
     authorized2 = authorize_initial(
         parse(query2.data.encode()), _ctx(query2, user_id=1)
     )
@@ -221,8 +239,12 @@ async def test_double_pick_second_click_is_expired_after_first_consumes(
     await execute(authorized1, _adapters(FakeSessionManager(), FakeTmuxManager()))
     await execute(authorized2, _adapters(FakeSessionManager(), FakeTmuxManager()))
 
+    # First click dispatches and writes the ``dispatched`` ledger row; the
+    # second click on the same keyed callback finds that row and answers
+    # "Action already received" instead of re-dispatching the digit.
     assert query1.answers == [("1. Yes", False)]
-    assert query2.answers == [("Card expired, refreshing.", False)]
+    assert query2.answers == [("Action already received: Yes", False)]
+    auq_ledger.reset_for_tests()
 
 
 @pytest.mark.asyncio
