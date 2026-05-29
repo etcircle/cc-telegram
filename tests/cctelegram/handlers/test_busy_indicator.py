@@ -320,29 +320,6 @@ def test_clear_route_drops_state():
 
 
 @pytest.mark.asyncio
-async def test_state_callback_fires_on_transition():
-    seen: list[tuple[RunState, RunState]] = []
-
-    async def cb(route: busy_indicator.Route, old: RunState, new: RunState) -> None:
-        assert route == ROUTE
-        seen.append((old, new))
-
-    busy_indicator.register_state_callback(cb)
-
-    await busy_indicator.on_transcript_event(
-        _event(
-            role="assistant",
-            block_type="tool_use",
-            tool_use_id="t1",
-            tool_name="Bash",
-            stop_reason="tool_use",
-        ),
-        [ROUTE],
-    )
-    assert seen == [(RunState.IDLE_CLEARED, RunState.RUNNING_TOOL)]
-
-
-@pytest.mark.asyncio
 async def test_parallel_interactive_and_non_interactive_tools():
     """Locks Bug 1: closing the interactive tool must drop back to RUNNING_TOOL
     while a non-interactive tool is still pending — not stay WAITING_ON_USER."""
@@ -391,14 +368,8 @@ async def test_parallel_interactive_and_non_interactive_tools():
 
 @pytest.mark.asyncio
 async def test_mark_topic_recovered_restores_prior_state():
-    """Locks Bug 2: BROKEN_TOPIC has an explicit recovery path that fires
-    callbacks and restores the pre-broken state without needing a new
-    JSONL event."""
-    seen: list[tuple[RunState, RunState]] = []
-
-    async def cb(route: busy_indicator.Route, old: RunState, new: RunState) -> None:
-        seen.append((old, new))
-
+    """Locks Bug 2: BROKEN_TOPIC has an explicit recovery path that
+    restores the pre-broken state without needing a new JSONL event."""
     # 1. Walk to RUNNING via a tool_use + tool_result.
     await busy_indicator.on_transcript_event(
         _event(
@@ -416,10 +387,6 @@ async def test_mark_topic_recovered_restores_prior_state():
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING
 
-    # Register the callback after the warm-up transitions so we only see the
-    # broken/recovered pair.
-    busy_indicator.register_state_callback(cb)
-
     # 2. Mark broken.
     await busy_indicator.mark_topic_broken(ROUTE)
     assert busy_indicator.state(ROUTE) is RunState.BROKEN_TOPIC
@@ -427,10 +394,6 @@ async def test_mark_topic_recovered_restores_prior_state():
     # 3. Explicit recovery — back to RUNNING without any TranscriptEvent.
     await busy_indicator.mark_topic_recovered(ROUTE)
     assert busy_indicator.state(ROUTE) is RunState.RUNNING
-
-    # 4. Both transitions visible to the callback.
-    assert (RunState.RUNNING, RunState.BROKEN_TOPIC) in seen
-    assert (RunState.BROKEN_TOPIC, RunState.RUNNING) in seen
 
 
 @pytest.mark.asyncio
@@ -511,67 +474,6 @@ async def test_mid_turn_assistant_text_with_open_tool_stays_running_tool():
         [ROUTE],
     )
     assert busy_indicator.state(ROUTE) is RunState.RUNNING_TOOL
-
-
-@pytest.mark.asyncio
-async def test_register_state_callback_dedupes_by_identity():
-    calls: list[int] = []
-
-    async def cb(route: busy_indicator.Route, old: RunState, new: RunState) -> None:
-        calls.append(1)
-
-    busy_indicator.register_state_callback(cb)
-    busy_indicator.register_state_callback(cb)  # duplicate — should be ignored
-    busy_indicator.register_state_callback(cb)  # third — also ignored
-
-    await busy_indicator.on_transcript_event(
-        _event(
-            role="assistant",
-            block_type="tool_use",
-            tool_use_id="t1",
-            tool_name="Bash",
-            stop_reason="tool_use",
-        ),
-        [ROUTE],
-    )
-    assert calls == [1]
-
-
-@pytest.mark.asyncio
-async def test_state_callback_exception_does_not_block_others(
-    caplog: pytest.LogCaptureFixture,
-):
-    seen_b: list[tuple[RunState, RunState]] = []
-
-    async def cb_a(route: busy_indicator.Route, old: RunState, new: RunState) -> None:
-        raise RuntimeError("boom from cb_a")
-
-    async def cb_b(route: busy_indicator.Route, old: RunState, new: RunState) -> None:
-        seen_b.append((old, new))
-
-    busy_indicator.register_state_callback(cb_a)
-    busy_indicator.register_state_callback(cb_b)
-
-    import logging
-
-    with caplog.at_level(logging.ERROR, logger=busy_indicator.logger.name):
-        await busy_indicator.on_transcript_event(
-            _event(
-                role="assistant",
-                block_type="tool_use",
-                tool_use_id="t1",
-                tool_name="Bash",
-                stop_reason="tool_use",
-            ),
-            [ROUTE],
-        )
-
-    # The transition still landed.
-    assert busy_indicator.state(ROUTE) is RunState.RUNNING_TOOL
-    # cb_b ran despite cb_a raising.
-    assert seen_b == [(RunState.IDLE_CLEARED, RunState.RUNNING_TOOL)]
-    # The error was logged.
-    assert any("state callback error" in rec.message for rec in caplog.records)
 
 
 @pytest.mark.asyncio

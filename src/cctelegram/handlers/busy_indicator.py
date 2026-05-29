@@ -16,10 +16,10 @@ handles for routes that go away mid-decay.
 
 Public surface:
   - ``RunState``
-  - ``register_state_callback(cb)`` — process-lifetime registration; deduped by identity
-  - ``register_activity_callback(cb)`` — fires on every real activity event,
-    even when state didn't change (closes the gap that ``register_state_callback``
-    can't, since same-state refreshes don't reach ``_set_state``'s fan-out)
+  - ``register_activity_callback(cb)`` — process-lifetime registration
+    (deduped by identity); fires on every real activity event, even when
+    state didn't change, which is what the status_polling idle-clear re-arm
+    relies on
   - ``state(route)``
   - ``context_usage(route)`` / ``update_context_usage(route, tokens, model)``
   - ``context_pct(route)`` — derived from usage, kept for the digest gate
@@ -103,34 +103,16 @@ _context_usage: dict[Route, ContextUsage] = {}
 # restore where we were rather than guessing.
 _pre_broken_state: dict[Route, RunState] = {}
 
-StateCallback = Callable[[Route, RunState, RunState], Awaitable[None]]
-_state_callbacks: list[StateCallback] = []
-
 ActivityCallback = Callable[[Route], Awaitable[None]]
 _activity_callbacks: list[ActivityCallback] = []
-
-
-def register_state_callback(callback: StateCallback) -> None:
-    """Register a coroutine called on every state transition.
-
-    Callback signature: ``(route, old_state, new_state)``. Multiple callbacks
-    are supported; they fire in registration order. Exceptions in one do not
-    prevent the next from running.
-
-    Registrations are process-lifetime — there is no unregister. Identity
-    dedupe guards against accidental double-registration on bot reload.
-    """
-    if callback in _state_callbacks:
-        return
-    _state_callbacks.append(callback)
 
 
 def register_activity_callback(callback: ActivityCallback) -> None:
     """Register a coroutine called on every real activity event for a route.
 
-    Unlike ``register_state_callback``, this fires even when state didn't
-    change (same-state activity refreshes), which is required by the
-    status_polling idle-clear re-arm mechanism. Once ``mark_pane_idle`` has
+    This fires even when state didn't change (same-state activity
+    refreshes), which is required by the status_polling idle-clear re-arm
+    mechanism. Once ``mark_pane_idle`` has
     fired for a route, ``status_polling._idle_state[key]`` becomes
     ``"cleared"`` and only re-arms when ``is_running == True`` is observed
     on the pane. Sub-agent / quick tool turns routinely slip between the
@@ -180,7 +162,6 @@ def reset_for_tests() -> None:
     _last_event_at.clear()
     _context_usage.clear()
     _pre_broken_state.clear()
-    _state_callbacks.clear()
     _activity_callbacks.clear()
 
 
@@ -375,7 +356,7 @@ def seed_open_tools(route: Route, tools: dict[str, bool]) -> None:
 
 
 async def _set_state(route: Route, new: RunState) -> None:
-    """Mutate state and fire callbacks if it actually changed."""
+    """Mutate the route's run state when it actually changed."""
     old = _run_state.get(route, RunState.IDLE_CLEARED)
     _last_event_at[route] = _now()
     if old is new:
@@ -388,17 +369,6 @@ async def _set_state(route: Route, new: RunState) -> None:
         new.value,
         sorted(_open_tools.get(route, {}).keys()),
     )
-    for cb in list(_state_callbacks):
-        try:
-            await cb(route, old, new)
-        except Exception as e:
-            logger.error(
-                "state callback error route=%s old=%s new=%s: %s",
-                route,
-                old.value,
-                new.value,
-                e,
-            )
 
 
 async def _apply_event(event: TranscriptEvent, route: Route) -> None:
@@ -512,11 +482,10 @@ async def on_transcript_event(event: TranscriptEvent, routes: list[Route]) -> No
 
     Fires ``_fire_activity(route)`` after each ``_apply_event`` regardless
     of whether the state actually changed. This is what lets the
-    status_polling idle-clear backstop re-arm after a previous clear: a
-    bare ``register_state_callback`` would miss same-state refreshes (e.g.
-    a second ``tool_use`` while already ``RUNNING_TOOL``), and those are
-    exactly the events that re-leak ``open_tools`` after the first
-    ``mark_pane_idle`` had drained them.
+    status_polling idle-clear backstop re-arm after a previous clear:
+    same-state refreshes (e.g. a second ``tool_use`` while already
+    ``RUNNING_TOOL``) are exactly the events that re-leak ``open_tools``
+    after the first ``mark_pane_idle`` had drained them.
     """
     for route in routes:
         await _apply_event(event, route)

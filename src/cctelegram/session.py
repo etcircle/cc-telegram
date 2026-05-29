@@ -212,11 +212,7 @@ class SessionManager:
         return key.startswith("@") and len(key) > 1 and key[1:].isdigit()
 
     def _load_state(self) -> None:
-        """Load state synchronously during initialization.
-
-        Detects old-format state (window_name keys without '@' prefix) and
-        marks for migration on next startup re-resolution.
-        """
+        """Load state synchronously during initialization."""
         if config.state_file.exists():
             try:
                 state = json.loads(config.state_file.read_text())
@@ -236,28 +232,6 @@ class SessionManager:
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
-
-                # Detect old format: keys that don't look like window IDs
-                needs_migration = False
-                for k in self.window_states:
-                    if not self._is_window_id(k):
-                        needs_migration = True
-                        break
-                if not needs_migration:
-                    for bindings in self.thread_bindings.values():
-                        for wid in bindings.values():
-                            if not self._is_window_id(wid):
-                                needs_migration = True
-                                break
-                        if needs_migration:
-                            break
-
-                if needs_migration:
-                    logger.info(
-                        "Detected old-format state (window_name keys), "
-                        "will re-resolve on startup"
-                    )
-                    pass
 
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning("Failed to load state: %s", e)

@@ -130,9 +130,9 @@ class Config:
         # message_queue's status-card visibility into one lock-protected
         # interface. Default False during soak; flip to True manually,
         # observe for ≥48h, then a follow-up commit deletes the legacy
-        # ``busy_indicator.register_state_callback`` /
-        # ``register_activity_callback`` fan-out and the ``_idle_state``
-        # backstop. Asymmetry with ``busy_indicator_v2`` (default True)
+        # ``busy_indicator.register_activity_callback`` fan-out and the
+        # ``_idle_state`` backstop. Asymmetry with ``busy_indicator_v2``
+        # (default True)
         # is intentional — Wave B ships off-by-default so the legacy path
         # continues to drive production until the snapshot interface has
         # had real load.

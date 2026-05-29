@@ -103,7 +103,7 @@ async def execute_screenshot_callback(authorized: Any, adapters: Any) -> None:
             await safe_answer(query, "Failed to capture pane", show_alert=True)
             return
 
-        png_bytes = await text_to_image(text, with_ansi=True)
+        png_bytes = await text_to_image(text)
         keyboard = build_screenshot_keyboard(window_id)
         try:
             await query.edit_message_media(
