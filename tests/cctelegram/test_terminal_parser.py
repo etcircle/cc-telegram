@@ -2908,3 +2908,52 @@ class TestArrowNavStaleScrollbackCursor:
         form = parse_ask_user_question(pane)
         assert form is not None
         assert [o.number for o in form.options if o.cursor] == [2]
+
+    def test_multiselect_long_scrolled_real_capture_no_false_cursor(self):
+        # Real 80x24 capture: a long multiselect picker scrolled to cursor=4
+        # with options 1,2 toggled [✔]. Option 1 is in scrollback. The parser
+        # must report exactly the live cursor (4) and preserve checkbox state —
+        # NOT invent a stale cursor on a scrolled-off row.
+        form = parse_ask_user_question(
+            _fixture("auq_multiselect_long_scrolled_toggled_S500.txt")
+        )
+        assert form is not None
+        assert form.select_mode == "multi"
+        assert [o.number for o in form.options if o.cursor] == [4]
+        assert [(o.number, o.selected) for o in form.options] == [
+            (1, True),
+            (2, True),
+            (3, False),
+            (4, False),
+            (5, False),
+        ]
+
+    def test_multiselect_stale_above_live_below_keeps_last_with_checkboxes(self):
+        # Synthetic composition of the established stale-scrollback structure on
+        # a MULTISELECT pane: a frozen ❯ on option 1 (scrollback, [✔]) above the
+        # live ❯ on option 3 ([ ]). keep-last must select option 3 as the live
+        # cursor while preserving every checkbox state.
+        pane = (
+            "←  ☐ Safeguards  ✔ Submit  →\n"
+            "Select safeguards.\n\n"
+            "❯ 1. [✔] A) Verify cursor row\n"
+            "  2. [✔] B) Keep side file\n"
+            "❯ 3. [ ] C) Suppress tabbed\n"
+            "  4. [ ] D) Ledger Enter\n"
+            "  5. [ ] Type something\n"
+            "     Submit\n"
+            "─\n"
+            "  6. Chat about this\n"
+            "\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert form.select_mode == "multi"
+        assert [o.number for o in form.options if o.cursor] == [3]
+        assert [(o.number, o.selected) for o in form.options[:5]] == [
+            (1, True),
+            (2, True),
+            (3, False),
+            (4, False),
+            (5, False),
+        ]

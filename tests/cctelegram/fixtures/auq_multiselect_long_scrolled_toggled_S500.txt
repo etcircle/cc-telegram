@@ -1,0 +1,55 @@
+export CC_TELEGRAM_DIR=/tmp/auqdbg4; cd /Users/felixcardix/dev-workspaces/cc-tel
+egram
+felixcardix@Felixs-Mac-mini cc-telegram % export CC_TELEGRAM_DIR=/tmp/auqdbg4; c
+d /Users/felixcardix/dev-workspaces/cc-telegram
+felixcardix@Felixs-Mac-mini cc-telegram % claude --dangerously-skip-permissions
+--model sonnet "Use the AskUserQuestion tool now with multiSelect TRUE. Question
+ title: Select safeguards to ship. Provide 4 options each WITH a long ~200-char
+description: A) Verify cursor row from the tmux pane before dispatching Space so
+ toggles never hit the wrong option even on compressed panes; B) Keep the PreToo
+lUse side file alive across every toggle so descriptions survive; C) Suppress ta
+bbed multi-question forms when the current tab cannot be confidently inferred; D
+) Use the submit ledger for the final Enter so a duplicate tap after restart is
+idempotent. Do not answer it yourself; leave it open."
+ ▐▛███▜▌   Claude Code v2.1.156
+▝▜█████▛▘  Sonnet 4.6 with high effort · Claude Max
+  ▘▘ ▝▝    ~/dev-workspaces/cc-telegram
+
+
+❯ Use the AskUserQuestion tool now with multiSelect TRUE. Question title:
+  Select safeguards to ship. Provide 4 options each WITH a long ~200-char
+  description: A) Verify cursor row from the tmux pane before dispatching Space
+  so toggles never hit the wrong option even on compressed panes; B) Keep the
+  PreToolUse side file alive across every toggle so descriptions survive; C)
+  Suppress tabbed multi-question forms when the current tab cannot be
+  confidently inferred; D) Use the submit ledger for the final Enter so a
+  duplicate tap after restart is idempotent. Do not answer it yourself; leave
+  it open.
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Safeguards  ✔ Submit  →
+
+Select safeguards to ship?
+
+  1. [✔] A) Verify cursor row
+  Verify cursor row from the tmux pane before dispatching Space so toggles never
+  hit the wrong option even on compressed panes where only the cursor line is
+  visible to the scraper.
+  2. [✔] B) Keep side file alive
+  Keep the PreToolUse side file alive across every multi-select toggle so full
+  option descriptions survive the entire pick session and are never lost between
+  aqt: callbacks.
+  3. [ ] C) Suppress tabbed forms
+  Suppress tabbed multi-question forms when the current tab cannot be
+  confidently inferred from the pane, preventing silent wrong-tab submission on
+  ambiguous or compressed terminal output.
+❯ 4. [ ] D) Ledger the final Enter
+  Use the submit ledger for the final Enter keystroke so a duplicate Submit tap
+  after a launchctl kickstart restart is idempotent and never dispatches a
+  second Enter to tmux.
+  5. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
