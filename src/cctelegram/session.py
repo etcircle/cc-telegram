@@ -245,11 +245,14 @@ class SessionManager:
     async def resolve_stale_ids(self) -> None:
         """Re-resolve persisted window IDs against live tmux windows.
 
-        Called on startup. Handles two cases:
-        1. Old-format migration: window_name keys → window_id keys
-        2. Stale IDs: window_id no longer exists but display name matches a live window
+        Called on startup. Handles stale IDs: a window_id no longer exists
+        but its display name matches a live window, so the entry is re-pointed
+        at the new id (or dropped if no live window matches).
 
-        Builds {window_name: window_id} from live windows, then remaps or drops entries.
+        Builds {window_name: window_id} from live windows, then remaps or drops
+        entries. Pre-2026-02-11 ``window_name``-keyed entries are no longer
+        migrated; any such legacy keys found on load are dropped with a one-shot
+        per-map warning (the live hook only ever emits ``@N`` keys).
         """
         windows = await tmux_manager.list_windows()
         live_by_name: dict[str, str] = {}  # window_name -> window_id
@@ -265,88 +268,87 @@ class SessionManager:
         # offsets are silently dropped.
         stale_display_name_keys: set[str] = set()
 
-        # --- Migrate window_states ---
+        # --- Re-resolve window_states (window_id keys only) ---
+        legacy_window_state_keys = [
+            key for key in self.window_states if not self._is_window_id(key)
+        ]
+        if legacy_window_state_keys:
+            logger.warning(
+                "dropping legacy window_name-keyed %s entries: %s",
+                "window_states",
+                sorted(legacy_window_state_keys),
+            )
+            changed = True
         new_window_states: dict[str, WindowState] = {}
         for key, ws in self.window_states.items():
-            if self._is_window_id(key):
-                if key in live_ids:
-                    new_window_states[key] = ws
-                else:
-                    # Stale ID — try re-resolve by display name
-                    display = self.window_display_names.get(key, ws.window_name or key)
-                    new_id = live_by_name.get(display)
-                    if new_id:
-                        logger.info(
-                            "Re-resolved stale window_id %s -> %s (name=%s)",
-                            key,
-                            new_id,
-                            display,
-                        )
-                        new_window_states[new_id] = ws
-                        ws.window_name = display
-                        self.window_display_names[new_id] = display
-                        stale_display_name_keys.add(key)
-                        changed = True
-                    else:
-                        logger.info(
-                            "Dropping stale window_state: %s (name=%s)", key, display
-                        )
-                        changed = True
+            if not self._is_window_id(key):
+                # Pre-2026-02-11 window_name-keyed legacy entry — dropped.
+                continue
+            if key in live_ids:
+                new_window_states[key] = ws
             else:
-                # Old format: key is window_name
-                new_id = live_by_name.get(key)
+                # Stale ID — try re-resolve by display name
+                display = self.window_display_names.get(key, ws.window_name or key)
+                new_id = live_by_name.get(display)
                 if new_id:
-                    logger.info("Migrating window_state key %s -> %s", key, new_id)
-                    ws.window_name = key
+                    logger.info(
+                        "Re-resolved stale window_id %s -> %s (name=%s)",
+                        key,
+                        new_id,
+                        display,
+                    )
                     new_window_states[new_id] = ws
-                    self.window_display_names[new_id] = key
+                    ws.window_name = display
+                    self.window_display_names[new_id] = display
+                    stale_display_name_keys.add(key)
                     changed = True
                 else:
                     logger.info(
-                        "Dropping old-format window_state: %s (no live window)", key
+                        "Dropping stale window_state: %s (name=%s)", key, display
                     )
                     changed = True
         self.window_states = new_window_states
 
-        # --- Migrate thread_bindings ---
+        # --- Re-resolve thread_bindings (window_id values only) ---
+        legacy_thread_binding_vals = sorted(
+            {
+                val
+                for bindings in self.thread_bindings.values()
+                for val in bindings.values()
+                if not self._is_window_id(val)
+            }
+        )
+        if legacy_thread_binding_vals:
+            logger.warning(
+                "dropping legacy window_name-keyed %s entries: %s",
+                "thread_bindings",
+                legacy_thread_binding_vals,
+            )
+            changed = True
         for uid, bindings in self.thread_bindings.items():
             new_bindings: dict[int, str] = {}
             for tid, val in bindings.items():
-                if self._is_window_id(val):
-                    if val in live_ids:
-                        new_bindings[tid] = val
-                    else:
-                        display = self.window_display_names.get(val, val)
-                        new_id = live_by_name.get(display)
-                        if new_id:
-                            logger.info(
-                                "Re-resolved thread binding %s -> %s (name=%s)",
-                                val,
-                                new_id,
-                                display,
-                            )
-                            new_bindings[tid] = new_id
-                            self.window_display_names[new_id] = display
-                            changed = True
-                        else:
-                            logger.info(
-                                "Dropping stale thread binding: user=%d, thread=%d, wid=%s",
-                                uid,
-                                tid,
-                                val,
-                            )
-                            changed = True
+                if not self._is_window_id(val):
+                    # Pre-2026-02-11 window_name-keyed legacy binding — dropped.
+                    continue
+                if val in live_ids:
+                    new_bindings[tid] = val
                 else:
-                    # Old format: val is window_name
-                    new_id = live_by_name.get(val)
+                    display = self.window_display_names.get(val, val)
+                    new_id = live_by_name.get(display)
                     if new_id:
-                        logger.info("Migrating thread binding %s -> %s", val, new_id)
+                        logger.info(
+                            "Re-resolved thread binding %s -> %s (name=%s)",
+                            val,
+                            new_id,
+                            display,
+                        )
                         new_bindings[tid] = new_id
-                        self.window_display_names[new_id] = val
+                        self.window_display_names[new_id] = display
                         changed = True
                     else:
                         logger.info(
-                            "Dropping old-format thread binding: user=%d, thread=%d, name=%s",
+                            "Dropping stale thread binding: user=%d, thread=%d, wid=%s",
                             uid,
                             tid,
                             val,
@@ -359,23 +361,33 @@ class SessionManager:
         for uid in empty_users:
             del self.thread_bindings[uid]
 
-        # --- Migrate user_window_offsets ---
+        # --- Re-resolve user_window_offsets (window_id keys only) ---
+        legacy_offset_keys = sorted(
+            {
+                key
+                for offsets in self.user_window_offsets.values()
+                for key in offsets
+                if not self._is_window_id(key)
+            }
+        )
+        if legacy_offset_keys:
+            logger.warning(
+                "dropping legacy window_name-keyed %s entries: %s",
+                "user_window_offsets",
+                legacy_offset_keys,
+            )
+            changed = True
         for uid, offsets in self.user_window_offsets.items():
             new_offsets: dict[str, int] = {}
             for key, offset in offsets.items():
-                if self._is_window_id(key):
-                    if key in live_ids:
-                        new_offsets[key] = offset
-                    else:
-                        display = self.window_display_names.get(key, key)
-                        new_id = live_by_name.get(display)
-                        if new_id:
-                            new_offsets[new_id] = offset
-                            changed = True
-                        else:
-                            changed = True
+                if not self._is_window_id(key):
+                    # Pre-2026-02-11 window_name-keyed legacy offset — dropped.
+                    continue
+                if key in live_ids:
+                    new_offsets[key] = offset
                 else:
-                    new_id = live_by_name.get(key)
+                    display = self.window_display_names.get(key, key)
+                    new_id = live_by_name.get(display)
                     if new_id:
                         new_offsets[new_id] = offset
                         changed = True
@@ -392,49 +404,8 @@ class SessionManager:
             self._save_state()
             logger.info("Startup re-resolution complete")
 
-        # Clean up session_map.json: stale window IDs and old-format keys
+        # Clean up session_map.json: stale window IDs (no live tmux window).
         await self._cleanup_stale_session_map_entries(live_ids)
-        await self._cleanup_old_format_session_map_keys()
-
-    async def _cleanup_old_format_session_map_keys(self) -> None:
-        """Remove old-format keys (window_name instead of @window_id) from session_map.json."""
-        if not config.session_map_file.exists():
-            return
-
-        prefix = f"{config.tmux_session_name}:"
-        # Hold session_map.lock across read-modify-write so a concurrent hook
-        # update can't be clobbered by writing back our stale snapshot.
-        lock_path = config.session_map_file.with_suffix(".lock")
-        try:
-            with open(lock_path, "w") as lock_f:
-                fcntl.flock(lock_f, fcntl.LOCK_EX)
-                try:
-                    try:
-                        session_map = json.loads(config.session_map_file.read_text())
-                    except (json.JSONDecodeError, OSError):
-                        return
-
-                    old_keys = [
-                        key
-                        for key in session_map
-                        if key.startswith(prefix)
-                        and not self._is_window_id(key[len(prefix) :])
-                    ]
-                    if not old_keys:
-                        return
-
-                    for key in old_keys:
-                        del session_map[key]
-                    atomic_write_json(config.session_map_file, session_map)
-                    logger.info(
-                        "Cleaned up %d old-format session_map keys: %s",
-                        len(old_keys),
-                        old_keys,
-                    )
-                finally:
-                    fcntl.flock(lock_f, fcntl.LOCK_UN)
-        except OSError as e:
-            logger.warning("Failed to clean up old-format session_map keys: %s", e)
 
     async def _cleanup_stale_session_map_entries(self, live_ids: set[str]) -> None:
         """Remove entries for tmux windows that no longer exist.
