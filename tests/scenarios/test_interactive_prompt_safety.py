@@ -7,7 +7,8 @@ a click from a *non-owner* user must:
     consume-then-reject path destroyed tokens on wrong-user clicks).
 
 The legitimate owner's subsequent click on the same token then still
-lands. This scenario exercises the public ``aqp:<token>`` callback path.
+lands. This scenario exercises the public keyed
+``aqp:<route_hash>:<fp8>:<opt>:<token>`` callback path.
 
 The aqp token map is private state inside ``interactive_ui``; the test
 seeds it via the same internal helpers the production keyboard builder
@@ -23,7 +24,7 @@ import time
 import pytest
 
 from cctelegram import bot as bot_module
-from cctelegram.handlers import interactive_ui
+from cctelegram.handlers import auq_ledger, interactive_ui
 from cctelegram.handlers.callback_data import CB_ASK_PICK
 from cctelegram.handlers.interactive_ui import _PickTokenEntry, _pick_tokens
 from tests.conftest import ScenarioHarness, make_update_callback
@@ -34,6 +35,22 @@ pytestmark = pytest.mark.scenario
 
 _OWNER_ID = 12345  # default test user
 _INTRUDER_ID = 99999
+_FINGERPRINT = "fp-test"
+_OPT = 1
+
+
+def _keyed_callback(
+    *, owner_id: int, thread_id: int, window_id: str, token: str
+) -> str:
+    """Build the Wave 3 keyed ``aqp:<route_hash>:<fp8>:<opt>:<token>`` shape.
+
+    The route_hash/fp8/opt triplet keys the restart-safe ledger and is the
+    only callback shape the dispatcher parses since the legacy
+    ``aqp:<token>`` shape was retired.
+    """
+    route_hash = auq_ledger.make_route_hash(owner_id, thread_id, window_id)
+    fp8 = _FINGERPRINT[:8]
+    return f"{CB_ASK_PICK}{route_hash}:{fp8}:{_OPT}:{token}"
 
 
 def _seed_pick_token(*, owner_id: int, thread_id: int, window_id: str) -> str:
@@ -41,8 +58,8 @@ def _seed_pick_token(*, owner_id: int, thread_id: int, window_id: str) -> str:
         window_id=window_id,
         user_id=owner_id,
         thread_id=thread_id,
-        fingerprint="fp-test",
-        option_number=1,
+        fingerprint=_FINGERPRINT,
+        option_number=_OPT,
         option_label="Yes",
         is_review_submit=False,
         expires_at=time.monotonic() + 300.0,
@@ -59,9 +76,12 @@ async def test_wrong_user_click_is_rejected_without_consuming_token(
     wid = scenario.add_window(window_name="repo", cwd="/repo")
     scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
     token = _seed_pick_token(owner_id=_OWNER_ID, thread_id=42, window_id=wid)
+    callback_data = _keyed_callback(
+        owner_id=_OWNER_ID, thread_id=42, window_id=wid, token=token
+    )
 
     intruder_update = make_update_callback(
-        f"{CB_ASK_PICK}{token}", thread_id=42, user_id=_INTRUDER_ID
+        callback_data, thread_id=42, user_id=_INTRUDER_ID
     )
     await bot_module.callback_handler(intruder_update, scenario.context)
 
@@ -85,7 +105,11 @@ async def test_stale_token_refreshes_card(
     interactive_ui.set_interactive_mode(_OWNER_ID, wid, 42)
 
     update = make_update_callback(
-        f"{CB_ASK_PICK}deadbeefdead", thread_id=42, user_id=_OWNER_ID
+        _keyed_callback(
+            owner_id=_OWNER_ID, thread_id=42, window_id=wid, token="deadbeefdead"
+        ),
+        thread_id=42,
+        user_id=_OWNER_ID,
     )
     await bot_module.callback_handler(update, scenario.context)
 
@@ -105,7 +129,9 @@ async def test_owner_click_on_stale_form_refreshes_without_keystroke(
     token = _seed_pick_token(owner_id=_OWNER_ID, thread_id=42, window_id=wid)
 
     update = make_update_callback(
-        f"{CB_ASK_PICK}{token}", thread_id=42, user_id=_OWNER_ID
+        _keyed_callback(owner_id=_OWNER_ID, thread_id=42, window_id=wid, token=token),
+        thread_id=42,
+        user_id=_OWNER_ID,
     )
     await bot_module.callback_handler(update, scenario.context)
 

@@ -48,7 +48,7 @@ CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
 # embedding state in the 64-byte callback_data — same shape as the
 # attention-card flow in handlers/attention.py. Multi-select toggles use
 # the same keyed token shape but dispatch only a bare digit and do not ledger.
-CB_ASK_PICK = "aqp:"  # aqp:<token> or aqp:<route_hash>:<fp8>:<opt>:<token>
+CB_ASK_PICK = "aqp:"  # aqp:<route_hash>:<fp8>:<opt>:<token>
 CB_ASK_TOGGLE = "aqt:"  # aqt:<route_hash>:<fp8>:<opt>:<token>
 
 # Session picker (resume existing session)

@@ -5,7 +5,6 @@ Covers:
     load-time projection (post-restart).
   - Wrong-user replay returns WRONG_USER_PICK_TEXT (not the option label).
   - Legitimate live-token collision falls through to the in-process path.
-  - Legacy ``aqp:<token>`` callbacks round-trip without consulting the ledger.
   - Malformed callback shape bounces with "Card expired".
   - Same-user window-id collision falls through to the token path.
 
@@ -424,42 +423,7 @@ class TestOwnerSecurity:
         assert owner_row_after.state == "dispatched"
 
 
-class TestLegacyAndMalformedCallbacks:
-    @pytest.mark.asyncio
-    async def test_legacy_one_part_callback_round_trips_without_ledger(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A pre-Wave-3 callback (``aqp:<token>``) still dispatches via
-        the token path with the ledger untouched.
-        """
-        monkeypatch.setattr("asyncio.sleep", AsyncMock())
-        monkeypatch.setattr(
-            "cctelegram.handlers.interactive_ui.resolve_ask_tool_input",
-            lambda _wid: None,
-        )
-        # Mint a token but render as the LEGACY shape (no key triplet).
-        entry_cls = cast(Any, interactive_ui._PickTokenEntry)
-        mint = cast(Any, interactive_ui._mint_pick_token)
-        token = mint(
-            entry_cls(
-                window_id=_WINDOW_ID,
-                user_id=_OWNER_ID,
-                thread_id=_THREAD_ID,
-                fingerprint=_FINGERPRINT,
-                option_number=_OPT,
-                option_label=_LABEL,
-                is_review_submit=False,
-                expires_at=time.monotonic() + 300,
-            )
-        )
-        query = FakeQuery(f"{CB_ASK_PICK}{token}")
-        authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
-        await execute(authorized, _adapters(FakeSessionManager(), FakeTmuxManager()))
-        # Dispatched normally: answer carries the option label.
-        assert query.answers == [(f"{_OPT}. {_LABEL}", False)]
-        # Ledger untouched (no keyed shape → no ledger interaction).
-        assert auq_ledger._entries == {}
-
+class TestMalformedCallbacks:
     @pytest.mark.asyncio
     async def test_malformed_three_part_callback_refreshes(
         self, monkeypatch: pytest.MonkeyPatch
