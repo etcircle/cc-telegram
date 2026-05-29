@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telegram.error import BadRequest
 
+from cctelegram.handlers.busy_indicator import RunState
 from cctelegram.handlers.message_sender import TopicSendOutcome, _classify_bad_request
 from cctelegram.handlers.status_polling import update_status_message
 
@@ -786,6 +787,284 @@ class TestActivityCallbackReArmsIdleState:
 
         busy_indicator.reset_for_tests()
         status_polling._idle_state.clear()
+
+
+_IDLE_PANE = (
+    "$ echo done\n"
+    "done\n"
+    "──────────────────────────────────────\n"
+    "❯ \n"
+    "──────────────────────────────────────\n"
+    "  [Opus 4.6] Context: 50%\n"
+)
+# "esc to interrupt" in the bottom chrome bar = Claude actively running.
+_BUSY_PANE = (
+    "✻ Cooking for 2s\n"
+    "──────────────────────────────────────\n"
+    "❯ \n"
+    "──────────────────────────────────────\n"
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt\n"
+)
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestRouteRuntimeV2IdleClearDebounce:
+    """Under ``route_runtime_v2`` the debounced "🟡 Busy" card clear is owned
+    by ``route_runtime`` (8b). These tests drive the public
+    ``update_status_message`` seam and assert the debounce timing is
+    byte-equivalent to the legacy ``_idle_state`` machine:
+
+      - the card stays up during ``IDLE_CLEAR_DELAY_SECONDS`` of idle,
+      - clears exactly once after the delay,
+      - any activity (transcript / inbound) during the window cancels the
+        pending clear (c313657 guard),
+      - the legacy ``_idle_state`` dict is never touched.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_runtime(self, monkeypatch: pytest.MonkeyPatch):
+        from cctelegram import route_runtime
+        from cctelegram.config import config
+        from cctelegram.handlers import busy_indicator, status_polling
+
+        monkeypatch.setattr(config, "route_runtime_v2", True)
+        route_runtime.reset_for_tests()
+        busy_indicator.reset_for_tests()
+        status_polling._idle_state.clear()
+        yield
+        route_runtime.reset_for_tests()
+        busy_indicator.reset_for_tests()
+        status_polling._idle_state.clear()
+
+    @pytest.mark.asyncio
+    async def test_idle_clears_after_delay_once_and_legacy_state_untouched(
+        self, mock_bot: AsyncMock
+    ):
+        from cctelegram import route_runtime
+        from cctelegram.handlers import status_polling
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        status_polling.reset_idle_counter(1, 42)
+        fake_now = [1000.0]
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=_IDLE_PANE)
+
+            # First idle observation arms the route_runtime deadline only.
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 0
+            snap = route_runtime.snapshot(route)
+            assert (
+                snap.pane_idle_clear_at
+                == 1000.0 + status_polling.IDLE_CLEAR_DELAY_SECONDS
+            )
+            # Legacy machine is dormant under v2.
+            assert (1, 42) not in status_polling._idle_state
+
+            # Still inside the delay window — no clear.
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS - 0.5
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 0
+
+            # Past the delay — clears exactly once with text=None.
+            fake_now[0] += 1.0
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 1
+            args, _kwargs = mock_enqueue.await_args
+            assert args[3] is None
+            # Run-state reconciled to IDLE_CLEARED.
+            assert route_runtime.snapshot(route).run_state is RunState.IDLE_CLEARED
+
+            # Further idle polls do not re-trigger.
+            fake_now[0] += 5.0
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 1
+            # Legacy machine still never touched.
+            assert (1, 42) not in status_polling._idle_state
+
+    @pytest.mark.asyncio
+    async def test_busy_pane_cancels_pending_clear(self, mock_bot: AsyncMock):
+        """A busy pane mid-debounce cancels the pending route_runtime clear,
+        so a subsequent idle stretch must wait the full delay again."""
+        from cctelegram import route_runtime
+        from cctelegram.handlers import status_polling
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        status_polling.reset_idle_counter(1, 42)
+        fake_now = [1000.0]
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+
+            # Idle: arm the deadline.
+            mock_tmux.capture_pane = AsyncMock(return_value=_IDLE_PANE)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert route_runtime.snapshot(route).pane_idle_clear_at is not None
+
+            # Bump past WATCHDOG so the next tick actually scrapes the pane,
+            # which now shows Claude running again → cancels the deadline.
+            fake_now[0] += status_polling.WATCHDOG_INTERVAL + 0.1
+            mock_tmux.capture_pane = AsyncMock(return_value=_BUSY_PANE)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert route_runtime.snapshot(route).pane_idle_clear_at is None
+            # The busy poll enqueued a live status line (not a clear).
+            assert mock_enqueue.await_count == 1
+            assert mock_enqueue.await_args[0][3] is not None
+
+            # Idle again — re-arm from this point; the old elapsed time
+            # must not count, so no clear until a fresh full delay.
+            fake_now[0] += status_polling.WATCHDOG_INTERVAL + 0.1
+            mock_tmux.capture_pane = AsyncMock(return_value=_IDLE_PANE)
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            armed_at = route_runtime.snapshot(route).pane_idle_clear_at
+            assert armed_at == fake_now[0] + status_polling.IDLE_CLEAR_DELAY_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_transcript_activity_cancels_pending_clear(self, mock_bot: AsyncMock):
+        """c313657 guard at the seam: a transcript event during the debounce
+        window cancels the pending clear, so the next idle tick does NOT
+        clear the card (it re-arms)."""
+        from cctelegram import route_runtime, transcript_event_adapter
+        from cctelegram.handlers import status_polling
+        from cctelegram.session_monitor import TranscriptEvent
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        status_polling.reset_idle_counter(1, 42)
+        fake_now = [1000.0]
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=_IDLE_PANE)
+
+            # Arm the deadline.
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert route_runtime.snapshot(route).pane_idle_clear_at is not None
+
+            # Real transcript activity lands during the debounce window.
+            await transcript_event_adapter.dispatch_transcript_event(
+                TranscriptEvent(
+                    session_id="sess-1",
+                    role="assistant",
+                    block_type="tool_use",
+                    tool_use_id="t1",
+                    tool_name="Bash",
+                    stop_reason="tool_use",
+                    timestamp=None,
+                    text="",
+                    image_data=None,
+                ),
+                [route],
+            )
+            # Pending clear cancelled.
+            assert route_runtime.snapshot(route).pane_idle_clear_at is None
+
+            # Next pane-scraping idle tick, past the ORIGINAL deadline: must
+            # NOT clear — it re-arms from now. (Bump past WATCHDOG so the
+            # pane is actually scraped instead of the cleanup-only path,
+            # which deliberately never arms without pane confirmation.)
+            fake_now[0] += status_polling.WATCHDOG_INTERVAL + 1.0
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+            assert mock_enqueue.await_count == 0
+            re_armed = route_runtime.snapshot(route).pane_idle_clear_at
+            assert re_armed == fake_now[0] + status_polling.IDLE_CLEAR_DELAY_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_process_idle_clear_only_never_arms(self, mock_bot: AsyncMock):
+        """The watchdog-skipped cleanup path commits a due deadline but never
+        arms one (no pane confirmation)."""
+        from cctelegram import route_runtime
+        from cctelegram.handlers import status_polling
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        fake_now = [1000.0]
+
+        with (
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            # No deadline armed → cleanup-only path is a no-op.
+            await status_polling._process_idle_clear_only(
+                mock_bot, 1, window_id, 42, skip_status=False
+            )
+            assert mock_enqueue.await_count == 0
+            assert route_runtime.snapshot(route).pane_idle_clear_at is None
+
+            # Arm a deadline (as a prior confirmed-idle tick would), advance
+            # past it, then the cleanup path commits the clear once.
+            route_runtime.arm_pane_idle_clear(route, now=1000.0)
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS + 0.1
+            await status_polling._process_idle_clear_only(
+                mock_bot, 1, window_id, 42, skip_status=False
+            )
+            assert mock_enqueue.await_count == 1
+            assert mock_enqueue.await_args[0][3] is None
+            assert route_runtime.snapshot(route).run_state is RunState.IDLE_CLEARED
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")

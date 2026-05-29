@@ -22,8 +22,10 @@ the ≥48h soak):
   - ``busy_indicator._context_usage``: now ``snapshot.context_usage``.
   - ``busy_indicator._pre_broken_state``: internal-only here, exposed
     via ``snapshot.broken_topic`` (bool) and recovery logic.
-  - ``status_polling._idle_state``: now ``snapshot.idle_clear_at`` plus
-    the ``mark_pane_idle`` consumer.
+  - ``status_polling._idle_state``: now ``snapshot.pane_idle_clear_at``
+    plus the ``arm_pane_idle_clear`` / ``pane_idle_clear_due`` /
+    ``commit_pane_idle_clear`` debounce triad. (``snapshot.idle_clear_at``
+    is the separate run-state decay deadline — see RouteRuntimeSnapshot.)
   - ``handlers.message_queue._status_msg_info[skey]`` lifecycle
     (visibility, not msg_id storage — message_queue stays the sole
     sender/editor): now ``snapshot.status_card_visible`` /
@@ -43,20 +45,22 @@ Concurrency contract:
   - One per-route ``asyncio.Lock``. Independent routes do not serialize.
   - Async mutators (``ingest_transcript_event``, ``mark_inbound_sent``,
     ``mark_topic_broken`` / ``mark_topic_recovered``, ``mark_pane_idle``,
-    ``mark_session_reset``) acquire the route's lock, mutate, freeze a
-    snapshot, **then** release the lock before fanning observers out
-    against the committed snapshot. Observers can therefore call back
-    into ``snapshot(other_route)`` / ``ingest_*`` without deadlocking.
+    ``commit_pane_idle_clear``, ``mark_session_reset``) acquire the
+    route's lock, mutate, freeze a snapshot, **then** release the lock
+    before fanning observers out against the committed snapshot.
+    Observers can therefore call back into ``snapshot(other_route)`` /
+    ``ingest_*`` without deadlocking.
   - **Synchronous side-band writes** (``mark_status_card_published`` /
     ``mark_status_card_cleared``, ``update_context_usage``,
-    ``seed_open_tools``, ``clear_route``) intentionally bypass the
-    lock. They are bookkeeping for read-side flags — they don't change
-    ``run_state`` (no transition table runs), don't fire observers
-    (no fan-out), and don't await between their initial read of
-    ``_state`` and the field write. Safe under Python's single-threaded
-    asyncio scheduling because no suspension point separates the read
-    from the write. **Do not call these from a thread** — they assume
-    event-loop-thread execution.
+    ``seed_open_tools``, ``arm_pane_idle_clear``, ``clear_route``)
+    intentionally bypass the lock. They are bookkeeping for read-side
+    flags — they don't change ``run_state`` (no transition table runs),
+    don't fire observers (no fan-out), and don't await between their
+    initial read of ``_state`` and the field write. Safe under Python's
+    single-threaded asyncio scheduling because no suspension point
+    separates the read from the write. ``pane_idle_clear_due`` is a pure
+    synchronous read in the same vein. **Do not call these from a
+    thread** — they assume event-loop-thread execution.
   - Every committed transition increments ``_global_seq``; the snapshot
     carries ``monotonic_seq`` so subscribers can dedupe / detect drops.
   - Pane snapshots (``mark_pane_idle``) are reconciliation events with
@@ -134,9 +138,23 @@ class RouteRuntimeSnapshot:
         ``context_usage`` to render the header.
       - ``status_polling.typing_action_loop`` reads ``typing_eligible``
         to decide whether to re-emit the native typing indicator.
-      - ``status_polling._on_busy_activity`` (legacy) no longer reads
-        snapshots; under v2 the snapshot itself replaces the
-        ``_idle_state`` re-arm bookkeeping.
+      - ``status_polling`` (under v2) reads ``pane_idle_clear_at`` to drive
+        the debounced "🟡 Busy" card clear: it arms the deadline on the
+        first confirmed-idle pane observation and clears the card once
+        ``now >= pane_idle_clear_at``. The legacy ``_idle_state`` re-arm
+        bookkeeping it replaces is dormant under v2.
+
+    ``idle_clear_at`` vs ``pane_idle_clear_at`` — two *distinct* deadlines:
+      - ``idle_clear_at`` is the run-state decay deadline. It is armed by a
+        transcript end-of-turn (``_set_run_state(IDLE_RECENT)``) and drives
+        the lazy ``IDLE_RECENT → IDLE_CLEARED`` decay read by the digest
+        header. It has nothing to do with the pane.
+      - ``pane_idle_clear_at`` is the *card-clear* debounce deadline. It is
+        armed by ``status_polling`` on a confirmed-idle pane observation
+        (``arm_pane_idle_clear``) and drives the visible status-card
+        removal. Activity re-arms (cancels) it. Keeping them separate
+        preserves the legacy ``_idle_state`` trigger (confirmed-idle pane,
+        not transcript end_turn) so the debounce timing is byte-equivalent.
 
     Equality is by value — comparing two snapshots tells you whether
     *anything* the route observes has changed. Distinct ``monotonic_seq``
@@ -152,6 +170,7 @@ class RouteRuntimeSnapshot:
     context_usage: ContextUsage | None
     last_event_at: float
     idle_clear_at: float | None
+    pane_idle_clear_at: float | None
     typing_eligible: bool
     status_card_visible: bool
     status_card_msg_id: int | None
@@ -168,6 +187,18 @@ class _RouteState:
     context_usage: ContextUsage | None = None
     last_event_at: float = 0.0
     idle_clear_at: float | None = None
+    # Card-clear debounce deadline (distinct from ``idle_clear_at``). Armed
+    # by ``arm_pane_idle_clear`` on the first confirmed-idle pane
+    # observation; the visible status card clears once ``now`` reaches it.
+    # ``None`` means "not armed". Mirrors the legacy ``status_polling.
+    # _idle_state[key] == float-timestamp`` arm state, but storing the
+    # *deadline* rather than the *first-observed-at* timestamp.
+    pane_idle_clear_at: float | None = None
+    # Sentinel mirroring the legacy ``_idle_state[key] == "cleared"`` state:
+    # the card was cleared for this idle stretch, so further idle ticks are
+    # no-ops until activity re-arms (resets it). Without this a second arm
+    # after the clear would re-fire and re-enqueue a status_clear.
+    pane_idle_cleared: bool = False
     pre_broken_state: RunState | None = None
     status_card_msg_id: int | None = None
     seen: bool = False  # have we ever observed this route?
@@ -273,6 +304,7 @@ def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
         context_usage=st.context_usage,
         last_event_at=st.last_event_at,
         idle_clear_at=st.idle_clear_at,
+        pane_idle_clear_at=st.pane_idle_clear_at,
         typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
@@ -296,6 +328,7 @@ def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
         context_usage=None,
         last_event_at=0.0,
         idle_clear_at=None,
+        pane_idle_clear_at=None,
         typing_eligible=False,
         status_card_visible=False,
         status_card_msg_id=None,
@@ -332,6 +365,26 @@ def _recover_from_broken(st: _RouteState) -> None:
     if st.run_state is RunState.BROKEN_TOPIC:
         st.run_state = st.pre_broken_state or RunState.RUNNING
         st.pre_broken_state = None
+
+
+def _rearm_pane_idle_in_place(st: _RouteState) -> None:
+    """Cancel any pending / completed pane-idle card-clear on real activity.
+
+    The Wave-B replacement for ``status_polling._on_busy_activity`` (which
+    popped ``_idle_state[key]`` on every transcript event and inbound
+    delivery). Real activity on a route MUST cancel a pending clear and
+    reset the "already cleared this stretch" sentinel so the next
+    confirmed-idle pane observation re-arms from scratch — this is the
+    c313657 guard: a sub-agent / quick-tool turn that finishes between two
+    pane scrapes must not leave the route stuck having cleared too early.
+
+    Called unconditionally from ``ingest_transcript_event`` /
+    ``mark_inbound_sent`` (even on same-state refreshes) to mirror the
+    legacy callback firing on *every* activity event, not only on
+    state changes.
+    """
+    st.pane_idle_clear_at = None
+    st.pane_idle_cleared = False
 
 
 def _set_run_state(st: _RouteState, new: RunState) -> None:
@@ -445,6 +498,9 @@ async def ingest_transcript_event(
     async with lock:
         st = _state_for_route(route)
         _apply_lifecycle_event(st, event)
+        # Activity re-arms the pane-idle debounce (cancels a pending clear),
+        # mirroring the legacy ``_on_busy_activity`` callback.
+        _rearm_pane_idle_in_place(st)
         snap = _freeze(route, st)
     await _fan_out(route, snap)
     return snap
@@ -483,6 +539,7 @@ def snapshot(route: Route) -> RouteRuntimeSnapshot:
         context_usage=st.context_usage,
         last_event_at=st.last_event_at,
         idle_clear_at=st.idle_clear_at,
+        pane_idle_clear_at=st.pane_idle_clear_at,
         typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
@@ -514,6 +571,8 @@ async def mark_inbound_sent(route: Route) -> RouteRuntimeSnapshot:
         else:
             st.last_event_at = _now()
             st.seen = True
+        # Inbound delivery is real activity — re-arm the pane-idle debounce.
+        _rearm_pane_idle_in_place(st)
         snap = _freeze(route, st)
     await _fan_out(route, snap)
     return snap
@@ -554,6 +613,28 @@ async def mark_topic_recovered(route: Route) -> RouteRuntimeSnapshot:
     return snap
 
 
+def _reconcile_pane_idle_in_place(st: _RouteState) -> None:
+    """Reconcile a confirmed-idle route to ``IDLE_CLEARED`` in place.
+
+    Pane snapshots have **lower authority** than transcript lifecycle
+    events:
+
+      - ``WAITING_ON_USER`` is preserved (interactive prompt is open).
+      - ``BROKEN_TOPIC`` is preserved (recovery gates on a real event).
+      - Otherwise drops any lingering open tools and transitions to
+        ``IDLE_CLEARED``.
+
+    Shared by ``mark_pane_idle`` (immediate, legacy/flag-off) and
+    ``commit_pane_idle_clear`` (debounced, v2) so both apply identical
+    reconciliation. Caller holds the route's lock.
+    """
+    if st.run_state in (RunState.WAITING_ON_USER, RunState.BROKEN_TOPIC):
+        return
+    st.open_tools.clear()
+    st.invalidate_tool_cache()
+    _set_run_state(st, RunState.IDLE_CLEARED)
+
+
 async def mark_pane_idle(route: Route) -> RouteRuntimeSnapshot:
     """Pane has been confirmed idle for ``IDLE_CLEAR_DELAY_SECONDS``.
 
@@ -566,20 +647,136 @@ async def mark_pane_idle(route: Route) -> RouteRuntimeSnapshot:
         ``IDLE_CLEARED``.
 
     Mirrors ``busy_indicator.mark_pane_idle`` so the visible "🟡 Busy"
-    card removal and the run-state machine stay in sync.
+    card removal and the run-state machine stay in sync. This is the
+    *immediate* clear (no debounce); under ``route_runtime_v2`` the
+    debounce is owned by ``arm_pane_idle_clear`` /
+    ``pane_idle_clear_due`` / ``commit_pane_idle_clear`` and this
+    function is only reached via the flag-off legacy ``status_polling``
+    path. Retained until the 8c legacy deletion.
     """
     lock = _lock_for_route(route)
     async with lock:
         st = _state_for_route(route)
-        if st.run_state in (RunState.WAITING_ON_USER, RunState.BROKEN_TOPIC):
-            snap = _freeze(route, st)
-        else:
-            st.open_tools.clear()
-            st.invalidate_tool_cache()
-            _set_run_state(st, RunState.IDLE_CLEARED)
-            snap = _freeze(route, st)
+        _reconcile_pane_idle_in_place(st)
+        snap = _freeze(route, st)
     await _fan_out(route, snap)
     return snap
+
+
+# ── debounced pane-idle card-clear (route_runtime_v2 owns the timer) ─────
+#
+# Replaces the legacy ``status_polling._idle_state`` three-state machine
+# (missing → float-timestamp → "cleared"). The deadline lives here so the
+# card-clear and the run-state reconciliation share a single source of
+# truth, and so ``now`` can be injected for deterministic tests.
+#
+#   - missing arm          → ``arm_pane_idle_clear`` sets ``pane_idle_clear_at``
+#   - waiting out the delay → ``pane_idle_clear_due`` returns False
+#   - delay elapsed         → ``pane_idle_clear_due`` returns True; the caller
+#                             then runs ``commit_pane_idle_clear``
+#   - already cleared       → ``pane_idle_cleared`` sentinel; arm is a no-op
+#   - activity re-arms      → ``_rearm_pane_idle_in_place`` resets both
+
+
+def arm_pane_idle_clear(route: Route, *, now: float) -> RouteRuntimeSnapshot:
+    """Arm the debounced card-clear deadline on the first confirmed-idle
+    pane observation.
+
+    Idempotent and synchronous (a read-side bookkeeping write — no
+    run-state transition, no observer fan-out, like
+    ``mark_status_card_published``):
+
+      - No-op if the route was already cleared this idle stretch
+        (``pane_idle_cleared``), mirroring the legacy
+        ``_idle_state[key] == "cleared"`` early return.
+      - No-op if the deadline is already armed (don't push it forward —
+        the legacy ``state is None`` arm only fires once per stretch).
+      - Otherwise sets ``pane_idle_clear_at = now + IDLE_CLEAR_DELAY_SECONDS``.
+
+    ``now`` is injected (no hidden ``time.monotonic()`` call inside the
+    transition) so the deadline is deterministically testable. Pass the
+    same monotonic clock ``status_polling`` reads.
+    """
+    st = _state.get(route)
+    if st is None:
+        st = _RouteState()
+        _state[route] = st
+    if st.pane_idle_cleared:
+        return snapshot(route)
+    if st.pane_idle_clear_at is None:
+        st.pane_idle_clear_at = now + IDLE_CLEAR_DELAY_SECONDS
+    return snapshot(route)
+
+
+def pane_idle_clear_due(route: Route, *, now: float) -> bool:
+    """Return True iff an armed pane-idle clear deadline has elapsed.
+
+    Pure query (no mutation). Mirrors the legacy
+    ``(now - state) >= IDLE_CLEAR_DELAY_SECONDS`` check, but only when a
+    deadline is actually armed — an unarmed or already-cleared route is
+    never "due". ``now`` is injected so callers (``update_status_message``
+    and ``_process_idle_clear_only``) decide whether to commit using the
+    same clock they armed with.
+    """
+    st = _state.get(route)
+    if st is None or st.pane_idle_clear_at is None:
+        return False
+    return now >= st.pane_idle_clear_at
+
+
+async def commit_pane_idle_clear(route: Route, *, now: float) -> bool:
+    """Perform the debounced card clear once the deadline is due.
+
+    Returns ``True`` iff it actually cleared (reconciled run-state, dropped the
+    deadline, latched the ``pane_idle_cleared`` sentinel, fanned out); ``False``
+    if it no-op'd. Callers enqueue the card clear ONLY on ``True``.
+
+    TOCTOU re-validation (Codex 8b P1): the caller checks
+    ``pane_idle_clear_due`` WITHOUT the lock, then ``await``\\s this. Between
+    that check and our lock acquisition, a transcript ``ingest_transcript_event``
+    or ``mark_inbound_sent`` may have re-armed — ``_rearm_pane_idle_in_place``
+    sets ``pane_idle_clear_at=None`` (cancel) or a future deadline. Committing
+    a now-stale clear would blank the "🟡 Busy" card mid-turn after fresh
+    activity (which may land the route in ``WAITING_ON_USER`` / ``IDLE_RECENT``,
+    not only ``RUNNING`` — so the run-state alone cannot tell the caller whether
+    a clear happened; this explicit bool can). We re-check the SAME armed-and-due
+    predicate under the lock with the caller's ``now`` and return ``False``
+    (no clear, no fan-out) if the deadline is no longer armed or not yet due.
+    This makes the route_runtime path strictly race-free vs the legacy
+    ``_idle_state`` machine, which set ``"cleared"`` synchronously before
+    awaiting ``mark_pane_idle``.
+    """
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state_for_route(route)
+        if st.pane_idle_clear_at is None or now < st.pane_idle_clear_at:
+            # Re-armed or cancelled since the lockless due-check — do not clear.
+            return False
+        _reconcile_pane_idle_in_place(st)
+        st.pane_idle_clear_at = None
+        st.pane_idle_cleared = True
+        snap = _freeze(route, st)
+    await _fan_out(route, snap)
+    return True
+
+
+def reset_pane_idle_clear(route: Route) -> None:
+    """Cancel a pending / completed pane-idle clear from a *pane* signal.
+
+    Synchronous side-band write (no run-state transition, no fan-out — like
+    ``arm_pane_idle_clear``). Called by ``status_polling`` when a pane
+    scrape shows the route running again, mirroring the legacy
+    ``_idle_state.pop(key)`` in the ``is_running`` branch: a fresh idle
+    stretch must re-arm from scratch rather than fire on a deadline left
+    over from a previous stretch. Distinct from
+    ``_rearm_pane_idle_in_place`` (the transcript/inbound re-arm) only in
+    that this is the public pane-driven seam.
+    """
+    st = _state.get(route)
+    if st is None:
+        return
+    st.pane_idle_clear_at = None
+    st.pane_idle_cleared = False
 
 
 async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
@@ -597,6 +794,9 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         st.invalidate_tool_cache()
         st.context_usage = None
         st.pre_broken_state = None
+        # Fresh session — drop any pending/completed pane-idle debounce so
+        # the new session's first idle stretch arms from scratch.
+        _rearm_pane_idle_in_place(st)
         _set_run_state(st, RunState.IDLE_CLEARED)
         snap = _freeze(route, st)
     await _fan_out(route, snap)
@@ -760,7 +960,9 @@ __all__ = [
     "RouteRuntimeSnapshot",
     "RunState",
     "TranscriptLifecycleEvent",
+    "arm_pane_idle_clear",
     "clear_route",
+    "commit_pane_idle_clear",
     "ingest_transcript_event",
     "mark_inbound_sent",
     "mark_pane_idle",
@@ -769,7 +971,9 @@ __all__ = [
     "mark_status_card_published",
     "mark_topic_broken",
     "mark_topic_recovered",
+    "pane_idle_clear_due",
     "reset_for_tests",
+    "reset_pane_idle_clear",
     "seed_open_tools",
     "snapshot",
     "subscribe",
