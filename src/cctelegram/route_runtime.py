@@ -17,7 +17,7 @@ This module owns the run-state machine, the context-usage cache, and the
 debounced pane-idle card-clear. The surfaces that consume it:
 
   - ``snapshot.run_state`` — run-state (RUNNING / RUNNING_TOOL /
-    WAITING_ON_USER / IDLE_RECENT / IDLE_CLEARED / BROKEN_TOPIC).
+    WAITING_ON_USER / IDLE_RECENT / IDLE_CLEARED).
   - ``snapshot.open_tools`` / ``snapshot.waiting_on_user_tools`` — the
     in-flight tool set (replay-seeded on startup via ``seed_open_tools``).
   - ``snapshot.context_usage`` — the context-window cache with the 1M latch.
@@ -44,7 +44,7 @@ Concurrency contract:
 
   - One per-route ``asyncio.Lock``. Independent routes do not serialize.
   - Async mutators (``ingest_transcript_event``, ``mark_inbound_sent``,
-    ``mark_topic_broken`` / ``mark_topic_recovered``, ``mark_pane_idle``,
+    ``mark_pane_idle``,
     ``commit_pane_idle_clear``, ``mark_session_reset``) acquire the
     route's lock, mutate, freeze a snapshot, **then** release the lock
     before fanning observers out against the committed snapshot.
@@ -65,20 +65,19 @@ Concurrency contract:
     carries ``monotonic_seq`` so subscribers can dedupe / detect drops.
   - Pane snapshots (``mark_pane_idle`` / ``commit_pane_idle_clear``) are
     reconciliation events with **lower authority** than transcript
-    lifecycle events: they preserve ``WAITING_ON_USER`` and
-    ``BROKEN_TOPIC``, only clearing ``RUNNING`` / ``RUNNING_TOOL`` to
-    ``IDLE_CLEARED`` after the debounce delay has elapsed, keeping the
-    visible "🟡 Busy" card and the run-state machine in sync.
+    lifecycle events: they preserve ``WAITING_ON_USER``, only clearing
+    ``RUNNING`` / ``RUNNING_TOOL`` to ``IDLE_CLEARED`` after the debounce
+    delay has elapsed, keeping the visible "🟡 Busy" card and the
+    run-state machine in sync.
 
 Persistence policy:
 
   - In-memory by default. ``open_tools`` reconstructs from JSONL replay
     on startup via ``seed_open_tools`` /
-    ``parse_pending_tools_from_jsonl``. ``broken_topic`` and
-    ``status_card_*`` are not persisted — restart-induced loss is
-    self-healing (next event clears BROKEN_TOPIC; next status-card send
-    re-publishes the msg_id). When persistence is needed it will land via
-    a state.json ``schema_version`` bump in a follow-up wave.
+    ``parse_pending_tools_from_jsonl``. ``status_card_*`` is not
+    persisted — restart-induced loss is self-healing (next status-card
+    send re-publishes the msg_id). When persistence is needed it will
+    land via a state.json ``schema_version`` bump in a follow-up wave.
 """
 
 from __future__ import annotations
@@ -105,7 +104,6 @@ class RunState(Enum):
     WAITING_ON_USER = "WAITING_ON_USER"
     IDLE_RECENT = "IDLE_RECENT"
     IDLE_CLEARED = "IDLE_CLEARED"
-    BROKEN_TOPIC = "BROKEN_TOPIC"
 
 
 # Wall-clock seconds an IDLE_RECENT route stays "recent" before decaying to
@@ -203,7 +201,6 @@ class RouteRuntimeSnapshot:
     typing_eligible: bool
     status_card_visible: bool
     status_card_msg_id: int | None
-    broken_topic: bool
     monotonic_seq: int
 
 
@@ -227,7 +224,6 @@ class _RouteState:
     # a second arm after the clear would re-fire and re-enqueue a
     # status_clear.
     pane_idle_cleared: bool = False
-    pre_broken_state: RunState | None = None
     status_card_msg_id: int | None = None
     seen: bool = False  # have we ever observed this route?
     # Cached frozensets — invalidated on any open_tools mutation.
@@ -337,7 +333,6 @@ def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
         typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
-        broken_topic=st.run_state is RunState.BROKEN_TOPIC,
         monotonic_seq=_next_seq(),
     )
 
@@ -363,7 +358,6 @@ def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
         typing_eligible=False,
         status_card_visible=False,
         status_card_msg_id=None,
-        broken_topic=False,
         monotonic_seq=0,
     )
 
@@ -385,18 +379,6 @@ def _decay_idle_in_place(st: _RouteState) -> None:
         if _now() >= st.idle_clear_at:
             st.run_state = RunState.IDLE_CLEARED
             st.idle_clear_at = None
-
-
-def _recover_from_broken(st: _RouteState) -> None:
-    """If the route was BROKEN_TOPIC, restore pre-broken state.
-
-    Runs before event-specific rules in ``_apply_lifecycle_event`` so
-    subsequent rules operate on the recovered state — e.g. a tool_result
-    that closes the last open tool still walks to RUNNING.
-    """
-    if st.run_state is RunState.BROKEN_TOPIC:
-        st.run_state = st.pre_broken_state or RunState.RUNNING
-        st.pre_broken_state = None
 
 
 def _rearm_pane_idle_in_place(st: _RouteState) -> None:
@@ -437,7 +419,6 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
     Operates on ``_RouteState`` without async (the lock is the caller's
     responsibility).
     """
-    _recover_from_broken(st)
     st.seen = True
 
     role = event.role
@@ -570,7 +551,6 @@ def snapshot(route: Route) -> RouteRuntimeSnapshot:
         typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
-        broken_topic=st.run_state is RunState.BROKEN_TOPIC,
         monotonic_seq=_global_seq,  # read-only — no commit
     )
 
@@ -581,10 +561,9 @@ def snapshot(route: Route) -> RouteRuntimeSnapshot:
 async def mark_inbound_sent(route: Route) -> RouteRuntimeSnapshot:
     """A Telegram-originated prompt was delivered to Claude's tmux window.
 
-    Idempotent: never downgrades RUNNING_TOOL / WAITING_ON_USER /
-    BROKEN_TOPIC. Otherwise transitions to RUNNING so the typing
-    indicator and status card show activity before the first JSONL
-    event lands.
+    Idempotent: never downgrades RUNNING_TOOL / WAITING_ON_USER.
+    Otherwise transitions to RUNNING so the typing indicator and status
+    card show activity before the first JSONL event lands.
     """
     lock = _lock_for_route(route)
     async with lock:
@@ -592,7 +571,6 @@ async def mark_inbound_sent(route: Route) -> RouteRuntimeSnapshot:
         if st.run_state not in (
             RunState.RUNNING_TOOL,
             RunState.WAITING_ON_USER,
-            RunState.BROKEN_TOPIC,
         ):
             _set_run_state(st, RunState.RUNNING)
         else:
@@ -605,41 +583,6 @@ async def mark_inbound_sent(route: Route) -> RouteRuntimeSnapshot:
     return snap
 
 
-async def mark_topic_broken(route: Route) -> RouteRuntimeSnapshot:
-    """Outbound Telegram send classified as ``TOPIC_BROKEN_OUTCOMES`` —
-    transition to ``BROKEN_TOPIC``, remembering the prior state.
-
-    Idempotent: repeated calls don't overwrite ``pre_broken_state``
-    with another ``BROKEN_TOPIC`` sentinel.
-    """
-    lock = _lock_for_route(route)
-    async with lock:
-        st = _state_for_route(route)
-        if st.run_state is not RunState.BROKEN_TOPIC:
-            st.pre_broken_state = st.run_state
-            _set_run_state(st, RunState.BROKEN_TOPIC)
-        snap = _freeze(route, st)
-    await _fan_out(route, snap)
-    return snap
-
-
-async def mark_topic_recovered(route: Route) -> RouteRuntimeSnapshot:
-    """Restore a ``BROKEN_TOPIC`` route to its pre-broken state.
-
-    No-op if the route isn't currently ``BROKEN_TOPIC``.
-    """
-    lock = _lock_for_route(route)
-    async with lock:
-        st = _state_for_route(route)
-        if st.run_state is RunState.BROKEN_TOPIC:
-            prior = st.pre_broken_state or RunState.RUNNING
-            st.pre_broken_state = None
-            _set_run_state(st, prior)
-        snap = _freeze(route, st)
-    await _fan_out(route, snap)
-    return snap
-
-
 def _reconcile_pane_idle_in_place(st: _RouteState) -> None:
     """Reconcile a confirmed-idle route to ``IDLE_CLEARED`` in place.
 
@@ -647,7 +590,6 @@ def _reconcile_pane_idle_in_place(st: _RouteState) -> None:
     events:
 
       - ``WAITING_ON_USER`` is preserved (interactive prompt is open).
-      - ``BROKEN_TOPIC`` is preserved (recovery gates on a real event).
       - Otherwise drops any lingering open tools and transitions to
         ``IDLE_CLEARED``.
 
@@ -655,7 +597,7 @@ def _reconcile_pane_idle_in_place(st: _RouteState) -> None:
     ``commit_pane_idle_clear`` (the debounced production card-clear) so
     both apply identical reconciliation. Caller holds the route's lock.
     """
-    if st.run_state in (RunState.WAITING_ON_USER, RunState.BROKEN_TOPIC):
+    if st.run_state is RunState.WAITING_ON_USER:
         return
     st.open_tools.clear()
     st.invalidate_tool_cache()
@@ -669,7 +611,6 @@ async def mark_pane_idle(route: Route) -> RouteRuntimeSnapshot:
     transcript lifecycle events:
 
       - ``WAITING_ON_USER`` is preserved (interactive prompt is open).
-      - ``BROKEN_TOPIC`` is preserved (recovery gates on a real event).
       - Otherwise drops any lingering open tools and transitions to
         ``IDLE_CLEARED``.
 
@@ -813,7 +754,6 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         st.open_tools.clear()
         st.invalidate_tool_cache()
         st.context_usage = None
-        st.pre_broken_state = None
         # Fresh session — drop any pending/completed pane-idle debounce so
         # the new session's first idle stretch arms from scratch.
         _rearm_pane_idle_in_place(st)
@@ -1062,8 +1002,6 @@ __all__ = [
     "mark_session_reset",
     "mark_status_card_cleared",
     "mark_status_card_published",
-    "mark_topic_broken",
-    "mark_topic_recovered",
     "pane_idle_clear_due",
     "parse_pending_tools_from_jsonl",
     "reset_for_tests",

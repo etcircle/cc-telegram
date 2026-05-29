@@ -74,7 +74,6 @@ def test_default_snapshot_for_unknown_route():
     assert snap.typing_eligible is False
     assert snap.status_card_visible is False
     assert snap.status_card_msg_id is None
-    assert snap.broken_topic is False
 
 
 # ── transition table ────────────────────────────────────────────────────
@@ -131,9 +130,7 @@ async def test_close_interactive_tool_while_noninteractive_open_drops_to_running
     assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING_TOOL
     await route_runtime.ingest_transcript_event(
         ROUTE,
-        _evt(
-            "assistant", "tool_use", tool_use_id="ask-1", tool_name="AskUserQuestion"
-        ),
+        _evt("assistant", "tool_use", tool_use_id="ask-1", tool_name="AskUserQuestion"),
     )
     assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
     # Close the interactive tool; Bash remains open → back to RUNNING_TOOL.
@@ -407,30 +404,6 @@ async def test_session_reset_clears_pending_pane_idle():
     snap = await route_runtime.mark_session_reset(ROUTE)
     assert snap.pane_idle_clear_at is None
     assert route_runtime.pane_idle_clear_due(ROUTE, now=10_000.0) is False
-
-
-async def test_mark_topic_broken_and_recovered_round_trip():
-    await route_runtime.ingest_transcript_event(
-        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
-    )
-    broken = await route_runtime.mark_topic_broken(ROUTE)
-    assert broken.broken_topic is True
-    assert broken.run_state is RunState.BROKEN_TOPIC
-
-    recovered = await route_runtime.mark_topic_recovered(ROUTE)
-    assert recovered.broken_topic is False
-    assert recovered.run_state is RunState.RUNNING_TOOL
-
-
-async def test_mark_topic_broken_idempotent_preserves_prior():
-    await route_runtime.ingest_transcript_event(
-        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
-    )
-    await route_runtime.mark_topic_broken(ROUTE)
-    # Second call must NOT overwrite pre_broken_state with BROKEN_TOPIC.
-    await route_runtime.mark_topic_broken(ROUTE)
-    recovered = await route_runtime.mark_topic_recovered(ROUTE)
-    assert recovered.run_state is RunState.RUNNING_TOOL
 
 
 async def test_mark_session_reset_drops_open_tools_and_usage():
