@@ -63,7 +63,6 @@ from .handlers.directory_browser import (
     STATE_KEY,
     clear_browse_state,
 )
-from .handlers import busy_indicator
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.inbound_aggregator import (
@@ -707,32 +706,25 @@ async def forward_command_handler(
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
         await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
-        # Mark route busy so the V2 typing loop has something to refresh
-        # while Claude processes the slash command (most slash commands
-        # never produce a transcript event — /model opens a pane UI, /clear
-        # resets state — so the JSONL signal alone cannot light the
-        # indicator). status_polling will downgrade to WAITING_ON_USER if a
-        # pane interactive UI is detected later.
-        if config.busy_indicator_v2:
-            await busy_indicator.mark_inbound_sent(route)
-        if config.route_runtime_v2:
-            await route_runtime.mark_inbound_sent(route)
+        # Mark route busy so the typing loop has something to refresh while
+        # Claude processes the slash command (most slash commands never
+        # produce a transcript event — /model opens a pane UI, /clear resets
+        # state — so the JSONL signal alone cannot light the indicator).
+        # status_polling will downgrade to WAITING_ON_USER if a pane
+        # interactive UI is detected later.
+        await route_runtime.mark_inbound_sent(route)
         # If /clear command was sent, clear the session association
         # so we can detect the new session after first message
         if cc_slash.strip().lower() == "/clear":
             logger.info("Clearing session for window %s after /clear", display)
             session_manager.clear_window_session(wid)
-            # /clear rotates the session_id — drop any in-flight
-            # open_tools / context_usage that belong to the dead session.
-            # busy_indicator's clear_route happens later via the
-            # session_monitor change-detection path, but route_runtime
+            # /clear rotates the session_id — drop any in-flight open_tools /
+            # context_usage that belong to the dead session. route_runtime
             # exposes the intent directly so consumers see IDLE_CLEARED
-            # immediately rather than waiting for the next poll cycle.
-            # Unconditional (8a): the context footer now reads
-            # route_runtime.context_usage in ALL configs, so the reset that
-            # DROPS that cache must fire in all configs too — otherwise the
-            # 1M latch would survive a /clear and the new session's footer
-            # would render the stale larger window (Codex 8a finding).
+            # immediately rather than waiting for the next poll cycle. The
+            # context footer reads route_runtime.context_usage, so this reset
+            # (which DROPS that cache) keeps the new session's footer from
+            # rendering the dead session's 1M latch.
             await route_runtime.mark_session_reset(route)
 
         # Interactive commands (e.g. /model) render a terminal-based UI
@@ -774,7 +766,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             bot=context.bot,
             route_runtime=route_runtime,
             config=config,
-            busy_indicator=busy_indicator,
             terminal_parser=terminal_parser,
         ),
         is_user_allowed_func=is_user_allowed,
@@ -798,11 +789,10 @@ async def _build_context_footer(
     scrolling back through history sees how context evolved turn by turn.
 
     Reads context usage from ``route_runtime.snapshot(route).context_usage``
-    (8a: single authority for both the write and the read). The 1M-cap latch
+    (the single authority for both the write and the read). The 1M-cap latch
     lives in ``route_runtime.update_context_usage`` so a session that
     previously crossed 200k but is now back to 80k still shows ``80k / 1M``
-    rather than dropping back to ``80k / 200k``. The footer renders the same
-    regardless of ``config.route_runtime_v2`` since the write is unconditional.
+    rather than dropping back to ``80k / 200k``.
     """
     if not window_id:
         return None
@@ -811,7 +801,6 @@ async def _build_context_footer(
     if session is None or not session.file_path:
         return None
 
-    from .handlers import busy_indicator
     from .handlers.topic_title import format_max, format_tokens
     from .transcript_parser import read_latest_usage
 
@@ -820,13 +809,6 @@ async def _build_context_footer(
         return None
 
     route = (user_id, thread_id or 0, window_id)
-    busy_indicator.update_context_usage(route, latest.tokens, latest.model)
-    # 8a: route_runtime is the footer's single authority for BOTH the write
-    # and the read. The write is unconditional (populated in every config,
-    # not just the soak flag) so the read below never blanks; the 200k→1M
-    # latch lives in route_runtime.update_context_usage. busy_indicator's
-    # update is retained only so the topic-title indicator (a separate 8c
-    # consumer) keeps its shared cache during the migration.
     route_runtime.update_context_usage(route, latest.tokens, latest.model)
     usage = route_runtime.snapshot(route).context_usage
     if usage is None:
@@ -1157,63 +1139,55 @@ async def post_init(application: Application) -> None:
     # for NEW lines, and the buffered AUQ is already past the offset.
     monitor.set_bot(application.bot)
 
-    # Stage 3: event-driven RunState. Gated together with the digest /
-    # status_polling RunState reads — flipping the flag wires both ends so
-    # the indicator never updates state without affecting any UI surface.
-    if config.busy_indicator_v2:
+    # Event-driven RunState: drive route_runtime from the JSONL event stream.
 
-        async def event_callback(event: TranscriptEvent) -> None:
-            active = await session_manager.find_users_for_session(event.session_id)
-            if not active:
-                return
-            routes: list[busy_indicator.Route] = [
-                (user_id, thread_id or 0, wid) for user_id, wid, thread_id in active
-            ]
-            await busy_indicator.on_transcript_event(event, routes)
-            if config.route_runtime_v2:
-                # Wave B parallel path: drive route_runtime from the same
-                # event stream. The adapter normalises ``TranscriptEvent`` →
-                # ``TranscriptLifecycleEvent`` and fans out per route. Any
-                # per-route failure is logged once-per-session and the
-                # remaining routes still get the event.
-                await transcript_event_adapter.dispatch_transcript_event(event, routes)
-            # End-of-turn-question "🔔 Awaiting your reply" card with Yes/No
-            # quick-replies removed 2026-05-17 at user request: it fired on
-            # any assistant turn that ended with ``?``, producing a Yes/No
-            # presumption that was misleading for list-selection questions
-            # ("Which of those would you change?"). Real AskUserQuestion
-            # tool calls still surface as full interactive pickers via
-            # ``handle_interactive_ui``; plain-text questions no longer get
-            # a half-card with the wrong action shape.
+    async def event_callback(event: TranscriptEvent) -> None:
+        active = await session_manager.find_users_for_session(event.session_id)
+        if not active:
+            return
+        routes: list[route_runtime.Route] = [
+            (user_id, thread_id or 0, wid) for user_id, wid, thread_id in active
+        ]
+        # The adapter normalises ``TranscriptEvent`` →
+        # ``TranscriptLifecycleEvent`` and fans out per route. Any per-route
+        # failure is logged once-per-session and the remaining routes still
+        # get the event.
+        await transcript_event_adapter.dispatch_transcript_event(event, routes)
+        # End-of-turn-question "🔔 Awaiting your reply" card with Yes/No
+        # quick-replies removed 2026-05-17 at user request: it fired on
+        # any assistant turn that ended with ``?``, producing a Yes/No
+        # presumption that was misleading for list-selection questions
+        # ("Which of those would you change?"). Real AskUserQuestion
+        # tool calls still surface as full interactive pickers via
+        # ``handle_interactive_ui``; plain-text questions no longer get
+        # a half-card with the wrong action shape.
 
-        monitor.set_event_callback(event_callback)
+    monitor.set_event_callback(event_callback)
 
-        # Replay tool_use/tool_result pairs from each tracked parent JSONL so
-        # tools that were open at the moment of bot shutdown (most painfully,
-        # long-running sub-agent Task calls) are visible to the busy indicator
-        # immediately. Without this, ``_open_tools`` is empty after restart
-        # and routes stay IDLE_CLEARED until the parent emits a fresh event —
-        # for an in-flight Task that means no typing indicator for the entire
-        # sub-agent runtime, since sub-agents write to a separate JSONL.
-        seeded_routes = 0
-        for sid, tracked in monitor.state.tracked_sessions.items():
-            pending = await asyncio.to_thread(
-                busy_indicator.parse_pending_tools_from_jsonl, tracked.file_path
-            )
-            if not pending:
-                continue
-            active = await session_manager.find_users_for_session(sid)
-            for user_id, wid, thread_id in active:
-                route: busy_indicator.Route = (user_id, thread_id or 0, wid)
-                busy_indicator.seed_open_tools(route, pending)
-                if config.route_runtime_v2:
-                    route_runtime.seed_open_tools(route, pending)
-                seeded_routes += 1
-        if seeded_routes:
-            logger.info(
-                "Replayed pending tool state for %d route(s) at startup",
-                seeded_routes,
-            )
+    # Replay tool_use/tool_result pairs from each tracked parent JSONL so
+    # tools that were open at the moment of bot shutdown (most painfully,
+    # long-running sub-agent Task calls) are visible to route_runtime
+    # immediately. Without this, ``open_tools`` is empty after restart
+    # and routes stay IDLE_CLEARED until the parent emits a fresh event —
+    # for an in-flight Task that means no typing indicator for the entire
+    # sub-agent runtime, since sub-agents write to a separate JSONL.
+    seeded_routes = 0
+    for sid, tracked in monitor.state.tracked_sessions.items():
+        pending = await asyncio.to_thread(
+            route_runtime.parse_pending_tools_from_jsonl, tracked.file_path
+        )
+        if not pending:
+            continue
+        active = await session_manager.find_users_for_session(sid)
+        for user_id, wid, thread_id in active:
+            route: route_runtime.Route = (user_id, thread_id or 0, wid)
+            route_runtime.seed_open_tools(route, pending)
+            seeded_routes += 1
+    if seeded_routes:
+        logger.info(
+            "Replayed pending tool state for %d route(s) at startup",
+            seeded_routes,
+        )
 
     monitor.start()
     session_monitor = monitor

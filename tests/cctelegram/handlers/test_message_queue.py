@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telegram.error import RetryAfter
 
+from cctelegram import route_runtime
+from cctelegram.route_runtime import RunState
 from cctelegram.handlers import message_queue
 
 
@@ -1372,7 +1374,13 @@ class TestConvertStatusToContentOrdering:
 
 @pytest.mark.usefixtures("_clear_queue_state")
 class TestActivityDigestHeader:
-    """Render the digest header from RunState + context_pct under V2 flag."""
+    """Render the digest header from RunState + context_pct (route_runtime)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_route_runtime(self):
+        route_runtime.reset_for_tests()
+        yield
+        route_runtime.reset_for_tests()
 
     def _state(self, *, done: bool = False) -> message_queue.ActivityDigestState:
         s = message_queue.ActivityDigestState(message_id=0, window_id="@7")
@@ -1381,54 +1389,30 @@ class TestActivityDigestHeader:
         s.done = done
         return s
 
-    def _enable_v2(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _set_run_state(self, route, run_state) -> None:
+        """Seed a route's run_state directly in route_runtime."""
+        st = route_runtime._state_for_route(route)
+        st.run_state = run_state
+        st.seen = True
+
+    def test_running_state_renders_busy(self, monkeypatch: pytest.MonkeyPatch):
         from cctelegram.config import config as cfg
 
-        monkeypatch.setattr(cfg, "busy_indicator_v2", True)
-        # Pin route_runtime_v2 to False so these tests stay on the
-        # legacy busy_indicator activity-digest path even when an
-        # outer process sets CC_TELEGRAM_ROUTE_RUNTIME_V2=true.
-        # Coverage for the route_runtime path lives in
-        # tests/scenarios/test_route_runtime_snapshot.py.
-        monkeypatch.setattr(cfg, "route_runtime_v2", False)
         monkeypatch.setattr(cfg, "context_pct_threshold", 80)
-
-    def test_legacy_path_unchanged_when_flag_off(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.config import config as cfg
-        from cctelegram.handlers import busy_indicator
-
-        monkeypatch.setattr(cfg, "busy_indicator_v2", False)
-        busy_indicator.reset_for_tests()
-
-        s = self._state(done=True)
-        rendered = message_queue._render_activity_digest(s, route=(1, 42, "@7"))
-        # Legacy path: state.done → "✅ Done"; no ctx suffix even at high pct.
-        assert rendered.startswith("✅ Done — ")
-        assert "ctx" not in rendered
-
-    def test_v2_running_state_renders_busy(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.handlers import busy_indicator
-
-        self._enable_v2(monkeypatch)
-        busy_indicator.reset_for_tests()
         route = (1, 42, "@7")
-        busy_indicator._run_state[route] = busy_indicator.RunState.RUNNING_TOOL
+        self._set_run_state(route, RunState.RUNNING_TOOL)
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         assert rendered.startswith("🟡 Busy — ")
 
-    def test_v2_idle_cleared_renders_done(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.handlers import busy_indicator
-
-        self._enable_v2(monkeypatch)
-        busy_indicator.reset_for_tests()
+    def test_idle_cleared_renders_done(self, monkeypatch: pytest.MonkeyPatch):
         route = (1, 42, "@7")
-        busy_indicator._run_state[route] = busy_indicator.RunState.IDLE_CLEARED
+        self._set_run_state(route, RunState.IDLE_CLEARED)
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         assert rendered.startswith("✅ Done — ")
 
-    def test_v2_idle_recent_renders_done(self, monkeypatch: pytest.MonkeyPatch):
+    def test_idle_recent_renders_done(self, monkeypatch: pytest.MonkeyPatch):
         """IDLE_RECENT must render as Done, not Busy.
 
         Regression: the digest is finalized exactly once when the assistant's
@@ -1436,146 +1420,91 @@ class TestActivityDigestHeader:
         IDLE_CLEARED decay 4s later. Mapping IDLE_RECENT → "🟡 Busy" produced
         a stuck "Busy" header that never flipped to Done in production. The
         decay grace window matters for typing-action / Busy-card lifecycles
-        (status_polling reads state() each tick), not for this header.
+        (status_polling reads the snapshot each tick), not for this header.
         """
-        from cctelegram.handlers import busy_indicator
-
-        self._enable_v2(monkeypatch)
-        busy_indicator.reset_for_tests()
         route = (1, 42, "@7")
-        busy_indicator._run_state[route] = busy_indicator.RunState.IDLE_RECENT
+        self._set_run_state(route, RunState.IDLE_RECENT)
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         assert rendered.startswith("✅ Done — ")
 
-    def test_v2_waiting_on_user(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.handlers import busy_indicator
-
-        self._enable_v2(monkeypatch)
-        busy_indicator.reset_for_tests()
+    def test_waiting_on_user(self, monkeypatch: pytest.MonkeyPatch):
         route = (1, 42, "@7")
-        busy_indicator._run_state[route] = busy_indicator.RunState.WAITING_ON_USER
+        self._set_run_state(route, RunState.WAITING_ON_USER)
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         assert rendered.startswith("🔔 Waiting on you — ")
 
-    def test_v2_broken_topic(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.handlers import busy_indicator
-
-        self._enable_v2(monkeypatch)
-        busy_indicator.reset_for_tests()
+    def test_broken_topic(self, monkeypatch: pytest.MonkeyPatch):
         route = (1, 42, "@7")
-        busy_indicator._run_state[route] = busy_indicator.RunState.BROKEN_TOPIC
+        self._set_run_state(route, RunState.BROKEN_TOPIC)
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         assert rendered.startswith("⚠️ Topic unreachable — ")
 
-    def test_v2_ctx_below_threshold_no_suffix(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.handlers import busy_indicator
+    def test_ctx_below_threshold_no_suffix(self, monkeypatch: pytest.MonkeyPatch):
+        from cctelegram.config import config as cfg
 
-        self._enable_v2(monkeypatch)
-        busy_indicator.reset_for_tests()
+        monkeypatch.setattr(cfg, "context_pct_threshold", 80)
         route = (1, 42, "@7")
-        busy_indicator.update_context_usage(route, 100_000, "claude-opus-4-7")
+        route_runtime.update_context_usage(route, 100_000, "claude-opus-4-7")
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         assert "ctx" not in rendered
 
-    def test_v2_ctx_at_threshold_neutral_suffix(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.handlers import busy_indicator
+    def test_ctx_at_threshold_neutral_suffix(self, monkeypatch: pytest.MonkeyPatch):
+        from cctelegram.config import config as cfg
 
-        self._enable_v2(monkeypatch)
-        busy_indicator.reset_for_tests()
+        monkeypatch.setattr(cfg, "context_pct_threshold", 80)
         route = (1, 42, "@7")
-        busy_indicator.update_context_usage(route, 178_000, "claude-opus-4-7")
+        route_runtime.update_context_usage(route, 178_000, "claude-opus-4-7")
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         first_line = rendered.split("\n", 1)[0]
         assert first_line.endswith("· ctx 89%")
         assert "⚠️" not in first_line
 
-    def test_v2_ctx_critical_warning(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.handlers import busy_indicator
+    def test_ctx_critical_warning(self, monkeypatch: pytest.MonkeyPatch):
+        from cctelegram.config import config as cfg
 
-        self._enable_v2(monkeypatch)
-        busy_indicator.reset_for_tests()
+        monkeypatch.setattr(cfg, "context_pct_threshold", 80)
         route = (1, 42, "@7")
-        busy_indicator.update_context_usage(route, 194_000, "claude-opus-4-7")
+        route_runtime.update_context_usage(route, 194_000, "claude-opus-4-7")
 
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         first_line = rendered.split("\n", 1)[0]
         assert first_line.endswith("· ⚠️ ctx 97%")
 
-    # --- V2-OFF digest parity (Test D) ----------------------------------
-    # Exhaustive matrix: with the flag OFF, the header reproduces the
-    # pre-Stage-3 behavior byte-for-byte across done × waiting × route.
+    # --- route is None fallback ----------------------------------------
+    # Without a resolvable route the header falls back to the
+    # waiting / state.done flags rather than RunState.
 
-    def test_v2_off_busy_when_not_done_not_waiting(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        from cctelegram.config import config as cfg
-        from cctelegram.handlers import busy_indicator
-
-        monkeypatch.setattr(cfg, "busy_indicator_v2", False)
-        busy_indicator.reset_for_tests()
-
+    def test_no_route_busy_when_not_done_not_waiting(self):
         rendered = message_queue._render_activity_digest(
             self._state(done=False),
             waiting=False,
-            route=(1, 42, "@7"),
+            route=None,
         )
         assert rendered.startswith("🟡 Busy — ")
         assert "ctx" not in rendered
 
-    def test_v2_off_done_when_done_not_waiting(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.config import config as cfg
-        from cctelegram.handlers import busy_indicator
-
-        monkeypatch.setattr(cfg, "busy_indicator_v2", False)
-        busy_indicator.reset_for_tests()
-
+    def test_no_route_done_when_done_not_waiting(self):
         rendered = message_queue._render_activity_digest(
             self._state(done=True),
             waiting=False,
-            route=(1, 42, "@7"),
+            route=None,
         )
         assert rendered.startswith("✅ Done — ")
         assert "ctx" not in rendered
 
-    def test_v2_off_waiting_overrides_done(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.config import config as cfg
-        from cctelegram.handlers import busy_indicator
-
-        monkeypatch.setattr(cfg, "busy_indicator_v2", False)
-        busy_indicator.reset_for_tests()
-
+    def test_no_route_waiting_overrides_done(self):
         # waiting=True takes precedence even with done=True.
         rendered = message_queue._render_activity_digest(
             self._state(done=True),
             waiting=True,
-            route=(1, 42, "@7"),
+            route=None,
         )
         assert rendered.startswith("🔔 Waiting on you — ")
-        assert "ctx" not in rendered
-
-    def test_v2_off_ignores_run_state_and_ctx(self, monkeypatch: pytest.MonkeyPatch):
-        from cctelegram.config import config as cfg
-        from cctelegram.handlers import busy_indicator
-
-        monkeypatch.setattr(cfg, "busy_indicator_v2", False)
-        busy_indicator.reset_for_tests()
-        route = (1, 42, "@7")
-        # Even with high context usage + a non-default RunState, the legacy
-        # path renders the legacy header and never adds the ctx suffix.
-        busy_indicator.update_context_usage(route, 198_000, "claude-opus-4-7")
-        busy_indicator._run_state[route] = busy_indicator.RunState.WAITING_ON_USER
-
-        rendered = message_queue._render_activity_digest(
-            self._state(done=False),
-            waiting=False,
-            route=route,
-        )
-        assert rendered.startswith("🟡 Busy — ")
         assert "ctx" not in rendered
 
 

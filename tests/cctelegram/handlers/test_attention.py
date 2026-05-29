@@ -21,7 +21,6 @@ from cctelegram.handlers.message_queue import (
     ActivityDigestState,
     _activity_msg_info,
     _finalize_activity_digest,
-    _refresh_activity_digest_if_present,
     _render_activity_digest,
 )
 from cctelegram.handlers.message_sender import TopicSendOutcome
@@ -127,54 +126,12 @@ async def test_finalize_activity_digest_marks_done_for_non_attention_text():
         _activity_msg_info.pop(key, None)
 
 
-@pytest.mark.asyncio
-async def test_refresh_activity_digest_renders_waiting_after_attention_state_changes(
-    _reset_attention, mock_session_manager, monkeypatch
-):
-    # Pins the V1 attention-driven header path. V2 sources the header from
-    # ``RunState`` and ignores attention state, so this test scopes itself
-    # to V1 explicitly. Equivalent V2 coverage lives in test_busy_indicator.
-    monkeypatch.setattr(
-        "cctelegram.handlers.message_queue.config.busy_indicator_v2", False
-    )
-    bot = AsyncMock()
-    key = (1, 10)
-    state = ActivityDigestState(message_id=123, window_id="@0")
-    state.lines = ["⚙️ Read foo.py"]
-    state.tool_count = 1
-    _activity_msg_info[key] = state
-    try:
-        sent = _make_sent_message(message_id=42)
-        with (
-            patch(
-                "cctelegram.handlers.attention.topic_send",
-                new_callable=AsyncMock,
-            ) as mock_send,
-            patch(
-                "cctelegram.handlers.message_queue.topic_edit",
-                new_callable=AsyncMock,
-            ) as mock_edit,
-            patch("cctelegram.handlers.message_queue.session_manager") as mq_session,
-        ):
-            mock_send.return_value = (sent, TopicSendOutcome.OK)
-            mock_edit.return_value = TopicSendOutcome.OK
-            mq_session.resolve_chat_id.return_value = -100123
-            mq_session.get_display_name.return_value = "cctelegram"
-
-            await attention.notify_waiting(
-                bot,
-                user_id=1,
-                thread_id=10,
-                window_id="@0",
-                prompt_text="Do you want me to proceed?",
-                kind="interactive_ui",
-            )
-            await _refresh_activity_digest_if_present(bot, 1, 10, "@0")
-
-            mock_edit.assert_awaited_once()
-            assert mock_edit.await_args.kwargs["text"].startswith("🔔 Waiting on you")
-    finally:
-        _activity_msg_info.pop(key, None)
+# The former ``test_refresh_activity_digest_renders_waiting_after_attention_
+# state_changes`` pinned the legacy V1 attention-driven digest header
+# (``CC_TELEGRAM_BUSY_INDICATOR_V2=false``). That path no longer exists —
+# ``_render_activity_digest`` sources the header from ``RunState`` whenever a
+# route resolves. The "🔔 Waiting on you" header for WAITING_ON_USER is now
+# covered by the route_runtime tests + the route-busy lifecycle scenario.
 
 
 # ── State machine ──────────────────────────────────────────────────────────

@@ -7,7 +7,7 @@ When ``/kill`` runs against a topic with an in-flight tool_use, the bot must:
   - confirm with a reply that mentions the killed display name.
 
 The "mid tool_use" framing is the regression target: pre-fix paths leaked
-``message_queue._tool_msg_ids`` and ``busy_indicator._open_tools`` entries
+``message_queue._tool_msg_ids`` and ``route_runtime`` open-tool entries
 when /kill ran between tool_use and tool_result. The deeper open_tools
 cleanup is exercised end-to-end by ``test_route_busy_lifecycle.py`` which
 drives the full message_queue pipeline.

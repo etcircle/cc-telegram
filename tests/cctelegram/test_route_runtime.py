@@ -1,9 +1,7 @@
-"""Unit tests for ``cctelegram.route_runtime`` — the Wave B snapshot
-state machine.
+"""Unit tests for ``cctelegram.route_runtime`` — the run-state / context-usage
+/ idle-clear snapshot state machine.
 
-Mirrors ``test_busy_indicator.py``'s transition coverage so a regression
-in either path is visible immediately. Plus tests specific to the
-snapshot interface that don't have a busy_indicator analogue:
+Covers the transition table plus the snapshot interface:
 
   - Snapshots are frozen — mutating internal state does not change a
     captured snapshot.
@@ -14,6 +12,7 @@ snapshot interface that don't have a busy_indicator analogue:
   - ``mark_session_reset`` drops in-flight ``open_tools`` + context_usage.
   - Status card publish/clear bookkeeping mutates only the
     ``status_card_*`` snapshot fields.
+  - ``parse_pending_tools_from_jsonl`` startup replay parsing.
 """
 
 from __future__ import annotations
@@ -24,9 +23,10 @@ from dataclasses import replace
 import pytest
 
 from cctelegram import route_runtime
-from cctelegram.handlers.busy_indicator import ContextUsage, RunState
 from cctelegram.route_runtime import (
+    ContextUsage,
     RouteRuntimeSnapshot,
+    RunState,
     TranscriptLifecycleEvent,
 )
 
@@ -116,6 +116,32 @@ async def test_tool_result_closes_slot():
     )
     assert snap.run_state is RunState.RUNNING
     assert snap.open_tools == frozenset()
+
+
+async def test_close_interactive_tool_while_noninteractive_open_drops_to_running_tool():
+    """Mixed parallel tools: closing the interactive tool while a
+    non-interactive tool stays open must re-derive WAITING_ON_USER →
+    RUNNING_TOOL from the REMAINING open set. Regression guard ported from the
+    deleted test_busy_indicator.py mixed-parallel case (Hermes 8c P2) — the
+    state machine derives run-state from open_tools, but the dynamic
+    tool_result-on-interactive-while-other-open transition needs its own lock."""
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="bash-1", tool_name="Bash")
+    )
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING_TOOL
+    await route_runtime.ingest_transcript_event(
+        ROUTE,
+        _evt(
+            "assistant", "tool_use", tool_use_id="ask-1", tool_name="AskUserQuestion"
+        ),
+    )
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
+    # Close the interactive tool; Bash remains open → back to RUNNING_TOOL.
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "tool_result", tool_use_id="ask-1")
+    )
+    assert snap.run_state is RunState.RUNNING_TOOL
+    assert snap.open_tools == frozenset({"bash-1"})
 
 
 async def test_tool_result_stale_id_ignored():
@@ -323,7 +349,9 @@ async def test_commit_noops_if_rearmed_after_lockless_due_check():
     # Commit with the stale 'due' now must NOT clear: it returns False (the
     # explicit signal status_polling uses to decide whether to enqueue the
     # clear), and run-state stays running.
-    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is False
+    assert (
+        await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is False
+    )
     snap = route_runtime.snapshot(ROUTE)
     assert snap.run_state is RunState.RUNNING_TOOL
     assert snap.pane_idle_clear_at is None  # cancelled by the re-arm
@@ -343,7 +371,9 @@ async def test_commit_noops_if_rearmed_to_waiting_on_user():
     )
     assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
     # Non-running, but commit must still NOT clear (deadline was cancelled).
-    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is False
+    assert (
+        await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is False
+    )
 
 
 async def test_activity_after_commit_reenables_arming():
@@ -692,3 +722,157 @@ async def test_clear_route_drops_all_state():
     assert snap.run_state is RunState.IDLE_CLEARED
     assert snap.context_usage is None
     assert snap.status_card_msg_id is None
+
+
+# ── parse_pending_tools_from_jsonl (startup replay) ──────────────────────
+
+
+def _write_jsonl(path: str, entries: list[dict]) -> None:
+    """Write one JSON entry per line. Test helper for the replay parser."""
+    import json
+
+    with open(path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+
+def _entry(content: list[dict], *, is_sidechain: bool = False) -> dict:
+    """Wrap a content list in the JSONL envelope shape the parser expects."""
+    return {
+        "type": "assistant",
+        "isSidechain": is_sidechain,
+        "message": {"role": "assistant", "content": content},
+    }
+
+
+def test_replay_returns_unmatched_tool_uses(tmp_path):
+    """tool_use without a matching tool_result remains in the open set."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry([{"type": "tool_use", "id": "t1", "name": "Bash"}]),
+            _entry([{"type": "tool_result", "tool_use_id": "t1"}]),
+            _entry([{"type": "tool_use", "id": "t2", "name": "Task"}]),
+        ],
+    )
+    pending = route_runtime.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"t2": False}
+
+
+def test_replay_marks_interactive_tool(tmp_path):
+    """An open AskUserQuestion is flagged as interactive in the replay."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry([{"type": "tool_use", "id": "q1", "name": "AskUserQuestion"}]),
+        ],
+    )
+    pending = route_runtime.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"q1": True}
+
+
+def test_replay_skips_sidechain_entries(tmp_path):
+    """isSidechain=true entries are ignored — they belong to a sub-agent."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry(
+                [{"type": "tool_use", "id": "s1", "name": "Bash"}],
+                is_sidechain=True,
+            ),
+            _entry([{"type": "tool_use", "id": "p1", "name": "Bash"}]),
+        ],
+    )
+    pending = route_runtime.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"p1": False}
+
+
+def test_replay_tolerates_malformed_lines(tmp_path):
+    """Bad JSON lines don't break the scan — we just skip them."""
+    p = tmp_path / "sess.jsonl"
+    p.write_text(
+        "\n".join(
+            [
+                "not json {",
+                "",
+                '{"type":"assistant","message":{"content":'
+                '[{"type":"tool_use","id":"ok","name":"Read"}]}}',
+                '{"type":"assistant","message":"not-a-dict"}',
+                '{"type":"assistant","message":{"content":"not-a-list"}}',
+            ]
+        )
+        + "\n"
+    )
+    pending = route_runtime.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"ok": False}
+
+
+def test_replay_returns_empty_for_missing_file(tmp_path):
+    """Missing JSONL is non-fatal: replay yields nothing, route stays idle."""
+    pending = route_runtime.parse_pending_tools_from_jsonl(
+        str(tmp_path / "does-not-exist.jsonl")
+    )
+    assert pending == {}
+
+
+def test_replay_pairs_tool_result_before_tool_use(tmp_path):
+    """Branch / rewind / --resume can lay tool_result *before* its tool_use.
+
+    A forward-pop walk would leave a phantom open tool here. Set-difference
+    semantics correctly pair them regardless of line order.
+    """
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry([{"type": "tool_result", "tool_use_id": "rewound"}]),
+            _entry([{"type": "tool_use", "id": "rewound", "name": "Bash"}]),
+        ],
+    )
+    pending = route_runtime.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {}
+
+
+def test_replay_repeated_tool_use_same_id_collapses(tmp_path):
+    """A duplicate tool_use line (same id) does not produce two open entries."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry([{"type": "tool_use", "id": "dup", "name": "Bash"}]),
+            _entry([{"type": "tool_use", "id": "dup", "name": "Bash"}]),
+        ],
+    )
+    pending = route_runtime.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"dup": False}
+
+
+def test_replay_skips_string_content(tmp_path):
+    """Some entries have ``message.content`` as a string, not a list. Skip."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            {"type": "user", "message": {"role": "user", "content": "hello world"}},
+            _entry([{"type": "tool_use", "id": "t1", "name": "Read"}]),
+        ],
+    )
+    pending = route_runtime.parse_pending_tools_from_jsonl(str(p))
+    assert pending == {"t1": False}
+
+
+def test_replay_then_seed_open_tools_round_trip(tmp_path):
+    """The replay output feeds ``seed_open_tools`` and lights the run state."""
+    p = tmp_path / "sess.jsonl"
+    _write_jsonl(
+        str(p),
+        [
+            _entry([{"type": "tool_use", "id": "task-1", "name": "Task"}]),
+        ],
+    )
+    pending = route_runtime.parse_pending_tools_from_jsonl(str(p))
+    route_runtime.seed_open_tools(ROUTE, pending)
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING_TOOL

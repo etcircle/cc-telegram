@@ -113,52 +113,6 @@ class Config:
         except ValueError:
             self.tool_summary_max_chars = 40
 
-        # Stage-3 event-driven RunState. Gates two coupled changes together:
-        #   1. bot.py: whether monitor.set_event_callback is wired
-        #   2. activity-digest renderer + status_polling: whether they read
-        #      RunState / context_pct, or fall back to the legacy
-        #      state.done / is_status_active(pane) paths.
-        # Default true after Stage 4 + the lifecycle-event / pane-idle
-        # backstop fixes landed; legacy V1 path remains accessible by
-        # setting CC_TELEGRAM_BUSY_INDICATOR_V2=false.
-        self.busy_indicator_v2 = (
-            os.getenv("CC_TELEGRAM_BUSY_INDICATOR_V2", "true").lower() == "true"
-        )
-
-        # Wave B RouteRuntime: per-route snapshot state machine that
-        # subsumes busy_indicator + status_polling's idle-clear state +
-        # message_queue's status-card visibility into one lock-protected
-        # interface. Default False during soak; flip to True manually,
-        # observe for ≥48h, then a follow-up commit deletes the legacy
-        # ``busy_indicator.register_activity_callback`` fan-out and the
-        # ``_idle_state`` backstop. Asymmetry with ``busy_indicator_v2``
-        # (default True)
-        # is intentional — Wave B ships off-by-default so the legacy path
-        # continues to drive production until the snapshot interface has
-        # had real load.
-        #
-        # Requires ``busy_indicator_v2=true``. The event-callback wiring
-        # in ``bot.py`` is gated on busy_indicator_v2, so flipping
-        # route_runtime_v2 on while busy_indicator_v2 is off would leave
-        # route_runtime never receiving transcript events. A startup
-        # warning fires below; the v2 reads still fall back gracefully
-        # (snapshot returns IDLE_CLEARED for unseeded routes), so the
-        # misconfiguration manifests as "indicator never lights" rather
-        # than a crash.
-        self.route_runtime_v2 = (
-            os.getenv("CC_TELEGRAM_ROUTE_RUNTIME_V2", "false").lower() == "true"
-        )
-        if self.route_runtime_v2 and not self.busy_indicator_v2:
-            logger.warning(
-                "CC_TELEGRAM_ROUTE_RUNTIME_V2=true requires "
-                "CC_TELEGRAM_BUSY_INDICATOR_V2=true — the transcript "
-                "event callback is gated on busy_indicator_v2. "
-                "RouteRuntime will be reachable only via direct "
-                "mark_* calls (e.g. mark_inbound_sent); it will not "
-                "receive on_transcript_event fan-out. Enable both flags "
-                "or disable route_runtime_v2."
-            )
-
         # Context-window indicator threshold (percent). The activity-digest
         # header appends "· ctx NN%" when the cached value crosses this; at
         # ≥95 it prepends a warning glyph. Below threshold or unknown: no

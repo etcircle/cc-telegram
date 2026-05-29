@@ -17,7 +17,7 @@ import pytest
 
 from cctelegram import terminal_parser
 from cctelegram.callback_dispatcher import DispatcherAdapters, dispatch_callback
-from cctelegram.handlers import busy_indicator, interactive_ui
+from cctelegram.handlers import interactive_ui
 from cctelegram.handlers.callback_data import CB_ASK_PICK
 from cctelegram.utils import app_dir
 from tests.conftest import ScenarioHarness, make_update_callback
@@ -121,7 +121,6 @@ def _adapters(scenario: ScenarioHarness) -> DispatcherAdapters:
         bot=scenario.bot,
         route_runtime=SimpleNamespace(),
         config=SimpleNamespace(),
-        busy_indicator=busy_indicator,
         terminal_parser=terminal_parser,
     )
 

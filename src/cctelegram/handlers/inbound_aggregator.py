@@ -180,16 +180,11 @@ async def _send_bundle(route: Route, bundle: _PendingBundle) -> bool:
         return False
 
     # Closes the gap between "prompt accepted" and "first transcript event":
-    # the V2 typing loop only refreshes RUNNING / RUNNING_TOOL routes, so
+    # the typing loop only refreshes RUNNING / RUNNING_TOOL routes, so
     # without this mark the indicator was dark during preliminary work.
-    if config.busy_indicator_v2:
-        from . import busy_indicator
+    from .. import route_runtime
 
-        await busy_indicator.mark_inbound_sent(route)
-    if config.route_runtime_v2:
-        from .. import route_runtime
-
-        await route_runtime.mark_inbound_sent(route)
+    await route_runtime.mark_inbound_sent(route)
     return True
 
 

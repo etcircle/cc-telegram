@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telegram.error import BadRequest
 
-from cctelegram.handlers.busy_indicator import RunState
+from cctelegram.route_runtime import RunState
 from cctelegram.handlers.message_sender import TopicSendOutcome, _classify_bad_request
 from cctelegram.handlers.status_polling import update_status_message
 
@@ -31,19 +31,21 @@ def _clear_interactive_state():
     from cctelegram.handlers import status_polling
     from cctelegram.handlers.interactive_ui import _interactive_mode, _interactive_msgs
 
+    from cctelegram import route_runtime
+
     _interactive_mode.clear()
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
     status_polling._absent_streak.clear()
-    status_polling._idle_state.clear()
+    route_runtime.reset_for_tests()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
     status_polling._absent_streak.clear()
-    status_polling._idle_state.clear()
+    route_runtime.reset_for_tests()
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
@@ -221,7 +223,6 @@ class TestStatusPollerSettingsDetection:
             "  [Opus 4.6] Context: 50%\n"
         )
 
-        status_polling.reset_idle_counter(1, 42)
         fake_now = [1000.0]
 
         def fake_monotonic() -> float:
@@ -270,8 +271,6 @@ class TestStatusPollerSettingsDetection:
             )
             assert mock_enqueue.await_count == 1
 
-        status_polling.reset_idle_counter(1, 42)
-
     @pytest.mark.asyncio
     async def test_busy_status_resets_idle_state(self, mock_bot: AsyncMock):
         """A real active status resets the idle state, so a subsequent idle
@@ -296,7 +295,6 @@ class TestStatusPollerSettingsDetection:
             "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt\n"
         )
 
-        status_polling.reset_idle_counter(1, 42)
         fake_now = [1000.0]
 
         def fake_monotonic() -> float:
@@ -357,8 +355,6 @@ class TestStatusPollerSettingsDetection:
             assert mock_enqueue.await_count == enqueue_count_after_busy + 1
             assert mock_enqueue.await_args.args[3] is None
 
-        status_polling.reset_idle_counter(1, 42)
-
     @pytest.mark.asyncio
     async def test_post_completion_summary_treated_as_idle(self, mock_bot: AsyncMock):
         """A static "✻ Worked for 2s" line with a blank line above chrome
@@ -385,7 +381,6 @@ class TestStatusPollerSettingsDetection:
             "──────────────────────────────────────\n"
         )
 
-        status_polling.reset_idle_counter(1, 42)
         fake_now = [1000.0]
 
         def fake_monotonic() -> float:
@@ -417,8 +412,6 @@ class TestStatusPollerSettingsDetection:
             )
             assert mock_enqueue.await_count == 1
             assert mock_enqueue.await_args.args[3] is None
-
-        status_polling.reset_idle_counter(1, 42)
 
     @pytest.mark.asyncio
     async def test_normal_pane_no_interactive_ui(self, mock_bot: AsyncMock):
@@ -723,70 +716,13 @@ class TestStatusPollLoopDoesNotProbeTelegram:
         bot.unpin_all_forum_topic_messages.assert_not_called()
 
 
-class TestActivityCallbackReArmsIdleState:
-    """An activity event (transcript / inbound prompt delivery) for a route
-    sitting at ``_idle_state[key] == "cleared"`` must pop the entry directly,
-    without waiting for the next ``WATCHDOG_INTERVAL`` pane scrape.
-
-    Regression: ``busy_indicator.register_activity_callback`` had a producer
-    (``_fire_activity``) but no consumer, so the re-arm path documented in
-    its docstring was inert. Sub-agent / quick tool turns that finished
-    between two 10s pane scrapes left ``_idle_state[key] == "cleared"``
-    permanently — ``_open_tools`` kept accumulating in ``busy_indicator``,
-    state pinned at ``RUNNING_TOOL``, and ``typing_action_loop`` refreshed
-    the native Telegram typing indicator forever.
-    """
-
-    @pytest.mark.asyncio
-    async def test_transcript_event_re_arms_cleared_idle_state(self):
-        from cctelegram.handlers import busy_indicator, status_polling
-        from cctelegram.session_monitor import TranscriptEvent
-
-        # Hermetic setup: reset clears _activity_callbacks, so re-register
-        # the consumer that's normally bound at module import time.
-        busy_indicator.reset_for_tests()
-        busy_indicator.register_activity_callback(status_polling._on_busy_activity)
-        status_polling._idle_state.clear()
-        status_polling._idle_state[(1, 42)] = "cleared"
-
-        event = TranscriptEvent(
-            session_id="sess-1",
-            role="assistant",
-            block_type="tool_use",
-            tool_use_id="t1",
-            tool_name="Bash",
-            stop_reason="tool_use",
-            timestamp=None,
-            text="",
-            image_data=None,
-        )
-        await busy_indicator.on_transcript_event(event, [(1, 42, "@7")])
-
-        assert (1, 42) not in status_polling._idle_state
-
-        busy_indicator.reset_for_tests()
-        status_polling._idle_state.clear()
-
-    @pytest.mark.asyncio
-    async def test_inbound_send_re_arms_cleared_idle_state(self):
-        """``mark_inbound_sent`` (Telegram-originated prompt delivered to the
-        tmux window) also fires the activity callback. Without this, /effort /
-        /clear / arbitrary slash commands — which often produce no JSONL
-        events at all — never get their cleared idle entry popped, so the
-        next idle observation can't start a fresh delay timer."""
-        from cctelegram.handlers import busy_indicator, status_polling
-
-        busy_indicator.reset_for_tests()
-        busy_indicator.register_activity_callback(status_polling._on_busy_activity)
-        status_polling._idle_state.clear()
-        status_polling._idle_state[(1, 42)] = "cleared"
-
-        await busy_indicator.mark_inbound_sent((1, 42, "@7"))
-
-        assert (1, 42) not in status_polling._idle_state
-
-        busy_indicator.reset_for_tests()
-        status_polling._idle_state.clear()
+# The former ``TestActivityCallbackReArmsIdleState`` class exercised the
+# legacy ``busy_indicator.register_activity_callback`` → ``_idle_state``
+# re-arm channel. route_runtime now owns that re-arm inline
+# (``_rearm_pane_idle_in_place``); the equivalent coverage lives in
+# ``test_route_runtime.py`` (``test_transcript_activity_rearms_pending_clear``
+# / ``test_inbound_sent_rearms_pending_clear``) and in the
+# ``test_transcript_activity_cancels_pending_clear`` seam test below.
 
 
 _IDLE_PANE = (
@@ -808,33 +744,24 @@ _BUSY_PANE = (
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
-class TestRouteRuntimeV2IdleClearDebounce:
-    """Under ``route_runtime_v2`` the debounced "🟡 Busy" card clear is owned
-    by ``route_runtime`` (8b). These tests drive the public
-    ``update_status_message`` seam and assert the debounce timing is
-    byte-equivalent to the legacy ``_idle_state`` machine:
+class TestRouteRuntimeIdleClearDebounce:
+    """The debounced "🟡 Busy" card clear is owned by ``route_runtime``.
+    These tests drive the public ``update_status_message`` seam and assert
+    the debounce timing:
 
       - the card stays up during ``IDLE_CLEAR_DELAY_SECONDS`` of idle,
       - clears exactly once after the delay,
       - any activity (transcript / inbound) during the window cancels the
-        pending clear (c313657 guard),
-      - the legacy ``_idle_state`` dict is never touched.
+        pending clear (c313657 guard).
     """
 
     @pytest.fixture(autouse=True)
-    def _reset_runtime(self, monkeypatch: pytest.MonkeyPatch):
+    def _reset_runtime(self):
         from cctelegram import route_runtime
-        from cctelegram.config import config
-        from cctelegram.handlers import busy_indicator, status_polling
 
-        monkeypatch.setattr(config, "route_runtime_v2", True)
         route_runtime.reset_for_tests()
-        busy_indicator.reset_for_tests()
-        status_polling._idle_state.clear()
         yield
         route_runtime.reset_for_tests()
-        busy_indicator.reset_for_tests()
-        status_polling._idle_state.clear()
 
     @pytest.mark.asyncio
     async def test_idle_clears_after_delay_once_and_legacy_state_untouched(
@@ -847,7 +774,6 @@ class TestRouteRuntimeV2IdleClearDebounce:
         route = (1, 42, window_id)
         mock_window = MagicMock()
         mock_window.window_id = window_id
-        status_polling.reset_idle_counter(1, 42)
         fake_now = [1000.0]
 
         with (
@@ -875,8 +801,6 @@ class TestRouteRuntimeV2IdleClearDebounce:
                 snap.pane_idle_clear_at
                 == 1000.0 + status_polling.IDLE_CLEAR_DELAY_SECONDS
             )
-            # Legacy machine is dormant under v2.
-            assert (1, 42) not in status_polling._idle_state
 
             # Still inside the delay window — no clear.
             fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS - 0.5
@@ -902,8 +826,6 @@ class TestRouteRuntimeV2IdleClearDebounce:
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
             assert mock_enqueue.await_count == 1
-            # Legacy machine still never touched.
-            assert (1, 42) not in status_polling._idle_state
 
     @pytest.mark.asyncio
     async def test_busy_pane_cancels_pending_clear(self, mock_bot: AsyncMock):
@@ -916,7 +838,6 @@ class TestRouteRuntimeV2IdleClearDebounce:
         route = (1, 42, window_id)
         mock_window = MagicMock()
         mock_window.window_id = window_id
-        status_polling.reset_idle_counter(1, 42)
         fake_now = [1000.0]
 
         with (
@@ -975,7 +896,6 @@ class TestRouteRuntimeV2IdleClearDebounce:
         route = (1, 42, window_id)
         mock_window = MagicMock()
         mock_window.window_id = window_id
-        status_polling.reset_idle_counter(1, 42)
         fake_now = [1000.0]
 
         with (

@@ -106,13 +106,13 @@ def _adapters(
         session_manager=session_manager,
         tmux_manager=tmux_manager,
         bot=SimpleNamespace(),
-        route_runtime=SimpleNamespace(snapshot=lambda _route: None),
+        route_runtime=SimpleNamespace(
+            snapshot=lambda _route: None,
+            mark_inbound_sent=AsyncMock(),
+        ),
         config=SimpleNamespace(
-            busy_indicator_v2=False,
-            route_runtime_v2=False,
             browse_root=".",
         ),
-        busy_indicator=SimpleNamespace(mark_inbound_sent=AsyncMock()),
         terminal_parser=SimpleNamespace(
             resolve_ask_form=lambda _cached_input, _pane: FakeForm()
         ),

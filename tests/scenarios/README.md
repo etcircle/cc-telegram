@@ -23,7 +23,7 @@ Run: `uv run pytest -m scenario -q`.
 | `test_interactive_prompt_safety.py` | Wrong-user click on an `aqp:` token is rejected with "Not your card." and does NOT consume the token. Expired / stale-fingerprint clicks refresh the card without sending a digit to tmux. |
 | `test_media_group.py` | Telegram media-group photos coalesce into one bundle; caption rides item 1 only; subsequent items skip the caption to avoid duplication. |
 | `test_tmux_restart.py` | Stale window IDs re-resolve via display names after tmux restart. **Includes one `xfail`** that surfaces a real ordering bug in `resolve_stale_ids()` (see "Wave A findings" below). |
-| `test_route_busy_lifecycle.py` | c313657 regression: a transcript event after `IDLE_CLEARED` drops `status_polling._idle_state[key]` via the `register_activity_callback` channel. Inbound-sent and full-turn state walks too. |
+| `test_route_busy_lifecycle.py` | c313657 regression: a transcript event during the debounce window cancels the pending `route_runtime` pane-idle clear (re-arm). Inbound-sent and full-turn state walks too. |
 | `test_topic_close_cleanup.py` | Closing a topic kills the bound tmux window and unbinds. Idempotent against missing bindings / already-killed windows. |
 | `test_voice_upload_transcribe.py` | Voice → `transcribe_voice` substrate → `aggregator_offer_voice` with the transcription. Echo bubble sent. Missing API key surfaces a warning. |
 | `test_document_upload.py` | Document → download → `aggregator_offer_document` (bound) or pending-attachment stash (unbound). Oversized files are rejected. |
@@ -43,7 +43,7 @@ which are scenario-overlap candidates.
 
 | Bucket | Files (and why) |
 | --- | --- |
-| **(1) Keep — protected invariants** | `tests/cctelegram/handlers/test_busy_indicator.py` (parallel-tools / 1M context latch / sidechain replay / WAITING_ON_USER restoration), `test_status_polling.py` + `test_status_polling_wave2.py` (V2 typing separation), `test_pending_route_payload.py` (owner replacement + ignored-stale-thread machinery), `test_stale_window_callbacks.py` (ordering: stale rejection before tmux lookup), `test_terminal_parser.py` / `test_transcript_parser.py` (pure parsers — no scenario overlap), `test_message_queue.py` (digest invariants Wave A doesn't yet cover end-to-end), `test_interactive_ui.py` (mint/peek/consume mechanics under sidechain), `test_session_monitor.py` (poll cycle invariants). |
+| **(1) Keep — protected invariants** | `tests/cctelegram/test_route_runtime.py` (parallel-tools / 1M context latch / sidechain replay / WAITING_ON_USER restoration — run-state machine moved here from the deleted `test_busy_indicator.py`), `test_status_polling.py` + `test_status_polling_wave2.py` (typing separation), `test_pending_route_payload.py` (owner replacement + ignored-stale-thread machinery), `test_stale_window_callbacks.py` (ordering: stale rejection before tmux lookup), `test_terminal_parser.py` / `test_transcript_parser.py` (pure parsers — no scenario overlap), `test_message_queue.py` (digest invariants Wave A doesn't yet cover end-to-end), `test_interactive_ui.py` (mint/peek/consume mechanics under sidechain), `test_session_monitor.py` (poll cycle invariants). |
 | **(2) Replace — scenario overlap; keep for now** | `test_forward_command.py` overlaps with `test_slash_command_flush`. `test_kill_command.py` overlaps with `test_kill_mid_tool_use`. Parts of `test_pending_route_payload.py` overlap with `test_stale_pending_replacement` (but keep for the file-deletion invariants the scenario doesn't cover). |
 | **(3) Delete — incidental coupling** | **None in Wave A.** Wave B/C may revisit after deepening lands. |
 
@@ -64,13 +64,14 @@ do NOT block Wave A merge — Wave B/C should address them.
      so the bindings loop's display-name lookup misses and the binding
      is silently dropped. Fix: hold the display-name snapshot for the
      whole function, or migrate bindings before popping.
-  2. **`busy_indicator._open_tools` only cleared via `teardown_route`.**
-     If `_open_tools[route]` got seeded (e.g. via startup replay) but
-     no message_queue queue ever opened for the route, `/kill` /
-     topic-close don't reach `busy_indicator.clear_route`. The
-     route's open_tools survives. (Touched in Wave A by relaxing the
-     direct assertion in `test_kill_mid_tool_use`; full coverage will
-     come via the Wave B `RouteRuntime` snapshot interface.)
+  2. **Route open-tools cleared only via teardown.** (RESOLVED by Wave 3
+     8c.) Historically `busy_indicator._open_tools` could survive a
+     `/kill` / topic-close if it was seeded (e.g. via startup replay)
+     without a message_queue queue ever opening for the route. Run-state
+     is now owned solely by `route_runtime` (the `RouteRuntimeSnapshot`
+     interface); `busy_indicator` is deleted, and teardown / session
+     reset route through `route_runtime` (`mark_session_reset`,
+     `clear_route`).
   3. **`message_queue` lacks a `reset_for_tests()` seam.** The fixture
      in `tests/conftest.py` clears 20+ module-level dicts to give each
      scenario a clean slate. Wave B's `RouteRuntime` should consolidate
