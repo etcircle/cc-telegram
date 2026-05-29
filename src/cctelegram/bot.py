@@ -728,8 +728,12 @@ async def forward_command_handler(
             # session_monitor change-detection path, but route_runtime
             # exposes the intent directly so consumers see IDLE_CLEARED
             # immediately rather than waiting for the next poll cycle.
-            if config.route_runtime_v2:
-                await route_runtime.mark_session_reset(route)
+            # Unconditional (8a): the context footer now reads
+            # route_runtime.context_usage in ALL configs, so the reset that
+            # DROPS that cache must fire in all configs too — otherwise the
+            # 1M latch would survive a /clear and the new session's footer
+            # would render the stale larger window (Codex 8a finding).
+            await route_runtime.mark_session_reset(route)
 
         # Interactive commands (e.g. /model) render a terminal-based UI
         # with no JSONL tool_use entry.  The status poller already detects
@@ -793,10 +797,12 @@ async def _build_context_footer(
     of context size at the moment the assistant turn ended, so a user
     scrolling back through history sees how context evolved turn by turn.
 
-    Routes through ``busy_indicator.update_context_usage`` so the 1M-cap
-    latch is shared with the topic-title indicator — otherwise a session
-    that previously crossed 200k but is now back to 80k would show
-    ``80k / 1M`` in the title and ``80k / 200k`` in the footer.
+    Reads context usage from ``route_runtime.snapshot(route).context_usage``
+    (8a: single authority for both the write and the read). The 1M-cap latch
+    lives in ``route_runtime.update_context_usage`` so a session that
+    previously crossed 200k but is now back to 80k still shows ``80k / 1M``
+    rather than dropping back to ``80k / 200k``. The footer renders the same
+    regardless of ``config.route_runtime_v2`` since the write is unconditional.
     """
     if not window_id:
         return None
@@ -815,9 +821,14 @@ async def _build_context_footer(
 
     route = (user_id, thread_id or 0, window_id)
     busy_indicator.update_context_usage(route, latest.tokens, latest.model)
-    if config.route_runtime_v2:
-        route_runtime.update_context_usage(route, latest.tokens, latest.model)
-    usage = busy_indicator.context_usage(route)
+    # 8a: route_runtime is the footer's single authority for BOTH the write
+    # and the read. The write is unconditional (populated in every config,
+    # not just the soak flag) so the read below never blanks; the 200k→1M
+    # latch lives in route_runtime.update_context_usage. busy_indicator's
+    # update is retained only so the topic-title indicator (a separate 8c
+    # consumer) keeps its shared cache during the migration.
+    route_runtime.update_context_usage(route, latest.tokens, latest.model)
+    usage = route_runtime.snapshot(route).context_usage
     if usage is None:
         return None
     return f"_📊 {format_tokens(usage.tokens)} / {format_max(usage.max_tokens)}_"
