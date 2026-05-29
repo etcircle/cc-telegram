@@ -652,11 +652,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # won't match and we MUST NOT send a digit — picking "1" on a new
         # form could submit the wrong answer.
         #
-        # PR 2: use ``resolve_ask_form`` with the same cached JSONL payload
-        # the render path saw (via ``resolve_ask_tool_input``). Without
-        # this, a multi-question form rendered with the JSONL overlay
-        # would mint fingerprints the pane-only re-parse here could never
-        # match, bouncing every click to "Form changed, refreshing".
+        # PR 2: use ``resolve_ask_form`` with the same AUQ source the render
+        # path saw (via ``_resolve_auq_source``). For live pending AUQs Claude
+        # buffers JSONL until the question is answered, so the PreToolUse side
+        # file is the authoritative dict source while the live pane remains the
+        # staleness check. Falling back to ``resolve_ask_tool_input`` here would
+        # miss that side file and mint/validate against different forms.
         # Capture with the SAME scrollback as the render path
         # (handlers/interactive_ui.py uses scrollback_lines=500). A
         # smaller scrollback here produces a different pane slice from
@@ -666,9 +667,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # were only recoverable in the 500-line capture) to bounce with
         # "Form changed, refreshing".
         pane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
-        cached_input = resolve_ask_tool_input(window_id)
+        resolved_input = interactive_ui._resolve_auq_source(window_id, None, pane or "")
         current_form = (
-            adapters.terminal_parser.resolve_ask_form(cached_input, pane)
+            adapters.terminal_parser.resolve_ask_form(resolved_input, pane)
             if pane
             else None
         )
@@ -845,6 +846,11 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # and ``handle_interactive_ui`` reacquiring the route lock, the
         # re-render sees the guard mismatch and aborts — no orphan card
         # posted after the prompt has already advanced.
+        # Intentionally remains JSONL-cache-only: this guard prevents orphan
+        # post-answer re-renders when a completed tool_result clears/replaces
+        # the replay cache. The live PreToolUse side file is not cleared at
+        # digit dispatch time, so including it here would not strengthen that
+        # post-answer race guard.
         rerender_guard = _ask_tool_input_digest(resolve_ask_tool_input(window_id))
         await handle_interactive_ui(
             context.bot,

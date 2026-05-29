@@ -1146,10 +1146,9 @@ class TestRenderAskUserQuestion:
         form = AskUserQuestionForm()
         assert _render_ask_user_question(form) == ""
 
-    def test_descriptions_inlined_under_each_option(self):
-        """PR 2: per-option description text from the JSONL payload shows
-        up indented under the option label. Empty descriptions skip the
-        indent line (pane-only forms don't carry descriptions).
+    def test_single_select_descriptions_not_inlined_under_each_option(self):
+        """Single-select picker cards stay compact; rich descriptions live
+        in the separate AUQ context message.
         """
         form = AskUserQuestionForm(
             tabs=(),
@@ -1181,10 +1180,12 @@ class TestRenderAskUserQuestion:
         out = _render_ask_user_question(form)
         # Option labels still visible.
         assert "❯ 1. A — Top toolbar (Recommended)" in out
-        # Descriptions appear indented under their option.
-        assert "    Always-visible button next to Render." in out
-        assert "    Cleaner timeline; less visual noise" in out
-        # An option with empty description does NOT get an empty indent line.
+        assert "  2. B — Hover labels" in out
+        assert "  3. C — Skip the feature" in out
+        # Descriptions are deliberately not duplicated in the picker card.
+        assert "Always-visible button next to Render" not in out
+        assert "Cleaner timeline; less visual noise" not in out
+        # No option gets an empty indent line.
         lines = out.split("\n")
         for i, line in enumerate(lines):
             if "3. C — Skip" in line:
@@ -1196,10 +1197,9 @@ class TestRenderAskUserQuestion:
                 assert nxt == "" or "Enter to select" in nxt
                 break
 
-    def test_description_truncated_at_250_chars(self):
-        """A description longer than 250 chars is hard-truncated with an
-        ellipsis. Multi-line descriptions get collapsed first so the cap
-        counts against visible characters.
+    def test_long_single_select_description_omitted_from_card(self):
+        """Long single-select descriptions are omitted rather than truncated
+        inline; the context message owns the full detail.
         """
         long_desc = (
             "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 10
@@ -1218,15 +1218,11 @@ class TestRenderAskUserQuestion:
             ),
         )
         out = _render_ask_user_question(form)
-        # The rendered indent line must be ≤ 4 (indent) + 250 chars long.
-        desc_lines = [line for line in out.split("\n") if line.startswith("    L")]
-        assert desc_lines, "expected an indented description line"
-        # 4 leading spaces + 250 chars max = 254 cap on the visible line.
-        assert all(len(line) <= 4 + 250 for line in desc_lines)
-        # Last char before any newline is the ellipsis.
-        assert desc_lines[0].endswith("…")
+        assert "❯ 1. A" in out
+        assert "Lorem ipsum" not in out
+        assert not any(line.startswith("    ") for line in out.split("\n"))
 
-    def test_multiline_description_collapsed_to_single_line(self):
+    def test_multiline_single_select_description_omitted_from_card(self):
         form = AskUserQuestionForm(
             tabs=(),
             current_question_title="Q?",
@@ -1241,17 +1237,13 @@ class TestRenderAskUserQuestion:
             ),
         )
         out = _render_ask_user_question(form)
-        # The whole description renders on a single indented line.
-        assert "    line one line two line three" in out
+        assert "❯ 1. A" in out
+        assert "line one" not in out
+        assert "line two" not in out
+        assert "line three" not in out
 
-    def test_body_clipped_at_3800_chars(self):
-        """Even with the per-option cap, a worst-case form could exceed
-        3800 chars. The renderer hard-clips the whole body so the send
-        layer never has to split (splitting would break the multi-tab
-        message_ids invariant in PR 3).
-        """
-        # Build 20 options each with a 250-char description ≈ 5300 chars
-        # of just descriptions. Total body well over the 3800 cap.
+    def test_single_select_long_descriptions_do_not_force_body_clip(self):
+        """Omitted descriptions keep large single-select cards compact."""
         opts = tuple(
             AskOption(
                 label=f"Option {i}",
@@ -1268,10 +1260,10 @@ class TestRenderAskUserQuestion:
             options=opts,
         )
         out = _render_ask_user_question(form)
-        # Body capped under 3800.
         assert len(out) <= 3800
-        # Cut marker present so the user knows it's truncated.
-        assert "body truncated" in out
+        assert "body truncated" not in out
+        assert "X" * 40 not in out
+        assert "20. Option 20" in out
 
 
 # ── PR 2b: pick-token map + structured option keyboard ────────────────────
