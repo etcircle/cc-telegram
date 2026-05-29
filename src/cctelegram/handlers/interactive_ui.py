@@ -2879,16 +2879,6 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
             cursor = "❯ " if opt.cursor else "  "
             rec = " (Recommended)" if opt.recommended else ""
             lines.append(f"{cursor}{opt.number}. {opt.label}{rec}")
-            # PR 2: inline per-option reasoning text from the JSONL payload
-            # when available. The pane parser doesn't populate
-            # ``description`` (it can't reliably attribute description
-            # lines to specific options), so this branch only fires for
-            # forms that came from ``resolve_ask_form`` with a JSONL
-            # overlay. Capped at 250 chars per option; collapses
-            # multi-line descriptions.
-            desc = _truncate_description(opt.description)
-            if desc:
-                lines.append(f"    {desc}")
         if form.is_free_text:
             lines.append("")
             lines.append("  (Type something — send a regular message to free-text)")
