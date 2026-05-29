@@ -60,8 +60,25 @@ def _single_select_input() -> dict[str, Any]:
 
 
 def _compressed_pane() -> str:
-    return """Choose the AUQ picker hotfix lane.
+    return """← ☐ Hotfix lane  ✔ Submit →
+Choose the AUQ picker hotfix lane.
 
+❯ 2. B) Live picker fix
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+
+def _compressed_pane_different_question_same_labels() -> str:
+    return """← ☐ Approval path  ✔ Submit →
+Choose the production approval path.
+
+❯ 2. B) Live picker fix
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+
+def _compressed_pane_title_absent_same_labels() -> str:
+    return """← ☐ Hotfix lane  ✔ Submit →
 ❯ 2. B) Live picker fix
 Enter to select · ↑/↓ to navigate · Esc to cancel
 """
@@ -205,4 +222,97 @@ async def test_single_select_side_file_fingerprint_dispatch_and_compact_card(
     ]
     assert "Form changed, refreshing." not in [
         str(sent.kwargs.get("text") or "") for sent in scenario.bot.sent
+    ]
+
+
+@pytest.mark.asyncio
+async def test_single_select_compressed_pane_rejects_stale_same_labels_title_mismatch(
+    scenario: ScenarioHarness,
+) -> None:
+    wid = _bind(scenario, _compressed_pane())
+    _write_side_file(_single_select_input())
+
+    await _render(scenario, wid)
+    picks = [cb for cb in _pick_callbacks(scenario) if cb.startswith(CB_ASK_PICK)]
+    assert len(picks) == 3
+
+    stale_record = interactive_ui._read_pretool_side_file(_SESSION_ID)
+    assert stale_record is not None
+    different_pane = _compressed_pane_different_question_same_labels()
+    different_form = terminal_parser.resolve_ask_form(None, different_pane)
+    assert different_form is not None
+    assert (
+        different_form.current_question_title == "Choose the production approval path."
+    )
+    assert not different_form.options_contiguous_from_one()
+    assert interactive_ui._record_consistent_with_pane(
+        stale_record, different_form
+    ) == (
+        False,
+        "title_mismatch",
+    )
+
+    scenario.tmux.set_pane(wid, different_pane)
+    await _tap(scenario, picks[1])
+
+    assert scenario.tmux.sent_keys == []
+
+
+@pytest.mark.asyncio
+async def test_single_select_compressed_pane_matching_title_still_dispatches(
+    scenario: ScenarioHarness,
+) -> None:
+    pane = _compressed_pane()
+    wid = _bind(scenario, pane)
+    _write_side_file(_single_select_input())
+
+    await _render(scenario, wid)
+    picks = [cb for cb in _pick_callbacks(scenario) if cb.startswith(CB_ASK_PICK)]
+    assert len(picks) == 3
+
+    record = interactive_ui._read_pretool_side_file(_SESSION_ID)
+    assert record is not None
+    pane_form = terminal_parser.resolve_ask_form(None, pane)
+    assert pane_form is not None
+    assert pane_form.current_question_title == "Choose the AUQ picker hotfix lane."
+    assert not pane_form.options_contiguous_from_one()
+    assert interactive_ui._record_consistent_with_pane(record, pane_form) == (
+        True,
+        "ok",
+    )
+
+    await _tap(scenario, picks[1])
+    assert scenario.tmux.sent_keys[-2:] == [
+        (wid, "2", False, True),
+        (wid, "Enter", False, False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_single_select_compressed_pane_title_absent_still_dispatches(
+    scenario: ScenarioHarness,
+) -> None:
+    pane = _compressed_pane_title_absent_same_labels()
+    wid = _bind(scenario, pane)
+    _write_side_file(_single_select_input())
+
+    await _render(scenario, wid)
+    picks = [cb for cb in _pick_callbacks(scenario) if cb.startswith(CB_ASK_PICK)]
+    assert len(picks) == 3
+
+    record = interactive_ui._read_pretool_side_file(_SESSION_ID)
+    assert record is not None
+    pane_form = terminal_parser.resolve_ask_form(None, pane)
+    assert pane_form is not None
+    assert pane_form.current_question_title is None
+    assert not pane_form.options_contiguous_from_one()
+    assert interactive_ui._record_consistent_with_pane(record, pane_form) == (
+        True,
+        "ok",
+    )
+
+    await _tap(scenario, picks[1])
+    assert scenario.tmux.sent_keys[-2:] == [
+        (wid, "2", False, True),
+        (wid, "Enter", False, False),
     ]

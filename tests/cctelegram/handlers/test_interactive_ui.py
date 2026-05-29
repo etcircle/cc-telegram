@@ -4289,20 +4289,15 @@ class TestRecordConsistentWithPane:
         # Codex P1: label-only matching would accept this stale side file
         # because "Label C" exists, but the visible pane says it is option 3.
         rec = self._single_q_record(["Label C", "Label B", "Other label"])
-        form = _make_form_single_question(
-            "Bogus wrapped description title", ["Label C"], option_numbers=[3]
-        )
+        form = _make_form_single_question("", ["Label C"], option_numbers=[3])
         ok, reason = _record_consistent_with_pane(rec, form)
         assert ok is False
         assert reason == "label_mismatch"
 
     def test_compressed_pane_accepts_side_file_label_at_visible_number(self):
-        # Compressed panes can have bogus titles; the preserved option number
-        # anchors the side-file label check.
+        # Title-absent compressed panes are anchored by preserved option number.
         rec = self._single_q_record(["Label A", "Label B", "Label C"])
-        form = _make_form_single_question(
-            "Bogus wrapped description title", ["Label C"], option_numbers=[3]
-        )
+        form = _make_form_single_question("", ["Label C"], option_numbers=[3])
         ok, reason = _record_consistent_with_pane(rec, form)
         assert ok is True
         assert reason == "ok"
