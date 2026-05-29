@@ -51,11 +51,21 @@ exposes immutable `RouteRuntimeSnapshot` reads. Every mutation
 `asyncio.Lock`, applies the transition, freezes a snapshot, and fires
 observers **after** commit. Snapshot fields: `run_state`,
 `open_tools`, `waiting_on_user_tools`, `context_usage`,
-`last_event_at`, `idle_clear_at`, `typing_eligible`,
-`status_card_visible`, `status_card_msg_id`, `broken_topic`,
-`monotonic_seq`. The plan target: post-soak, the legacy paths are
-deleted and consumers (typing_action_loop, activity-digest renderer,
-status-card lifecycle in `message_queue`) read only from
+`last_event_at`, `idle_clear_at`, `pane_idle_clear_at`,
+`typing_eligible`, `status_card_visible`, `status_card_msg_id`,
+`broken_topic`, `monotonic_seq`. The two idle deadlines are distinct:
+`idle_clear_at` is the run-state `IDLE_RECENT → IDLE_CLEARED` decay
+(armed by a transcript end-of-turn), while `pane_idle_clear_at` is the
+debounced "🟡 Busy" *card-clear* deadline (armed by `status_polling`
+on a confirmed-idle pane via `arm_pane_idle_clear`, read back via
+`pane_idle_clear_due`, committed by `commit_pane_idle_clear`; activity
+re-arms/cancels it inside `ingest_transcript_event` /
+`mark_inbound_sent`). Wave 3 8b moved card-clear *ownership* into
+`route_runtime` under `route_runtime_v2=true`, so the legacy
+`status_polling._idle_state` machine is dormant under flag-on (deleted
+in 8c). The plan target: post-soak, the legacy paths are deleted and
+consumers (typing_action_loop, activity-digest renderer, status-card
+lifecycle in `message_queue`) read only from
 `route_runtime.snapshot(route)`. **Active when
 `CC_TELEGRAM_ROUTE_RUNTIME_V2=true`** — set the env var manually,
 observe for ≥48h, then ship the legacy deletion as a follow-up commit.

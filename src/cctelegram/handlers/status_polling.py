@@ -514,6 +514,20 @@ async def update_status_message(
     if skip_status:
         return
 
+    if config.route_runtime_v2:
+        # route_runtime_v2: the debounced card clear is owned by
+        # route_runtime (``arm_pane_idle_clear`` / ``pane_idle_clear_due``
+        # / ``commit_pane_idle_clear``). The legacy ``_idle_state``
+        # three-state machine below is dormant under this flag (deleted in
+        # 8c). Debounce timing is preserved exactly: the card is not
+        # cleared until IDLE_CLEAR_DELAY_SECONDS of *continued* confirmed
+        # idle, and any transcript / inbound activity re-arms (cancels) the
+        # pending clear inside route_runtime.
+        await _drive_pane_idle_clear_v2(
+            bot, user_id, window_id, thread_id, is_running, status_line
+        )
+        return
+
     if is_running:
         _idle_state.pop(key, None)
         await enqueue_status_update(
@@ -548,8 +562,6 @@ async def update_status_message(
     # ``handle_interactive_ui`` — that branch already returned early above.
     if config.busy_indicator_v2:
         await busy_indicator.mark_pane_idle((user_id, thread_id or 0, window_id))
-    if config.route_runtime_v2:
-        await route_runtime.mark_pane_idle((user_id, thread_id or 0, window_id))
     await enqueue_status_update(
         bot,
         user_id,
@@ -557,6 +569,77 @@ async def update_status_message(
         None,
         thread_id=thread_id,
     )
+
+
+async def _drive_pane_idle_clear_v2(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None,
+    is_running: bool,
+    status_line: str | None,
+) -> None:
+    """route_runtime_v2 card-clear driver (replaces the ``_idle_state`` machine).
+
+    Preserves the legacy debounce timing exactly, but the deadline lives in
+    ``route_runtime`` (so it shares a source of truth with the run-state
+    machine and ``now`` is injectable for tests):
+
+      - **Running pane** → re-arm by cancelling any pending pane-idle clear
+        (``arm_pane_idle_clear`` is a no-op while running; instead we let a
+        live transcript/inbound event re-arm via
+        ``route_runtime``'s own ``_rearm_pane_idle_in_place``). We still
+        enqueue the live status line. Mirrors the legacy
+        ``_idle_state.pop(key)`` + status enqueue.
+      - **Idle pane, not yet due** → ``arm_pane_idle_clear`` (idempotent;
+        sets the deadline on the first confirmed-idle observation, then
+        waits it out). Mirrors ``_idle_state[key] = now``.
+      - **Idle pane, deadline due** → ``commit_pane_idle_clear`` (reconciles
+        run-state to IDLE_CLEARED, latches the cleared sentinel) + enqueue
+        the card clear. Mirrors ``_idle_state[key] = "cleared"`` +
+        ``mark_pane_idle`` + clear enqueue.
+
+    A single ``now`` is read once and threaded through arm/due so the
+    decision is consistent within the tick.
+    """
+    route = (user_id, thread_id or 0, window_id)
+    if is_running:
+        # Pane shows active work. Cancel any pending pane-idle clear so a
+        # fresh idle stretch re-arms from scratch (mirrors the legacy
+        # ``_idle_state.pop(key)`` in the running branch); without this a
+        # deadline armed in a prior idle stretch could fire immediately
+        # when the pane next goes quiet, skipping the debounce. Transcript /
+        # inbound events also re-arm inside route_runtime, but the pane can
+        # show running before the next transcript event lands.
+        route_runtime.reset_pane_idle_clear(route)
+        await enqueue_status_update(
+            bot, user_id, window_id, status_line, thread_id=thread_id
+        )
+        return
+
+    now = time.monotonic()
+    if route_runtime.pane_idle_clear_due(route, now=now):
+        # Debounce elapsed — clear once. ``commit_pane_idle_clear``
+        # reconciles run-state (no-op for WAITING_ON_USER / BROKEN_TOPIC,
+        # the same guard the interactive branch above already enforces) and
+        # latches the cleared sentinel so repeat idle ticks are no-ops.
+        # ``now`` lets commit re-validate armed-and-due under the lock (TOCTOU
+        # vs a concurrent activity re-arm) — it no-ops if re-armed/cancelled.
+        if not await route_runtime.commit_pane_idle_clear(route, now=now):
+            # commit no-op'd: activity re-armed between the lockless due-check
+            # and the lock. Do NOT clear the card this tick (TOCTOU guard —
+            # see commit_pane_idle_clear; run-state alone is ambiguous, so the
+            # explicit bool is authoritative).
+            return
+        if config.busy_indicator_v2:
+            # Keep the legacy indicator reconciled during the dual-flag
+            # soak; deleted with the rest of busy_indicator in 8c.
+            await busy_indicator.mark_pane_idle(route)
+        await enqueue_status_update(bot, user_id, window_id, None, thread_id=thread_id)
+        return
+
+    # Idle but not yet due — arm (idempotent) and wait out the delay.
+    route_runtime.arm_pane_idle_clear(route, now=now)
 
 
 async def _process_idle_clear_only(
@@ -585,6 +668,25 @@ async def _process_idle_clear_only(
     """
     if skip_status:
         return
+
+    if config.route_runtime_v2:
+        # route_runtime_v2: advance the route_runtime-owned debounce, but
+        # NEVER arm here — without a pane scrape we can't confirm idle.
+        # Only commit a clear that a prior confirmed-idle tick already
+        # armed and that is now due. Mirrors the legacy "do nothing unless
+        # a float timestamp is already pending and elapsed" semantics.
+        route = (user_id, thread_id or 0, window_id)
+        now = time.monotonic()
+        if not route_runtime.pane_idle_clear_due(route, now=now):
+            return
+        if not await route_runtime.commit_pane_idle_clear(route, now=now):
+            # commit no-op'd (activity re-armed) — do not clear the card.
+            return
+        if config.busy_indicator_v2:
+            await busy_indicator.mark_pane_idle(route)
+        await enqueue_status_update(bot, user_id, window_id, None, thread_id=thread_id)
+        return
+
     key = (user_id, thread_id or 0)
     state = _idle_state.get(key)
     if state is None or state == "cleared":
@@ -595,8 +697,6 @@ async def _process_idle_clear_only(
     _idle_state[key] = "cleared"
     if config.busy_indicator_v2:
         await busy_indicator.mark_pane_idle((user_id, thread_id or 0, window_id))
-    if config.route_runtime_v2:
-        await route_runtime.mark_pane_idle((user_id, thread_id or 0, window_id))
     await enqueue_status_update(
         bot,
         user_id,

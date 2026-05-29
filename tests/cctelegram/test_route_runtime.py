@@ -70,6 +70,7 @@ def test_default_snapshot_for_unknown_route():
     assert snap.waiting_on_user_tools == frozenset()
     assert snap.context_usage is None
     assert snap.idle_clear_at is None
+    assert snap.pane_idle_clear_at is None
     assert snap.typing_eligible is False
     assert snap.status_card_visible is False
     assert snap.status_card_msg_id is None
@@ -199,6 +200,183 @@ async def test_mark_pane_idle_drops_lingering_tools():
     snap = await route_runtime.mark_pane_idle(ROUTE)
     assert snap.run_state is RunState.IDLE_CLEARED
     assert snap.open_tools == frozenset()
+
+
+# ── debounced pane-idle card-clear triad (8b) ────────────────────────────
+#
+# These exercise the route_runtime-owned debounce in isolation, with an
+# injected ``now`` so the deadline timing is deterministic (no wall clock).
+# The DELAY is route_runtime.IDLE_CLEAR_DELAY_SECONDS.
+
+_DELAY = route_runtime.IDLE_CLEAR_DELAY_SECONDS
+
+
+async def test_arm_pane_idle_clear_sets_deadline():
+    snap = route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    assert snap.pane_idle_clear_at == 100.0 + _DELAY
+    # Not yet due immediately after arming.
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=100.0) is False
+
+
+async def test_arm_is_idempotent_does_not_push_deadline_forward():
+    """A second arm during the same idle stretch must NOT extend the
+    deadline (legacy ``state is None`` arm only fires once)."""
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    snap = route_runtime.arm_pane_idle_clear(ROUTE, now=102.0)
+    # Still anchored to the first observation, not 102 + DELAY.
+    assert snap.pane_idle_clear_at == 100.0 + _DELAY
+
+
+async def test_pane_idle_clear_not_due_before_delay():
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    # One tick before the deadline.
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=100.0 + _DELAY - 0.001) is False
+
+
+async def test_pane_idle_clear_due_at_and_after_deadline():
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=100.0 + _DELAY) is True
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=100.0 + _DELAY + 5) is True
+
+
+async def test_unarmed_route_is_never_due():
+    """``_process_idle_clear_only`` relies on this: no arm → never commit."""
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=1_000_000.0) is False
+
+
+async def test_commit_pane_idle_clear_reconciles_and_latches():
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
+    )
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is True
+    snap = route_runtime.snapshot(ROUTE)
+    # Same reconciliation as mark_pane_idle.
+    assert snap.run_state is RunState.IDLE_CLEARED
+    assert snap.open_tools == frozenset()
+    # Deadline dropped; cleared sentinel latched.
+    assert snap.pane_idle_clear_at is None
+
+
+async def test_commit_then_arm_is_noop_until_activity():
+    """After a commit, re-arming during the same idle stretch is a no-op
+    (mirrors the legacy ``_idle_state[key] == 'cleared'`` early return) so
+    the card-clear fires exactly once."""
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY)
+    snap = route_runtime.arm_pane_idle_clear(ROUTE, now=200.0)
+    assert snap.pane_idle_clear_at is None  # still cleared, not re-armed
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=10_000.0) is False
+
+
+async def test_commit_preserves_waiting_on_user():
+    """An open interactive prompt must survive a debounced clear, exactly
+    like mark_pane_idle."""
+    await route_runtime.ingest_transcript_event(
+        ROUTE,
+        _evt("assistant", "tool_use", tool_use_id="auq", tool_name="AskUserQuestion"),
+    )
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is True
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
+
+
+async def test_transcript_activity_rearms_pending_clear():
+    """c313657 guard: a transcript event during the debounce window cancels
+    the pending clear so the card stays up."""
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=100.0 + _DELAY) is True
+    # Real activity lands before the poller commits.
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t9", tool_name="Bash")
+    )
+    # Pending clear cancelled — no longer due.
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=100.0 + _DELAY) is False
+    assert route_runtime.snapshot(ROUTE).pane_idle_clear_at is None
+
+
+async def test_inbound_sent_rearms_pending_clear():
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    await route_runtime.mark_inbound_sent(ROUTE)
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=100.0 + _DELAY) is False
+
+
+async def test_commit_noops_if_rearmed_after_lockless_due_check():
+    """TOCTOU re-validation (Codex 8b P1).
+
+    ``status_polling`` checks ``pane_idle_clear_due`` WITHOUT the lock, then
+    ``await``\\s ``commit_pane_idle_clear``. If a transcript event lands in
+    between (re-arming → cancelling the deadline), commit must re-check under
+    the lock and NO-OP — committing the now-stale clear would blank the card
+    mid-turn after fresh activity. Without the in-lock re-validation this test
+    fails (run-state would be IDLE_CLEARED)."""
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
+    )
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    # Caller's lockless due-check sees True at the deadline...
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=100.0 + _DELAY) is True
+    # ...but real activity lands (re-arm cancels the deadline) before commit.
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t2", tool_name="Bash")
+    )
+    # Commit with the stale 'due' now must NOT clear: it returns False (the
+    # explicit signal status_polling uses to decide whether to enqueue the
+    # clear), and run-state stays running.
+    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is False
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.run_state is RunState.RUNNING_TOOL
+    assert snap.pane_idle_clear_at is None  # cancelled by the re-arm
+
+
+async def test_commit_noops_if_rearmed_to_waiting_on_user():
+    """Re-arm to a NON-running state must STILL no-op the clear (Codex 8b
+    re-review P1/P2). An AskUserQuestion landing between the lockless due-check
+    and the lock puts the route in WAITING_ON_USER and cancels the deadline; a
+    run-state proxy would mis-read WAITING_ON_USER as a legitimate clear, but
+    the explicit bool returns False so status_polling does NOT blank the card."""
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=100.0 + _DELAY) is True
+    await route_runtime.ingest_transcript_event(
+        ROUTE,
+        _evt("assistant", "tool_use", tool_use_id="auq", tool_name="AskUserQuestion"),
+    )
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
+    # Non-running, but commit must still NOT clear (deadline was cancelled).
+    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is False
+
+
+async def test_activity_after_commit_reenables_arming():
+    """After a clear, real activity resets the cleared sentinel so the next
+    idle stretch can re-arm and fire again (a new turn → new debounce)."""
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY)
+    # New turn.
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t2", tool_name="Bash")
+    )
+    # Now arming works again with a fresh deadline.
+    snap = route_runtime.arm_pane_idle_clear(ROUTE, now=300.0)
+    assert snap.pane_idle_clear_at == 300.0 + _DELAY
+
+
+async def test_reset_pane_idle_clear_cancels_and_reenables():
+    """Pane-running observation cancels a pending clear AND resets the
+    cleared sentinel (mirrors the legacy ``_idle_state.pop`` in the
+    running branch)."""
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    route_runtime.reset_pane_idle_clear(ROUTE)
+    assert route_runtime.snapshot(ROUTE).pane_idle_clear_at is None
+    # Re-arming works immediately (sentinel was cleared, not latched).
+    snap = route_runtime.arm_pane_idle_clear(ROUTE, now=200.0)
+    assert snap.pane_idle_clear_at == 200.0 + _DELAY
+
+
+async def test_session_reset_clears_pending_pane_idle():
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    snap = await route_runtime.mark_session_reset(ROUTE)
+    assert snap.pane_idle_clear_at is None
+    assert route_runtime.pane_idle_clear_due(ROUTE, now=10_000.0) is False
 
 
 async def test_mark_topic_broken_and_recovered_round_trip():
