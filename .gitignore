@@ -71,3 +71,15 @@ venv.bak/
 uv.lock
 temp/
 .clawpatch/
+
+# Local agent/session cruft (never commit — see 2026-05-29 cleanup handoff)
+.DS_Store
+.cgcignore
+.claude/.curate/
+.claude/hooks/
+.claude/skills/
+.claude/scheduled_tasks.lock
+memory/
+docs/plans/
+/20260527_165550_ac916c
+/20260527_165944_36eead

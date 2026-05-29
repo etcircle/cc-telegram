@@ -30,7 +30,7 @@ else
     printf "callback_handler LoC      : n/a\n"
 fi
 printf "message_queue.py LoC      : %d\n" "$(wc -l < src/cctelegram/handlers/message_queue.py)"
-printf "busy_indicator.py LoC     : %d\n" "$(wc -l < src/cctelegram/handlers/busy_indicator.py)"
+printf "route_runtime.py LoC      : %d\n" "$(wc -l < src/cctelegram/route_runtime.py)"
 printf "status_polling.py LoC     : %d\n" "$(wc -l < src/cctelegram/handlers/status_polling.py)"
 printf "interactive_ui.py LoC     : %d\n" "$(wc -l < src/cctelegram/handlers/interactive_ui.py)"
 hr
