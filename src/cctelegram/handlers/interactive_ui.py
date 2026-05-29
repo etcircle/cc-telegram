@@ -71,9 +71,6 @@ from .message_sender import (
 
 logger = logging.getLogger(__name__)
 
-# Tool names that trigger interactive UI via JSONL (terminal capture + inline keyboard)
-INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
-
 # Track interactive UI message IDs: (user_id, thread_id_or_0) -> message_id
 _interactive_msgs: dict[tuple[int, int], int] = {}
 

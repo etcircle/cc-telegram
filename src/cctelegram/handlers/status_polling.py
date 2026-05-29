@@ -7,12 +7,16 @@ Provides background polling of terminal status lines for all active users:
   - Polls thread_bindings (each topic = one window)
   - Cleans up bindings whose tmux window has been killed
 
-Topic-existence detection is reactive only: real topic_send/topic_edit failures
-classify into ``_TOPIC_BROKEN_OUTCOMES`` and trigger emergency DMs from the
-message queue. We deliberately do NOT poll Telegram for topic liveness; the
-previously-used ``unpin_all_forum_topic_messages`` probe was destructive (it
-clears pinned messages on success, not a no-op) and runs every 60s for every
-bound topic, which would silently wipe legitimate user pins.
+Topic-existence detection is reactive in the polling loop: real
+topic_send/topic_edit failures classify into ``_TOPIC_BROKEN_OUTCOMES`` and
+trigger emergency DMs from the message queue. The status poller itself does NOT
+poll Telegram for topic liveness; the previously-used
+``unpin_all_forum_topic_messages`` probe was destructive (it clears pinned
+messages on success, not a no-op) and ran every 60s for every bound topic,
+which would silently wipe legitimate user pins. (A non-destructive
+``sendChatAction`` probe for *dormant* deleted topics does run, but only once
+per day from the GC loop in ``bot.py`` via ``message_queue.probe_topic_liveness``
+— that is separate from this 1s status loop.)
 
 Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (1 second)

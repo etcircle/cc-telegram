@@ -90,12 +90,19 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Awaitable, Callable, Literal
 
-from .handlers.interactive_ui import INTERACTIVE_TOOL_NAMES
-
 logger = logging.getLogger(__name__)
 
 
 Route = tuple[int, int, str]
+
+# Tool names whose open tool_use means "the run-state is WAITING_ON_USER".
+# Owned HERE (the run-state authority that classifies them) rather than imported
+# from the heavy ``handlers.interactive_ui`` UI layer — importing UI from the
+# core authority created a circular import (route_runtime → interactive_ui →
+# callback_dispatcher → …) that made ``import cctelegram.route_runtime`` fail
+# standalone and only work by bot.py's import order. interactive_ui and bot.py
+# import this constant FROM route_runtime now (one-way dependency).
+INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
 
 
 class RunState(Enum):

@@ -14,7 +14,7 @@ Each Telegram topic maps to one tmux window running one Claude Code process. The
 - **Run-state digest** — compact activity digests show tool activity, context-window percentage, and busy/waiting state.
 - **Reply context** — Telegram replies/quotes are injected into Claude with fenced, role-aware context for text, voice, photo, and document messages.
 - **Photos and voice** — photos are forwarded as base64 image blocks; voice notes are transcribed through OpenAI-compatible transcription.
-- **Attention cards** — end-of-turn questions can raise a prominent card with yes/no/type buttons.
+- **Attention cards** — when Claude is waiting on you and the structured picker can't be delivered to the topic, a single bold "Claude is waiting for you" card is pushed (notified once per episode, then silently kept current).
 - **SQLite provenance** — outgoing Telegram messages are indexed for safer reply-context resolution.
 - **Reactive broken-topic fallback** — if Telegram says a topic is gone/closed/forbidden, the bot falls back to DM rather than silently dropping Claude output.
 
@@ -76,9 +76,6 @@ Useful behavior knobs:
 - `CC_TELEGRAM_SHOW_TOOL_CALLS` — show tool use/result stream; default `true`.
 - `CC_TELEGRAM_SHOW_HIDDEN_DIRS` — show dot-directories in picker; default `false`.
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` — max input shown in `**Tool**(...)`; default `40`.
-- `CC_TELEGRAM_ATTENTION_BUTTONS` — inline buttons on attention cards; default `true`.
-- `CC_TELEGRAM_ATTENTION_BUTTON_TTL_SECONDS` — attention token TTL; default `86400`.
-- `CC_TELEGRAM_ATTENTION_QUESTION_PREVIEW_CHARS` — question card excerpt; default `200`.
 - `CC_TELEGRAM_AGENT_PROMPT_PREVIEW_CHARS` — subagent dispatch excerpt; default `400`.
 - `CC_TELEGRAM_REPLY_CONTEXT` — inject reply/quote context; default `true`.
 - `CC_TELEGRAM_QUOTE_INJECTION_MAX_CHARS` — max quoted text injected into Claude; default `1600`.

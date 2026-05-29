@@ -115,7 +115,6 @@ from .handlers.inbound_telegram import (  # noqa: F401
     voice_handler,
 )
 from .handlers.interactive_ui import (
-    INTERACTIVE_TOOL_NAMES,
     clear_interactive_mode,
     clear_interactive_msg,
     forget_ask_tool_input,
@@ -841,7 +840,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # tool_use/tool_result pair does.
         if (
             msg.subagent_key is None
-            and msg.tool_name in INTERACTIVE_TOOL_NAMES
+            and msg.tool_name in route_runtime.INTERACTIVE_TOOL_NAMES
             and msg.content_type == "tool_use"
         ):
             # Mark interactive mode BEFORE sleeping so polling skips this window
