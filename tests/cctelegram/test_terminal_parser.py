@@ -2684,7 +2684,13 @@ class TestPrBMultiSelectDetection:
         assert form.select_mode == "single"
         assert [o.label for o in form.options] == ["Submit answers", "Cancel"]
 
-    def test_compressed_fixture_detects_down_cursor_multi_but_incomplete(self):
+    def test_compressed_fixture_scroll_indicator_is_not_a_cursor(self):
+        # The top visible row of this compressed capture is ``↓ 3. [ ] C)``.
+        # The leading ``↓`` is Claude Code's scroll-more indicator (earlier
+        # options scrolled off the viewport), NOT a selection cursor — the
+        # real ``❯`` cursor is in the frozen scrollback above this slice. The
+        # parser must keep the row as an option but report cursor=False, so
+        # the JSONL overlay does not paint a phantom ❯ on the scroll boundary.
         form = parse_ask_user_question(
             _fixture("auq_multiselect_compressed_long_cursor_only_tmux_capture.txt")
         )
@@ -2692,7 +2698,7 @@ class TestPrBMultiSelectDetection:
         assert form.select_mode == "multi"
         assert form.options_complete is False
         assert [o.number for o in form.options] == [3]
-        assert form.options[0].cursor is True
+        assert form.options[0].cursor is False
         assert form.options[0].selected is False
 
     def test_ascii_checkbox_parsed_header_glyphs_not_option_glyphs(self):
@@ -2826,3 +2832,79 @@ class TestPrBMultiSelectDetection:
             assert iu._resolve_auq_source("@1", None, pane) == fresh
         finally:
             iu._last_completed_ask_tool_input.pop("@1", None)
+
+
+# ── Task #9 — arrow-nav stale-scrollback cursor regression ──────────────────
+#
+# Live ground truth: a single-select picker whose long option descriptions
+# push it past the 24-row viewport at the live bot's 80x24 geometry. After the
+# user scrolls (↑/↓), ``tmux capture-pane -S -500`` retains the pre-scroll top
+# rows in scrollback — including a frozen ``❯`` on option 1 — while the live
+# viewport shows the real ``❯`` further down. Pre-fix the parser reported BOTH
+# cursors and ``_overlay_cursor_and_selection`` locked onto the first (stale)
+# one, so the rendered card stayed on option 1 forever and arrow taps came back
+# MESSAGE_NOT_MODIFIED. The fixtures below are real captures at cursor positions
+# 1-5 (captured via direct ``tmux send-keys`` Up/Down against a live 80x24
+# picker). The live cursor is always the bottom-most ``❯``.
+
+
+class TestArrowNavStaleScrollbackCursor:
+    _CASES = {
+        "auq_single_long_scrolled_cursor1_S500.txt": 1,
+        "auq_single_long_scrolled_cursor2_S500.txt": 2,
+        "auq_single_long_scrolled_cursor3_S500.txt": 3,
+        "auq_single_long_scrolled_cursor4_S500.txt": 4,
+        "auq_single_long_scrolled_cursor5_S500.txt": 5,
+    }
+
+    def test_parser_reports_single_live_cursor_bottom_most(self):
+        for fixture_name, live in self._CASES.items():
+            form = parse_ask_user_question(_fixture(fixture_name))
+            assert form is not None, fixture_name
+            cursors = [o.number for o in form.options if o.cursor]
+            assert cursors == [live], (fixture_name, cursors)
+
+    def test_overlay_tracks_live_cursor_not_stale_scrollback(self):
+        from cctelegram.terminal_parser import _overlay_cursor_and_selection
+
+        dict_opts = tuple(
+            AskOption(label=f"opt{i}", recommended=False, cursor=False, number=i)
+            for i in range(1, 7)
+        )
+        for fixture_name, live in self._CASES.items():
+            form = parse_ask_user_question(_fixture(fixture_name))
+            assert form is not None, fixture_name
+            overlaid = _overlay_cursor_and_selection(dict_opts, form.options)
+            cursors = [o.number for o in overlaid if o.cursor]
+            assert cursors == [live], (fixture_name, cursors)
+
+    def test_overlay_prefers_last_cursor_when_pane_carries_two(self):
+        # Defense-in-depth: even if a caller feeds a raw multi-cursor pane
+        # tuple (stale option-1 ❯ above the live option-3 ❯), the overlay
+        # must render the LAST (live) cursor.
+        from cctelegram.terminal_parser import _overlay_cursor_and_selection
+
+        dict_opts = tuple(
+            AskOption(label=f"opt{i}", recommended=False, cursor=False, number=i)
+            for i in range(1, 4)
+        )
+        pane_opts = (
+            AskOption("opt1", False, True, 1),
+            AskOption("opt2", False, False, 2),
+            AskOption("opt3", False, True, 3),
+        )
+        overlaid = _overlay_cursor_and_selection(dict_opts, pane_opts)
+        assert [o.number for o in overlaid if o.cursor] == [3]
+
+    def test_keep_last_dedup_preserves_short_picker_single_cursor(self):
+        # No scroll, no stale duplicate: the lone cursor passes through.
+        pane = (
+            "Choose deployment strategy\n\n"
+            "  1. A) Blue-green rolling\n"
+            "❯ 2. B) Direct in-place restart\n"
+            "  3. C) Feature-flag dark launch\n"
+            "\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert [o.number for o in form.options if o.cursor] == [2]
