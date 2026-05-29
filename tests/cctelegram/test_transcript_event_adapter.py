@@ -1,5 +1,5 @@
-"""Unit tests for ``cctelegram.transcript_event_adapter`` — the Wave B
-shim that translates raw ``TranscriptEvent`` shapes into
+"""Unit tests for ``cctelegram.transcript_event_adapter`` — the adapter
+that translates raw ``TranscriptEvent`` shapes into
 ``TranscriptLifecycleEvent`` and fans out per route.
 
 Coverage:
@@ -8,8 +8,7 @@ Coverage:
     input order.
   - ``dispatch_transcript_event`` returns an empty list (no mutation)
     when translation rejects the event.
-  - ``dispatch_context_usage`` mirrors the bulk fan-out path
-    busy_indicator callers used to follow.
+  - ``dispatch_context_usage`` is the bulk context-usage fan-out path.
   - ``dispatch_seed_open_tools`` is the startup-replay entry point.
   - Once-per-session warning suppression doesn't crash the dispatch.
 """
@@ -21,7 +20,7 @@ from typing import Iterable
 import pytest
 
 from cctelegram import route_runtime, transcript_event_adapter
-from cctelegram.handlers.busy_indicator import RunState
+from cctelegram.route_runtime import RunState
 from cctelegram.session_monitor import TranscriptEvent
 
 

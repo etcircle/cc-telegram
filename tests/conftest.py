@@ -36,7 +36,6 @@ from cctelegram.utils import app_dir
 from cctelegram.handlers import (
     attention,
     auq_ledger,
-    busy_indicator,
     inbound_aggregator,
     interactive_ui,
     message_queue,
@@ -651,7 +650,7 @@ def _reset_aggregator() -> None:
 
 def _reset_status_polling() -> None:
     sp = status_polling
-    for name in ("_idle_state", "_route_typing_eligible", "_pane_idle_observed_at"):
+    for name in ("_last_pane_capture", "_last_published_ui_hash", "_absent_streak"):
         attr = getattr(sp, name, None)
         if isinstance(attr, dict):
             attr.clear()
@@ -688,7 +687,6 @@ def _reset_all_handler_state() -> None:
         for path in pending_dir.glob("*.json"):
             path.unlink(missing_ok=True)
     auq_ledger.reset_for_tests()
-    busy_indicator.reset_for_tests()
     route_runtime.reset_for_tests()
     transcript_event_adapter.reset_for_tests()
     attention.reset_for_tests()

@@ -80,11 +80,9 @@ async def clear_topic_state(
     # Drop any live attention card state — fresh topic gets a fresh episode.
     attention.clear(user_id, thread_id)
 
-    # Drop the status-polling idle counter so a re-bound topic starts fresh.
-    # Lazy import: status_polling already imports from this module.
-    from .status_polling import reset_idle_counter
-
-    reset_idle_counter(user_id, thread_id)
+    # The per-route pane-idle debounce state lives in ``route_runtime`` and is
+    # dropped by ``teardown_route`` → ``route_runtime.clear_route(route)``
+    # above, so a re-bound topic starts fresh without a separate reset here.
 
     # Clear pending thread state from user_data
     if user_data is not None:

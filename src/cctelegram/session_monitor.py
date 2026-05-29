@@ -814,9 +814,9 @@ class SessionMonitor:
 
         sessions_to_remove: set[str] = set()
         # Windows whose session_id flipped (e.g. /clear): the route's
-        # busy_indicator carries pre-/clear ``open_tools`` IDs that the new
-        # session will never close, pinning the route to RUNNING forever.
-        # Tracked here so we can hand them to ``busy_indicator.clear_route``
+        # route_runtime state carries pre-/clear ``open_tools`` IDs that the
+        # new session will never close, pinning the route to RUNNING forever.
+        # Tracked here so we can hand them to ``route_runtime.mark_session_reset``
         # once routes are resolved below.
         changed_window_ids: set[str] = set()
         # window_id → OLD session_id for windows whose session_id flipped
@@ -869,36 +869,29 @@ class SessionMonitor:
                 self._remove_sidechains_for_parent(session_id)
             self.state.save_if_dirty()
 
-        # Reset busy_indicator state for routes bound to windows whose
-        # session changed. Without this, ``_open_tools`` keeps the
-        # tool_use_ids from the pre-/clear session and ``_state_from_open_tools``
-        # never returns to IDLE, so the typing indicator and "🟡 Busy" card
-        # stay stuck forever even though the new session is genuinely idle.
+        # Reset route_runtime state for routes bound to windows whose session
+        # changed. Without this, ``open_tools`` keeps the tool_use_ids from the
+        # pre-/clear session and the run-state never returns to IDLE, so the
+        # typing indicator and "🟡 Busy" card stay stuck forever even though
+        # the new session is genuinely idle. ``mark_session_reset`` transitions
+        # the snapshot visibly (IDLE_CLEARED with ``status_card_msg_id``
+        # preserved) so subscribers observe the reset instead of silently
+        # dropping route state; it also drops the context_usage cache, so the
+        # 1M latch can't survive into the new session's footer.
         # Deferred imports for the same reason as ``_monitor_loop`` — these
         # modules transitively pull in this one.
         if changed_window_ids:
             from .session import session_manager
-            from .handlers import busy_indicator
             from .handlers.interactive_ui import forget_ask_tool_input
             from . import route_runtime
 
             for user_id, thread_id, wid in session_manager.iter_thread_bindings():
                 if wid in changed_window_ids:
-                    busy_indicator.clear_route((user_id, thread_id or 0, wid))
-                    # Same intent as busy_indicator.clear_route, but routed
-                    # through ``mark_session_reset`` so the snapshot transitions
-                    # visibly (IDLE_CLEARED with ``status_card_msg_id``
-                    # preserved). Lets subscribers observe the reset instead of
-                    # silently dropping route state. Unconditional (8a): the
-                    # context footer reads route_runtime.context_usage in ALL
-                    # configs, so this reset (which drops that cache) must mirror
-                    # busy_indicator.clear_route in all configs — else the 1M
-                    # latch survives a session change in flag-off config.
                     await route_runtime.mark_session_reset(
                         (user_id, thread_id or 0, wid)
                     )
                     logger.info(
-                        "Cleared busy_indicator route after session change: "
+                        "Reset route_runtime route after session change: "
                         "user=%d thread=%s window=%s",
                         user_id,
                         thread_id,

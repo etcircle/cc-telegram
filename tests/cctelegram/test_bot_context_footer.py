@@ -1,15 +1,12 @@
 """Regression coverage for ``bot._build_context_footer``.
 
-Pins the 8a migration of the ``📊 Nk/200k`` context-window footer onto
-``route_runtime`` as the single authority for both the write and the read:
+Pins the ``📊 Nk/200k`` context-window footer onto ``route_runtime`` as the
+single authority for both the write and the read:
 
   - the 200k→1M cap **latch** (once usage crosses 200k the denominator
     latches to 1M and stays there even when usage falls back below 200k);
-  - **flag-independence** — the footer renders identically regardless of
-    ``config.route_runtime_v2``, because the route_runtime write is now
-    unconditional rather than gated behind the soak flag.
-
-Before 8a this function had zero coverage (thinnest spot in the audit).
+  - ``mark_session_reset`` drops the latched cap so a fresh session renders
+    a fresh 200k denominator.
 """
 
 from __future__ import annotations
@@ -17,7 +14,6 @@ from __future__ import annotations
 import pytest
 
 from cctelegram import bot, route_runtime
-from cctelegram.config import config
 from cctelegram.session import ClaudeSession
 from cctelegram.transcript_parser import LatestUsage
 
@@ -57,65 +53,43 @@ def _install_usage(
     )
 
 
-async def _footer(monkeypatch: pytest.MonkeyPatch, *, v2: bool) -> str | None:
-    monkeypatch.setattr(config, "route_runtime_v2", v2)
+async def _footer() -> str | None:
     return await bot._build_context_footer(USER_ID, THREAD_ID, WINDOW_ID)
 
 
-@pytest.mark.parametrize("v2", [True, False])
-async def test_footer_renders_below_200k_in_both_configs(
-    monkeypatch: pytest.MonkeyPatch, v2: bool
-):
-    """Footer reads from route_runtime regardless of the soak flag.
-
-    Since the route_runtime write is now unconditional, the footer must
-    render identically whether ``route_runtime_v2`` is on or off — if the
-    write stayed gated, the read would blank in the flag-off config.
-    """
+async def test_footer_renders_below_200k(monkeypatch: pytest.MonkeyPatch):
+    """Footer reads context usage from route_runtime."""
     route_runtime.reset_for_tests()
     _install_usage(monkeypatch, 50_000)
 
-    footer = await _footer(monkeypatch, v2=v2)
-
-    assert footer == "_📊 50k / 200k_"
+    assert await _footer() == "_📊 50k / 200k_"
 
 
-@pytest.mark.parametrize("v2", [True, False])
 async def test_footer_latches_to_1m_after_crossing_200k(
-    monkeypatch: pytest.MonkeyPatch, v2: bool
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """200k→1M latch: once usage crosses 200k the denominator latches to 1M
-    and stays there even after usage falls back below 200k.
-
-    Asserted in BOTH flag configs to prove the unconditional write keeps the
-    latch state populated regardless of ``route_runtime_v2``.
-    """
+    and stays there even after usage falls back below 200k."""
     route_runtime.reset_for_tests()
     _install_usage(monkeypatch, 250_000)
-    assert await _footer(monkeypatch, v2=v2) == "_📊 250k / 1M_"
+    assert await _footer() == "_📊 250k / 1M_"
 
     # Same route drops back to 80k — the cap must remain latched at 1M, not
     # snap back to 200k.
     _install_usage(monkeypatch, 80_000)
-    assert await _footer(monkeypatch, v2=v2) == "_📊 80k / 1M_"
+    assert await _footer() == "_📊 80k / 1M_"
 
 
-@pytest.mark.parametrize("v2", [True, False])
-async def test_footer_latch_cleared_by_session_reset_in_both_configs(
-    monkeypatch: pytest.MonkeyPatch, v2: bool
+async def test_footer_latch_cleared_by_session_reset(
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    """Session reset drops the latch in ALL configs (Codex 8a finding).
-
-    The footer reads route_runtime.context_usage unconditionally, so the
-    reset that DROPS that cache (``mark_session_reset``, fired on /clear and
-    on session-change cleanup) must also be unconditional — otherwise the 1M
-    latch would survive a session reset in the flag-off config and the new
-    session's footer would render the stale larger window.
-    """
+    """``mark_session_reset`` (fired on /clear and on session-change cleanup)
+    drops the cached usage + the latched cap, so the new session's footer
+    renders a fresh 200k denominator rather than the stale 1M."""
     route = (USER_ID, THREAD_ID, WINDOW_ID)
     route_runtime.reset_for_tests()
     _install_usage(monkeypatch, 250_000)
-    assert await _footer(monkeypatch, v2=v2) == "_📊 250k / 1M_"
+    assert await _footer() == "_📊 250k / 1M_"
 
     # The session rotates (/clear or session-change cleanup) → reset drops the
     # cached usage + the latched cap for this route.
@@ -123,7 +97,7 @@ async def test_footer_latch_cleared_by_session_reset_in_both_configs(
 
     # New session reports 80k — the cap must be a FRESH 200k, not the stale 1M.
     _install_usage(monkeypatch, 80_000)
-    assert await _footer(monkeypatch, v2=v2) == "_📊 80k / 200k_"
+    assert await _footer() == "_📊 80k / 200k_"
 
 
 async def test_footer_blank_when_no_usage_observed(monkeypatch: pytest.MonkeyPatch):
@@ -131,4 +105,4 @@ async def test_footer_blank_when_no_usage_observed(monkeypatch: pytest.MonkeyPat
     route_runtime.reset_for_tests()
     _install_usage(monkeypatch, None)
 
-    assert await _footer(monkeypatch, v2=True) is None
+    assert await _footer() is None

@@ -1824,7 +1824,6 @@ async def test_pending_replay_observes_all_split_send_failures(
     route = (1, 10, "@0")
 
     with (
-        patch.object(bot_module.config, "busy_indicator_v2", False),
         patch.object(bot_module.config, "aggregator_max_attachments", max_attachments),
         patch.object(
             bot_module.session_manager,

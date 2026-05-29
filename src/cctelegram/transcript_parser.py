@@ -24,10 +24,10 @@ from .config import config
 
 logger = logging.getLogger(__name__)
 
-# Mirrors handlers.busy_indicator._TURN_END_REASONS so the lifecycle-only
-# end-of-turn marker emitted in ``parse_entries`` is keyed off the same
-# stop_reason set the indicator's transition table reads. Duplicated rather
-# than imported to keep the parser dependency-free.
+# Mirrors route_runtime._TURN_END_REASONS so the lifecycle-only end-of-turn
+# marker emitted in ``parse_entries`` is keyed off the same stop_reason set
+# the run-state transition table reads. Duplicated rather than imported to
+# keep the parser dependency-free.
 _TURN_END_REASONS_LITERAL = frozenset({"end_turn", "stop_sequence"})
 
 
@@ -497,8 +497,8 @@ class TranscriptParser:
             # System ``turn_duration`` is the only definitive end-of-turn
             # signal Claude writes when the assistant message is absent
             # entirely (model returned nothing). It's the marker we use to
-            # diagnose empty turns and to drive busy_indicator to IDLE in
-            # cases where no assistant ``stop_reason=end_turn`` ever lands.
+            # diagnose empty turns and to drive the run-state machine to IDLE
+            # in cases where no assistant ``stop_reason=end_turn`` ever lands.
             if msg_type == "system" and data.get("subtype") == "turn_duration":
                 if seen_user_prompt and not assistant_emitted_after_prompt:
                     ts = cls.get_timestamp(data)
@@ -523,7 +523,7 @@ class TranscriptParser:
                         )
                     )
                     # Synthetic end-of-turn lifecycle marker so the
-                    # busy_indicator transitions to IDLE_RECENT even though
+                    # run-state machine transitions to IDLE_RECENT even though
                     # no assistant text/thinking with stop_reason=end_turn
                     # was emitted by Claude itself.
                     result.append(

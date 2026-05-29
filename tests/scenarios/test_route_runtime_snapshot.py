@@ -1,11 +1,10 @@
-"""Scenario: route_runtime snapshot interface (Wave B campaign floor).
+"""Scenario: route_runtime snapshot interface (architecture floor).
 
 End-to-end coverage that the snapshot returned by ``route_runtime`` is
-the authoritative view of a route's state under
-``CC_TELEGRAM_ROUTE_RUNTIME_V2``. Walks one route through the same
-lifecycle as ``test_route_busy_lifecycle.test_full_tool_turn_walks_states``
-but asserts via the new ``RouteRuntimeSnapshot`` shape — including
-fields that ``busy_indicator`` does not expose:
+the authoritative view of a route's state. Walks one route through the
+same lifecycle as
+``test_route_busy_lifecycle.test_full_tool_turn_walks_states`` and asserts
+via the ``RouteRuntimeSnapshot`` shape:
 
   - ``typing_eligible`` is True iff Claude is actively producing output.
   - ``status_card_visible`` flips when message_queue records a card.
@@ -17,9 +16,9 @@ fields that ``busy_indicator`` does not expose:
   - The adapter (``transcript_event_adapter``) is exercised, not just
     raw ``route_runtime`` — wiring is verified.
 
-Wave A floor: this file is part of the ``@pytest.mark.scenario`` net.
-Wave B production-code changes must keep it green; any change that
-breaks the snapshot semantics breaks an external consumer contract.
+This file is part of the ``@pytest.mark.scenario`` net; production-code
+changes must keep it green — breaking the snapshot semantics breaks an
+external consumer contract.
 """
 
 from __future__ import annotations
@@ -29,8 +28,7 @@ from typing import Any
 import pytest
 
 from cctelegram import route_runtime, transcript_event_adapter
-from cctelegram.config import config
-from cctelegram.handlers.busy_indicator import ContextUsage, RunState
+from cctelegram.route_runtime import ContextUsage, RunState
 from cctelegram.session_monitor import TranscriptEvent
 from tests.conftest import ScenarioHarness
 
@@ -55,16 +53,14 @@ def _event(**kw: Any) -> TranscriptEvent:
 
 
 @pytest.fixture
-def _enable_route_runtime_v2(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Flip ``route_runtime_v2`` on for the duration of one scenario test.
+def _enable_route_runtime_v2() -> None:
+    """No-op kept so existing scenario signatures stay stable.
 
-    Default in Wave B is False (soak window — production keeps the
-    legacy callback path until ≥48h with v2 = True). Scenario tests
-    that assert the v2 path opt in via this fixture; the conftest's
-    ``_reset_all_handler_state`` still drops the snapshot state between
-    tests so leakage is impossible.
+    route_runtime is now the sole run-state authority — there is no flag to
+    flip. The conftest's ``_reset_all_handler_state`` drops the snapshot
+    state between tests so leakage is impossible.
     """
-    monkeypatch.setattr(config, "route_runtime_v2", True)
+    return None
 
 
 @pytest.mark.asyncio
@@ -200,8 +196,7 @@ async def test_pane_idle_drops_lingering_tools_when_v2(
 ) -> None:
     """Pane-idle backstop reconciles a stuck route to IDLE_CLEARED.
 
-    Mirrors ``busy_indicator.mark_pane_idle`` semantics — the pane
-    snapshot is a reconciliation event with lower authority than
+    The pane snapshot is a reconciliation event with lower authority than
     transcript lifecycle, so it preserves WAITING_ON_USER but clears
     RUNNING / RUNNING_TOOL after the debounce.
     """
@@ -267,28 +262,16 @@ async def test_monotonic_seq_visible_to_subscribers(
 
 
 @pytest.mark.asyncio
-async def test_event_callback_wiring_drives_both_paths(
-    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+async def test_event_callback_wiring_drives_route_runtime(
+    scenario: ScenarioHarness,
 ) -> None:
     """Integration: bot.py's ``event_callback`` body resolves routes via
-    ``session_manager.find_users_for_session`` and feeds both
-    ``busy_indicator.on_transcript_event`` and
-    ``transcript_event_adapter.dispatch_transcript_event``. The plan's
-    "v2 ships in parallel during soak" guarantee depends on this — we
-    verify both observers arrive at compatible state.
-
-    This is the integration shape that ``test_route_busy_lifecycle``
-    only covers for the legacy path. Wave B asserts the parallel
-    feed.
+    ``session_manager.find_users_for_session`` and feeds
+    ``transcript_event_adapter.dispatch_transcript_event``. We verify the
+    route_runtime snapshot and the activity-digest renderer arrive at the
+    expected state through the real adapter wiring.
     """
-    from cctelegram import bot as bot_module
-    from cctelegram.config import config
-    from cctelegram.handlers import busy_indicator
     from cctelegram.session import session_manager
-
-    # Both flags on — production-soak configuration.
-    monkeypatch.setattr(config, "busy_indicator_v2", True)
-    monkeypatch.setattr(config, "route_runtime_v2", True)
 
     wid = scenario.add_window(window_name="repo", cwd="/repo")
     scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
@@ -298,9 +281,8 @@ async def test_event_callback_wiring_drives_both_paths(
     # ``load_session_map`` uses.
     session_manager.get_window_state(wid).session_id = "sess-int-1"
 
-    # Replicate ``bot.py::create_bot``'s event_callback body. The
-    # original is a closure inside ``create_bot``; the diff at
-    # bot.py:3322-3346 is what we're testing the integration of.
+    # Replicate ``bot.py::create_bot``'s event_callback body (now a single
+    # route_runtime feed via the adapter).
     async def event_callback(
         event: route_runtime.TranscriptLifecycleEvent | object,
     ) -> None:
@@ -308,12 +290,10 @@ async def test_event_callback_wiring_drives_both_paths(
         if not active:
             return
         routes = [(user_id, thread_id or 0, wid) for user_id, wid, thread_id in active]
-        await busy_indicator.on_transcript_event(event, routes)  # type: ignore[arg-type]
-        if config.route_runtime_v2:
-            await transcript_event_adapter.dispatch_transcript_event(
-                event,
-                routes,  # type: ignore[arg-type]
-            )
+        await transcript_event_adapter.dispatch_transcript_event(
+            event,
+            routes,  # type: ignore[arg-type]
+        )
 
     await event_callback(
         _event(
@@ -326,14 +306,11 @@ async def test_event_callback_wiring_drives_both_paths(
     )
 
     route: route_runtime.Route = (scenario.user_id, 42, wid)
-    # Both paths agree the route is RUNNING_TOOL.
-    assert busy_indicator.state(route) is RunState.RUNNING_TOOL
     snap = route_runtime.snapshot(route)
     assert snap.run_state is RunState.RUNNING_TOOL
     assert snap.open_tools == frozenset({"int-1"})
 
-    # End the turn — both paths should arrive at IDLE_RECENT after
-    # tool_result + end_turn.
+    # End the turn — IDLE_RECENT after tool_result + end_turn.
     await event_callback(
         _event(
             session_id="sess-int-1",
@@ -349,11 +326,10 @@ async def test_event_callback_wiring_drives_both_paths(
             stop_reason="end_turn",
         )
     )
-    assert busy_indicator.state(route) is RunState.IDLE_RECENT
     assert route_runtime.snapshot(route).run_state is RunState.IDLE_RECENT
 
-    # message_queue's activity-digest renderer, when route_runtime_v2 is
-    # on, reads from route_runtime — verify it picks up the same state.
+    # message_queue's activity-digest renderer reads from route_runtime —
+    # verify it picks up the same state.
     from cctelegram.handlers import message_queue
 
     state = message_queue.ActivityDigestState(message_id=0, window_id=wid)
@@ -362,6 +338,3 @@ async def test_event_callback_wiring_drives_both_paths(
     state.done = False
     rendered = message_queue._render_activity_digest(state, route=route)
     assert rendered.startswith("✅ Done")  # IDLE_RECENT → "✅ Done"
-
-    # Silence the unused import.
-    _ = bot_module

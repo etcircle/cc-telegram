@@ -1,10 +1,10 @@
 """Translate ``session_monitor.TranscriptEvent`` into ``route_runtime``
 lifecycle events.
 
-This is the Wave B compatibility shim — it lives so callers continue to
-emit the higher-level ``TranscriptEvent`` (with full provenance) while
-``route_runtime`` consumes the smaller normalized
-``TranscriptLifecycleEvent`` shape needed by the state machine.
+Callers emit the higher-level ``TranscriptEvent`` (with full provenance)
+while ``route_runtime`` consumes the smaller normalized
+``TranscriptLifecycleEvent`` shape needed by the state machine; this
+adapter does the translation.
 
 Two responsibilities:
 
@@ -17,22 +17,18 @@ Two responsibilities:
      ``route_runtime.ingest_transcript_event`` and returns the
      resulting snapshots. Also routes ``message.usage`` through
      ``route_runtime.update_context_usage`` when the session_monitor's
-     parser propagated usage data on the event (kept symmetric with
-     ``busy_indicator.update_context_usage`` callers).
+     parser propagated usage data on the event.
 
-LoC budget: 150-250 lines (Wave B plan kill signal at 250 — beyond that
-this is Transcript Stream pretending to be an adapter, and the
-campaign should pause and re-evaluate). Current size is well under the
-floor; the helpers stay terse because the underlying
-``TranscriptEvent`` already carries the lifecycle fields cleanly. If a
-new ``TranscriptEvent`` shape lands that requires non-trivial
-normalisation here, file it against the kill signal.
+LoC budget: 150-250 lines (kill signal at 250 — beyond that this is
+Transcript Stream pretending to be an adapter, and the campaign should
+pause and re-evaluate). Current size is well under the floor; the
+helpers stay terse because the underlying ``TranscriptEvent`` already
+carries the lifecycle fields cleanly. If a new ``TranscriptEvent`` shape
+lands that requires non-trivial normalisation here, file it against the
+kill signal.
 
 Error contract: parse failures are logged once per session, the event
-is dropped, no snapshot is mutated. The legacy ``busy_indicator`` path
-keeps serving the route untouched during the soak — there is no
-partial-mutation window where one path saw the event and the other
-didn't.
+is dropped, no snapshot is mutated.
 """
 
 from __future__ import annotations
@@ -142,10 +138,7 @@ def dispatch_context_usage(
 ) -> None:
     """Fan ``update_context_usage`` out to every route observing this session.
 
-    Mirrors today's ``busy_indicator.update_context_usage`` callsites
-    that live behind ``config.busy_indicator_v2`` (the polling loop and
-    the in-message footer). Synchronous because the underlying update
-    is synchronous.
+    Synchronous because the underlying update is synchronous.
     """
     for route in routes:
         try:

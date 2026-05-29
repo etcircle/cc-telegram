@@ -4,8 +4,7 @@ Wave 2 stops the 1Hz pane scrape from running on every binding every cycle.
 The 1Hz loop still ticks (so idle-clear and stale-binding cleanup remain
 responsive), but ``capture_pane`` only fires when one of:
   - this route is currently in interactive mode,
-  - WATCHDOG_INTERVAL seconds have elapsed since the last capture,
-  - V1 busy indicator is in use (V1 needs the pane every tick).
+  - WATCHDOG_INTERVAL seconds have elapsed since the last capture.
 
 These tests pin those criteria, plus the regression that stale-binding
 cleanup still runs even on capture-skipped ticks.
@@ -35,17 +34,18 @@ def mock_bot():
 @pytest.fixture
 def _clear_state():
     """Reset all per-route state between tests."""
+    from cctelegram import route_runtime
     from cctelegram.handlers.interactive_ui import _interactive_mode, _interactive_msgs
 
     _interactive_mode.clear()
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
-    status_polling._idle_state.clear()
+    route_runtime.reset_for_tests()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
-    status_polling._idle_state.clear()
+    route_runtime.reset_for_tests()
 
 
 # Active pane (Claude is running) — used to assert capture / no-capture
@@ -84,7 +84,6 @@ class TestAdaptivePaneCapture:
         with (
             patch.object(status_polling, "tmux_manager") as mock_tmux,
             patch.object(status_polling.time, "monotonic", side_effect=fake_monotonic),
-            patch.object(status_polling.config, "busy_indicator_v2", True),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=_ACTIVE_PANE)
@@ -122,7 +121,6 @@ class TestAdaptivePaneCapture:
                 status_polling, "clear_interactive_msg", new_callable=AsyncMock
             ),
             patch.object(status_polling.time, "monotonic", side_effect=fake_monotonic),
-            patch.object(status_polling.config, "busy_indicator_v2", True),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tmux.capture_pane = AsyncMock(return_value=_ACTIVE_PANE)
@@ -157,7 +155,6 @@ class TestAdaptivePaneCapture:
                 status_polling, "enqueue_status_update", new_callable=AsyncMock
             ),
             patch.object(status_polling.time, "monotonic", side_effect=fake_monotonic),
-            patch.object(status_polling.config, "busy_indicator_v2", True),
             patch.object(
                 status_polling.session_manager,
                 "resolve_session_for_window",
@@ -202,7 +199,6 @@ class TestAdaptivePaneCapture:
             patch.object(status_polling, "session_manager") as mock_sm,
             patch.object(status_polling, "clear_topic_state", new_callable=AsyncMock),
             patch.object(status_polling.time, "monotonic", side_effect=fake_monotonic),
-            patch.object(status_polling.config, "busy_indicator_v2", True),
         ):
             mock_tmux.find_window_by_id = AsyncMock(return_value=None)
             mock_tmux.capture_pane = AsyncMock(return_value=_ACTIVE_PANE)
@@ -219,41 +215,11 @@ class TestAdaptivePaneCapture:
             # is never called for a dead window.
             mock_tmux.capture_pane.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_v1_indicator_captures_every_tick(self, mock_bot: AsyncMock):
-        """V1 indicator (busy_indicator_v2 = False) bypasses the watchdog gate
-        entirely — V1 needs a fresh pane every tick to derive ``is_running``
-        for the typing-action send.
-        """
-        window_id = "@5"
-        mock_window = MagicMock()
-        mock_window.window_id = window_id
-        route = (1, 42, window_id)
 
-        fake_now = [1000.0]
-
-        def fake_monotonic() -> float:
-            return fake_now[0]
-
-        # Watchdog NOT elapsed — V1 should capture anyway.
-        status_polling._last_pane_capture[route] = fake_now[0] - 0.5
-
-        with (
-            patch.object(status_polling, "tmux_manager") as mock_tmux,
-            patch.object(
-                status_polling, "enqueue_status_update", new_callable=AsyncMock
-            ),
-            patch.object(status_polling.time, "monotonic", side_effect=fake_monotonic),
-            patch.object(status_polling.config, "busy_indicator_v2", False),
-        ):
-            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux.capture_pane = AsyncMock(return_value=_ACTIVE_PANE)
-
-            await status_polling.update_status_message(
-                mock_bot, user_id=1, window_id=window_id, thread_id=42
-            )
-
-            mock_tmux.capture_pane.assert_called_once()
+# The former ``test_v1_indicator_captures_every_tick`` asserted the legacy V1
+# (``busy_indicator_v2=False``) every-tick capture bypass. That bypass no
+# longer exists — ``should_capture`` is now ``in_interactive or
+# watchdog_elapsed`` only.
 
 
 # ── terminal_parser: dead-pattern removal ─────────────────────────────────

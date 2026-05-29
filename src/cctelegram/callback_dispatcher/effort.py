@@ -97,10 +97,7 @@ async def execute_effort_callback(authorized: Any, adapters: Any) -> None:
             window_id, f"/effort {level}"
         )
         if success:
-            if adapters.config.busy_indicator_v2:
-                await adapters.busy_indicator.mark_inbound_sent(route)
-            if adapters.config.route_runtime_v2:
-                await route_runtime.mark_inbound_sent(route)
+            await route_runtime.mark_inbound_sent(route)
             await safe_edit(query, f"✓ Effort set to {label}", reply_markup=None)
         else:
             await safe_edit(query, f"❌ {send_msg}", reply_markup=None)

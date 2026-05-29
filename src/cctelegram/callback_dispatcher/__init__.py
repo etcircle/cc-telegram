@@ -131,7 +131,6 @@ class DispatcherAdapters:
     bot: Any
     route_runtime: Any
     config: Any
-    busy_indicator: Any
     terminal_parser: Any
 
 

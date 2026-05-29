@@ -24,13 +24,16 @@ import asyncio
 import hashlib
 import logging
 import time
-from typing import Literal
 
 from telegram import Bot
 from telegram.constants import ChatAction
 
-from ..config import config
 from .. import route_runtime
+
+# Re-exported from route_runtime (the idle-clear authority) so callers and
+# tests that read ``status_polling.IDLE_CLEAR_DELAY_SECONDS`` keep resolving
+# to the single source of truth.
+from ..route_runtime import IDLE_CLEAR_DELAY_SECONDS as IDLE_CLEAR_DELAY_SECONDS
 from ..session import session_manager
 from ..terminal_parser import (
     extract_interactive_content,
@@ -40,8 +43,6 @@ from ..terminal_parser import (
 )
 from ..transcript_parser import read_latest_usage
 from ..tmux_manager import TmuxWindow, tmux_manager
-from . import busy_indicator
-from .busy_indicator import RunState
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -71,12 +72,10 @@ FIRST_PICKER_CONTENT_DRAIN_TIMEOUT = 2.0
 #   - this route is currently in interactive mode (we need to detect when
 #     the user closes the open UI),
 #   - WATCHDOG_INTERVAL seconds have elapsed since the last capture for
-#     this route (catches RestoreCheckpoint / Settings / non-V2 status
-#     transitions that don't show up in the JSONL stream),
-#   - V1 indicator is in use — V1 still relies on pane-derived ``is_running``
-#     to gate the typing-action send and therefore needs a fresh pane every
-#     tick. V2 reads ``busy_indicator.state`` directly, so the watchdog is
-#     enough to catch missed transitions.
+#     this route (catches RestoreCheckpoint / Settings / status transitions
+#     that don't show up in the JSONL stream).
+# The run-state machine reads ``route_runtime.snapshot(route)`` directly, so
+# the watchdog cadence is enough to catch missed pane-only transitions.
 # JSONL-driven AskUserQuestion / ExitPlanMode dispatch already happens in
 # ``bot.handle_new_message`` (tool_use → ``handle_interactive_ui``), so the
 # pane scrape is a redundant safety net for those — fine to skip it most
@@ -88,26 +87,9 @@ WATCHDOG_INTERVAL = 10.0
 # because the per-binding tmux fan-out in ``status_poll_loop`` can push the
 # full cycle past the 5s TTL (~6-8s on macOS with ~14 bindings), making the
 # indicator flash on instead of staying continuous. This loop reads
-# ``busy_indicator.state(route)`` directly with no tmux I/O so cadence stays
-# tight regardless of binding count.
+# ``route_runtime.snapshot(route).typing_eligible`` directly with no tmux I/O
+# so cadence stays tight regardless of binding count.
 TYPING_ACTION_INTERVAL = 3.0
-
-# Wall-clock seconds of confirmed idle (post-completion summary or no status
-# line) before the stale "🟡 Busy" message is cleared. Time-based rather than
-# poll-count-based because the polling loop iterates all bindings sequentially
-# — with N bound topics, any single window is only polled every N seconds, so
-# a poll-count threshold makes the perceived clear delay scale with how many
-# topics the user has open. 4s of confirmed idle is comfortably longer than
-# Claude's slowest UI transition while still feeling responsive.
-IDLE_CLEAR_DELAY_SECONDS = 4.0
-
-# Per-route idle-state machine, keyed by ``(user_id, thread_id_or_0)``:
-#   - missing   → last poll saw an active status (or this route is brand new)
-#   - float ts  → first poll where idle was confirmed; waiting out the delay
-#   - "cleared" → idle delay elapsed and the clear has already been enqueued;
-#                 further idle ticks are no-ops until ``is_running`` flips
-#                 back true and the entry is dropped.
-_idle_state: dict[tuple[int, int], float | Literal["cleared"]] = {}
 
 # Per-route last-capture timestamp, keyed by ``(user_id, thread_id_or_0,
 # window_id)``. Drives the WATCHDOG_INTERVAL gate in ``update_status_message``
@@ -142,36 +124,6 @@ _last_published_ui_hash: dict[tuple[int, int, str], str] = {}
 # can't kill a live picker; reset to 0 on any non-None UI observation.
 ABSENT_STREAK_THRESHOLD = 3  # ~3s at STATUS_POLL_INTERVAL=1.0
 _absent_streak: dict[tuple[int, int, str], int] = {}
-
-
-def reset_idle_counter(user_id: int, thread_id: int | None) -> None:
-    """Drop the idle state for a route.
-
-    Called by topic teardown so a re-bound topic starts with a clean slate
-    instead of inheriting a stale entry from a previous binding.
-    """
-    _idle_state.pop((user_id, thread_id or 0), None)
-
-
-async def _on_busy_activity(route: busy_indicator.Route) -> None:
-    """Re-arm the idle-clear state machine when real activity hits a route.
-
-    Wired to ``busy_indicator.register_activity_callback`` so transcript
-    events and inbound prompt deliveries drop ``_idle_state[key]`` directly
-    without waiting for the next ``WATCHDOG_INTERVAL`` pane scrape. Once a
-    route has been "cleared" (idle delay elapsed and ``mark_pane_idle``
-    fired), only ``is_running == True`` on a fresh pane scrape would
-    otherwise pop the entry — and sub-agent / quick tool turns routinely
-    finish between two 10s pane scrapes, leaving ``_idle_state[key] ==
-    "cleared"`` while ``busy_indicator`` accumulates open tools and the
-    typing indicator keeps refreshing. See
-    ``busy_indicator.register_activity_callback`` for the full rationale.
-    """
-    user_id, thread_id, _wid = route
-    _idle_state.pop((user_id, thread_id), None)
-
-
-busy_indicator.register_activity_callback(_on_busy_activity)
 
 
 def _on_interactive_clear(
@@ -275,7 +227,7 @@ async def update_status_message(
     watchdog_elapsed = (
         last_capture is None or (now_mono - last_capture) >= WATCHDOG_INTERVAL
     )
-    should_capture = in_interactive or watchdog_elapsed or not config.busy_indicator_v2
+    should_capture = in_interactive or watchdog_elapsed
 
     if not should_capture:
         # Cleanup-only path: stale-binding cleanup already ran above
@@ -292,29 +244,20 @@ async def update_status_message(
     _last_pane_capture[route] = time.monotonic()
 
     # Read the next-turn context size from the session's JSONL into the
-    # busy_indicator cache. The activity-digest header reads it via
-    # ``context_pct`` and the per-message footer (``bot._build_context_footer``)
-    # routes through the same cache so the 1M-cap latch is shared.
-    # read_latest_usage is mtime+size-cached so a 1Hz poller doesn't re-scan
-    # unchanged files.
-    if config.busy_indicator_v2:
-        session = await session_manager.resolve_session_for_window(window_id)
-        if session and session.file_path:
-            latest = read_latest_usage(session.file_path)
-            if latest is not None:
-                busy_indicator.update_context_usage(route, latest.tokens, latest.model)
-                if config.route_runtime_v2:
-                    route_runtime.update_context_usage(
-                        route, latest.tokens, latest.model
-                    )
-            else:
-                busy_indicator.update_context_usage(route, None, None)
-                if config.route_runtime_v2:
-                    route_runtime.update_context_usage(route, None, None)
+    # route_runtime context-usage cache. The activity-digest header reads it
+    # via ``snapshot.context_usage`` and the per-message footer
+    # (``bot._build_context_footer``) routes through the same cache so the
+    # 1M-cap latch is shared. read_latest_usage is mtime+size-cached so a 1Hz
+    # poller doesn't re-scan unchanged files.
+    session = await session_manager.resolve_session_for_window(window_id)
+    if session and session.file_path:
+        latest = read_latest_usage(session.file_path)
+        if latest is not None:
+            route_runtime.update_context_usage(route, latest.tokens, latest.model)
         else:
-            busy_indicator.update_context_usage(route, None, None)
-            if config.route_runtime_v2:
-                route_runtime.update_context_usage(route, None, None)
+            route_runtime.update_context_usage(route, None, None)
+    else:
+        route_runtime.update_context_usage(route, None, None)
 
     should_check_new_ui = True
 
@@ -459,7 +402,6 @@ async def update_status_message(
     # the rest of update_status_message returns early and the typing
     # action never gets sent.
     status_line = parse_status_line(pane_text)
-    key = (user_id, thread_id or 0)
 
     # When Claude is actively running, the spinner line sits directly above
     # the chrome separator. Post-completion summaries (e.g. "✻ Cooked for
@@ -470,108 +412,27 @@ async def update_status_message(
     # interrupt", and past-tense summaries don't always omit the spinner.
     is_running = bool(status_line) and is_status_active(pane_text)
 
-    # V1 path: gate typing-action on the pane-derived ``is_running``. V2
-    # delegates the typing-action send to ``typing_action_loop`` (it reads
-    # busy_indicator.state directly with no tmux I/O so cadence stays under
-    # Telegram's 5s TTL even with many bindings). Firing it from both places
-    # would just double-bill the API.
-    typing_active = (not config.busy_indicator_v2) and is_running
-
-    if typing_active:
-        # Re-emit Telegram's native typing indicator on every active poll
-        # so the "Felix's Claude is typing…" line under the topic title
-        # stays alive while Claude works. The action expires after ~5s, and
-        # we poll roughly every second per binding, so this keeps the
-        # indicator continuous without burning excessive API calls.
-        # Pass message_thread_id so the indicator shows in the topic, not
-        # at the chat level.
-        try:
-            await bot.send_chat_action(
-                chat_id=session_manager.resolve_chat_id(user_id, thread_id),
-                action=ChatAction.TYPING,
-                message_thread_id=thread_id,
-            )
-            logger.debug(
-                "typing_action user=%d thread=%s window=%s sent",
-                user_id,
-                thread_id,
-                window_id,
-            )
-        except Exception as e:
-            # Best-effort: never block the status update on a transient
-            # chat-action failure (rate limit, network, etc.).
-            logger.debug(
-                "typing_action user=%d thread=%s window=%s failed: %s",
-                user_id,
-                thread_id,
-                window_id,
-                e,
-            )
+    # Typing-action delivery is owned by ``typing_action_loop`` (it reads
+    # ``route_runtime.snapshot(route).typing_eligible`` directly with no tmux
+    # I/O so cadence stays under Telegram's 5s TTL even with many bindings).
+    # The status poller does not fire the indicator itself.
 
     # Normal status line check — skip the rest if queue is non-empty.
-    # Typing indicator already fired above so the active-work UX still
-    # works during heavy queue activity.
     if skip_status:
         return
 
-    if config.route_runtime_v2:
-        # route_runtime_v2: the debounced card clear is owned by
-        # route_runtime (``arm_pane_idle_clear`` / ``pane_idle_clear_due``
-        # / ``commit_pane_idle_clear``). The legacy ``_idle_state``
-        # three-state machine below is dormant under this flag (deleted in
-        # 8c). Debounce timing is preserved exactly: the card is not
-        # cleared until IDLE_CLEAR_DELAY_SECONDS of *continued* confirmed
-        # idle, and any transcript / inbound activity re-arms (cancels) the
-        # pending clear inside route_runtime.
-        await _drive_pane_idle_clear_v2(
-            bot, user_id, window_id, thread_id, is_running, status_line
-        )
-        return
-
-    if is_running:
-        _idle_state.pop(key, None)
-        await enqueue_status_update(
-            bot,
-            user_id,
-            window_id,
-            status_line,
-            thread_id=thread_id,
-        )
-        return
-
-    # Either no status line at all, or a static post-completion summary.
-    # Wait IDLE_CLEAR_DELAY_SECONDS of confirmed idle, then clear once.
-    state = _idle_state.get(key)
-    if state == "cleared":
-        return  # Already cleared this idle stretch.
-    now = time.monotonic()
-    if state is None:
-        _idle_state[key] = now
-        return
-    # state is the timestamp of the first idle observation.
-    assert isinstance(state, float)
-    if (now - state) < IDLE_CLEAR_DELAY_SECONDS:
-        return
-    _idle_state[key] = "cleared"
-    # V2 backstop: same confirmed-idle window that clears the status card
-    # also reconciles the run-state machine. Without this, a missed
-    # lifecycle event (lost tool_result, transcript-parser miss, crashed
-    # Claude run) leaves the typing-action loop refreshing the native
-    # indicator forever. ``mark_pane_idle`` is a no-op when an interactive
-    # prompt is visible (WAITING_ON_USER) so we don't fight the UI in
-    # ``handle_interactive_ui`` — that branch already returned early above.
-    if config.busy_indicator_v2:
-        await busy_indicator.mark_pane_idle((user_id, thread_id or 0, window_id))
-    await enqueue_status_update(
-        bot,
-        user_id,
-        window_id,
-        None,
-        thread_id=thread_id,
+    # The debounced card clear is owned by route_runtime
+    # (``arm_pane_idle_clear`` / ``pane_idle_clear_due`` /
+    # ``commit_pane_idle_clear``). The card is not cleared until
+    # IDLE_CLEAR_DELAY_SECONDS of *continued* confirmed idle, and any
+    # transcript / inbound activity re-arms (cancels) the pending clear
+    # inside route_runtime.
+    await _drive_pane_idle_clear(
+        bot, user_id, window_id, thread_id, is_running, status_line
     )
 
 
-async def _drive_pane_idle_clear_v2(
+async def _drive_pane_idle_clear(
     bot: Bot,
     user_id: int,
     window_id: str,
@@ -579,25 +440,19 @@ async def _drive_pane_idle_clear_v2(
     is_running: bool,
     status_line: str | None,
 ) -> None:
-    """route_runtime_v2 card-clear driver (replaces the ``_idle_state`` machine).
+    """Pane-idle card-clear driver.
 
-    Preserves the legacy debounce timing exactly, but the deadline lives in
-    ``route_runtime`` (so it shares a source of truth with the run-state
-    machine and ``now`` is injectable for tests):
+    The debounce deadline lives in ``route_runtime`` (so it shares a source
+    of truth with the run-state machine and ``now`` is injectable for tests):
 
-      - **Running pane** → re-arm by cancelling any pending pane-idle clear
-        (``arm_pane_idle_clear`` is a no-op while running; instead we let a
-        live transcript/inbound event re-arm via
-        ``route_runtime``'s own ``_rearm_pane_idle_in_place``). We still
-        enqueue the live status line. Mirrors the legacy
-        ``_idle_state.pop(key)`` + status enqueue.
+      - **Running pane** → cancel any pending pane-idle clear so a fresh idle
+        stretch re-arms from scratch, then enqueue the live status line.
       - **Idle pane, not yet due** → ``arm_pane_idle_clear`` (idempotent;
         sets the deadline on the first confirmed-idle observation, then
-        waits it out). Mirrors ``_idle_state[key] = now``.
+        waits it out).
       - **Idle pane, deadline due** → ``commit_pane_idle_clear`` (reconciles
         run-state to IDLE_CLEARED, latches the cleared sentinel) + enqueue
-        the card clear. Mirrors ``_idle_state[key] = "cleared"`` +
-        ``mark_pane_idle`` + clear enqueue.
+        the card clear.
 
     A single ``now`` is read once and threaded through arm/due so the
     decision is consistent within the tick.
@@ -605,12 +460,11 @@ async def _drive_pane_idle_clear_v2(
     route = (user_id, thread_id or 0, window_id)
     if is_running:
         # Pane shows active work. Cancel any pending pane-idle clear so a
-        # fresh idle stretch re-arms from scratch (mirrors the legacy
-        # ``_idle_state.pop(key)`` in the running branch); without this a
-        # deadline armed in a prior idle stretch could fire immediately
-        # when the pane next goes quiet, skipping the debounce. Transcript /
-        # inbound events also re-arm inside route_runtime, but the pane can
-        # show running before the next transcript event lands.
+        # fresh idle stretch re-arms from scratch; without this a deadline
+        # armed in a prior idle stretch could fire immediately when the pane
+        # next goes quiet, skipping the debounce. Transcript / inbound events
+        # also re-arm inside route_runtime, but the pane can show running
+        # before the next transcript event lands.
         route_runtime.reset_pane_idle_clear(route)
         await enqueue_status_update(
             bot, user_id, window_id, status_line, thread_id=thread_id
@@ -631,10 +485,6 @@ async def _drive_pane_idle_clear_v2(
             # see commit_pane_idle_clear; run-state alone is ambiguous, so the
             # explicit bool is authoritative).
             return
-        if config.busy_indicator_v2:
-            # Keep the legacy indicator reconciled during the dual-flag
-            # soak; deleted with the rest of busy_indicator in 8c.
-            await busy_indicator.mark_pane_idle(route)
         await enqueue_status_update(bot, user_id, window_id, None, thread_id=thread_id)
         return
 
@@ -651,59 +501,25 @@ async def _process_idle_clear_only(
 ) -> None:
     """Cleanup-only path used when adaptive gating skips the pane capture.
 
-    Without a pane scrape we can't run interactive-UI detection or update
-    the busy indicator's pane-derived signals — but the IDLE_CLEAR_DELAY
-    state machine still needs to advance so a previously-shown "🟡 Busy"
-    status gets cleared on schedule.
+    Without a pane scrape we can't run interactive-UI detection or arm a new
+    idle deadline — but the route_runtime-owned debounce still needs to
+    advance so a previously-shown "🟡 Busy" status gets cleared on schedule.
 
-    Semantics:
-      - If we have no idle-state entry for this route, do nothing. The next
-        watchdog-elapsed tick will scrape the pane and either confirm idle
-        (start the timer) or refresh the status. Starting the idle timer
-        here without confirming the pane is actually idle would falsely
-        clear an active status.
-      - If the route is already in idle-pending state and the delay has
-        elapsed, fire the clear once. This is the only case we're solving
-        for here; everything else is handled the next time we capture.
+    Semantics: NEVER arm here — without a pane scrape we can't confirm idle.
+    Only commit a clear that a prior confirmed-idle tick already armed and
+    that is now due. Everything else is handled the next time we capture.
     """
     if skip_status:
         return
 
-    if config.route_runtime_v2:
-        # route_runtime_v2: advance the route_runtime-owned debounce, but
-        # NEVER arm here — without a pane scrape we can't confirm idle.
-        # Only commit a clear that a prior confirmed-idle tick already
-        # armed and that is now due. Mirrors the legacy "do nothing unless
-        # a float timestamp is already pending and elapsed" semantics.
-        route = (user_id, thread_id or 0, window_id)
-        now = time.monotonic()
-        if not route_runtime.pane_idle_clear_due(route, now=now):
-            return
-        if not await route_runtime.commit_pane_idle_clear(route, now=now):
-            # commit no-op'd (activity re-armed) — do not clear the card.
-            return
-        if config.busy_indicator_v2:
-            await busy_indicator.mark_pane_idle(route)
-        await enqueue_status_update(bot, user_id, window_id, None, thread_id=thread_id)
+    route = (user_id, thread_id or 0, window_id)
+    now = time.monotonic()
+    if not route_runtime.pane_idle_clear_due(route, now=now):
         return
-
-    key = (user_id, thread_id or 0)
-    state = _idle_state.get(key)
-    if state is None or state == "cleared":
+    if not await route_runtime.commit_pane_idle_clear(route, now=now):
+        # commit no-op'd (activity re-armed) — do not clear the card.
         return
-    assert isinstance(state, float)
-    if (time.monotonic() - state) < IDLE_CLEAR_DELAY_SECONDS:
-        return
-    _idle_state[key] = "cleared"
-    if config.busy_indicator_v2:
-        await busy_indicator.mark_pane_idle((user_id, thread_id or 0, window_id))
-    await enqueue_status_update(
-        bot,
-        user_id,
-        window_id,
-        None,
-        thread_id=thread_id,
-    )
+    await enqueue_status_update(bot, user_id, window_id, None, thread_id=thread_id)
 
 
 async def status_poll_loop(bot: Bot) -> None:
@@ -787,22 +603,14 @@ async def typing_action_loop(bot: Bot) -> None:
     """Re-emit Telegram's native typing indicator for every actively-running
     route on a fixed cadence, independent of pane polling.
 
-    Reads ``busy_indicator.state(route)`` directly: no tmux subprocess fan-out,
-    no per-binding capture_pane. With ~14 bindings the status poller's full
-    cycle empirically lands at 6-8s on macOS, longer than Telegram's ~5s
-    typing-action TTL, so the indicator was flashing rather than holding
-    steady. This loop fires every ``TYPING_ACTION_INTERVAL`` seconds so the
-    cadence stays well under the TTL regardless of binding count.
-
-    V1 (``busy_indicator_v2`` off) keeps the legacy pane-derived path in
-    ``update_status_message``. The two paths are mutually exclusive — when V2
-    is on, ``update_status_message`` skips the typing-action send.
+    Reads ``route_runtime.snapshot(route).typing_eligible`` directly: no tmux
+    subprocess fan-out, no per-binding capture_pane. With ~14 bindings the
+    status poller's full cycle empirically lands at 6-8s on macOS, longer than
+    Telegram's ~5s typing-action TTL, so the indicator was flashing rather
+    than holding steady. This loop fires every ``TYPING_ACTION_INTERVAL``
+    seconds so the cadence stays well under the TTL regardless of binding
+    count. ``update_status_message`` never fires the typing indicator itself.
     """
-    if not config.busy_indicator_v2:
-        logger.info(
-            "Typing-action loop: V2 indicator disabled, deferring to status poller"
-        )
-        return
     logger.info("Typing-action loop started (interval: %ss)", TYPING_ACTION_INTERVAL)
     while True:
         try:
@@ -810,16 +618,10 @@ async def typing_action_loop(bot: Bot) -> None:
             sends: list = []
             for user_id, thread_id, wid in bindings:
                 route = (user_id, thread_id or 0, wid)
-                if config.route_runtime_v2:
-                    # Wave B: route_runtime is authoritative under v2.
-                    # ``typing_eligible`` already covers the
-                    # RUNNING / RUNNING_TOOL discrimination.
-                    if not route_runtime.snapshot(route).typing_eligible:
-                        continue
-                else:
-                    run = busy_indicator.state(route)
-                    if run not in (RunState.RUNNING, RunState.RUNNING_TOOL):
-                        continue
+                # ``typing_eligible`` already covers the
+                # RUNNING / RUNNING_TOOL discrimination.
+                if not route_runtime.snapshot(route).typing_eligible:
+                    continue
                 sends.append(_send_typing_action(bot, user_id, thread_id, wid))
             if sends:
                 await asyncio.gather(*sends, return_exceptions=True)
