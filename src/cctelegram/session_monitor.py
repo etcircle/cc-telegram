@@ -29,6 +29,15 @@ from .utils import read_cwd_from_jsonl
 logger = logging.getLogger(__name__)
 
 
+def _is_window_id(key: str) -> bool:
+    """Check if a session_map suffix looks like a tmux window ID (e.g. '@0', '@12').
+
+    Mirrors ``SessionManager._is_window_id``; kept local so session_monitor
+    has no import-time dependency on ``session``.
+    """
+    return key.startswith("@") and len(key) > 1 and key[1:].isdigit()
+
+
 @dataclass
 class SessionInfo:
     """Information about a Claude Code session."""
@@ -123,9 +132,13 @@ class SessionMonitor:
         self._bot: Any = None
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
-        # Track last known session_map for detecting changes
-        # Keys may be window_id (@12) or window_name (old format) during transition
-        self._last_session_map: dict[str, str] = {}  # window_key -> session_id
+        # Track last known session_map for detecting changes.
+        # Only window_id (@12) keys are accepted; pre-2026-02-11 window_name
+        # keys are filtered out (with a one-shot warning) in
+        # _load_current_session_map.
+        self._last_session_map: dict[str, str] = {}  # window_id -> session_id
+        # One-shot guard so the legacy-key warning fires at most once per run.
+        self._warned_legacy_session_map_keys = False
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
 
@@ -699,13 +712,16 @@ class SessionMonitor:
             )
 
     async def _load_current_session_map(self) -> dict[str, str]:
-        """Load current session_map and return window_key -> session_id mapping.
+        """Load current session_map and return window_id -> session_id mapping.
 
         Keys in session_map are formatted as "tmux_session:window_id"
-        (e.g. "cc-telegram:@12"). Old-format keys ("cc-telegram:window_name") are also
-        accepted so that sessions running before a code upgrade continue
-        to be monitored until the hook re-fires with new format.
-        Only entries matching our tmux_session_name are processed.
+        (e.g. "cc-telegram:@12"). Only entries matching our tmux_session_name
+        AND carrying an ``@N`` window_id suffix are processed. Pre-2026-02-11
+        window_name-keyed entries (e.g. "cc-telegram:myproject") are dropped:
+        the live SessionStart hook only ever emits ``@N`` keys, so a non-``@``
+        suffix can only come from a stale on-disk file. A one-shot warning
+        naming the dropped keys fires before they are filtered out, so they do
+        not silently stop being monitored.
         """
         window_to_session: dict[str, str] = {}
         if config.session_map_file.exists():
@@ -714,14 +730,26 @@ class SessionMonitor:
                     content = await f.read()
                 session_map = json.loads(content)
                 prefix = f"{config.tmux_session_name}:"
+                legacy_keys: list[str] = []
                 for key, info in session_map.items():
                     # Only process entries for our tmux session
                     if not key.startswith(prefix):
                         continue
                     window_key = key[len(prefix) :]
+                    if not _is_window_id(window_key):
+                        # Pre-2026-02-11 window_name-keyed legacy entry — dropped.
+                        legacy_keys.append(key)
+                        continue
                     session_id = info.get("session_id", "")
                     if session_id:
                         window_to_session[window_key] = session_id
+                if legacy_keys and not self._warned_legacy_session_map_keys:
+                    logger.warning(
+                        "dropping legacy window_name-keyed session_map entries "
+                        "(no longer monitored): %s",
+                        sorted(legacy_keys),
+                    )
+                    self._warned_legacy_session_map_keys = True
             except (json.JSONDecodeError, OSError):
                 pass
         return window_to_session

@@ -978,3 +978,69 @@ class TestAuqCacheClearOnSessionChange:
         # /clear flipped the session under window @11 → cached AUQ tool_input
         # belongs to the dead session and must be dropped.
         assert interactive_ui.resolve_ask_tool_input("@11") is None
+
+
+class TestLoadCurrentSessionMapLegacyKeyFilter:
+    """_load_current_session_map accepts only @-keyed (window_id) entries.
+
+    Pre-2026-02-11 window_name-keyed session_map entries are dropped (the live
+    hook only ever emits @N keys), but the drop MUST emit a one-shot warning
+    naming the keys — otherwise a stale on-disk file would silently stop those
+    sessions from being monitored (Hermes P2.2)."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_window_name_keys_filtered_and_warned(
+        self, monitor, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        from cctelegram.session_monitor import config as monitor_config
+
+        prefix = f"{monitor_config.tmux_session_name}:"
+        session_map_file = tmp_path / "session_map.json"
+        session_map_file.write_text(
+            json.dumps(
+                {
+                    # @-keyed (window_id) entries pass through.
+                    f"{prefix}@0": {"session_id": "sid-at-zero"},
+                    f"{prefix}@12": {"session_id": "sid-at-twelve"},
+                    # Legacy window_name-keyed entries are dropped + warned.
+                    f"{prefix}myproject": {"session_id": "sid-legacy-1"},
+                    f"{prefix}old-name": {"session_id": "sid-legacy-2"},
+                    # Entry for a different tmux session is ignored entirely.
+                    "other-session:@3": {"session_id": "sid-other"},
+                }
+            )
+        )
+        monkeypatch.setattr(monitor_config, "session_map_file", session_map_file)
+
+        with caplog.at_level(logging.WARNING, logger="cctelegram.session_monitor"):
+            result = await monitor._load_current_session_map()
+
+        # Only the @-keyed entries for our tmux session survive.
+        assert result == {"@0": "sid-at-zero", "@12": "sid-at-twelve"}
+        assert "myproject" not in result
+        assert "old-name" not in result
+
+        # The drop is announced via a one-shot warning naming the dropped keys.
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any("dropping legacy window_name-keyed" in m for m in warnings)
+        assert any(
+            f"{prefix}myproject" in m and f"{prefix}old-name" in m for m in warnings
+        )
+
+        # One-shot guard: a second load does not re-warn.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="cctelegram.session_monitor"):
+            result2 = await monitor._load_current_session_map()
+        assert result2 == {"@0": "sid-at-zero", "@12": "sid-at-twelve"}
+        assert not [r for r in caplog.records if "dropping legacy" in r.getMessage()]
