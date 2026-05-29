@@ -870,7 +870,15 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
         label = m.group("label").strip()
         selected = _checkbox_selected_from_line(line)
         label = _strip_option_checkbox(label)
-        cursor = m.group("cursor").strip() in ("❯", "›", "▶", "*", "↓")
+        # ``↓`` is the picker's scroll-more indicator, NOT a selection cursor.
+        # Claude Code paints it at the left edge of the top visible option when
+        # earlier options have scrolled off the viewport. Empirically (live
+        # ``tmux capture-pane -S -500`` of a scrolled picker): the real ``❯``
+        # cursor sits in the frozen scrollback rows while the live viewport's
+        # top row carries ``↓``. It stays in ``_RE_NUMBERED_OPTION``'s cursor
+        # char-class so the row still parses as an option, but it must not set
+        # ``cursor`` — doing so painted a phantom ❯ on the scroll-boundary row.
+        cursor = m.group("cursor").strip() in ("❯", "›", "▶", "*")
         recommended = bool(_RE_RECOMMENDED.search(label))
         if recommended:
             label = _RE_RECOMMENDED.sub("", label).rstrip()
@@ -930,6 +938,32 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
                 label=opt.label,
                 recommended=opt.recommended,
                 cursor=True,
+                number=opt.number,
+                description=opt.description,
+                selected=opt.selected,
+            )
+
+    # Stale-scrollback dedup: a ``tmux capture-pane -S -<n>`` of a scrolled
+    # picker retains the pre-scroll top rows — INCLUDING a frozen ``❯`` on
+    # whatever option was the cursor before the viewport scrolled. That stale
+    # ``❯`` is always physically ABOVE the live cursor row (new content scrolls
+    # old rows up into history), so the live cursor is the BOTTOM-MOST ``❯``
+    # (closest to the footer). When more than one cursor still survives, keep
+    # only the last and clear the rest. Without this, a long picker reported
+    # cursor=option-1 forever and ↑/↓ never moved the rendered card
+    # (MESSAGE_NOT_MODIFIED). Validated against live 80x24 captures at cursor
+    # positions 1-5, both navigation directions. Generalizes the Bug-C
+    # recommended-row dedup above (whose decorative-``❯`` trigger no longer
+    # occurs in Claude Code v2.1.x) and runs after it so its restore invariant
+    # is preserved.
+    cursor_idxs = [i for i, o in enumerate(kept) if o.cursor]
+    if len(cursor_idxs) > 1:
+        for i in cursor_idxs[:-1]:
+            opt = kept[i]
+            kept[i] = AskOption(
+                label=opt.label,
+                recommended=opt.recommended,
+                cursor=False,
                 number=opt.number,
                 description=opt.description,
                 selected=opt.selected,
@@ -1628,7 +1662,12 @@ def _overlay_cursor_and_selection(
         if opt.number is None:
             continue
         selected_by_num[opt.number] = opt.selected
-        if opt.cursor and cursor_at is None:
+        # Prefer the LAST cursor flag in pane order. ``_parse_numbered_options``
+        # already dedups to a single (bottom-most) cursor, but a raw or future
+        # pane_options tuple could still carry a stale-scrollback ``❯`` above
+        # the live one — the live cursor is always the bottom-most. Overwrite
+        # rather than first-wins so the overlay tracks the live cursor.
+        if opt.cursor:
             cursor_at = opt.number
     if cursor_at is None and jsonl_options:
         cursor_at = jsonl_options[0].number

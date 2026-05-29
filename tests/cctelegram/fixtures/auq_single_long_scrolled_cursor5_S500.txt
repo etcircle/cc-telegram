@@ -1,0 +1,62 @@
+export CC_TELEGRAM_DIR=/tmp/auqdbg2; cd /Users/felixcardix/dev-workspaces/cc-tel
+egram
+felixcardix@Felixs-Mac-mini cc-telegram % export CC_TELEGRAM_DIR=/tmp/auqdbg2; c
+d /Users/felixcardix/dev-workspaces/cc-telegram
+felixcardix@Felixs-Mac-mini cc-telegram % claude --dangerously-skip-permissions
+--model sonnet "Use the AskUserQuestion tool now (single-select, multiSelect fal
+se). Question title: Choose deployment strategy. Provide 4 options, each WITH a
+long ~220-character description explaining tradeoffs in detail: A) Blue-green ro
+lling deploy with full health gating and automatic rollback on canary regression
+; B) Direct in-place restart accepting brief downtime to minimize operational co
+mplexity and infra cost; C) Feature-flag dark launch then progressive ramp with
+per-cohort metrics; D) Manual staged promotion across regions with human approva
+l gates. Do not answer it yourself; leave the question open."
+ ▐▛███▜▌   Claude Code v2.1.156
+▝▜█████▛▘  Sonnet 4.6 with high effort · Claude Max
+  ▘▘ ▝▝    ~/dev-workspaces/cc-telegram
+
+
+❯ Use the AskUserQuestion tool now (single-select, multiSelect false). Question
+  title: Choose deployment strategy. Provide 4 options, each WITH a long
+  ~220-character description explaining tradeoffs in detail: A) Blue-green
+  rolling deploy with full health gating and automatic rollback on canary
+  regression; B) Direct in-place restart accepting brief downtime to minimize
+  operational complexity and infra cost; C) Feature-flag dark launch then
+  progressive ramp with per-cohort metrics; D) Manual staged promotion across
+  regions with human approval gates. Do not answer it yourself; leave the
+  question open.
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Deploy strategy
+
+Choose deployment strategy
+
+❯ 1. A) Blue-green rolling
+     Blue-green rolling deploy with full health gating and automatic rollback on
+     canary regression. Maintains two identical environments; traffic shifts
+     incrementally while old env stays hot. Rollback is instantaneous but
+     doubles infra cost and requires robust health-check coverage to catch
+     regressions before full cutover.
+  2. B) Direct in-place restart
+     Direct in-place restart accepting brief downtime to minimize operational
+     complexity and infra cost. No second environment needed; single binary swap
+     plus launchctl kickstart. Fastest to execute and cheapest to run, but any
+     deploy-time failure means visible outage until manual intervention or
+     revert.
+  3. C) Feature-flag dark launch
+     Feature-flag dark launch then progressive ramp with per-cohort metrics. New
+     code ships to all instances immediately but feature gates control
+     exposure. Zero-downtime with fine-grained rollback per flag, but adds
+     flag-management overhead and requires instrumentation to surface per-cohort
+     signal before each ramp step.
+  4. D) Manual staged promotion
+     Manual staged promotion across regions with human approval gates at each
+     stage. Ops team reviews metrics between stages; no automation risk of bad
+     auto-promotion. Safest blast-radius control and clearest audit trail, but
+     slowest to full deploy and requires on-call availability at every gate to
+     avoid prolonged partial-deploy states.
+❯ 5. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel
+
