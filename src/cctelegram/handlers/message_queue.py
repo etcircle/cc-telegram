@@ -1119,7 +1119,6 @@ _RUN_STATE_HEADER: dict[RunState, str] = {
     RunState.IDLE_RECENT: "✅ Done",
     RunState.WAITING_ON_USER: "🔔 Waiting on you",
     RunState.IDLE_CLEARED: "✅ Done",
-    RunState.BROKEN_TOPIC: "⚠️ Topic unreachable",
 }
 
 

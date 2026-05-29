@@ -42,7 +42,7 @@ freezes a snapshot, and fires observers **after** commit. Snapshot
 fields: `run_state`, `open_tools`, `waiting_on_user_tools`,
 `context_usage`, `last_event_at`, `idle_clear_at`, `pane_idle_clear_at`,
 `typing_eligible`, `status_card_visible`, `status_card_msg_id`,
-`broken_topic`, `monotonic_seq`. The two idle deadlines are distinct:
+`monotonic_seq`. The two idle deadlines are distinct:
 `idle_clear_at` is the run-state `IDLE_RECENT → IDLE_CLEARED` decay
 (armed by a transcript end-of-turn), while `pane_idle_clear_at` is the
 debounced "🟡 Busy" *card-clear* deadline (armed by `status_polling`

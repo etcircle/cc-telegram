@@ -474,8 +474,8 @@ async def _drive_pane_idle_clear(
     now = time.monotonic()
     if route_runtime.pane_idle_clear_due(route, now=now):
         # Debounce elapsed — clear once. ``commit_pane_idle_clear``
-        # reconciles run-state (no-op for WAITING_ON_USER / BROKEN_TOPIC,
-        # the same guard the interactive branch above already enforces) and
+        # reconciles run-state (no-op for WAITING_ON_USER, the same guard
+        # the interactive branch above already enforces) and
         # latches the cleared sentinel so repeat idle ticks are no-ops.
         # ``now`` lets commit re-validate armed-and-due under the lock (TOCTOU
         # vs a concurrent activity re-arm) — it no-ops if re-armed/cancelled.

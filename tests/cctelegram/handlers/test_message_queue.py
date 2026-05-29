@@ -1435,13 +1435,6 @@ class TestActivityDigestHeader:
         rendered = message_queue._render_activity_digest(self._state(), route=route)
         assert rendered.startswith("🔔 Waiting on you — ")
 
-    def test_broken_topic(self, monkeypatch: pytest.MonkeyPatch):
-        route = (1, 42, "@7")
-        self._set_run_state(route, RunState.BROKEN_TOPIC)
-
-        rendered = message_queue._render_activity_digest(self._state(), route=route)
-        assert rendered.startswith("⚠️ Topic unreachable — ")
-
     def test_ctx_below_threshold_no_suffix(self, monkeypatch: pytest.MonkeyPatch):
         from cctelegram.config import config as cfg
 
