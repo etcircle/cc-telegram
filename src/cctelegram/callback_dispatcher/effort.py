@@ -24,13 +24,23 @@ from cctelegram.handlers.message_sender import safe_edit
 
 from . import safe_answer, window_lease
 
-EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+EFFORT_LEVELS: tuple[str, ...] = (
+    "auto",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultracode",
+)
 EFFORT_LABELS: dict[str, str] = {
+    "auto": "Auto",
     "low": "Low",
     "medium": "Medium",
     "high": "High",
     "xhigh": "Extra High",
     "max": "Max",
+    "ultracode": "Ultracode",
 }
 
 
@@ -47,6 +57,7 @@ def build_effort_keyboard(window_id: str) -> InlineKeyboardMarkup:
         [
             [btn("low"), btn("medium"), btn("high")],
             [btn("xhigh"), btn("max")],
+            [btn("auto"), btn("ultracode")],
         ]
     )
 
