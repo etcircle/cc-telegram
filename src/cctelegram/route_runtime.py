@@ -372,22 +372,6 @@ def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
 # ── pure transitions (callers hold the lock) ────────────────────────────
 
 
-def _decay_idle_in_place(st: _RouteState) -> None:
-    """Apply lazy IDLE_RECENT → IDLE_CLEARED decay.
-
-    On-read instead of a scheduled ``call_later`` so we don't leak timer
-    handles for routes that get torn down mid-decay. Called immediately
-    before freezing a snapshot when no state-affecting event ran — i.e.
-    during pure reads via ``snapshot()`` — so a stale IDLE_RECENT
-    doesn't survive past its delay just because nothing else has
-    happened on the route.
-    """
-    if st.run_state is RunState.IDLE_RECENT and st.idle_clear_at is not None:
-        if _now() >= st.idle_clear_at:
-            st.run_state = RunState.IDLE_CLEARED
-            st.idle_clear_at = None
-
-
 def _rearm_pane_idle_in_place(st: _RouteState) -> None:
     """Cancel any pending / completed pane-idle card-clear on real activity.
 
