@@ -38,7 +38,6 @@ from telegram import (
     BotCommandScopeChatAdministrators,
     BotCommandScopeChatMember,
     BotCommandScopeDefault,
-    CallbackQuery,
     Update,
 )
 from telegram.constants import ChatAction
@@ -60,7 +59,6 @@ from .callback_dispatcher.screenshot import (
     build_screenshot_keyboard as _build_screenshot_keyboard,
 )
 from .handlers.directory_browser import (
-    STATE_KEY,
     clear_browse_state,
 )
 from .handlers.cleanup import clear_topic_state
@@ -132,7 +130,6 @@ from .handlers.message_queue import (
 )
 from . import message_refs
 from .handlers.message_sender import (
-    safe_answer,
     safe_edit,  # noqa: F401 - re-exported for callback dispatcher override tests
     safe_reply,
 )
@@ -242,74 +239,6 @@ CC_COMMANDS: dict[str, str] = {
     "model": "↗ Switch AI model",
     "effort": "↗ Set reasoning effort level",
 }
-
-
-async def _answer_stale_pending_thread_mismatch(
-    query: CallbackQuery,
-    user_data: dict | None,
-    callback_thread_id: int | None,
-    answer_text: str,
-    *,
-    clear_picker_state: bool = False,
-) -> None:
-    """Answer a pending-thread mismatch without deleting newer replacement media.
-
-    Old callbacks from a pending topic that was explicitly replaced by a newer
-    pending topic are only acknowledged as stale. Other mismatches retain the
-    prior safety behavior: reject and clear/delete the active stale payload.
-    """
-    if not _is_ignored_stale_thread_id(user_data, callback_thread_id):
-        if clear_picker_state:
-            clear_browse_state(user_data)
-        if user_data is not None:
-            _clear_pending_route_payload(user_data, delete_files=True)
-    await safe_answer(query, answer_text, show_alert=True)
-
-
-_PICKER_STALE_TOPIC_MISMATCH = "topic_mismatch"
-
-
-def _validate_pending_picker_callback(
-    user_data: dict | None,
-    callback_thread_id: int | None,
-    expected_states: tuple[str, ...],
-) -> tuple[bool, int | None, str | None]:
-    """Validate a picker callback still owns an active pending topic route.
-
-    Directory/session/window picker buttons are only actionable while their
-    pending route payload is active. Missing user_data, missing/wrong state, a
-    missing ``_pending_thread_id``, or a different callback topic are all stale.
-    """
-    if user_data is None:
-        return False, None, "missing_user_data"
-
-    current_state = user_data.get(STATE_KEY)
-    if current_state not in expected_states:
-        return False, None, "wrong_state"
-
-    pending_tid = _pending_thread_id(user_data)
-    if pending_tid is None:
-        return False, None, "missing_pending_owner"
-
-    if callback_thread_id != pending_tid:
-        return False, pending_tid, _PICKER_STALE_TOPIC_MISMATCH
-
-    return True, pending_tid, None
-
-
-async def _answer_invalid_pending_picker_callback(
-    query: CallbackQuery,
-    answer_text: str,
-) -> None:
-    """Answer a stale picker callback without mutating pending picker state."""
-    await safe_answer(query, answer_text, show_alert=True)
-
-
-def _callback_window_is_current(
-    user_id: int, thread_id: int | None, window_id: str
-) -> bool:
-    """Return True when a callback's encoded window still owns the topic."""
-    return session_manager.resolve_window_for_thread(user_id, thread_id) == window_id
 
 
 # --- Command handlers ---

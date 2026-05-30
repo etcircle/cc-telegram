@@ -292,21 +292,6 @@ async def aggregator_offer_document(
     await _offer_attachment(route, path, caption, media_group_id)
 
 
-async def aggregator_offer_attachment(
-    route: Route,
-    path: Path,
-    caption: str | None,
-    media_group_id: str | None,
-) -> None:
-    """Kind-agnostic offer for the unbound-topic flush sites.
-
-    Photo and document handlers stash a ``PendingAttachment`` without a
-    ``kind`` field; the bind-flush replays them through this wrapper since
-    both routes converge on the same internal coroutine.
-    """
-    await _offer_attachment(route, path, caption, media_group_id)
-
-
 async def aggregator_replay_payload(
     route: Route,
     *,
