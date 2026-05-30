@@ -221,47 +221,6 @@ async def test_pane_idle_drops_lingering_tools_when_v2(
 
 
 @pytest.mark.asyncio
-async def test_monotonic_seq_visible_to_subscribers(
-    scenario: ScenarioHarness, _enable_route_runtime_v2: None
-) -> None:
-    """Subscribers observe snapshots in commit order via ``monotonic_seq``.
-
-    Property a future Slack/Discord transport adapter will need to
-    detect dropped notifications and resync from ``snapshot()``.
-    """
-    wid = scenario.add_window(window_name="repo", cwd="/repo")
-    scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
-    route: route_runtime.Route = (scenario.user_id, 42, wid)
-
-    observed_seqs: list[int] = []
-
-    async def observer(snap: route_runtime.RouteRuntimeSnapshot) -> None:
-        observed_seqs.append(snap.monotonic_seq)
-
-    unsubscribe = route_runtime.subscribe(route, observer)
-    try:
-        await route_runtime.mark_inbound_sent(route)
-        await transcript_event_adapter.dispatch_transcript_event(
-            _event(
-                block_type="tool_use",
-                tool_use_id="t1",
-                tool_name="Bash",
-                stop_reason="tool_use",
-            ),
-            [route],
-        )
-        await transcript_event_adapter.dispatch_transcript_event(
-            _event(role="user", block_type="tool_result", tool_use_id="t1"),
-            [route],
-        )
-    finally:
-        unsubscribe()
-
-    assert observed_seqs == sorted(observed_seqs)
-    assert len(set(observed_seqs)) == 3
-
-
-@pytest.mark.asyncio
 async def test_event_callback_wiring_drives_route_runtime(
     scenario: ScenarioHarness,
 ) -> None:

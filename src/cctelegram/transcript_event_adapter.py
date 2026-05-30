@@ -91,10 +91,10 @@ async def dispatch_transcript_event(
     Concurrency: per-route ingests run **concurrently** under
     ``asyncio.gather`` so independent route locks don't serialise on the
     adapter side. Within a route, ``route_runtime.ingest_transcript_event``
-    still holds the per-route lock across mutation + freeze; observer
-    fan-out then runs after lock release. The plan's "independent routes
-    do not serialise" invariant holds at the adapter level — a slow
-    observer on route A does NOT delay route B seeing the same event.
+    holds the per-route lock across mutation + freeze and returns the
+    committed snapshot (there is no observer/push channel). The
+    "independent routes do not serialise" invariant holds at the adapter
+    level — work on route A does NOT delay route B seeing the same event.
 
     Returns the per-route committed snapshots in input order — useful
     for callers that want to chain immediate side-effects off the new

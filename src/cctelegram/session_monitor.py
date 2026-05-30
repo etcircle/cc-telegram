@@ -875,9 +875,10 @@ class SessionMonitor:
         # typing indicator and "🟡 Busy" card stay stuck forever even though
         # the new session is genuinely idle. ``mark_session_reset`` transitions
         # the snapshot visibly (IDLE_CLEARED with ``status_card_msg_id``
-        # preserved) so subscribers observe the reset instead of silently
-        # dropping route state; it also drops the context_usage cache, so the
-        # 1M latch can't survive into the new session's footer.
+        # preserved) so the next ``snapshot(route)`` read reflects the reset
+        # instead of silently dropping route state; it also drops the
+        # context_usage cache, so the 1M latch can't survive into the new
+        # session's footer.
         # Deferred imports for the same reason as ``_monitor_loop`` — these
         # modules transitively pull in this one.
         if changed_window_ids:
