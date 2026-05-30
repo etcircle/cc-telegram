@@ -7,11 +7,10 @@ Single source of truth for "what is this route doing right now":
     point-in-time view.
   - Mutations go through ``ingest_*`` / ``mark_*`` functions, which acquire
     a per-route ``asyncio.Lock``, apply the transition, freeze a snapshot,
-    release the lock, then fan out to observers against the committed
-    snapshot. Observers cannot see partial state.
-  - ``snapshot(route)`` is the primary read seam — pull-based, fast, no
-    coroutine machinery. ``subscribe(route, cb)`` is secondary, for UI
-    surfaces that benefit from push notifications.
+    and release the lock. Each mutator returns the committed snapshot.
+  - ``snapshot(route)`` is the sole read seam — pull-based, fast, no
+    coroutine machinery. There is no push/observer channel: surfaces read
+    state by calling ``snapshot(route)``.
 
 This module owns the run-state machine, the context-usage cache, and the
 debounced pane-idle card-clear. The surfaces that consume it:
@@ -43,26 +42,23 @@ The ``message_queue`` boundary:
 Concurrency contract:
 
   - One per-route ``asyncio.Lock``. Independent routes do not serialize.
-  - Async mutators (``ingest_transcript_event``, ``mark_inbound_sent``,
-    ``mark_pane_idle``,
-    ``commit_pane_idle_clear``, ``mark_session_reset``) acquire the
-    route's lock, mutate, freeze a snapshot, **then** release the lock
-    before fanning observers out against the committed snapshot.
-    Observers can therefore call back into ``snapshot(other_route)`` /
-    ``ingest_*`` without deadlocking.
+  - Async mutators acquire the route's lock, mutate, and release it. Most
+    (``ingest_transcript_event``, ``mark_inbound_sent``, ``mark_pane_idle``,
+    ``mark_session_reset``) freeze and return the committed snapshot;
+    ``commit_pane_idle_clear`` mutates under the lock and returns a ``bool``
+    (whether it actually cleared). There is no push/observer channel —
+    surfaces read state by calling ``snapshot(route)``.
   - **Synchronous side-band writes** (``mark_status_card_published`` /
     ``mark_status_card_cleared``, ``update_context_usage``,
     ``seed_open_tools``, ``arm_pane_idle_clear``, ``clear_route``)
     intentionally bypass the lock. They are bookkeeping for read-side
-    flags — they don't change ``run_state`` (no transition table runs),
-    don't fire observers (no fan-out), and don't await between their
-    initial read of ``_state`` and the field write. Safe under Python's
-    single-threaded asyncio scheduling because no suspension point
-    separates the read from the write. ``pane_idle_clear_due`` is a pure
-    synchronous read in the same vein. **Do not call these from a
-    thread** — they assume event-loop-thread execution.
-  - Every committed transition increments ``_global_seq``; the snapshot
-    carries ``monotonic_seq`` so subscribers can dedupe / detect drops.
+    flags — they don't change ``run_state`` (no transition table runs)
+    and don't await between their initial read of ``_state`` and the
+    field write. Safe under Python's single-threaded asyncio scheduling
+    because no suspension point separates the read from the write.
+    ``pane_idle_clear_due`` is a pure synchronous read in the same vein.
+    **Do not call these from a thread** — they assume event-loop-thread
+    execution.
   - Pane snapshots (``mark_pane_idle`` / ``commit_pane_idle_clear``) are
     reconciliation events with **lower authority** than transcript
     lifecycle events: they preserve ``WAITING_ON_USER``, only clearing
@@ -88,7 +84,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Awaitable, Callable, Literal
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -191,10 +187,7 @@ class RouteRuntimeSnapshot:
         end_turn) is distinct from run-state decay.
 
     Equality is by value — comparing two snapshots tells you whether
-    *anything* the route observes has changed. Distinct ``monotonic_seq``
-    values are guaranteed for any two ``ingest_*`` results on the same
-    route (or different routes) regardless of whether the visible fields
-    moved.
+    *anything* the route observes has changed.
     """
 
     route: Route
@@ -208,7 +201,6 @@ class RouteRuntimeSnapshot:
     typing_eligible: bool
     status_card_visible: bool
     status_card_msg_id: int | None
-    monotonic_seq: int
 
 
 @dataclass
@@ -256,17 +248,11 @@ class _RouteState:
         return self._waiting_tools_cache
 
 
-# Per-route state + lock + observer maps. Keys are ``Route`` tuples; the
+# Per-route state + lock maps. Keys are ``Route`` tuples; the
 # tuple itself is the natural identity, so we use a plain dict (not a
 # defaultdict) and lazy-init under ``_lock_for_route``.
 _state: dict[Route, _RouteState] = {}
 _locks: dict[Route, asyncio.Lock] = {}
-_observers: dict[Route, list[Callable[[RouteRuntimeSnapshot], Awaitable[None]]]] = {}
-
-# Monotonic sequence — increments on every committed transition. Snapshots
-# carry the value seen at commit time so an observer can detect dropped
-# / reordered notifications independently of event payload.
-_global_seq: int = 0
 
 
 # ── lock helpers ────────────────────────────────────────────────────────
@@ -305,12 +291,6 @@ def _now() -> float:
     return time.monotonic()
 
 
-def _next_seq() -> int:
-    global _global_seq
-    _global_seq += 1
-    return _global_seq
-
-
 def _state_from_open_tools(open_tools: dict[str, bool]) -> RunState:
     """Derive the run state from the current open-tool set.
 
@@ -327,7 +307,7 @@ def _state_from_open_tools(open_tools: dict[str, bool]) -> RunState:
 
 def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
     """Snapshot ``st`` under the route's lock. Must be called with the
-    lock held. Increments ``_global_seq``."""
+    lock held."""
     return RouteRuntimeSnapshot(
         route=route,
         run_state=st.run_state,
@@ -340,7 +320,6 @@ def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
         typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
-        monotonic_seq=_next_seq(),
     )
 
 
@@ -350,8 +329,7 @@ def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
 
     Unknown routes default to ``IDLE_CLEARED`` (treat-as-idle): a surface
     asking about a route the runtime has never seen is best off rendering
-    "no busy state" rather than fabricating one. Does NOT consume a sequence
-    number — pure observation, no commit.
+    "no busy state" rather than fabricating one. Pure observation, no commit.
     """
     return RouteRuntimeSnapshot(
         route=route,
@@ -365,7 +343,6 @@ def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
         typing_eligible=False,
         status_card_visible=False,
         status_card_msg_id=None,
-        monotonic_seq=0,
     )
 
 
@@ -492,7 +469,7 @@ async def ingest_transcript_event(
     """Apply ``event`` to ``route``'s state and return the committed snapshot.
 
     Locks the route, applies the transition, freezes a snapshot, releases
-    the lock, then fires observers against the committed snapshot.
+    the lock, and returns the committed snapshot.
     """
     lock = _lock_for_route(route)
     async with lock:
@@ -501,7 +478,6 @@ async def ingest_transcript_event(
         # Activity re-arms the pane-idle debounce (cancels a pending clear).
         _rearm_pane_idle_in_place(st)
         snap = _freeze(route, st)
-    await _fan_out(route, snap)
     return snap
 
 
@@ -520,8 +496,7 @@ def snapshot(route: Route) -> RouteRuntimeSnapshot:
     st = _state.get(route)
     if st is None:
         return _default_snapshot(route)
-    # Lazy decay is observation-only — it doesn't fire observers and
-    # doesn't consume a sequence number unless decay actually fires.
+    # Lazy decay is observation-only.
     if (
         st.run_state is RunState.IDLE_RECENT
         and st.idle_clear_at is not None
@@ -542,7 +517,6 @@ def snapshot(route: Route) -> RouteRuntimeSnapshot:
         typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
-        monotonic_seq=_global_seq,  # read-only — no commit
     )
 
 
@@ -570,7 +544,6 @@ async def mark_inbound_sent(route: Route) -> RouteRuntimeSnapshot:
         # Inbound delivery is real activity — re-arm the pane-idle debounce.
         _rearm_pane_idle_in_place(st)
         snap = _freeze(route, st)
-    await _fan_out(route, snap)
     return snap
 
 
@@ -615,7 +588,6 @@ async def mark_pane_idle(route: Route) -> RouteRuntimeSnapshot:
         st = _state_for_route(route)
         _reconcile_pane_idle_in_place(st)
         snap = _freeze(route, st)
-    await _fan_out(route, snap)
     return snap
 
 
@@ -639,8 +611,7 @@ def arm_pane_idle_clear(route: Route, *, now: float) -> RouteRuntimeSnapshot:
     pane observation.
 
     Idempotent and synchronous (a read-side bookkeeping write — no
-    run-state transition, no observer fan-out, like
-    ``mark_status_card_published``):
+    run-state transition, like ``mark_status_card_published``):
 
       - No-op if the route was already cleared this idle stretch
         (``pane_idle_cleared``).
@@ -681,7 +652,7 @@ async def commit_pane_idle_clear(route: Route, *, now: float) -> bool:
     """Perform the debounced card clear once the deadline is due.
 
     Returns ``True`` iff it actually cleared (reconciled run-state, dropped the
-    deadline, latched the ``pane_idle_cleared`` sentinel, fanned out); ``False``
+    deadline, latched the ``pane_idle_cleared`` sentinel); ``False``
     if it no-op'd. Callers enqueue the card clear ONLY on ``True``.
 
     TOCTOU re-validation (Codex 8b P1): the caller checks
@@ -694,7 +665,7 @@ async def commit_pane_idle_clear(route: Route, *, now: float) -> bool:
     not only ``RUNNING`` — so the run-state alone cannot tell the caller whether
     a clear happened; this explicit bool can). We re-check the SAME armed-and-due
     predicate under the lock with the caller's ``now`` and return ``False``
-    (no clear, no fan-out) if the deadline is no longer armed or not yet due.
+    (no clear) if the deadline is no longer armed or not yet due.
     This makes the card-clear strictly race-free: the deadline is
     re-validated under the lock before reconciling, so a clear can never
     blank a card that fresh activity already re-armed.
@@ -708,15 +679,13 @@ async def commit_pane_idle_clear(route: Route, *, now: float) -> bool:
         _reconcile_pane_idle_in_place(st)
         st.pane_idle_clear_at = None
         st.pane_idle_cleared = True
-        snap = _freeze(route, st)
-    await _fan_out(route, snap)
     return True
 
 
 def reset_pane_idle_clear(route: Route) -> None:
     """Cancel a pending / completed pane-idle clear from a *pane* signal.
 
-    Synchronous side-band write (no run-state transition, no fan-out — like
+    Synchronous side-band write (no run-state transition — like
     ``arm_pane_idle_clear``). Called by ``status_polling`` when a pane
     scrape shows the route running again: a fresh idle stretch must re-arm
     from scratch rather than fire on a deadline left over from a previous
@@ -750,7 +719,6 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         _rearm_pane_idle_in_place(st)
         _set_run_state(st, RunState.IDLE_CLEARED)
         snap = _freeze(route, st)
-    await _fan_out(route, snap)
     return snap
 
 
@@ -759,9 +727,9 @@ def mark_status_card_published(route: Route, msg_id: int) -> None:
 
     Synchronous: this is bookkeeping for the read-side
     ``snapshot.status_card_visible`` flag, not a state-machine
-    transition. Does not fire observers — message_queue is the
-    authoritative writer and observers would be reacting to their own
-    side-effect.
+    transition. message_queue is the authoritative writer for the status
+    card; the runtime only records the id for the pull-only ``snapshot``
+    read (there is no push/observer channel).
     """
     st = _state.get(route)
     if st is None:
@@ -773,8 +741,8 @@ def mark_status_card_published(route: Route, msg_id: int) -> None:
 def mark_status_card_cleared(route: Route) -> None:
     """message_queue cleared the status card for this route.
 
-    Counterpart to ``mark_status_card_published``. No observer fan-out
-    for the same reason.
+    Counterpart to ``mark_status_card_published`` — the same pull-only
+    bookkeeping, not a state-machine transition.
     """
     st = _state.get(route)
     if st is not None:
@@ -904,48 +872,6 @@ def parse_pending_tools_from_jsonl(jsonl_path: str) -> dict[str, bool]:
     return {tid: interactive for tid, interactive in uses.items() if tid not in results}
 
 
-# ── subscribe / observer fan-out ────────────────────────────────────────
-
-
-def subscribe(
-    route: Route,
-    observer: Callable[[RouteRuntimeSnapshot], Awaitable[None]],
-) -> Callable[[], None]:
-    """Register an observer for ``route``. Returns an unsubscribe callable.
-
-    Observers fire **after** ``ingest_*`` / ``mark_*`` commits a snapshot
-    — never during mutation. They cannot see partial state.
-    """
-    obs = _observers.setdefault(route, [])
-    obs.append(observer)
-
-    def _unsubscribe() -> None:
-        try:
-            _observers.get(route, []).remove(observer)
-        except ValueError:
-            pass
-
-    return _unsubscribe
-
-
-async def _fan_out(route: Route, snap: RouteRuntimeSnapshot) -> None:
-    """Invoke observers against the committed snapshot.
-
-    Exceptions in one observer never block the next. Observers run
-    sequentially in registration order — concurrent fan-out is left for
-    a future iteration once the subscriber count proves it's needed
-    (kill signal: ≤ 5 subscribers per route during initial Wave B).
-    """
-    obs = _observers.get(route)
-    if not obs:
-        return
-    for cb in list(obs):
-        try:
-            await cb(snap)
-        except Exception as e:
-            logger.error("route_runtime observer error route=%s: %s", route, e)
-
-
 # ── maintenance ─────────────────────────────────────────────────────────
 
 
@@ -958,12 +884,10 @@ def clear_route(route: Route) -> None:
     racing on a fresh lock object.
     """
     _state.pop(route, None)
-    _observers.pop(route, None)
 
 
 def reset_for_tests() -> None:
-    """Test-only: drop all per-route state, locks, observers, and reset
-    the monotonic sequence.
+    """Test-only: drop all per-route state and locks.
 
     This is the single test-side reset seam for the run-state machine,
     the context-usage cache, the pane-idle debounce, and status-card
@@ -971,11 +895,8 @@ def reset_for_tests() -> None:
     ``interactive_ui`` keep their own reset seams for their send-layer
     caches.
     """
-    global _global_seq
     _state.clear()
     _locks.clear()
-    _observers.clear()
-    _global_seq = 0
 
 
 __all__ = [
@@ -999,6 +920,5 @@ __all__ = [
     "reset_pane_idle_clear",
     "seed_open_tools",
     "snapshot",
-    "subscribe",
     "update_context_usage",
 ]

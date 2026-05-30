@@ -38,11 +38,12 @@ status / interactive prompts in another.)
 authority — a single per-route state machine that exposes immutable
 `RouteRuntimeSnapshot` reads. Every mutation (`ingest_transcript_event`,
 `mark_*`) acquires a per-route `asyncio.Lock`, applies the transition,
-freezes a snapshot, and fires observers **after** commit. Snapshot
+and freezes an immutable snapshot read via `snapshot(route)` (no
+observer/push channel). Snapshot
 fields: `run_state`, `open_tools`, `waiting_on_user_tools`,
 `context_usage`, `last_event_at`, `idle_clear_at`, `pane_idle_clear_at`,
-`typing_eligible`, `status_card_visible`, `status_card_msg_id`,
-`monotonic_seq`. The two idle deadlines are distinct:
+`typing_eligible`, `status_card_visible`, `status_card_msg_id`. The two
+idle deadlines are distinct:
 `idle_clear_at` is the run-state `IDLE_RECENT → IDLE_CLEARED` decay
 (armed by a transcript end-of-turn), while `pane_idle_clear_at` is the
 debounced "🟡 Busy" *card-clear* deadline (armed by `status_polling`

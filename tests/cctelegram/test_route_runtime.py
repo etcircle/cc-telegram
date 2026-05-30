@@ -5,8 +5,6 @@ Covers the transition table plus the snapshot interface:
 
   - Snapshots are frozen — mutating internal state does not change a
     captured snapshot.
-  - ``monotonic_seq`` strictly increases across mutations.
-  - Observers fire **after** commit and see the committed snapshot.
   - Per-route locks serialise within a route but do **not** serialise
     across routes.
   - ``mark_session_reset`` drops in-flight ``open_tools`` + context_usage.
@@ -25,7 +23,6 @@ import pytest
 from cctelegram import route_runtime
 from cctelegram.route_runtime import (
     ContextUsage,
-    RouteRuntimeSnapshot,
     RunState,
     TranscriptLifecycleEvent,
 )
@@ -503,7 +500,7 @@ async def test_seed_open_tools_skips_route_with_live_state():
     assert snap.open_tools == frozenset({"live-tool"})
 
 
-# ── snapshot immutability + monotonic seq ───────────────────────────────
+# ── snapshot immutability ───────────────────────────────────────────────
 
 
 async def test_snapshots_are_frozen_dataclasses():
@@ -517,167 +514,61 @@ async def test_snapshots_are_frozen_dataclasses():
         snap.run_state = RunState.IDLE_CLEARED  # type: ignore[misc]
 
 
-async def test_monotonic_seq_strictly_increases():
-    seqs: list[int] = []
-    snap = await route_runtime.mark_inbound_sent(ROUTE)
-    seqs.append(snap.monotonic_seq)
-    for tid in ("t1", "t2", "t3"):
-        snap = await route_runtime.ingest_transcript_event(
-            ROUTE,
-            _evt(
-                "assistant",
-                "tool_use",
-                tool_use_id=tid,
-                tool_name="Bash",
-            ),
-        )
-        seqs.append(snap.monotonic_seq)
-    assert seqs == sorted(seqs)
-    assert len(set(seqs)) == len(seqs)
-
-
-async def test_snapshot_read_does_not_consume_seq_when_no_decay():
-    await route_runtime.mark_inbound_sent(ROUTE)
-    before = route_runtime.snapshot(ROUTE).monotonic_seq
-    after = route_runtime.snapshot(ROUTE).monotonic_seq
-    # Pure reads return the same global seq.
-    assert before == after
-
-
-# ── observers ───────────────────────────────────────────────────────────
-
-
-async def test_subscribe_fires_after_commit():
-    seen: list[RouteRuntimeSnapshot] = []
-
-    async def observer(snap: RouteRuntimeSnapshot) -> None:
-        seen.append(snap)
-
-    unsubscribe = route_runtime.subscribe(ROUTE, observer)
-    try:
-        snap = await route_runtime.mark_inbound_sent(ROUTE)
-    finally:
-        unsubscribe()
-    assert seen == [snap]
-    assert seen[0].run_state is RunState.RUNNING
-
-
-async def test_subscribe_does_not_block_subsequent_ingest_in_observer():
-    """An observer that calls back into ``snapshot`` must not deadlock.
-
-    Snapshot is a pure read — no lock acquisition — so calling it from
-    inside an observer is safe.
-    """
-    events: list[str] = []
-
-    async def observer(snap: RouteRuntimeSnapshot) -> None:
-        # Reading inside observer: read state should be the committed one.
-        inner = route_runtime.snapshot(ROUTE)
-        events.append(f"obs:{snap.run_state.value}:{inner.run_state.value}")
-
-    route_runtime.subscribe(ROUTE, observer)
-    await route_runtime.mark_inbound_sent(ROUTE)
-    assert events == ["obs:RUNNING:RUNNING"]
-
-
-async def test_unsubscribe_stops_future_callbacks():
-    seen: list[RouteRuntimeSnapshot] = []
-
-    async def observer(snap: RouteRuntimeSnapshot) -> None:
-        seen.append(snap)
-
-    unsubscribe = route_runtime.subscribe(ROUTE, observer)
-    await route_runtime.mark_inbound_sent(ROUTE)
-    unsubscribe()
-    await route_runtime.mark_inbound_sent(ROUTE)
-    assert len(seen) == 1
-
-
-async def test_observer_exception_does_not_break_fan_out():
-    """A bad observer must not prevent later observers from running."""
-    seen: list[str] = []
-
-    async def broken(_snap: RouteRuntimeSnapshot) -> None:
-        raise RuntimeError("boom")
-
-    async def good(snap: RouteRuntimeSnapshot) -> None:
-        seen.append(snap.run_state.value)
-
-    route_runtime.subscribe(ROUTE, broken)
-    route_runtime.subscribe(ROUTE, good)
-    await route_runtime.mark_inbound_sent(ROUTE)
-    assert seen == ["RUNNING"]
-
-
 # ── per-route lock isolation ────────────────────────────────────────────
 
 
 async def test_independent_routes_do_not_serialise():
     """Two routes can ingest concurrently without blocking each other.
 
-    Verified by ensuring the second ingest's snapshot reflects a
-    higher seq AND completes within roughly the same tick — if they
-    serialised on a single global lock, the second would wait for the
-    first's lock release.
+    Holding ROUTE's lock open must not stop ROUTE_2 from committing — the
+    per-route locks are independent. We grab ROUTE's lock by hand to model
+    an in-flight mutation, then prove ROUTE_2 still commits while it's held.
     """
-    barrier = asyncio.Event()
-    proceed = asyncio.Event()
-    seen_route1_state: list[str] = []
-
-    async def observer_route1(_snap: RouteRuntimeSnapshot) -> None:
-        # Block route 1's commit until route 2 has independently ingested.
-        seen_route1_state.append("entered")
-        await proceed.wait()
-
-    route_runtime.subscribe(ROUTE, observer_route1)
-
-    async def trigger_route1() -> None:
-        await route_runtime.mark_inbound_sent(ROUTE)
-        seen_route1_state.append("done")
-        barrier.set()
-
-    async def trigger_route2() -> None:
-        await route_runtime.mark_inbound_sent(ROUTE_2)
-
-    task1 = asyncio.create_task(trigger_route1())
-    # Wait until route1's observer is blocked.
-    while "entered" not in seen_route1_state:
-        await asyncio.sleep(0)
-    # Route2 should be able to commit even though route1's observer is
-    # stuck — the lock for ROUTE_2 is independent of ROUTE's.
-    await asyncio.wait_for(trigger_route2(), timeout=1.0)
-    # Now release route1 and let it finish.
-    proceed.set()
-    await asyncio.wait_for(task1, timeout=1.0)
+    lock = route_runtime._lock_for_route(ROUTE)
+    async with lock:
+        # ROUTE's lock is held; ROUTE_2 must still be able to commit because
+        # it acquires a different lock.
+        snap2 = await asyncio.wait_for(
+            route_runtime.mark_inbound_sent(ROUTE_2), timeout=1.0
+        )
+        assert snap2.run_state is RunState.RUNNING
 
 
 async def test_same_route_serialises():
-    """Two ingest calls on the SAME route must serialise.
+    """A same-route mutation must WAIT for an in-flight one to release the lock.
 
-    The state machine never sees half-applied state — every transition
-    is atomic relative to other transitions on that route.
+    A bare ``gather`` of mutators cannot prove this: each mutator's critical
+    section (``ingest_transcript_event`` at route_runtime.py:475-480) is
+    synchronous between lock acquisition and release, so asyncio never
+    interleaves them even with a no-op lock — the final open-set would be the
+    same either way (a vacuous assertion). Instead we hold ROUTE's lock by
+    hand to model an in-flight mutation, launch a SECOND same-route mutation,
+    and prove it stays PENDING (its effect has not landed) until we release —
+    then completes once released. Replacing the ``async with lock`` in the
+    mutators with a no-op would let the second mutation finish while the lock
+    is held, failing the ``not task.done()`` / empty-open-set assertions.
     """
-    observed: list[int] = []
-
-    async def observer(snap: RouteRuntimeSnapshot) -> None:
-        observed.append(snap.monotonic_seq)
-
-    route_runtime.subscribe(ROUTE, observer)
-    # Fire several mutations concurrently; the lock must order them.
-    await asyncio.gather(
-        route_runtime.mark_inbound_sent(ROUTE),
-        route_runtime.ingest_transcript_event(
-            ROUTE,
-            _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash"),
-        ),
-        route_runtime.ingest_transcript_event(
-            ROUTE,
-            _evt("assistant", "tool_use", tool_use_id="t2", tool_name="Bash"),
-        ),
-    )
-    # All three observed snapshots had unique, strictly-increasing seqs.
-    assert observed == sorted(observed)
-    assert len(set(observed)) == 3
+    lock = route_runtime._lock_for_route(ROUTE)
+    await lock.acquire()
+    try:
+        blocked = asyncio.create_task(
+            route_runtime.ingest_transcript_event(
+                ROUTE,
+                _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash"),
+            )
+        )
+        # Yield so the task is scheduled; it must block on the held route lock.
+        await asyncio.sleep(0)
+        assert not blocked.done(), "same-route mutation ran while the lock was held"
+        assert route_runtime.snapshot(ROUTE).open_tools == frozenset(), (
+            "same-route mutation landed its effect without acquiring the lock"
+        )
+    finally:
+        lock.release()
+    # Once released, the blocked mutation acquires the lock and commits.
+    snap = await asyncio.wait_for(blocked, timeout=1.0)
+    assert snap.open_tools == frozenset({"t1"})
+    assert route_runtime.snapshot(ROUTE).open_tools == frozenset({"t1"})
 
 
 # ── clear_route ─────────────────────────────────────────────────────────
