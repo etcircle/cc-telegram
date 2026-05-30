@@ -38,48 +38,12 @@ def mock_bot():
     return bot
 
 
-def _reset_state() -> None:
-    message_queue._route_queues.clear()
-    message_queue._route_workers.clear()
-    message_queue._route_locks.clear()
-    message_queue._route_pending_ephemeral.clear()
-    message_queue._route_ephemeral_kick.clear()
-    message_queue._route_inflight.clear()
-    message_queue._route_tearing_down.clear()
-    message_queue._status_msg_info.clear()
-    message_queue._tool_msg_ids.clear()
-    message_queue._agent_tool_ids.clear()
-    message_queue._activity_msg_info.clear()
-    message_queue._tool_activity_indices.clear()
-    for _, flush in list(message_queue._activity_flush_tasks.items()):
-        if not flush.done():
-            flush.cancel()
-    message_queue._activity_flush_tasks.clear()
-    message_queue._activity_locks.clear()
-    message_queue._subagent_msg_info.clear()
-    message_queue._subagent_tool_indices.clear()
-    for _, flush in list(message_queue._subagent_flush_tasks.items()):
-        if not flush.done():
-            flush.cancel()
-    message_queue._subagent_flush_tasks.clear()
-    message_queue._subagent_locks.clear()
-    for _, flush in list(message_queue._todo_flush_tasks.items()):
-        if not flush.done():
-            flush.cancel()
-    message_queue._todo_flush_tasks.clear()
-    message_queue._todo_locks.clear()
-    message_queue._todo_msg_info.clear()
-    message_queue._todo_pending_snapshot.clear()
-    message_queue._todo_tool_ids.clear()
-    message_queue._flood_until.clear()
-
-
 @pytest.fixture
 def _clear_queue_state():
-    """Drop per-route queue/worker state between tests."""
-    _reset_state()
+    """Drop per-route queue/worker state between tests via the module seam."""
+    message_queue.reset_for_tests()
     yield
-    _reset_state()
+    message_queue.reset_for_tests()
 
 
 @pytest.mark.usefixtures("_clear_queue_state")

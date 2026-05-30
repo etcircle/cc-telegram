@@ -2982,3 +2982,65 @@ async def shutdown_workers() -> None:
     _route_ephemeral_kick.clear()
     _route_inflight.clear()
     logger.info("Message queue workers stopped")
+
+
+def reset_for_tests() -> None:
+    """Test-only: drop ALL module-level send-layer state and cancel any
+    scheduled asyncio task.
+
+    Co-located with the state it resets (the R3 reset-seam contract): every
+    map is resolved by direct module reference, never ``getattr(name)`` string
+    indirection — that string lookup is the "reset fixture by stale name =
+    silent no-op" footgun this seam removes. Adding a module-level MUTABLE
+    per-test dict/set/task map WITHOUT adding it here will leave state leaking
+    into the next test; the pinning test ``test_message_queue_reset.py`` guards
+    the invariant: after this call no module-level state and no scheduled
+    asyncio task survives into the next test. (Immutable module-level constant
+    lookup tables — e.g. ``_RUN_STATE_HEADER`` — are NOT per-test state and are
+    intentionally excluded.)
+
+    The task maps are cancel-then-clear: ``_route_workers`` (the per-route
+    queue workers) and the three flush-task maps each have every pending (not
+    ``.done()``) task ``.cancel()``-ed BEFORE the map is cleared, so a live
+    worker or a debounce scheduled by a prior test cannot survive — or fire its
+    edit — into the next one.
+    """
+    # Plain dicts.
+    _route_queues.clear()
+    _route_locks.clear()
+    _route_pending_ephemeral.clear()
+    _route_ephemeral_kick.clear()
+    _route_inflight.clear()
+    _status_msg_info.clear()
+    _route_last_user_message.clear()
+    _tool_msg_ids.clear()
+    _agent_tool_ids.clear()
+    _activity_msg_info.clear()
+    _tool_activity_indices.clear()
+    _activity_locks.clear()
+    _subagent_msg_info.clear()
+    _subagent_tool_indices.clear()
+    _subagent_locks.clear()
+    _todo_locks.clear()
+    _todo_msg_info.clear()
+    _todo_pending_snapshot.clear()
+    _flood_until.clear()
+    # OrderedDict (LRU-as-set of seen TodoWrite tool_use ids).
+    _todo_tool_ids.clear()
+    # Set-typed state.
+    _route_tearing_down.clear()
+    _bad_topic_threads.clear()
+    # Task maps: cancel-then-clear, preserving that exact ordering, so no
+    # scheduled asyncio task survives into the next test. ``_route_workers``
+    # holds live per-route queue workers (created via ``asyncio.create_task``
+    # in ``_get_or_create_route``); the other three are debounce-flush tasks.
+    for task_map in (
+        _route_workers,
+        _activity_flush_tasks,
+        _subagent_flush_tasks,
+        _todo_flush_tasks,
+    ):
+        for task in list(task_map.values()):
+            if not task.done():
+                task.cancel()
+        task_map.clear()
