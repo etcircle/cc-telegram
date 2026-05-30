@@ -3820,3 +3820,32 @@ async def clear_interactive_msg(
             )
 
     await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)
+
+
+def reset_for_tests() -> None:
+    """Test-only: drop all per-test module-level state for interactive UI.
+
+    Co-located with the state it resets (the R3 reset-seam contract): every
+    map is resolved by direct module reference, never ``getattr(name)`` string
+    indirection. Clears the picker/mode/meta/context maps, the pick-token
+    tables, the pretool-ask records, and ``_route_locks`` (created lazily by
+    ``_get_route_lock`` and otherwise never cleaned up, so clearing between
+    tests is a pure improvement — they are recreated on demand).
+
+    ``_clear_callbacks`` is a process-lifetime registry (``status_polling``
+    registers ``_on_interactive_clear`` at import); it is intentionally NOT
+    reset — clearing it would silently disable clear-callback propagation for
+    the rest of the suite since the registration only runs once at import.
+    """
+    _interactive_msgs.clear()
+    _interactive_mode.clear()
+    _interactive_msg_meta.clear()
+    _last_completed_ask_tool_input.clear()
+    _last_auq_tool_use_id.clear()
+    _pretool_ask_records.clear()
+    _pick_tokens.clear()
+    _pick_token_cache.clear()
+    _auq_context_posted.clear()
+    _auq_context_post_pending.clear()
+    _auq_context_msgs.clear()
+    _route_locks.clear()

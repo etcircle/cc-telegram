@@ -9,8 +9,10 @@ one user-visible scenario; assertions reach only at the seams:
     `message_queue` worker → fake bot.
 
 No test body monkeypatches handler-module internals. Fixture-side state
-reset lives in `tests/conftest.py` (a known Wave B target — `message_queue`
-et al. lack `reset_for_tests()` seams today).
+reset lives in `tests/conftest.py`, which calls each module's
+`reset_for_tests()` seam (`message_queue` + `interactive_ui` gained theirs
+in R3; `inbound_aggregator` + `status_polling` are still reset inline — see
+the scaffolding-debt notes below).
 
 Run: `uv run pytest -m scenario -q`.
 
@@ -72,13 +74,16 @@ do NOT block Wave A merge — Wave B/C should address them.
      interface); `busy_indicator` is deleted, and teardown / session
      reset route through `route_runtime` (`mark_session_reset`,
      `clear_route`).
-  3. **`message_queue` lacks a `reset_for_tests()` seam.** The fixture
-     in `tests/conftest.py` clears 20+ module-level dicts to give each
-     scenario a clean slate. Wave B's `RouteRuntime` should consolidate
-     this into a single reset call.
-  4. **`inbound_aggregator`, `status_polling`, `interactive_ui` same as
-     above** — no `reset_for_tests()` seam; the fixture pokes module
-     state directly. Each is a Wave B/C candidate for a real seam.
+  3. **`message_queue` reset seam.** (RESOLVED by R3.) `message_queue`
+     now exposes `reset_for_tests()`, co-located with the state it resets;
+     the `tests/conftest.py` fixture calls that single seam instead of
+     hand-enumerating 20+ module-level dicts. The seam cancels in-flight
+     task maps (`_route_workers` + the debounce-flush maps) before clearing.
+  4. **Remaining modules without a seam.** `interactive_ui` also got a
+     `reset_for_tests()` seam in R3 (it intentionally preserves the
+     process-lifetime `_clear_callbacks` registry). `inbound_aggregator`
+     and `status_polling` still lack one — the fixture pokes their module
+     state directly. Each remains a candidate for a real seam.
 
 The kill criterion ("scenarios can't be written without monkeypatching
 internals") was **not** triggered: every scenario test body assertion

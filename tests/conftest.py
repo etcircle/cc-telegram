@@ -8,11 +8,13 @@ black-box tests that drive the bot from the public Telegram seam through the
 real handler stack to ``tmux_manager`` / ``session_manager``, with no
 monkeypatch of handler internals in *test bodies*.
 
-Wave A note: a few handler modules don't yet expose a ``reset_for_tests()``
-seam (``message_queue``, ``inbound_aggregator``, ``status_polling``,
-``interactive_ui``). The fixtures below clear their module-level state
-directly. That fixture-side coupling is exactly the architecture smell Wave
-B is meant to fix; until then, keeping it in this file (not in test bodies)
+Reset-seam note: handler modules expose a co-located ``reset_for_tests()``
+seam next to the state it resets — ``message_queue.reset_for_tests()`` and
+``interactive_ui.reset_for_tests()`` join the existing
+``route_runtime`` / ``auq_ledger`` / ``attention`` seams. ``_reset_all_handler_state``
+calls those seams directly. ``inbound_aggregator`` and ``status_polling``
+still have small fixture-side clears below (their module state is a couple of
+caches); keeping any residual reset code in this file — not in test bodies —
 preserves the kill-criterion signal: scenarios fail the bar only when the
 *tests themselves* must reach into handler internals.
 """
@@ -588,58 +590,6 @@ def _reset_session_manager() -> None:
     _real_sm.group_chat_ids.clear()
 
 
-def _reset_message_queue() -> None:
-    """Drain per-route queues, workers, ephemeral slots, msg_id maps.
-
-    No ``reset_for_tests()`` seam yet — this duplicates the pattern in
-    ``test_message_queue.py::_reset_state``. Wave B should pull this into a
-    real seam on ``RouteRuntime`` / ``message_queue`` itself.
-    """
-    mq = message_queue
-    for name in (
-        "_route_queues",
-        "_route_workers",
-        "_route_locks",
-        "_route_pending_ephemeral",
-        "_route_ephemeral_kick",
-        "_route_inflight",
-        "_route_tearing_down",
-        "_status_msg_info",
-        "_tool_msg_ids",
-        "_agent_tool_ids",
-        "_activity_msg_info",
-        "_tool_activity_indices",
-        "_activity_locks",
-        "_subagent_msg_info",
-        "_subagent_tool_indices",
-        "_subagent_locks",
-        "_todo_locks",
-        "_todo_msg_info",
-        "_todo_pending_snapshot",
-        "_todo_tool_ids",
-        "_flood_until",
-    ):
-        attr = getattr(mq, name, None)
-        if isinstance(attr, dict):
-            attr.clear()
-    # Set-typed module state needs separate clearance.
-    bad_topics = getattr(mq, "_bad_topic_threads", None)
-    if isinstance(bad_topics, set):
-        bad_topics.clear()
-    # Cancel any in-flight digest flush tasks before clearing their maps.
-    for task_map_name in (
-        "_activity_flush_tasks",
-        "_subagent_flush_tasks",
-        "_todo_flush_tasks",
-    ):
-        m = getattr(mq, task_map_name, None)
-        if isinstance(m, dict):
-            for task in list(m.values()):
-                if hasattr(task, "done") and not task.done():
-                    task.cancel()
-            m.clear()
-
-
 def _reset_aggregator() -> None:
     agg = inbound_aggregator
     for name in ("_bundles", "_locks"):
@@ -652,26 +602,6 @@ def _reset_status_polling() -> None:
     sp = status_polling
     for name in ("_last_pane_capture", "_last_published_ui_hash", "_absent_streak"):
         attr = getattr(sp, name, None)
-        if isinstance(attr, dict):
-            attr.clear()
-
-
-def _reset_interactive_ui() -> None:
-    iu = interactive_ui
-    for name in (
-        "_interactive_msgs",
-        "_interactive_mode",
-        "_interactive_msg_meta",
-        "_last_completed_ask_tool_input",
-        "_last_auq_tool_use_id",
-        "_pretool_ask_records",
-        "_pick_tokens",
-        "_pick_token_cache",
-        "_auq_context_posted",
-        "_auq_context_post_pending",
-        "_auq_context_msgs",
-    ):
-        attr = getattr(iu, name, None)
         if isinstance(attr, dict):
             attr.clear()
 
@@ -690,10 +620,10 @@ def _reset_all_handler_state() -> None:
     route_runtime.reset_for_tests()
     transcript_event_adapter.reset_for_tests()
     attention.reset_for_tests()
-    _reset_message_queue()
+    message_queue.reset_for_tests()
+    interactive_ui.reset_for_tests()
     _reset_aggregator()
     _reset_status_polling()
-    _reset_interactive_ui()
     _reset_session_manager()
 
 
