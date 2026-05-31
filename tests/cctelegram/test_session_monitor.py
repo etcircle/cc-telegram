@@ -1,6 +1,7 @@
 """Unit tests for SessionMonitor JSONL reading and offset handling."""
 
 import json
+import time
 
 import pytest
 
@@ -978,6 +979,155 @@ class TestAuqCacheClearOnSessionChange:
         # /clear flipped the session under window @11 → cached AUQ tool_input
         # belongs to the dead session and must be dropped.
         assert interactive_ui.resolve_ask_tool_input("@11") is None
+
+    @staticmethod
+    def _write_side_file(tmp_path, session_id: str, tool_use_id: str) -> "object":
+        pending = tmp_path / "auq_pending"
+        pending.mkdir(mode=0o700, exist_ok=True)
+        path = pending / f"{session_id}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "tool_use_id": tool_use_id,
+                    "written_at": time.time(),
+                    "tool_input": {
+                        "questions": [
+                            {
+                                "question": "Q?",
+                                "header": "Q1",
+                                "options": [{"label": "a"}, {"label": "b"}],
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        return path
+
+    @pytest.mark.asyncio
+    async def test_reconciles_orphaned_side_file_when_no_pending_auq(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """Codex+Hermes dual-FAIL fix (2026-05-31): an answered AUQ whose side
+        file was never unlinked (bot down / callback errored while the monitor
+        offset had already passed the tool_result) must be reconciled on
+        startup hydration — otherwise side_file_live_for_window keeps a DEAD
+        card alive forever.
+        """
+        from cctelegram.handlers import auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        # session_id must be a canonical UUID — the side-file reader rejects
+        # non-UUID names (path-traversal defense).
+        sid = "11111111-1111-4111-8111-111111111111"
+        # JSONL shows the AUQ was ANSWERED (tool_use + matching tool_result)
+        # → _find_latest_pending_auq returns None.
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("auq_done"), _tool_result_entry("auq_done")],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, sid, "auq_done")
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            assert auq_source.side_file_live_for_window("@7") is True
+
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+
+            assert not side.exists(), "orphaned side file must be reconciled away"
+            assert auq_source.side_file_live_for_window("@7") is False
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_keeps_side_file_when_auq_still_pending(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """Inverse safety: a genuinely PENDING AUQ (tool_use, no tool_result)
+        must NOT have its side file reconciled away — that would resurrect the
+        disappearing-card bug.
+        """
+        from cctelegram.handlers import auq_source, interactive_ui
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        sid = "22222222-2222-4222-8222-222222222222"
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(jsonl, [_auq_tool_use_entry("auq_pending")])
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, sid, "auq_pending")
+        session_manager.window_states["@8"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            await monitor._hydrate_ask_tool_input_cache({"@8": sid})
+            assert side.exists(), "live AUQ side file must be kept"
+        finally:
+            session_manager.window_states.pop("@8", None)
+            interactive_ui._last_completed_ask_tool_input.pop("@8", None)
+            auq_source.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_is_session_keyed_not_window_keyed(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """Hermes round-2 P2: the reconciler keys on current_map's session_id,
+        NOT a re-resolve via peek_session_id_for_window (window_states) — which
+        at startup (hydration runs before the loop's load_session_map) can
+        point at a DIFFERENT session. Checking liveness on one session while
+        unlinking another is the mint/validate parity trap. Here window_states
+        is deliberately stale; the orphan for the current-map session must
+        still be reconciled (and a window-keyed check would have missed it).
+        """
+        from cctelegram.handlers import auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        cur = "11111111-1111-4111-8111-111111111111"  # current_map session
+        stale = "99999999-9999-4999-8999-999999999999"  # stale window_states
+
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("auq_done"), _tool_result_entry("auq_done")],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=cur, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, cur, "auq_done")
+        # window_states disagrees with current_map (stale binding at startup).
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=stale)
+        try:
+            await monitor._hydrate_ask_tool_input_cache({"@7": cur})
+            assert not side.exists(), (
+                "reconciler must unlink the current-map session's orphan even "
+                "when window_states points elsewhere (session-keyed)"
+            )
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
 
 
 class TestLoadCurrentSessionMapLegacyKeyFilter:

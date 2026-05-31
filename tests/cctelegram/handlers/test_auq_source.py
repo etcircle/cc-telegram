@@ -273,3 +273,123 @@ class TestRememberBeforeMintParity:
             assert again.source_fingerprint == resolved.source_fingerprint
         finally:
             interactive_ui._last_completed_ask_tool_input.pop(self._WID, None)
+
+
+def _write_side_file_at(
+    cc_dir: Path,
+    session_id: str,
+    *,
+    written_at: float,
+    schema_version: int = 1,
+) -> None:
+    """Write a (by default) schema-valid side file with a controllable
+    ``written_at`` / ``schema_version``, reusing the real affordance
+    ``tool_input`` so the trust-boundary reader accepts the shape.
+    """
+    sidefile = json.loads(_AFFORDANCE_SIDEFILE.read_text())
+    pending = cc_dir / "auq_pending"
+    pending.mkdir(mode=0o700, exist_ok=True)
+    (pending / f"{session_id}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "session_id": session_id,
+                "tool_use_id": sidefile["tool_use_id"],
+                "written_at": written_at,
+                "tool_input": sidefile["tool_input"],
+            }
+        )
+    )
+
+
+class TestSideFileLiveForWindow:
+    """The pane-INDEPENDENT card-clear authority (2026-05-31 disappearing-card
+    fix). ``side_file_live_for_window`` is True iff a schema-valid side file
+    exists for the window's session and is not future-skewed — deliberately
+    WITHOUT the read-TTL and WITHOUT any pane-consistency check.
+    """
+
+    _WID = "@auqsrc-live"
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    def test_true_when_present_and_pane_independent(self, _cc_dir):
+        """A fresh valid side file → True with NO pane supplied at all (proves
+        pane-independence, the whole point) AND without populating the
+        ``_pretool_ask_records`` cache (read-only invariant: ``resolve_record``
+        stays the sole mutator).
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_affordance_side_file(_cc_dir, self._SID)
+            assert auq_source.side_file_live_for_window(self._WID) is True
+            assert self._WID not in auq_source._pretool_ask_records
+        finally:
+            _unbind_window(self._WID)
+
+    def test_true_past_ttl_still_live(self, _cc_dir):
+        """KEY regression: a genuinely-live AUQ unanswered well past the 5-min
+        read-TTL must STILL be live for the clear gate. The user's bar is
+        literal — the card "shouldn't expire ... unless it expired on the other
+        side of the bridge"; a read-TTL is NOT that bridge. A regression to a
+        TTL-based predicate would flip this to False and resurrect the bug.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_side_file_at(
+                _cc_dir,
+                self._SID,
+                written_at=time.time() - (auq_source._PRETOOL_TTL_SECONDS + 60),
+            )
+            assert auq_source.side_file_live_for_window(self._WID) is True
+        finally:
+            _unbind_window(self._WID)
+
+    def test_false_when_no_session_bound(self, _cc_dir):
+        # No window_states entry → peek returns None → False (file never read).
+        assert auq_source.side_file_live_for_window("@auqsrc-unbound") is False
+
+    def test_false_when_no_side_file(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            assert auq_source.side_file_live_for_window(self._WID) is False
+        finally:
+            _unbind_window(self._WID)
+
+    def test_false_on_schema_mismatch(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_side_file_at(
+                _cc_dir, self._SID, written_at=time.time(), schema_version=2
+            )
+            assert auq_source.side_file_live_for_window(self._WID) is False
+        finally:
+            _unbind_window(self._WID)
+
+    def test_false_on_future_skew(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_side_file_at(
+                _cc_dir,
+                self._SID,
+                written_at=time.time() + auq_source._PRETOOL_FUTURE_SKEW_SECONDS + 30,
+            )
+            assert auq_source.side_file_live_for_window(self._WID) is False
+        finally:
+            _unbind_window(self._WID)
+
+    def test_session_keyed_core_is_window_independent(self, _cc_dir):
+        """side_file_live_for_session works off the session_id alone — no
+        window binding, no pane. This is the canonical form the startup orphan
+        reconciler uses so its liveness check and the unlink target the SAME
+        session (the window wrapper would re-resolve via peek/window_states).
+        """
+        # No _bind_window: the session-keyed core never consults window_states.
+        _write_affordance_side_file(_cc_dir, self._SID)
+        assert auq_source.side_file_live_for_session(self._SID) is True
+        assert auq_source.side_file_live_for_session("") is False
+        assert (
+            auq_source.side_file_live_for_session(
+                "00000000-0000-4000-8000-000000000000"
+            )
+            is False
+        )

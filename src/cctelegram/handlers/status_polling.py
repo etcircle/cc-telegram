@@ -47,6 +47,7 @@ from ..terminal_parser import (
 )
 from ..transcript_parser import read_latest_usage
 from ..tmux_manager import TmuxWindow, tmux_manager
+from . import auq_source
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -334,6 +335,29 @@ async def update_status_message(
         # anchors present → reset the streak, keep the card.
         if is_picker_anchor_visible(pane_text):
             _absent_streak.pop(route, None)
+            return
+        # The visible pane lacks picker anchors — but the pane is only a
+        # DISPLAY, not the lifecycle authority. The PreToolUse side file
+        # (auq_pending/<session>.json) is written before the picker renders
+        # and unlinked ONLY when the question truly resolves (tool_result),
+        # on /clear, on window delete, or by the 1h GC. While it is live, an
+        # obstructing overlay (Claude task-list, a scrolled/compressed Submit
+        # screen, tool-output spam) must NOT tear down a still-pending
+        # question's card. RouteRuntime contract: pane signals are LOWER
+        # authority than the resolution lifecycle. (2026-05-31 @4/msg48427:
+        # the task-list overlay made both pane predicates read "absent" for
+        # 3 polls and a LIVE multi-select AUQ card was tombstoned.) NB: this
+        # uses ``side_file_live_for_window`` and NOT ``resolve_record`` —
+        # the latter needs a pane-parsed form which is None under exactly
+        # the overlay this must survive.
+        if auq_source.side_file_live_for_window(window_id):
+            _absent_streak.pop(route, None)
+            logger.debug(
+                "Interactive UI absent on pane but PreToolUse side file live "
+                "for window_id %s — preserving card (route=%s)",
+                window_id,
+                route,
+            )
             return
         # Hysteresis: a single absent poll can be a transient redraw frame on
         # a still-live picker (see ``ABSENT_STREAK_THRESHOLD`` docstring).

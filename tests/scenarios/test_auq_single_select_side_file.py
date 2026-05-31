@@ -15,10 +15,12 @@ from typing import Any
 
 import pytest
 
+from cctelegram import bot as bot_module
 from cctelegram import terminal_parser
 from cctelegram.callback_dispatcher import DispatcherAdapters, dispatch_callback
-from cctelegram.handlers import auq_source, interactive_ui, pick_token
+from cctelegram.handlers import auq_source, interactive_ui, pick_token, status_polling
 from cctelegram.handlers.callback_data import CB_ASK_PICK
+from cctelegram.session_monitor import NewMessage
 from cctelegram.utils import app_dir
 from tests.conftest import ScenarioHarness, make_update_callback
 
@@ -313,3 +315,107 @@ async def test_single_select_compressed_pane_title_absent_still_dispatches(
         (wid, "2", False, True),
         (wid, "Enter", False, False),
     ]
+
+
+# ── Card-liveness regression: a live AUQ card must NOT auto-expire while the
+#    question is still pending on the Claude side (2026-05-31 @4/msg48427). ────
+
+_TASKLIST_OVERLAY_PANE = (
+    # The exact incident shape: a Claude task-list overlay occupies the visible
+    # pane tail, so NO picker/Submit anchors are present even though the AUQ is
+    # live. Pre-fix this tombstoned the card after 3 absent polls.
+    "  ◻ Wave 3 R6: pick_verdict() verdict-parity › blocked by #2\n"
+    "  ◻ Wave 3 R7: extract auq_context_dedup.py  › blocked by #3\n"
+    "  ◻ Wave 3 R8: EditableCard Route Outbox      › blocked by #4\n"
+)
+
+
+async def _poll(scenario: ScenarioHarness, wid: str, n: int) -> None:
+    for _ in range(n):
+        await status_polling.update_status_message(
+            scenario.bot, user_id=scenario.user_id, window_id=wid, thread_id=42
+        )
+
+
+@pytest.mark.asyncio
+async def test_tasklist_overlay_does_not_tombstone_live_auq(
+    scenario: ScenarioHarness,
+) -> None:
+    """Core regression. With the PreToolUse side file present (question live),
+    a pane obscured by the Claude task-list overlay must NOT tear down the
+    card — not even past the absent-streak threshold.
+    """
+    wid = _bind(scenario, _compressed_pane())
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)
+    assert interactive_ui.has_interactive_surface(scenario.user_id, 42)
+
+    scenario.tmux.set_pane(wid, _TASKLIST_OVERLAY_PANE)
+    await _poll(scenario, wid, status_polling.ABSENT_STREAK_THRESHOLD + 2)
+
+    assert interactive_ui.has_interactive_surface(scenario.user_id, 42), (
+        "live AUQ card must survive an obscured pane while the side file lives"
+    )
+    assert (app_dir() / "auq_pending" / f"{_SESSION_ID}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_overlay_does_not_tombstone_even_past_read_ttl(
+    scenario: ScenarioHarness,
+) -> None:
+    """Presence-not-TTL at the public seam. A genuinely-live AUQ unanswered
+    well past the 5-min read-TTL must still keep its card — the read-TTL bounds
+    stale-render risk, NOT card liveness. A regression to a TTL-gated clear
+    would tombstone here.
+    """
+    wid = _bind(scenario, _compressed_pane())
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)
+
+    path = app_dir() / "auq_pending" / f"{_SESSION_ID}.json"
+    rec = json.loads(path.read_text())
+    rec["written_at"] = time.time() - (auq_source._PRETOOL_TTL_SECONDS + 120)
+    path.write_text(json.dumps(rec))
+
+    scenario.tmux.set_pane(wid, _TASKLIST_OVERLAY_PANE)
+    await _poll(scenario, wid, status_polling.ABSENT_STREAK_THRESHOLD + 2)
+
+    assert interactive_ui.has_interactive_surface(scenario.user_id, 42)
+
+
+@pytest.mark.asyncio
+async def test_overlay_card_clears_once_tool_result_resolves(
+    scenario: ScenarioHarness,
+) -> None:
+    """The other half of the contract: the card persists through the obscured
+    pane while live, then clears once the question truly resolves on the Claude
+    side. The real AskUserQuestion tool_result flows through the bot seam, which
+    unlinks the side file (forget_ask_tool_input → auq_source.forget_for_window)
+    and clears the surface.
+    """
+    wid = _bind(scenario, _compressed_pane())
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)
+
+    scenario.tmux.set_pane(wid, _TASKLIST_OVERLAY_PANE)
+    await _poll(scenario, wid, status_polling.ABSENT_STREAK_THRESHOLD + 2)
+    assert interactive_ui.has_interactive_surface(scenario.user_id, 42)
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id=_SESSION_ID,
+            text="**AskUserQuestion**(Choose the AUQ picker hotfix lane.) Answered.",
+            content_type="tool_result",
+            tool_use_id="tool-use-single-select",
+            tool_name="AskUserQuestion",
+            role="assistant",
+        ),
+        scenario.bot,
+    )
+
+    assert not (app_dir() / "auq_pending" / f"{_SESSION_ID}.json").exists(), (
+        "tool_result must unlink the side file — the question resolved"
+    )
+    assert not interactive_ui.has_interactive_surface(scenario.user_id, 42), (
+        "with the question resolved, the card must clear"
+    )

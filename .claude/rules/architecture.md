@@ -85,7 +85,12 @@ Additional modules:
 Handler modules (handlers/):
   message_sender.py   ─ safe_reply/safe_edit/safe_send + rate_limit_send
   message_queue.py    ─ Per-user queue + worker (merge, status dedup)
-  status_polling.py   ─ Background status line polling (1s interval)
+  status_polling.py   ─ Background status line polling (1s interval). Its
+                        pane-absent AUQ-card clear gate consults
+                        auq_source.side_file_live_for_window (the PreToolUse
+                        side-file lifecycle authority) before tombstoning, so
+                        an obscured pane (task-list overlay / scrolled Submit
+                        screen) can't tear down a still-live question's card.
   response_builder.py ─ Response pagination and formatting
   interactive_ui.py   ─ AskUserQuestion / ExitPlanMode / Permission UI
   directory_browser.py─ Directory selection + session picker UI for new topics
