@@ -122,7 +122,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Up", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Up",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -145,7 +154,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Down", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Down", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Down",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -168,7 +186,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Left", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Left", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Left",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -191,7 +218,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Right", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Right", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Right",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -221,7 +257,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             return
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Escape", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Escape",
+            nav_ok,
+        )
         await clear_interactive_msg(
             user.id, context.bot, thread_id, session_mgr=adapters.session_manager
         )
@@ -238,7 +283,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Enter", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Enter", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Enter",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -261,7 +315,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Space", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Space", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Space",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -284,7 +347,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Tab", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Tab",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -384,9 +456,8 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             return
 
         pane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
-        resolved_input = auq_source.resolve_auq_source(
-            window_id, None, pane or ""
-        ).payload
+        resolved_src = auq_source.resolve_auq_source(window_id, None, pane or "")
+        resolved_input = resolved_src.payload
         current_form = (
             adapters.terminal_parser.resolve_ask_form(resolved_input, pane)
             if pane
@@ -399,12 +470,34 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             or not current_form.options_complete
         ):
             logger.info(
-                "Toggle-token staleness reject: user=%d window=%s opt=%d minted_fp=%s current_fp=%s",
+                "AUQ_TAP toggle_reject user=%d window=%s opt=%d minted_fp=%s live_fp=%s "
+                "reason_form_none=%s reason_fp=%s reason_mode=%s reason_incomplete=%s "
+                "minted_src=%s live_src=%s minted_src_fp=%s live_src_fp=%s "
+                "live_sel_mode=%s live_opts_complete=%s live_cursor=%s live_selected=%s",
                 user.id,
                 window_id,
                 entry.option_number,
-                entry.fingerprint,
-                current_form.fingerprint() if current_form else "none",
+                entry.fingerprint[:8],
+                current_form.fingerprint()[:8] if current_form else "none",
+                current_form is None,
+                bool(
+                    current_form is not None
+                    and current_form.fingerprint() != entry.fingerprint
+                ),
+                bool(current_form is not None and current_form.select_mode != "multi"),
+                bool(current_form is not None and not current_form.options_complete),
+                entry.source_kind,
+                resolved_src.kind,
+                entry.source_fingerprint[:8],
+                resolved_src.source_fingerprint[:8],
+                current_form.select_mode if current_form else "none",
+                current_form.options_complete if current_form else "none",
+                [o.number for o in current_form.options if o.cursor]
+                if current_form
+                else None,
+                {o.number: o.selected for o in current_form.options}
+                if current_form
+                else None,
             )
             await safe_answer(query, "Form changed, refreshing.", show_alert=False)
             await handle_interactive_ui(
@@ -438,6 +531,23 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             )
             return
 
+        logger.info(
+            "AUQ_TAP toggle_dispatch_ok user=%d window=%s opt=%d send_keys_ok=%s "
+            "minted_fp=%s live_fp=%s minted_src=%s live_src=%s "
+            "live_sel_mode=%s live_opts_complete=%s live_cursor=%s live_selected=%s",
+            user.id,
+            window_id,
+            entry.option_number,
+            toggle_ok,
+            entry.fingerprint[:8],
+            current_form.fingerprint()[:8],
+            entry.source_kind,
+            resolved_src.kind,
+            current_form.select_mode,
+            current_form.options_complete,
+            [o.number for o in current_form.options if o.cursor],
+            {o.number: o.selected for o in current_form.options},
+        )
         await asyncio.sleep(0.3)
         await handle_interactive_ui(
             context.bot,
