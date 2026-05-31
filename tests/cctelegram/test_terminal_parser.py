@@ -1458,32 +1458,24 @@ _SINGLE_QUESTION_GOLDEN_FORM = AskUserQuestionForm(
 class TestSingleQuestionFingerprintGolden:
     """Lock down the single-question canonical fingerprint.
 
-    2026-05-31 (AUQ multi-select source-parity fix): ``TABS:`` is now emitted
-    ONLY for multi-question forms (like ``QS:``/``INF:``), and ``Q`` strips a
-    trailing ``?``/whitespace. A single-question multiSelect's live TUI paints a
-    one-cell ``← ☐ X  ✔ Submit →`` strip, so a pane-sourced parse carried
-    ``tabs`` while a side-file-sourced parse did not — that divergence alone
-    rotated the fingerprint across a render→tap source flip and silently rejected
-    the toggle. Excluding the strip from the single-question canonical makes the
-    fingerprint a source-independent question identity. The golden hash is bumped
-    intentionally below; live single-question tokens in flight at deploy refresh
-    once with an honest "Card expired" (accepted one-time cost). If anyone
-    changes the canonical line set or order WITHOUT bumping the golden hash, this
+    The plan (FA3) commits to byte-identical canonical_repr output for
+    single-question forms across the multi-tab rollout. If anyone changes
+    canonical line set or order without bumping the golden hash, this
     test fires loudly.
     """
 
     def test_canonical_repr_lines_unchanged(self):
-        # Single-question form now produces exactly 4 lines: Q / OPTS / RVW /
-        # FT. No TABS: (multi-question only now), no QS:, no INF:. Anything else
-        # means the multi-tab gates fired on a single-question form — bug.
+        # Single-question form produces exactly 5 lines: TABS / Q / OPTS /
+        # RVW / FT. No QS:, no INF:. Anything else means the multi-tab
+        # gates fired on a single-question form — bug.
         repr_str = _SINGLE_QUESTION_GOLDEN_FORM._canonical_repr()
         lines = repr_str.split("\n")
-        assert len(lines) == 4
-        assert lines[0].startswith("Q:")
-        assert lines[1].startswith("OPTS:")
-        assert lines[2].startswith("RVW:")
-        assert lines[3].startswith("FT:")
-        assert not any(line.startswith("TABS:") for line in lines)
+        assert len(lines) == 5
+        assert lines[0].startswith("TABS:")
+        assert lines[1].startswith("Q:")
+        assert lines[2].startswith("OPTS:")
+        assert lines[3].startswith("RVW:")
+        assert lines[4].startswith("FT:")
         assert not any(line.startswith("QS:") for line in lines)
         assert not any(line.startswith("INF:") for line in lines)
 
@@ -1491,8 +1483,7 @@ class TestSingleQuestionFingerprintGolden:
         # Pinned SHA-1 of the canonical above. Update this constant ONLY
         # if you intentionally changed single-question canonical output
         # AND you've considered the rolling-deploy impact on live tokens.
-        # Bumped 2026-05-31 for the TABS-multi-q-only + title-normalize change.
-        expected = "96d8434493a9156d"
+        expected = "6651ea1b8174f879"
         assert _SINGLE_QUESTION_GOLDEN_FORM.fingerprint() == expected
 
 
@@ -1687,9 +1678,8 @@ class TestResolveAskForm:
         )
         assert form is not None
         assert len(form.questions) == 1
-        # Canonical stays single-tab shape (4 lines: Q/OPTS/RVW/FT — TABS is
-        # multi-question-only since the 2026-05-31 source-parity fix).
-        assert len(form._canonical_repr().split("\n")) == 4
+        # Canonical stays single-tab shape (5 lines).
+        assert len(form._canonical_repr().split("\n")) == 5
 
     def test_multi_question_with_matching_pane_infers_current(self):
         # Pane shows Q2's title + Q2's options → resolver picks idx 1.
@@ -2748,16 +2738,14 @@ class TestPrBMultiSelectDetection:
         assert form.select_mode == "unknown"
 
     def test_legacy_single_select_canonical_byte_identical(self):
-        # Single-question canonical no longer carries a leading ``TABS:`` line
-        # (multi-question-only since the 2026-05-31 AUQ source-parity fix); see
-        # TestSingleQuestionFingerprintGolden for the rationale + deploy impact.
         assert _SINGLE_QUESTION_GOLDEN_FORM._canonical_repr() == (
+            "TABS:\n"
             "Q:Pick one.\n"
             "OPTS:1:A) First:_:C|2:B) Second:_:_|3:C) Third:R:_\n"
             "RVW:0\n"
             "FT:0"
         )
-        assert _SINGLE_QUESTION_GOLDEN_FORM.fingerprint() == "96d8434493a9156d"
+        assert _SINGLE_QUESTION_GOLDEN_FORM.fingerprint() == "6651ea1b8174f879"
 
     def test_selected_flip_does_not_change_canonical(self):
         a = AskUserQuestionForm(

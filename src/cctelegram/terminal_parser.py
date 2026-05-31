@@ -667,50 +667,35 @@ class AskUserQuestionForm:
         field that should influence callback freshness, append a new line
         here — don't reorder existing ones.
 
-        ``TABS:``, ``QS:`` and ``INF:`` appear ONLY for multi-question forms
-        (``len(questions) > 1``). For a single-question multiSelect the live
-        TUI still paints a one-cell ``← ☐ X  ✔ Submit →`` strip, so a
-        pane-sourced parse carries ``tabs`` while a side-file-sourced parse
-        does not — a render(side_file)→tap(pane) source flip would then
-        produce divergent fingerprints on the ``TABS`` line alone and the
-        toggle would silently reject (2026-05-31). The strip is display-only
-        for a single-question form (identity lives in ``Q`` + ``OPTS``), so
-        it is excluded from the single-question canonical, exactly like
-        ``QS:``/``INF:``. ``Q`` likewise strips a trailing ``?`` /
-        whitespace, which Claude Code renders on the pane title but the JSONL
-        question text omits — another display-only render→tap divergence.
-        Net: a single-question form's canonical is source-independent.
-        Changing this layout invalidates in-flight callback tokens once on
-        deploy (they refresh with an honest "Card expired"); that is the
-        accepted cost of making the fingerprint a true question identity.
+        Single-question forms (``len(questions) <= 1``) produce the exact
+        5-line canonical that pre-multi-tab code did, so callback tokens
+        minted against single-question forms keep validating across the
+        deploy that introduces ``questions`` / ``current_tab_inferred``.
+        The ``QS:`` and ``INF:`` lines only appear for multi-tab forms,
+        where there is no live single-question token to invalidate.
         """
+        tabs_str = "|".join(
+            f"{t.label}:{'A' if t.answered else 'E'}"
+            f":{'C' if t.is_current else '_'}"
+            f":{'S' if t.is_submit else '_'}"
+            for t in self.tabs
+        )
         opts_str = "|".join(
             f"{o.number}:{o.label}"
             f":{'R' if o.recommended else '_'}"
             f":{'C' if o.cursor else '_'}"
             for o in self.options
         )
-        multi_question = len(self.questions) > 1
-        # Trailing ``?``/whitespace on the title is a pane-render artifact the
-        # side-file/JSONL question text omits — normalize it out so the two
-        # source paths agree.
-        q_norm = (self.current_question_title or "").rstrip(" ?").strip()
-        lines: list[str] = []
-        if multi_question:
-            tabs_str = "|".join(
-                f"{t.label}:{'A' if t.answered else 'E'}"
-                f":{'C' if t.is_current else '_'}"
-                f":{'S' if t.is_submit else '_'}"
-                for t in self.tabs
-            )
-            lines.append(f"TABS:{tabs_str}")
-        lines.append(f"Q:{q_norm}")
-        lines.append(f"OPTS:{opts_str}")
-        lines.append(f"RVW:{'1' if self.is_review_screen else '0'}")
-        lines.append(f"FT:{'1' if self.is_free_text else '0'}")
+        lines = [
+            f"TABS:{tabs_str}",
+            f"Q:{self.current_question_title or ''}",
+            f"OPTS:{opts_str}",
+            f"RVW:{'1' if self.is_review_screen else '0'}",
+            f"FT:{'1' if self.is_free_text else '0'}",
+        ]
         if self.select_mode != "single":
             lines.append(f"SEL:{self.select_mode}")
-        if multi_question:
+        if len(self.questions) > 1:
             lines.append(f"QS:{_questions_digest(self.questions)}")
             lines.append(f"INF:{'1' if self.current_tab_inferred else '0'}")
         return "\n".join(lines)
@@ -1352,14 +1337,23 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
         range(1, len(options) + 1)
     )
     # A pure-pane picker is "complete" when we can see option 1 (contiguous
-    # from 1 = top of the list present) AND the "Type something" free-text
-    # affordance (is_free_text), which Claude Code always renders at the
-    # BOTTOM of the option list — so its presence means we've captured the
-    # whole list, not a scrolled tail. Conservative: if the affordance is
-    # off-screen or numbering doesn't start at 1, options_complete stays
-    # False (toggle buttons suppressed → keystroke-nav fallback), never a
-    # wrong dispatch.
-    options_complete = options_contiguous and is_free_text
+    # from 1 = top of the list present) AND an affordance OPTION ROW
+    # ("Type something" / "Chat about this") was actually parsed in the option
+    # block. Claude Code always renders those affordance rows at the BOTTOM of
+    # the option list, so a parsed affordance row proves we captured the whole
+    # list rather than a scrolled tail. We require an affordance *row in the
+    # option block* — NOT the weaker ``is_free_text`` tail-substring scan, which
+    # could be tripped by question text or an option description containing the
+    # phrase "Type something" (hermes review 2026-05-31). Conservative: if no
+    # affordance row is in-block or numbering doesn't start at 1,
+    # options_complete stays False (toggle buttons suppressed → keystroke-nav
+    # fallback), never a wrong dispatch.
+    affordance_row_in_block = any(
+        (_m := _RE_NUMBERED_OPTION.match(line)) is not None
+        and is_affordance_label(_strip_option_checkbox(_m.group("label").strip()))
+        for line in options_region
+    )
+    options_complete = options_contiguous and affordance_row_in_block
 
     return AskUserQuestionForm(
         tabs=tabs,

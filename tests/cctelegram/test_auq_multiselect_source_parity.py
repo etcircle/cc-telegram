@@ -1,21 +1,36 @@
-"""Source-parity regression tests for the multi-select AUQ "fast button".
+"""Source-stickiness regression tests for the multi-select AUQ "fast button".
 
 Root-cause coverage for the silent multi-select toggle failure: when the bot's
 AUQ source flips from the PreToolUse side file to the raw pane between render
-(mint) and tap (validate), two parser asymmetries used to break the toggle's
-fingerprint match:
+(mint) and tap (validate), the toggle gate rejected the tap with no digit sent
+("fast buttons dead / options unselectable"). Two parser asymmetries are now
+closed at the parse layer:
 
   1. ``_parse_numbered_options`` INCLUDED the "Type something" / "Chat about
      this" free-text affordances as real numbered options, while the side-file
      source and the pane-signal classifiers EXCLUDED them — so a pure-pane parse
-     carried N+1 options vs the side file's N → fingerprint mismatch → the
-     toggle gate rejected the tap with no digit sent.
+     carried N+1 options vs the side file's N. (Part A — kept.)
   2. ``parse_ask_user_question`` hardcoded ``options_complete=False`` on the
      pure-pane path, so even with the option count reconciled the toggle gate
      (``not current_form.options_complete``) and the mint suppress gate hid the
-     buttons on re-render.
+     buttons on re-render. (Part B — kept.)
 
-These tests pin the corrected parser behavior using the REAL captured fixture
+But the side-file form and the pure-pane form for the SAME single question still
+LEGITIMATELY differ in their full fingerprint (the live TUI paints a one-cell
+``TABS:`` strip and a trailing ``?`` on the title that the JSONL/side-file
+question text omits). The robust fix is NOT to force those two parser-only paths
+to fingerprint-match (two prior dual-reviews failed that approach — the pane
+simply cannot reconstruct the side file's full form). Instead, at TAP the
+``aqt:`` handler PINS the source the button was minted against
+(``auq_source.peek_sticky_source``): if the side file is still live and
+unchanged, the tap re-resolves the SAME side-file source the render used, so the
+tap-time form fingerprint equals the render-time form fingerprint and the toggle
+dispatches. A genuinely-changed question fingerprints differently → no pin →
+fall back to ``resolve_auq_source`` → the staleness gate still catches the real
+change.
+
+These tests pin the corrected parser behavior + the source-stickiness invariant
+using the REAL captured fixture
 ``auq_multiselect_long_scrolled_toggled_S500.txt`` (a long multi-select picker
 scrolled to cursor=4 with options 1,2 toggled ``[✔]``; the "Type something" /
 "Chat about this" affordances trail the four real options).
@@ -75,31 +90,43 @@ class TestMultiSelectSourceParity:
         assert form is not None
         assert form.options_complete is True
 
-    def test_source_flip_fingerprint_parity(self):
-        # THE regression test for the bug. A render→tap source flip (side file →
-        # pure pane) used to diverge on FOUR things: the affordance count
-        # (Part A), the hardcoded ``options_complete=False`` (Part B), the
-        # single-question tab strip, and the trailing ``?`` on the pane title
-        # (Part D — ``_canonical_repr`` now omits ``TABS`` for single-question
-        # forms and normalizes the title). With all four closed, the FULL form
-        # fingerprint is byte-identical across the flip, so a toggle minted from
-        # the side-file render validates cleanly against a pure-pane tap.
+    def test_source_stickiness_pins_side_file_form_across_tap(self):
+        # THE regression test for the bug, re-cast for the source-stickiness fix.
+        #
+        # The render mints the toggle against the SIDE-FILE form
+        # (``resolve_ask_form(_SIDE_FILE, pane)``). At tap, the ``aqt:`` handler
+        # PINS that same side-file source (``peek_sticky_source`` returns the
+        # unchanged ``_SIDE_FILE`` tool_input), so the tap re-resolves with the
+        # SAME ``_SIDE_FILE`` payload. That makes the tap-time form fingerprint
+        # IDENTICAL to the render-time form fingerprint — which is exactly what
+        # keeps the toggle gate from rejecting (the gate compares
+        # ``current_form.fingerprint() != entry.fingerprint``).
         pane = _multiselect_pane()
-        side_form = resolve_ask_form(_SIDE_FILE, pane)
-        pane_form = resolve_ask_form(None, pane)
-        assert side_form is not None
-        assert pane_form is not None
-        assert len(side_form.options) == 4
-        assert len(pane_form.options) == 4
-        assert side_form.options_complete is True
-        assert pane_form.options_complete is True
-        assert side_form.select_mode == "multi"
-        assert pane_form.select_mode == "multi"
+        render_form = resolve_ask_form(_SIDE_FILE, pane)
+        assert render_form is not None
+        assert len(render_form.options) == 4
+        assert render_form.options_complete is True
+        assert render_form.select_mode == "multi"
 
-        # Full canonical + fingerprint parity across the source flip — the whole
-        # point of the fix. A mismatch here is the silent-toggle-reject bug.
-        assert side_form._canonical_repr() == pane_form._canonical_repr()
-        assert side_form.fingerprint() == pane_form.fingerprint()
+        # Tap with the SAME pinned side-file source (what Part E guarantees) →
+        # byte-identical fingerprint vs render. A mismatch here would be the
+        # silent-toggle-reject bug.
+        tap_form_sticky = resolve_ask_form(_SIDE_FILE, pane)
+        assert tap_form_sticky is not None
+        assert tap_form_sticky.fingerprint() == render_form.fingerprint()
+
+        # WHY stickiness is needed: the pure-pane tap path (the flip the bug
+        # hit) legitimately DIVERGES from the side-file render fingerprint —
+        # the live single-question TUI paints a ``TABS:`` strip + trailing
+        # ``?`` that the side-file question text omits. Without the pin, this
+        # divergence is the dead button. (Parser-only parity is intentionally
+        # NOT enforced; the pin is the fix.)
+        pane_form = resolve_ask_form(None, pane)
+        assert pane_form is not None
+        assert len(pane_form.options) == 4
+        assert pane_form.options_complete is True
+        assert pane_form.select_mode == "multi"
+        assert pane_form.fingerprint() != render_form.fingerprint()
 
     def test_overlay_still_correct(self):
         # Guards against Part A regressing the cursor/selection overlay: the

@@ -27,6 +27,9 @@ Core responsibilities:
 Key components:
   - ``ResolvedAuqSource`` / ``resolve_auq_source`` — the typed resolver.
   - ``PreToolAskRecord`` / ``resolve_record`` — the side-file trust boundary.
+  - ``peek_sticky_source`` — re-resolve the EXACT source a callback was minted
+    against (side_file / jsonl_cache), pane-AGNOSTIC, so the ``aqt:`` toggle can
+    pin its minted source through a transient render→tap source flip.
   - ``side_file_live_for_session`` / ``side_file_live_for_window`` —
     pane-INDEPENDENT "is the AUQ still live?" authority for the card-clear
     gate and the startup orphan reconciler (presence + schema + future-skew,
@@ -510,22 +513,24 @@ def _record_consistent_with_pane(
     return True, "ok"
 
 
-def resolve_record(
-    window_id: str,
-    pane_form: AskUserQuestionForm | None,
-) -> PreToolAskRecord | None:
-    """Return the PreToolUse side-file record for ``window_id`` if it is
-    consistent with the live pane parse, else ``None``.
+def _read_live_pretool_record(window_id: str) -> PreToolAskRecord | None:
+    """Read the PreToolUse side-file record for ``window_id``, pane-AGNOSTIC.
 
-    The cache invariant is revalidate-on-every-call: a record that no
-    longer matches the pane (user navigated, picker advanced, label set
-    drifted) MUST be evicted at the next call, not stale-served. This
-    keeps wrong-action class bugs out of the cache layer.
+    Everything ``resolve_record`` does EXCEPT the final
+    ``_record_consistent_with_pane`` pane check:
+    ``peek_session_id_for_window`` → ``_read_pretool_side_file`` → TTL guard
+    (``age > _PRETOOL_TTL_SECONDS``) → future-skew guard
+    (``age < -_PRETOOL_FUTURE_SKEW_SECONDS``) → return the ``PreToolAskRecord``,
+    else ``None``.
 
-    Reason codes for rejection are logged at DEBUG level (not INFO — the
-    reader runs on every status-poll iteration when an AUQ is visible,
-    and we don't want to flood the log). Question text is NEVER logged
-    here; only the reason code + the record's fingerprint.
+    DELIBERATELY does NOT write ``_pretool_ask_records``: that cache's
+    invariant is "consistent-with-pane records only", so ``resolve_record``
+    stays its sole mutator. This helper is the pane-agnostic core used by
+    both ``resolve_record`` (which then applies the pane check) and
+    ``peek_sticky_source`` (which deliberately skips it so a transiently
+    degraded pane can't break a source-stickiness pin). Reason codes are
+    logged at DEBUG (same as ``resolve_record``); question text is never
+    logged.
     """
     # Codex chunk-3 P2: peek (read-only) — never mutate session_manager
     # state by auto-creating a WindowState on miss. session_id_for_window
@@ -533,13 +538,10 @@ def resolve_record(
     session_id = peek_session_id_for_window(window_id)
     if not session_id:
         logger.debug("Pretool resolve window=%s reason=missing_map", window_id)
-        _pretool_ask_records.pop(window_id, None)
         return None
 
     record = _read_pretool_side_file(session_id)
     if record is None:
-        # Missing or malformed — evict any stale cache.
-        _pretool_ask_records.pop(window_id, None)
         return None
 
     # Defense-in-depth: only log fingerprints that match the strict
@@ -562,7 +564,6 @@ def resolve_record(
             age,
             safe_fp,
         )
-        _pretool_ask_records.pop(window_id, None)
         return None
     if age > _PRETOOL_TTL_SECONDS:
         logger.debug(
@@ -571,8 +572,48 @@ def resolve_record(
             age,
             safe_fp,
         )
+        return None
+
+    return record
+
+
+def resolve_record(
+    window_id: str,
+    pane_form: AskUserQuestionForm | None,
+) -> PreToolAskRecord | None:
+    """Return the PreToolUse side-file record for ``window_id`` if it is
+    consistent with the live pane parse, else ``None``.
+
+    The cache invariant is revalidate-on-every-call: a record that no
+    longer matches the pane (user navigated, picker advanced, label set
+    drifted) MUST be evicted at the next call, not stale-served. This
+    keeps wrong-action class bugs out of the cache layer.
+
+    Reason codes for rejection are logged at DEBUG level (not INFO — the
+    reader runs on every status-poll iteration when an AUQ is visible,
+    and we don't want to flood the log). Question text is NEVER logged
+    here; only the reason code + the record's fingerprint.
+
+    The session/read/TTL/skew portion is delegated to
+    ``_read_live_pretool_record`` (the pane-agnostic core); this function
+    layers on the ``_record_consistent_with_pane`` check and remains the
+    SOLE mutator of ``_pretool_ask_records``.
+    """
+    record = _read_live_pretool_record(window_id)
+    if record is None:
+        # Missing map, malformed, TTL/skew, or no session — evict any stale
+        # cache (matching the pre-refactor behavior on every failure path).
         _pretool_ask_records.pop(window_id, None)
         return None
+
+    # Defense-in-depth: only log fingerprints that match the strict
+    # hex shape. The reader recomputed it from validated tool_input,
+    # so this should always be true, but guard against future drift.
+    safe_fp = (
+        record.input_fingerprint
+        if _FINGERPRINT_RE.fullmatch(record.input_fingerprint)
+        else "<invalid>"
+    )
 
     # Pane-compatibility predicate (revalidated every call).
     consistent, reason = _record_consistent_with_pane(record, pane_form)
@@ -588,6 +629,40 @@ def resolve_record(
 
     _pretool_ask_records[window_id] = record
     return record
+
+
+def peek_sticky_source(
+    window_id: str, minted_kind: str, minted_fingerprint: str
+) -> dict | None:
+    """Return the minted AUQ source's ``tool_input`` IF that exact source is
+    still live and UNCHANGED since mint, WITHOUT the pane-consistency check.
+
+    Used by the ``aqt:`` toggle to PIN the source it was minted against, so a
+    transient pane degradation that would flip ``resolve_auq_source``
+    (side_file → pane) cannot break the toggle. Returns None when the minted
+    source is gone, changed (a new question replaced it), or was pane-only.
+
+    Parity: the fingerprint is computed with the SAME
+    ``_canonical_dict_fingerprint`` the minter used in ``resolve_auq_source``
+    (NOT ``PreToolAskRecord.input_fingerprint``, which is a DIFFERENT digest —
+    ``questions_content_digest``). Comparing the wrong digest would silently
+    never match (mint/validate source-parity trap).
+    """
+    if minted_kind == "side_file":
+        record = _read_live_pretool_record(window_id)
+        if record is not None and (
+            _canonical_dict_fingerprint(record.tool_input) == minted_fingerprint
+        ):
+            return record.tool_input
+        return None
+    if minted_kind == "jsonl_cache":
+        cached = _jsonl_cache_getter(window_id)
+        if isinstance(cached, dict) and (
+            _canonical_dict_fingerprint(cached) == minted_fingerprint
+        ):
+            return cached
+        return None
+    return None
 
 
 # ── Side-file lifecycle ───────────────────────────────────────────────────────

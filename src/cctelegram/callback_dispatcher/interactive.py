@@ -11,7 +11,7 @@ Key components:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, cast
 
 import asyncio
 import logging
@@ -456,8 +456,29 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             return
 
         pane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
-        resolved_src = auq_source.resolve_auq_source(window_id, None, pane or "")
-        resolved_input = resolved_src.payload
+        # Source-stickiness: re-resolve using the SAME source this toggle button
+        # was minted against, if it is still live + unchanged. A transient pane
+        # degradation can make resolve_auq_source flip side_file→pane at tap;
+        # that flip changes the resolved form's fingerprint and silently rejects
+        # the toggle. Pinning the minted source keeps the toggle dispatching as
+        # long as the underlying question hasn't actually changed (a replaced
+        # side file has a different canonical fingerprint → no pin → fall back).
+        sticky_input = auq_source.peek_sticky_source(
+            window_id, entry.source_kind, entry.source_fingerprint
+        )
+        if sticky_input is not None:
+            resolved_input = sticky_input
+            # peek_sticky_source only returns non-None for the side_file /
+            # jsonl_cache kinds (it returns None for "pane"), so the minted
+            # kind here is always a valid ResolvedAuqSource.kind literal.
+            resolved_src = auq_source.ResolvedAuqSource(
+                kind=cast(Literal["side_file", "jsonl_cache"], entry.source_kind),
+                payload=sticky_input,
+                source_fingerprint=entry.source_fingerprint,
+            )
+        else:
+            resolved_src = auq_source.resolve_auq_source(window_id, None, pane or "")
+            resolved_input = resolved_src.payload
         current_form = (
             adapters.terminal_parser.resolve_ask_form(resolved_input, pane)
             if pane
