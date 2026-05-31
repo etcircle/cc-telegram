@@ -1038,7 +1038,18 @@ async def post_init(application: Application) -> None:
     # lookups. MUST run BEFORE SessionMonitor() and the polling tasks
     # so the first poll cycle sees the restored _interactive_msgs map
     # and takes the edit-branch instead of fresh-send.
+    from .handlers import auq_source
+    from .handlers import interactive_ui as _interactive_ui
     from .handlers.interactive_ui import hydrate_interactive_state
+
+    # Wire the auq_source JSONL-cache getter ONCE (R5). The neutral
+    # auq_source leaf reads interactive_ui's in-process
+    # ``_last_completed_ask_tool_input`` cache through this injected getter
+    # so it never imports interactive_ui (no import cycle). The ``jsonl_cache``
+    # resolver branch resolves to nothing until this is set.
+    auq_source.set_jsonl_cache_getter(
+        lambda wid: _interactive_ui._last_completed_ask_tool_input.get(wid)
+    )
 
     hydrate_interactive_state(session_manager)
 
@@ -1130,12 +1141,10 @@ async def post_init(application: Application) -> None:
     #      lose AUQ descriptions at pick time until they run
     #      `cc-telegram hook --install`.
     try:
-        from .handlers.interactive_ui import (
-            gc_stale_pretool_side_files,
-            warn_if_pre_tool_use_hook_missing,
-        )
+        from .handlers.auq_source import gc_stale
+        from .handlers.interactive_ui import warn_if_pre_tool_use_hook_missing
 
-        gc_stale_pretool_side_files()
+        gc_stale()
         warn_if_pre_tool_use_hook_missing()
     except Exception as e:  # noqa: BLE001
         # Never let cleanup/maintenance crash bot startup.

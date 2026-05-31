@@ -912,26 +912,22 @@ class SessionMonitor:
             # session would miss the old session's file entirely. We
             # captured the old session_id in ``changed_old_sessions`` above
             # for exactly this purpose.
-            from .handlers.interactive_ui import (
-                _unlink_pretool_side_file_for_session,
-            )
+            from .handlers.auq_source import unlink_for_session
 
             for wid in changed_window_ids:
                 old_sid = changed_old_sessions.get(wid, "")
                 if old_sid:
-                    _unlink_pretool_side_file_for_session(old_sid)
+                    unlink_for_session(old_sid)
                 forget_ask_tool_input(wid)
 
         # Codex P2 (chunk 5): unlink side files for deleted windows
         # too. Outside the ``if changed_window_ids`` block because a
         # cycle with only deletes (no changes) still needs cleanup.
         if deleted_session_ids:
-            from .handlers.interactive_ui import (
-                _unlink_pretool_side_file_for_session,
-            )
+            from .handlers.auq_source import unlink_for_session
 
             for sid in deleted_session_ids:
-                _unlink_pretool_side_file_for_session(sid)
+                unlink_for_session(sid)
 
         # Update last known map
         self._last_session_map = current_map

@@ -4010,7 +4010,7 @@ class TestCodexP2Fixes:
 import json as _json  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 
-from cctelegram.handlers.interactive_ui import (  # noqa: E402
+from cctelegram.handlers.auq_source import (  # noqa: E402
     PreToolAskRecord,
     _PRETOOL_SCHEMA_VERSION,
     _PRETOOL_TTL_SECONDS,
@@ -4019,7 +4019,7 @@ from cctelegram.handlers.interactive_ui import (  # noqa: E402
     _pretool_ask_records,
     _read_pretool_side_file,
     _record_consistent_with_pane,
-    _resolve_pretool_record,
+    resolve_record,
 )
 from cctelegram.terminal_parser import (  # noqa: E402,F811
     AskOption,
@@ -4464,19 +4464,19 @@ class TestResolvePretoolRecord:
         # No window→session map → reader returns None.
         form = _make_form_single_question("Q", ["A"])
         # Use a window_id that isn't in session_manager.
-        assert _resolve_pretool_record("@no-such-window", form) is None
+        assert resolve_record("@no-such-window", form) is None
 
     def test_returns_none_when_side_file_missing(self, _cc_telegram_dir):
         self._bind_window_to_session("@9001", "11111111-1111-1111-1111-111111111111")
         form = _make_form_single_question("Q", ["A"])
-        assert _resolve_pretool_record("@9001", form) is None
+        assert resolve_record("@9001", form) is None
 
     def test_happy_path_returns_record(self, _cc_telegram_dir):
         sid = "550e8400-e29b-41d4-a716-446655440000"
         self._bind_window_to_session("@9002", sid)
         _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
         form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
-        rec = _resolve_pretool_record("@9002", form)
+        rec = resolve_record("@9002", form)
         assert rec is not None
         assert rec.tool_use_id == "toolu_017abcdef01234567890ab"
 
@@ -4485,7 +4485,7 @@ class TestResolvePretoolRecord:
         self._bind_window_to_session("@9003", sid)
         _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
         form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
-        _resolve_pretool_record("@9003", form)
+        resolve_record("@9003", form)
         assert "@9003" in _pretool_ask_records
 
     def test_ttl_expiry_evicts_and_returns_none(self, _cc_telegram_dir):
@@ -4497,7 +4497,7 @@ class TestResolvePretoolRecord:
             written_at=time.time() - _PRETOOL_TTL_SECONDS - 1,
         )
         form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
-        assert _resolve_pretool_record("@9004", form) is None
+        assert resolve_record("@9004", form) is None
         assert "@9004" not in _pretool_ask_records
 
     def test_pane_drift_evicts_cached_record(self, _cc_telegram_dir):
@@ -4507,11 +4507,11 @@ class TestResolvePretoolRecord:
         self._bind_window_to_session("@9005", sid)
         _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
         form_initial = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
-        rec1 = _resolve_pretool_record("@9005", form_initial)
+        rec1 = resolve_record("@9005", form_initial)
         assert rec1 is not None
         # Pane drifts to a different label set (user moved on).
         form_drifted = _make_form_single_question("Other Q", ["Cherry", "Date"])
-        rec2 = _resolve_pretool_record("@9005", form_drifted)
+        rec2 = resolve_record("@9005", form_drifted)
         assert rec2 is None
         assert "@9005" not in _pretool_ask_records
 
@@ -4520,11 +4520,11 @@ class TestResolvePretoolRecord:
         self._bind_window_to_session("@9006", sid)
         _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
         form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
-        rec1 = _resolve_pretool_record("@9006", form)
+        rec1 = resolve_record("@9006", form)
         assert rec1 is not None
         # Now corrupt the file on disk.
         (_cc_telegram_dir / "auq_pending" / f"{sid}.json").write_text("{garbage")
-        rec2 = _resolve_pretool_record("@9006", form)
+        rec2 = resolve_record("@9006", form)
         assert rec2 is None
         assert "@9006" not in _pretool_ask_records
 
@@ -4532,7 +4532,7 @@ class TestResolvePretoolRecord:
         # Codex chunk-3 P1: a side file with written_at in the future
         # (clock skew or tampering) MUST be rejected, not stay valid
         # indefinitely. The reader uses a -30s skew window.
-        from cctelegram.handlers.interactive_ui import (
+        from cctelegram.handlers.auq_source import (
             _PRETOOL_FUTURE_SKEW_SECONDS,
         )
 
@@ -4550,7 +4550,7 @@ class TestResolvePretoolRecord:
                 written_at=time.time() + _PRETOOL_FUTURE_SKEW_SECONDS + 60,
             )
             form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
-            assert _resolve_pretool_record("@skew1", form) is None
+            assert resolve_record("@skew1", form) is None
         finally:
             session_manager.window_states.pop("@skew1", None)
 
@@ -4568,7 +4568,7 @@ class TestResolvePretoolRecord:
                 _cc_telegram_dir, session_id=sid, written_at=time.time() + 2
             )
             form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
-            assert _resolve_pretool_record("@skew2", form) is not None
+            assert resolve_record("@skew2", form) is not None
         finally:
             session_manager.window_states.pop("@skew2", None)
 
@@ -4578,11 +4578,9 @@ class TestResolvePretoolRecord:
         # auq_pending/ via path traversal.
         import logging as _logging
 
-        from cctelegram.handlers.interactive_ui import _read_pretool_side_file
+        from cctelegram.handlers.auq_source import _read_pretool_side_file
 
-        with caplog.at_level(
-            _logging.WARNING, logger="cctelegram.handlers.interactive_ui"
-        ):
+        with caplog.at_level(_logging.WARNING, logger="cctelegram.handlers.auq_source"):
             assert _read_pretool_side_file("../etc/passwd") is None
         assert any(
             "refusing to resolve non-UUID" in r.getMessage() for r in caplog.records
@@ -4616,7 +4614,7 @@ class TestResolvePretoolRecord:
             "input_fingerprint": "SECRET_QUESTION_TEXT_LEAK",
         }
         (pending_dir / f"{sid}.json").write_text(_json.dumps(rec))
-        from cctelegram.handlers.interactive_ui import _read_pretool_side_file
+        from cctelegram.handlers.auq_source import _read_pretool_side_file
 
         loaded = _read_pretool_side_file(sid)
         assert loaded is not None
@@ -4627,7 +4625,7 @@ class TestResolvePretoolRecord:
 
     def test_peek_does_not_create_window_state(self):
         # Codex chunk-3 P2: peek must NOT auto-create a WindowState
-        # for an unknown window. _resolve_pretool_record uses peek
+        # for an unknown window. resolve_record uses peek
         # so probing for an unknown window doesn't mutate state.
         from cctelegram.session import peek_session_id_for_window, session_manager
 
@@ -4659,10 +4657,8 @@ class TestResolvePretoolRecord:
             ],
         )
         form = _make_form_single_question("Different Q", ["Different Label"])
-        with caplog.at_level(
-            _logging.DEBUG, logger="cctelegram.handlers.interactive_ui"
-        ):
-            rec = _resolve_pretool_record("@9007", form)
+        with caplog.at_level(_logging.DEBUG, logger="cctelegram.handlers.auq_source"):
+            rec = resolve_record("@9007", form)
         assert rec is None
         for record in caplog.records:
             assert "ULTRA_SECRET" not in record.getMessage()
@@ -4674,10 +4670,11 @@ class TestResolvePretoolRecord:
 @pytest.fixture
 def _pretool_gate_setup(tmp_path, monkeypatch):
     """Set up CC_TELEGRAM_DIR + clean caches before each gate test."""
+    from cctelegram.handlers import auq_source as _auq_source
     from cctelegram.handlers import interactive_ui as iui
 
     monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
-    iui._pretool_ask_records.clear()
+    _auq_source._pretool_ask_records.clear()
     iui._last_completed_ask_tool_input.clear()
     iui._last_auq_tool_use_id.clear()
     iui._auq_context_posted.clear()
@@ -4685,7 +4682,7 @@ def _pretool_gate_setup(tmp_path, monkeypatch):
     iui._interactive_msgs.clear()
     iui._interactive_mode.clear()
     yield tmp_path
-    iui._pretool_ask_records.clear()
+    _auq_source._pretool_ask_records.clear()
     iui._last_completed_ask_tool_input.clear()
     iui._last_auq_tool_use_id.clear()
     iui._auq_context_posted.clear()
@@ -4997,18 +4994,18 @@ class TestPretoolCleanup:
             self._unbind("@cleanup1")
 
     def test_forget_ask_tool_input_clears_pretool_cache(self, _cc_telegram_dir):
-        from cctelegram.handlers.interactive_ui import (
+        from cctelegram.handlers.auq_source import (
             _pretool_ask_records,
-            _resolve_pretool_record,
-            forget_ask_tool_input,
+            resolve_record,
         )
+        from cctelegram.handlers.interactive_ui import forget_ask_tool_input
 
         sid = "550e8400-e29b-41d4-a716-446655440000"
         self._bind("@cleanup2", sid)
         try:
             _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
             form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
-            _resolve_pretool_record("@cleanup2", form)
+            resolve_record("@cleanup2", form)
             assert "@cleanup2" in _pretool_ask_records
             forget_ask_tool_input("@cleanup2")
             assert "@cleanup2" not in _pretool_ask_records
@@ -5018,22 +5015,22 @@ class TestPretoolCleanup:
     def test_unlink_for_session_handles_non_uuid_session_id(self, _cc_telegram_dir):
         # Defense: a corrupt session_id should not raise — the helper
         # is best-effort and silently no-ops on non-UUID input.
-        from cctelegram.handlers.interactive_ui import (
-            _unlink_pretool_side_file_for_session,
+        from cctelegram.handlers.auq_source import (
+            unlink_for_session,
         )
 
         # Should not raise.
-        _unlink_pretool_side_file_for_session("../etc/passwd")
-        _unlink_pretool_side_file_for_session("")
+        unlink_for_session("../etc/passwd")
+        unlink_for_session("")
 
     def test_unlink_for_session_silently_skips_missing_file(self, _cc_telegram_dir):
         # No file written yet — unlink is silent.
-        from cctelegram.handlers.interactive_ui import (
-            _unlink_pretool_side_file_for_session,
+        from cctelegram.handlers.auq_source import (
+            unlink_for_session,
         )
 
         sid = "550e8400-e29b-41d4-a716-446655440000"
-        _unlink_pretool_side_file_for_session(sid)
+        unlink_for_session(sid)
         # No file created either.
         assert not (_cc_telegram_dir / "auq_pending" / f"{sid}.json").exists()
 
@@ -5042,9 +5039,9 @@ class TestPretoolStartupGC:
     """Bot-startup garbage collection of stale side files."""
 
     def test_deletes_files_older_than_1h(self, _cc_telegram_dir):
-        from cctelegram.handlers.interactive_ui import (
+        from cctelegram.handlers.auq_source import (
             _PRETOOL_GC_AGE_SECONDS,
-            gc_stale_pretool_side_files,
+            gc_stale,
         )
 
         old_sid = "11111111-1111-1111-1111-111111111111"
@@ -5057,7 +5054,7 @@ class TestPretoolStartupGC:
 
         _os.utime(old_file, (old_mtime, old_mtime))
 
-        deleted = gc_stale_pretool_side_files()
+        deleted = gc_stale()
         assert deleted == 1
         assert not old_file.exists()
         assert fresh_file.exists()
@@ -5065,9 +5062,9 @@ class TestPretoolStartupGC:
     def test_no_dir_no_action(self, tmp_path, monkeypatch):
         # GC must not crash if auq_pending/ doesn't exist yet.
         monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
-        from cctelegram.handlers.interactive_ui import gc_stale_pretool_side_files
+        from cctelegram.handlers.auq_source import gc_stale
 
-        assert gc_stale_pretool_side_files() == 0
+        assert gc_stale() == 0
 
     def test_gc_skips_unlink_when_file_replaced_during_scan(
         self, _cc_telegram_dir, monkeypatch
@@ -5077,9 +5074,9 @@ class TestPretoolStartupGC:
         # second stat to return a fresh mtime — file must survive.
         from pathlib import Path as _PPath
 
-        from cctelegram.handlers.interactive_ui import (
+        from cctelegram.handlers.auq_source import (
             _PRETOOL_GC_AGE_SECONDS,
-            gc_stale_pretool_side_files,
+            gc_stale,
         )
 
         sid = "11111111-1111-1111-1111-111111111111"
@@ -5118,16 +5115,16 @@ class TestPretoolStartupGC:
         import os
 
         monkeypatch.setattr(_PPath, "stat", flipping_stat)
-        deleted = gc_stale_pretool_side_files()
+        deleted = gc_stale()
         assert deleted == 0
         assert target.exists()
 
     def test_ignores_non_uuid_filenames(self, _cc_telegram_dir):
         # An entry that doesn't match <uuid>.json (e.g. a leftover
         # temp file) is left alone, even if older than the cutoff.
-        from cctelegram.handlers.interactive_ui import (
+        from cctelegram.handlers.auq_source import (
             _PRETOOL_GC_AGE_SECONDS,
-            gc_stale_pretool_side_files,
+            gc_stale,
         )
 
         pending_dir = _cc_telegram_dir / "auq_pending"
@@ -5139,7 +5136,7 @@ class TestPretoolStartupGC:
 
         _os.utime(non_uuid, (old_mtime, old_mtime))
 
-        gc_stale_pretool_side_files()
+        gc_stale()
         # Non-UUID file untouched.
         assert non_uuid.exists()
 
@@ -5223,12 +5220,12 @@ class TestSessionMonitorClearRace:
 
     def test_session_change_unlinks_old_side_file(self, _cc_telegram_dir):
         # Simulate the cleanup path directly. session_monitor calls
-        # _unlink_pretool_side_file_for_session(old_sid) BEFORE
+        # unlink_for_session(old_sid) BEFORE
         # forget_ask_tool_input(window_id) so the OLD session's file
         # gets cleaned even though the window's WindowState now points
         # to the new session.
-        from cctelegram.handlers.interactive_ui import (
-            _unlink_pretool_side_file_for_session,
+        from cctelegram.handlers.auq_source import (
+            unlink_for_session,
         )
 
         old_sid = "11111111-1111-1111-1111-111111111111"
@@ -5242,7 +5239,7 @@ class TestSessionMonitorClearRace:
         )
         try:
             assert old_file.exists()
-            _unlink_pretool_side_file_for_session(old_sid)
+            unlink_for_session(old_sid)
             assert not old_file.exists()
         finally:
             session_manager.window_states.pop("@race1", None)

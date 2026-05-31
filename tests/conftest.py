@@ -38,6 +38,7 @@ from cctelegram.utils import app_dir
 from cctelegram.handlers import (
     attention,
     auq_ledger,
+    auq_source,
     inbound_aggregator,
     interactive_ui,
     message_queue,
@@ -622,6 +623,16 @@ def _reset_all_handler_state() -> None:
     attention.reset_for_tests()
     message_queue.reset_for_tests()
     interactive_ui.reset_for_tests()
+    auq_source.reset_for_tests()
+    # Re-inject the production JSONL-cache getter (bot.post_init wires this
+    # once at startup, but post_init doesn't run under test). Without it the
+    # ``jsonl_cache`` resolver branch would no-op and the render path would
+    # silently lose the in-process ``_last_completed_ask_tool_input`` source —
+    # a behavior divergence from production. Tests that need the no-op default
+    # (getter-reset isolation) call ``auq_source.reset_for_tests()`` themselves.
+    auq_source.set_jsonl_cache_getter(
+        lambda wid: interactive_ui._last_completed_ask_tool_input.get(wid)
+    )
     _reset_aggregator()
     _reset_status_polling()
     _reset_session_manager()
