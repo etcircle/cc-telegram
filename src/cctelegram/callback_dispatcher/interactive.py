@@ -598,6 +598,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             try:
                 opt_num = int(opt_str)
             except ValueError:
+                logger.info("AUQ_PICK malformed user=%d", user.id)
                 await _refresh_pick_card(
                     query,
                     context,
@@ -609,7 +610,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 )
                 return
             ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, opt_num)
+            logger.info(
+                "AUQ_PICK entry user=%d window=%s opt=%d fp8=%s token=%s",
+                user.id,
+                "?",
+                opt_num,
+                fp8,
+                token[:6],
+            )
         else:
+            logger.info("AUQ_PICK malformed user=%d", user.id)
             await _refresh_pick_card(
                 query,
                 context,
@@ -644,6 +654,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 and pick_token.stable_key(live) == ledger_key
             )
             if not is_collision:
+                logger.info("AUQ_PICK wrong_user user=%d window=%s", user.id, "?")
                 await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
                 return
             # Plan v4 §7.2: "ledger entry from the other route stays put
@@ -676,6 +687,14 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 and existing.accepted_at < auq_ledger.process_start_time()
             ):
                 proj_state = "unknown"
+            logger.info(
+                "AUQ_PICK ledger_hit user=%d window=%s opt=%d proj_state=%s raw_state=%s",
+                user.id,
+                existing.window_id,
+                existing.option_number,
+                proj_state,
+                existing.state,
+            )
             if proj_state == "dispatched":
                 await safe_answer(
                     query,
@@ -736,6 +755,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             # 5-minute TTL. Refresh the card so the user sees the live form
             # state and can click a fresh button. (The ledger gate above
             # already answered any real SEQUENTIAL duplicate.)
+            logger.info("AUQ_PICK peek_none user=%d token=%s", user.id, token[:6])
             await _refresh_pick_card(
                 query,
                 context,
@@ -755,9 +775,11 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # so it cannot burn the owner's token. validate_and_consume's own phase
         # (a) owner check is the authoritative, race-safe re-check.
         if not owner_matches(peeked, user.id):
+            logger.info("AUQ_PICK wrong_user user=%d window=%s", user.id, window_id)
             await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
             return
         if await reject_stale_window_callback(window_id):
+            logger.info("AUQ_PICK stale_window user=%d window=%s", user.id, window_id)
             return
 
         # Atomic validate + single-use consume. Re-resolves the AUQ source via
@@ -779,6 +801,14 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         entry = result.entry
         current_form = result.current_form
+        logger.info(
+            "AUQ_PICK validate user=%d window=%s opt=%d outcome=%s is_review_submit=%s",
+            user.id,
+            window_id,
+            peeked.option_number,
+            result.outcome,
+            peeked.is_review_submit,
+        )
         if result.outcome == "wrong_user":
             await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
             return
@@ -852,6 +882,20 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                     "Pick-token submit-guard reject: user=%d window=%s",
                     user.id,
                     window_id,
+                )
+                logger.info(
+                    "AUQ_PICK submit_guard_reject user=%d window=%s is_review=%s "
+                    "opt1_cursor=%s opt1_num=%s label_match=%s",
+                    user.id,
+                    window_id,
+                    current_form.is_review_screen,
+                    (current_form.options[0].cursor if current_form.options else None),
+                    (current_form.options[0].number if current_form.options else None),
+                    (
+                        current_form.options[0].label == entry.option_label
+                        if current_form.options
+                        else None
+                    ),
                 )
                 await safe_answer(
                     query, "Review screen moved, refreshing.", show_alert=False
@@ -981,6 +1025,17 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             )
             raise
 
+        logger.info(
+            "AUQ_PICK dispatch_ok user=%d window=%s opt=%d label=%s "
+            "is_review_submit=%s digit_ok=%s enter_ok=%s",
+            user.id,
+            window_id,
+            entry.option_number,
+            entry.option_label[:24],
+            entry.is_review_submit,
+            digit_ok,
+            enter_ok,
+        )
         await safe_answer(query, f"{entry.option_number}. {entry.option_label[:32]}")
         await asyncio.sleep(0.5)
         # Re-render the picker after the digit lands so the card reflects the
