@@ -825,6 +825,35 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 # UI not rendered — clear the early-set mode
                 clear_interactive_mode(user_id, thread_id)
 
+        # AUQ ``tool_result`` always invalidates the cached ``tool_input`` AND
+        # unlinks the PreToolUse side file — done BEFORE the awaited
+        # ``clear_interactive_msg`` below so a raise in the card clear can't
+        # leave the side file orphaned. An orphaned side file would make
+        # status_polling's side-file gate (``side_file_live_for_session``)
+        # preserve a DEAD card indefinitely until the next restart /
+        # window-switch / topic-close — the uptime half of the dead-card class
+        # (Codex round-2 P2, 2026-05-31).
+        #
+        # This is also why the invalidation is UNCONDITIONAL (not gated on
+        # ``has_interactive_surface``): a card that status_polling's
+        # absent-streak hysteresis cleared BEFORE the JSONL ``tool_result``
+        # arrives would otherwise leave the cache pointing at the
+        # just-completed AUQ, and the NEXT AUQ's render overlays the new pane
+        # onto the completed question's options with pick-buttons suppressed
+        # via ``current_tab_inferred=False`` (2026-05-21 09:30:21 incident on
+        # @40 / msg 34563: D1+D2 multi-Q answered at 09:29:16, hysteresis
+        # cleared the card, the ``tool_result`` arrived at 09:29:31 with no
+        # surface so the cache stayed, and the D3 AUQ at 09:30:21 rendered as
+        # stale-D1 verbatim text). ``forget_ask_tool_input`` is ``dict.pop`` +
+        # an idempotent unlink — safe to call here and again in the clear
+        # branch below.
+        if (
+            msg.role == "assistant"
+            and msg.tool_name == "AskUserQuestion"
+            and msg.content_type == "tool_result"
+        ):
+            forget_ask_tool_input(wid)
+
         # Any non-interactive message means the interaction is complete —
         # delete the UI card. ``has_interactive_surface`` is the bool
         # predicate the cleanup gate is written against.
@@ -832,28 +861,6 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await clear_interactive_msg(
                 user_id, bot, thread_id, session_mgr=session_manager
             )
-            forget_ask_tool_input(wid)
-        # AUQ ``tool_result`` always invalidates the cached ``tool_input``,
-        # even when no card is live to clear. The branch above is gated on
-        # ``has_interactive_surface``, so a card that status_polling's
-        # absent-streak hysteresis cleared BEFORE the JSONL ``tool_result``
-        # arrives leaves the cache pointing at the just-completed AUQ.
-        # The NEXT AUQ's render then overlays the new pane onto the
-        # completed question's options and pick-buttons get suppressed via
-        # ``current_tab_inferred=False`` — the user sees the wrong card
-        # (2026-05-21 09:30:21 incident on @40 / msg 34563: D1+D2 multi-Q
-        # was answered at 09:29:16, hysteresis-cleared the card at
-        # 09:29:16, the D1+D2 ``tool_result`` JSONL line then arrived at
-        # 09:29:31 with no surface so the cache stayed; the next AUQ
-        # appearing at 09:30:21 rendered as stale-D1 verbatim text and
-        # the user couldn't see the live D3 picker without /screenshot).
-        # ``forget_ask_tool_input`` is ``dict.pop(key, None)`` — re-call
-        # is safe when the branch above also fired.
-        if (
-            msg.role == "assistant"
-            and msg.tool_name == "AskUserQuestion"
-            and msg.content_type == "tool_result"
-        ):
             forget_ask_tool_input(wid)
 
         # Skip tool call notifications when CC_TELEGRAM_SHOW_TOOL_CALLS=false

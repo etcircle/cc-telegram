@@ -65,6 +65,51 @@ consumers. If a change ever needs to mutate `message_queue` internals
 beyond that boundary, the kill criterion fires — promote a Route Outbox
 slice now.
 
+**AUQ card-liveness authority (pane is lower authority than the
+lifecycle)** — `status_polling`'s pane-absent clear gate must not tombstone
+an AskUserQuestion card on visible-pane absence alone. The visible tmux pane
+is only a *display*: a Claude task-list overlay, a scrolled/compressed
+multi-step Submit screen, or tool-output spam can push the picker/Submit
+anchors out of the captured pane while the question is still genuinely
+pending on the Claude side (2026-05-31 @4/msg48427 — a live multi-select
+card was tombstoned after the task-list overlay defeated both pane
+predicates for 3 polls). The lifecycle authority is the PreToolUse side
+file `auq_pending/<session>.json`, queried via
+`auq_source.side_file_live_for_window(window_id)` (presence + schema +
+future-skew, **deliberately NOT** the 5-min read-TTL and **NOT** the
+pane-consistency check — a live-but-unanswered AUQ has not "expired on the
+other side of the bridge", and `resolve_record` cannot be used because it
+needs a pane-parsed form that is `None` under exactly the obstructing
+overlay). While the side file is live the gate refreshes/keeps the card
+and never enters the absent-streak countdown; the card is cleared only by
+the genuine resolution (`tool_result` → `forget_ask_tool_input` unlinks the
+side file), a window switch, a topic close, or the 1h startup `gc_stale`.
+**Orphan reconciliation** — an *answered* AUQ whose side file was never
+unlinked would keep the liveness probe `True` forever and strand a *dead*
+card (the inverse failure the TTL-drop must not introduce). Two paths close
+it: (1) **at the source** — `bot.handle_new_message` runs the AUQ
+`tool_result` `forget_ask_tool_input` (which unlinks the side file) *before*
+the awaited `clear_interactive_msg`, so a raise in the card clear can't
+orphan it; (2) **on startup** — the monitor advances its byte offset inside
+`check_for_updates` before the callback runs, so a crash/down-bot at that
+moment leaves an orphan that path (1) can't catch;
+`session_monitor._hydrate_ask_tool_input_cache` reconciles it on startup: for
+each bound session whose JSONL shows **no pending AUQ**
+(`_find_latest_pending_auq` is `None`) it unlinks any live side file via
+**`side_file_live_for_session(session_id)` keyed on the same `current_map`
+session it then unlinks** — never the window-keyed wrapper, whose `peek →
+window_states` lookup can disagree with `current_map` at startup (checking one
+source while unlinking another is the mint/validate parity trap). So presence
+again tracks genuine liveness. Off-contract limitation: the
+side file is keyed by *session*, so under a double-`--resume` of one session
+into two windows a dead card on the sibling can linger (bounded by the
+tool_result fan-out + window-switch + topic-close + 1h GC + the startup
+reconciliation); a `tool_use_id` correlation would not help (the JSONL
+`tool_use` / `_last_auq_tool_use_id` and the side file's `tool_use_id` are
+typically unavailable during the live window), but a schema-v2 side file
+carrying the hook-captured `window_id` could discriminate — deferred as
+off-contract.
+
 ## Rate Limiting
 
 - `AIORateLimiter(max_retries=5)` on the Application (30/s global)

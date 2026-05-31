@@ -165,3 +165,63 @@ async def test_auq_tool_result_drops_cache_when_card_is_active(
         "with an active surface, the legacy cleanup branch should fire and "
         "drop the cache"
     )
+
+
+@pytest.mark.asyncio
+async def test_auq_tool_result_forgets_before_card_clear(
+    scenario: ScenarioHarness, monkeypatch
+) -> None:
+    """Codex round-2 P2 fix: the AUQ tool_result invalidation
+    (forget_ask_tool_input -> unlink side file) must run BEFORE the awaited
+    clear_interactive_msg, so a raise in the card clear cannot orphan the side
+    file — which would otherwise strand a DEAD card via the status_polling
+    side_file_live_for_session gate (the uptime half of the dead-card class).
+    """
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(
+        thread_id=42,
+        window_id=wid,
+        display_name="repo",
+        cwd="/repo",
+        session_id="sess-1",
+    )
+    # A live interactive surface so the has_interactive_surface clear branch
+    # fires (and is rigged to raise).
+    interactive_ui._interactive_mode[(scenario.user_id, 42)] = wid
+    interactive_ui._interactive_msgs[(scenario.user_id, 42)] = 12345
+
+    order: list[str] = []
+    forgotten: list[str] = []
+
+    def tracking_forget(w):
+        order.append("forget")
+        forgotten.append(w)
+
+    async def raising_clear(*args, **kwargs):
+        order.append("clear")
+        raise RuntimeError("simulated Telegram clear failure")
+
+    monkeypatch.setattr(bot_module, "forget_ask_tool_input", tracking_forget)
+    monkeypatch.setattr(bot_module, "clear_interactive_msg", raising_clear)
+
+    try:
+        await bot_module.handle_new_message(
+            NewMessage(
+                session_id="sess-1",
+                text="**AskUserQuestion**(Q?) Answered.",
+                content_type="tool_result",
+                tool_use_id="t-auq-1",
+                tool_name="AskUserQuestion",
+                role="assistant",
+            ),
+            scenario.bot,
+        )
+    except RuntimeError:
+        pass  # clear raised AFTER forget ran — that's the whole point
+
+    assert "forget" in order, "AUQ tool_result must invalidate even if clear raises"
+    assert "clear" in order
+    assert order.index("forget") < order.index("clear"), (
+        "forget_ask_tool_input must run before the awaited clear_interactive_msg"
+    )
+    assert wid in forgotten

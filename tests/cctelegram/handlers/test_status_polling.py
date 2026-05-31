@@ -1208,6 +1208,123 @@ class TestAbsentStreakHysteresis:
             assert status_polling._absent_streak.get(route) == 1
 
     @pytest.mark.asyncio
+    async def test_side_file_live_blocks_tombstone_indefinitely(
+        self, mock_bot: AsyncMock
+    ):
+        """ROOT-CAUSE regression (2026-05-31 @4/msg48427): while the PreToolUse
+        side file says the AUQ is genuinely live, an obstructing pane (here the
+        TaskList overlay) must NEVER tombstone the card — not even past the
+        absent-streak threshold. The pane is a display; the side file is the
+        lifecycle authority. This is the test that would have caught the
+        incident.
+        """
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@37"
+        user_id = 6427984308
+        thread_id = 10636
+        ikey = (user_id, thread_id)
+        route = (user_id, thread_id, window_id)
+        _interactive_mode[ikey] = window_id
+        _interactive_msgs[ikey] = 48427
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ) as mock_clear,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling.auq_source,
+                "side_file_live_for_window",
+                return_value=True,
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=self._BAD_FRAME_PANE)
+
+            # Far past the threshold — the side-file gate short-circuits every
+            # tick before the streak can accumulate.
+            for _ in range(status_polling.ABSENT_STREAK_THRESHOLD + 2):
+                await status_polling.update_status_message(
+                    mock_bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    thread_id=thread_id,
+                )
+
+            mock_clear.assert_not_called()
+            assert route not in status_polling._absent_streak
+
+    @pytest.mark.asyncio
+    async def test_side_file_absent_still_tombstones_after_threshold(
+        self, mock_bot: AsyncMock
+    ):
+        """Complement: when the side file is gone (the question truly resolved
+        on the Claude side — answered in tmux / auto-resolved / unlinked on
+        tool_result), the legitimate non-Telegram-pick close must still fire
+        after the threshold. The fix must not strand a dead card.
+        """
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@37"
+        user_id = 6427984308
+        thread_id = 10636
+        ikey = (user_id, thread_id)
+        _interactive_mode[ikey] = window_id
+        _interactive_msgs[ikey] = 48427
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ) as mock_clear,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling.auq_source,
+                "side_file_live_for_window",
+                return_value=False,
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=self._BAD_FRAME_PANE)
+
+            for _ in range(status_polling.ABSENT_STREAK_THRESHOLD):
+                await status_polling.update_status_message(
+                    mock_bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    thread_id=thread_id,
+                )
+
+            mock_clear.assert_called_once()
+            assert mock_clear.call_args.kwargs.get("tombstone") is True
+
+    @pytest.mark.asyncio
     async def test_absent_streak_resets_on_pane_recovery(self, mock_bot: AsyncMock):
         """absent → live → absent → absent → live: streak must reset on every
         live observation so transient flickers can't accumulate toward a false

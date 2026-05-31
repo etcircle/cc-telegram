@@ -27,6 +27,11 @@ Core responsibilities:
 Key components:
   - ``ResolvedAuqSource`` / ``resolve_auq_source`` — the typed resolver.
   - ``PreToolAskRecord`` / ``resolve_record`` — the side-file trust boundary.
+  - ``side_file_live_for_session`` / ``side_file_live_for_window`` —
+    pane-INDEPENDENT "is the AUQ still live?" authority for the card-clear
+    gate and the startup orphan reconciler (presence + schema + future-skew,
+    deliberately NO read-TTL and NO pane-consistency check). The session-keyed
+    form is canonical; the window form is a ``peek``-resolving wrapper.
   - ``unlink_for_session`` / ``forget_for_window`` / ``gc_stale`` — lifecycle.
   - ``set_jsonl_cache_getter`` / ``reset_for_tests`` — injection + test seam.
 """
@@ -626,6 +631,99 @@ def forget_for_window(window_id: str) -> None:
     if not session_id:
         return
     unlink_for_session(session_id)
+
+
+def side_file_live_for_window(window_id: str) -> bool:
+    """Pane-INDEPENDENT "is an AskUserQuestion still live for this window?".
+
+    The lifecycle authority for the card-clear gate. Returns ``True`` iff a
+    Thin window-keyed wrapper over :func:`side_file_live_for_session` — it
+    resolves the window's session via ``peek_session_id_for_window`` and
+    defers all liveness logic to the session-keyed core. Callers that ALREADY
+    hold the session_id (e.g. the startup orphan reconciler, which also calls
+    ``unlink_for_session``) MUST use :func:`side_file_live_for_session`
+    directly so the liveness check and the unlink act on the SAME session —
+    checking one source (peek → window_states) and acting on another
+    (a session_id from elsewhere) is the mint/validate parity trap.
+
+    Returns ``True`` iff a schema-valid PreToolUse side file exists for the
+    window's bound session and its ``written_at`` is not implausibly in the
+    future.
+
+    Deliberately UNLIKE ``resolve_record`` in two load-bearing ways:
+
+      1. It does NOT run ``_record_consistent_with_pane``. The whole point
+         is that the visible pane may be obstructed (a Claude task-list
+         overlay, a scrolled/compressed multi-step Submit screen,
+         tool-output spam) while the question is genuinely pending on the
+         Claude side. Requiring pane consistency here would re-create the
+         exact bug this guards against — a live card torn down because its
+         anchors scrolled out of the captured pane.
+
+      2. It does NOT apply the ``_PRETOOL_TTL_SECONDS`` read-TTL. That TTL
+         bounds *stale-render* risk on the resolve path; it must NOT bound
+         *card liveness*. A question left unanswered longer than the TTL
+         has NOT "expired on the other side of the bridge" — it is still
+         waiting on the user. Only the future-skew guard is applied
+         (rejects clock-tampered timestamps). Orphans are bounded by the
+         real unlink paths (``forget_for_window`` on tool_result,
+         ``unlink_for_session`` on /clear & window-delete) and the 1h
+         startup ``gc_stale`` — never by a clear-gate timer.
+
+    Strictly higher authority than the visible-pane liveness predicates,
+    per the RouteRuntime contract that pane snapshots are reconciliation
+    events of LOWER authority than the resolution lifecycle.
+
+    Read-only: must NOT mutate ``_pretool_ask_records`` (``resolve_record``
+    stays the sole cache mutator); a pure probe used by ``status_polling``'s
+    pane-absent clear gate to refuse tombstoning a still-live card.
+
+    Off-contract limitation: the side file is keyed by *session*, not
+    *window*. Under 1 topic = 1 window = 1 session this is exact. If two
+    windows are bound to one session (only reachable by double-``--resume``
+    of the same session into two topics), a live AUQ on one window keeps
+    this ``True`` for its sibling, so a *dead* card on the sibling lingers
+    until the tool_result fan-out, a window switch, a topic close, or the
+    1h GC clears it. A ``tool_use_id`` correlation would NOT help here: the
+    JSONL ``tool_use`` (hence ``interactive_ui._last_auq_tool_use_id``) is
+    buffered until the answer, and the side file's ``tool_use_id`` "may be
+    ''", so both are typically unavailable during the live window. A
+    schema-v2 side file capturing the hook-side ``window_id`` (the
+    SessionStart hook already resolves it via ``TMUX_PANE``) COULD
+    discriminate and is the natural fix if double-resume ever becomes
+    supported; it is deferred here as off-contract. The bounded dead-card
+    linger is accepted for now.
+    """
+    return side_file_live_for_session(peek_session_id_for_window(window_id) or "")
+
+
+def side_file_live_for_session(session_id: str) -> bool:
+    """Pane-INDEPENDENT AUQ liveness keyed by SESSION.
+
+    The session-keyed core of :func:`side_file_live_for_window`. The side file
+    is itself keyed by session (``auq_pending/<session_id>.json``), so this is
+    the canonical form. Returns ``True`` iff a schema-valid side file exists
+    for ``session_id`` and its ``written_at`` is not implausibly in the future
+    — DELIBERATELY without the ``_PRETOOL_TTL_SECONDS`` read-TTL and without
+    the pane-consistency check (see :func:`side_file_live_for_window` for the
+    full rationale).
+
+    Read-only: must NOT mutate ``_pretool_ask_records``. Use this (not the
+    window wrapper) wherever the caller already holds the session_id and will
+    act on it (e.g. pairing the check with ``unlink_for_session(session_id)``),
+    so the check and the action target the same session.
+    """
+    if not session_id:
+        return False
+    record = _read_pretool_side_file(session_id)
+    if record is None:
+        return False
+    # Future-skew guard ONLY (NOT the read-TTL): a side file written
+    # implausibly far in the future (clock tamper) is rejected; an
+    # old-but-unanswered AUQ is STILL live.
+    if time.time() - record.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
+        return False
+    return True
 
 
 def gc_stale() -> int:

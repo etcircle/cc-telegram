@@ -1045,6 +1045,44 @@ class SessionMonitor:
                                 window_id,
                                 upgrade_exc,
                             )
+            else:
+                # No pending AUQ in this session's JSONL. If a PreToolUse
+                # side file nonetheless still reports live, it is an ORPHAN:
+                # the AUQ was answered but its tool_result ->
+                # forget_ask_tool_input unlink never ran (the bot was down, or
+                # the message callback errored, while check_for_updates had
+                # already advanced the byte offset past the tool_result, so it
+                # never re-emits). Left in place the orphan would make
+                # auq_source.side_file_live_for_window return True
+                # indefinitely and strand a DEAD card at status_polling's
+                # clear gate — the dead-card class the clear-gate TTL-drop
+                # must not introduce. The JSONL is authoritative that no
+                # question is pending, so unlink the stale side file; the
+                # status poller's hysteresis then clears the stale card on the
+                # next absent polls. (Codex+Hermes 2026-05-31 dual-FAIL on the
+                # AUQ disappearing-card fix.)
+                #
+                # SESSION-KEYED on purpose: check liveness and unlink the SAME
+                # ``session_id`` (from ``current_map``). The window-keyed
+                # ``side_file_live_for_window`` would re-resolve the session via
+                # ``peek_session_id_for_window`` against ``window_states``, which
+                # at this point (hydration runs before the loop's first
+                # ``load_session_map``) can disagree with ``current_map`` — and
+                # checking one source while unlinking another is exactly the
+                # mint/validate parity trap (Hermes round-2 P2).
+                from .handlers.auq_source import (
+                    side_file_live_for_session,
+                    unlink_for_session,
+                )
+
+                if side_file_live_for_session(session_id):
+                    unlink_for_session(session_id)
+                    logger.info(
+                        "AUQ reconcile: unlinked orphaned side file for "
+                        "window %s session %s (JSONL shows no pending AUQ)",
+                        window_id,
+                        session_id[:8],
+                    )
 
     async def _find_latest_pending_auq(self, jsonl_path: Path) -> dict | None:
         """Return ``{"id": tool_use_id, "input": tool_input}`` for the most
