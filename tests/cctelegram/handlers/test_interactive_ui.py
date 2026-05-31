@@ -1743,10 +1743,14 @@ class TestAskUserQuestionPaneOnlySafety:
     async def test_poller_cache_empty_partial_renders_without_pick_buttons_and_notice(
         self, mock_bot
     ):
+        # Real option labels at 3-4 (NOT the "Type something"/"Chat about this"
+        # affordances, which the parser now drops): the visible region scrolled
+        # past option 1, so options are non-contiguous-from-1 → no pick buttons +
+        # the "Only options N-M visible" notice.
         pane = (
             "Fastest path to the CEO review.\n"
-            "❯ 3. Type something\n"
-            "  4. Chat about this\n"
+            "❯ 3. C) Parallel tracks\n"
+            "  4. D) Stabilize core\n"
             "\n"
             "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
         )

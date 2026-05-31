@@ -667,35 +667,50 @@ class AskUserQuestionForm:
         field that should influence callback freshness, append a new line
         here — don't reorder existing ones.
 
-        Single-question forms (``len(questions) <= 1``) produce the exact
-        5-line canonical that pre-multi-tab code did, so callback tokens
-        minted against single-question forms keep validating across the
-        deploy that introduces ``questions`` / ``current_tab_inferred``.
-        The ``QS:`` and ``INF:`` lines only appear for multi-tab forms,
-        where there is no live single-question token to invalidate.
+        ``TABS:``, ``QS:`` and ``INF:`` appear ONLY for multi-question forms
+        (``len(questions) > 1``). For a single-question multiSelect the live
+        TUI still paints a one-cell ``← ☐ X  ✔ Submit →`` strip, so a
+        pane-sourced parse carries ``tabs`` while a side-file-sourced parse
+        does not — a render(side_file)→tap(pane) source flip would then
+        produce divergent fingerprints on the ``TABS`` line alone and the
+        toggle would silently reject (2026-05-31). The strip is display-only
+        for a single-question form (identity lives in ``Q`` + ``OPTS``), so
+        it is excluded from the single-question canonical, exactly like
+        ``QS:``/``INF:``. ``Q`` likewise strips a trailing ``?`` /
+        whitespace, which Claude Code renders on the pane title but the JSONL
+        question text omits — another display-only render→tap divergence.
+        Net: a single-question form's canonical is source-independent.
+        Changing this layout invalidates in-flight callback tokens once on
+        deploy (they refresh with an honest "Card expired"); that is the
+        accepted cost of making the fingerprint a true question identity.
         """
-        tabs_str = "|".join(
-            f"{t.label}:{'A' if t.answered else 'E'}"
-            f":{'C' if t.is_current else '_'}"
-            f":{'S' if t.is_submit else '_'}"
-            for t in self.tabs
-        )
         opts_str = "|".join(
             f"{o.number}:{o.label}"
             f":{'R' if o.recommended else '_'}"
             f":{'C' if o.cursor else '_'}"
             for o in self.options
         )
-        lines = [
-            f"TABS:{tabs_str}",
-            f"Q:{self.current_question_title or ''}",
-            f"OPTS:{opts_str}",
-            f"RVW:{'1' if self.is_review_screen else '0'}",
-            f"FT:{'1' if self.is_free_text else '0'}",
-        ]
+        multi_question = len(self.questions) > 1
+        # Trailing ``?``/whitespace on the title is a pane-render artifact the
+        # side-file/JSONL question text omits — normalize it out so the two
+        # source paths agree.
+        q_norm = (self.current_question_title or "").rstrip(" ?").strip()
+        lines: list[str] = []
+        if multi_question:
+            tabs_str = "|".join(
+                f"{t.label}:{'A' if t.answered else 'E'}"
+                f":{'C' if t.is_current else '_'}"
+                f":{'S' if t.is_submit else '_'}"
+                for t in self.tabs
+            )
+            lines.append(f"TABS:{tabs_str}")
+        lines.append(f"Q:{q_norm}")
+        lines.append(f"OPTS:{opts_str}")
+        lines.append(f"RVW:{'1' if self.is_review_screen else '0'}")
+        lines.append(f"FT:{'1' if self.is_free_text else '0'}")
         if self.select_mode != "single":
             lines.append(f"SEL:{self.select_mode}")
-        if len(self.questions) > 1:
+        if multi_question:
             lines.append(f"QS:{_questions_digest(self.questions)}")
             lines.append(f"INF:{'1' if self.current_tab_inferred else '0'}")
         return "\n".join(lines)
@@ -846,6 +861,13 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
     parse failure).
     """
     options: list[AskOption] = []
+    # True when the live cursor ``❯`` is parked on a free-text affordance row
+    # ("Type something" / "Chat about this"). Affordances ALWAYS trail the real
+    # options, so an affordance cursor is the bottom-most ``❯`` on screen — i.e.
+    # the live one — which means every ``❯`` on a real option above it is stale
+    # scrollback. We track this so the bottom-most-cursor dedup below can clear
+    # the surviving stale real-option cursor instead of painting a phantom.
+    affordance_cursor_seen = False
     for line in lines:
         m = _RE_NUMBERED_OPTION.match(line)
         if m is None:
@@ -870,6 +892,21 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
         label = m.group("label").strip()
         selected = _checkbox_selected_from_line(line)
         label = _strip_option_checkbox(label)
+        # Free-text affordances ("Type something", "Chat about this") render as
+        # numbered rows in the TUI but are NOT real picker options. The
+        # side-file source and the pane-signal classifiers (``_pane_glyph_signal``,
+        # ``auq_source._record_consistent_with_pane``) already exclude them, so
+        # including them here gave a pure-pane parse N+1 options vs the side
+        # file's N → fingerprint mismatch → silent toggle reject. Skip them so a
+        # render→tap source flip keeps the fingerprint stable. Affordances always
+        # trail the real options, so skipping them preserves the 1-based numbering
+        # and the contiguity guard below stays satisfied. We still note when the
+        # live cursor sits on a (dropped) affordance so the dedup below doesn't
+        # promote a stale scrollback cursor on a real option to "live".
+        if is_affordance_label(label):
+            if m.group("cursor").strip() in ("❯", "›", "▶", "*"):
+                affordance_cursor_seen = True
+            continue
         # ``↓`` is the picker's scroll-more indicator, NOT a selection cursor.
         # Claude Code paints it at the left edge of the top visible option when
         # earlier options have scrolled off the viewport. Empirically (live
@@ -934,17 +971,26 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
     # directions) and the legacy Bug-C dual-cursor / restore cases, which all
     # resolve to the bottom-most ``❯``.
     cursor_idxs = [i for i, o in enumerate(kept) if o.cursor]
-    if len(cursor_idxs) > 1:
-        for i in cursor_idxs[:-1]:
-            opt = kept[i]
-            kept[i] = AskOption(
-                label=opt.label,
-                recommended=opt.recommended,
-                cursor=False,
-                number=opt.number,
-                description=opt.description,
-                selected=opt.selected,
-            )
+    # When the live cursor is on a (dropped) trailing affordance, every real
+    # option ``❯`` is stale scrollback above it — clear them all so no real
+    # option is mislabelled as the cursor. Otherwise keep only the bottom-most
+    # real-option ``❯`` (the live cursor) and clear the stale ones above it.
+    if affordance_cursor_seen:
+        clear_idxs = list(cursor_idxs)
+    elif len(cursor_idxs) > 1:
+        clear_idxs = cursor_idxs[:-1]
+    else:
+        clear_idxs = []
+    for i in clear_idxs:
+        opt = kept[i]
+        kept[i] = AskOption(
+            label=opt.label,
+            recommended=opt.recommended,
+            cursor=False,
+            number=opt.number,
+            description=opt.description,
+            selected=opt.selected,
+        )
     return tuple(kept)
 
 
@@ -1302,6 +1348,19 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     )
     pane_excerpt = "\n".join(lines[excerpt_start:]).rstrip()
 
+    options_contiguous = bool(options) and [o.number for o in options] == list(
+        range(1, len(options) + 1)
+    )
+    # A pure-pane picker is "complete" when we can see option 1 (contiguous
+    # from 1 = top of the list present) AND the "Type something" free-text
+    # affordance (is_free_text), which Claude Code always renders at the
+    # BOTTOM of the option list — so its presence means we've captured the
+    # whole list, not a scrolled tail. Conservative: if the affordance is
+    # off-screen or numbering doesn't start at 1, options_complete stays
+    # False (toggle buttons suppressed → keystroke-nav fallback), never a
+    # wrong dispatch.
+    options_complete = options_contiguous and is_free_text
+
     return AskUserQuestionForm(
         tabs=tabs,
         current_question_title=current_question_title,
@@ -1311,7 +1370,7 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
         pane_excerpt=pane_excerpt,
         pane_walkback_title=pane_walkback_title,
         select_mode=select_mode,
-        options_complete=False,
+        options_complete=options_complete,
     )
 
 

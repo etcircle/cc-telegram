@@ -277,7 +277,7 @@ def mint_row(
     ):
         # Cache-REUSE: unchanged form AND unchanged source, all tokens still
         # live, not tombstoned. Same tokens, NO generation bump.
-        logger.info(
+        logger.debug(
             "AUQ_MINT path=reuse window=%s fp=%s source_kind=%s source_fp=%s generation=%s n_tokens=%d",
             window_id,
             fingerprint[:8],
@@ -317,7 +317,7 @@ def mint_row(
         source_kind=source_kind,
         source_fingerprint=source_fingerprint,
     )
-    logger.info(
+    logger.debug(
         "AUQ_MINT path=fresh window=%s fp=%s source_kind=%s source_fp=%s generation=%s n_tokens=%d",
         window_id,
         fingerprint[:8],

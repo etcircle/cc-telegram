@@ -307,9 +307,11 @@ Enter to select · ↑/↓ to navigate · Esc to cancel
 
 
 @pytest.mark.asyncio
-async def test_hook_missing_compressed_and_full_pane_have_no_toggles(
+async def test_hook_missing_compressed_suppresses_full_pane_mints_toggles(
     scenario: ScenarioHarness,
 ) -> None:
+    # Compressed capture (options scrolled past 1, non-contiguous-from-1 → the
+    # full list is NOT captured): no toggles + "full list unavailable" notice.
     wid = _bind(
         scenario,
         _fixture("auq_multiselect_compressed_long_cursor_only_tmux_capture.txt"),
@@ -318,10 +320,17 @@ async def test_hook_missing_compressed_and_full_pane_have_no_toggles(
     assert not _prefixes(_callbacks(scenario), CB_ASK_TOGGLE)
     assert "full list unavailable" in _texts(scenario)
 
+    # Full fresh capture, hook still missing (pure-pane source): the picker is
+    # now "complete" — options contiguous from 1 AND the "Type something"
+    # free-text affordance is visible at the bottom of the list, proving the
+    # whole list was captured. The fix deliberately mints toggles here so a
+    # render→tap AUQ-source flip (side file → pure pane) keeps the fast buttons
+    # working instead of silently rejecting the tap. (Pre-fix the pure-pane
+    # path hardcoded options_complete=False and this minted no toggles.)
     scenario.bot.sent.clear()
     scenario.tmux.set_pane(wid, _fixture("auq_multiselect_fresh_tmux_capture.txt"))
     await _render(scenario, wid)
-    assert not _prefixes(_callbacks(scenario), CB_ASK_TOGGLE)
+    assert len(_prefixes(_callbacks(scenario), CB_ASK_TOGGLE)) == 4
 
 
 @pytest.mark.asyncio

@@ -2657,7 +2657,7 @@ async def handle_interactive_ui(
             # contiguous pickers when an earlier AUQ sat in the cache.
         if form is not None:
             if form.select_mode == "multi":
-                logger.info(
+                logger.debug(
                     "AUQ_RENDER window=%s from_poller=%s source_kind=%s source_fp=%s "
                     "sel_mode=%s opts_complete=%s current_tab_inferred=%s fp=%s cursor=%s selected=%s",
                     window_id,
