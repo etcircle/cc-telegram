@@ -2656,6 +2656,21 @@ async def handle_interactive_ui(
             # stale_fallback alone dropped buttons on legitimate complete
             # contiguous pickers when an earlier AUQ sat in the cache.
         if form is not None:
+            if form.select_mode == "multi":
+                logger.debug(
+                    "AUQ_RENDER window=%s from_poller=%s source_kind=%s source_fp=%s "
+                    "sel_mode=%s opts_complete=%s current_tab_inferred=%s fp=%s cursor=%s selected=%s",
+                    window_id,
+                    from_poller,
+                    resolved_source.kind,
+                    resolved_source.source_fingerprint[:8],
+                    form.select_mode,
+                    form.options_complete,
+                    form.current_tab_inferred,
+                    form.fingerprint()[:8],
+                    [o.number for o in form.options if o.cursor],
+                    {o.number: o.selected for o in form.options},
+                )
             structured = _render_ask_user_question(form)
             if structured:
                 text = structured

@@ -846,6 +846,13 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
     parse failure).
     """
     options: list[AskOption] = []
+    # True when the live cursor ``❯`` is parked on a free-text affordance row
+    # ("Type something" / "Chat about this"). Affordances ALWAYS trail the real
+    # options, so an affordance cursor is the bottom-most ``❯`` on screen — i.e.
+    # the live one — which means every ``❯`` on a real option above it is stale
+    # scrollback. We track this so the bottom-most-cursor dedup below can clear
+    # the surviving stale real-option cursor instead of painting a phantom.
+    affordance_cursor_seen = False
     for line in lines:
         m = _RE_NUMBERED_OPTION.match(line)
         if m is None:
@@ -870,6 +877,21 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
         label = m.group("label").strip()
         selected = _checkbox_selected_from_line(line)
         label = _strip_option_checkbox(label)
+        # Free-text affordances ("Type something", "Chat about this") render as
+        # numbered rows in the TUI but are NOT real picker options. The
+        # side-file source and the pane-signal classifiers (``_pane_glyph_signal``,
+        # ``auq_source._record_consistent_with_pane``) already exclude them, so
+        # including them here gave a pure-pane parse N+1 options vs the side
+        # file's N → fingerprint mismatch → silent toggle reject. Skip them so a
+        # render→tap source flip keeps the fingerprint stable. Affordances always
+        # trail the real options, so skipping them preserves the 1-based numbering
+        # and the contiguity guard below stays satisfied. We still note when the
+        # live cursor sits on a (dropped) affordance so the dedup below doesn't
+        # promote a stale scrollback cursor on a real option to "live".
+        if is_affordance_label(label):
+            if m.group("cursor").strip() in ("❯", "›", "▶", "*"):
+                affordance_cursor_seen = True
+            continue
         # ``↓`` is the picker's scroll-more indicator, NOT a selection cursor.
         # Claude Code paints it at the left edge of the top visible option when
         # earlier options have scrolled off the viewport. Empirically (live
@@ -934,17 +956,26 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
     # directions) and the legacy Bug-C dual-cursor / restore cases, which all
     # resolve to the bottom-most ``❯``.
     cursor_idxs = [i for i, o in enumerate(kept) if o.cursor]
-    if len(cursor_idxs) > 1:
-        for i in cursor_idxs[:-1]:
-            opt = kept[i]
-            kept[i] = AskOption(
-                label=opt.label,
-                recommended=opt.recommended,
-                cursor=False,
-                number=opt.number,
-                description=opt.description,
-                selected=opt.selected,
-            )
+    # When the live cursor is on a (dropped) trailing affordance, every real
+    # option ``❯`` is stale scrollback above it — clear them all so no real
+    # option is mislabelled as the cursor. Otherwise keep only the bottom-most
+    # real-option ``❯`` (the live cursor) and clear the stale ones above it.
+    if affordance_cursor_seen:
+        clear_idxs = list(cursor_idxs)
+    elif len(cursor_idxs) > 1:
+        clear_idxs = cursor_idxs[:-1]
+    else:
+        clear_idxs = []
+    for i in clear_idxs:
+        opt = kept[i]
+        kept[i] = AskOption(
+            label=opt.label,
+            recommended=opt.recommended,
+            cursor=False,
+            number=opt.number,
+            description=opt.description,
+            selected=opt.selected,
+        )
     return tuple(kept)
 
 
@@ -1302,6 +1333,28 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     )
     pane_excerpt = "\n".join(lines[excerpt_start:]).rstrip()
 
+    options_contiguous = bool(options) and [o.number for o in options] == list(
+        range(1, len(options) + 1)
+    )
+    # A pure-pane picker is "complete" when we can see option 1 (contiguous
+    # from 1 = top of the list present) AND an affordance OPTION ROW
+    # ("Type something" / "Chat about this") was actually parsed in the option
+    # block. Claude Code always renders those affordance rows at the BOTTOM of
+    # the option list, so a parsed affordance row proves we captured the whole
+    # list rather than a scrolled tail. We require an affordance *row in the
+    # option block* — NOT the weaker ``is_free_text`` tail-substring scan, which
+    # could be tripped by question text or an option description containing the
+    # phrase "Type something" (hermes review 2026-05-31). Conservative: if no
+    # affordance row is in-block or numbering doesn't start at 1,
+    # options_complete stays False (toggle buttons suppressed → keystroke-nav
+    # fallback), never a wrong dispatch.
+    affordance_row_in_block = any(
+        (_m := _RE_NUMBERED_OPTION.match(line)) is not None
+        and is_affordance_label(_strip_option_checkbox(_m.group("label").strip()))
+        for line in options_region
+    )
+    options_complete = options_contiguous and affordance_row_in_block
+
     return AskUserQuestionForm(
         tabs=tabs,
         current_question_title=current_question_title,
@@ -1311,7 +1364,7 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
         pane_excerpt=pane_excerpt,
         pane_walkback_title=pane_walkback_title,
         select_mode=select_mode,
-        options_complete=False,
+        options_complete=options_complete,
     )
 
 

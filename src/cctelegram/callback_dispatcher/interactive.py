@@ -11,7 +11,7 @@ Key components:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, cast
 
 import asyncio
 import logging
@@ -122,7 +122,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Up", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Up",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -145,7 +154,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Down", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Down", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Down",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -168,7 +186,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Left", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Left", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Left",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -191,7 +218,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Right", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Right", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Right",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -221,7 +257,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             return
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Escape", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Escape",
+            nav_ok,
+        )
         await clear_interactive_msg(
             user.id, context.bot, thread_id, session_mgr=adapters.session_manager
         )
@@ -238,7 +283,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Enter", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Enter", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Enter",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -261,7 +315,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Space", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Space", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Space",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -284,7 +347,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
+        nav_ok = await tmux_manager.send_keys(
+            w.window_id, "Tab", enter=False, literal=False
+        )
+        logger.info(
+            "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
+            user.id,
+            window_id,
+            "Tab",
+            nav_ok,
+        )
         await asyncio.sleep(0.5)
         await handle_interactive_ui(
             context.bot,
@@ -384,9 +456,29 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             return
 
         pane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
-        resolved_input = auq_source.resolve_auq_source(
-            window_id, None, pane or ""
-        ).payload
+        # Source-stickiness: re-resolve using the SAME source this toggle button
+        # was minted against, if it is still live + unchanged. A transient pane
+        # degradation can make resolve_auq_source flip side_file→pane at tap;
+        # that flip changes the resolved form's fingerprint and silently rejects
+        # the toggle. Pinning the minted source keeps the toggle dispatching as
+        # long as the underlying question hasn't actually changed (a replaced
+        # side file has a different canonical fingerprint → no pin → fall back).
+        sticky_input = auq_source.peek_sticky_source(
+            window_id, entry.source_kind, entry.source_fingerprint
+        )
+        if sticky_input is not None:
+            resolved_input = sticky_input
+            # peek_sticky_source only returns non-None for the side_file /
+            # jsonl_cache kinds (it returns None for "pane"), so the minted
+            # kind here is always a valid ResolvedAuqSource.kind literal.
+            resolved_src = auq_source.ResolvedAuqSource(
+                kind=cast(Literal["side_file", "jsonl_cache"], entry.source_kind),
+                payload=sticky_input,
+                source_fingerprint=entry.source_fingerprint,
+            )
+        else:
+            resolved_src = auq_source.resolve_auq_source(window_id, None, pane or "")
+            resolved_input = resolved_src.payload
         current_form = (
             adapters.terminal_parser.resolve_ask_form(resolved_input, pane)
             if pane
@@ -399,12 +491,34 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             or not current_form.options_complete
         ):
             logger.info(
-                "Toggle-token staleness reject: user=%d window=%s opt=%d minted_fp=%s current_fp=%s",
+                "AUQ_TAP toggle_reject user=%d window=%s opt=%d minted_fp=%s live_fp=%s "
+                "reason_form_none=%s reason_fp=%s reason_mode=%s reason_incomplete=%s "
+                "minted_src=%s live_src=%s minted_src_fp=%s live_src_fp=%s "
+                "live_sel_mode=%s live_opts_complete=%s live_cursor=%s live_selected=%s",
                 user.id,
                 window_id,
                 entry.option_number,
-                entry.fingerprint,
-                current_form.fingerprint() if current_form else "none",
+                entry.fingerprint[:8],
+                current_form.fingerprint()[:8] if current_form else "none",
+                current_form is None,
+                bool(
+                    current_form is not None
+                    and current_form.fingerprint() != entry.fingerprint
+                ),
+                bool(current_form is not None and current_form.select_mode != "multi"),
+                bool(current_form is not None and not current_form.options_complete),
+                entry.source_kind,
+                resolved_src.kind,
+                entry.source_fingerprint[:8],
+                resolved_src.source_fingerprint[:8],
+                current_form.select_mode if current_form else "none",
+                current_form.options_complete if current_form else "none",
+                [o.number for o in current_form.options if o.cursor]
+                if current_form
+                else None,
+                {o.number: o.selected for o in current_form.options}
+                if current_form
+                else None,
             )
             await safe_answer(query, "Form changed, refreshing.", show_alert=False)
             await handle_interactive_ui(
@@ -438,6 +552,23 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             )
             return
 
+        logger.info(
+            "AUQ_TAP toggle_dispatch_ok user=%d window=%s opt=%d send_keys_ok=%s "
+            "minted_fp=%s live_fp=%s minted_src=%s live_src=%s "
+            "live_sel_mode=%s live_opts_complete=%s live_cursor=%s live_selected=%s",
+            user.id,
+            window_id,
+            entry.option_number,
+            toggle_ok,
+            entry.fingerprint[:8],
+            current_form.fingerprint()[:8],
+            entry.source_kind,
+            resolved_src.kind,
+            current_form.select_mode,
+            current_form.options_complete,
+            [o.number for o in current_form.options if o.cursor],
+            {o.number: o.selected for o in current_form.options},
+        )
         await asyncio.sleep(0.3)
         await handle_interactive_ui(
             context.bot,
@@ -467,6 +598,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             try:
                 opt_num = int(opt_str)
             except ValueError:
+                logger.info("AUQ_PICK malformed user=%d", user.id)
                 await _refresh_pick_card(
                     query,
                     context,
@@ -478,7 +610,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 )
                 return
             ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, opt_num)
+            logger.info(
+                "AUQ_PICK entry user=%d window=%s opt=%d fp8=%s token=%s",
+                user.id,
+                "?",
+                opt_num,
+                fp8,
+                token[:6],
+            )
         else:
+            logger.info("AUQ_PICK malformed user=%d", user.id)
             await _refresh_pick_card(
                 query,
                 context,
@@ -513,6 +654,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 and pick_token.stable_key(live) == ledger_key
             )
             if not is_collision:
+                logger.info("AUQ_PICK wrong_user user=%d window=%s", user.id, "?")
                 await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
                 return
             # Plan v4 §7.2: "ledger entry from the other route stays put
@@ -545,6 +687,14 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 and existing.accepted_at < auq_ledger.process_start_time()
             ):
                 proj_state = "unknown"
+            logger.info(
+                "AUQ_PICK ledger_hit user=%d window=%s opt=%d proj_state=%s raw_state=%s",
+                user.id,
+                existing.window_id,
+                existing.option_number,
+                proj_state,
+                existing.state,
+            )
             if proj_state == "dispatched":
                 await safe_answer(
                     query,
@@ -605,6 +755,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             # 5-minute TTL. Refresh the card so the user sees the live form
             # state and can click a fresh button. (The ledger gate above
             # already answered any real SEQUENTIAL duplicate.)
+            logger.info("AUQ_PICK peek_none user=%d token=%s", user.id, token[:6])
             await _refresh_pick_card(
                 query,
                 context,
@@ -624,9 +775,11 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # so it cannot burn the owner's token. validate_and_consume's own phase
         # (a) owner check is the authoritative, race-safe re-check.
         if not owner_matches(peeked, user.id):
+            logger.info("AUQ_PICK wrong_user user=%d window=%s", user.id, window_id)
             await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
             return
         if await reject_stale_window_callback(window_id):
+            logger.info("AUQ_PICK stale_window user=%d window=%s", user.id, window_id)
             return
 
         # Atomic validate + single-use consume. Re-resolves the AUQ source via
@@ -648,6 +801,14 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         entry = result.entry
         current_form = result.current_form
+        logger.info(
+            "AUQ_PICK validate user=%d window=%s opt=%d outcome=%s is_review_submit=%s",
+            user.id,
+            window_id,
+            peeked.option_number,
+            result.outcome,
+            peeked.is_review_submit,
+        )
         if result.outcome == "wrong_user":
             await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
             return
@@ -721,6 +882,20 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                     "Pick-token submit-guard reject: user=%d window=%s",
                     user.id,
                     window_id,
+                )
+                logger.info(
+                    "AUQ_PICK submit_guard_reject user=%d window=%s is_review=%s "
+                    "opt1_cursor=%s opt1_num=%s label_match=%s",
+                    user.id,
+                    window_id,
+                    current_form.is_review_screen,
+                    (current_form.options[0].cursor if current_form.options else None),
+                    (current_form.options[0].number if current_form.options else None),
+                    (
+                        current_form.options[0].label == entry.option_label
+                        if current_form.options
+                        else None
+                    ),
                 )
                 await safe_answer(
                     query, "Review screen moved, refreshing.", show_alert=False
@@ -850,6 +1025,17 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             )
             raise
 
+        logger.info(
+            "AUQ_PICK dispatch_ok user=%d window=%s opt=%d label=%s "
+            "is_review_submit=%s digit_ok=%s enter_ok=%s",
+            user.id,
+            window_id,
+            entry.option_number,
+            entry.option_label[:24],
+            entry.is_review_submit,
+            digit_ok,
+            enter_ok,
+        )
         await safe_answer(query, f"{entry.option_number}. {entry.option_label[:32]}")
         await asyncio.sleep(0.5)
         # Re-render the picker after the digit lands so the card reflects the

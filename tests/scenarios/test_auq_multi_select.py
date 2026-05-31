@@ -307,9 +307,11 @@ Enter to select · ↑/↓ to navigate · Esc to cancel
 
 
 @pytest.mark.asyncio
-async def test_hook_missing_compressed_and_full_pane_have_no_toggles(
+async def test_hook_missing_compressed_suppresses_full_pane_mints_toggles(
     scenario: ScenarioHarness,
 ) -> None:
+    # Compressed capture (options scrolled past 1, non-contiguous-from-1 → the
+    # full list is NOT captured): no toggles + "full list unavailable" notice.
     wid = _bind(
         scenario,
         _fixture("auq_multiselect_compressed_long_cursor_only_tmux_capture.txt"),
@@ -318,10 +320,17 @@ async def test_hook_missing_compressed_and_full_pane_have_no_toggles(
     assert not _prefixes(_callbacks(scenario), CB_ASK_TOGGLE)
     assert "full list unavailable" in _texts(scenario)
 
+    # Full fresh capture, hook still missing (pure-pane source): the picker is
+    # now "complete" — options contiguous from 1 AND the "Type something"
+    # free-text affordance is visible at the bottom of the list, proving the
+    # whole list was captured. The fix deliberately mints toggles here so a
+    # render→tap AUQ-source flip (side file → pure pane) keeps the fast buttons
+    # working instead of silently rejecting the tap. (Pre-fix the pure-pane
+    # path hardcoded options_complete=False and this minted no toggles.)
     scenario.bot.sent.clear()
     scenario.tmux.set_pane(wid, _fixture("auq_multiselect_fresh_tmux_capture.txt"))
     await _render(scenario, wid)
-    assert not _prefixes(_callbacks(scenario), CB_ASK_TOGGLE)
+    assert len(_prefixes(_callbacks(scenario), CB_ASK_TOGGLE)) == 4
 
 
 @pytest.mark.asyncio
@@ -355,6 +364,47 @@ async def test_staleness_mid_toggle_refreshes_without_dispatch_or_cleanup(
     await _tap(scenario, opt2)
     assert not scenario.tmux.sent_keys
     assert side_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_toggle_survives_degraded_pane_at_tap_via_source_stickiness(
+    scenario: ScenarioHarness,
+) -> None:
+    # Source-stickiness regression (Part E). Render mints the toggle against the
+    # PreToolUse SIDE FILE (fresh pane). Then the pane is DEGRADED at tap — the
+    # question-title region is obscured to "?" while the option block (cursor on
+    # 1, nothing selected) is unchanged. On that degraded pane a plain
+    # resolve_auq_source FLIPS side_file→pane (resolve_record rejects on the
+    # title mismatch), and the pure-pane form fingerprint diverges from the
+    # minted one — pre-fix that silently rejected the tap (dead button). With the
+    # pin (peek_sticky_source returns the unchanged side file), the tap
+    # re-resolves the SAME side-file source, the form fingerprint matches the
+    # minted entry, and the digit IS dispatched.
+    wid = _bind(scenario, _fixture("auq_multiselect_fresh_tmux_capture.txt"))
+    side_file = _write_side_file(_SESSION_ID, _safeguards_input())
+    await _render(scenario, wid)
+    toggles = _prefixes(_callbacks(scenario), CB_ASK_TOGGLE)
+    assert len(toggles) == 4
+
+    degraded_pane = """←  ☐ Safeguards  ✔ Submit  →
+
+?
+
+❯ 1. [ ] A) Verify cursor row from tmux pane before Space
+  2. [ ] B) Keep PreToolUse side file alive across toggles
+  3. [ ] C) Suppress tabbed multi-question forms
+  4. [ ] D) Add Submit and Cancel buttons
+  5. [ ] Type something
+     Submit
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+    scenario.tmux.set_pane(wid, degraded_pane)
+    await _tap(scenario, toggles[1])
+    # The toggle dispatched (digit 2 sent), proving the pin survived the flip.
+    assert scenario.tmux.sent_keys == [(wid, "2", False, True)]
+    assert side_file.exists(), "aqt toggles must not clean side files"
 
 
 @pytest.mark.asyncio

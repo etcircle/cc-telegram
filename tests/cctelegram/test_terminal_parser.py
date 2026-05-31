@@ -856,7 +856,11 @@ class TestParseAskUserQuestion:
         )
         form = parse_ask_user_question(pane)
         assert form is not None
-        assert [opt.number for opt in form.options] == [2, 3, 4, 5]
+        # The "Type something." / "Chat about this" rows (4, 5) are picker
+        # affordances, not real options — the parser now drops them (matching
+        # the side-file source and the pane-glyph classifier), so only the two
+        # real options survive.
+        assert [opt.number for opt in form.options] == [2, 3]
         assert form.options[0].label.startswith("B) Still no buttons")
         assert form.options[1].label.startswith("C) Buttons appeared")
 
@@ -1016,8 +1020,11 @@ class TestParseAskUserQuestion:
             "D5 — If durationMode-as-permanent-flag is cruft, "
             "how do we handle legacy voice_patch ops?"
         )
-        # All six visible options preserved.
-        assert [o.number for o in form.options] == [1, 2, 3, 4, 5, 6]
+        # The four REAL options are preserved; the trailing picker affordances
+        # "5. Type something." and "6. Chat about this" are dropped (they are
+        # not real options — matching the side-file source and the pane-glyph
+        # classifier), so the walk-back title capture is unaffected.
+        assert [o.number for o in form.options] == [1, 2, 3, 4]
 
     def test_walkback_title_excluded_from_fingerprint(self):
         """Hermes P1 defense: pane_walkback_title must NOT influence
@@ -2657,7 +2664,11 @@ class TestPrBMultiSelectDetection:
         )
         assert form is not None
         assert form.select_mode == "multi"
-        assert form.options_complete is False
+        # A fresh, fully-visible picker is now "complete": options are
+        # contiguous from 1 AND the "Type something" free-text affordance is
+        # visible at the bottom of the list (is_free_text), so the whole list
+        # was captured. (Previously the pure-pane path hardcoded False.)
+        assert form.options_complete is True
         assert form.options[0].cursor is True
         assert [o.selected for o in form.options[:4]] == [False, False, False, False]
         assert {t.label for t in form.tabs} >= {"Safeguards", "Submit"}
@@ -2853,12 +2864,18 @@ class TestPrBMultiSelectDetection:
 
 
 class TestArrowNavStaleScrollbackCursor:
+    # Maps fixture → the live real-option cursor number. ``cursor5`` parks the
+    # live ``❯`` on the "5. Type something." free-text affordance, which the
+    # parser now drops (it is not a real option). Since the affordance is the
+    # bottom-most ``❯`` (= live cursor), every ``❯`` on a real option above it
+    # is stale scrollback and is cleared — so NO real option carries the cursor
+    # (expected ``[]``). The keystroke fallback still reaches the affordance.
     _CASES = {
-        "auq_single_long_scrolled_cursor1_S500.txt": 1,
-        "auq_single_long_scrolled_cursor2_S500.txt": 2,
-        "auq_single_long_scrolled_cursor3_S500.txt": 3,
-        "auq_single_long_scrolled_cursor4_S500.txt": 4,
-        "auq_single_long_scrolled_cursor5_S500.txt": 5,
+        "auq_single_long_scrolled_cursor1_S500.txt": [1],
+        "auq_single_long_scrolled_cursor2_S500.txt": [2],
+        "auq_single_long_scrolled_cursor3_S500.txt": [3],
+        "auq_single_long_scrolled_cursor4_S500.txt": [4],
+        "auq_single_long_scrolled_cursor5_S500.txt": [],
     }
 
     def test_parser_reports_single_live_cursor_bottom_most(self):
@@ -2866,7 +2883,7 @@ class TestArrowNavStaleScrollbackCursor:
             form = parse_ask_user_question(_fixture(fixture_name))
             assert form is not None, fixture_name
             cursors = [o.number for o in form.options if o.cursor]
-            assert cursors == [live], (fixture_name, cursors)
+            assert cursors == live, (fixture_name, cursors)
 
     def test_overlay_tracks_live_cursor_not_stale_scrollback(self):
         from cctelegram.terminal_parser import _overlay_cursor_and_selection
@@ -2875,12 +2892,21 @@ class TestArrowNavStaleScrollbackCursor:
             AskOption(label=f"opt{i}", recommended=False, cursor=False, number=i)
             for i in range(1, 7)
         )
-        for fixture_name, live in self._CASES.items():
+        # The overlay's documented fallback: when the pane carries NO cursor on a
+        # real option (cursor5 parks the live ❯ on the dropped "Type something"
+        # affordance), the overlay defaults to option 1. This is a display-only
+        # fallback — dispatch correctness is guarded by the fingerprint check —
+        # so cursor5 overlays to [1] even though the raw parse reports [].
+        overlay_expected = {
+            **self._CASES,
+            "auq_single_long_scrolled_cursor5_S500.txt": [1],
+        }
+        for fixture_name, live in overlay_expected.items():
             form = parse_ask_user_question(_fixture(fixture_name))
             assert form is not None, fixture_name
             overlaid = _overlay_cursor_and_selection(dict_opts, form.options)
             cursors = [o.number for o in overlaid if o.cursor]
-            assert cursors == [live], (fixture_name, cursors)
+            assert cursors == live, (fixture_name, cursors)
 
     def test_overlay_prefers_last_cursor_when_pane_carries_two(self):
         # Defense-in-depth: even if a caller feeds a raw multi-cursor pane
@@ -2924,12 +2950,13 @@ class TestArrowNavStaleScrollbackCursor:
         assert form is not None
         assert form.select_mode == "multi"
         assert [o.number for o in form.options if o.cursor] == [4]
+        # The "5. Type something" affordance is dropped (not a real option);
+        # only the four real options remain, with checkbox state preserved.
         assert [(o.number, o.selected) for o in form.options] == [
             (1, True),
             (2, True),
             (3, False),
             (4, False),
-            (5, False),
         ]
 
     def test_multiselect_stale_above_live_below_keeps_last_with_checkboxes(self):
@@ -2954,12 +2981,13 @@ class TestArrowNavStaleScrollbackCursor:
         assert form is not None
         assert form.select_mode == "multi"
         assert [o.number for o in form.options if o.cursor] == [3]
-        assert [(o.number, o.selected) for o in form.options[:5]] == [
+        # The "5. [ ] Type something" affordance is dropped (not a real option);
+        # the four real options keep their checkbox state, cursor stays on 3.
+        assert [(o.number, o.selected) for o in form.options] == [
             (1, True),
             (2, True),
             (3, False),
             (4, False),
-            (5, False),
         ]
 
     def test_stale_cursor_above_recommended_live_cursor_keeps_live(self):

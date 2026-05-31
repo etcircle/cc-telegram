@@ -277,6 +277,15 @@ def mint_row(
     ):
         # Cache-REUSE: unchanged form AND unchanged source, all tokens still
         # live, not tombstoned. Same tokens, NO generation bump.
+        logger.debug(
+            "AUQ_MINT path=reuse window=%s fp=%s source_kind=%s source_fp=%s generation=%s n_tokens=%d",
+            window_id,
+            fingerprint[:8],
+            source_kind,
+            source_fingerprint[:8],
+            cached.row_generation,
+            len(cached.tokens),
+        )
         return cached.tokens
 
     # FRESH mint: drop any stale/tombstoned row at this key, allocate a new
@@ -307,6 +316,15 @@ def mint_row(
         row_generation=generation,
         source_kind=source_kind,
         source_fingerprint=source_fingerprint,
+    )
+    logger.debug(
+        "AUQ_MINT path=fresh window=%s fp=%s source_kind=%s source_fp=%s generation=%s n_tokens=%d",
+        window_id,
+        fingerprint[:8],
+        source_kind,
+        source_fingerprint[:8],
+        generation,
+        len(tokens),
     )
     return tokens
 

@@ -393,3 +393,141 @@ class TestSideFileLiveForWindow:
             )
             is False
         )
+
+
+class TestPeekStickySource:
+    """The source-stickiness pin for the ``aqt:`` multi-select toggle.
+
+    ``peek_sticky_source`` re-resolves the EXACT source a toggle button was
+    minted against (side_file / jsonl_cache), pane-AGNOSTIC, so a transient
+    render→tap source flip (side_file → pane, on a degraded pane) cannot break
+    the toggle. The fingerprint compared is the minter's
+    ``_canonical_dict_fingerprint`` — NOT the side file's stored
+    ``input_fingerprint`` (``questions_content_digest``), which is a different
+    digest (the mint/validate source-parity trap).
+    """
+
+    _WID = "@auqsrc-sticky"
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    _CACHE_INPUT = {
+        "questions": [
+            {
+                "question": "Pick a fruit",
+                "options": [{"label": "Apple"}, {"label": "Banana"}],
+            }
+        ]
+    }
+
+    def test_side_file_matching_canonical_fp_returns_tool_input(self, _cc_dir):
+        # The exact minted source is still live + unchanged → returns its
+        # tool_input dict, pane-agnostic (no pane is supplied at all).
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_affordance_side_file(_cc_dir, self._SID)
+            minted_fp = auq_source._canonical_dict_fingerprint(tool_input)
+            got = auq_source.peek_sticky_source(self._WID, "side_file", minted_fp)
+            assert got == tool_input
+            # Read-only invariant: the pane-agnostic helper must NOT populate
+            # the consistent-with-pane cache.
+            assert self._WID not in auq_source._pretool_ask_records
+        finally:
+            _unbind_window(self._WID)
+
+    def test_side_file_changed_canonical_fp_returns_none(self, _cc_dir):
+        # A new question replaced the side file → its canonical fingerprint
+        # differs from the minted one → no pin (fall back to resolve).
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_affordance_side_file(_cc_dir, self._SID)
+            minted_fp = auq_source._canonical_dict_fingerprint(tool_input)
+
+            # Mutate the live side file's tool_input (different canonical fp).
+            sidefile = json.loads(_AFFORDANCE_SIDEFILE.read_text())
+            mutated = sidefile["tool_input"]
+            mutated["questions"][0]["header"] = "DIFFERENT QUESTION"
+            (_cc_dir / "auq_pending" / f"{self._SID}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "session_id": self._SID,
+                        "tool_use_id": sidefile["tool_use_id"],
+                        "written_at": time.time(),
+                        "tool_input": mutated,
+                    }
+                )
+            )
+            assert (
+                auq_source.peek_sticky_source(self._WID, "side_file", minted_fp) is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_side_file_absent_returns_none(self, _cc_dir):
+        # No side file on disk → no pin.
+        _bind_window(self._WID, self._SID)
+        try:
+            assert (
+                auq_source.peek_sticky_source(self._WID, "side_file", "deadbeef")
+                is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_pane_minted_kind_returns_none(self, _cc_dir):
+        # A pane-minted button has no sticky source to pin → always None.
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_affordance_side_file(_cc_dir, self._SID)
+            assert auq_source.peek_sticky_source(self._WID, "pane", "anything") is None
+        finally:
+            _unbind_window(self._WID)
+
+    def test_jsonl_cache_matching_fp_returns_cached(self, _cc_dir):
+        auq_source.set_jsonl_cache_getter(
+            lambda wid: self._CACHE_INPUT if wid == self._WID else None
+        )
+        minted_fp = auq_source._canonical_dict_fingerprint(self._CACHE_INPUT)
+        got = auq_source.peek_sticky_source(self._WID, "jsonl_cache", minted_fp)
+        assert got == self._CACHE_INPUT
+
+    def test_jsonl_cache_non_matching_fp_returns_none(self, _cc_dir):
+        auq_source.set_jsonl_cache_getter(
+            lambda wid: self._CACHE_INPUT if wid == self._WID else None
+        )
+        assert (
+            auq_source.peek_sticky_source(self._WID, "jsonl_cache", "notthefp") is None
+        )
+
+    def test_jsonl_cache_absent_returns_none(self, _cc_dir):
+        # reset default getter returns None → no cached dict → no pin.
+        assert (
+            auq_source.peek_sticky_source(self._WID, "jsonl_cache", "anything") is None
+        )
+
+    def test_uses_canonical_fp_not_input_fingerprint(self, _cc_dir):
+        # Parity guard: the side file's stored ``input_fingerprint``
+        # (questions_content_digest, a 12-char hex) is a DIFFERENT digest from
+        # ``_canonical_dict_fingerprint`` (a 64-char sha256). The helper must
+        # match on the canonical digest the minter used — passing the
+        # input_fingerprint must NOT match, but the canonical fp MUST.
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_affordance_side_file(_cc_dir, self._SID)
+            record = auq_source._read_live_pretool_record(self._WID)
+            assert record is not None
+            canonical_fp = auq_source._canonical_dict_fingerprint(tool_input)
+            input_fp = record.input_fingerprint
+            # The two digests genuinely differ (else this guard is vacuous).
+            assert canonical_fp != input_fp
+            # Matching the canonical fp pins; matching the input_fingerprint
+            # does NOT (proving the helper does not use input_fingerprint).
+            assert (
+                auq_source.peek_sticky_source(self._WID, "side_file", canonical_fp)
+                == tool_input
+            )
+            assert (
+                auq_source.peek_sticky_source(self._WID, "side_file", input_fp) is None
+            )
+        finally:
+            _unbind_window(self._WID)
