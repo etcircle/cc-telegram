@@ -17,7 +17,7 @@ import pytest
 
 from cctelegram import terminal_parser
 from cctelegram.callback_dispatcher import DispatcherAdapters, dispatch_callback
-from cctelegram.handlers import interactive_ui
+from cctelegram.handlers import auq_source, interactive_ui
 from cctelegram.handlers.callback_data import CB_ASK_PICK
 from cctelegram.utils import app_dir
 from tests.conftest import ScenarioHarness, make_update_callback
@@ -194,7 +194,7 @@ async def test_single_select_side_file_fingerprint_dispatch_and_compact_card(
 
     entry = interactive_ui.peek_pick_token(_token(picks[1]))
     assert entry is not None
-    resolved_input = interactive_ui._resolve_auq_source(wid, None, pane)
+    resolved_input = auq_source.resolve_auq_source(wid, None, pane).payload
     current_form = terminal_parser.resolve_ask_form(resolved_input, pane)
     assert current_form is not None
     assert entry.fingerprint == current_form.fingerprint()
@@ -235,7 +235,7 @@ async def test_single_select_compressed_pane_rejects_stale_same_labels_title_mis
     picks = [cb for cb in _pick_callbacks(scenario) if cb.startswith(CB_ASK_PICK)]
     assert len(picks) == 3
 
-    stale_record = interactive_ui._read_pretool_side_file(_SESSION_ID)
+    stale_record = auq_source._read_pretool_side_file(_SESSION_ID)
     assert stale_record is not None
     different_pane = _compressed_pane_different_question_same_labels()
     different_form = terminal_parser.resolve_ask_form(None, different_pane)
@@ -244,9 +244,7 @@ async def test_single_select_compressed_pane_rejects_stale_same_labels_title_mis
         different_form.current_question_title == "Choose the production approval path."
     )
     assert not different_form.options_contiguous_from_one()
-    assert interactive_ui._record_consistent_with_pane(
-        stale_record, different_form
-    ) == (
+    assert auq_source._record_consistent_with_pane(stale_record, different_form) == (
         False,
         "title_mismatch",
     )
@@ -269,13 +267,13 @@ async def test_single_select_compressed_pane_matching_title_still_dispatches(
     picks = [cb for cb in _pick_callbacks(scenario) if cb.startswith(CB_ASK_PICK)]
     assert len(picks) == 3
 
-    record = interactive_ui._read_pretool_side_file(_SESSION_ID)
+    record = auq_source._read_pretool_side_file(_SESSION_ID)
     assert record is not None
     pane_form = terminal_parser.resolve_ask_form(None, pane)
     assert pane_form is not None
     assert pane_form.current_question_title == "Choose the AUQ picker hotfix lane."
     assert not pane_form.options_contiguous_from_one()
-    assert interactive_ui._record_consistent_with_pane(record, pane_form) == (
+    assert auq_source._record_consistent_with_pane(record, pane_form) == (
         True,
         "ok",
     )
@@ -299,13 +297,13 @@ async def test_single_select_compressed_pane_title_absent_still_dispatches(
     picks = [cb for cb in _pick_callbacks(scenario) if cb.startswith(CB_ASK_PICK)]
     assert len(picks) == 3
 
-    record = interactive_ui._read_pretool_side_file(_SESSION_ID)
+    record = auq_source._read_pretool_side_file(_SESSION_ID)
     assert record is not None
     pane_form = terminal_parser.resolve_ask_form(None, pane)
     assert pane_form is not None
     assert pane_form.current_question_title is None
     assert not pane_form.options_contiguous_from_one()
-    assert interactive_ui._record_consistent_with_pane(record, pane_form) == (
+    assert auq_source._record_consistent_with_pane(record, pane_form) == (
         True,
         "ok",
     )

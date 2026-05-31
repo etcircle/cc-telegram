@@ -19,7 +19,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
 import secrets
 import time
 from collections.abc import Callable
@@ -33,19 +32,18 @@ from typing import Any
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
 from ..config import config
-from ..session import peek_session_id_for_window, session_id_for_window, session_manager
+from ..session import session_id_for_window, session_manager
 from ..terminal_parser import (
     AskUserQuestionForm,
     build_form_from_tool_input,
     extract_interactive_content,
-    is_affordance_label,
     parse_ask_user_question,
     resolve_ask_form,
     visible_pane_liveness,
 )
 from ..tmux_manager import tmux_manager
-from ..utils import app_dir, atomic_write_json
-from . import attention
+from ..utils import atomic_write_json
+from . import attention, auq_source
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -395,18 +393,17 @@ def forget_ask_tool_input(window_id: str) -> None:
     forward a stale claim marker or an upgrade record for a resolved
     AUQ.
 
-    AUQ PreToolUse hook integration (v4 plan): also clears the in-memory
-    pretool record cache for this window and unlinks the side file for
-    the window's CURRENT session_id. The ``/clear`` race (where
-    ``session_monitor._detect_and_cleanup_changes`` runs BEFORE this and
-    swaps the session_id under us) is handled separately in
-    session_monitor — that path uses the OLD session_id, which is no
-    longer reachable from here.
+    AUQ PreToolUse hook integration (v4 plan): the side-file half (in-memory
+    pretool record cache + unlink the side file for the window's CURRENT
+    session_id) is delegated to ``auq_source.forget_for_window``. The
+    ``/clear`` race (where ``session_monitor._detect_and_cleanup_changes``
+    runs BEFORE this and swaps the session_id under us) is handled separately
+    in session_monitor — that path uses the OLD session_id via
+    ``auq_source.unlink_for_session``, which is no longer reachable from here.
     """
     _last_completed_ask_tool_input.pop(window_id, None)
     _last_auq_tool_use_id.pop(window_id, None)
-    _pretool_ask_records.pop(window_id, None)
-    _unlink_pretool_side_file_for_window(window_id)
+    auq_source.forget_for_window(window_id)
     # Wave 1: drop any in-flight pending claim too. The AUQ lifecycle
     # is ending (tool_result arrived); a pending claim from this AUQ
     # is no longer valid and rolling it forward would commit a stale
@@ -419,103 +416,7 @@ def forget_ask_tool_input(window_id: str) -> None:
         _persist_interactive_state()
 
 
-def _unlink_pretool_side_file_for_window(window_id: str) -> None:
-    """Best-effort unlink of the side file for ``window_id``'s current session.
-
-    Used by ``forget_ask_tool_input`` (tool_result clean-up) and by
-    ``session_monitor._detect_and_cleanup_changes`` (with the OLD
-    session_id when a window's session_id changes — the /clear race).
-    Silent on missing file. Errors are logged at debug level only —
-    the cleanup is opportunistic; the bot-startup GC will catch
-    anything that escapes.
-    """
-    session_id = peek_session_id_for_window(window_id)
-    if not session_id:
-        return
-    _unlink_pretool_side_file_for_session(session_id)
-
-
-def _unlink_pretool_side_file_for_session(session_id: str) -> None:
-    """Best-effort unlink of the side file for ``session_id``.
-
-    Public-ish helper used by session_monitor when the OLD session_id
-    is known at /clear time (the current ``WindowState.session_id``
-    has already been swapped to the new session by then). Silent on
-    missing file / non-UUID session_id.
-    """
-    path = _pretool_side_file_path(session_id)
-    if path is None:
-        return
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    except OSError as e:
-        logger.debug(
-            "Pretool side file unlink for session=%s failed: %s",
-            session_id,
-            e,
-        )
-
-
-_PRETOOL_GC_AGE_SECONDS = 3600  # 1h — bot startup cleanup
 _CLAUDE_SETTINGS_FILE_FOR_WARN = Path.home() / ".claude" / "settings.json"
-
-
-def gc_stale_pretool_side_files() -> int:
-    """Delete AUQ side files older than ``_PRETOOL_GC_AGE_SECONDS``.
-
-    Best-effort. Called on bot startup. Returns the number of files
-    deleted (useful for tests; the bot's startup log doesn't need it).
-    Anything older than 1h is presumed stale — TTL on the read path is
-    only 5min, so a 1h file definitely cannot be served. Crashes /
-    kickstart-between-AUQs are the typical sources of these orphans.
-    """
-    pending_dir = app_dir() / "auq_pending"
-    if not pending_dir.is_dir():
-        return 0
-    cutoff = time.time() - _PRETOOL_GC_AGE_SECONDS
-    deleted = 0
-    try:
-        entries = list(pending_dir.iterdir())
-    except OSError as e:
-        logger.warning("Pretool GC: iterdir on %s failed: %s", pending_dir, e)
-        return 0
-    for entry in entries:
-        # Skip non-regular files; reject anything that doesn't match the
-        # canonical "<uuid>.json" name to avoid touching unexpected files.
-        if not entry.is_file():
-            continue
-        if not entry.name.endswith(".json"):
-            continue
-        stem = entry.stem
-        if not _SESSION_ID_RE.fullmatch(stem):
-            continue
-        try:
-            mtime = entry.stat().st_mtime
-        except OSError:
-            continue
-        if mtime >= cutoff:
-            continue
-        # Codex P2 (chunk 5): re-check mtime just before unlink. The
-        # hook may have replaced this side file (atomic temp+rename)
-        # between our initial stat and now; if so, skip — deleting a
-        # fresh file would force fallback to labels-only for the
-        # next AUQ on this session.
-        try:
-            current_mtime = entry.stat().st_mtime
-        except OSError:
-            continue
-        if current_mtime >= cutoff:
-            continue
-        try:
-            entry.unlink()
-            deleted += 1
-        except OSError as e:
-            logger.debug("Pretool GC: unlink %s failed: %s", entry, e)
-    if deleted:
-        logger.info("Pretool GC: deleted %d stale side file(s)", deleted)
-    return deleted
 
 
 def warn_if_pre_tool_use_hook_missing(
@@ -1079,26 +980,6 @@ def _resolve_ask_tool_input(window_id: str, explicit: dict | None) -> dict | Non
     return _last_completed_ask_tool_input.get(window_id)
 
 
-def _resolve_auq_source(
-    window_id: str,
-    explicit: dict | None,
-    pane_text: str,
-) -> dict | None:
-    """Resolve pane-aware AUQ source with render/callback parity.
-
-    Live PreToolUse side files win over stale completed-cache entries when the
-    side file validates against the current pane. Explicit JSONL input is next,
-    then the completed replay cache. PR-C wires this into render + callback.
-    """
-    pane_form = resolve_ask_form(None, pane_text) if pane_text else None
-    pretool_record = _resolve_pretool_record(window_id, pane_form)
-    if pretool_record is not None:
-        return pretool_record.tool_input
-    if explicit is not None:
-        return explicit
-    return _last_completed_ask_tool_input.get(window_id)
-
-
 # Public sibling-imported alias for use by ``bot.py`` callback handlers.
 # ``_resolve_ask_tool_input`` is module-internal by convention (underscore
 # prefix), but the pick-token callback at ``bot.py:2896`` needs the same
@@ -1113,404 +994,6 @@ def resolve_ask_tool_input(window_id: str) -> dict | None:
     the two paths produce byte-identical fingerprints.
     """
     return _last_completed_ask_tool_input.get(window_id)
-
-
-# ── AUQ PreToolUse-hook reader (v4 plan) ────────────────────────────────
-
-
-@dataclass(frozen=True)
-class PreToolAskRecord:
-    """A PreToolUse-hook AUQ side-file record.
-
-    Carries the structured ``tool_input`` from the AUQ tool_use payload
-    PLUS provenance fields (session_id, tool_use_id, written_at,
-    input_fingerprint) so the context gate (next chunk) can distinguish
-    this source from JSONL-derived cache entries. Acceptance into the
-    cache requires passing the projection predicate in
-    ``_record_consistent_with_pane`` — NOT digest equality. The
-    fingerprint is only a logging/integrity field.
-    """
-
-    tool_input: dict[str, Any]
-    session_id: str
-    tool_use_id: str  # may be "" if hook payload didn't carry one
-    written_at: float
-    input_fingerprint: str
-
-
-# Per-window in-memory cache of accepted PreToolAskRecord. Populated by
-# ``_resolve_pretool_record`` on each gate use; revalidated on every call
-# (no stale-serve). Cleared by ``forget_ask_tool_input`` (chunk 5) when
-# the AUQ resolves.
-_pretool_ask_records: dict[str, PreToolAskRecord] = {}
-
-_PRETOOL_TTL_SECONDS = 300  # 5 minutes (v4 plan; lowered from v2's 10)
-# Codex chunk-3 P1: future-timestamp guard. A side file with
-# ``written_at`` far in the future (clock skew, time tamper) would
-# otherwise stay valid indefinitely because ``time.time() - written_at``
-# is negative and the ``age > TTL`` check passes. Reject anything more
-# than this many seconds ahead of the bot's clock.
-_PRETOOL_FUTURE_SKEW_SECONDS = 30
-_PRETOOL_SCHEMA_VERSION = 1
-
-# Codex chunk-3 P2 (path-traversal defense in depth): require the
-# session_id used to construct ``auq_pending/<session_id>.json`` to
-# be a canonical UUID. The hook validates this upstream, and the bot
-# only resolves session_id via ``session_id_for_window`` which returns
-# whatever the session map stored — but defense-in-depth keeps a
-# corrupt/maliciously-edited session_map from constructing a side-file
-# path outside the pending directory. Use ``fullmatch()`` (codex P3 —
-# chunks 3+4) to reject trailing-newline edge cases that ``$`` would
-# tolerate.
-_SESSION_ID_RE = re.compile(
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-)
-# Codex chunk-3 P1: ``input_fingerprint`` is read from the side file
-# (UNTRUSTED) and previously logged as-is. A malformed or malicious
-# write could inject question text. Recompute the fingerprint from
-# the validated tool_input before logging — never trust the stored
-# value. Defense-in-depth: also reject anything that isn't a strict
-# 12-char hex digest before it enters the log surface.
-_FINGERPRINT_RE = re.compile(r"[0-9a-f]{12}")
-
-
-def _pretool_side_file_path(session_id: str) -> Path | None:
-    """Resolve the side-file path for ``session_id`` after UUID validation.
-
-    Returns ``None`` if ``session_id`` isn't a canonical UUID — defense
-    in depth against a corrupt session_map that ever stored e.g. ``../x``
-    in the session_id field.
-    """
-    if not _SESSION_ID_RE.fullmatch(session_id):
-        return None
-    return app_dir() / "auq_pending" / f"{session_id}.json"
-
-
-def _read_pretool_side_file(session_id: str) -> PreToolAskRecord | None:
-    """Read and parse the AUQ PreToolUse side file for ``session_id``.
-
-    Returns ``None`` on missing file (silent — hook hasn't fired yet or
-    already cleaned up), invalid session_id (path-traversal defense in
-    depth), JSON parse error, schema_version mismatch, or shape mismatch.
-
-    Codex chunk-3 P1 fix: the ``input_fingerprint`` carried in the
-    PreToolAskRecord is RECOMPUTED from the validated tool_input — never
-    trusted from the file. The stored value could otherwise be poisoned
-    by a malformed write and leak through the rejection-reason logs.
-
-    Does NOT validate TTL or pane compatibility — those happen in
-    ``_resolve_pretool_record`` against the live pane.
-    """
-    path = _pretool_side_file_path(session_id)
-    if path is None:
-        # session_id failed UUID validation — refuse to construct a
-        # path that could escape auq_pending/.
-        logger.warning(
-            "Pretool side file: refusing to resolve non-UUID session_id=%r",
-            session_id,
-        )
-        return None
-    try:
-        raw = path.read_text()
-    except FileNotFoundError:
-        return None
-    except OSError as e:
-        logger.debug("Pretool side file unreadable for %s: %s", session_id, e)
-        return None
-    try:
-        rec = json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.warning("Pretool side file malformed JSON for %s: %s", session_id, e)
-        return None
-    if not isinstance(rec, dict):
-        logger.warning("Pretool side file is not a dict: %s", session_id)
-        return None
-    if rec.get("schema_version") != _PRETOOL_SCHEMA_VERSION:
-        logger.warning(
-            "Pretool side file schema_version=%r unknown for %s",
-            rec.get("schema_version"),
-            session_id,
-        )
-        return None
-    tool_input = rec.get("tool_input")
-    if not isinstance(tool_input, dict):
-        logger.warning("Pretool side file tool_input invalid for %s", session_id)
-        return None
-    try:
-        written_at = float(rec.get("written_at", 0))
-    except (TypeError, ValueError):
-        return None
-
-    # Recompute the fingerprint from the validated tool_input — never
-    # trust the stored value (codex chunk-3 P1). If pairs extraction
-    # fails, the side file is malformed; reject.
-    from ..terminal_parser import (
-        questions_content_digest,
-        questions_content_pairs_from_tool_input,
-    )
-
-    pairs = questions_content_pairs_from_tool_input(tool_input)
-    if pairs is None:
-        logger.warning(
-            "Pretool side file tool_input failed shape validation for %s",
-            session_id,
-        )
-        return None
-    fingerprint = questions_content_digest(pairs)
-
-    return PreToolAskRecord(
-        tool_input=tool_input,
-        session_id=str(rec.get("session_id", "") or session_id),
-        tool_use_id=str(rec.get("tool_use_id", "") or ""),
-        written_at=written_at,
-        input_fingerprint=fingerprint,
-    )
-
-
-def _safe_record_labels(question: dict) -> tuple[str, ...] | None:
-    """Extract ordered option labels from a tool_input question dict.
-
-    Returns ``None`` on shape mismatch. Mirrors
-    ``terminal_parser.questions_content_pairs_from_tool_input`` validation
-    so the predicate fails closed on malformed records.
-    """
-    options = question.get("options")
-    if not isinstance(options, list):
-        return None
-    labels: list[str] = []
-    for o in options:
-        if not isinstance(o, dict):
-            return None
-        label = o.get("label")
-        if not isinstance(label, str):
-            return None
-        labels.append(label)
-    return tuple(labels)
-
-
-def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> bool:
-    """True if ``visible`` is a contiguous subsequence of ``full``.
-
-    The pane may render only the visible region; earlier options can be
-    pushed off the top by long descriptions. We still accept the record
-    if whatever IS visible matches the corresponding contiguous slice of
-    the record's labels.
-    """
-    if not visible:
-        return False
-    if len(visible) > len(full):
-        return False
-    for start in range(len(full) - len(visible) + 1):
-        if full[start : start + len(visible)] == visible:
-            return True
-    return False
-
-
-def _pane_labels_match_candidate_by_number(
-    pane_form: AskUserQuestionForm,
-    candidate_labels: tuple[str, ...],
-) -> bool:
-    """True when every visible numbered pane option matches that candidate slot.
-
-    Compressed panes preserve option numbers even when earlier options are
-    off-screen, so a visible ``3. Label C`` must match ``candidate_labels[2]`` —
-    not just any occurrence of ``Label C``. If a future parser ever emits a
-    visible option without a number, fall back to the legacy contiguous
-    subsequence check because there is no stable slot to validate against.
-    """
-    pane_labels = tuple(o.label for o in pane_form.options)
-    if any(o.number is None for o in pane_form.options):
-        return _labels_are_subsequence(pane_labels, candidate_labels)
-
-    checked_any = False
-    for option in pane_form.options:
-        assert option.number is not None
-        index = option.number - 1
-        if 0 <= index < len(candidate_labels):
-            if candidate_labels[index] != option.label:
-                return False
-            checked_any = True
-        else:
-            if is_affordance_label(option.label):
-                continue
-            return False
-    return checked_any
-
-
-def _record_consistent_with_pane(
-    record: PreToolAskRecord,
-    pane_form: AskUserQuestionForm | None,
-) -> tuple[bool, str]:
-    """v4 plan step 5: projection-based structural predicate.
-
-    Returns ``(accepted, reason_code)``. On accept: ``(True, "ok")``.
-    On reject: ``(False, code)`` where ``code`` is one of:
-    ``no_pane_form``, ``no_candidate``, ``title_mismatch``,
-    ``label_mismatch``, ``count_sanity``.
-
-    Acceptance is structural — NOT digest equality. We compare projected
-    fields one at a time so each edge case (title-missing,
-    walkback-only-title, multi-question subset) has a principled answer.
-    NEVER computes ``AskUserQuestionForm.fingerprint()`` here — that
-    includes cursor/recommended/tab state and would reject valid records.
-    """
-    if pane_form is None or not pane_form.options:
-        return False, "no_pane_form"
-
-    raw_questions = record.tool_input.get("questions")
-    if not isinstance(raw_questions, list) or not raw_questions:
-        return False, "no_candidate"
-
-    pane_labels = tuple(o.label for o in pane_form.options)
-    pane_title = (pane_form.current_question_title or "").strip()
-    candidate: dict | None = None
-
-    # Step 5.a — pick a candidate record-question.
-    if len(raw_questions) == 1 and isinstance(raw_questions[0], dict):
-        candidate = raw_questions[0]
-    elif pane_form.current_tab_inferred and pane_title:
-        for q in raw_questions:
-            if not isinstance(q, dict):
-                continue
-            qt = (q.get("question") or "").strip()
-            if not qt:
-                continue
-            if qt.startswith(pane_title) or pane_title.startswith(qt):
-                candidate = q
-                break
-
-    if candidate is None:
-        # Multi-question fallthrough (current_tab_inferred=False, or no
-        # title match): accept the FIRST question whose labels match the
-        # visible labels as a subsequence.
-        for q in raw_questions:
-            if not isinstance(q, dict):
-                continue
-            q_labels = _safe_record_labels(q)
-            if q_labels is None:
-                continue
-            if _labels_are_subsequence(pane_labels, q_labels):
-                candidate = q
-                break
-    if candidate is None:
-        return False, "no_candidate"
-
-    # Step 5.b — TITLE check (conditional).
-    # Skip only when:
-    #   - pane title empty (including compressed panes where the current
-    #     question has scrolled off-screen)
-    #   - pane title sourced from walkback only (current_question_title is
-    #     empty, pane_walkback_title may be set but is unreliable per the
-    #     parser's docstring — DON'T use it for acceptance)
-    #   - candidate has no question title
-    #
-    # Deliberately do NOT require contiguous-from-1 options here: compressed
-    # panes can still expose a reliable current_question_title, and accepting
-    # a stale side file on labels alone can dispatch the old digit against a
-    # different live question. Residual: if the pane title is genuinely
-    # unparseable and labels coincidentally match a stale not-overwritten side
-    # file within TTL, that edge remains irreducible without question text.
-    candidate_title = (candidate.get("question") or "").strip()
-    if pane_title and candidate_title:
-        if not (
-            candidate_title.startswith(pane_title)
-            or pane_title.startswith(candidate_title)
-        ):
-            return False, "title_mismatch"
-
-    # Step 5.c — LABEL check (mandatory).
-    candidate_labels = _safe_record_labels(candidate)
-    if candidate_labels is None:
-        return False, "no_candidate"
-    if not _pane_labels_match_candidate_by_number(pane_form, candidate_labels):
-        return False, "label_mismatch"
-
-    # Step 5.d — option-count sanity for full match.
-    if pane_labels == candidate_labels:
-        if not pane_form.options_contiguous_from_one():
-            return False, "count_sanity"
-
-    return True, "ok"
-
-
-def _resolve_pretool_record(
-    window_id: str,
-    pane_form: AskUserQuestionForm | None,
-) -> PreToolAskRecord | None:
-    """Return the PreToolUse side-file record for ``window_id`` if it is
-    consistent with the live pane parse, else ``None``.
-
-    The cache invariant is revalidate-on-every-call: a record that no
-    longer matches the pane (user navigated, picker advanced, label set
-    drifted) MUST be evicted at the next call, not stale-served. This
-    keeps wrong-action class bugs out of the cache layer.
-
-    Reason codes for rejection are logged at DEBUG level (not INFO — the
-    reader runs on every status-poll iteration when an AUQ is visible,
-    and we don't want to flood the log). Question text is NEVER logged
-    here; only the reason code + the record's fingerprint.
-    """
-    # Codex chunk-3 P2: peek (read-only) — never mutate session_manager
-    # state by auto-creating a WindowState on miss. session_id_for_window
-    # via get_window_state would have that side-effect for unknown windows.
-    session_id = peek_session_id_for_window(window_id)
-    if not session_id:
-        logger.debug("Pretool resolve window=%s reason=missing_map", window_id)
-        _pretool_ask_records.pop(window_id, None)
-        return None
-
-    record = _read_pretool_side_file(session_id)
-    if record is None:
-        # Missing or malformed — evict any stale cache.
-        _pretool_ask_records.pop(window_id, None)
-        return None
-
-    # Defense-in-depth: only log fingerprints that match the strict
-    # hex shape. The reader recomputed it from validated tool_input,
-    # so this should always be true, but guard against future drift.
-    safe_fp = (
-        record.input_fingerprint
-        if _FINGERPRINT_RE.fullmatch(record.input_fingerprint)
-        else "<invalid>"
-    )
-
-    # TTL check + future-skew guard (codex chunk-3 P1). Negative age
-    # (timestamp in the future) is rejected to prevent a tampered or
-    # clock-skewed file from staying valid indefinitely.
-    age = time.time() - record.written_at
-    if age < -_PRETOOL_FUTURE_SKEW_SECONDS:
-        logger.debug(
-            "Pretool resolve window=%s reason=future_skew age=%.1fs fp=%s",
-            window_id,
-            age,
-            safe_fp,
-        )
-        _pretool_ask_records.pop(window_id, None)
-        return None
-    if age > _PRETOOL_TTL_SECONDS:
-        logger.debug(
-            "Pretool resolve window=%s reason=stale age=%.1fs fp=%s",
-            window_id,
-            age,
-            safe_fp,
-        )
-        _pretool_ask_records.pop(window_id, None)
-        return None
-
-    # Pane-compatibility predicate (revalidated every call).
-    consistent, reason = _record_consistent_with_pane(record, pane_form)
-    if not consistent:
-        logger.debug(
-            "Pretool resolve window=%s reason=%s fp=%s",
-            window_id,
-            reason,
-            safe_fp,
-        )
-        _pretool_ask_records.pop(window_id, None)
-        return None
-
-    _pretool_ask_records[window_id] = record
-    return record
 
 
 # ── Per-route asyncio.Lock ───────────────────────────────────────────────
@@ -3333,7 +2816,9 @@ async def handle_interactive_ui(
         # ``current_tab_inferred``; the FA5+ guard in
         # ``_build_pick_button_rows`` suppresses pick buttons when False so
         # we don't dispatch a digit against the wrong tab.
-        resolved_input = _resolve_auq_source(window_id, tool_input, pane_text)
+        resolved_input = auq_source.resolve_auq_source(
+            window_id, tool_input, pane_text
+        ).payload
         form = resolve_ask_form(resolved_input, pane_text)
         if form is None:
             # Belt-and-braces fallback. resolve_ask_form already tries
@@ -3415,7 +2900,7 @@ async def handle_interactive_ui(
             # Source-of-truth selection — v4 plan, tri-level:
             #   1. JSONL via _resolve_ask_tool_input + _last_auq_tool_use_id
             #      → ctx_source = dict; source_tag = "dict_via_jsonl"
-            #   2. PreToolUse-hook side file via _resolve_pretool_record
+            #   2. PreToolUse-hook side file via auq_source.resolve_record
             #      → ctx_source = dict; source_tag = "dict_via_hook";
             #        dedup_key = "pretool:<tool_use_id>" (or
             #        "pretool:<input_fingerprint>" when the hook payload
@@ -3432,11 +2917,13 @@ async def handle_interactive_ui(
             cached_tool_use_id = _last_auq_tool_use_id.get(window_id)
 
             # Resolve the PreToolUse-hook record only when JSONL is silent
-            # (the common case for live AUQs). _resolve_pretool_record
+            # (the common case for live AUQs). auq_source.resolve_record
             # revalidates the cached record against the live pane on
             # every call (v4 plan cache invariant).
-            pretool_record: PreToolAskRecord | None = (
-                _resolve_pretool_record(window_id, form) if ctx_input is None else None
+            pretool_record: auq_source.PreToolAskRecord | None = (
+                auq_source.resolve_record(window_id, form)
+                if ctx_input is None
+                else None
             )
 
             ctx_source: dict | AskUserQuestionForm | None
@@ -3828,9 +3315,10 @@ def reset_for_tests() -> None:
     Co-located with the state it resets (the R3 reset-seam contract): every
     map is resolved by direct module reference, never ``getattr(name)`` string
     indirection. Clears the picker/mode/meta/context maps, the pick-token
-    tables, the pretool-ask records, and ``_route_locks`` (created lazily by
-    ``_get_route_lock`` and otherwise never cleaned up, so clearing between
-    tests is a pure improvement — they are recreated on demand).
+    tables, and ``_route_locks`` (created lazily by ``_get_route_lock`` and
+    otherwise never cleaned up, so clearing between tests is a pure
+    improvement — they are recreated on demand). The PreToolUse record cache
+    moved to ``auq_source`` (R5); reset it via ``auq_source.reset_for_tests``.
 
     ``_clear_callbacks`` is a process-lifetime registry (``status_polling``
     registers ``_on_interactive_clear`` at import); it is intentionally NOT
@@ -3842,7 +3330,6 @@ def reset_for_tests() -> None:
     _interactive_msg_meta.clear()
     _last_completed_ask_tool_input.clear()
     _last_auq_tool_use_id.clear()
-    _pretool_ask_records.clear()
     _pick_tokens.clear()
     _pick_token_cache.clear()
     _auq_context_posted.clear()

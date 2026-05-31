@@ -28,7 +28,6 @@ _PER_TEST_DICT_NAMES = (
     "_interactive_msg_meta",
     "_last_completed_ask_tool_input",
     "_last_auq_tool_use_id",
-    "_pretool_ask_records",
     "_pick_tokens",
     "_pick_token_cache",
     "_auq_context_posted",

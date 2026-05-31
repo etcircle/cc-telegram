@@ -2789,7 +2789,7 @@ class TestPrBMultiSelectDetection:
     def test_source_parity_prefers_fresh_side_file_over_stale_cache(
         self, tmp_path, monkeypatch
     ):
-        from cctelegram.handlers import interactive_ui as iu
+        from cctelegram.handlers import auq_source
 
         session_id = "12345678-1234-1234-1234-123456789abc"
         pane = _fixture("auq_multiselect_compressed_long_cursor_only_tmux_capture.txt")
@@ -2823,15 +2823,19 @@ class TestPrBMultiSelectDetection:
                 }
             )
         )
-        monkeypatch.setattr(iu, "app_dir", lambda: tmp_path)
+        monkeypatch.setattr(auq_source, "app_dir", lambda: tmp_path)
         monkeypatch.setattr(
-            iu, "peek_session_id_for_window", lambda _window_id: session_id
+            auq_source, "peek_session_id_for_window", lambda _window_id: session_id
         )
-        iu._last_completed_ask_tool_input["@1"] = stale
+        # The stale JSONL cache is read via the injected getter; the fresh
+        # side file must still win (side_file branch precedes jsonl_cache).
+        auq_source.set_jsonl_cache_getter(lambda wid: stale if wid == "@1" else None)
         try:
-            assert iu._resolve_auq_source("@1", None, pane) == fresh
+            resolved = auq_source.resolve_auq_source("@1", None, pane)
+            assert resolved.kind == "side_file"
+            assert resolved.payload == fresh
         finally:
-            iu._last_completed_ask_tool_input.pop("@1", None)
+            auq_source.reset_for_tests()
 
 
 # ── Task #9 — arrow-nav stale-scrollback cursor regression ──────────────────
