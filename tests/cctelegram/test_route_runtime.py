@@ -414,6 +414,284 @@ async def test_mark_session_reset_drops_open_tools_and_usage():
     assert snap.context_usage is None
 
 
+# ── pane_interactive_pending: promote / clear / branch-scoped reclaim ─────
+#
+# Bug 1: while Claude Code buffers an interactive tool_use in JSONL, the poller
+# PROMOTES an active RUNNING route to WAITING_ON_USER via
+# ``mark_interactive_pending`` (lower authority than the transcript). The
+# transcript reclaim (and ``mark_interactive_cleared`` / ``mark_session_reset``)
+# retract it. Invariant: ``interactive_pending`` is True ⟺ a *pane-set*
+# WAITING_ON_USER (empty open_tools).
+
+
+def test_derive_run_state_ordering():
+    """The deriver: transcript open-tool set is strictly above the pane bit;
+    the bit is consulted only on an empty open set."""
+    derive = route_runtime._state_from_open_tools
+    # Interactive transcript id wins regardless of the bit.
+    assert (
+        derive({"a": True}, pane_interactive_pending=True) is RunState.WAITING_ON_USER
+    )
+    assert derive({"a": True}) is RunState.WAITING_ON_USER
+    # Non-interactive tool open → RUNNING_TOOL; the pane bit is ignored.
+    assert derive({"a": False}, pane_interactive_pending=True) is RunState.RUNNING_TOOL
+    assert derive({"a": False}) is RunState.RUNNING_TOOL
+    # Empty open set: the bit decides WAITING vs RUNNING.
+    assert derive({}, pane_interactive_pending=True) is RunState.WAITING_ON_USER
+    assert derive({}) is RunState.RUNNING
+
+
+async def test_mark_interactive_pending_promotes_running_only():
+    # RUNNING → WAITING_ON_USER + bit; typing suppressed.
+    await route_runtime.mark_inbound_sent(ROUTE)
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING
+    snap = await route_runtime.mark_interactive_pending(ROUTE)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+    assert snap.typing_eligible is False
+
+    # Idempotent: a second promote on the now-WAITING route is a no-op.
+    snap = await route_runtime.mark_interactive_pending(ROUTE)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+
+
+async def test_mark_interactive_pending_no_op_on_running_tool():
+    # RUNNING_TOOL (non-interactive tool open) is NOT promoted — the transcript
+    # has authority and the bit must not co-exist with an open tool.
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
+    )
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING_TOOL
+    snap = await route_runtime.mark_interactive_pending(ROUTE)
+    assert snap.run_state is RunState.RUNNING_TOOL
+    assert snap.interactive_pending is False
+
+
+async def test_mark_interactive_pending_no_op_on_running_with_stale_open_tools():
+    """codex/hermes P1: ``RUNNING`` does NOT imply an empty open set. A ``user``
+    turn mid-tool sets ``RUNNING`` while leaving a stale ``open_tools`` entry.
+    Promoting then would set the bit while the deriver returns RUNNING_TOOL /
+    transcript-WAITING, breaking the invariant. The promote must no-op."""
+    # (a) non-interactive tool still open under a RUNNING route.
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="bash", tool_name="Bash")
+    )
+    snap = await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
+    assert snap.run_state is RunState.RUNNING  # user turn set RUNNING...
+    assert snap.open_tools == frozenset({"bash"})  # ...but the tool is still open
+    snap = await route_runtime.mark_interactive_pending(ROUTE)
+    assert snap.interactive_pending is False  # NOT promoted
+    assert snap.run_state is RunState.RUNNING
+
+    # (b) interactive tool still open under a RUNNING route (Hermes path):
+    # promoting would have left the bit True on a transcript-set WAITING.
+    route_runtime.reset_for_tests()
+    await route_runtime.ingest_transcript_event(
+        ROUTE,
+        _evt("assistant", "tool_use", tool_use_id="auq", tool_name="AskUserQuestion"),
+    )
+    await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
+    snap = await route_runtime.mark_interactive_pending(ROUTE)
+    assert snap.interactive_pending is False  # NOT promoted (stale open tool)
+
+
+async def test_mark_interactive_pending_no_op_on_idle_and_unseen():
+    # Unseen route → no-op (never seeds / resurrects).
+    snap = await route_runtime.mark_interactive_pending(ROUTE)
+    assert snap.run_state is RunState.IDLE_CLEARED
+    assert snap.interactive_pending is False
+
+    # IDLE_RECENT (seen, idle) → no-op (never resurrects idle).
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "text", stop_reason="end_turn")
+    )
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.IDLE_RECENT
+    snap = await route_runtime.mark_interactive_pending(ROUTE)
+    assert snap.run_state is RunState.IDLE_RECENT
+    assert snap.interactive_pending is False
+
+
+async def test_mark_interactive_pending_no_op_on_transcript_waiting():
+    """Double-resume guard: a transcript-set WAITING (interactive id open) is
+    NOT touched — promote fires only from RUNNING, so the bit is never set when
+    a transcript interactive tool is already open."""
+    await route_runtime.ingest_transcript_event(
+        ROUTE,
+        _evt("assistant", "tool_use", tool_use_id="auq", tool_name="AskUserQuestion"),
+    )
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
+    snap = await route_runtime.mark_interactive_pending(ROUTE)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is False  # bit NOT set on transcript-WAITING
+
+
+async def test_mark_interactive_cleared_retracts_pane_set_waiting():
+    await route_runtime.mark_inbound_sent(ROUTE)
+    await route_runtime.mark_interactive_pending(ROUTE)
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
+
+    snap = await route_runtime.mark_interactive_cleared(ROUTE)
+    # Empty open set → back to RUNNING; bit dropped.
+    assert snap.run_state is RunState.RUNNING
+    assert snap.interactive_pending is False
+
+    # Idempotent: clearing an already-cleared route is a no-op.
+    snap = await route_runtime.mark_interactive_cleared(ROUTE)
+    assert snap.run_state is RunState.RUNNING
+    assert snap.interactive_pending is False
+
+
+async def test_mark_interactive_cleared_noops_against_transcript_waiting():
+    """A transcript-set WAITING (interactive id open) must NOT be retracted by
+    the pane clear — run_state is unchanged; only the (already-False) bit is
+    dropped."""
+    await route_runtime.ingest_transcript_event(
+        ROUTE,
+        _evt("assistant", "tool_use", tool_use_id="auq", tool_name="AskUserQuestion"),
+    )
+    snap = await route_runtime.mark_interactive_cleared(ROUTE)
+    assert snap.run_state is RunState.WAITING_ON_USER  # UNCHANGED
+    assert snap.interactive_pending is False
+    assert snap.waiting_on_user_tools == frozenset({"auq"})
+
+
+async def _pane_set_waiting(route: route_runtime.Route) -> None:
+    """Drive ``route`` into the pane-set WAITING state (bit True, empty
+    open_tools) via the production path."""
+    await route_runtime.mark_inbound_sent(route)
+    await route_runtime.mark_interactive_pending(route)
+    snap = route_runtime.snapshot(route)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+
+
+async def test_transcript_reclaim_preserves_bit_on_text_and_thinking():
+    """A buffered plain-text / thinking continuation during a live prompt must
+    NOT strip the pane-set WAITING badge."""
+    await _pane_set_waiting(ROUTE)
+    snap = await route_runtime.ingest_transcript_event(ROUTE, _evt("assistant", "text"))
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "thinking")
+    )
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+
+
+async def test_transcript_reclaim_interactive_tool_use_takes_over_bit():
+    await _pane_set_waiting(ROUTE)
+    # The buffered interactive tool_use finally flushes → transcript-set WAITING.
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE,
+        _evt("assistant", "tool_use", tool_use_id="auq", tool_name="AskUserQuestion"),
+    )
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is False  # bit superseded by the transcript
+    assert snap.waiting_on_user_tools == frozenset({"auq"})
+
+
+async def test_transcript_reclaim_noninteractive_tool_use_clears_bit():
+    await _pane_set_waiting(ROUTE)
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
+    )
+    assert snap.run_state is RunState.RUNNING_TOOL
+    assert snap.interactive_pending is False
+
+
+async def test_transcript_reclaim_end_of_turn_clears_bit():
+    await _pane_set_waiting(ROUTE)
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "text", stop_reason="end_turn")
+    )
+    assert snap.run_state is RunState.IDLE_RECENT
+    assert snap.interactive_pending is False
+
+
+async def test_transcript_reclaim_user_turn_clears_bit():
+    await _pane_set_waiting(ROUTE)
+    snap = await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
+    assert snap.run_state is RunState.RUNNING
+    assert snap.interactive_pending is False
+
+
+async def test_tool_result_unknown_id_preserves_bit():
+    """An unknown-id tool_result early-returns: it must NOT strand a pane-set
+    WAITING (the early-return at the unknown-id branch leaves run_state + bit
+    untouched)."""
+    await _pane_set_waiting(ROUTE)
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "tool_result", tool_use_id="never-opened")
+    )
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+
+
+async def test_known_tool_result_reclaim_is_bit_safe():
+    """Defensive belt-and-suspenders: the known-id tool_result branch zeroes the
+    bit before re-deriving. Unreachable with the bit True via the public API
+    (promote requires an empty open set), so the artificial state is seeded
+    directly to exercise the branch."""
+    st = route_runtime._RouteState()
+    st.seen = True
+    st.run_state = RunState.WAITING_ON_USER
+    st.open_tools = {"t1": False}
+    st.invalidate_tool_cache()
+    st.pane_interactive_pending = True
+    route_runtime._state[ROUTE] = st
+
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "tool_result", tool_use_id="t1")
+    )
+    assert snap.run_state is RunState.RUNNING  # open set now empty
+    assert snap.interactive_pending is False
+
+
+async def test_pane_idle_clear_preserves_pane_set_waiting():
+    """A pane-set WAITING survives a due pane-idle card-clear (the same
+    preservation as a transcript-set WAITING; ``_reconcile_pane_idle_in_place``
+    is unchanged). ``commit_pane_idle_clear`` returns True — it latches the
+    debounce sentinel — consistent with ``test_commit_preserves_waiting_on_user``;
+    the run-state is what matters and it stays WAITING. (The plan's draft test
+    table said the commit returns False; that conflicts with the existing
+    transcript-WAITING contract and the documented no-change to the reconciler,
+    so the invariant asserted here is preservation of WAITING + the bit.)"""
+    await _pane_set_waiting(ROUTE)
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is True
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+
+
+async def test_mark_interactive_pending_rearms_stale_pane_idle_deadline():
+    """Defensive hardening: a pane-idle deadline armed during the prior RUNNING
+    stretch is cancelled by the promote, so a pane-set WAITING never carries a
+    live card-clear deadline (invariant held locally in route_runtime, not via
+    the status_polling control-flow contract)."""
+    await route_runtime.mark_inbound_sent(ROUTE)  # RUNNING
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    assert route_runtime.snapshot(ROUTE).pane_idle_clear_at == 100.0 + _DELAY
+    snap = await route_runtime.mark_interactive_pending(ROUTE)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+    assert snap.pane_idle_clear_at is None  # stale deadline cancelled
+
+
+async def test_session_reset_drops_pane_bit():
+    await _pane_set_waiting(ROUTE)
+    snap = await route_runtime.mark_session_reset(ROUTE)
+    assert snap.run_state is RunState.IDLE_CLEARED
+    assert snap.interactive_pending is False
+
+
+def test_default_snapshot_has_interactive_pending_false():
+    assert route_runtime.snapshot(ROUTE).interactive_pending is False
+
+
 # ── status card lifecycle ───────────────────────────────────────────────
 
 

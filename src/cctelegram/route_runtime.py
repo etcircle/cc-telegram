@@ -65,6 +65,22 @@ Concurrency contract:
     ``RUNNING`` / ``RUNNING_TOOL`` to ``IDLE_CLEARED`` after the debounce
     delay has elapsed, keeping the visible "🟡 Busy" card and the
     run-state machine in sync.
+  - A pane/lifecycle signal may also **PROMOTE** an *active* ``RUNNING``
+    route (empty ``open_tools``) to ``WAITING_ON_USER`` via
+    ``mark_interactive_pending`` — for the window where Claude Code buffers
+    an interactive ``tool_use`` (AskUserQuestion / ExitPlanMode) in JSONL,
+    so the transcript can't yet open the id. It is **strictly lower
+    authority than the transcript**: the deriver checks ``open_tools``
+    first, the promote fires only on an active ``RUNNING`` route, and the
+    ``tool_use`` / known-``tool_result`` / end-of-turn / user branches zero
+    the ``pane_interactive_pending`` bit (a plain-text/thinking
+    continuation or an unknown ``tool_result`` preserves it). It never
+    resurrects idle, seeds an unseen route, overrides a transcript
+    ``RUNNING_TOOL``, or clobbers a transcript-set ``WAITING_ON_USER``.
+    ``mark_interactive_cleared`` is the sole programmatic retract (no-op
+    against a transcript-set ``WAITING_ON_USER``). Both run **under the
+    route lock** — like every other run-state transition, no sync side-band
+    transitions ``run_state``.
 
 Persistence policy:
 
@@ -201,6 +217,13 @@ class RouteRuntimeSnapshot:
     typing_eligible: bool
     status_card_visible: bool
     status_card_msg_id: int | None
+    # Pane-confirmed "interactive prompt is live" bit. True only while the
+    # poller has promoted an active RUNNING route to WAITING_ON_USER for a
+    # buffered interactive tool_use (see ``mark_interactive_pending``).
+    # Invariant: ``interactive_pending`` is True ⟺ ``run_state`` is a
+    # *pane-set* WAITING_ON_USER (the deriver folds the bit into the
+    # empty-``open_tools`` branch). Lower authority than the transcript.
+    interactive_pending: bool
 
 
 @dataclass
@@ -224,6 +247,12 @@ class _RouteState:
     # status_clear.
     pane_idle_cleared: bool = False
     status_card_msg_id: int | None = None
+    # Lower-authority pane input to the deriver (NOT a parallel run_state).
+    # Set True only by ``mark_interactive_pending`` (promote an active RUNNING
+    # route to WAITING_ON_USER while an interactive tool_use is buffered in
+    # JSONL); cleared by ``mark_interactive_cleared``, the branch-scoped
+    # transcript reclaim in ``_apply_lifecycle_event``, and ``mark_session_reset``.
+    pane_interactive_pending: bool = False
     seen: bool = False  # have we ever observed this route?
     # Cached frozensets — invalidated on any open_tools mutation.
     # Most snapshots happen with no open tools (idle route), so the
@@ -291,15 +320,29 @@ def _now() -> float:
     return time.monotonic()
 
 
-def _state_from_open_tools(open_tools: dict[str, bool]) -> RunState:
+def _state_from_open_tools(
+    open_tools: dict[str, bool], *, pane_interactive_pending: bool = False
+) -> RunState:
     """Derive the run state from the current open-tool set.
 
-    Empty → RUNNING (turn still in flight, no tools pending).
-    Any interactive id → WAITING_ON_USER (user input gates progress).
-    Otherwise → RUNNING_TOOL (model is waiting on tool output).
+    Transcript is strictly above the pane bit:
+
+      - Empty ``open_tools`` → WAITING_ON_USER iff ``pane_interactive_pending``
+        (a buffered interactive ``tool_use`` the transcript can't open yet),
+        else RUNNING (turn still in flight, no tools pending).
+      - Any interactive id open → WAITING_ON_USER (transcript-set; **the pane
+        bit is ignored** — it is only reachable on an empty ``open_tools``).
+      - Otherwise → RUNNING_TOOL (a non-interactive tool is open; pane bit
+        ignored).
+
+    ``pane_interactive_pending`` defaults False so every existing positional
+    caller (``seed_open_tools`` / the transcript reclaim branches) is
+    byte-identical.
     """
     if not open_tools:
-        return RunState.RUNNING
+        return (
+            RunState.WAITING_ON_USER if pane_interactive_pending else RunState.RUNNING
+        )
     if any(open_tools.values()):
         return RunState.WAITING_ON_USER
     return RunState.RUNNING_TOOL
@@ -320,6 +363,7 @@ def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
         typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
+        interactive_pending=st.pane_interactive_pending,
     )
 
 
@@ -343,6 +387,7 @@ def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
         typing_eligible=False,
         status_card_visible=False,
         status_card_msg_id=None,
+        interactive_pending=False,
     )
 
 
@@ -401,6 +446,12 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         )
         st.open_tools[event.tool_use_id] = is_interactive
         st.invalidate_tool_cache()
+        # Transcript reclaim: the buffered turn flushed. An interactive
+        # tool_use now opens the id (→ WAITING from open_tools); a
+        # non-interactive one → RUNNING_TOOL. Either way the pane bit is
+        # superseded by the transcript — zero it before deriving so the
+        # derived state comes purely from open_tools.
+        st.pane_interactive_pending = False
         _set_run_state(st, _state_from_open_tools(st.open_tools))
         return
 
@@ -412,9 +463,14 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
     # enough.
     if block == "tool_result" and event.tool_use_id:
         if event.tool_use_id not in st.open_tools:
+            # Unknown id (stale / pre-startup). Preserve run_state AND the pane
+            # bit — an unknown tool_result must not strand a pane-set WAITING.
             return
         st.open_tools.pop(event.tool_use_id, None)
         st.invalidate_tool_cache()
+        # Transcript reclaim on a KNOWN id: the buffered turn flushed. Zero
+        # the pane bit before deriving from the remaining open set.
+        st.pane_interactive_pending = False
         _set_run_state(st, _state_from_open_tools(st.open_tools))
         return
 
@@ -427,6 +483,8 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         and stop_reason in _TURN_END_REASONS
         and not st.open_tools
     ):
+        # End-of-turn reclaims authority from the pane bit (the turn is over).
+        st.pane_interactive_pending = False
         _set_run_state(st, RunState.IDLE_RECENT)
         return
 
@@ -451,8 +509,10 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         st.last_event_at = _now()
         return
 
-    # User non-tool_result: user prompted Claude — RUNNING.
+    # User non-tool_result: user prompted Claude — RUNNING. A fresh user turn
+    # supersedes any pane-set WAITING (the prompt was answered or replaced).
     if role == "user" and block != "tool_result":
+        st.pane_interactive_pending = False
         _set_run_state(st, RunState.RUNNING)
         return
 
@@ -517,6 +577,7 @@ def snapshot(route: Route) -> RouteRuntimeSnapshot:
         typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
+        interactive_pending=st.pane_interactive_pending,
     )
 
 
@@ -543,6 +604,81 @@ async def mark_inbound_sent(route: Route) -> RouteRuntimeSnapshot:
             st.seen = True
         # Inbound delivery is real activity — re-arm the pane-idle debounce.
         _rearm_pane_idle_in_place(st)
+        snap = _freeze(route, st)
+    return snap
+
+
+async def mark_interactive_pending(route: Route) -> RouteRuntimeSnapshot:
+    """Promote an active ``RUNNING`` route to ``WAITING_ON_USER`` for a
+    buffered interactive ``tool_use`` (AskUserQuestion / ExitPlanMode).
+
+    Called by ``status_polling`` from a **pane-confirmed** live picker /
+    plan-approval surface while Claude Code buffers the interactive
+    ``tool_use`` in JSONL (so the transcript can't open the id yet). Lower
+    authority than the transcript:
+
+      - **Promote-from-RUNNING-with-empty-open-tools-only.** No-op on an
+        unseen / idle / ``RUNNING_TOOL`` / already-``WAITING_ON_USER`` route
+        — it never resurrects idle, seeds an unseen route, overrides a
+        transcript ``RUNNING_TOOL``, or clobbers a transcript-set ``WAITING``.
+        It ALSO requires an **empty ``open_tools``**: ``RUNNING`` does not
+        imply an empty open set (a ``user`` turn mid-tool sets ``RUNNING``
+        while leaving a stale ``open_tools`` entry — codex/hermes P1), and
+        promoting then would set the bit while the deriver, seeing the
+        non-empty set, returns ``RUNNING_TOOL`` / transcript-``WAITING`` —
+        breaking the invariant "``interactive_pending`` ⟺ pane-set
+        ``WAITING_ON_USER`` (empty ``open_tools``)". Empty + ``RUNNING`` is
+        the only state where setting the bit derives a clean pane-set
+        ``WAITING_ON_USER``.
+      - **Idempotent** across the 1 Hz poll ticks (already-WAITING → no-op).
+
+    The bit (and the ``WAITING`` it derives) is retracted by the transcript
+    reclaim (``_apply_lifecycle_event``), ``mark_interactive_cleared`` (the
+    poller liveness reconciliation), ``mark_session_reset``, or route
+    teardown (``clear_route``).
+    """
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state_for_route(route)
+        if not st.seen or st.run_state is not RunState.RUNNING or st.open_tools:
+            return _freeze(route, st)
+        st.pane_interactive_pending = True
+        _set_run_state(
+            st, _state_from_open_tools(st.open_tools, pane_interactive_pending=True)
+        )
+        # Promotion to WAITING is real activity — cancel any stale pane-idle
+        # debounce armed during the prior RUNNING/idle-pane stretch. This keeps
+        # the invariant "a pane-set WAITING never carries a live pane-idle
+        # deadline" inside route_runtime, independent of the status_polling
+        # control-flow contract (defensive; the deadline would otherwise be
+        # dormant during the live prompt anyway).
+        _rearm_pane_idle_in_place(st)
+        snap = _freeze(route, st)
+    return snap
+
+
+async def mark_interactive_cleared(route: Route) -> RouteRuntimeSnapshot:
+    """Retract a pane-set ``WAITING_ON_USER`` — the SOLE programmatic clear.
+
+    Called by ``status_polling``'s liveness reconciliation (mode-ended) and
+    the in-mode tombstone when no live interactive surface remains. It clears
+    only a **pane-set** WAITING (``run_state`` WAITING with no transcript
+    interactive id open). Against a **transcript-set** WAITING (an interactive
+    id is open in ``open_tools``) it is a run-state NO-OP — it only drops the
+    already-False bit — so it can never strip a genuine transcript ``WAITING``.
+    Never arms idle. Runs under the route lock.
+    """
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state_for_route(route)
+        if st.run_state is RunState.WAITING_ON_USER and not any(st.open_tools.values()):
+            st.pane_interactive_pending = False
+            # Empty / non-interactive open set → RUNNING / RUNNING_TOOL.
+            _set_run_state(st, _state_from_open_tools(st.open_tools))
+        else:
+            # Transcript-set WAITING (interactive id open) or not-waiting →
+            # drop the (already-False) bit only; do NOT transition run_state.
+            st.pane_interactive_pending = False
         snap = _freeze(route, st)
     return snap
 
@@ -651,9 +787,15 @@ def pane_idle_clear_due(route: Route, *, now: float) -> bool:
 async def commit_pane_idle_clear(route: Route, *, now: float) -> bool:
     """Perform the debounced card clear once the deadline is due.
 
-    Returns ``True`` iff it actually cleared (reconciled run-state, dropped the
-    deadline, latched the ``pane_idle_cleared`` sentinel); ``False``
-    if it no-op'd. Callers enqueue the card clear ONLY on ``True``.
+    Returns ``True`` iff the armed deadline was still due at lock time — i.e.
+    the debounce *fired*: the deadline was dropped and the ``pane_idle_cleared``
+    sentinel latched. ``False`` if it no-op'd (re-armed / cancelled / not yet
+    due). Callers enqueue the card clear ONLY on ``True``. **NOTE:** ``True``
+    does NOT imply ``run_state`` changed — ``_reconcile_pane_idle_in_place``
+    *preserves* a ``WAITING_ON_USER`` route (transcript- or pane-set; pane has
+    lower authority), so for WAITING the deadline is consumed and ``True`` is
+    returned while the run-state is left untouched. Only ``RUNNING`` /
+    ``RUNNING_TOOL`` are reconciled to ``IDLE_CLEARED``.
 
     TOCTOU re-validation (Codex 8b P1): the caller checks
     ``pane_idle_clear_due`` WITHOUT the lock, then ``await``\\s this. Between
@@ -717,6 +859,8 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         # Fresh session — drop any pending/completed pane-idle debounce so
         # the new session's first idle stretch arms from scratch.
         _rearm_pane_idle_in_place(st)
+        # The old session's interactive prompt (if any) is gone with it.
+        st.pane_interactive_pending = False
         _set_run_state(st, RunState.IDLE_CLEARED)
         snap = _freeze(route, st)
     return snap
@@ -910,6 +1054,8 @@ __all__ = [
     "commit_pane_idle_clear",
     "ingest_transcript_event",
     "mark_inbound_sent",
+    "mark_interactive_cleared",
+    "mark_interactive_pending",
     "mark_pane_idle",
     "mark_session_reset",
     "mark_status_card_cleared",
