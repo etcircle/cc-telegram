@@ -2148,13 +2148,18 @@ async def _finalize_activity_digest(
     await _flush_activity_digest_now(bot, user_id, thread_id)
 
 
-async def _refresh_activity_digest_if_present(
+async def refresh_activity_digest_if_present(
     bot: Bot,
     user_id: int,
     thread_id: int | None,
     window_id: str,
 ) -> None:
-    """Re-render an existing activity digest after attention state changes."""
+    """Re-render an existing activity digest after attention/run-state changes.
+
+    Public seam: ``status_polling`` calls this on a run-state transition
+    (e.g. the pane-confirmed WAITING_ON_USER promotion / its retract) to
+    repaint the digest header immediately. No-ops when no digest for
+    ``(user_id, thread_id)`` is on screen, or when its window_id differs."""
     tid = thread_id or 0
     state = _activity_msg_info.get((user_id, tid))
     if not state or state.window_id != window_id:
@@ -2399,7 +2404,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             bot, user_id, task.thread_id, wid, logical_text, task.content_type
         )
         if task.content_type == "text" and attention.is_attention_request(logical_text):
-            await _refresh_activity_digest_if_present(bot, user_id, task.thread_id, wid)
+            await refresh_activity_digest_if_present(bot, user_id, task.thread_id, wid)
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":

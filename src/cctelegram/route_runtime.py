@@ -590,6 +590,13 @@ async def mark_inbound_sent(route: Route) -> RouteRuntimeSnapshot:
     Idempotent: never downgrades RUNNING_TOOL / WAITING_ON_USER.
     Otherwise transitions to RUNNING so the typing indicator and status
     card show activity before the first JSONL event lands.
+
+    A **pane-set** WAITING_ON_USER (``pane_interactive_pending`` True) is
+    preserved here by design — exactly like a transcript-set WAITING — and
+    the bit is left set: a prompt typed while a picker is still live keeps the
+    route WAITING until the transcript user-turn reclaim
+    (``_apply_lifecycle_event``) and/or the poller's mode-ended reconciliation
+    retract it within a tick. ``mark_inbound_sent`` does not clear the bit.
     """
     lock = _lock_for_route(route)
     async with lock:
@@ -1030,6 +1037,28 @@ def clear_route(route: Route) -> None:
     _state.pop(route, None)
 
 
+def clear_routes_for_topic(user_id: int, thread_id_or_0: int) -> None:
+    """Drop all per-route state for every route under ``(user_id, thread_id_or_0)``.
+
+    route_runtime's OWN topic-teardown seam: route ownership must NOT be derived
+    from ``message_queue._route_queues``. A route can carry run-state /
+    ``pane_interactive_pending`` via ``mark_inbound_sent`` / JSONL replay /
+    ``mark_interactive_pending`` *without ever having a message_queue worker*
+    (a queue is created only when content is enqueued). A topic teardown that
+    only walks ``routes_for_topic`` (queued routes) would therefore strand such
+    a route's state — e.g. a pane-set ``WAITING_ON_USER`` left after the topic
+    is closed / the window is gone (hermes round-2 P2). ``clear_topic_state``
+    calls this so route_runtime is torn down for the WHOLE topic regardless of
+    queue presence.
+
+    Synchronous side-band write (drops state, no ``run_state`` transition — like
+    ``clear_route``); keeps the locks (cheap, re-acquired on rebind). Safe under
+    single-threaded asyncio: no ``await`` between reading ``_state`` and popping.
+    """
+    for key in [k for k in _state if k[0] == user_id and k[1] == thread_id_or_0]:
+        _state.pop(key, None)
+
+
 def reset_for_tests() -> None:
     """Test-only: drop all per-route state and locks.
 
@@ -1051,6 +1080,7 @@ __all__ = [
     "TranscriptLifecycleEvent",
     "arm_pane_idle_clear",
     "clear_route",
+    "clear_routes_for_topic",
     "commit_pane_idle_clear",
     "ingest_transcript_event",
     "mark_inbound_sent",

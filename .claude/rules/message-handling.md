@@ -42,7 +42,8 @@ and freezes an immutable snapshot read via `snapshot(route)` (no
 observer/push channel). Snapshot
 fields: `run_state`, `open_tools`, `waiting_on_user_tools`,
 `context_usage`, `last_event_at`, `idle_clear_at`, `pane_idle_clear_at`,
-`typing_eligible`, `status_card_visible`, `status_card_msg_id`. The two
+`typing_eligible`, `status_card_visible`, `status_card_msg_id`,
+`interactive_pending`. The two
 idle deadlines are distinct:
 `idle_clear_at` is the run-state `IDLE_RECENT → IDLE_CLEARED` decay
 (armed by a transcript end-of-turn), while `pane_idle_clear_at` is the
@@ -64,6 +65,52 @@ snapshot's `status_card_visible` flag is accurate for external
 consumers. If a change ever needs to mutate `message_queue` internals
 beyond that boundary, the kill criterion fires — promote a Route Outbox
 slice now.
+
+**Pane-set `WAITING_ON_USER` (live AUQ / ExitPlanMode "🔔 Waiting on you")** —
+Claude Code buffers the interactive `tool_use` (AskUserQuestion / ExitPlanMode)
+in JSONL until the prompt resolves, so `route_runtime` never ingests it and the
+route would otherwise stay `RUNNING` ("🟡 Busy" + false "typing…"). The
+lower-authority `pane_interactive_pending` bit is a **derivation input** (NOT a
+parallel `run_state`): the deriver folds it into the empty-`open_tools` branch
+(`WAITING_ON_USER` if the bit else `RUNNING`), so the single committed
+`run_state` flips and the digest header + `typing_eligible` follow. The mutator
+pair: `mark_interactive_pending` PROMOTES an **active `RUNNING` route with an
+empty `open_tools` set** (the only state where setting the bit derives a clean
+pane-set `WAITING`; `RUNNING` does not imply empty — a user turn mid-tool leaves
+a stale entry) and re-arms the pane-idle debounce; `mark_interactive_cleared` is
+the sole programmatic retract (NO-OP against a transcript-set `WAITING`).
+**SET is pane-confirmed only**, fired by `status_polling.update_status_message`
+at the live-picker proof points — site (a) `ui_content` present, site (b)
+`is_picker_anchor_visible`, site (d) first-render dispatch — so the bit is True
+⟺ a pane-set `WAITING`. **Site (c) (`side_file_live_for_window`, obscured pane)
+is BIT-NEUTRAL**: it preserves the card but never promotes, so the bit shares
+the AUQ card's liveness boundary and a double-`--resume` sibling (whose pane
+never shows the picker) is never falsely lit. **CLEAR** is: the transcript
+reclaim (primary — the `tool_use`/known-`tool_result`/end-of-turn/user branches
+zero the bit when the buffered turn flushes; plain-text/thinking and an
+unknown-id `tool_result` preserve it); the poller **mode-ended liveness
+reconciliation** in the `interactive_window != window_id` block (gap-free —
+covers mode-popped / window-switch / ExitPlanMode-no-flush, no flush dependency);
+the **in-mode tombstone** (`mark_interactive_cleared` alongside the
+`clear_interactive_msg(tombstone=True)`); and route teardown — the bit is
+dropped wherever route_runtime state is cleared: **directly** at the
+`inbound_telegram` stale-window unbinds (`clear_route`) and via
+`mark_session_reset` (`/clear`), and via `clear_topic_state` →
+`route_runtime.clear_routes_for_topic(user, thread)` on topic-close /
+poller window-gone. The topic seam is **route_runtime's own** — it drops every
+route under `(user, thread)` and is NOT derived from
+`message_queue._route_queues` (a route can carry run-state /
+`pane_interactive_pending` via `mark_inbound_sent` / replay /
+`mark_interactive_pending` with no queue worker, so a `_route_queues`-only
+enumeration would strand it; hermes round-2 P2). The digest header repaints on a
+run-state transition via the poller's `_maybe_repaint_digest_on_transition`
+(seeds without an edit on first observation; fires
+`message_queue.refresh_activity_digest_if_present` once per change, both
+directions; backed by the poller-local self-healing `_prev_run_state` dedup
+cache, torn down only in the window-gone path — popping it on the bot-less
+interactive-clear seam would mask the post-clear repaint). Pull-only; no
+observer channel (c313657 stays forbidden). The bot-less `_on_interactive_clear`
+seam is UNCHANGED — it touches neither the bit nor `_prev_run_state`.
 
 **AUQ card-liveness authority (pane is lower authority than the
 lifecycle)** — `status_polling`'s pane-absent clear gate must not tombstone

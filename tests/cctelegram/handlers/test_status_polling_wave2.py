@@ -40,11 +40,13 @@ def _clear_state():
     _interactive_mode.clear()
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
+    status_polling._prev_run_state.clear()
     route_runtime.reset_for_tests()
     yield
     _interactive_mode.clear()
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
+    status_polling._prev_run_state.clear()
     route_runtime.reset_for_tests()
 
 
