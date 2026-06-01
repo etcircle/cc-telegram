@@ -638,8 +638,13 @@ async def forward_command_handler(
         # Claude processes the slash command (most slash commands never
         # produce a transcript event — /model opens a pane UI, /clear resets
         # state — so the JSONL signal alone cannot light the indicator).
-        # status_polling will downgrade to WAITING_ON_USER if a pane
-        # interactive UI is detected later.
+        # ``status_polling.update_status_message`` calls
+        # ``route_runtime.mark_interactive_pending`` on a pane-confirmed live
+        # interactive surface (AUQ picker or ExitPlanMode plan-approval),
+        # promoting RUNNING → WAITING_ON_USER while the interactive ``tool_use``
+        # is buffered in JSONL. It is retracted by the transcript flush
+        # (reclaim), the poller liveness reconciliation when no live surface
+        # remains, or route teardown (``clear_route`` / ``mark_session_reset``).
         await route_runtime.mark_inbound_sent(route)
         # If /clear command was sent, clear the session association
         # so we can detect the new session after first message

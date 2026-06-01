@@ -56,7 +56,11 @@ from .interactive_ui import (
     register_clear_callback,
 )
 from .cleanup import clear_topic_state
-from .message_queue import enqueue_status_update, get_content_queue
+from .message_queue import (
+    enqueue_status_update,
+    get_content_queue,
+    refresh_activity_digest_if_present,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +134,42 @@ _last_published_ui_hash: dict[tuple[int, int, str], str] = {}
 ABSENT_STREAK_THRESHOLD = 3  # ~3s at STATUS_POLL_INTERVAL=1.0
 _absent_streak: dict[tuple[int, int, str], int] = {}
 
+# Per-route last-rendered run_state, keyed by ``(user_id, thread_id_or_0,
+# window_id)``. Drives ``_maybe_repaint_digest_on_transition``: a poller-local,
+# self-healing repaint-dedup cache so the activity-digest header is re-rendered
+# exactly once per run-state transition (e.g. the pane-confirmed RUNNING →
+# WAITING_ON_USER promotion, or its retract). Read ONLY inside that helper
+# (which is only ever called from the poller), so a leaked entry is harmless: at
+# worst one spurious ``refresh_activity_digest_if_present`` that no-ops when no
+# matching digest is on screen. Torn down best-effort in the window-gone path;
+# NOT popped on external interactive-clear / window-switch (popping there masked
+# the post-clear repaint — the v3 shared P1). Pull-only; no observer channel.
+_UNSEEN = object()
+_prev_run_state: dict[tuple[int, int, str], object] = {}
+
+
+async def _maybe_repaint_digest_on_transition(
+    bot: Bot, user_id: int, thread_id: int | None, window_id: str
+) -> None:
+    """Repaint the activity-digest header iff this route's ``run_state`` changed
+    since the last poller observation.
+
+    First observation seeds ``_prev_run_state`` WITHOUT a spurious edit (a route
+    absent from the map records its state and does not repaint). Only a change
+    from a recorded prior repaints — and ``refresh_activity_digest_if_present``
+    itself no-ops when no digest is on screen, so this is cheap. Pull-only: the
+    poller reads the committed snapshot, decides, and edits — no observer/push
+    channel (the c313657 pattern stays forbidden)."""
+    route = (user_id, thread_id or 0, window_id)
+    snap = route_runtime.snapshot(route)
+    prev = _prev_run_state.get(route, _UNSEEN)
+    if prev is _UNSEEN:
+        _prev_run_state[route] = snap.run_state  # seed only — no edit
+        return
+    if prev is not snap.run_state:
+        _prev_run_state[route] = snap.run_state
+        await refresh_activity_digest_if_present(bot, user_id, thread_id, window_id)
+
 
 def _on_interactive_clear(
     user_id: int, thread_id_or_0: int, window_id: str | None
@@ -196,6 +236,12 @@ async def update_status_message(
     ``window`` lets callers (e.g. ``_poll_one_binding``) pass in an already-
     resolved TmuxWindow to avoid a redundant find_window_by_id round-trip.
     """
+    # Repaint the activity-digest header on any run-state transition since the
+    # last tick (e.g. a transcript reclaim flushed and flipped WAITING → Done,
+    # or the reconciliation below cleared a stale bit). Placed FIRST so it runs
+    # before every early-return, both directions; pull-only and a no-op when no
+    # digest is on screen, so it is cheap on the common idle tick.
+    await _maybe_repaint_digest_on_transition(bot, user_id, thread_id, window_id)
     if window is None:
         window = await tmux_manager.find_window_by_id(window_id)
     if not window:
@@ -207,6 +253,11 @@ async def update_status_message(
         # Drop the watchdog entry so a re-bind starts fresh.
         _last_pane_capture.pop((user_id, thread_id or 0, window_id), None)
         _last_published_ui_hash.pop((user_id, thread_id or 0, window_id), None)
+        # Best-effort teardown of the poller-local repaint-dedup cache (the only
+        # _prev_run_state pop; status_polling-local, so import-safe — NOT from
+        # message_queue, which would invert the status_polling → message_queue
+        # edge). A re-bound window seeds fresh (first observation, no edit).
+        _prev_run_state.pop((user_id, thread_id or 0, window_id), None)
         return
 
     # Adaptive pane-capture gate. The 1Hz loop still runs (so cleanup,
@@ -226,6 +277,22 @@ async def update_status_message(
         # capture — ``_absent_streak`` doesn't depend on pane content, only
         # on interactive lifecycle ownership.
         _absent_streak.pop(route, None)
+        # Mode-ended liveness reconciliation (the UNIFIED pane-set WAITING
+        # clear). Reaching this block ⟺ the route is NOT in interactive mode
+        # for this window (mode popped, window-switched, or never-this-window).
+        # The bit is only ever SET while this window IS in interactive mode
+        # (sites a/b require interactive_window == window_id; site d is a
+        # first-render that immediately set_interactive_mode), so a set bit
+        # here means the interactive lifecycle ended without a transcript flush
+        # → clear it. Gap-free (covers mode-popped, window-switch, and
+        # ExitPlanMode-no-flush — no side file needed), no flush dependency, no
+        # flap (a genuinely-live picker keeps interactive_window == window_id so
+        # this branch isn't taken). Runs every tick before the capture gate.
+        if route_runtime.snapshot(route).interactive_pending:
+            await route_runtime.mark_interactive_cleared(route)
+            await _maybe_repaint_digest_on_transition(
+                bot, user_id, thread_id, window_id
+            )
     in_interactive = interactive_window == window_id
     now_mono = time.monotonic()
     last_capture = _last_pane_capture.get(route)
@@ -233,6 +300,12 @@ async def update_status_message(
         last_capture is None or (now_mono - last_capture) >= WATCHDOG_INTERVAL
     )
     should_capture = in_interactive or watchdog_elapsed
+    # Nudge: force a pane capture while the pane-set WAITING bit is live so the
+    # SET sites (a/b/d) re-assert promptly. Belt-and-suspenders — a set bit
+    # implies this window is in interactive mode, so ``in_interactive`` is
+    # normally already True (the mode-ended reconciliation above already cleared
+    # the bit on any window-mismatch tick).
+    should_capture = should_capture or route_runtime.snapshot(route).interactive_pending
 
     if not should_capture:
         # Cleanup-only path: stale-binding cleanup already ran above
@@ -282,6 +355,16 @@ async def update_status_message(
             # line until the user answers, so the poller is the only chance
             # to refresh in real time.
             _absent_streak.pop(route, None)
+            # SET (a): pane-confirmed live picker (AUQ or ExitPlanMode plan
+            # approval) while THIS window is in interactive mode → promote an
+            # active RUNNING route to WAITING_ON_USER. Before the same-hash
+            # early-return so it re-asserts on same-UI ticks (idempotent; the
+            # RUNNING-with-empty-open_tools guard no-ops otherwise). Repaint on
+            # transition.
+            await route_runtime.mark_interactive_pending(route)
+            await _maybe_repaint_digest_on_transition(
+                bot, user_id, thread_id, window_id
+            )
             ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
             if ui_hash == _last_published_ui_hash.get(route):
                 # Same UI as last publish — user is mid-interaction, skip.
@@ -335,6 +418,12 @@ async def update_status_message(
         # anchors present → reset the streak, keep the card.
         if is_picker_anchor_visible(pane_text):
             _absent_streak.pop(route, None)
+            # SET (b): scrolled/compressed Submit screen — picker tail anchors
+            # visible. Pane-confirmed → promote + repaint.
+            await route_runtime.mark_interactive_pending(route)
+            await _maybe_repaint_digest_on_transition(
+                bot, user_id, thread_id, window_id
+            )
             return
         # The visible pane lacks picker anchors — but the pane is only a
         # DISPLAY, not the lifecycle authority. The PreToolUse side file
@@ -383,6 +472,12 @@ async def update_status_message(
         # keyboard. The other clear_interactive_msg call sites (topic
         # close, window switch, callback-handled picks) keep delete.
         await clear_interactive_msg(user_id, bot, thread_id, tombstone=True)
+        # CLEAR (ii): genuine in-mode absence (mode still set for this window,
+        # side file not live, pane absent ≥ ABSENT_STREAK_THRESHOLD). Retract
+        # the pane-set WAITING bit alongside the card tombstone + repaint. The
+        # hysteresis above prevents a transient redraw from clearing early.
+        await route_runtime.mark_interactive_cleared(route)
+        await _maybe_repaint_digest_on_transition(bot, user_id, thread_id, window_id)
         _last_published_ui_hash.pop(route, None)
         _absent_streak.pop(route, None)
         should_check_new_ui = False
@@ -418,9 +513,21 @@ async def update_status_message(
         ).hexdigest()
         if is_first_publish_for_route:
             await _drain_content_queue_before_first_picker_publish(route)
-        await handle_interactive_ui(
+        published = await handle_interactive_ui(
             bot, user_id, window_id, thread_id, from_poller=True
         )
+        # SET (d): first-render dispatch. Promote RUNNING → WAITING_ON_USER +
+        # repaint only on a real surface publish. `published` gates on
+        # handle_interactive_ui's return — which is True only when a card was
+        # actually published; it can set _interactive_mode yet return False on a
+        # topic-send failure, so `published` (not mode-set) is the right gate.
+        # The no-surface case is handled next tick by site (a) (if the picker is
+        # still on the pane) or the has_interactive_surface publish-race return.
+        if published:
+            await route_runtime.mark_interactive_pending(route)
+            await _maybe_repaint_digest_on_transition(
+                bot, user_id, thread_id, window_id
+            )
         return
 
     # Compute active-state up front so the typing indicator fires even

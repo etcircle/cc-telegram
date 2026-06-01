@@ -1,26 +1,20 @@
-"""Scenario: live AUQ shows "🟡 Busy" instead of "🔔 Waiting on you" (Bug 1).
+"""Scenario: live AUQ / ExitPlanMode shows "🔔 Waiting on you" not "🟡 Busy" (Bug 1).
 
-**Verification gate (PR-A).** During a live ``AskUserQuestion`` the interactive
+During a live ``AskUserQuestion`` / ``ExitPlanMode`` prompt the interactive
 ``tool_use`` is buffered in JSONL until the prompt resolves, so ``route_runtime``
-never ingests it: the route stays ``RUNNING`` and the activity-digest header
-renders "🟡 Busy" (the wired-but-unreachable "🔔 Waiting on you" at
-``message_queue.py`` never fires) while the false "typing…" chat-action keeps
-firing (``typing_eligible`` excludes ``WAITING_ON_USER``).
+never ingests it. The 1 Hz ``status_polling`` poller PROMOTES the active
+``RUNNING`` route to ``WAITING_ON_USER`` from a **pane-confirmed** live surface
+(``mark_interactive_pending``), so the activity-digest header flips
+"🟡 Busy" → "🔔 Waiting on you" and the false "typing…" stops. It is retracted
+by the transcript reclaim (primary), the poller liveness reconciliation
+(mode-ended), the in-mode tombstone, or route teardown — so no strand and no
+false-promote on a double-resume sibling.
 
-This file reproduces the bug at the public Telegram seam by *withholding* the
-interactive ``tool_use`` event — modelling Claude Code's JSONL buffer — while a
-pane-confirmed picker is live and a side file is present. The digest header is
-captured via the existing ``message_queue._render_activity_digest(state,
-route=route)`` direct-render path (same pattern as
-``test_route_runtime_snapshot.py``).
-
-PR-A asserts the **buggy baseline** ("🟡 Busy" / ``RUNNING`` / typing-eligible)
-and passes on ``main`` — proving the harness captures the bug. PR-C wires the
-fix (``route_runtime.mark_interactive_pending`` promoted from the 1 Hz poller on
-a pane-confirmed surface) and flips these assertions to the fixed
-"🔔 Waiting on you" / ``WAITING_ON_USER`` / typing-off behaviour, and adds the
-full state-machine matrix (clear-ordering, multi-question, reconciliation,
-tombstone, teardown). Scope: Bug 1 only.
+These are public-Telegram-seam scenario tests. The digest header is captured via
+``message_queue._render_activity_digest(state, route=route)`` (the accepted
+precedent from ``test_route_runtime_snapshot.py``); ``run_state`` /
+``interactive_pending`` / ``typing_eligible`` are read from the real
+``route_runtime.snapshot(route)`` the production surfaces read.
 """
 
 from __future__ import annotations
@@ -32,11 +26,18 @@ from typing import Any
 
 import pytest
 
-from cctelegram import route_runtime
+from cctelegram import bot as bot_module
+from cctelegram import route_runtime, transcript_event_adapter
 from cctelegram.route_runtime import RunState
-from cctelegram.handlers import interactive_ui, message_queue, status_polling
+from cctelegram.handlers import (
+    auq_source,
+    interactive_ui,
+    message_queue,
+    status_polling,
+)
+from cctelegram.session_monitor import TranscriptEvent
 from cctelegram.utils import app_dir
-from tests.conftest import ScenarioHarness
+from tests.conftest import ScenarioHarness, make_update_text, make_update_topic_closed
 
 pytestmark = pytest.mark.scenario
 
@@ -60,30 +61,54 @@ def _single_select_input() -> dict[str, Any]:
     }
 
 
-def _picker_pane() -> str:
-    """A live, pane-confirmed single-select AUQ picker (``extract_interactive_content``
-    matches this shape)."""
-    return """← ☐ Rollout lane  ✔ Submit →
-Which rollout lane should we take?
+def _picker_pane(question: str = "Which rollout lane should we take?") -> str:
+    """A live, pane-confirmed single-select AUQ picker."""
+    return (
+        "← ☐ Rollout lane  ✔ Submit →\n"
+        f"{question}\n"
+        "\n"
+        "❯ 1. A) Ship now\n"
+        "  2. B) Bake first\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    )
 
-❯ 1. A) Ship now
-  2. B) Bake first
-Enter to select · ↑/↓ to navigate · Esc to cancel
-"""
+
+def _exitplan_pane() -> str:
+    """A live ExitPlanMode plan-approval pane (NO PreToolUse side file)."""
+    return (
+        "  Would you like to proceed?\n"
+        "  ─────────────────────────────────\n"
+        "  Yes     No\n"
+        "  ─────────────────────────────────\n"
+        "  ctrl-g to edit in vim\n"
+    )
 
 
-def _write_side_file(tool_input: dict[str, Any]) -> Path:
-    """Write the PreToolUse ``auq_pending/<session>.json`` side file (the
-    question-is-live authority), exactly as ``hook.py`` does before the picker
-    renders."""
+def _gone_pane() -> str:
+    """A non-interactive, idle pane (no picker, no anchors)."""
+    return "> \n\nClaude is ready.\n"
+
+
+# Claude task-list overlay: obscures the picker so BOTH pane predicates read
+# absent, but the PreToolUse side file is still live (site c — bit-neutral).
+_OVERLAY_PANE = (
+    "  ◻ Wave 3 R6: pick_verdict() verdict-parity › blocked by #2\n"
+    "  ◻ Wave 3 R7: extract auq_context_dedup.py  › blocked by #3\n"
+    "  ◻ Wave 3 R8: EditableCard Route Outbox      › blocked by #4\n"
+)
+
+
+def _write_side_file(
+    tool_input: dict[str, Any], *, session_id: str = _SESSION_ID
+) -> Path:
     pending = app_dir() / "auq_pending"
     pending.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = pending / f"{_SESSION_ID}.json"
+    path = pending / f"{session_id}.json"
     path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "session_id": _SESSION_ID,
+                "session_id": session_id,
                 "tool_use_id": "tool-use-waiting-indicator",
                 "written_at": time.time(),
                 "tool_input": tool_input,
@@ -93,85 +118,396 @@ def _write_side_file(tool_input: dict[str, Any]) -> Path:
     return path
 
 
-def _bind(scenario: ScenarioHarness, pane: str) -> str:
-    wid = scenario.add_window(window_name="repo", cwd="/repo", pane_text=pane)
+def _bind(
+    scenario: ScenarioHarness,
+    pane: str,
+    *,
+    thread_id: int = _THREAD_ID,
+    session_id: str = _SESSION_ID,
+    name: str = "repo",
+) -> str:
+    wid = scenario.add_window(window_name=name, cwd="/repo", pane_text=pane)
     scenario.bind_thread(
-        _THREAD_ID,
-        wid,
-        display_name="repo",
-        cwd="/repo",
-        session_id=_SESSION_ID,
+        thread_id, wid, display_name=name, cwd="/repo", session_id=session_id
     )
     return wid
 
 
-async def _render(scenario: ScenarioHarness, wid: str) -> None:
+async def _render(
+    scenario: ScenarioHarness, wid: str, *, thread_id: int = _THREAD_ID
+) -> bool:
     """Publish the interactive picker card (sets interactive mode). Renders from
-    the pane / side file — it does NOT ingest the buffered ``tool_use``, so
-    ``route_runtime`` run-state is untouched (the bug's premise)."""
-    assert await interactive_ui.handle_interactive_ui(
-        scenario.bot,
-        scenario.user_id,
-        wid,
-        _THREAD_ID,
-        tmux_mgr=scenario.tmux,
-        session_mgr=scenario.session_manager,
+    the pane / side file — it does NOT ingest the buffered ``tool_use``."""
+    return bool(
+        await interactive_ui.handle_interactive_ui(
+            scenario.bot,
+            scenario.user_id,
+            wid,
+            thread_id,
+            tmux_mgr=scenario.tmux,
+            session_mgr=scenario.session_manager,
+        )
     )
 
 
-async def _poll(scenario: ScenarioHarness, wid: str, n: int) -> None:
+async def _poll(
+    scenario: ScenarioHarness, wid: str, n: int = 1, *, thread_id: int = _THREAD_ID
+) -> None:
     for _ in range(n):
         await status_polling.update_status_message(
-            scenario.bot,
-            user_id=scenario.user_id,
-            window_id=wid,
-            thread_id=_THREAD_ID,
+            scenario.bot, user_id=scenario.user_id, window_id=wid, thread_id=thread_id
         )
 
 
-def _render_digest(
-    scenario: ScenarioHarness, route: route_runtime.Route, wid: str
-) -> str:
-    """Render the activity-digest card text for ``route`` (header is driven by
+def _route(
+    scenario: ScenarioHarness, wid: str, *, thread_id: int = _THREAD_ID
+) -> route_runtime.Route:
+    return (scenario.user_id, thread_id, wid)
+
+
+def _digest(scenario: ScenarioHarness, wid: str, *, thread_id: int = _THREAD_ID) -> str:
+    """Render the activity-digest card text for this route (header driven by
     ``route_runtime.snapshot(route).run_state``)."""
     state = message_queue.ActivityDigestState(message_id=0, window_id=wid)
-    return message_queue._render_activity_digest(state, route=route)
+    return message_queue._render_activity_digest(
+        state, route=(scenario.user_id, thread_id, wid)
+    )
+
+
+def _txn(**kw: Any) -> TranscriptEvent:
+    defaults: dict[str, Any] = dict(
+        session_id=_SESSION_ID,
+        role="assistant",
+        block_type="text",
+        tool_use_id=None,
+        tool_name=None,
+        stop_reason=None,
+        timestamp=None,
+        text="",
+        image_data=None,
+    )
+    defaults.update(kw)
+    return TranscriptEvent(**defaults)
+
+
+# ── core: the fix (flipped from the PR-A RED baseline) ────────────────────
 
 
 @pytest.mark.asyncio
-async def test_live_auq_red_baseline_shows_busy_not_waiting(
-    scenario: ScenarioHarness,
-) -> None:
-    """RED baseline (PR-A): a live AUQ with the interactive ``tool_use``
-    WITHHELD leaves ``route_runtime`` at ``RUNNING``, so the digest renders
-    "🟡 Busy" and typing stays eligible. PR-C flips all three assertions to
-    ``WAITING_ON_USER`` / "🔔 Waiting on you" / typing-off.
-    """
-    pane = _picker_pane()
-    wid = _bind(scenario, pane)
-    route: route_runtime.Route = (scenario.user_id, _THREAD_ID, wid)
+async def test_live_auq_shows_waiting_not_busy(scenario: ScenarioHarness) -> None:
+    """The fix: a live AUQ whose interactive ``tool_use`` is buffered flips the
+    digest to "🔔 Waiting on you", run_state to WAITING_ON_USER, and typing off
+    — via the pane-confirmed poller promotion."""
+    wid = _bind(scenario, _picker_pane())
+    route = _route(scenario, wid)
 
-    # Telegram-originated prompt delivered to tmux → RUNNING (the real
-    # ``bot.py`` path via ``mark_inbound_sent``). This is the state the route
-    # is stuck in for the whole live-AUQ window.
-    await route_runtime.mark_inbound_sent(route)
+    await route_runtime.mark_inbound_sent(route)  # RUNNING (the stuck state)
     assert route_runtime.snapshot(route).run_state is RunState.RUNNING
-
-    # PreToolUse side file lands before the picker renders; the interactive
-    # ``tool_use`` is BUFFERED in JSONL — modelled by never dispatching it
-    # through the transcript adapter.
     _write_side_file(_single_select_input())
-    await _render(scenario, wid)
-    assert interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID)
+    assert await _render(scenario, wid)
 
-    # The 1 Hz poller ticks over the live picker pane. (PR-C: this is where
-    # ``mark_interactive_pending`` will promote RUNNING → WAITING_ON_USER.)
     await _poll(scenario, wid, 2)
 
     snap = route_runtime.snapshot(route)
-    # ── RED assertions: the bug. PR-C flips all three. ─────────────────────
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+    assert snap.typing_eligible is False
+    rendered = _digest(scenario, wid)
+    assert rendered.startswith("🔔 Waiting on you")
+    assert "🟡 Busy" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_first_render_poller_path_promotes_site_d(
+    scenario: ScenarioHarness,
+) -> None:
+    """SET site (d): when the poller itself FIRST-renders the picker (no prior
+    interactive mode), a successful publish promotes RUNNING → WAITING_ON_USER
+    on the same tick. (The other tests pre-render then poll → site (a); this
+    proves the first-render dispatch path.)"""
+    wid = _bind(scenario, _picker_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)  # RUNNING
+    _write_side_file(_single_select_input())
+    # NO _render() — the route is not yet in interactive mode; the poller's
+    # new-UI dispatch (site d) renders the card AND promotes.
+    assert not interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID)
+
+    await _poll(scenario, wid)
+
+    assert interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID)
+    snap = route_runtime.snapshot(route)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+    assert _digest(scenario, wid).startswith("🔔 Waiting on you")
+
+
+@pytest.mark.asyncio
+async def test_multiquestion_stays_waiting_across_pickers(
+    scenario: ScenarioHarness,
+) -> None:
+    """Q1 → Q2 → Q3: each keeps a picker on the pane, so SET (a) re-asserts
+    every tick and the badge stays "🔔 Waiting on you" across non-final picks."""
+    wid = _bind(scenario, _picker_pane("Q1: pick a lane?"))
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)
+
+    for q in ("Q1: pick a lane?", "Q2: confirm scope?", "Q3: ship window?"):
+        scenario.tmux.set_pane(wid, _picker_pane(q))
+        await _poll(scenario, wid)
+        assert route_runtime.snapshot(route).run_state is RunState.WAITING_ON_USER
+        assert _digest(scenario, wid).startswith("🔔 Waiting on you")
+
+
+@pytest.mark.asyncio
+async def test_answer_flush_clears_via_transcript_reclaim(
+    scenario: ScenarioHarness,
+) -> None:
+    """The PRIMARY clear: when the buffered turn flushes, the transcript
+    tool_use+tool_result land and re-derive run_state, zeroing the pane bit."""
+    wid = _bind(scenario, _picker_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)
+    await _poll(scenario, wid)
+    assert route_runtime.snapshot(route).interactive_pending is True
+
+    # The buffered turn flushes: interactive tool_use (transcript-set WAITING,
+    # bit cleared) then its tool_result (open set empties → RUNNING).
+    await transcript_event_adapter.dispatch_transcript_event(
+        _txn(block_type="tool_use", tool_use_id="auq-1", tool_name="AskUserQuestion"),
+        [route],
+    )
+    assert route_runtime.snapshot(route).interactive_pending is False
+    await transcript_event_adapter.dispatch_transcript_event(
+        _txn(role="user", block_type="tool_result", tool_use_id="auq-1"),
+        [route],
+    )
+    snap = route_runtime.snapshot(route)
     assert snap.run_state is RunState.RUNNING
-    assert snap.typing_eligible is True
-    rendered = _render_digest(scenario, route, wid)
-    assert rendered.startswith("🟡 Busy")
-    assert "🔔 Waiting on you" not in rendered
+    assert snap.interactive_pending is False
+    assert "🔔 Waiting on you" not in _digest(scenario, wid)
+
+
+@pytest.mark.asyncio
+async def test_mode_ended_no_flush_clears_via_reconciliation(
+    scenario: ScenarioHarness,
+) -> None:
+    """The UNIFIED clear: the interactive lifecycle ends (mode popped) with NO
+    transcript flush and the pane UI gone → the next poller tick's mode-ended
+    reconciliation (`interactive_window != window_id`) clears the bit. The
+    bot-less seam (`clear_interactive_msg`) must NOT clear the bit itself."""
+    wid = _bind(scenario, _picker_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)
+    await _poll(scenario, wid)
+    assert route_runtime.snapshot(route).interactive_pending is True
+
+    # Mode ends with no transcript flush (the seam fires); side file gone too.
+    auq_source.forget_for_window(wid)
+    await interactive_ui.clear_interactive_msg(
+        scenario.user_id, scenario.bot, _THREAD_ID
+    )
+    # Seam is UNCHANGED — the bit still lingers until the poller reconciles.
+    assert route_runtime.snapshot(route).interactive_pending is True
+
+    scenario.tmux.set_pane(wid, _gone_pane())
+    await _poll(scenario, wid)
+    snap = route_runtime.snapshot(route)
+    assert snap.interactive_pending is False
+    assert snap.run_state is RunState.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_exitplanmode_no_flush_clears_via_reconciliation(
+    scenario: ScenarioHarness,
+) -> None:
+    """ExitPlanMode variant (no side file): pane-confirmed promote, then
+    mode-ended reconciliation clears it."""
+    wid = _bind(scenario, _exitplan_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    assert await _render(scenario, wid)  # no side file
+    await _poll(scenario, wid)
+    assert route_runtime.snapshot(route).run_state is RunState.WAITING_ON_USER
+
+    await interactive_ui.clear_interactive_msg(
+        scenario.user_id, scenario.bot, _THREAD_ID
+    )
+    scenario.tmux.set_pane(wid, _gone_pane())
+    await _poll(scenario, wid)
+    assert route_runtime.snapshot(route).interactive_pending is False
+
+
+@pytest.mark.asyncio
+async def test_esc_in_tmux_tombstone_clears(scenario: ScenarioHarness) -> None:
+    """ESC / answer-in-tmux while mode is STILL set, side file gone, pane absent
+    ≥ threshold → the in-mode tombstone clears the bit (and the card)."""
+    wid = _bind(scenario, _exitplan_pane())  # no side file to manage
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    await _render(scenario, wid)
+    await _poll(scenario, wid)
+    assert route_runtime.snapshot(route).interactive_pending is True
+
+    # Pane goes absent; mode stays set; no side file → streak → tombstone.
+    scenario.tmux.set_pane(wid, _gone_pane())
+    await _poll(scenario, wid, status_polling.ABSENT_STREAK_THRESHOLD + 1)
+    snap = route_runtime.snapshot(route)
+    assert snap.interactive_pending is False
+    assert not interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID)
+
+
+@pytest.mark.asyncio
+async def test_sidefile_only_preserves_prior_waiting(scenario: ScenarioHarness) -> None:
+    """Site (c) is bit-neutral: an obscured pane with the side file still live
+    PRESERVES an already-promoted WAITING (no flap) — and never tears the card
+    down. (The bit shares the AUQ card's liveness boundary.)"""
+    wid = _bind(scenario, _picker_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)
+    await _poll(scenario, wid)
+    assert route_runtime.snapshot(route).interactive_pending is True
+
+    # Task-list overlay obscures the picker; the side file is still live.
+    scenario.tmux.set_pane(wid, _OVERLAY_PANE)
+    await _poll(scenario, wid, status_polling.ABSENT_STREAK_THRESHOLD + 2)
+    snap = route_runtime.snapshot(route)
+    assert snap.interactive_pending is True  # preserved (no flap)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID)
+
+
+@pytest.mark.asyncio
+async def test_obstructed_from_first_poll_underclaims_busy(
+    scenario: ScenarioHarness,
+) -> None:
+    """Obstructed from the FIRST poll (side file live but never pane-confirmed):
+    the bit is never set → bounded under-claim, stays "🟡 Busy"."""
+    wid = _bind(scenario, _picker_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)  # card rendered over the picker (exists)
+    # Obscured BEFORE any poll pane-confirms the picker → SET (a/b/d) never
+    # fire; every poll sees the overlay → site (c) bit-neutral preserve.
+    scenario.tmux.set_pane(wid, _OVERLAY_PANE)
+    await _poll(scenario, wid, 3)
+    snap = route_runtime.snapshot(route)
+    assert snap.interactive_pending is False  # never pane-confirmed
+    assert snap.run_state is RunState.RUNNING
+    assert _digest(scenario, wid).startswith("🟡 Busy")
+    # ...but the card is preserved (site c), so the question isn't lost.
+    assert interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID)
+
+
+@pytest.mark.asyncio
+async def test_exitplanmode_shows_waiting_no_side_file(
+    scenario: ScenarioHarness,
+) -> None:
+    """ExitPlanMode promotes to WAITING / "🔔 Waiting on you" with NO side file
+    (pane-confirmed SET works on the plan-approval pane)."""
+    wid = _bind(scenario, _exitplan_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    assert await _render(scenario, wid)
+    await _poll(scenario, wid, 2)
+    snap = route_runtime.snapshot(route)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.typing_eligible is False
+    assert _digest(scenario, wid).startswith("🔔 Waiting on you")
+    assert not (app_dir() / "auq_pending" / f"{_SESSION_ID}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_typing_isolation_concurrent_route(scenario: ScenarioHarness) -> None:
+    """The AUQ route suppresses typing (WAITING), while a concurrent RUNNING
+    route in another topic is still typing-eligible."""
+    wid_auq = _bind(scenario, _picker_pane(), thread_id=42, name="auq")
+    route_auq = _route(scenario, wid_auq, thread_id=42)
+    await route_runtime.mark_inbound_sent(route_auq)
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid_auq, thread_id=42)
+    await _poll(scenario, wid_auq, thread_id=42)
+
+    wid_run = _bind(
+        scenario, _gone_pane(), thread_id=99, session_id="run-sess", name="run"
+    )
+    route_run = _route(scenario, wid_run, thread_id=99)
+    await route_runtime.mark_inbound_sent(route_run)  # RUNNING
+
+    assert route_runtime.snapshot(route_auq).typing_eligible is False
+    assert route_runtime.snapshot(route_run).typing_eligible is True
+
+
+@pytest.mark.asyncio
+async def test_clear_mid_auq_settles_idle(scenario: ScenarioHarness) -> None:
+    """`/clear` mid-AUQ → mark_session_reset drops the bit and settles IDLE."""
+    wid = _bind(scenario, _picker_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)
+    await _poll(scenario, wid)
+    assert route_runtime.snapshot(route).interactive_pending is True
+
+    await route_runtime.mark_session_reset(route)
+    snap = route_runtime.snapshot(route)
+    assert snap.run_state is RunState.IDLE_CLEARED
+    assert snap.interactive_pending is False
+    assert _digest(scenario, wid).startswith("✅ Done")
+
+
+@pytest.mark.asyncio
+async def test_topic_close_clears_waiting(scenario: ScenarioHarness) -> None:
+    """Closing the topic mid-AUQ tears the route down via clear_topic_state →
+    route_runtime.clear_routes_for_topic: the snapshot is back to the default,
+    no stranded "Waiting on you". The route has NO message_queue queue worker
+    (the hermes round-2 P2 case) — route_runtime is torn down regardless of
+    queue presence, NOT derived from _route_queues."""
+    wid = _bind(scenario, _picker_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    _write_side_file(_single_select_input())
+    await _render(scenario, wid)
+    await _poll(scenario, wid)
+    assert route_runtime.snapshot(route).interactive_pending is True
+    # No content was enqueued → this route has no _route_queues entry.
+    assert route not in message_queue._route_queues
+
+    update = make_update_topic_closed(thread_id=_THREAD_ID, user_id=scenario.user_id)
+    await bot_module.topic_closed_handler(update, scenario.context)
+
+    snap = route_runtime.snapshot(route)
+    assert snap.run_state is RunState.IDLE_CLEARED  # _default_snapshot
+    assert snap.interactive_pending is False
+
+
+@pytest.mark.asyncio
+async def test_inbound_stale_window_unbind_clears_route(
+    scenario: ScenarioHarness,
+) -> None:
+    """codex/hermes round-5 P2: an inbound message that hits a stale window
+    (find_window_by_id None) unbinds the thread AND tears down route_runtime
+    state — the pane bit (and all route_runtime state) is gone, no leak."""
+    wid = _bind(scenario, _picker_pane())
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)
+    await route_runtime.mark_interactive_pending(route)
+    assert route_runtime.snapshot(route).interactive_pending is True
+
+    # The tmux window vanishes externally; the binding is now stale.
+    scenario.tmux.windows.pop(wid, None)
+    update = make_update_text("hello?", thread_id=_THREAD_ID, user_id=scenario.user_id)
+    await bot_module.text_handler(update, scenario.context)
+
+    snap = route_runtime.snapshot(route)
+    assert snap.run_state is RunState.IDLE_CLEARED  # clear_route → default
+    assert snap.interactive_pending is False

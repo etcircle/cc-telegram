@@ -53,6 +53,7 @@ from telegram import (
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
+from .. import route_runtime
 from ..config import config
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
@@ -512,6 +513,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not w:
         display = session_manager.get_display_name(wid)
         session_manager.unbind_thread(user.id, thread_id)
+        # Tear down route_runtime state for the now-unbound route (run-state /
+        # open_tools / context_usage / pane_interactive_pending) — unbind_thread
+        # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
+        route_runtime.clear_route((user.id, thread_id or 0, wid))
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -591,6 +596,10 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not w:
         display = session_manager.get_display_name(wid)
         session_manager.unbind_thread(user.id, thread_id)
+        # Tear down route_runtime state for the now-unbound route (run-state /
+        # open_tools / context_usage / pane_interactive_pending) — unbind_thread
+        # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
+        route_runtime.clear_route((user.id, thread_id or 0, wid))
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -759,6 +768,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not w:
         display = session_manager.get_display_name(wid)
         session_manager.unbind_thread(user.id, thread_id)
+        # Tear down route_runtime state for the now-unbound route (run-state /
+        # open_tools / context_usage / pane_interactive_pending) — unbind_thread
+        # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
+        route_runtime.clear_route((user.id, thread_id or 0, wid))
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -1018,6 +1031,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             thread_id,
         )
         session_manager.unbind_thread(user.id, thread_id)
+        # Tear down route_runtime state for the now-unbound route (run-state /
+        # open_tools / context_usage / pane_interactive_pending) — unbind_thread
+        # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
+        route_runtime.clear_route((user.id, thread_id or 0, wid))
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"

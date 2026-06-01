@@ -13,6 +13,7 @@ from typing import Any
 
 from telegram import Bot
 
+from .. import route_runtime
 from ..session import session_manager
 
 from . import attention
@@ -80,9 +81,15 @@ async def clear_topic_state(
     # Drop any live attention card state — fresh topic gets a fresh episode.
     attention.clear(user_id, thread_id)
 
-    # The per-route pane-idle debounce state lives in ``route_runtime`` and is
-    # dropped by ``teardown_route`` → ``route_runtime.clear_route(route)``
-    # above, so a re-bound topic starts fresh without a separate reset here.
+    # Tear down ALL route_runtime state for this topic — run-state, open_tools,
+    # context_usage, and pane_interactive_pending. ``teardown_route`` above only
+    # reaches routes present in ``message_queue._route_queues`` (queued routes);
+    # a route can carry route_runtime state with NO queue worker (mark_inbound_sent
+    # / JSONL replay / status_polling.mark_interactive_pending operate directly on
+    # the route key), so deriving runtime ownership from _route_queues would strand
+    # e.g. a pane-set WAITING_ON_USER after the topic is closed / the window is gone
+    # (hermes round-2 P2). route_runtime owns its own topic-teardown seam.
+    route_runtime.clear_routes_for_topic(user_id, thread_id or 0)
 
     # Clear pending thread state from user_data
     if user_data is not None:

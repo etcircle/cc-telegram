@@ -866,6 +866,35 @@ async def test_clear_route_drops_all_state():
     assert snap.status_card_msg_id is None
 
 
+async def test_clear_routes_for_topic_drops_all_matching_routes():
+    """hermes round-2 P2: route_runtime's own topic-teardown seam clears EVERY
+    route under (user, thread) — including a pane-set WAITING route that never
+    had a message_queue queue — without touching other topics/users."""
+    user_id, thread_id = 1, 42
+    r_a = (user_id, thread_id, "@a")  # pane-set WAITING, no queue
+    r_b = (user_id, thread_id, "@b")  # RUNNING_TOOL via transcript
+    other_thread = (user_id, 99, "@c")  # different topic — must survive
+    other_user = (2, thread_id, "@d")  # different user — must survive
+
+    await route_runtime.mark_inbound_sent(r_a)
+    await route_runtime.mark_interactive_pending(r_a)
+    assert route_runtime.snapshot(r_a).interactive_pending is True
+    await route_runtime.ingest_transcript_event(
+        r_b, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
+    )
+    await route_runtime.mark_inbound_sent(other_thread)
+    await route_runtime.mark_inbound_sent(other_user)
+
+    route_runtime.clear_routes_for_topic(user_id, thread_id)
+
+    assert route_runtime.snapshot(r_a).run_state is RunState.IDLE_CLEARED
+    assert route_runtime.snapshot(r_a).interactive_pending is False
+    assert route_runtime.snapshot(r_b).run_state is RunState.IDLE_CLEARED
+    # Other topic / other user untouched.
+    assert route_runtime.snapshot(other_thread).run_state is RunState.RUNNING
+    assert route_runtime.snapshot(other_user).run_state is RunState.RUNNING
+
+
 # ── parse_pending_tools_from_jsonl (startup replay) ──────────────────────
 
 

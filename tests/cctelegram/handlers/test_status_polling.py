@@ -38,6 +38,7 @@ def _clear_interactive_state():
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
     status_polling._absent_streak.clear()
+    status_polling._prev_run_state.clear()
     route_runtime.reset_for_tests()
     yield
     _interactive_mode.clear()
@@ -45,6 +46,7 @@ def _clear_interactive_state():
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
     status_polling._absent_streak.clear()
+    status_polling._prev_run_state.clear()
     route_runtime.reset_for_tests()
 
 
@@ -1723,3 +1725,159 @@ class TestAbsentStreakHysteresis:
             )
 
             mock_clear.assert_called_once_with(user_id, mock_bot, thread_id_for_poll)
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestPaneInteractivePendingWiring:
+    """PR-C poller-local wiring for the pane-set WAITING bit (Bug 1):
+    the _prev_run_state repaint-dedup cache lifecycle + the repaint-on-transition
+    helper. The end-to-end promote/clear behaviour lives in the scenario floor
+    (tests/scenarios/test_auq_waiting_indicator.py)."""
+
+    @pytest.mark.asyncio
+    async def test_on_interactive_clear_does_not_pop_prev_run_state(self):
+        """v3 shared-P1 guard: the bot-less interactive-clear seam must NOT pop
+        _prev_run_state — popping there masked the post-clear repaint (a route
+        that flips WAITING → RUNNING after the clear would never repaint)."""
+        from cctelegram.handlers import status_polling
+        from cctelegram.route_runtime import RunState
+
+        route = (111, 222, "@3")
+        status_polling._prev_run_state[route] = RunState.WAITING_ON_USER
+        status_polling._on_interactive_clear(111, 222, "@3")
+        assert route in status_polling._prev_run_state  # NOT popped
+
+    @pytest.mark.asyncio
+    async def test_window_switch_branch_clears_old_route_bit(self, mock_bot: AsyncMock):
+        """Window-switch (interactive_window != window_id, not None): the
+        mode-ended reconciliation clears the polled route's pane-set WAITING bit
+        before the card-delete branch — no stuck WAITING after focus moves. Same
+        `interactive_window != window_id` reconciliation as the mode-popped case,
+        exercised here with interactive_window pointing at a DIFFERENT window."""
+        from cctelegram import route_runtime
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+        from cctelegram.route_runtime import RunState
+
+        live_window = "@37"  # focus moved here
+        polling_window = "@29"  # we poll the OLD window
+        user_id, thread_id = 6427984308, 3207
+        route = (user_id, thread_id, polling_window)
+
+        # The old route carried a pane-set WAITING bit.
+        await route_runtime.mark_inbound_sent(route)
+        await route_runtime.mark_interactive_pending(route)
+        assert route_runtime.snapshot(route).interactive_pending is True
+
+        _interactive_mode[(user_id, thread_id)] = live_window  # != polling_window
+        _interactive_msgs[(user_id, thread_id)] = 32835
+
+        mock_window = MagicMock()
+        mock_window.window_id = polling_window
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling,
+                "refresh_activity_digest_if_present",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value="non-interactive\n❯ \n")
+            await status_polling.update_status_message(
+                mock_bot,
+                user_id=user_id,
+                window_id=polling_window,
+                thread_id=thread_id,
+            )
+
+        snap = route_runtime.snapshot(route)
+        assert snap.interactive_pending is False  # reconciliation cleared it
+        assert snap.run_state is RunState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_window_gone_path_pops_prev_run_state(self, mock_bot: AsyncMock):
+        """The window-gone path is the sole _prev_run_state teardown (alongside
+        _last_pane_capture / _last_published_ui_hash) — status_polling-local,
+        import-safe."""
+        from cctelegram.handlers import status_polling
+        from cctelegram.route_runtime import RunState
+
+        user_id, thread_id, window_id = 111, 222, "@gone"
+        route = (user_id, thread_id, window_id)
+        status_polling._prev_run_state[route] = RunState.RUNNING
+        status_polling._last_pane_capture[route] = 1.0
+        status_polling._last_published_ui_hash[route] = "h"
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=None)  # window gone
+            await status_polling.update_status_message(
+                mock_bot, user_id=user_id, window_id=window_id, thread_id=thread_id
+            )
+
+        assert route not in status_polling._prev_run_state
+        assert route not in status_polling._last_pane_capture
+        assert route not in status_polling._last_published_ui_hash
+
+    @pytest.mark.asyncio
+    async def test_maybe_repaint_seeds_then_repaints_once_per_transition(
+        self, mock_bot: AsyncMock
+    ):
+        """First observation seeds without an edit; a change repaints exactly
+        once; an unchanged state does not repaint."""
+        from cctelegram import route_runtime
+        from cctelegram.handlers import status_polling
+
+        user_id, thread_id, window_id = 111, 222, "@7"
+        route = (user_id, thread_id, window_id)
+
+        with patch.object(
+            status_polling, "refresh_activity_digest_if_present", new_callable=AsyncMock
+        ) as mock_refresh:
+            # RUNNING. First observation seeds — NO edit.
+            await route_runtime.mark_inbound_sent(route)
+            await status_polling._maybe_repaint_digest_on_transition(
+                mock_bot, user_id, thread_id, window_id
+            )
+            mock_refresh.assert_not_called()
+
+            # Same state — still no edit.
+            await status_polling._maybe_repaint_digest_on_transition(
+                mock_bot, user_id, thread_id, window_id
+            )
+            mock_refresh.assert_not_called()
+
+            # Transition RUNNING → WAITING_ON_USER (pane-set) — repaint ONCE.
+            await route_runtime.mark_interactive_pending(route)
+            await status_polling._maybe_repaint_digest_on_transition(
+                mock_bot, user_id, thread_id, window_id
+            )
+            assert mock_refresh.await_count == 1
+
+            # Same WAITING state again — no further edit.
+            await status_polling._maybe_repaint_digest_on_transition(
+                mock_bot, user_id, thread_id, window_id
+            )
+            assert mock_refresh.await_count == 1
+
+            # Transition back WAITING → RUNNING — repaint once more (both
+            # directions repaint).
+            await route_runtime.mark_interactive_cleared(route)
+            await status_polling._maybe_repaint_digest_on_transition(
+                mock_bot, user_id, thread_id, window_id
+            )
+            assert mock_refresh.await_count == 2

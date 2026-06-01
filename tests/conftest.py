@@ -602,7 +602,12 @@ def _reset_aggregator() -> None:
 
 def _reset_status_polling() -> None:
     sp = status_polling
-    for name in ("_last_pane_capture", "_last_published_ui_hash", "_absent_streak"):
+    for name in (
+        "_last_pane_capture",
+        "_last_published_ui_hash",
+        "_absent_streak",
+        "_prev_run_state",
+    ):
         attr = getattr(sp, name, None)
         if isinstance(attr, dict):
             attr.clear()
