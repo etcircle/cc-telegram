@@ -99,6 +99,45 @@ def make_thinking_block():
     return _make
 
 
+@pytest.fixture
+def make_assistant_message():
+    """Factory: a raw assistant JSONL line carrying a ``message.id`` shared
+    across its content blocks.
+
+    Mirrors the real capture (``temp/auq-fixtures/2026-06-02-messagedisplay-
+    live-capture/scratch_session.jsonl``) where one ``message.id`` spans the
+    thinking/text/tool_use lines of a single assistant turn. The existing
+    ``make_jsonl_entry`` cannot set ``message.id``; Bug 2's dedup must group the
+    sibling prose with the interactive ``tool_use`` by that id, so the corpus
+    needs a builder that sets it. Distinct per-line ``uuid`` matches the capture
+    (each block is its own JSONL line / uuid under one message.id).
+    """
+
+    def _make(
+        *,
+        blocks: list[dict],
+        message_id: str,
+        uuid: str = "uuid-1",
+        stop_reason: str = "tool_use",
+        session_id: str = "test-session-id",
+        timestamp: str | None = None,
+    ) -> dict:
+        return {
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {
+                "id": message_id,
+                "stop_reason": stop_reason,
+                "content": blocks,
+            },
+            "sessionId": session_id,
+            "cwd": "/tmp/test",
+            "timestamp": timestamp or time.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        }
+
+    return _make
+
+
 # ── Sample pane text for terminal parser ─────────────────────────────────
 
 
