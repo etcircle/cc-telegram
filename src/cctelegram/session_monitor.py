@@ -67,6 +67,12 @@ class TranscriptEvent:
     image_data: list[tuple[str, bytes]] | None
     tool_input: dict[str, Any] | None = None
     transcript_uuid: str | None = None
+    # JSONL ``message.id`` (per-message, shared across a turn's blocks) and the
+    # synthetic-text origin marker, propagated from ParsedEntry. Bug 2's
+    # live-prose dedup groups a prose block with its sibling interactive
+    # tool_use by ``(session_id, message_id)`` and excludes synthetic plan text.
+    message_id: str | None = None
+    block_origin: str | None = None
 
 
 @dataclass
@@ -94,6 +100,13 @@ class NewMessage:
     # the bot adapter to identify end-of-turn assistant text bubbles, where
     # the per-message context-window footer is appended.
     stop_reason: str | None = None
+    # JSONL ``message.id`` (per-message, shared across a turn's blocks) and the
+    # synthetic-text origin marker, propagated from ParsedEntry. Bug 2's
+    # live-prose dedup groups a prose block with its sibling interactive
+    # tool_use by ``(session_id, message_id)`` and excludes synthetic plan text
+    # (``block_origin``) so it never suppresses real prose.
+    message_id: str | None = None
+    block_origin: str | None = None
 
 
 class SessionMonitor:
@@ -486,6 +499,8 @@ class SessionMonitor:
                                 image_data=entry.image_data,
                                 tool_input=entry.tool_input,
                                 transcript_uuid=entry.uuid,
+                                message_id=entry.message_id,
+                                block_origin=entry.block_origin,
                             )
                             try:
                                 await self._event_callback(event)
@@ -526,6 +541,8 @@ class SessionMonitor:
                             tool_input=entry.tool_input,
                             transcript_uuid=entry.uuid,
                             stop_reason=entry.stop_reason,
+                            message_id=entry.message_id,
+                            block_origin=entry.block_origin,
                         )
                     )
                     logger.info(
@@ -688,6 +705,8 @@ class SessionMonitor:
                             transcript_uuid=entry.uuid,
                             subagent_key=tracking_key,
                             stop_reason=entry.stop_reason,
+                            message_id=entry.message_id,
+                            block_origin=entry.block_origin,
                         )
                     )
 

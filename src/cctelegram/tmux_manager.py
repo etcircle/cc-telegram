@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 import shutil
 import time
 from dataclasses import dataclass
@@ -60,6 +61,26 @@ import libtmux  # noqa: E402  (must follow the shutil patch)
 from .config import SENSITIVE_ENV_VARS, config  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+def _compose_launch_command(
+    base_command: str, md_settings_path: str, resume_session_id: str | None
+) -> str:
+    """Compose the ``claude`` launch command line sent to the pane.
+
+    Appends ``--settings <path>`` (the bot-managed MessageDisplay live-prose
+    capture settings — Bug 2) when a path is given, then ``--resume <id>`` when
+    resuming. Both injected values are shell-quoted: the string is executed by
+    the shell via tmux ``send_keys``, so an unquoted path with a space or shell
+    metacharacter would split or be mangled. ``base_command`` is left verbatim
+    (it is the trusted ``CLAUDE_COMMAND`` config, which may itself carry flags).
+    """
+    cmd = base_command
+    if md_settings_path:
+        cmd = f"{cmd} --settings {shlex.quote(md_settings_path)}"
+    if resume_session_id:
+        cmd = f"{cmd} --resume {shlex.quote(resume_session_id)}"
+    return cmd
 
 
 @dataclass
@@ -575,6 +596,21 @@ class TmuxManager:
             final_window_name = f"{base_name}-{counter}"
             counter += 1
 
+        # Resolve the bot-managed MessageDisplay capture settings once, off the
+        # tmux worker thread. Passing it via ``claude --settings`` scopes the
+        # live-prose hook (Bug 2) to bot-launched sessions and merges with the
+        # global SessionStart / PreToolUse hooks. A failed write degrades
+        # gracefully — the window still launches, just without live-prose
+        # capture (falls back to post-resolution JSONL delivery).
+        from . import md_capture
+
+        try:
+            md_settings_path = md_capture.ensure_capture_settings()
+            md_settings = str(md_settings_path) if md_settings_path.exists() else ""
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not prepare MessageDisplay capture settings: %s", e)
+            md_settings = ""
+
         # Create window in thread
         def _create_and_start() -> tuple[bool, str, str, str]:
             session = self.get_or_create_session()
@@ -594,9 +630,9 @@ class TmuxManager:
                 if start_claude:
                     pane = window.active_pane
                     if pane:
-                        cmd = config.claude_command
-                        if resume_session_id:
-                            cmd = f"{cmd} --resume {resume_session_id}"
+                        cmd = _compose_launch_command(
+                            config.claude_command, md_settings, resume_session_id
+                        )
                         pane.send_keys(cmd, enter=True)
 
                 logger.info(

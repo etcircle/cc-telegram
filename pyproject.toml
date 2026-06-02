@@ -47,6 +47,7 @@ asyncio_mode = "auto"
 markers = [
     "integration: tests using real filesystem or external processes",
     "scenario: black-box behavior tests at the public Telegram seam",
+    "benchmark: latency/perf gates (subprocess timing); stable via delta-over-baseline",
 ]
 
 [tool.coverage.run]

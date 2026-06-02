@@ -157,6 +157,46 @@ typically unavailable during the live window), but a schema-v2 side file
 carrying the hook-captured `window_id` could discriminate — deferred as
 off-contract.
 
+## MessageDisplay live-prose capture (Bug 2)
+
+Assistant free-text prose written in the same turn as an `AskUserQuestion` /
+`ExitPlanMode` `tool_use` is co-flushed to the session JSONL only at
+resolution, so during a live prompt the monitor's byte-offset read sees no new
+bytes and the prose is not on the bridge — the Telegram user would see only the
+picker card and choose blind. Claude Code's `MessageDisplay` hook fires with
+each streaming `delta` of an assistant message BEFORE the picker blocks; the
+tiny stdlib appender (`_md_display_appender.py`) writes each raw payload as one
+NDJSON line to `msg_display/<session>.ndjson`, keyed by
+`Path(transcript_path).stem` (resume-safe). The hook is scoped to bot-launched
+sessions via a bot-managed `md_hook_settings.json` passed as `claude
+--settings` (it merges with the global `SessionStart` / `PreToolUse` hooks and
+is never installed into `~/.claude/settings.json`).
+
+`MessageDisplay.message_id` has no JSONL counterpart and `delta` is per-flush
+(`final=True` marks end-of-message), so **accumulation is bot-side**:
+`md_capture.read_prose_records(session_id)` reads the per-session NDJSON ON
+DEMAND (pull-only — no background tailer / observer; c313657 stays forbidden),
+groups deltas by `message_id`, concatenates them in index order, and returns one
+`ProseRecord` per FINALIZED message (`{session_id, transcript_path,
+md_message_id, text, raw_hash, norm_hash, first_seen_at, final_at}`) ordered by
+`final_at`. It tolerates a missing file, corrupt / partially-written lines, and
+not-yet-final messages (omitted — the render-path bounded retry re-reads).
+`md_capture.normalize_prose` (CR/CRLF→LF + per-line trailing-trim + edge strip,
+NO interior collapse) is the SINGLE normalization used for both the live
+`norm_hash` here and the post-resolution JSONL dedup, so the two compare equal
+regardless of streaming-vs-flush quirks — the mint/validate parity that keeps
+dedup from silently failing.
+
+The §3.0 data-model prerequisite plumbs JSONL `message.id` + a `block_origin`
+marker through `ParsedEntry` / `TranscriptEvent` / `NewMessage` (a single
+backfill stamps every entry of an assistant line with its `message.id`; the
+synthetic ExitPlanMode plan body — emitted as `content_type="text"` from
+`input.plan` — is marked `BLOCK_ORIGIN_EXIT_PLAN` so dedup never suppresses real
+prose by matching it). The live-delivery surface (post the record before the
+picker card), the freshness gate, the restart-safe shown-live marker, and the
+JSONL dedup land in PR-C+D; PR-B ships the capture + read + normalization +
+lifecycle (`teardown_session` / `gc_stale`) primitives.
+
 ## Rate Limiting
 
 - `AIORateLimiter(max_retries=5)` on the Application (30/s global)

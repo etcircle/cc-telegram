@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 # keep the parser dependency-free.
 _TURN_END_REASONS_LITERAL = frozenset({"end_turn", "stop_sequence"})
 
+# ``ParsedEntry.block_origin`` marker for the synthetic ExitPlanMode plan body
+# (emitted as a ``content_type="text"`` entry from ``tool_use.input.plan``).
+# A real assistant free-text block leaves ``block_origin`` None. Bug 2's
+# live-prose dedup must never suppress real prose by matching this synthetic
+# plan text, so it considers only origin-less (None) text blocks.
+BLOCK_ORIGIN_EXIT_PLAN = "exit_plan"
+
 
 @dataclass
 class ParsedMessage:
@@ -73,6 +80,21 @@ class ParsedEntry:
     # description / subagent_type / prompt without re-parsing JSONL.
     tool_input: dict[str, Any] | None = None
     uuid: str | None = None
+    # JSONL ``message.id`` — the per-MESSAGE id shared by every content block
+    # (text / thinking / tool_use) of one assistant turn, distinct from the
+    # per-LINE ``uuid``. Bug 2's live-prose dedup groups a sibling prose block
+    # with its trailing interactive ``tool_use`` (AskUserQuestion /
+    # ExitPlanMode) by ``(session_id, message_id)``; ``uuid`` cannot, since
+    # each block is its own JSONL line / uuid. None for user-role entries and
+    # any assistant line whose ``message`` carries no string ``id``.
+    message_id: str | None = None
+    # Origin marker separating a REAL assistant free-text block (None) from a
+    # SYNTHETIC text entry the parser fabricates — currently only the
+    # ExitPlanMode plan body (``BLOCK_ORIGIN_EXIT_PLAN``), emitted as
+    # ``content_type="text"`` from ``input.plan``. Bug 2 dedup considers only
+    # origin-less blocks so it never suppresses real prose by matching the
+    # synthetic plan text.
+    block_origin: str | None = None
     # When True, this entry exists only to drive run-state transitions in
     # the busy indicator and must NOT be rendered in Telegram. Emitted for
     # raw JSONL events that lack visible content (empty tool_result, an
@@ -89,6 +111,10 @@ class PendingToolInfo:
     tool_name: str  # Tool name (e.g. "Read", "Edit")
     input_data: Any = None  # Tool input parameters (for Edit to generate diff)
     uuid: str | None = None
+    # JSONL ``message.id`` of the assistant turn this tool_use belonged to, so
+    # the one-shot/history flush below re-emits the tool_use entry with the
+    # same id the main-loop entry carries (Bug 2 grouping consistency).
+    message_id: str | None = None
 
 
 class TranscriptParser:
@@ -551,6 +577,14 @@ class TranscriptParser:
             message = data.get("message")
             if not isinstance(message, dict):
                 continue
+            # JSONL ``message.id`` — shared across the content blocks of one
+            # assistant turn. Stamped onto every entry derived from this line
+            # (backfilled below) so Bug 2 dedup can group prose with its
+            # sibling interactive tool_use. Absent / non-str on user lines.
+            raw_message_id = message.get("id")
+            entry_message_id = (
+                raw_message_id if isinstance(raw_message_id, str) else None
+            )
             content = message.get("content", "")
             if not isinstance(content, list):
                 content = [{"type": "text", "text": str(content)}] if content else []
@@ -643,6 +677,9 @@ class TranscriptParser:
                                         timestamp=entry_timestamp,
                                         stop_reason=entry_stop_reason,
                                         uuid=entry_uuid,
+                                        # Mark the fabricated plan body so Bug 2
+                                        # dedup never treats it as real prose.
+                                        block_origin=BLOCK_ORIGIN_EXIT_PLAN,
                                     )
                                 )
                         if tool_id:
@@ -661,6 +698,7 @@ class TranscriptParser:
                                 tool_name=name,
                                 input_data=input_data,
                                 uuid=entry_uuid,
+                                message_id=entry_message_id,
                             )
                             # Also emit tool_use entry with tool_name for immediate handling
                             result.append(
@@ -740,6 +778,16 @@ class TranscriptParser:
                             lifecycle_only=True,
                         )
                     )
+
+                # Stamp the per-message id onto every entry derived from this
+                # assistant line (text / thinking / tool_use / lifecycle), in
+                # one place rather than threading a kwarg through each
+                # ParsedEntry above. ``_result_len_before`` was captured before
+                # this line's blocks were appended, so the slice is exactly
+                # this turn's entries. Bug 2 dedup groups a prose block with
+                # its sibling interactive tool_use by this id.
+                for _entry in result[_result_len_before:]:
+                    _entry.message_id = entry_message_id
 
             elif msg_type == "user":
                 # Check for tool_result blocks and merge with pending tools
@@ -963,6 +1011,7 @@ class TranscriptParser:
                         content_type="tool_use",
                         tool_use_id=tool_id,
                         uuid=tool_info.uuid,
+                        message_id=tool_info.message_id,
                     )
                 )
 
