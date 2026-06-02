@@ -84,6 +84,28 @@ def session_ndjson_path(session_id: str) -> Path:
     return msg_display_dir() / f"{session_id}.ndjson"
 
 
+def _resolve_session_path(session_id: str, base_dir: Path | None) -> Path:
+    if base_dir is not None:
+        return base_dir / MD_DISPLAY_DIRNAME / f"{session_id}.ndjson"
+    return session_ndjson_path(session_id)
+
+
+def _append_json_line(path: Path, obj: dict) -> None:
+    """Append one compact NDJSON line via a single O_APPEND write (same atomic
+    pattern as the hook appender + the AUQ ledger). Best-effort; a failed write
+    is swallowed (a missed marker degrades to at worst a benign double-post)."""
+    line = json.dumps(obj, separators=(",", ":")) + "\n"
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError as e:
+        logger.warning("md_capture: could not append marker to %s: %s", path, e)
+
+
 def _hook_command() -> str:
     """The shell command Claude runs for the hook: the bot's own interpreter
     (absolute, guaranteed to exist with a stdlib) running the appender. Both
@@ -161,24 +183,32 @@ def normalize_prose(text: str) -> str:
     The ONLY transforms (per the locked dedup contract): CR/CRLF → LF, strip
     trailing whitespace per line, strip leading/trailing blank lines. No
     interior whitespace collapse — that would conflate genuinely different
-    prose. This same function normalizes BOTH the live captured text (for the
-    ``norm_hash`` stored here) and the post-resolution JSONL aggregate (PR-D's
-    dedup), so the two compare equal regardless of streaming vs flush quirks.
+    prose. This same function normalizes (via ``prose_norm_hash``) BOTH the live
+    captured text (the marker ``norm_hash``) and the post-resolution JSONL
+    aggregate (``session_monitor.filter_live_prose_duplicates``), so the two
+    compare equal regardless of streaming-vs-flush quirks.
 
-    PR-C/D PARITY CONTRACT (codex + panel PR-B P2 — lock before coding the
-    comparator): for a SINGLE assistant text block this is provably equal on
-    both sides, which is Bug 2's observed shape (every message in the live
-    capture was single-block). But the JSONL side strips EACH text block
-    independently (``transcript_parser.py`` ``entry.text.strip()``) and the
-    plan joins real-text blocks with a single ``\n``, whereas this normalizes
-    one whole display string and PRESERVES interior blank lines / indentation.
-    So a multi-text-block message whose live display carries a blank line
-    BETWEEN blocks would hash-diverge from the per-block-stripped-then-joined
-    JSONL aggregate → a dedup miss → the prose double-posts (benign, not a
-    crash). PR-C MUST reduce both sides to ONE pre-hash shape — e.g. aggregate
-    the JSONL side from RAW (pre-strip) block text joined with ``\n`` and
-    normalize the whole, matching the live string — and add the adversarial
-    multi-block fixture. This is unobserved today and has no consumer in PR-B.
+    MULTI-BLOCK RESIDUAL (codex + panel PR-B P2): for a SINGLE assistant text
+    block — Bug 2's observed shape (every captured message was single-block) —
+    the two sides are provably equal. The dedup aggregates the JSONL side by
+    joining the parser-STRIPPED text blocks with ``\n``; that matches the live
+    whole-string form for single-block and adjacent multi-block prose. The only
+    divergence is a multi-text-block message whose live display carries a blank
+    line BETWEEN blocks (the per-block strip drops it) → a hash MISMATCH → a
+    dedup MISS → the prose double-posts (benign in the current turn — a mismatch
+    can only fail to suppress, never suppress different prose). Second-order
+    hazard (panel PR-C+D P3): a missed dedup leaves the shown-live marker
+    UNCONSUMED. It is cleared at resolution by ``teardown_session`` (so the
+    normal flow is safe), but if teardown is skipped between turns (a
+    crash / down-bot window), a later turn whose prose normalizes to the same
+    hash AND carries an interactive tool_use could match the lingering marker
+    and be falsely SUPPRESSED — bounded by the 1h ``gc_stale`` backstop and
+    gated on that crash window, so latent + low-probability. Closing the root
+    miss would need the JSONL side aggregated from RAW pre-strip block text,
+    which the post-strip ``NewMessage`` stream does not expose. A marker TTL is
+    NOT a clean fix (it must outlive an arbitrarily slow user answer, so it
+    can't be short enough to expire a crash-orphan before the next turn);
+    deferred as the documented residual.
     """
     lf = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [ln.rstrip() for ln in lf.split("\n")]
@@ -187,6 +217,14 @@ def normalize_prose(text: str) -> str:
 
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def prose_norm_hash(text: str) -> str:
+    """The normalized-prose hash used for cross-source dedup. The SINGLE
+    function for both the live capture's ``ProseRecord.norm_hash`` and the
+    post-resolution JSONL aggregate (``session_monitor`` dedup), so the two are
+    equal-by-construction for the same prose (mint/validate parity)."""
+    return _sha256(normalize_prose(text))
 
 
 # ── On-demand read + accumulation ────────────────────────────────────────────
@@ -253,11 +291,7 @@ def read_prose_records(
     incrementally from a persisted byte offset (per-resolution teardown keeps it
     small in the common case).
     """
-    path = (
-        (base_dir / MD_DISPLAY_DIRNAME / f"{session_id}.ndjson")
-        if base_dir is not None
-        else session_ndjson_path(session_id)
-    )
+    path = _resolve_session_path(session_id, base_dir)
     try:
         raw = path.read_text(encoding="utf-8")
     except (FileNotFoundError, OSError):
@@ -313,13 +347,162 @@ def read_prose_records(
                 md_message_id=mid,
                 text=text,
                 raw_hash=_sha256(text),
-                norm_hash=_sha256(normalize_prose(text)),
+                norm_hash=prose_norm_hash(text),
                 first_seen_at=acc.first_seen_at,
                 final_at=acc.final_at,
             )
         )
     records.sort(key=lambda r: r.final_at)
     return records
+
+
+# Freshness TTLs for the live-prose render path (tunable; final values pinned by
+# the PR-C tests). The prose is captured ~0.68s before the picker blocks and the
+# poller detects the picker within ~1s, so the matching final lands a few seconds
+# before render — these bound how stale a candidate can be before it's rejected
+# (a previous turn's leftover prose) and the path falls back to JSONL delivery.
+AUQ_PROSE_TTL_S = 8.0
+EPM_PROSE_TTL_S = 12.0
+
+
+def select_fresh_prose(
+    session_id: str,
+    *,
+    now: float,
+    ttl_seconds: float,
+    base_dir: Path | None = None,
+) -> ProseRecord | None:
+    """Pick the freshest FINALIZED prose record whose ``final_at`` is within
+    ``ttl_seconds`` of ``now`` (a previous turn's leftover prose ages out), or
+    ``None``. Records are per-session by construction (the file is keyed by the
+    session's transcript stem), so "same session" needs no extra check; the TTL
+    is the staleness guard. Returns the MOST RECENT match — the prose that
+    streamed immediately before this picker."""
+    fresh = [
+        r
+        for r in read_prose_records(session_id, base_dir=base_dir)
+        if (now - r.final_at) <= ttl_seconds
+    ]
+    return fresh[-1] if fresh else None
+
+
+# ── Shown-live markers (the dedup bridge to the post-resolution JSONL copy) ──
+#
+# When the render path posts a captured prose live (before the picker card), it
+# records a "shown_live" marker in the SAME per-session NDJSON file, so the
+# marker shares the capture's lifecycle (``teardown_session`` unlinks it) and is
+# restart-safe (a ``launchctl kickstart`` between live-post and answer can't
+# double-post). The batch dedup (session_monitor) reads the unconsumed markers
+# at the JSONL flush, matches a group's aggregated real-prose ``norm_hash``, and
+# ``consume``s the marker so the post-resolution copy is suppressed exactly once.
+# Marker lines carry a ``marker`` key; ``read_prose_records`` ignores them (no
+# ``payload``), and this reader ignores the delta lines — they coexist cleanly.
+
+
+@dataclass(frozen=True)
+class ShownLiveMarker:
+    md_message_id: str
+    norm_hash: str
+    shown_at: float
+
+
+def record_shown_live(
+    session_id: str,
+    *,
+    md_message_id: str,
+    norm_hash: str,
+    shown_at: float,
+    base_dir: Path | None = None,
+) -> None:
+    """Mark a captured prose message as delivered live (before the picker)."""
+    _append_json_line(
+        _resolve_session_path(session_id, base_dir),
+        {
+            "marker": "shown_live",
+            "md_message_id": md_message_id,
+            "norm_hash": norm_hash,
+            "shown_at": shown_at,
+        },
+    )
+
+
+def consume_shown_live(
+    session_id: str, md_message_id: str, *, base_dir: Path | None = None
+) -> None:
+    """Mark a shown-live marker consumed (its post-resolution copy was
+    suppressed) so a later read no longer returns it."""
+    _append_json_line(
+        _resolve_session_path(session_id, base_dir),
+        {"marker": "consumed", "md_message_id": md_message_id},
+    )
+
+
+def read_shown_live_markers(
+    session_id: str, *, base_dir: Path | None = None
+) -> list[ShownLiveMarker]:
+    """Return the UNCONSUMED shown-live markers for the session (latest
+    ``shown_live`` per ``md_message_id`` minus any later ``consumed`` line).
+    Missing file → ``[]``; corrupt lines skipped."""
+    try:
+        raw = _resolve_session_path(session_id, base_dir).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return []
+    shown: dict[str, ShownLiveMarker] = {}
+    consumed: set[str] = set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        kind = rec.get("marker")
+        mid = rec.get("md_message_id")
+        if not isinstance(mid, str) or not mid:
+            continue
+        if kind == "shown_live":
+            nh = rec.get("norm_hash")
+            sa = rec.get("shown_at")
+            if isinstance(nh, str) and isinstance(sa, (int, float)):
+                shown[mid] = ShownLiveMarker(
+                    md_message_id=mid, norm_hash=nh, shown_at=float(sa)
+                )
+        elif kind == "consumed":
+            consumed.add(mid)
+    return [m for mid, m in shown.items() if mid not in consumed]
+
+
+def was_shown_live(
+    session_id: str, md_message_id: str, *, base_dir: Path | None = None
+) -> bool:
+    """True if a ``shown_live`` marker was EVER recorded for this MessageDisplay
+    message — consumed or not. The render-path idempotency guard: once a prose
+    has been delivered live, never re-deliver it, even after the batch dedup
+    consumes its marker or if the picker pane is still apparently live on a
+    later ``handle_interactive_ui`` call. (Distinct from ``read_shown_live_
+    markers``, which returns only UNCONSUMED markers for the dedup to match.)"""
+    try:
+        raw = _resolve_session_path(session_id, base_dir).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return False
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if (
+            isinstance(rec, dict)
+            and rec.get("marker") == "shown_live"
+            and rec.get("md_message_id") == md_message_id
+        ):
+            return True
+    return False
 
 
 # ── Lifecycle / teardown ─────────────────────────────────────────────────────
