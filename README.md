@@ -9,6 +9,7 @@ Each Telegram topic maps to one tmux window running one Claude Code process. The
 - **Topic-based sessions** — one Telegram topic = one tmux window = one Claude session.
 - **Hook-based session tracking** — Claude Code `SessionStart` writes `session_map.json`, so `/clear` and resumed sessions stay attached to the right topic.
 - **AskUserQuestion descriptions and multi-select toggles** — a `PreToolUse` hook captures the structured `AskUserQuestion` payload before Claude renders the picker, so each option's full description shows in Telegram right away. Single-select options submit through the restart-safe `aqp:` pick flow; multi-select options toggle with non-ledgered `aqt:` bare-digit callbacks, then final Submit/Cancel reuses the review-screen `aqp:` flow.
+- **Live prose before interactive prompts** — when Claude writes explanatory prose in the same turn as an `AskUserQuestion` / `ExitPlanMode`, Claude Code buffers the whole turn in the session JSONL until the prompt resolves, so without help the Telegram user would see only the picker and choose blind. A lightweight `MessageDisplay` hook captures that prose live (before the picker blocks) so the bot can deliver it ahead of the picker card.
 - **Streaming output** — assistant text, thinking, tool use/result summaries, interactive prompts, and local command output flow into Telegram.
 - **Per-route queues** — each `(user_id, thread_id, window_id)` has its own worker, so one noisy topic does not stall another.
 - **Run-state digest** — compact activity digests show tool activity, context-window percentage, and busy/waiting state.
@@ -98,6 +99,8 @@ Under `$CC_TELEGRAM_DIR` (default `~/.cc-telegram/`):
 - `interactive_state.json` — persisted picker message ids + AUQ context markers (survives bot restart so a `launchctl kickstart` doesn't lose interactive state).
 - `auq_pending/<session_id>.json` — `PreToolUse` side files (one per active AUQ; mode `0600` under directory mode `0700`). Multi-select `aqt:` toggles keep the side file alive; it is cleaned when the AUQ `tool_result` runs `forget_ask_tool_input`, on session replacement, or by startup GC.
 - `auq_action_ledger.jsonl` — restart-safe write-ahead ledger for AUQ option-pick dispatches (mode `0600`; append-only JSONL; latest line per `(route_hash, fp8, opt)` key wins; the callback handler consults this to detect duplicate taps after a process restart so Claude doesn't receive the same digit twice).
+- `md_hook_settings.json` — bot-managed Claude Code settings file registering the `MessageDisplay` hook. Passed to bot-launched sessions via `claude --settings`, so the live-prose hook is scoped to the bot's own windows (it is never written into the global `~/.claude/settings.json`). Re-written on startup and on each window launch if its content drifts.
+- `msg_display/<session_id>.ndjson` — `MessageDisplay` live-prose capture (one file per session keyed by the transcript filename, so it is resume-safe; mode `0600` under directory mode `0700`). The hook appends each streaming `delta`; the bot accumulates them into completed prose and reads it at picker-render time. Swept by a 1h startup GC; the per-prompt teardown (on prompt resolution / session teardown / `/clear` / topic close) is wired in a later step of the feature.
 - `message_refs.db` — SQLite provenance index for safer reply-context resolution (path overridable via `CC_TELEGRAM_MESSAGE_REFS_DB_PATH`).
 - `log-archive/` — gzipped log rotations (only present if the rotation LaunchAgent is installed; see "Log rotation").
 
@@ -164,6 +167,24 @@ Side files are:
 - Safe to delete the directory at any time; it is re-created on the next AUQ.
 
 If the PreToolUse hook entry is missing from `~/.claude/settings.json`, the bot logs a one-time startup warning and falls back to pane-only descriptions. Re-run `cc-telegram hook --install` to repair.
+
+### Live prose before AskUserQuestion / ExitPlanMode (MessageDisplay hook)
+
+`cc-telegram hook --install` manages only the `SessionStart` and `PreToolUse` entries above. A third hook — Claude Code's `MessageDisplay` event — is managed **automatically by the bot** and needs no manual install. It is **not** written into the global `~/.claude/settings.json`; instead the bot writes a small settings file and passes it only to the sessions it launches:
+
+```
+<CC_TELEGRAM_DIR>/md_hook_settings.json    → claude --settings <that file>
+```
+
+So the hook fires only for the bot's own windows (it merges with the global `SessionStart` / `PreToolUse` hooks). The hook itself is a tiny stdlib-only appender (run directly by the Python interpreter, never importing the package) so it stays well under the streaming-display latency budget. It appends each streaming `delta` of an assistant message to:
+
+```
+<CC_TELEGRAM_DIR>/msg_display/<session_id>.ndjson   (mode 0600; directory mode 0700)
+```
+
+When Claude writes prose in the same turn as an `AskUserQuestion` / `ExitPlanMode`, Claude Code buffers the whole turn in the session JSONL until the prompt resolves — so the explanatory prose would otherwise reach Telegram only after the user already chose. The bot accumulates the captured `delta`s into the completed prose and reads it at picker-render time, so the prose can be delivered before the picker card. Capture files are swept by a 1h startup GC (the per-prompt teardown on resolution / session-teardown is wired in a later step of the feature); the directory is safe to delete at any time.
+
+If the bot cannot write the settings file (e.g. an unwritable config dir), it logs a one-time startup warning and live prose silently falls back to post-resolution delivery — no crash, the picker still works.
 
 ## Run
 
@@ -287,6 +308,8 @@ src/cctelegram/session_monitor.py         JSONL tail + TranscriptEvent dispatch
 src/cctelegram/transcript_parser.py       JSONL → ParsedEntry / TranscriptEvent
 src/cctelegram/route_runtime.py           per-route run-state / context-usage / idle-clear authority
 src/cctelegram/transcript_event_adapter.py  TranscriptEvent → route_runtime adapter
+src/cctelegram/md_capture.py              MessageDisplay live-prose reader/accumulator + capture-settings/teardown
+src/cctelegram/_md_display_appender.py    tiny stdlib MessageDisplay hook (appends deltas; never imports the package)
 tests/                              pytest suite
 tests/scenarios/                    black-box behavior floor (@pytest.mark.scenario)
 bin/post-wave-check.sh              repo-health diff for the architecture campaign

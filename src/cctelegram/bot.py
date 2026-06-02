@@ -1162,6 +1162,32 @@ async def post_init(application: Application) -> None:
         # Never let cleanup/maintenance crash bot startup.
         logger.warning("AUQ pretool startup maintenance raised: %s", e)
 
+    # MessageDisplay live-prose capture maintenance (Bug 2 — prose buffered
+    # behind a live AUQ / ExitPlanMode):
+    #   1. Write the bot-managed --settings file that registers the
+    #      MessageDisplay hook (scoped to bot-launched sessions via
+    #      `claude --settings`; merges with the global hooks).
+    #   2. GC stale per-session capture files (>1h) left by crashes /
+    #      kickstart-between-prompts.
+    #   3. Self-check: warn if the settings file ended up WITHOUT the hook
+    #      (e.g. an unwritable config dir). The bot still works — live prose
+    #      silently falls back to post-resolution JSONL delivery.
+    try:
+        from . import md_capture
+
+        md_capture.ensure_capture_settings()
+        md_capture.gc_stale()
+        if not md_capture.capture_settings_has_message_display():
+            logger.warning(
+                "MessageDisplay capture settings missing the hook (%s); live "
+                "prose before an AUQ/ExitPlanMode will fall back to "
+                "post-resolution delivery. Check that %s is writable.",
+                md_capture.capture_settings_path(),
+                md_capture.app_dir(),
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("MessageDisplay capture startup maintenance raised: %s", e)
+
     # Start status polling task
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")

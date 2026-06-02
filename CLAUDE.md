@@ -43,6 +43,8 @@ cc-telegram hook --install            # Auto-install Claude Code SessionStart ho
   - `interactive_state.json` (persisted picker msg ids + AUQ context markers; survives `launchctl kickstart`)
   - `auq_pending/<session_id>.json` (`PreToolUse` side files; one per active AUQ; mode `0600` under directory mode `0700`; survives multi-select `aqt:` toggles; cleaned when AUQ `tool_result` calls `forget_ask_tool_input`, on session replacement, or by startup GC)
   - `auq_action_ledger.jsonl` (Wave 3 append-only write-ahead ledger of AUQ option-pick lifecycle states keyed by `(route_hash, fp8, opt)`; mode `0600`; latest line per key wins; the callback handler reads it BEFORE the in-memory `_pick_tokens` table so a duplicate tap after `launchctl kickstart` answers "Action already received" instead of re-dispatching the digit to tmux)
+  - `md_hook_settings.json` (Bug 2 bot-managed Claude Code settings registering the `MessageDisplay` hook; passed to bot-launched sessions via `claude --settings` so the live-prose hook is scoped to the bot's windows and is NOT written to global `~/.claude/settings.json`; re-written when its content drifts)
+  - `msg_display/<session_id>.ndjson` (Bug 2 `MessageDisplay` live-prose capture; one per session keyed by the transcript filename stem — resume-safe; dir mode `0700`, files mode `0600`; the tiny stdlib appender hook appends each streaming `delta`, the bot accumulates them by `MessageDisplay.message_id` into completed prose read at picker-render; swept by a 1h startup GC, with the `teardown_session` primitive wired to AUQ/EPM resolution / session replacement / `/clear` / topic close in a later step of the feature)
   - `message_refs.db` (SQLite provenance index; path overridable via `CC_TELEGRAM_MESSAGE_REFS_DB_PATH`)
   - `log-archive/` (gzipped log rotations; only if the rotation LaunchAgent is installed)
 
@@ -70,6 +72,8 @@ Or manually in `~/.claude/settings.json`:
 ```
 
 `SessionStart` writes `session_map.json` (window ↔ session resolution). `PreToolUse` (matcher `AskUserQuestion`) captures the structured `tool_input` to `~/.cc-telegram/auq_pending/<session_id>.json` so the bot can render each option's full description in the Telegram picker at first render. Multi-select AUQs use `aqt:` callbacks for non-ledgered bare-digit toggles; Tab reaches the review screen, where Submit/Cancel reuses the existing ledgered `aqp:` pick flow. The bot logs a one-time startup warning if `PreToolUse` is missing; re-run `cc-telegram hook --install` to repair.
+
+A third hook event — `MessageDisplay` (Bug 2 live prose) — is **NOT** managed by `cc-telegram hook --install` and is **NOT** in `~/.claude/settings.json`. The bot writes its own `md_hook_settings.json` and passes it only to sessions it launches via `claude --settings <file>` (`tmux_manager._compose_launch_command`), scoping the hook to the bot's windows (it merges with the global `SessionStart`/`PreToolUse`). The hook command runs the tiny stdlib `_md_display_appender.py` directly (it must never import the package — the streaming-display path runs hooks with `forceSyncExecution`, so latency matters; `md_capture` benchmarks the appender against a bare interpreter start). The bot logs a one-time startup warning if it cannot write the settings file, and live prose silently falls back to post-resolution JSONL delivery.
 
 ## Documentation conventions
 
