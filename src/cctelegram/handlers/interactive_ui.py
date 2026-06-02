@@ -41,6 +41,7 @@ from ..terminal_parser import (
     resolve_ask_form,
     visible_pane_liveness,
 )
+from .. import md_capture
 from ..tmux_manager import tmux_manager
 from ..utils import atomic_write_json
 from . import attention, auq_source, pick_token
@@ -404,6 +405,15 @@ def forget_ask_tool_input(window_id: str) -> None:
     _last_completed_ask_tool_input.pop(window_id, None)
     _last_auq_tool_use_id.pop(window_id, None)
     auq_source.forget_for_window(window_id)
+    # Bug 2: tear down the MessageDisplay live-prose capture for this window's
+    # CURRENT session on resolution. This is the primary teardown seam — it
+    # fires for BOTH AUQ (the tool_result branch) and ExitPlanMode (via the
+    # ``has_interactive_surface`` clear branch in ``bot.handle_new_message``).
+    # The ``/clear`` race (session_id swapped under us) is covered separately in
+    # ``session_monitor`` using the OLD session id, mirroring ``unlink_for_session``.
+    _md_session = session_id_for_window(window_id)
+    if _md_session:
+        md_capture.teardown_session(_md_session)
     # Wave 1: drop any in-flight pending claim too. The AUQ lifecycle
     # is ending (tool_result arrived); a pending claim from this AUQ
     # is no longer valid and rolling it forward would commit a stale
@@ -2512,6 +2522,105 @@ def _build_interactive_keyboard(
 # which walks tabs in place by editing body+keyboard as the picker advances.
 
 
+# Bug 2 live-prose: the bounded retry budget when the picker is detected before
+# the matching MessageDisplay ``final`` delta has landed. The prose finalizes
+# ~0.68s BEFORE the picker blocks, so in practice the first read hits and no
+# retry runs; this only covers the rare same-tick race. Held under the route
+# lock, so it is intentionally short.
+_LIVE_PROSE_RETRY_BUDGET_S = 0.25
+_LIVE_PROSE_RETRY_STEP_S = 0.05
+
+
+async def _maybe_post_live_prose(
+    bot: Bot,
+    *,
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int,
+    window_id: str,
+    ui_name: str,
+) -> None:
+    """Bug 2: deliver the assistant prose buffered behind a live AUQ /
+    ExitPlanMode BEFORE the picker card.
+
+    Claude Code co-flushes the whole turn (prose + the interactive ``tool_use``)
+    to the session JSONL only at resolution, so without this the prose reaches
+    Telegram only after the user already chose. The ``MessageDisplay`` hook
+    captured it live (``md_capture``); here we read the fresh candidate, post it
+    ahead of the card, and record a shown-live marker so the post-resolution
+    JSONL copy is deduped (``session_monitor``).
+
+    Idempotent: the shown-live marker (in the per-session capture file) makes a
+    re-render / poll re-detect / post-``kickstart`` call skip re-posting.
+    Fallback: no fresh capture (e.g. the hook isn't installed, or capture
+    missed) → silent no-op; the JSONL copy delivers post-resolution exactly as
+    before — no marker, no dedup, never a delayed picker. Called under the route
+    lock so the prose is ordered strictly before the picker card.
+    """
+    session_id = session_id_for_window(window_id)
+    if not session_id:
+        return
+    # If an interactive card already exists for this route we are PAST the first
+    # render (a re-render / poll re-detect / UI change). Posting prose now would
+    # land it BELOW the existing card and recreate the bug — so bail. This also
+    # covers the late-finalize edge: prose that wasn't ready at first render is
+    # NOT back-filled below the card; it falls back to post-resolution JSONL
+    # delivery (panel PR-C+D P2). ``was_shown_live`` below is the second guard.
+    if _interactive_msgs.get((user_id, thread_id or 0)) is not None:
+        return
+    ttl = (
+        md_capture.EPM_PROSE_TTL_S
+        if ui_name == "ExitPlanMode"
+        else md_capture.AUQ_PROSE_TTL_S
+    )
+    deadline = time.monotonic() + _LIVE_PROSE_RETRY_BUDGET_S
+    candidate: md_capture.ProseRecord | None = None
+    while True:
+        candidate = md_capture.select_fresh_prose(
+            session_id, now=time.time(), ttl_seconds=ttl
+        )
+        if candidate is not None or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(_LIVE_PROSE_RETRY_STEP_S)
+    if candidate is None or not candidate.text.strip():
+        return
+    # Already delivered live (re-render / poll re-detect / post-kickstart /
+    # after the dedup consumed its marker) → don't double-post. Uses the
+    # consumed-inclusive guard, NOT the unconsumed-marker set.
+    if md_capture.was_shown_live(session_id, candidate.md_message_id):
+        return
+    sent, _outcome = await topic_send(
+        bot,
+        op="content",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        text=candidate.text,
+        plain=False,
+        role="assistant",
+        content_type="text",
+        session_id=session_id,
+    )
+    if sent is None:
+        # Send failed — record NO marker so the JSONL copy still delivers the
+        # prose post-resolution (no silent loss).
+        return
+    md_capture.record_shown_live(
+        session_id,
+        md_message_id=candidate.md_message_id,
+        norm_hash=candidate.norm_hash,
+        shown_at=time.time(),
+    )
+    logger.info(
+        "Bug2 live-prose posted before picker: window=%s session=%s md_msg=%s len=%d",
+        window_id,
+        session_id[:8],
+        candidate.md_message_id[:8],
+        len(candidate.text),
+    )
+
+
 async def handle_interactive_ui(
     bot: Bot,
     user_id: int,
@@ -2824,6 +2933,23 @@ async def handle_interactive_ui(
                     (meta.session_id or "<empty>")[:8],
                     (current_session or "<none>")[:8],
                 )
+
+        # Bug 2: post any prose buffered behind this live picker BEFORE the
+        # card, under the same route lock so the ordering holds. Placed AFTER
+        # the staleness gate above (which drops a stale-session
+        # ``_interactive_msgs`` entry) so the card-existence guard inside
+        # ``_maybe_post_live_prose`` reflects only a VALID current-session card —
+        # a stale entry about to be replaced must NOT suppress live prose (codex
+        # PR-C+D re-review). Idempotent + best-effort; a no-op when there's no
+        # fresh live capture. Covers both AskUserQuestion and ExitPlanMode.
+        await _maybe_post_live_prose(
+            bot,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            window_id=window_id,
+            ui_name=content.name,
+        )
 
         # Check if we have an existing interactive message to edit
         existing_msg_id = _interactive_msgs.get(ikey)

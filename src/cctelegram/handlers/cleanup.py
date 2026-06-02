@@ -13,8 +13,8 @@ from typing import Any
 
 from telegram import Bot
 
-from .. import route_runtime
-from ..session import session_manager
+from .. import md_capture, route_runtime
+from ..session import session_id_for_window, session_manager
 
 from . import attention
 from .inbound_aggregator import aggregator_clear_route
@@ -67,6 +67,15 @@ async def clear_topic_state(
         # debounced flush can't fire into a torn-down window after the
         # queue is gone.
         aggregator_clear_route(route)
+        # Bug 2: tear down the MessageDisplay live-prose capture for this route's
+        # window. Resolved from the route's window_id via window_states (NOT
+        # thread_bindings — callers unbind the thread BEFORE clear_topic_state,
+        # so the binding is already gone; the route + window_state survive until
+        # teardown_route below). The session_monitor deleted-window seam
+        # backstops any queue-less window not in routes_for_topic.
+        _md_session = session_id_for_window(route[2])
+        if _md_session:
+            md_capture.teardown_session(_md_session)
         await teardown_route(route, drop_pending=drop_pending)
 
     # Clear status message tracking

@@ -192,10 +192,50 @@ marker through `ParsedEntry` / `TranscriptEvent` / `NewMessage` (a single
 backfill stamps every entry of an assistant line with its `message.id`; the
 synthetic ExitPlanMode plan body — emitted as `content_type="text"` from
 `input.plan` — is marked `BLOCK_ORIGIN_EXIT_PLAN` so dedup never suppresses real
-prose by matching it). The live-delivery surface (post the record before the
-picker card), the freshness gate, the restart-safe shown-live marker, and the
-JSONL dedup land in PR-C+D; PR-B ships the capture + read + normalization +
-lifecycle (`teardown_session` / `gc_stale`) primitives.
+prose by matching it).
+
+**Live delivery (PR-C).** `interactive_ui.handle_interactive_ui`, under the
+route lock and BEFORE the picker card / AUQ context message,
+`_maybe_post_live_prose` reads the freshest finalized capture
+(`md_capture.select_fresh_prose`, freshness = `final_at` within a per-mode TTL
+of now — `AUQ_PROSE_TTL_S` / `EPM_PROSE_TTL_S`, a previous turn's leftover ages
+out), posts it as its own message, and records a **shown-live marker** in the
+same per-session capture file. Idempotent via `md_capture.was_shown_live`
+(consume-INCLUSIVE: a re-render / poll re-detect / post-`kickstart` / the dedup
+having consumed the marker all skip a re-post). A miss is a silent no-op — the
+JSONL copy delivers post-resolution exactly as before (no marker, no dedup,
+never a delayed picker). A bounded ≤250ms retry covers the rare same-tick race
+(the prose finalizes ~0.68s before the picker blocks, so it almost never fires).
+Render-path state only — NOT a RouteRuntime field (Bug-1 contract intact).
+
+**Dedup (PR-D).** `session_monitor.filter_live_prose_duplicates` runs on the
+poll BATCH before per-message dispatch (the prose text block and its sibling
+interactive `tool_use` are separate `NewMessage`s of one `message_id`, prose
+first — only the batch sees the pairing). For each `(session_id, message_id)`
+group with an AskUserQuestion / ExitPlanMode `tool_use`, it aggregates the REAL
+text blocks (excludes `BLOCK_ORIGIN_EXIT_PLAN`), hashes via the SINGLE shared
+`md_capture.prose_norm_hash`, matches an unconsumed shown-live marker, and
+suppresses + consumes (consume-once, restart-safe). EPM ambiguity safety: >1
+group sharing one `(session, norm_hash)` marker → suppress NONE. Multi-block
+parity: aggregation joins parser-stripped blocks with `\n` — exact for
+single-block (Bug 2's observed shape) and adjacent multi-block, a benign
+double-post only for the rare blank-line-between-blocks case. Within one poll
+batch the dedup runs BEFORE the dispatch that triggers teardown, so it reads the
+marker first; the only gap is the split-batch edge (prose and its tool_use land
+in SEPARATE poll batches — unlikely given the turn co-flushes atomically), where
+the prose batch can dispatch undeduped and teardown can fire before the later
+tool_use batch → another benign double-post, never a crash.
+
+**Lifecycle.** `md_capture.teardown_session` (unlinks the per-session capture +
+its markers) is wired at AUQ/EPM resolution (`forget_ask_tool_input`, the
+primary seam — fires for both via `bot.handle_new_message`'s
+`has_interactive_surface` branch), the `/clear` race + deleted windows
+(`session_monitor` via the OLD session id), and topic close (`clear_topic_state`
+→ the thread's bound window). The 1h startup `gc_stale` is the backstop. The
+shown-live / consumed marker lines live in the SAME `msg_display/<session>.ndjson`
+as the capture deltas (the delta reader ignores `marker` lines and vice-versa),
+so they share that lifecycle. Pull-only throughout (no observer; c313657
+forbidden).
 
 ## Rate Limiting
 

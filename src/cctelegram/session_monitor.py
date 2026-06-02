@@ -20,6 +20,7 @@ from typing import Any, Callable, Awaitable, Literal
 
 import aiofiles
 
+from . import md_capture
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
@@ -27,6 +28,11 @@ from .transcript_parser import TranscriptParser
 from .utils import read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
+
+# Tool names whose buffered turn carries the Bug 2 live-prose surface. Mirrors
+# route_runtime.INTERACTIVE_TOOL_NAMES; duplicated to keep session_monitor free
+# of a route_runtime import (and the dedup is content-only, not run-state).
+_INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
 
 
 def _is_window_id(key: str) -> bool:
@@ -107,6 +113,93 @@ class NewMessage:
     # (``block_origin``) so it never suppresses real prose.
     message_id: str | None = None
     block_origin: str | None = None
+
+
+def filter_live_prose_duplicates(messages: list[NewMessage]) -> list[NewMessage]:
+    """Bug 2 dedup: suppress the post-resolution JSONL copy of prose that was
+    already delivered LIVE before a picker card.
+
+    Operates at the batch/group level (NOT per-message) because the prose text
+    block and its sibling interactive ``tool_use`` arrive as separate
+    ``NewMessage``s of the SAME ``message_id``, and prose precedes the tool_use
+    — only the whole batch sees the pairing. For each ``(session_id,
+    message_id)`` group that contains an AskUserQuestion / ExitPlanMode
+    ``tool_use``, the REAL text blocks are aggregated (synthetic ExitPlanMode
+    plan text, ``block_origin`` set, is excluded), normalized via the SINGLE
+    shared ``md_capture.prose_norm_hash``, and matched against an unconsumed
+    shown-live marker for the session. A match → suppress that group's prose
+    ``NewMessage``s and consume the marker (consume-once, restart-safe).
+
+    EPM ambiguity safety: if MORE THAN ONE group in the batch matches the same
+    ``(session_id, norm_hash)``, suppress NONE (no first-match-wins). Multi-block
+    parity: aggregation joins the parser-stripped blocks with ``\\n``; this is
+    exact for single-block prose (Bug 2's observed shape) and adjacent
+    multi-block, and degrades to a benign double-post only for the rare
+    multi-block message with a blank line BETWEEN blocks (see
+    ``md_capture.normalize_prose``).
+
+    Returns the batch with suppressed prose removed (order preserved). A batch
+    with no interactive group is returned unchanged with no marker I/O.
+    """
+    groups: dict[tuple[str, str], list[NewMessage]] = {}
+    for m in messages:
+        if m.role == "assistant" and m.session_id and m.message_id:
+            groups.setdefault((m.session_id, m.message_id), []).append(m)
+    if not groups:
+        return messages
+
+    # (session_id, norm_hash) -> list of each matching group's real-prose msgs.
+    by_key: dict[tuple[str, str], list[list[NewMessage]]] = {}
+    for (sid, _mid), grp in groups.items():
+        has_interactive = any(
+            g.content_type == "tool_use" and g.tool_name in _INTERACTIVE_TOOL_NAMES
+            for g in grp
+        )
+        if not has_interactive:
+            continue
+        real = [
+            g
+            for g in grp
+            if g.content_type == "text" and g.block_origin is None and g.text
+        ]
+        if not real:
+            continue
+        norm_hash = md_capture.prose_norm_hash("\n".join(g.text for g in real))
+        by_key.setdefault((sid, norm_hash), []).append(real)
+    if not by_key:
+        return messages
+
+    markers_cache: dict[str, list[md_capture.ShownLiveMarker]] = {}
+    suppress: set[int] = set()
+    for (sid, norm_hash), real_lists in by_key.items():
+        markers = markers_cache.get(sid)
+        if markers is None:
+            markers = md_capture.read_shown_live_markers(sid)
+            markers_cache[sid] = markers
+        match = next((mk for mk in markers if mk.norm_hash == norm_hash), None)
+        if match is None:
+            continue
+        if len(real_lists) > 1:
+            # >1 unresolved candidate group for one marker — ambiguous; the
+            # plan's contract is to suppress NONE and consume no marker.
+            logger.warning(
+                "live-prose dedup ambiguous for session %s (%d groups share "
+                "one marker); suppressing none",
+                sid[:8],
+                len(real_lists),
+            )
+            continue
+        for g in real_lists[0]:
+            suppress.add(id(g))
+        md_capture.consume_shown_live(sid, match.md_message_id)
+        logger.info(
+            "Bug2 live-prose deduped post-resolution copy: session=%s md_msg=%s",
+            sid[:8],
+            match.md_message_id[:8],
+        )
+    if not suppress:
+        return messages
+    return [m for m in messages if id(m) not in suppress]
 
 
 class SessionMonitor:
@@ -937,6 +1030,11 @@ class SessionMonitor:
                 old_sid = changed_old_sessions.get(wid, "")
                 if old_sid:
                     unlink_for_session(old_sid)
+                    # Bug 2: tear down the OLD session's live-prose capture on
+                    # /clear (the session_id was swapped, so forget_ask_tool_input
+                    # below would only see the NEW session — same parity reason
+                    # as unlink_for_session above).
+                    md_capture.teardown_session(old_sid)
                 forget_ask_tool_input(wid)
 
         # Codex P2 (chunk 5): unlink side files for deleted windows
@@ -947,6 +1045,7 @@ class SessionMonitor:
 
             for sid in deleted_session_ids:
                 unlink_for_session(sid)
+                md_capture.teardown_session(sid)
 
         # Update last known map
         self._last_session_map = current_map
@@ -1247,6 +1346,14 @@ class SessionMonitor:
                 )
                 if sidechain_messages:
                     new_messages.extend(sidechain_messages)
+
+                # Bug 2: drop the post-resolution copy of any prose already
+                # delivered live before the picker (batch/group dedup against
+                # the shown-live markers). Never let it break the dispatch loop.
+                try:
+                    new_messages = filter_live_prose_duplicates(new_messages)
+                except Exception as e:
+                    logger.error(f"live-prose dedup error: {e}")
 
                 for msg in new_messages:
                     preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")
