@@ -1,0 +1,19 @@
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Approach  ☐ Rollout  ✔ Submit  →
+
+Which implementation approach should we take for the new caching layer?
+
+❯ 1. Write-through cache with Redis backend
+     Writes go to cache and datastore synchronously; strong consistency,
+     slightly higher write latency.
+  2. Write-back cache with periodic flush
+     Writes hit the cache first and flush to the datastore in batches; faster
+     writes, risk of data loss on crash.
+  3. No cache, optimize queries instead
+     Skip the caching layer entirely and improve query performance directly;
+     simpler, less infrastructure.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

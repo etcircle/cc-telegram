@@ -1,0 +1,18 @@
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Approach  ☐ Rollout  ✔ Submit  →
+
+How should we roll this out to production users?
+
+❯ 1. Immediate full rollout to everyone
+     Ship to 100% of users at once; fastest but highest blast radius if
+     something breaks.
+  2. Gradual canary over one week
+     Ramp traffic incrementally with monitoring; balances speed and safety.
+  3. Feature-flagged opt-in only
+     Users explicitly enable it; safest, but slowest adoption and limited
+     real-world signal.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

@@ -1,0 +1,14 @@
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Approach  ☒ Rollout  ✔ Submit  →
+
+Review your answers
+
+ ● Which implementation approach should we take for the new caching layer?
+   → Write-through cache with Redis backend
+ ● How should we roll this out to production users?
+   → Immediate full rollout to everyone
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
