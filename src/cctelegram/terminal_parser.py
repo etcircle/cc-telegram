@@ -407,6 +407,12 @@ _RE_PICKER_FOOTER = re.compile(r"Enter to select")
 _RE_REVIEW_HEADER = re.compile(r"^\s*Review your answers\s*$")
 _RE_SUBMIT_PROMPT = re.compile(r"^\s*Ready to submit your answers\?\s*$")
 
+# Literal label of the review-screen's "Submit answers" row (always option 1).
+# The single source of the literal that the cursor-blind Submit predicate
+# (``AskUserQuestionForm.review_submit_dispatchable``) and the mint-site tags
+# anchor on, so a relabeled/reordered review layout SAFELY DECLINES.
+REVIEW_SUBMIT_LABEL = "Submit answers"
+
 # Matches a free-text "Type something" option (variant where the user can
 # type free text instead of picking a numbered option).
 _RE_FREE_TEXT_OPTION = re.compile(r"Type something")
@@ -683,7 +689,7 @@ class AskUserQuestionForm:
         opts_str = "|".join(
             f"{o.number}:{o.label}"
             f":{'R' if o.recommended else '_'}"
-            f":{'C' if o.cursor else '_'}"
+            f":{'_' if self.is_review_screen else ('C' if o.cursor else '_')}"
             for o in self.options
         )
         lines = [
@@ -715,6 +721,22 @@ class AskUserQuestionForm:
         Claude Code redrew) and the click must not be dispatched verbatim.
         """
         return hashlib.sha1(self._canonical_repr().encode()).hexdigest()[:16]
+
+    def review_submit_dispatchable(self, option_label: str) -> bool:
+        """True iff this is a review screen whose Submit row (option 1) is the literal
+        REVIEW_SUBMIT_LABEL AND still matches the minted option_label — CURSOR-BLIND.
+        The digit dispatch activates Submit regardless of the terminal cursor (verified
+        on Claude Code v2.1.161), so the guard no longer requires the cursor on Submit;
+        is_review_screen + option#1 + literal label + minted-label anchors mean a
+        non-review screen, a relabeled Submit, or a reordered review layout all SAFELY
+        DECLINE (never a wrong dispatch)."""
+        return bool(
+            self.is_review_screen
+            and self.options
+            and self.options[0].number == 1
+            and self.options[0].label == REVIEW_SUBMIT_LABEL
+            and self.options[0].label == option_label
+        )
 
 
 def _parse_tab_header(line: str) -> tuple[AskTab, ...] | None:
@@ -1580,9 +1602,12 @@ def resolve_ask_form(
             pane_excerpt=pane_form.pane_excerpt,
             questions=jsonl_form.questions,
             # No inference happened — the pane authoritatively says "review".
-            # Suppress pick-button mint (mint gate honours this) so we don't
-            # mislabel the Submit/Cancel buttons against JSONL labels; the
-            # keystroke nav keyboard still lets the user submit / cancel.
+            # The mint gate has a review-screen EXCEPTION: it still mints the
+            # Submit/Cancel pick buttons from the pane's own options (these are
+            # the real review-screen labels, not JSONL Q-labels), so the user
+            # can submit / cancel via the Telegram keyboard as well as keystroke
+            # nav. `current_tab_inferred=False` only marks that no tab inference
+            # ran here.
             current_tab_inferred=False,
             select_mode="single",
             options_complete=True,

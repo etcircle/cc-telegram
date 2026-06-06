@@ -97,19 +97,6 @@ async def _refresh_pick_card(
         )
 
 
-def _review_submit_cursor_ok(current_form: Any, option_label: str) -> bool:
-    """True iff the live review screen still has the cursor on Submit (option 1)
-    with a matching label — the belt-and-braces Submit guard shared by the live
-    ``ok`` path and D2 recovery."""
-    return bool(
-        current_form.is_review_screen
-        and current_form.options
-        and current_form.options[0].cursor
-        and current_form.options[0].number == 1
-        and current_form.options[0].label == option_label
-    )
-
-
 async def _dispatch_pick_digit(
     *,
     query: Any,
@@ -1172,15 +1159,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             return
 
         # Submit-button guardrail: a click flagged ``is_review_submit`` only
-        # fires when the live parse still says we're on the review screen
-        # with the cursor on the submit row, AND the label matches. The
-        # fingerprint check above already encodes is_review_screen + cursor
-        # + option number + option label, so a mismatch would already have
-        # bounced — Hermes review asked for an explicit label compare here
-        # as belt-and-braces, so a future fingerprint-format change can't
-        # accidentally let an off-screen Submit dispatch.
-        if entry.is_review_submit and not _review_submit_cursor_ok(
-            current_form, entry.option_label
+        # fires when the live parse still says we're on the review screen with
+        # the literal "Submit answers" row as option 1 AND a matching minted
+        # label — CURSOR-BLIND. The digit `1` activates Submit regardless of the
+        # terminal cursor (verified on Claude Code v2.1.161), so we no longer
+        # require the cursor on Submit; the review-screen + option#1 + literal
+        # "Submit answers" + minted-label anchors mean a non-review screen, a
+        # relabeled Submit, or a reordered review layout all SAFELY DECLINE
+        # rather than dispatching the wrong action.
+        if entry.is_review_submit and not current_form.review_submit_dispatchable(
+            entry.option_label
         ):
             logger.info(
                 "AUQ_PICK submit_guard_reject user=%d window=%s",

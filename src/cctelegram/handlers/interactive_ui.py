@@ -38,6 +38,7 @@ from ..session import (
     session_manager,
 )
 from ..terminal_parser import (
+    REVIEW_SUBMIT_LABEL,
     AskUserQuestionForm,
     build_form_from_tool_input,
     extract_interactive_content,
@@ -2329,7 +2330,11 @@ def _build_pick_button_rows(
             pick_token._mint_spec(
                 opt.number or 0,
                 opt.label,
-                bool(form.is_review_screen and opt.cursor and opt.number == 1),
+                bool(
+                    form.is_review_screen
+                    and opt.number == 1
+                    and opt.label == REVIEW_SUBMIT_LABEL
+                ),
             )
             for opt in pickable
         ],
@@ -2358,7 +2363,9 @@ def _build_pick_button_rows(
                     option_number=opt.number or 0,
                     option_label=opt.label,
                     is_review_submit=bool(
-                        form.is_review_screen and opt.cursor and opt.number == 1
+                        form.is_review_screen
+                        and opt.number == 1
+                        and opt.label == REVIEW_SUBMIT_LABEL
                     ),
                 )
                 for opt, token in zip(pickable, tokens)
@@ -2385,7 +2392,11 @@ def _build_pick_button_rows(
         # ``opt.number is None`` was filtered above, but reassure the type
         # checker.
         assert opt.number is not None
-        is_submit = form.is_review_screen and opt.cursor and opt.number == 1
+        is_submit = (
+            form.is_review_screen
+            and opt.number == 1
+            and opt.label == REVIEW_SUBMIT_LABEL
+        )
         # Button text: number + truncated label + recommended star
         prefix = "✅ " if is_submit else f"{opt.number}. "
         # Cap label so the whole button stays under Telegram's tap-target
