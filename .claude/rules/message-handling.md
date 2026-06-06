@@ -234,6 +234,23 @@ for this fix — a refactor giving the pane source its own fingerprint basis wou
 re-break it; the review-screen fingerprint-EQUALITY-across-cursor-move test guards
 the coupling.
 
+**AUQ pick dispatch is a single BARE DIGIT (no Enter — v2.1.167 model).**
+`_dispatch_pick_digit` (shared by the live `aqp:` pick path AND D2 recovery)
+sends only the option digit (`send_keys(enter=False, literal=True)`) and records
+`accepted → dispatched` (or `failed_before_digit`) — there is **no Enter step**.
+On Claude Code v2.1.167 a bare digit is the universal select+advance (and, on the
+review screen, submit) action — the same keystroke `aqt:` toggles already used —
+so the prior trailing `Enter` over-advanced multi-QUESTION forms past Q2: tapping
+Q1 sent `1` (advancing Q1→Q2) then `Enter` (auto-answering Q2 with its
+cursor-default and jumping to the Submit review), so Q2's live picker never
+reached the user. The Enter was only "accidentally harmless" for single-question
+forms (the digit resolved the tool; the stray Enter hit the inert main prompt).
+The `auq_ledger` `digit_sent` / `failed_after_digit` states are **legacy-only**
+(kept defined for on-disk compat; no longer written by the dispatch path). The
+nav `⏎ Enter` button (`CB_ASK_ENTER`) + arrow nav still send Enter — that is the
+orthogonal navigation path, unchanged. Validated against Claude Code v2.1.167
+terminal behavior.
+
 ## MessageDisplay live-prose capture (Bug 2)
 
 Assistant free-text prose written in the same turn as an `AskUserQuestion` /

@@ -8,7 +8,7 @@ Each Telegram topic maps to one tmux window running one Claude Code process. The
 
 - **Topic-based sessions** — one Telegram topic = one tmux window = one Claude session.
 - **Hook-based session tracking** — Claude Code `SessionStart` writes `session_map.json`, so `/clear` and resumed sessions stay attached to the right topic.
-- **AskUserQuestion descriptions and multi-select toggles** — a `PreToolUse` hook captures the structured `AskUserQuestion` payload before Claude renders the picker, so each option's full description shows in Telegram right away. Single-select options submit through the restart-safe `aqp:` pick flow; multi-select options toggle with non-ledgered `aqt:` bare-digit callbacks, then final Submit/Cancel reuses the review-screen `aqp:` flow.
+- **AskUserQuestion descriptions and multi-select toggles** — a `PreToolUse` hook captures the structured `AskUserQuestion` payload before Claude renders the picker, so each option's full description shows in Telegram right away. Single-select options submit through the restart-safe `aqp:` pick flow; multi-select options toggle with non-ledgered `aqt:` bare-digit callbacks, then final Submit/Cancel reuses the review-screen `aqp:` flow. Every pick — single-select, multi-select toggle, and review Submit — dispatches a single **bare digit** (no Enter): on Claude Code v2.1.167 a bare digit is the select+advance (and, on the review screen, submit) action.
 - **Live prose before interactive prompts** — when Claude writes explanatory prose in the same turn as an `AskUserQuestion` / `ExitPlanMode`, Claude Code buffers the whole turn in the session JSONL until the prompt resolves, so without help the Telegram user would see only the picker and choose blind. A lightweight `MessageDisplay` hook captures that prose live (before the picker blocks) so the bot can deliver it ahead of the picker card.
 - **Streaming output** — assistant text, thinking, tool use/result summaries, interactive prompts, and local command output flow into Telegram.
 - **Per-route queues** — each `(user_id, thread_id, window_id)` has its own worker, so one noisy topic does not stall another.
@@ -158,6 +158,8 @@ When Claude Code calls `AskUserQuestion`, the option descriptions are not visibl
 ```
 
 The bot reads the side file at picker render time so the Telegram context message shows each option's full description right away, not after-the-fact. Multi-select AUQs render selected/unchecked/off-screen state and use `aqt:` callbacks to send a bare digit to tmux for each toggle; those toggles are reversible and not written to the AUQ ledger. The user then presses Tab to Claude Code's review screen, where Submit/Cancel uses the existing `aqp:` pick path and restart-safe ledger.
+
+The single-select `aqp:` pick and the review-screen Submit dispatch a **bare digit, no Enter** — the same keystroke as the `aqt:` toggles — because on Claude Code v2.1.167 a bare digit is the select+advance (and, on the review screen, submit) action. The prior `digit + Enter` over-advanced multi-question forms past Q2: the digit selected Q1 and advanced to Q2, then the Enter auto-answered Q2 with its cursor-default and jumped to Submit, so Q2's picker never reached the user. (Validated against Claude Code v2.1.167 terminal behavior.)
 
 Side files are:
 
