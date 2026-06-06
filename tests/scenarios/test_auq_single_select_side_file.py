@@ -217,9 +217,8 @@ async def test_single_select_side_file_fingerprint_dispatch_and_compact_card(
 
     await _tap(scenario, picks[1])
 
-    assert scenario.tmux.sent_keys[-2:] == [
+    assert scenario.tmux.sent_keys[-1:] == [
         (wid, "2", False, True),
-        (wid, "Enter", False, False),
     ]
     assert "Form changed, refreshing." not in [
         str(sent.kwargs.get("text") or "") for sent in scenario.bot.sent
@@ -281,9 +280,8 @@ async def test_single_select_compressed_pane_matching_title_still_dispatches(
     )
 
     await _tap(scenario, picks[1])
-    assert scenario.tmux.sent_keys[-2:] == [
+    assert scenario.tmux.sent_keys[-1:] == [
         (wid, "2", False, True),
-        (wid, "Enter", False, False),
     ]
 
 
@@ -311,9 +309,8 @@ async def test_single_select_compressed_pane_title_absent_still_dispatches(
     )
 
     await _tap(scenario, picks[1])
-    assert scenario.tmux.sent_keys[-2:] == [
+    assert scenario.tmux.sent_keys[-1:] == [
         (wid, "2", False, True),
-        (wid, "Enter", False, False),
     ]
 
 

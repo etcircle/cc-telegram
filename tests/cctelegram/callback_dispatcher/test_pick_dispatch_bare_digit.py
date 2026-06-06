@@ -30,7 +30,7 @@ from cctelegram.callback_dispatcher import (
     execute,
     parse,
 )
-from cctelegram.handlers import auq_ledger, auq_source, interactive_ui, pick_token
+from cctelegram.handlers import auq_ledger, auq_source, pick_token
 from cctelegram.handlers.callback_data import CB_ASK_PICK
 from cctelegram.terminal_parser import resolve_ask_form
 

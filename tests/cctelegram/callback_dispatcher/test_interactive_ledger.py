@@ -510,8 +510,9 @@ class TestAcceptedToDispatchedHappyPath:
     async def test_first_keyed_tap_writes_full_state_machine(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Owner taps a fresh keyed button. Ledger should write
-        accepted → digit_sent → dispatched as the handler walks through.
+        """Owner taps a fresh keyed button. v2.1.167 single-keystroke model:
+        the ledger walks accepted → dispatched directly (the bare digit IS the
+        complete dispatch — no intermediate digit_sent / Enter step).
         """
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
         monkeypatch.setattr(
@@ -528,17 +529,19 @@ class TestAcceptedToDispatchedHappyPath:
         assert entry.state == "dispatched"
         assert entry.user_id == _OWNER_ID
         assert entry.option_label == _LABEL
-        assert entry.digit_sent_at is not None
+        # digit_sent is no longer written by the dispatch path (legacy state).
+        assert entry.digit_sent_at is None
         assert entry.dispatched_at is not None
 
 
 class TestSendKeysFailureRecordsFailed:
     """Codex Wave 3 P1: tmux send_keys returns False on missing session /
     window / pane / libtmux exception. Handler MUST check the return and
-    record failed_before_digit / failed_after_digit instead of writing
-    dispatched. A silent False return used to convert a tmux failure
-    into a permanent "already received" — duplicate tap then locked the
-    user out of the action even though tmux never received the digit.
+    record failed_before_digit instead of writing dispatched. A silent False
+    return used to convert a tmux failure into a permanent "already received"
+    — duplicate tap then locked the user out of the action even though tmux
+    never received the digit. (Post-v2.1.167 the dispatch sends only the bare
+    digit, so failed_after_digit is no longer reachable — there is no Enter.)
     """
 
     @pytest.mark.asyncio
@@ -565,36 +568,5 @@ class TestSendKeysFailureRecordsFailed:
         assert entry is not None
         assert entry.state == "failed_before_digit"
         assert entry.dispatched_at is None
-        # Only one send_keys call (the digit); Enter was never attempted.
+        # Only one send_keys call (the digit); v2.1.167 sends no Enter.
         assert tmux.send_keys.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_enter_send_returns_false_records_failed_after_digit(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr("asyncio.sleep", AsyncMock())
-        monkeypatch.setattr(
-            "cctelegram.handlers.interactive_ui.resolve_ask_tool_input",
-            lambda _wid: None,
-        )
-        monkeypatch.setattr(
-            interactive_ui, "handle_interactive_ui", AsyncMock(return_value=True)
-        )
-        callback_data, ledger_key = _build_keyed_callback()
-        tmux = FakeTmuxManager()
-        # First call (digit) succeeds; second (Enter) fails.
-        tmux.send_keys = AsyncMock(side_effect=[True, False])
-        query = FakeQuery(callback_data)
-        authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
-        await execute(authorized, _adapters(FakeSessionManager(), tmux))
-        assert query.answers == [
-            (
-                "Action sent but Enter failed; refreshing — verify in tmux.",
-                False,
-            )
-        ]
-        entry = auq_ledger.lookup(ledger_key)
-        assert entry is not None
-        assert entry.state == "failed_after_digit"
-        assert entry.digit_sent_at is not None
-        assert entry.dispatched_at is None

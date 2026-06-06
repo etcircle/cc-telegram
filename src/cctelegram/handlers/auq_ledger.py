@@ -1,10 +1,19 @@
 """Restart-safe write-ahead ledger for AskUserQuestion option-pick dispatches.
 
 Records every option-pick callback's lifecycle (``accepted`` →
-``digit_sent`` → ``dispatched``, or one of two failure terminals) so the
+``dispatched``, or the ``failed_before_digit`` failure terminal) so the
 callback handler can detect duplicate taps even after a process restart.
 The in-memory pick-token store (``pick_token._pick_tokens``) does not
 survive restart; this ledger does.
+
+v2.1.167 single-keystroke model: a pick dispatches only a BARE DIGIT (no
+trailing Enter), so the dispatch path now writes ``accepted`` → ``dispatched``
+directly. The ``digit_sent`` and ``failed_after_digit`` states are
+**legacy-only** — kept defined here so on-disk rows from older builds still
+load and project correctly, but they are no longer *written* by the dispatch
+path. (Before the Enter was deleted, ``digit_sent`` marked the gap between the
+digit and the Enter send, and ``failed_after_digit`` marked an Enter that
+returned False / raised.)
 
 Storage: append-only JSONL at ``<CC_TELEGRAM_DIR>/auq_action_ledger.jsonl``
 (mode ``0600``). Each line is one persisted state transition for one
@@ -14,10 +23,12 @@ a WARNING.
 
 Persisted states:
   - ``accepted``            — token validated, BEFORE digit send.
-  - ``digit_sent``          — digit landed on tmux, Enter not yet.
-  - ``dispatched``          — Enter landed (terminal success).
-  - ``failed_before_digit`` — exception raised before digit reached tmux.
-  - ``failed_after_digit``  — digit landed, Enter raised (ambiguous).
+  - ``dispatched``          — bare digit landed (terminal success).
+  - ``failed_before_digit`` — digit send returned False / raised before tmux.
+  - ``digit_sent``          — LEGACY (pre-v2.1.167 digit+Enter): digit landed,
+                              Enter not yet. No longer written.
+  - ``failed_after_digit``  — LEGACY (pre-v2.1.167 digit+Enter): digit landed,
+                              Enter raised (ambiguous). No longer written.
 
 ``unknown`` is NOT a persisted state — it is a load-time projection.
 Callers compare an entry's ``accepted_at`` against ``process_start_time()``

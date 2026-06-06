@@ -227,9 +227,8 @@ async def test_happy_path_toggle_tab_review_submit_and_tool_result_cleanup(
 
     submit = _prefixes(review_callbacks, CB_ASK_PICK)[0]
     await _tap(scenario, submit)
-    assert scenario.tmux.sent_keys[-2:] == [
+    assert scenario.tmux.sent_keys[-1:] == [
         (wid, "1", False, True),
-        (wid, "Enter", False, False),
     ]
     assert side_file.exists(), "review aqp dispatch is not the cleanup event"
 
@@ -458,7 +457,7 @@ async def test_multi_question_suppresses_toggle_buttons(
 
 
 @pytest.mark.asyncio
-async def test_single_select_unaffected_still_aqp_digit_enter(
+async def test_single_select_still_aqp_bare_digit_no_enter(
     scenario: ScenarioHarness,
 ) -> None:
     pane = """Pick one.
@@ -473,10 +472,12 @@ Enter to select · ↑/↓ to navigate · Esc to cancel
     assert len(picks) == 2
     assert not _prefixes(_callbacks(scenario), CB_ASK_TOGGLE)
     await _tap(scenario, picks[0])
-    assert scenario.tmux.sent_keys[:2] == [
+    # v2.1.167: a single-select pick dispatches a BARE DIGIT (no Enter) — same
+    # keystroke as aqt: toggles.
+    assert scenario.tmux.sent_keys[:1] == [
         (wid, "1", False, True),
-        (wid, "Enter", False, False),
     ]
+    assert (wid, "Enter", False, False) not in scenario.tmux.sent_keys
 
 
 def test_aqt_prefix_is_registered() -> None:
@@ -538,11 +539,11 @@ async def test_review_submit_after_poller_rerender_dispatches(
     scenario.tmux.sent_keys.clear()
     await _tap(scenario, submit_cb)
     # Post-fix the token survives (cache reuse, byte-identical keyboard) and the
-    # tap dispatches "1" + Enter. RED on main: the token was popped (peek_none),
-    # the card refreshes, and nothing is sent.
-    assert scenario.tmux.sent_keys[-2:] == [
+    # tap dispatches the bare digit "1" (v2.1.167 submits on a bare digit, no
+    # Enter). RED on main: the token was popped (peek_none), the card refreshes,
+    # and nothing is sent.
+    assert scenario.tmux.sent_keys[-1:] == [
         (wid, "1", False, True),
-        (wid, "Enter", False, False),
     ]
 
 
@@ -573,9 +574,8 @@ async def test_review_submit_sub_poll_window_dispatches(
 
     scenario.tmux.sent_keys.clear()
     await _tap(scenario, submit_cb)
-    assert scenario.tmux.sent_keys[-2:] == [
+    assert scenario.tmux.sent_keys[-1:] == [
         (wid, "1", False, True),
-        (wid, "Enter", False, False),
     ]
 
 
