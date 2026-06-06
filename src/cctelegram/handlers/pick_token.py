@@ -46,13 +46,19 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
-from . import auq_ledger
-from .auq_source import resolve_auq_source
+from . import auq_ledger, pick_intent
+from .auq_source import (
+    RecoverySideFile,
+    read_side_file_for_recovery,
+    resolve_auq_source,
+    side_file_live_for_session,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable
 
     from ..terminal_parser import AskUserQuestionForm
+    from .pick_intent import PickIntent
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +153,13 @@ _pick_token_cache: dict[tuple[int, int, str, str], _CacheRow] = {}
 # or other call now owns.
 _reservations: dict[str, str] = {}
 
+# D2 row-scoped recovery reservations. Keyed by the ROW cache_key
+# ``(user_id, thread_id_or_0, window_id, full_fingerprint)`` — NOT the per-token
+# ``_reservations`` — so a concurrent post-restart tap on ANY sibling option of
+# the same row serialises (single-select recovery is row-single-use). Value is
+# the uuid owner of the in-flight ``recover_and_consume`` call.
+_recovery_row_reservations: dict[tuple[int, int, str, str], str] = {}
+
 # MODULE-GLOBAL monotonic generation counter. MUST be module-global, NOT
 # per-row: a pruned G1 row re-minted under the same key must advance to G2 — a
 # per-row counter would lose that memory and reuse G1, misclassifying a stale
@@ -240,7 +253,7 @@ def mint_row(
     source_kind: str,
     source_fingerprint: str,
     specs: Iterable[_MintSpec],
-) -> list[str]:
+) -> tuple[list[str], bool]:
     """Mint (or reuse) the sibling-token row for one rendered form generation.
 
     Owns the cache-reuse logic so ``_pick_token_cache`` stays private. On a
@@ -263,7 +276,10 @@ def mint_row(
     tokens, new generation, new source tags) even though the form fingerprint
     is unchanged.
 
-    Returns the token list in the order ``specs`` was emitted.
+    Returns ``(tokens, fresh)`` — the token list in the order ``specs`` was
+    emitted, and ``fresh=True`` iff this call took the FRESH-mint path (the aqp:
+    callsite uses ``fresh`` to write the durable mint-intent only once per card,
+    not on every byte-identical re-render).
     """
     _prune_expired_pick_tokens()
     cache_key = (user_id, thread_id or 0, window_id, fingerprint)
@@ -289,7 +305,7 @@ def mint_row(
             cached.row_generation,
             len(cached.tokens),
         )
-        return cached.tokens
+        return cached.tokens, False
 
     # FRESH mint: drop any stale/tombstoned row at this key, allocate a new
     # generation, mint a token per spec stamped with that generation.
@@ -349,7 +365,7 @@ def mint_row(
         generation,
         len(tokens),
     )
-    return tokens
+    return tokens, True
 
 
 def peek(token: str) -> PickTokenEntry | None:
@@ -473,6 +489,7 @@ def reset_for_tests() -> None:
     _pick_tokens.clear()
     _pick_token_cache.clear()
     _reservations.clear()
+    _recovery_row_reservations.clear()
     _generation_counter = _INITIAL_GENERATION
 
 
@@ -668,6 +685,199 @@ async def validate_and_consume(
             async with _store_lock:
                 if _reservations.get(token) == reserved_by:
                     _reservations.pop(token, None)
+
+
+# ── D2 restart-recovery: re-dispatch a token-less tap after a bot restart ─────
+
+
+@dataclass(frozen=True)
+class PickRecovery:
+    """Typed outcome of ``recover_and_consume``.
+
+    On ``ok`` the ``accepted`` ledger claim has ALREADY been written (inside the
+    row reservation), so the caller only dispatches the digit + writes
+    ``digit_sent`` / ``dispatched`` at ``ledger_key``. ``current_form`` is the
+    live re-parse so the caller's Submit guard compares the same form.
+    """
+
+    outcome: Literal[
+        "ok",
+        "wrong_user",
+        "window_gone",
+        "stale_form",
+        "source_drift",
+        "superseded",
+        "already",
+        "in_progress",
+    ]
+    ledger_key: str | None = None
+    window_id: str | None = None
+    thread_id: int | None = None
+    option_number: int | None = None
+    is_review_submit: bool = False
+    option_label: str | None = None
+    current_form: AskUserQuestionForm | None = None
+
+
+def _any_sibling_claimed(
+    route_hash: str, fp8: str, option_numbers: Iterable[int]
+) -> bool:
+    """True iff ANY of the row's sibling option ledger keys already has a row.
+
+    Row-level single-use, restart-DURABLE: a single-select row is spent the
+    moment ANY one of its options reaches the action ledger
+    (accepted/digit_sent/dispatched/failed). Bounded ≤9 ``lookup``s — no ledger
+    scan API. Covers the crash-between-accepted-and-row-tomb case (the 24h ledger
+    row outlives the in-memory tomb) AND a sibling whose key the top callback gate
+    missed via collision-suppression (``ledger_key=None``).
+    """
+    return any(
+        auq_ledger.lookup(auq_ledger.make_ledger_key(route_hash, fp8, n)) is not None
+        for n in option_numbers
+    )
+
+
+def _recovery_source_parity_ok(
+    intent: PickIntent,
+    sf: RecoverySideFile | None,
+) -> bool:
+    """Source parity at recovery (the caller already matched the FORM fingerprint).
+
+    - ``pane``: the form-fingerprint match subsumes source parity.
+    - ``side_file``: present → canonical digest must equal the stored one; genuinely
+      gone (read-TTL-FREE liveness ``False``) → pane fallback (the form already
+      matches); else (present-but-drifted) → drift.
+    - ``jsonl_cache``: the in-process getter is wiped on restart → cannot
+      re-derive → decline.
+    """
+    kind = intent.source_kind
+    if kind == "pane":
+        return True
+    if kind == "side_file":
+        session = intent.session_id
+        if not session:
+            return False
+        if sf is not None:
+            return sf.source_fingerprint == intent.source_fingerprint
+        return not side_file_live_for_session(session)
+    return False
+
+
+async def recover_and_consume(
+    token: str,
+    intent: PickIntent,
+    sender_id: int,
+    *,
+    capture_pane: Callable[[str, int], Awaitable[str | None]],
+    find_window_by_id: Callable[[str], Awaitable[object | None]],
+) -> PickRecovery:
+    """Row-scoped restart-recovery of a token-less pick tap.
+
+    Reached only from the callback's dead branches AFTER the top ledger gate, so
+    a recoverable tap provably has no blocking ledger row for its own option key.
+    This re-runs the live validation against the DURABLE ``intent`` (there is no
+    in-memory token to anchor ``validate_and_consume``):
+
+      (A) Under the store lock: owner-auth; POSITIVE PROOF OF IN-MEMORY LOSS (any
+          ``_pick_token_cache`` row at the row key ⇒ this process still has /
+          just consumed the card → decline ``superseded``; this is what makes D2
+          strictly the restart net); row reservation (concurrent sibling tap →
+          ``in_progress``); per-sibling ledger guard (any sibling claimed →
+          ``already``).
+      (B) Lock RELEASED: read the side file read-TTL-free; capture the pane;
+          rebuild the FULL form from the side-file payload (so a >5min compressed
+          pane still matches the minted fingerprint); FORM-fp compare →
+          ``stale_form``; source parity → ``source_drift``.
+      (C) Re-acquire the lock, RE-RUN the proofs (cache-row + sibling ledger — a
+          live re-render or a racing live dispatch could have appeared across the
+          await), write the ``accepted`` claim at the reconstructed key, and tomb
+          the whole durable row. Releasing the reservation after ``accepted`` is
+          safe — the top gate then blocks every subsequent tap.
+
+    Pane capture / window lookup are INJECTED (no telegram/tmux import).
+    """
+    from ..terminal_parser import resolve_ask_form
+
+    route_hash = auq_ledger.make_route_hash(
+        intent.user_id, intent.thread_id, intent.window_id
+    )
+    fp8 = intent.full_fingerprint[:8]
+    ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, intent.option_number)
+    cache_key = (
+        intent.user_id,
+        intent.thread_id or 0,
+        intent.window_id,
+        intent.full_fingerprint,
+    )
+
+    # Phase (A): owner-auth + positive-proof-of-loss + reserve + sibling guard.
+    async with _store_lock:
+        if sender_id != intent.user_id:
+            return PickRecovery("wrong_user")
+        if cache_key in _pick_token_cache:
+            # Live row → normal path owns it; tombstoned row → this process just
+            # consumed it. Either way NOT a restart loss.
+            return PickRecovery("superseded")
+        if cache_key in _recovery_row_reservations:
+            return PickRecovery("in_progress")
+        if _any_sibling_claimed(route_hash, fp8, intent.sibling_option_numbers):
+            return PickRecovery("already")
+        reserved_by = uuid.uuid4().hex
+        _recovery_row_reservations[cache_key] = reserved_by
+
+    try:
+        # Phase (B): lock released — pane / form / source parity.
+        sf: RecoverySideFile | None = None
+        if intent.source_kind == "side_file" and intent.session_id:
+            sf = read_side_file_for_recovery(intent.session_id)
+
+        w = await find_window_by_id(intent.window_id)
+        if w is None:
+            return PickRecovery("window_gone")
+        pane = await capture_pane(intent.window_id, 500)
+        payload = sf.payload if sf is not None else None
+        current_form = resolve_ask_form(payload, pane) if pane else None
+        if (
+            current_form is None
+            or current_form.fingerprint() != intent.full_fingerprint
+        ):
+            return PickRecovery("stale_form")
+        if not _recovery_source_parity_ok(intent, sf):
+            return PickRecovery("source_drift")
+
+        # Phase (C): re-acquire, re-run the proofs, claim + tomb under the lock.
+        async with _store_lock:
+            if cache_key in _pick_token_cache:
+                return PickRecovery("superseded")
+            if _any_sibling_claimed(route_hash, fp8, intent.sibling_option_numbers):
+                return PickRecovery("already")
+            auq_ledger.record(
+                ledger_key,
+                state="accepted",
+                user_id=intent.user_id,
+                window_id=intent.window_id,
+                full_fingerprint=intent.full_fingerprint,
+                option_number=intent.option_number,
+                option_label=intent.option_label,
+            )
+            pick_intent.consume_row(token)
+        return PickRecovery(
+            outcome="ok",
+            ledger_key=ledger_key,
+            window_id=intent.window_id,
+            thread_id=intent.thread_id,
+            option_number=intent.option_number,
+            is_review_submit=intent.is_review_submit,
+            option_label=intent.option_label,
+            current_form=current_form,
+        )
+    finally:
+        # Always release THIS call's row reservation (owner-id guard). After a
+        # winning claim the ledger gate takes over, so the reservation is no
+        # longer needed; on any decline/raise it must not leak.
+        async with _store_lock:
+            if _recovery_row_reservations.get(cache_key) == reserved_by:
+                _recovery_row_reservations.pop(cache_key, None)
 
 
 def _mint_spec(

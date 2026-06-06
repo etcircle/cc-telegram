@@ -801,6 +801,45 @@ def side_file_live_for_session(session_id: str) -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class RecoverySideFile:
+    """The read-TTL-free side-file payload + its canonical source fingerprint.
+
+    ``source_fingerprint`` is ``_canonical_dict_fingerprint(payload)`` — the SAME
+    digest :func:`resolve_auq_source` stores as the ``side_file`` kind's
+    ``source_fingerprint`` (NOT ``PreToolAskRecord.input_fingerprint``, a
+    different 12-hex questions-content digest). ``payload`` is the side file's
+    ``tool_input`` so recovery can reconstruct the FULL-options form (matching the
+    minted fingerprint even when the live pane is compressed).
+    """
+
+    payload: dict
+    source_fingerprint: str
+
+
+def read_side_file_for_recovery(session_id: str) -> RecoverySideFile | None:
+    """Read the side file for D2 restart-recovery, read-TTL-free + pane-agnostic.
+
+    Returns the validated ``tool_input`` payload + its canonical source
+    fingerprint, or ``None`` if the side file is absent / invalid.
+
+    DELIBERATELY bypasses the 300s ``_PRETOOL_TTL_SECONDS`` read-TTL and the
+    pane-consistency (``resolve_record``) demotion: D2 targets a card a user may
+    have left open for hours (well past the read-TTL), and recovery compares the
+    canonical digest DIRECTLY to the stored ``source_fingerprint`` and rebuilds
+    the full form from ``payload`` — rather than re-resolving through the
+    read-TTL'd / pane-demoting resolver, which would falsely report a long-idle
+    side file as ``pane`` and wrongly decline.
+    """
+    record = _read_pretool_side_file(session_id)
+    if record is None:
+        return None
+    return RecoverySideFile(
+        payload=record.tool_input,
+        source_fingerprint=_canonical_dict_fingerprint(record.tool_input),
+    )
+
+
 def gc_stale() -> int:
     """Delete AUQ side files older than ``_PRETOOL_GC_AGE_SECONDS``.
 

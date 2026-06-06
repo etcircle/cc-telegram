@@ -306,7 +306,7 @@ class TestConcurrentSiblingToken:
         form = resolve_ask_form(None, _BASELINE_PANE)
         assert form is not None
         src = _baseline_source()
-        tokens = pick_token.mint_row(
+        tokens, _ = pick_token.mint_row(
             user_id=_USER,
             thread_id=_THREAD,
             window_id=_WINDOW,
@@ -368,7 +368,7 @@ class TestGenerationSemantics:
             source_kind=src.kind,
             source_fingerprint=src.source_fingerprint,
             specs=[pick_token._mint_spec(1, "Done navigating", False)],
-        )
+        )[0]
 
     def _row_for(self, fingerprint: str):
         return pick_token._pick_token_cache[(_USER, _THREAD, _WINDOW, fingerprint)]
@@ -454,7 +454,7 @@ class TestGenerationSemantics:
             source_kind="jsonl_cache",
             source_fingerprint=source_fingerprint,
             specs=[pick_token._mint_spec(1, "Done navigating", False)],
-        )
+        )[0]
 
     @pytest.mark.asyncio
     async def test_cache_reuse_broken_on_source_drift(self):
@@ -759,7 +759,7 @@ def _mint_row(
         source_kind="pane",
         source_fingerprint="srcfp",
         specs=specs,
-    )
+    )[0]
 
 
 class TestRefreshRouteDeadlines:

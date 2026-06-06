@@ -15,7 +15,13 @@ from typing import Any, Literal, cast
 
 import asyncio
 import logging
-from cctelegram.handlers import auq_ledger, auq_source, interactive_ui, pick_token
+from cctelegram.handlers import (
+    auq_ledger,
+    auq_source,
+    interactive_ui,
+    pick_intent,
+    pick_token,
+)
 from cctelegram.handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -89,6 +95,269 @@ async def _refresh_pick_card(
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )
+
+
+def _review_submit_cursor_ok(current_form: Any, option_label: str) -> bool:
+    """True iff the live review screen still has the cursor on Submit (option 1)
+    with a matching label — the belt-and-braces Submit guard shared by the live
+    ``ok`` path and D2 recovery."""
+    return bool(
+        current_form.is_review_screen
+        and current_form.options
+        and current_form.options[0].cursor
+        and current_form.options[0].number == 1
+        and current_form.options[0].label == option_label
+    )
+
+
+async def _dispatch_pick_digit(
+    *,
+    query: Any,
+    context: Any,
+    user: Any,
+    tmux_manager: Any,
+    adapters: Any,
+    w: Any,
+    window_id: str,
+    thread_id: int | None,
+    option_number: int,
+    option_label: str,
+    ledger_key: str | None,
+) -> None:
+    """Send the option digit + Enter, record the ledger lifecycle, answer, re-render.
+
+    Shared by the live ``ok`` path and D2 restart-recovery. The caller writes the
+    ``accepted`` claim BEFORE calling this (the live path inline; recovery inside
+    ``pick_token.recover_and_consume``). ``ledger_key`` is None only on a
+    collision-suppression fall-through — the ``if ledger_key is not None`` guards
+    keep those writes off another route's row. ``send_keys`` returns False (does
+    not raise) on failure; both returns are checked (Wave-3 P1).
+    """
+    digit_landed = False
+    try:
+        digit_ok = await tmux_manager.send_keys(
+            w.window_id, str(option_number), enter=False, literal=True
+        )
+        if not digit_ok:
+            if ledger_key is not None:
+                auq_ledger.record(
+                    ledger_key,
+                    state="failed_before_digit",
+                    failed_reason="tmux send_keys(digit) returned False",
+                )
+            logger.warning(
+                "Pick-token dispatch: tmux send_keys(digit=%d) returned False "
+                "for window=%s user=%d",
+                option_number,
+                window_id,
+                user.id,
+            )
+            await safe_answer(
+                query, "Action failed; refreshing card.", show_alert=False
+            )
+            await handle_interactive_ui(
+                context.bot,
+                user.id,
+                window_id,
+                thread_id,
+                tmux_mgr=tmux_manager,
+                session_mgr=adapters.session_manager,
+            )
+            return
+        digit_landed = True
+        if ledger_key is not None:
+            auq_ledger.record(ledger_key, state="digit_sent")
+        await asyncio.sleep(0.5)
+        enter_ok = await tmux_manager.send_keys(
+            w.window_id, "Enter", enter=False, literal=False
+        )
+        if not enter_ok:
+            if ledger_key is not None:
+                auq_ledger.record(
+                    ledger_key,
+                    state="failed_after_digit",
+                    failed_reason="tmux send_keys(Enter) returned False",
+                )
+            logger.warning(
+                "Pick-token dispatch: digit landed but tmux send_keys(Enter) "
+                "returned False for window=%s user=%d",
+                window_id,
+                user.id,
+            )
+            await safe_answer(
+                query,
+                "Action sent but Enter failed; refreshing — verify in tmux.",
+                show_alert=False,
+            )
+            await handle_interactive_ui(
+                context.bot,
+                user.id,
+                window_id,
+                thread_id,
+                tmux_mgr=tmux_manager,
+                session_mgr=adapters.session_manager,
+            )
+            return
+        if ledger_key is not None:
+            auq_ledger.record(ledger_key, state="dispatched")
+    except Exception as exc:
+        if ledger_key is not None:
+            auq_ledger.record(
+                ledger_key,
+                state=("failed_after_digit" if digit_landed else "failed_before_digit"),
+                failed_reason=str(exc),
+            )
+        await safe_answer(query, "Action failed; refreshing card.", show_alert=False)
+        raise
+
+    logger.info(
+        "AUQ_PICK dispatch_ok user=%d window=%s opt=%d label=%s",
+        user.id,
+        window_id,
+        option_number,
+        option_label[:24],
+    )
+    await safe_answer(query, f"{option_number}. {option_label[:32]}")
+    await asyncio.sleep(0.5)
+    # Re-render the picker after the digit lands so the card reflects the
+    # advanced screen. Orphan-card safety is the visible-pane liveness bail
+    # inside ``handle_interactive_ui``.
+    await handle_interactive_ui(
+        context.bot,
+        user.id,
+        window_id,
+        thread_id,
+        tmux_mgr=tmux_manager,
+        session_mgr=adapters.session_manager,
+    )
+
+
+async def _attempt_pick_recovery(
+    token: str,
+    sender_id: int,
+    route_hash: str,
+    fp8: str,
+    opt_num: int,
+    *,
+    query: Any,
+    context: Any,
+    user: Any,
+    tmux_manager: Any,
+    adapters: Any,
+    reject_stale_window: Any,
+) -> bool:
+    """D2 restart-recovery at a token-less dead branch (peek_none / expired).
+
+    Returns True iff this took over the click (dispatched the recovered option OR
+    answered a decline that has its own message); False to fall through to the
+    caller's default honest refresh modal. Reached only AFTER the top ledger gate,
+    so a recoverable tap provably has no blocking ledger row for its own option.
+    """
+    intent = pick_intent.lookup_intent(token)
+    if intent is None:
+        return False
+    # Callback-payload parity: the immutable callback_data must agree with the
+    # stored intent's derived key — else a corrupt/tampered store row could map a
+    # real button token to a different option/route. Mismatch → no recovery.
+    if (
+        route_hash
+        != auq_ledger.make_route_hash(
+            intent.user_id, intent.thread_id, intent.window_id
+        )
+        or fp8 != intent.full_fingerprint[:8]
+        or opt_num != intent.option_number
+    ):
+        logger.info(
+            "AUQ_PICK recover parity_mismatch user=%d token=%s", sender_id, token[:6]
+        )
+        return False
+    # Owner-auth (the historic peek_none branch had none) BEFORE the lease check,
+    # mirroring the live path's 785→789 ordering.
+    if intent.user_id != sender_id:
+        logger.info("AUQ_PICK recover wrong_user user=%d", sender_id)
+        await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+        return True
+    if await reject_stale_window(intent.window_id):
+        logger.info(
+            "AUQ_PICK recover stale_window user=%d window=%s",
+            sender_id,
+            intent.window_id,
+        )
+        return True
+
+    async def _capture(wid: str, scrollback: int) -> str | None:
+        return await tmux_manager.capture_pane(wid, scrollback_lines=scrollback)
+
+    result = await pick_token.recover_and_consume(
+        token,
+        intent,
+        sender_id,
+        capture_pane=_capture,
+        find_window_by_id=tmux_manager.find_window_by_id,
+    )
+    logger.info(
+        "AUQ_PICK recover outcome=%s user=%d window=%s opt=%d",
+        result.outcome,
+        sender_id,
+        intent.window_id,
+        intent.option_number,
+    )
+    if result.outcome == "wrong_user":
+        await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+        return True
+    if result.outcome == "already":
+        await safe_answer(
+            query,
+            f"Action already received: {intent.option_label[:32]}",
+            show_alert=False,
+        )
+        return True
+    if result.outcome == "in_progress":
+        await safe_answer(query, "Action in progress", show_alert=False)
+        return True
+    if result.outcome in ("superseded", "stale_form", "source_drift", "window_gone"):
+        # The on-screen keyboard is current/changed — fall through to the honest
+        # refresh modal so the user taps the live card.
+        return False
+    # outcome == "ok": the accepted claim is already written inside
+    # recover_and_consume; dispatch the digit.
+    assert (
+        result.window_id is not None
+        and result.option_number is not None
+        and result.option_label is not None
+        and result.current_form is not None
+    )
+    w = await tmux_manager.find_window_by_id(result.window_id)
+    if not w:
+        await safe_answer(query, "Window not found", show_alert=True)
+        return True
+    if result.is_review_submit and not _review_submit_cursor_ok(
+        result.current_form, result.option_label
+    ):
+        await safe_answer(query, "Review screen moved, refreshing.", show_alert=False)
+        await handle_interactive_ui(
+            context.bot,
+            user.id,
+            result.window_id,
+            result.thread_id,
+            tmux_mgr=tmux_manager,
+            session_mgr=adapters.session_manager,
+        )
+        return True
+    await _dispatch_pick_digit(
+        query=query,
+        context=context,
+        user=user,
+        tmux_manager=tmux_manager,
+        adapters=adapters,
+        w=w,
+        window_id=result.window_id,
+        thread_id=result.thread_id,
+        option_number=result.option_number,
+        option_label=result.option_label,
+        ledger_key=result.ledger_key,
+    )
+    return True
 
 
 async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
@@ -758,11 +1027,27 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # or burns the owner's token.
         peeked = pick_token.peek(token)
         if peeked is None:
-            # Token never existed, was already used, or has aged past the
-            # 5-minute TTL. Refresh the card so the user sees the live form
-            # state and can click a fresh button. (The ledger gate above
-            # already answered any real SEQUENTIAL duplicate.)
+            # Token never existed, was already used, aged past the TTL, or — the
+            # D2 case — was wiped by a bot RESTART while the published card kept
+            # its old keyboard (dead token strings baked into callback_data). Try
+            # restart-recovery first; if it doesn't take over, refresh the card so
+            # the user taps a fresh button. (The ledger gate above already
+            # answered any real SEQUENTIAL duplicate.)
             logger.info("AUQ_PICK peek_none user=%d token=%s", user.id, token[:6])
+            if await _attempt_pick_recovery(
+                token,
+                user.id,
+                route_hash,
+                fp8,
+                opt_num,
+                query=query,
+                context=context,
+                user=user,
+                tmux_manager=tmux_manager,
+                adapters=adapters,
+                reject_stale_window=reject_stale_window_callback,
+            ):
+                return
             await _refresh_pick_card(
                 query,
                 context,
@@ -828,6 +1113,23 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             await safe_answer(query, "Action already received.", show_alert=False)
             return
         if result.outcome == "expired":
+            # A token that survived peek but lost the consume race / TTL-pruned
+            # mid-flight. Same restart-recovery net as peek_none (gated identically
+            # — a tombstoned/live row declines via the cache-row proof).
+            if await _attempt_pick_recovery(
+                token,
+                user.id,
+                route_hash,
+                fp8,
+                opt_num,
+                query=query,
+                context=context,
+                user=user,
+                tmux_manager=tmux_manager,
+                adapters=adapters,
+                reject_stale_window=reject_stale_window_callback,
+            ):
+                return
             await _refresh_pick_card(
                 query,
                 context,
@@ -878,46 +1180,26 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # bounced — Hermes review asked for an explicit label compare here
         # as belt-and-braces, so a future fingerprint-format change can't
         # accidentally let an off-screen Submit dispatch.
-        if entry.is_review_submit:
-            cursor_on_submit_one = (
-                current_form.is_review_screen
-                and current_form.options
-                and current_form.options[0].cursor
-                and current_form.options[0].number == 1
-                and current_form.options[0].label == entry.option_label
+        if entry.is_review_submit and not _review_submit_cursor_ok(
+            current_form, entry.option_label
+        ):
+            logger.info(
+                "AUQ_PICK submit_guard_reject user=%d window=%s",
+                user.id,
+                window_id,
             )
-            if not cursor_on_submit_one:
-                logger.info(
-                    "Pick-token submit-guard reject: user=%d window=%s",
-                    user.id,
-                    window_id,
-                )
-                logger.info(
-                    "AUQ_PICK submit_guard_reject user=%d window=%s is_review=%s "
-                    "opt1_cursor=%s opt1_num=%s label_match=%s",
-                    user.id,
-                    window_id,
-                    current_form.is_review_screen,
-                    (current_form.options[0].cursor if current_form.options else None),
-                    (current_form.options[0].number if current_form.options else None),
-                    (
-                        current_form.options[0].label == entry.option_label
-                        if current_form.options
-                        else None
-                    ),
-                )
-                await safe_answer(
-                    query, "Review screen moved, refreshing.", show_alert=False
-                )
-                await handle_interactive_ui(
-                    context.bot,
-                    user.id,
-                    window_id,
-                    thread_id,
-                    tmux_mgr=tmux_manager,
-                    session_mgr=adapters.session_manager,
-                )
-                return
+            await safe_answer(
+                query, "Review screen moved, refreshing.", show_alert=False
+            )
+            await handle_interactive_ui(
+                context.bot,
+                user.id,
+                window_id,
+                thread_id,
+                tmux_mgr=tmux_manager,
+                session_mgr=adapters.session_manager,
+            )
+            return
 
         # Write-ahead ledger BEFORE dispatch. ``ledger_key`` is None ONLY on a
         # collision-suppression fall-through (set above at the wrong-user/
@@ -939,124 +1221,19 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 option_label=entry.option_label,
             )
 
-        # Dispatch: send the literal digit. Claude Code's AskUserQuestion
-        # picker accepts ``1``-``9`` as shortcuts; the digit moves the
-        # cursor to that option and Enter submits. We send digit + Enter
-        # in two passes (no auto-Enter on the digit) so the picker has
-        # time to register the selection before the Enter key arrives.
-        # 500ms matches the gap tmux_manager uses internally for the
-        # literal-text-then-Enter path — boring beats flaky.
-        #
-        # ``tmux_manager.send_keys`` returns ``False`` (does not raise) on
-        # missing session/window/pane or libtmux exceptions. Codex Wave 3
-        # P1: a silent False return used to fall through to
-        # ``auq_ledger.record(state="dispatched")``, which then made every
-        # subsequent retry tap answer "Action already received" even
-        # though tmux had never received the digit. Check both returns.
-        digit_landed = False
-        try:
-            digit_ok = await tmux_manager.send_keys(
-                w.window_id, str(entry.option_number), enter=False, literal=True
-            )
-            if not digit_ok:
-                if ledger_key is not None:
-                    auq_ledger.record(
-                        ledger_key,
-                        state="failed_before_digit",
-                        failed_reason="tmux send_keys(digit) returned False",
-                    )
-                logger.warning(
-                    "Pick-token dispatch: tmux send_keys(digit=%d) "
-                    "returned False for window=%s user=%d",
-                    entry.option_number,
-                    window_id,
-                    user.id,
-                )
-                await safe_answer(
-                    query, "Action failed; refreshing card.", show_alert=False
-                )
-                await handle_interactive_ui(
-                    context.bot,
-                    user.id,
-                    window_id,
-                    thread_id,
-                    tmux_mgr=tmux_manager,
-                    session_mgr=adapters.session_manager,
-                )
-                return
-            digit_landed = True
-            if ledger_key is not None:
-                auq_ledger.record(ledger_key, state="digit_sent")
-            await asyncio.sleep(0.5)
-            enter_ok = await tmux_manager.send_keys(
-                w.window_id, "Enter", enter=False, literal=False
-            )
-            if not enter_ok:
-                if ledger_key is not None:
-                    auq_ledger.record(
-                        ledger_key,
-                        state="failed_after_digit",
-                        failed_reason="tmux send_keys(Enter) returned False",
-                    )
-                logger.warning(
-                    "Pick-token dispatch: digit landed but tmux "
-                    "send_keys(Enter) returned False for window=%s user=%d",
-                    window_id,
-                    user.id,
-                )
-                await safe_answer(
-                    query,
-                    "Action sent but Enter failed; refreshing — verify in tmux.",
-                    show_alert=False,
-                )
-                await handle_interactive_ui(
-                    context.bot,
-                    user.id,
-                    window_id,
-                    thread_id,
-                    tmux_mgr=tmux_manager,
-                    session_mgr=adapters.session_manager,
-                )
-                return
-            if ledger_key is not None:
-                auq_ledger.record(ledger_key, state="dispatched")
-        except Exception as exc:
-            if ledger_key is not None:
-                auq_ledger.record(
-                    ledger_key,
-                    state=(
-                        "failed_after_digit" if digit_landed else "failed_before_digit"
-                    ),
-                    failed_reason=str(exc),
-                )
-            await safe_answer(
-                query, "Action failed; refreshing card.", show_alert=False
-            )
-            raise
-
-        logger.info(
-            "AUQ_PICK dispatch_ok user=%d window=%s opt=%d label=%s "
-            "is_review_submit=%s digit_ok=%s enter_ok=%s",
-            user.id,
-            window_id,
-            entry.option_number,
-            entry.option_label[:24],
-            entry.is_review_submit,
-            digit_ok,
-            enter_ok,
-        )
-        await safe_answer(query, f"{entry.option_number}. {entry.option_label[:32]}")
-        await asyncio.sleep(0.5)
-        # Re-render the picker after the digit lands so the card reflects the
-        # advanced screen (next question / review / completion). Orphan-card
-        # safety is provided by the visible-pane liveness bail inside
-        # ``handle_interactive_ui`` (it reads the live tmux pane and returns
-        # without rendering when no picker is on screen).
-        await handle_interactive_ui(
-            context.bot,
-            user.id,
-            window_id,
-            thread_id,
-            tmux_mgr=tmux_manager,
-            session_mgr=adapters.session_manager,
+        # Dispatch the digit + Enter and record the ledger lifecycle via the
+        # shared helper (also used by D2 restart-recovery). The ``accepted``
+        # claim was already written above.
+        await _dispatch_pick_digit(
+            query=query,
+            context=context,
+            user=user,
+            tmux_manager=tmux_manager,
+            adapters=adapters,
+            w=w,
+            window_id=window_id,
+            thread_id=thread_id,
+            option_number=entry.option_number,
+            option_label=entry.option_label,
+            ledger_key=ledger_key,
         )

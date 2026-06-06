@@ -32,7 +32,11 @@ from typing import Any
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
 from ..config import config
-from ..session import session_id_for_window, session_manager
+from ..session import (
+    peek_session_id_for_window,
+    session_id_for_window,
+    session_manager,
+)
 from ..terminal_parser import (
     AskUserQuestionForm,
     build_form_from_tool_input,
@@ -44,7 +48,7 @@ from ..terminal_parser import (
 from .. import md_capture
 from ..tmux_manager import tmux_manager
 from ..utils import atomic_write_json
-from . import attention, auq_source, pick_token
+from . import attention, auq_source, pick_intent, pick_token
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -405,6 +409,11 @@ def forget_ask_tool_input(window_id: str) -> None:
     _last_completed_ask_tool_input.pop(window_id, None)
     _last_auq_tool_use_id.pop(window_id, None)
     auq_source.forget_for_window(window_id)
+    # D2 restart-recovery: tomb this window's durable pick mint-intents on AUQ/EPM
+    # resolution (the primary teardown seam). Orphan-safety is also provided by
+    # recovery-time form/source re-validation + the 24h GC, but tombing here keeps
+    # the store hygienic and prevents a resolved card's tokens from recovering.
+    pick_intent.teardown_window(window_id)
     # Bug 2: tear down the MessageDisplay live-prose capture for this window's
     # CURRENT session on resolution. This is the primary teardown seam — it
     # fires for BOTH AUQ (the tool_result branch) and ExitPlanMode (via the
@@ -2309,7 +2318,7 @@ def _build_pick_button_rows(
     # Telegram MESSAGE_NOT_MODIFIED). Each entry records the resolved
     # ``(source_kind, source_fingerprint)`` so validate can measure source
     # parity.
-    tokens = pick_token.mint_row(
+    tokens, fresh = pick_token.mint_row(
         user_id=user_id,
         thread_id=thread_id,
         window_id=window_id,
@@ -2325,6 +2334,36 @@ def _build_pick_button_rows(
             for opt in pickable
         ],
     )
+
+    # D2 restart-recovery: on a FRESH mint only, persist the per-token mint
+    # intent so the callback handler can recover + re-dispatch the first
+    # token-less tap after a bot restart (the in-memory store is wiped, but the
+    # published card keeps its old keyboard). aqp: single-select + review-Submit
+    # ONLY — the aqt: multi-toggle minter (``_build_multi_toggle_rows``)
+    # deliberately does NOT persist (out of D2 scope). A byte-identical re-render
+    # (``fresh=False``) reuses the same tokens whose intent already persists.
+    if fresh:
+        pick_intent.record_row(
+            full_fingerprint=fingerprint,
+            source_kind=resolved_source.kind,
+            source_fingerprint=resolved_source.source_fingerprint,
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            session_id=peek_session_id_for_window(window_id),
+            minted_at=time.time(),
+            token_specs=[
+                pick_intent.TokenSpec(
+                    token=token,
+                    option_number=opt.number or 0,
+                    option_label=opt.label,
+                    is_review_submit=bool(
+                        form.is_review_screen and opt.cursor and opt.number == 1
+                    ),
+                )
+                for opt, token in zip(pickable, tokens)
+            ],
+        )
 
     # Wave 3: callback_data now carries (route_hash, fp8, opt, token) so
     # the restart-safe ledger can reconstruct the stable key without
@@ -2391,7 +2430,10 @@ def _build_multi_toggle_rows(
     if not pickable:
         return []
 
-    tokens = pick_token.mint_row(
+    # aqt: multi-select toggles are OUT of D2 restart-recovery scope, so this
+    # minter discards the ``fresh`` flag and never persists a durable mint
+    # intent (only the aqp: single-select / review-Submit minter does).
+    tokens, _ = pick_token.mint_row(
         user_id=user_id,
         thread_id=thread_id,
         window_id=window_id,

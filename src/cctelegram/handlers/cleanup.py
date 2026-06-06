@@ -16,7 +16,7 @@ from telegram import Bot
 from .. import md_capture, route_runtime
 from ..session import session_id_for_window, session_manager
 
-from . import attention
+from . import attention, pick_intent
 from .inbound_aggregator import aggregator_clear_route
 from .interactive_ui import clear_interactive_msg
 from .message_queue import (
@@ -76,6 +76,11 @@ async def clear_topic_state(
         _md_session = session_id_for_window(route[2])
         if _md_session:
             md_capture.teardown_session(_md_session)
+        # D2: tomb this window's durable pick mint-intents on topic close (the
+        # store is window-keyed; route[2] is the window_id). Orphan-safety is also
+        # provided by recovery-time re-validation + the 24h GC, but tombing here
+        # keeps the store hygienic.
+        pick_intent.teardown_window(route[2])
         await teardown_route(route, drop_pending=drop_pending)
 
     # Clear status message tracking
