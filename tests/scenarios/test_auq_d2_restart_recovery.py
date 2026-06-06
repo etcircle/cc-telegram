@@ -210,9 +210,8 @@ async def test_recover_after_restart_dispatches_exactly_once(
 
     await _tap(scenario, picks[1], user_id=scenario.user_id)
 
-    assert scenario.tmux.sent_keys[-2:] == [
+    assert scenario.tmux.sent_keys[-1:] == [
         (wid, "2", False, True),
-        (wid, "Enter", False, False),
     ]
     # The recovered dispatch wrote the ledger lifecycle at the reconstructed key.
     _route_hash, fp8, _opt = picks[1].removeprefix(CB_ASK_PICK).split(":")[:3]
@@ -316,9 +315,8 @@ async def test_idle_not_restarted_takes_normal_path_not_recovery(
 
     await _tap(scenario, picks[1], user_id=scenario.user_id)  # no reset
 
-    assert scenario.tmux.sent_keys[-2:] == [
+    assert scenario.tmux.sent_keys[-1:] == [
         (wid, "2", False, True),
-        (wid, "Enter", False, False),
     ]
     # The normal path does NOT call pick_intent.consume_row → the durable row
     # survives (recovery was not entered).

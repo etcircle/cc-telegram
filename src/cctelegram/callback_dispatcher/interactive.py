@@ -81,7 +81,8 @@ async def _refresh_pick_card(
     (``peek_none`` / ``expired``) callers set it ``True`` so their honest
     "tap again" prompt is a MODAL the user can't miss, while the ledger-state
     callers keep the default ``False`` so their specific warnings (e.g.
-    ``failed_after_digit`` "verify in tmux") stay as non-modal toasts.
+    ``failed_before_digit`` "Action failed previously; refreshing.") stay as
+    non-modal toasts.
     """
     await safe_answer(query, text, show_alert=show_alert)
     thread_id = _get_thread_id(update)
@@ -111,16 +112,21 @@ async def _dispatch_pick_digit(
     option_label: str,
     ledger_key: str | None,
 ) -> None:
-    """Send the option digit + Enter, record the ledger lifecycle, answer, re-render.
+    """Send the option digit (no Enter), record the ledger lifecycle, answer, re-render.
+
+    On Claude Code v2.1.167 a BARE DIGIT is the universal select+advance (and, on
+    the review screen, submit) action — the trailing ``Enter`` the bot used to
+    send over-advanced multi-question forms past Q2 (it auto-answered the next
+    question with its cursor-default). So only the bare digit is dispatched; the
+    digit landing IS the complete dispatch (``accepted`` → ``dispatched``).
 
     Shared by the live ``ok`` path and D2 restart-recovery. The caller writes the
     ``accepted`` claim BEFORE calling this (the live path inline; recovery inside
     ``pick_token.recover_and_consume``). ``ledger_key`` is None only on a
     collision-suppression fall-through — the ``if ledger_key is not None`` guards
     keep those writes off another route's row. ``send_keys`` returns False (does
-    not raise) on failure; both returns are checked (Wave-3 P1).
+    not raise) on failure; the return is checked (Wave-3 P1).
     """
-    digit_landed = False
     try:
         digit_ok = await tmux_manager.send_keys(
             w.window_id, str(option_number), enter=False, literal=True
@@ -151,47 +157,15 @@ async def _dispatch_pick_digit(
                 session_mgr=adapters.session_manager,
             )
             return
-        digit_landed = True
-        if ledger_key is not None:
-            auq_ledger.record(ledger_key, state="digit_sent")
-        await asyncio.sleep(0.5)
-        enter_ok = await tmux_manager.send_keys(
-            w.window_id, "Enter", enter=False, literal=False
-        )
-        if not enter_ok:
-            if ledger_key is not None:
-                auq_ledger.record(
-                    ledger_key,
-                    state="failed_after_digit",
-                    failed_reason="tmux send_keys(Enter) returned False",
-                )
-            logger.warning(
-                "Pick-token dispatch: digit landed but tmux send_keys(Enter) "
-                "returned False for window=%s user=%d",
-                window_id,
-                user.id,
-            )
-            await safe_answer(
-                query,
-                "Action sent but Enter failed; refreshing — verify in tmux.",
-                show_alert=False,
-            )
-            await handle_interactive_ui(
-                context.bot,
-                user.id,
-                window_id,
-                thread_id,
-                tmux_mgr=tmux_manager,
-                session_mgr=adapters.session_manager,
-            )
-            return
+        # The bare digit IS the complete dispatch (v2.1.167 single-keystroke
+        # model). Record the terminal ``dispatched`` directly — no Enter step.
         if ledger_key is not None:
             auq_ledger.record(ledger_key, state="dispatched")
     except Exception as exc:
         if ledger_key is not None:
             auq_ledger.record(
                 ledger_key,
-                state=("failed_after_digit" if digit_landed else "failed_before_digit"),
+                state="failed_before_digit",
                 failed_reason=str(exc),
             )
         await safe_answer(query, "Action failed; refreshing card.", show_alert=False)
@@ -1208,9 +1182,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 option_label=entry.option_label,
             )
 
-        # Dispatch the digit + Enter and record the ledger lifecycle via the
-        # shared helper (also used by D2 restart-recovery). The ``accepted``
-        # claim was already written above.
+        # Dispatch the bare digit (no Enter — v2.1.167 select+advance/submit) and
+        # record the ledger lifecycle via the shared helper (also used by D2
+        # restart-recovery). The ``accepted`` claim was already written above.
         await _dispatch_pick_digit(
             query=query,
             context=context,
