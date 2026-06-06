@@ -232,8 +232,8 @@ predicate (anchored on `is_review_screen` + option #1 + the literal
 Submit regardless of cursor, verified on Claude Code v2.1.161/.167). The
 `_pane_fingerprint` ⇄ `_canonical_repr` shared-canonical coupling is load-bearing
 for this fix — a refactor giving the pane source its own fingerprint basis would
-re-break it; the review-screen fingerprint-EQUALITY-across-cursor-move test guards
-the coupling.
+re-break it; the fingerprint-EQUALITY-across-cursor-move tests (for BOTH the
+review screen and non-review pickers) guard the coupling.
 
 **AUQ pick dispatch is a single BARE DIGIT (no Enter — v2.1.167 model).**
 `_dispatch_pick_digit` (shared by the live `aqp:` pick path AND D2 recovery)
