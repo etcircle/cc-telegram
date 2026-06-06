@@ -182,8 +182,43 @@ poll; no observer — c313657 forbidden). The residual cases — a restart (in-m
 tokens wiped) or a liveness-gate false-negative — degrade to the honest
 `_refresh_pick_card` MODAL "↻ Refreshed — tap your choice again." (D3-α,
 `show_alert=True` at the `peek_none`/`expired` callsites only; the ledger-state
-callers keep their specific non-modal warnings). Restart re-dispatch of a
-token-less stale tap (so even that first tap registers) is a deferred follow-up.
+callers keep their specific non-modal warnings).
+
+**Restart re-dispatch (D2 — the durable mint-intent net for the case D3-β can't
+cover).** D3-β keeps a live card's tokens alive only while the process is up; a
+bot **restart** wipes the in-memory `_pick_tokens`/`_pick_token_cache`, and the
+published card keeps its old keyboard with dead token strings, so the first tap
+hits `peek_none` for the card's whole remaining life. D2 persists the per-token
+mint intent at the fresh `aqp:` single-select/Submit render to a new leaf store
+(`pick_intent.py` → `pick_intent.jsonl`; `aqt:` toggles excluded) and the
+`peek_none` / `expired` callback branches call `_attempt_pick_recovery` →
+`pick_token.recover_and_consume` to re-dispatch that tap. It is the **idle net's
+sibling, not its overlap**: recovery fires ONLY on **positive proof of in-memory
+loss** — no `_pick_token_cache` row at the reconstructed
+`(user, thread_or_0, window, full_fingerprint)` cache_key (a live row ⇒ the normal
+`validate_and_consume` path owns it; a tombstoned row ⇒ this process just consumed
+it) — so an idle-kept-alive token (D3-β) never enters recovery. Recovery is
+**row-scoped single-use** (a `_recovery_row_reservations[cache_key]` for concurrent
+sibling taps + a per-sibling action-ledger guard for the restart-durable /
+crash-between-`accepted`-and-tomb case + a `consume_row` tomb for hygiene), adds
+the full **owner + `reject_stale_window_callback`** auth pair the `peek_none`
+branch historically lacked plus a callback-payload parity check vs the stored
+intent, and re-validates **read-TTL-free** source parity
+(`auq_source.read_side_file_for_recovery` comparing `_canonical_dict_fingerprint`,
+NOT the 12-hex `input_fingerprint`; pane fallback only when the side file is
+genuinely gone via `side_file_live_for_session`). The `accepted` claim is written
+at the reconstructed ledger key INSIDE the row reservation (no release-then-claim
+gap; a re-check of the cache-row + sibling proofs precedes it), and the action
+ledger stays the **24h durable single-use authority** — `pick_intent.jsonl` is a
+SEPARATE token-keyed store (writing recovery state into the latest-wins action
+ledger would clobber a `dispatched` row). The store is **NOT a `route_runtime`
+field** — render-path write, callback-path read, pull-only, no observer (c313657
+forbidden). Tombed at `forget_ask_tool_input` (AUQ/EPM resolution + the `/clear`
+race via the OLD-window `forget_ask_tool_input(wid)` call) and `clear_topic_state`;
+orphan-safe via the recovery-time form/source re-validation + the 24h GC.
+Off-contract residuals (safe DECLINE, never a wrong dispatch): a moved cursor
+across the restart (D3-γ — the cursor feeds the form fingerprint) and a
+`jsonl_cache`-minted card (its in-process getter is wiped on restart).
 
 ## MessageDisplay live-prose capture (Bug 2)
 

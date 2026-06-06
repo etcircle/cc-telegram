@@ -1899,7 +1899,7 @@ class TestClearInteractiveMsgPrunesTokens:
             source_kind="pane",
             source_fingerprint="sfp",
             specs=[_pick_token._mint_spec(1, "A", False)],
-        )[0]
+        )[0][0]
 
     @pytest.mark.asyncio
     async def test_clear_drops_tokens_for_active_window(self):

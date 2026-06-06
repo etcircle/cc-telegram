@@ -42,6 +42,7 @@ from cctelegram.handlers import (
     inbound_aggregator,
     interactive_ui,
     message_queue,
+    pick_intent,
     pick_token,
     status_polling,
 )
@@ -619,6 +620,14 @@ def _reset_all_handler_state() -> None:
         ledger_path.unlink()
     except FileNotFoundError:
         pass
+    # D2: unlink the durable pick-intent store by its REAL module constant (the
+    # shared CC_TELEGRAM_DIR would otherwise leak rows across tests — and a stale
+    # neighbor's intent could make a restart-recovery assertion pass for the wrong
+    # reason). Keyed by the current constant, never a literal (test-reset-noop).
+    try:
+        (app_dir() / pick_intent.STORE_FILENAME).unlink()
+    except FileNotFoundError:
+        pass
     pending_dir = app_dir() / "auq_pending"
     if pending_dir.is_dir():
         for path in pending_dir.glob("*.json"):
@@ -630,6 +639,7 @@ def _reset_all_handler_state() -> None:
     message_queue.reset_for_tests()
     interactive_ui.reset_for_tests()
     pick_token.reset_for_tests()
+    pick_intent.reset_for_tests()
     auq_source.reset_for_tests()
     # Re-inject the production JSONL-cache getter (bot.post_init wires this
     # once at startup, but post_init doesn't run under test). Without it the
