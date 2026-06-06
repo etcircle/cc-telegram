@@ -679,6 +679,14 @@ class AskUserQuestionForm:
         deploy that introduces ``questions`` / ``current_tab_inferred``.
         The ``QS:`` and ``INF:`` lines only appear for multi-tab forms,
         where there is no live single-question token to invalidate.
+
+        The per-option canonical is **cursor-blind** on every screen
+        (review and non-review): on Claude Code v2.1.167 dispatch is a
+        bare digit (the option IS the digit, cursor-independent), so the
+        terminal cursor ``❯`` position must NOT feed the form identity —
+        a cursor move would otherwise rotate the pick token and pop a
+        still-live card (peek_none / stale_form). The ``RVW:`` line, not
+        the cursor, distinguishes review from non-review forms.
         """
         tabs_str = "|".join(
             f"{t.label}:{'A' if t.answered else 'E'}"
@@ -687,9 +695,7 @@ class AskUserQuestionForm:
             for t in self.tabs
         )
         opts_str = "|".join(
-            f"{o.number}:{o.label}"
-            f":{'R' if o.recommended else '_'}"
-            f":{'_' if self.is_review_screen else ('C' if o.cursor else '_')}"
+            f"{o.number}:{o.label}:{'R' if o.recommended else '_'}"
             for o in self.options
         )
         lines = [

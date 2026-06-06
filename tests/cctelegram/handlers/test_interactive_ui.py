@@ -4274,9 +4274,13 @@ class TestRecordConsistentWithPane:
         assert ok is True
 
     def test_does_not_use_form_fingerprint_for_acceptance(self):
-        # Cursor on different option ⇒ form.fingerprint() differs but
-        # _record_consistent_with_pane must still accept (Codex R3 ask:
-        # NEVER use AskUserQuestionForm.fingerprint() in the predicate).
+        # Cursor on different option ⇒ _record_consistent_with_pane must
+        # still accept (Codex R3 ask: NEVER use
+        # AskUserQuestionForm.fingerprint() in the predicate). The form
+        # fingerprint is now cursor-blind on every screen (v2.1.167
+        # bare-digit dispatch), so a pure cursor move leaves it unchanged —
+        # the predicate must accept regardless, exercised here by moving the
+        # cursor between two otherwise-identical forms.
         rec = self._single_q_record(["Apple", "Banana"])
         form_cur_a = _make_form_single_question("Q", ["Apple", "Banana"])
         form_cur_b = AskUserQuestionForm(
@@ -4287,7 +4291,12 @@ class TestRecordConsistentWithPane:
             current_question_title="Q",
             current_tab_inferred=True,
         )
-        assert form_cur_a.fingerprint() != form_cur_b.fingerprint()
+        # Cursor genuinely moved (Apple → Banana); fingerprint is now
+        # cursor-blind so it stays equal across the move.
+        assert [o.cursor for o in form_cur_a.options] != [
+            o.cursor for o in form_cur_b.options
+        ]
+        assert form_cur_a.fingerprint() == form_cur_b.fingerprint()
         ok_a, _ = _record_consistent_with_pane(rec, form_cur_a)
         ok_b, _ = _record_consistent_with_pane(rec, form_cur_b)
         assert ok_a is True and ok_b is True
