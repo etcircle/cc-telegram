@@ -216,9 +216,23 @@ field** — render-path write, callback-path read, pull-only, no observer (c3136
 forbidden). Tombed at `forget_ask_tool_input` (AUQ/EPM resolution + the `/clear`
 race via the OLD-window `forget_ask_tool_input(wid)` call) and `clear_topic_state`;
 orphan-safe via the recovery-time form/source re-validation + the 24h GC.
-Off-contract residuals (safe DECLINE, never a wrong dispatch): a moved cursor
-across the restart (D3-γ — the cursor feeds the form fingerprint) and a
-`jsonl_cache`-minted card (its in-process getter is wiped on restart).
+Off-contract residuals (safe DECLINE, never a wrong dispatch): on a **non-review**
+picker, a moved cursor across the restart (D3-γ — the cursor feeds the form
+fingerprint) DECLINES, and a `jsonl_cache`-minted card DECLINES (its in-process
+getter is wiped on restart). The **review-screen** fingerprint is now
+cursor-blind — `AskUserQuestionForm._canonical_repr` omits the per-option cursor
+bit when `is_review_screen`, and `auq_source._pane_fingerprint` hashes the SAME
+`_canonical_repr` so the pane source fingerprint collapses in lockstep — so a
+moved Submit↔Cancel cursor (live OR across a restart) no longer rotates the pick
+token, and D2 review-Submit recovery SURVIVES a moved cursor. Both the live and
+recovery Submit guards share the cursor-blind `AskUserQuestionForm.review_submit_dispatchable`
+predicate (anchored on `is_review_screen` + option #1 + the literal
+`REVIEW_SUBMIT_LABEL` "Submit answers" + the minted label; digit `1` activates
+Submit regardless of cursor, verified on Claude Code v2.1.161). The
+`_pane_fingerprint` ⇄ `_canonical_repr` shared-canonical coupling is load-bearing
+for this fix — a refactor giving the pane source its own fingerprint basis would
+re-break it; the review-screen fingerprint-EQUALITY-across-cursor-move test guards
+the coupling.
 
 ## MessageDisplay live-prose capture (Bug 2)
 
