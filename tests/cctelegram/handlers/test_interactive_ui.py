@@ -4274,31 +4274,45 @@ class TestRecordConsistentWithPane:
         assert ok is True
 
     def test_does_not_use_form_fingerprint_for_acceptance(self):
-        # Cursor on different option ⇒ _record_consistent_with_pane must
-        # still accept (Codex R3 ask: NEVER use
-        # AskUserQuestionForm.fingerprint() in the predicate). The form
-        # fingerprint is now cursor-blind on every screen (v2.1.167
-        # bare-digit dispatch), so a pure cursor move leaves it unchanged —
-        # the predicate must accept regardless, exercised here by moving the
-        # cursor between two otherwise-identical forms.
+        # Codex R3 invariant: _record_consistent_with_pane must NEVER gate on
+        # AskUserQuestionForm.fingerprint() — acceptance is STRUCTURAL
+        # (labels/title/count only). Prove it by feeding two forms the
+        # structural predicate treats identically (same labels + title) but
+        # whose FINGERPRINTS DIFFER, and asserting BOTH are accepted.
+        #
+        # NOTE: the fingerprint is now cursor-blind on every screen (v2.1.167
+        # bare-digit dispatch), so a cursor move no longer differs the
+        # fingerprint and can't serve as the discriminator. We use the
+        # `recommended` (`:R`) bit instead — a canonical/fingerprint input that
+        # the structural predicate ignores. If the predicate ever regressed to
+        # compare fingerprints, one of these two would be rejected and this
+        # test would fail. (Cursors are also moved, to keep exercising UI-state
+        # invariance, but the fingerprint delta comes from `recommended`.)
         rec = self._single_q_record(["Apple", "Banana"])
-        form_cur_a = _make_form_single_question("Q", ["Apple", "Banana"])
-        form_cur_b = AskUserQuestionForm(
+        form_plain = AskUserQuestionForm(
             options=(
-                AskOption(label="Apple", recommended=False, cursor=False, number=1),
+                AskOption(label="Apple", recommended=False, cursor=True, number=1),
+                AskOption(label="Banana", recommended=False, cursor=False, number=2),
+            ),
+            current_question_title="Q",
+            current_tab_inferred=True,
+        )
+        form_recommended = AskUserQuestionForm(
+            options=(
+                AskOption(label="Apple", recommended=True, cursor=False, number=1),
                 AskOption(label="Banana", recommended=False, cursor=True, number=2),
             ),
             current_question_title="Q",
             current_tab_inferred=True,
         )
-        # Cursor genuinely moved (Apple → Banana); fingerprint is now
-        # cursor-blind so it stays equal across the move.
-        assert [o.cursor for o in form_cur_a.options] != [
-            o.cursor for o in form_cur_b.options
+        # Fingerprints DIFFER (the `:R` recommended bit) AND the cursor moved;
+        # accepting BOTH proves acceptance is fingerprint-independent.
+        assert form_plain.fingerprint() != form_recommended.fingerprint()
+        assert [o.cursor for o in form_plain.options] != [
+            o.cursor for o in form_recommended.options
         ]
-        assert form_cur_a.fingerprint() == form_cur_b.fingerprint()
-        ok_a, _ = _record_consistent_with_pane(rec, form_cur_a)
-        ok_b, _ = _record_consistent_with_pane(rec, form_cur_b)
+        ok_a, _ = _record_consistent_with_pane(rec, form_plain)
+        ok_b, _ = _record_consistent_with_pane(rec, form_recommended)
         assert ok_a is True and ok_b is True
 
 
