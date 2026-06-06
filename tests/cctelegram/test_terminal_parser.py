@@ -1483,7 +1483,7 @@ class TestSingleQuestionFingerprintGolden:
         # Pinned SHA-1 of the canonical above. Update this constant ONLY
         # if you intentionally changed single-question canonical output
         # AND you've considered the rolling-deploy impact on live tokens.
-        expected = "6651ea1b8174f879"
+        expected = "ee39790162543f29"
         assert _SINGLE_QUESTION_GOLDEN_FORM.fingerprint() == expected
 
 
@@ -2548,9 +2548,10 @@ class TestQuestionsContentPairsFromForm:
         pairs2 = questions_content_pairs_from_form(form2)
         assert pairs1 is not None and pairs2 is not None
         assert questions_content_digest(pairs1) == questions_content_digest(pairs2)
-        # Sanity: the form-level fingerprint, which DOES include cursor
-        # state, differs.
-        assert form1.fingerprint() != form2.fingerprint()
+        # The form-level fingerprint NO LONGER includes cursor state
+        # (cursor-blind on every screen — v2.1.167 bare-digit dispatch),
+        # so a pure cursor move leaves the fingerprint unchanged too.
+        assert form1.fingerprint() == form2.fingerprint()
 
 
 class TestDigestSymmetryToolInputVsForm:
@@ -2741,11 +2742,11 @@ class TestPrBMultiSelectDetection:
         assert _SINGLE_QUESTION_GOLDEN_FORM._canonical_repr() == (
             "TABS:\n"
             "Q:Pick one.\n"
-            "OPTS:1:A) First:_:C|2:B) Second:_:_|3:C) Third:R:_\n"
+            "OPTS:1:A) First:_|2:B) Second:_|3:C) Third:R\n"
             "RVW:0\n"
             "FT:0"
         )
-        assert _SINGLE_QUESTION_GOLDEN_FORM.fingerprint() == "6651ea1b8174f879"
+        assert _SINGLE_QUESTION_GOLDEN_FORM.fingerprint() == "ee39790162543f29"
 
     def test_selected_flip_does_not_change_canonical(self):
         a = AskUserQuestionForm(
@@ -3146,3 +3147,40 @@ class TestNonReviewFingerprintCursorBlind:
         )
         assert f3 is not None and f4 is not None
         assert f3.fingerprint() == f4.fingerprint()
+
+    def test_nonreview_multiselect_fingerprint_equal_across_cursor_move(self):
+        """Regression (codex+hermes ask): a NON-review MULTI-SELECT cursor move
+        must NOT change the form fingerprint — otherwise the ``aqt:`` toggle
+        validator (interactive.py, which compares FORM fingerprint only) would
+        reject a valid toggle tap after the cursor moved between renders.
+
+        Two multi-select non-review forms differing ONLY by which option carries
+        the cursor (via ``dataclasses.replace``, mirroring the review-distinct
+        test's pattern). Selection state, labels, and numbers are identical."""
+        import dataclasses
+
+        base = AskUserQuestionForm(
+            current_question_title="Pick several.",
+            options=(
+                AskOption(label="A", recommended=False, cursor=True, number=1),
+                AskOption(label="B", recommended=False, cursor=False, number=2),
+                AskOption(label="C", recommended=True, cursor=False, number=3),
+            ),
+            select_mode="multi",
+            is_review_screen=False,
+            is_free_text=False,
+        )
+        moved = dataclasses.replace(
+            base,
+            options=(
+                AskOption(label="A", recommended=False, cursor=False, number=1),
+                AskOption(label="B", recommended=False, cursor=True, number=2),
+                AskOption(label="C", recommended=True, cursor=False, number=3),
+            ),
+        )
+        assert base.is_review_screen is False and moved.is_review_screen is False
+        assert base.select_mode == "multi" and moved.select_mode == "multi"
+        # Sanity: the cursor genuinely moved (option 1 → option 2).
+        assert [o.cursor for o in base.options] == [True, False, False]
+        assert [o.cursor for o in moved.options] == [False, True, False]
+        assert base.fingerprint() == moved.fingerprint()
