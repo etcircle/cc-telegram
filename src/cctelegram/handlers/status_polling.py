@@ -393,11 +393,11 @@ async def update_status_message(
                 # mint_row's source-aware reuse prevents a re-render loop (after
                 # the re-mint to pane, the next tick sees pane==pane → no drift).
                 live = auq_source.resolve_auq_source(window_id, None, pane_text)
-                drift_form = resolve_ask_form(live.payload, pane_text)
-                if drift_form is not None:
-                    minted = pick_token.peek_route_source(
-                        user_id, thread_id, window_id, drift_form.fingerprint()
-                    )
+                # Only an AUQ pane can carry a pick-token card; bail on non-AUQ
+                # panes (Settings / EPM) — resolve_ask_form returns None there,
+                # so we never spuriously re-mint on them.
+                if resolve_ask_form(live.payload, pane_text) is not None:
+                    minted = pick_token.peek_route_source(user_id, thread_id, window_id)
                     if minted is not None and (
                         (live.kind, live.source_fingerprint) != minted
                     ):

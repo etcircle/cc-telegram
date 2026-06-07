@@ -123,7 +123,9 @@ Handler modules (handlers/):
                         + the poller-local _prev_run_state dedup cache). Item 1:
                         its same-hash idle branch ALSO re-mints a live AUQ card
                         on SOURCE drift (side_file aged past the read-TTL → pane)
-                        — re-resolve + resolve_ask_form + pick_token.peek_route_source
+                        — re-resolve + resolve_ask_form (gates out non-AUQ panes) +
+                        pick_token.peek_route_source by ROUTE (fingerprint-agnostic,
+                        since the side-file-form and pane-form fingerprints differ)
                         vs the live source; on mismatch re-render via
                         handle_interactive_ui so the first tap dispatches (the
                         read-TTL itself is untouched). The D3-β sibling.

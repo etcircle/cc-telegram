@@ -420,21 +420,33 @@ def prune_for_route(user_id: int, thread_id: int | None, window_id: str) -> None
 
 
 def peek_route_source(
-    user_id: int, thread_id: int | None, window_id: str, fingerprint: str
+    user_id: int, thread_id: int | None, window_id: str
 ) -> tuple[str, str] | None:
-    """Return the displayed card row's minted (source_kind, source_fingerprint)
-    for this route+fingerprint, or None if there's no live row at that key.
+    """Return the displayed card's minted (source_kind, source_fingerprint) for
+    this route+window, or None if there is no single live card row.
 
-    PURE / read-only — never acquires _store_lock, never mutates/refreshes/
-    resurrects. Skips TOMBSTONED rows (consumed_generation is not None): a
-    just-consumed card keeps a tombstone row at the same key, and peeking it
-    would falsely 'drift' and re-render a dead card. The key MUST match
-    mint_row's normalized cache key: (user_id, thread_id or 0, window_id,
-    fingerprint)."""
-    row = _pick_token_cache.get((user_id, thread_id or 0, window_id, fingerprint))
-    if row is None or row.consumed_generation is not None:
+    Searches by ROUTE (user, thread or 0, window) across ALL fingerprints — NOT
+    by a form fingerprint — because production mints a side_file card at the
+    SIDE-FILE form's fingerprint (the side-file dict carries the question
+    title), while after the side file ages out the poller can only see the PANE
+    form (title=None on single-select panes); those fingerprints differ, so a
+    fingerprint-keyed lookup would miss the row. ``mint_row``'s stale-row
+    hygiene guarantees AT MOST ONE non-tombstoned row per route, so the search
+    is unambiguous; 0 or (defensively) >1 live rows → None.
+
+    PURE / read-only — never acquires ``_store_lock``, never mutates. Skips
+    TOMBSTONED rows (``consumed_generation is not None``). The lock-free read is
+    safe because ``_pick_token_cache`` is only mutated synchronously on the
+    asyncio event loop (no thread races)."""
+    norm = (user_id, thread_id or 0, window_id)
+    live = [
+        row
+        for (u, t, w, _fp), row in _pick_token_cache.items()
+        if (u, t, w) == norm and row.consumed_generation is None
+    ]
+    if len(live) != 1:
         return None
-    return (row.source_kind, row.source_fingerprint)
+    return (live[0].source_kind, live[0].source_fingerprint)
 
 
 async def refresh_route_deadlines(

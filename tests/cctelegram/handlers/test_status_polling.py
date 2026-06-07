@@ -2034,6 +2034,102 @@ class TestPollerSourceDriftRemint:
         finally:
             pick_token.reset_for_tests()
 
+    async def test_drift_remint_terminates_next_tick_does_not_remint(
+        self, mock_bot: AsyncMock
+    ):
+        """Loop-termination: after the drift re-mint, the NEXT tick must NOT
+        re-mint. Tick 1 detects the drift (side_file row, live pane). We then
+        REPLACE the seeded row with the ``pane``-sourced row at the live pane
+        fingerprint — exactly what the real ``mint_row`` leaves after fresh-
+        minting the pane source and hygiene-dropping the old side_file-fp row.
+        Tick 2 now sees live pane == minted pane → no drift → exactly ONE
+        re-mint over the two ticks."""
+        import hashlib
+        import json
+        from pathlib import Path
+
+        from cctelegram.handlers import auq_source, pick_token, status_polling
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.handlers.status_polling import extract_interactive_content
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        pick_token.reset_for_tests()
+        try:
+            fx = Path(__file__).parents[1] / "fixtures"
+            pane = (fx / "auq_single_select_with_affordances_pane.txt").read_text()
+            tool_input = json.loads(
+                (fx / "auq_single_select_with_affordances_sidefile.json").read_text()
+            )["tool_input"]
+            window_id = "@5"
+            route = (1, 42, window_id)
+            mock_window = MagicMock()
+            mock_window.window_id = window_id
+            _interactive_mode[(1, 42)] = window_id
+
+            ui_content = extract_interactive_content(pane)
+            assert ui_content is not None
+            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            status_polling._last_published_ui_hash[route] = ui_hash
+
+            # Tick-1 seed: side_file-fp row (production mint shape), drifted.
+            side_file_form = resolve_ask_form(tool_input, pane)
+            assert side_file_form is not None
+            _pick_token_cache[(1, 42, window_id, side_file_form.fingerprint())] = (
+                _CacheRow(
+                    tokens=["redtok"],
+                    row_generation=1,
+                    source_kind="side_file",
+                    source_fingerprint="sf-fp",
+                    consumed_generation=None,
+                )
+            )
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ),
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=pane)
+
+                # Tick 1: drift detected → re-mint.
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+                assert mock_handle_ui.await_count == 1
+
+                # Simulate the real mint_row outcome: the fresh pane mint + the
+                # stale-row hygiene drop leave a SINGLE pane-sourced row at the
+                # live pane fingerprint.
+                _pick_token_cache.clear()
+                live = auq_source.resolve_auq_source(window_id, None, pane)
+                pane_form = resolve_ask_form(live.payload, pane)
+                assert pane_form is not None
+                _pick_token_cache[(1, 42, window_id, pane_form.fingerprint())] = (
+                    _CacheRow(
+                        tokens=["panetok"],
+                        row_generation=2,
+                        source_kind=live.kind,
+                        source_fingerprint=live.source_fingerprint,
+                        consumed_generation=None,
+                    )
+                )
+
+                # Tick 2: live pane == minted pane → no drift → NO re-mint.
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+                assert mock_handle_ui.await_count == 1
+        finally:
+            pick_token.reset_for_tests()
+
     async def test_same_hash_no_drift_does_not_remint(self, mock_bot: AsyncMock):
         """Source-MATCH guard: when the displayed card's minted source equals the
         live re-resolved source, the same-hash idle tick must NOT re-render — it

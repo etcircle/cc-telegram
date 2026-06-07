@@ -814,11 +814,16 @@ class TestRefreshRouteDeadlines:
 
 
 class TestPeekRouteSource:
-    """Item 1: the poller's source-drift detector reads the displayed card row's
-    minted (source_kind, source_fingerprint) via this PURE accessor. It returns
-    the tags for a live row, None for an absent key, and None for a TOMBSTONED
-    row (a just-consumed card keeps a tombstone row at the same key — peeking it
-    would falsely 'drift' and re-render a dead card)."""
+    """Item 1: the poller's source-drift detector reads the displayed card's
+    minted (source_kind, source_fingerprint) via this PURE accessor. It searches
+    by ROUTE (user, thread or 0, window) across ALL fingerprints — NOT by a form
+    fingerprint — because production mints a side_file card at the side-file
+    form's fingerprint while the poller can later only see the pane form, whose
+    fingerprint differs. ``mint_row``'s stale-row hygiene guarantees at most one
+    live row per route, so the search is unambiguous; it returns the tags for a
+    single live row, None for no row, None for a TOMBSTONED row (a just-consumed
+    card keeps a tombstone row — peeking it would falsely 'drift' and re-render a
+    dead card), and (defensively) None when >1 live rows share a route."""
 
     def test_returns_minted_tags_for_live_row(self):
         _mint_row(
@@ -826,14 +831,31 @@ class TestPeekRouteSource:
             [pick_token._mint_spec(1, "Opt 1", False)],
         )
         # _mint_row seeds source_kind="pane", source_fingerprint="srcfp".
-        got = pick_token.peek_route_source(_USER, _THREAD, _WINDOW, "fpLive")
+        got = pick_token.peek_route_source(_USER, _THREAD, _WINDOW)
         assert got == ("pane", "srcfp")
 
-    def test_returns_none_for_absent_key(self):
-        # Nothing minted at this fingerprint → no live row.
-        assert (
-            pick_token.peek_route_source(_USER, _THREAD, _WINDOW, "fpMissing") is None
+    def test_returns_tags_when_lookup_fingerprint_differs_from_mint(self):
+        # The CORE Item-1 fix: production mints at the side-file fingerprint, but
+        # the lookup is route-based (no fingerprint arg), so it finds the row
+        # regardless of which fingerprint it was minted under.
+        pick_token.mint_row(
+            user_id=_USER,
+            thread_id=_THREAD,
+            window_id=_WINDOW,
+            fingerprint="SIDE_FILE_FP",
+            source_kind="side_file",
+            source_fingerprint="side_src",
+            specs=[pick_token._mint_spec(1, "Opt 1", False)],
         )
+        # No fingerprint passed — found by route alone.
+        assert pick_token.peek_route_source(_USER, _THREAD, _WINDOW) == (
+            "side_file",
+            "side_src",
+        )
+
+    def test_returns_none_for_absent_route(self):
+        # Nothing minted for this route → no live row.
+        assert pick_token.peek_route_source(_USER, _THREAD, _WINDOW) is None
 
     def test_returns_none_for_tombstoned_row(self):
         from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
@@ -847,7 +869,27 @@ class TestPeekRouteSource:
             source_fingerprint="srcfp",
             consumed_generation=1,
         )
-        assert pick_token.peek_route_source(_USER, _THREAD, _WINDOW, "fpTomb") is None
+        assert pick_token.peek_route_source(_USER, _THREAD, _WINDOW) is None
+
+    def test_returns_none_when_ambiguous_multiple_live_rows(self):
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+
+        # Defensive: two non-tombstoned rows at the same route (different
+        # fingerprints) is a state mint_row's hygiene should prevent; if it ever
+        # happens, fail closed (None) rather than guess the displayed card.
+        _pick_token_cache[(_USER, _THREAD, _WINDOW, "fpOne")] = _CacheRow(
+            tokens=[],
+            row_generation=1,
+            source_kind="pane",
+            source_fingerprint="srcfp1",
+        )
+        _pick_token_cache[(_USER, _THREAD, _WINDOW, "fpTwo")] = _CacheRow(
+            tokens=[],
+            row_generation=2,
+            source_kind="side_file",
+            source_fingerprint="srcfp2",
+        )
+        assert pick_token.peek_route_source(_USER, _THREAD, _WINDOW) is None
 
     def test_normalizes_none_thread_to_zero(self):
         # thread_id=None must hit the same key mint_row normalizes to (thread or 0).
@@ -856,7 +898,7 @@ class TestPeekRouteSource:
             [pick_token._mint_spec(1, "Opt 1", False)],
             thread=0,
         )
-        assert pick_token.peek_route_source(_USER, None, _WINDOW, "fpThread0") == (
+        assert pick_token.peek_route_source(_USER, None, _WINDOW) == (
             "pane",
             "srcfp",
         )
