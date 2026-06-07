@@ -1953,7 +1953,16 @@ class TestPollerSourceDriftRemint:
     """
 
     async def test_same_hash_source_drift_remints_card(self, mock_bot: AsyncMock):
+        # FAITHFUL RED (exposes the key-mismatch P1): production mints a side_file
+        # card at the SIDE-FILE form's fingerprint — the side-file dict carries
+        # the question title — but after the side file ages out the poller can
+        # only see the PANE form, whose title is None on single-select panes, so
+        # its fingerprint DIFFERS. The row is therefore seeded at the side-file-
+        # form key, NOT the pane-form key the poller computes. The drift detector
+        # must find the displayed card by ROUTE (regardless of fingerprint) and
+        # re-mint; a fingerprint-keyed lookup misses it and the bug is unfixed.
         import hashlib
+        import json
         from pathlib import Path
 
         from cctelegram.handlers import pick_token, status_polling
@@ -1964,9 +1973,11 @@ class TestPollerSourceDriftRemint:
 
         pick_token.reset_for_tests()
         try:
-            auq_pane = (
-                Path(__file__).parents[1] / "fixtures" / "auq-baseline-pane.txt"
-            ).read_text()
+            fx = Path(__file__).parents[1] / "fixtures"
+            pane = (fx / "auq_single_select_with_affordances_pane.txt").read_text()
+            tool_input = json.loads(
+                (fx / "auq_single_select_with_affordances_sidefile.json").read_text()
+            )["tool_input"]
             window_id = "@5"
             route = (1, 42, window_id)
             mock_window = MagicMock()
@@ -1974,25 +1985,27 @@ class TestPollerSourceDriftRemint:
             _interactive_mode[(1, 42)] = window_id
 
             # Pin the published hash to the LIVE pane's hash → same-hash branch.
-            ui_content = extract_interactive_content(auq_pane)
+            ui_content = extract_interactive_content(pane)
             assert ui_content is not None
             ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
             status_polling._last_published_ui_hash[route] = ui_hash
 
-            # Seed the displayed card's row minted from `side_file`. With no side
-            # file present, resolve_auq_source(window, None, pane) returns `pane`,
-            # so the minted (side_file) vs live (pane) source has DRIFTED. The
-            # cache key MUST match the GREEN lookup: (user, thread or 0, window,
-            # resolve_ask_form(live.payload, pane).fingerprint()).
-            form = resolve_ask_form(None, auq_pane)
-            assert form is not None
-            fp = form.fingerprint()
-            _pick_token_cache[(1, 42, window_id, fp)] = _CacheRow(
-                tokens=["redtok"],
-                row_generation=1,
-                source_kind="side_file",
-                source_fingerprint="stale-side-file-fp",
-                consumed_generation=None,
+            # Production mints at the SIDE-FILE form fingerprint (title present),
+            # which differs from the poller's pane-form fingerprint (title=None).
+            side_file_form = resolve_ask_form(tool_input, pane)
+            pane_form = resolve_ask_form(None, pane)
+            assert side_file_form is not None and pane_form is not None
+            assert side_file_form.fingerprint() != pane_form.fingerprint(), (
+                "fixture must exercise the side-file-vs-pane title mismatch"
+            )
+            _pick_token_cache[(1, 42, window_id, side_file_form.fingerprint())] = (
+                _CacheRow(
+                    tokens=["redtok"],
+                    row_generation=1,
+                    source_kind="side_file",
+                    source_fingerprint="sf-fp",
+                    consumed_generation=None,
+                )
             )
 
             with (
@@ -2001,21 +2014,23 @@ class TestPollerSourceDriftRemint:
                     status_polling.pick_token,
                     "refresh_route_deadlines",
                     new_callable=AsyncMock,
-                ),
+                ) as mock_refresh,
                 patch.object(
                     status_polling, "handle_interactive_ui", new_callable=AsyncMock
                 ) as mock_handle_ui,
             ):
                 mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-                mock_tmux.capture_pane = AsyncMock(return_value=auq_pane)
+                mock_tmux.capture_pane = AsyncMock(return_value=pane)
 
                 await status_polling.update_status_message(
                     mock_bot, user_id=1, window_id=window_id, thread_id=42
                 )
 
-            # The minted source drifted under a live card → the poller MUST
-            # re-mint (NOT merely refresh deadlines and leave stale tokens).
+            # No side file on disk → resolve_auq_source → pane, so the card's
+            # minted side_file source has DRIFTED. The poller MUST re-mint (found
+            # by ROUTE despite the fingerprint mismatch) and NOT refresh.
             mock_handle_ui.assert_awaited()
+            mock_refresh.assert_not_awaited()
         finally:
             pick_token.reset_for_tests()
 
@@ -2083,6 +2098,59 @@ class TestPollerSourceDriftRemint:
                 )
 
             # Source matches → no re-render storm; deadlines refreshed once.
+            mock_handle_ui.assert_not_awaited()
+            mock_refresh.assert_awaited_once()
+        finally:
+            pick_token.reset_for_tests()
+
+    async def test_non_auq_pane_bails_to_refresh(self, mock_bot: AsyncMock):
+        """Non-AUQ interactive panes (e.g. the /model Settings picker) parse to
+        no AskUserQuestionForm, so the drift check must bail (``resolve_ask_form``
+        is None) — no re-mint, just the deadline refresh. Guards against a
+        spurious re-mint / crash on a non-AUQ same-hash idle tick."""
+        import hashlib
+
+        from cctelegram.handlers import pick_token, status_polling
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+        from cctelegram.handlers.status_polling import extract_interactive_content
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        pick_token.reset_for_tests()
+        try:
+            settings_pane = (
+                "Select model\n\n❯ 1. Default\n  2. Opus\n  3. Sonnet\n\n"
+                "Enter to confirm · Esc to cancel\n"
+            )
+            assert resolve_ask_form(None, settings_pane) is None  # not an AUQ
+            window_id = "@5"
+            route = (1, 42, window_id)
+            mock_window = MagicMock()
+            mock_window.window_id = window_id
+            _interactive_mode[(1, 42)] = window_id
+
+            ui_content = extract_interactive_content(settings_pane)
+            assert ui_content is not None
+            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            status_polling._last_published_ui_hash[route] = ui_hash
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ) as mock_refresh,
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=settings_pane)
+
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
             mock_handle_ui.assert_not_awaited()
             mock_refresh.assert_awaited_once()
         finally:
