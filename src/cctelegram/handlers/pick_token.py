@@ -430,9 +430,13 @@ def peek_route_source(
     SIDE-FILE form's fingerprint (the side-file dict carries the question
     title), while after the side file ages out the poller can only see the PANE
     form (title=None on single-select panes); those fingerprints differ, so a
-    fingerprint-keyed lookup would miss the row. ``mint_row``'s stale-row
-    hygiene guarantees AT MOST ONE non-tombstoned row per route, so the search
-    is unambiguous; 0 or (defensively) >1 live rows → None.
+    fingerprint-keyed lookup would miss the row. The AT-MOST-ONE-non-tombstoned-
+    row-per-route invariant the search relies on is guaranteed by ``mint_row``
+    being the SOLE inserter into ``_pick_token_cache`` (line ~353): every fresh
+    mint first runs the stale-row hygiene (drop every other non-tombstoned row
+    for the route, ~319-332), and no other code path assigns a row — all other
+    references are ``.pop`` / ``.clear``. So the search is unambiguous; 0 or
+    (defensively, should-not-happen) >1 live rows → None.
 
     PURE / read-only — never acquires ``_store_lock``, never mutates. Skips
     TOMBSTONED rows (``consumed_generation is not None``). The lock-free read is
