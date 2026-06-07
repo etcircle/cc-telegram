@@ -1931,3 +1931,90 @@ class TestPaneInteractivePendingWiring:
                 mock_bot, user_id, thread_id, window_id
             )
             assert mock_refresh.await_count == 2
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestPollerSourceDriftRemint:
+    """Item 1 RED gate: a live AUQ card whose minted source has DRIFTED must be
+    re-minted by the poller on the same-hash idle tick.
+
+    When the PreToolUse side file ages past the read-TTL under a static idle
+    picker, ``resolve_auq_source`` flips ``side_file`` → ``pane`` while the
+    displayed card's tokens were minted from ``side_file``. The poller's
+    same-hash idle branch currently only ``refresh_route_deadlines`` and returns
+    WITHOUT re-rendering, so the card keeps stale ``side_file`` tokens and the
+    user's first tap ``source_drift``s (swallowed + a misleading "Form changed,
+    refreshing."). The fix: the poller detects the source drift (re-resolve +
+    ``peek_route_source`` vs the live source) and re-mints via
+    ``handle_interactive_ui`` so the tokens track the current source.
+
+    RED pre-fix / GREEN post-fix: on current main the poller never re-mints on
+    the same-hash branch, so ``handle_interactive_ui`` is NOT awaited.
+    """
+
+    async def test_same_hash_source_drift_remints_card(self, mock_bot: AsyncMock):
+        import hashlib
+        from pathlib import Path
+
+        from cctelegram.handlers import pick_token, status_polling
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.handlers.status_polling import extract_interactive_content
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        pick_token.reset_for_tests()
+        try:
+            auq_pane = (
+                Path(__file__).parents[1] / "fixtures" / "auq-baseline-pane.txt"
+            ).read_text()
+            window_id = "@5"
+            route = (1, 42, window_id)
+            mock_window = MagicMock()
+            mock_window.window_id = window_id
+            _interactive_mode[(1, 42)] = window_id
+
+            # Pin the published hash to the LIVE pane's hash → same-hash branch.
+            ui_content = extract_interactive_content(auq_pane)
+            assert ui_content is not None
+            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            status_polling._last_published_ui_hash[route] = ui_hash
+
+            # Seed the displayed card's row minted from `side_file`. With no side
+            # file present, resolve_auq_source(window, None, pane) returns `pane`,
+            # so the minted (side_file) vs live (pane) source has DRIFTED. The
+            # cache key MUST match the GREEN lookup: (user, thread or 0, window,
+            # resolve_ask_form(live.payload, pane).fingerprint()).
+            form = resolve_ask_form(None, auq_pane)
+            assert form is not None
+            fp = form.fingerprint()
+            _pick_token_cache[(1, 42, window_id, fp)] = _CacheRow(
+                tokens=["redtok"],
+                row_generation=1,
+                source_kind="side_file",
+                source_fingerprint="stale-side-file-fp",
+                consumed_generation=None,
+            )
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ),
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=auq_pane)
+
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+            # The minted source drifted under a live card → the poller MUST
+            # re-mint (NOT merely refresh deadlines and leave stale tokens).
+            mock_handle_ui.assert_awaited()
+        finally:
+            pick_token.reset_for_tests()
