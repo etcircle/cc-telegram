@@ -387,6 +387,106 @@ def test_gc_stale_missing_dir_returns_zero(cc_dir):
     assert md_capture.gc_stale() == 0
 
 
+# ── gc_stale liveness gate (Item 3 / P2-2) ───────────────────────────────────
+#
+# A live picker's capture file (which also holds its shown_live/consumed dedup
+# markers) must survive startup GC even when >max_age, or the post-resolution
+# dedup double-posts. `is_live_session(stem)` is injected (md_capture stays a
+# leaf); the predicate keys by the file stem (= the original session id).
+
+
+def test_gc_stale_keeps_live_session_file(cc_dir):
+    d = cc_dir / "msg_display"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    live = d / "live-sess.ndjson"
+    dead = d / "dead-sess.ndjson"
+    for f in (live, dead):
+        f.write_text("{}\n")
+    stale = time.time() - 7200
+    for f in (live, dead):
+        os.utime(f, (stale, stale))
+    removed = md_capture.gc_stale(
+        max_age_seconds=3600,
+        is_live_session=lambda sid: sid == "live-sess",
+    )
+    assert removed == 1
+    assert live.exists()
+    assert not dead.exists()
+
+
+def test_gc_stale_predicate_receives_stem(cc_dir):
+    d = cc_dir / "msg_display"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    f = d / "session-xyz.ndjson"
+    f.write_text("{}\n")
+    stale = time.time() - 7200
+    os.utime(f, (stale, stale))
+    seen: list[str] = []
+
+    def pred(sid: str) -> bool:
+        seen.append(sid)
+        return False
+
+    md_capture.gc_stale(max_age_seconds=3600, is_live_session=pred)
+    assert seen == ["session-xyz"]
+
+
+def test_gc_stale_none_predicate_reaps(cc_dir):
+    d = cc_dir / "msg_display"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    f = d / "s.ndjson"
+    f.write_text("{}\n")
+    stale = time.time() - 7200
+    os.utime(f, (stale, stale))
+    assert md_capture.gc_stale(max_age_seconds=3600, is_live_session=None) == 1
+    assert not f.exists()
+
+
+def test_gc_stale_predicate_exception_skips_reap(cc_dir):
+    """A predicate that raises must NOT delete the file (conservative: skip on
+    uncertainty) and must not abort the whole GC pass."""
+    d = cc_dir / "msg_display"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    boom = d / "boom.ndjson"
+    ok = d / "ok.ndjson"
+    for f in (boom, ok):
+        f.write_text("{}\n")
+    stale = time.time() - 7200
+    for f in (boom, ok):
+        os.utime(f, (stale, stale))
+
+    def pred(sid: str) -> bool:
+        if sid == "boom":
+            raise RuntimeError("predicate boom")
+        return False
+
+    removed = md_capture.gc_stale(max_age_seconds=3600, is_live_session=pred)
+    assert boom.exists()  # raise → conservative skip
+    assert not ok.exists()  # other file still processed
+    assert removed == 1
+
+
+def test_gc_stale_toctou_reskip_when_refreshed_before_unlink(cc_dir):
+    """TOCTOU: if the file is refreshed (mtime advances within max_age) between
+    the age check and unlink, it is NOT reaped. Simulated via a predicate that
+    touches the file's mtime to 'now' as a side effect, then returns False."""
+    d = cc_dir / "msg_display"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    f = d / "race.ndjson"
+    f.write_text("{}\n")
+    stale = time.time() - 7200
+    os.utime(f, (stale, stale))
+
+    def pred(sid: str) -> bool:
+        now = time.time()
+        os.utime(f, (now, now))  # concurrent append landed
+        return False
+
+    removed = md_capture.gc_stale(max_age_seconds=3600, is_live_session=pred)
+    assert f.exists()  # re-stat before unlink sees fresh mtime → skip
+    assert removed == 0
+
+
 # ── Capture settings ─────────────────────────────────────────────────────────
 
 
