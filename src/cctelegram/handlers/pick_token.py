@@ -419,6 +419,40 @@ def prune_for_route(user_id: int, thread_id: int | None, window_id: str) -> None
                     _reservations.pop(tok, None)
 
 
+def peek_route_source(
+    user_id: int, thread_id: int | None, window_id: str
+) -> tuple[str, str] | None:
+    """Return the displayed card's minted (source_kind, source_fingerprint) for
+    this route+window, or None if there is no single live card row.
+
+    Searches by ROUTE (user, thread or 0, window) across ALL fingerprints — NOT
+    by a form fingerprint — because production mints a side_file card at the
+    SIDE-FILE form's fingerprint (the side-file dict carries the question
+    title), while after the side file ages out the poller can only see the PANE
+    form (title=None on single-select panes); those fingerprints differ, so a
+    fingerprint-keyed lookup would miss the row. The AT-MOST-ONE-non-tombstoned-
+    row-per-route invariant the search relies on is guaranteed by ``mint_row``
+    being the SOLE inserter into ``_pick_token_cache`` (line ~353): every fresh
+    mint first runs the stale-row hygiene (drop every other non-tombstoned row
+    for the route, ~319-332), and no other code path assigns a row — all other
+    references are ``.pop`` / ``.clear``. So the search is unambiguous; 0 or
+    (defensively, should-not-happen) >1 live rows → None.
+
+    PURE / read-only — never acquires ``_store_lock``, never mutates. Skips
+    TOMBSTONED rows (``consumed_generation is not None``). The lock-free read is
+    safe because ``_pick_token_cache`` is only mutated synchronously on the
+    asyncio event loop (no thread races)."""
+    norm = (user_id, thread_id or 0, window_id)
+    live = [
+        row
+        for (u, t, w, _fp), row in _pick_token_cache.items()
+        if (u, t, w) == norm and row.consumed_generation is None
+    ]
+    if len(live) != 1:
+        return None
+    return (live[0].source_kind, live[0].source_fingerprint)
+
+
 async def refresh_route_deadlines(
     user_id: int,
     thread_id: int | None,

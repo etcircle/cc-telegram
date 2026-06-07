@@ -44,6 +44,7 @@ from ..terminal_parser import (
     is_picker_anchor_visible,
     is_status_active,
     parse_status_line,
+    resolve_ask_form,
 )
 from ..transcript_parser import read_latest_usage
 from ..tmux_manager import TmuxWindow, tmux_manager
@@ -380,6 +381,33 @@ async def update_status_message(
                 # reported dead-first-tap). Inside the same-hash branch (NOT at
                 # the streak reset above, which also runs the re-render path,
                 # which fresh-mints anyway). Same token + generation → no churn.
+                #
+                # Item 1: BEFORE the deadline refresh, detect a SOURCE drift
+                # under the still-displayed card. A single-select picker left
+                # open >300s ages its PreToolUse side file past the read-TTL, so
+                # ``resolve_auq_source`` flips side_file → pane while the card's
+                # tokens were minted from side_file. The same-hash branch keeps
+                # the stale tokens, so the user's first tap ``source_drift``s
+                # (swallowed + a misleading "Form changed, refreshing."). Re-mint
+                # the live card to the current source so the tokens track it.
+                # mint_row's source-aware reuse prevents a re-render loop (after
+                # the re-mint to pane, the next tick sees pane==pane → no drift).
+                live = auq_source.resolve_auq_source(window_id, None, pane_text)
+                # Only an AUQ pane can carry a pick-token card; bail on non-AUQ
+                # panes (Settings / EPM) — resolve_ask_form returns None there,
+                # so we never spuriously re-mint on them.
+                if resolve_ask_form(live.payload, pane_text) is not None:
+                    minted = pick_token.peek_route_source(user_id, thread_id, window_id)
+                    if minted is not None and (
+                        (live.kind, live.source_fingerprint) != minted
+                    ):
+                        # Set the hash for parity with the new-UI branch so a
+                        # concurrent tick doesn't double-publish.
+                        _last_published_ui_hash[route] = ui_hash
+                        await handle_interactive_ui(
+                            bot, user_id, window_id, thread_id, from_poller=True
+                        )
+                        return
                 await pick_token.refresh_route_deadlines(
                     user_id,
                     thread_id,
