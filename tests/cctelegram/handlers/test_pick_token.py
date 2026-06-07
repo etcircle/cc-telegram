@@ -809,6 +809,58 @@ class TestRefreshRouteDeadlines:
         assert n == 0
         assert pick_token._pick_tokens[toks[0]].expires_at == exp
 
+
+# ── Item 1: peek_route_source (pure, read-only minted-source accessor) ──────────
+
+
+class TestPeekRouteSource:
+    """Item 1: the poller's source-drift detector reads the displayed card row's
+    minted (source_kind, source_fingerprint) via this PURE accessor. It returns
+    the tags for a live row, None for an absent key, and None for a TOMBSTONED
+    row (a just-consumed card keeps a tombstone row at the same key — peeking it
+    would falsely 'drift' and re-render a dead card)."""
+
+    def test_returns_minted_tags_for_live_row(self):
+        _mint_row(
+            "fpLive",
+            [pick_token._mint_spec(1, "Opt 1", False)],
+        )
+        # _mint_row seeds source_kind="pane", source_fingerprint="srcfp".
+        got = pick_token.peek_route_source(_USER, _THREAD, _WINDOW, "fpLive")
+        assert got == ("pane", "srcfp")
+
+    def test_returns_none_for_absent_key(self):
+        # Nothing minted at this fingerprint → no live row.
+        assert (
+            pick_token.peek_route_source(_USER, _THREAD, _WINDOW, "fpMissing") is None
+        )
+
+    def test_returns_none_for_tombstoned_row(self):
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+
+        # A tombstoned row (consumed_generation set) must read as absent so a
+        # just-consumed card is not falsely 'drifted' into a re-render.
+        _pick_token_cache[(_USER, _THREAD, _WINDOW, "fpTomb")] = _CacheRow(
+            tokens=[],
+            row_generation=1,
+            source_kind="side_file",
+            source_fingerprint="srcfp",
+            consumed_generation=1,
+        )
+        assert pick_token.peek_route_source(_USER, _THREAD, _WINDOW, "fpTomb") is None
+
+    def test_normalizes_none_thread_to_zero(self):
+        # thread_id=None must hit the same key mint_row normalizes to (thread or 0).
+        _mint_row(
+            "fpThread0",
+            [pick_token._mint_spec(1, "Opt 1", False)],
+            thread=0,
+        )
+        assert pick_token.peek_route_source(_USER, None, _WINDOW, "fpThread0") == (
+            "pane",
+            "srcfp",
+        )
+
     @pytest.mark.asyncio
     async def test_tombstoned_row_is_not_refreshed(self):
         # A consumed row is a tombstone (consumed_generation set, tokens=[]).

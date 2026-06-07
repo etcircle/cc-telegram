@@ -419,6 +419,24 @@ def prune_for_route(user_id: int, thread_id: int | None, window_id: str) -> None
                     _reservations.pop(tok, None)
 
 
+def peek_route_source(
+    user_id: int, thread_id: int | None, window_id: str, fingerprint: str
+) -> tuple[str, str] | None:
+    """Return the displayed card row's minted (source_kind, source_fingerprint)
+    for this route+fingerprint, or None if there's no live row at that key.
+
+    PURE / read-only — never acquires _store_lock, never mutates/refreshes/
+    resurrects. Skips TOMBSTONED rows (consumed_generation is not None): a
+    just-consumed card keeps a tombstone row at the same key, and peeking it
+    would falsely 'drift' and re-render a dead card. The key MUST match
+    mint_row's normalized cache key: (user_id, thread_id or 0, window_id,
+    fingerprint)."""
+    row = _pick_token_cache.get((user_id, thread_id or 0, window_id, fingerprint))
+    if row is None or row.consumed_generation is not None:
+        return None
+    return (row.source_kind, row.source_fingerprint)
+
+
 async def refresh_route_deadlines(
     user_id: int,
     thread_id: int | None,

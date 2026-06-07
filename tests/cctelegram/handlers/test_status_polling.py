@@ -2018,3 +2018,72 @@ class TestPollerSourceDriftRemint:
             mock_handle_ui.assert_awaited()
         finally:
             pick_token.reset_for_tests()
+
+    async def test_same_hash_no_drift_does_not_remint(self, mock_bot: AsyncMock):
+        """Source-MATCH guard: when the displayed card's minted source equals the
+        live re-resolved source, the same-hash idle tick must NOT re-render — it
+        only refreshes deadlines. This is the loop-termination condition: after a
+        re-mint to ``pane`` the next tick sees pane==pane → no re-render storm."""
+        import hashlib
+        from pathlib import Path
+
+        from cctelegram.handlers import auq_source, pick_token, status_polling
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.handlers.status_polling import extract_interactive_content
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        pick_token.reset_for_tests()
+        try:
+            auq_pane = (
+                Path(__file__).parents[1] / "fixtures" / "auq-baseline-pane.txt"
+            ).read_text()
+            window_id = "@5"
+            route = (1, 42, window_id)
+            mock_window = MagicMock()
+            mock_window.window_id = window_id
+            _interactive_mode[(1, 42)] = window_id
+
+            ui_content = extract_interactive_content(auq_pane)
+            assert ui_content is not None
+            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            status_polling._last_published_ui_hash[route] = ui_hash
+
+            # Seed the row minted from the REAL live `pane` source — no drift, so
+            # the poller must NOT re-render (only refresh deadlines).
+            live = auq_source.resolve_auq_source(window_id, None, auq_pane)
+            assert live.kind == "pane"
+            form = resolve_ask_form(live.payload, auq_pane)
+            assert form is not None
+            fp = form.fingerprint()
+            _pick_token_cache[(1, 42, window_id, fp)] = _CacheRow(
+                tokens=["livetok"],
+                row_generation=1,
+                source_kind=live.kind,
+                source_fingerprint=live.source_fingerprint,
+                consumed_generation=None,
+            )
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ) as mock_refresh,
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=auq_pane)
+
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+            # Source matches → no re-render storm; deadlines refreshed once.
+            mock_handle_ui.assert_not_awaited()
+            mock_refresh.assert_awaited_once()
+        finally:
+            pick_token.reset_for_tests()
