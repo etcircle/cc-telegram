@@ -120,7 +120,13 @@ Handler modules (handlers/):
                         bit-neutral), the mode-ended liveness reconciliation +
                         in-mode tombstone retract (mark_interactive_cleared), and
                         the per-tick digest repaint (_maybe_repaint_digest_on_transition
-                        + the poller-local _prev_run_state dedup cache).
+                        + the poller-local _prev_run_state dedup cache). Item 1:
+                        its same-hash idle branch ALSO re-mints a live AUQ card
+                        on SOURCE drift (side_file aged past the read-TTL → pane)
+                        — re-resolve + resolve_ask_form + pick_token.peek_route_source
+                        vs the live source; on mismatch re-render via
+                        handle_interactive_ui so the first tap dispatches (the
+                        read-TTL itself is untouched). The D3-β sibling.
   response_builder.py ─ Response pagination and formatting
   interactive_ui.py   ─ AskUserQuestion / ExitPlanMode / Permission UI
   directory_browser.py─ Directory selection + session picker UI for new topics

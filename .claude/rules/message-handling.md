@@ -184,6 +184,40 @@ tokens wiped) or a liveness-gate false-negative — degrade to the honest
 `show_alert=True` at the `peek_none`/`expired` callsites only; the ledger-state
 callers keep their specific non-modal warnings).
 
+**Source-drift re-mint (item 1 — a live card's TOKENS track its OBSERVED SOURCE;
+the D3-β sibling).** D3-β keeps the token *deadlines* fresh but PRESERVES the
+minted *source tags* (`dataclasses.replace(entry, expires_at=...)`). So a
+single-select picker left open >300s ages its PreToolUse side file past the
+read-TTL, `resolve_auq_source` flips `side_file`→`pane`, and the same-hash idle
+branch — which only `refresh_route_deadlines` and returns — keeps the stale
+`side_file` tokens. The user's first tap then hits `validate_and_consume`'s
+source check → `source_drift` (swallowed + a misleading "Form changed,
+refreshing."; self-heals on the 2nd tap via the existing source_drift re-render).
+Fix (item 1): the read-TTL is **UNTOUCHED** (it stays the orphan time-bound —
+nothing about side-file trust/lifetime changes), and the poller's same-hash idle
+branch, BEFORE `refresh_route_deadlines`, re-resolves
+`resolve_auq_source(window, None, pane)`, parses the live form via
+`resolve_ask_form` (added to `status_polling`'s imports — the poller had only
+`ui_content`, not a parsed form), and compares the displayed card row's minted
+`(source_kind, source_fingerprint)` — read via the PURE, tombstone-aware
+`pick_token.peek_route_source` — against the live source. On a mismatch it
+re-renders via `handle_interactive_ui` (re-mint to the CURRENT source) instead of
+refreshing deadlines, so the first tap dispatches. **Loop-safe (exactly ONE
+re-mint):** `description` is `compare=False`, so the side_file and pane forms hash
+to the SAME fingerprint for a single-Q visible picker → the cache key is stable →
+`peek_route_source` finds the row → `mint_row`'s existing source-aware reuse
+fresh-mints `pane` → the next tick sees `pane`==`pane` → no further re-render.
+`peek_route_source` skips TOMBSTONED rows (`consumed_generation is not None`) so a
+just-consumed card is never falsely drifted into a re-render of a dead card.
+Pull-only (rides the 1 Hz poll; no observer — c313657 forbidden). Residuals (all
+safe): a ≤1-poll-cycle boundary race at the 300s ageout (one tap routes through
+the existing source_drift re-render, the 2nd dispatches); a MULTI-question form
+whose pane fingerprint shifts on ageout (`current_tab_inferred=False` → different
+`QS:`/`INF:` lines → `peek_route_source` finds no row → falls through to
+`refresh_route_deadlines`, degrading to today's behavior — NOT fixed for that
+shape); and a scrolled pane (visible options start >1) where the re-mint drops the
+keyboard (`p14_suppress_picks`).
+
 **Restart re-dispatch (D2 — the durable mint-intent net for the case D3-β can't
 cover).** D3-β keeps a live card's tokens alive only while the process is up; a
 bot **restart** wipes the in-memory `_pick_tokens`/`_pick_token_cache`, and the
