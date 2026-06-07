@@ -99,6 +99,62 @@ def test_freshness_ttls_are_named_constants():
     assert md_capture.EPM_PROSE_TTL_S >= md_capture.AUQ_PROSE_TTL_S
 
 
+# ── not_before turn-boundary filter (Item 3 / P2-1) ──────────────────────────
+#
+# `not_before` is the wall-clock instant the bot delivered the current user turn
+# into the session (same `time.time()` clock as the prose `captured_at`). A prior
+# turn's prose finalized BEFORE that boundary; the current turn's prose AFTER it.
+# Filter is STRICT `final_at > not_before`.
+
+
+def test_select_fresh_prose_not_before_excludes_prior_turn(cc_dir):
+    """A prior turn's prose (final_at BEFORE the current delivery boundary) is
+    excluded even though it is still within the TTL window — the P2-1 leak."""
+    now = time.time()
+    _seed(_SID, message_id="PRIOR", delta="prior turn prose", captured_at=now - 3)
+    assert select_fresh_prose(_SID, now=now, ttl_seconds=8.0, not_before=now - 1) is None
+
+
+def test_select_fresh_prose_not_before_includes_current_turn(cc_dir):
+    """The current turn's prose (final_at AFTER the boundary) passes."""
+    now = time.time()
+    _seed(_SID, message_id="CUR", delta=_PROSE, captured_at=now - 0.5)
+    rec = select_fresh_prose(_SID, now=now, ttl_seconds=8.0, not_before=now - 1)
+    assert rec is not None and rec.md_message_id == "CUR"
+
+
+def test_select_fresh_prose_not_before_is_strict(cc_dir):
+    """final_at == not_before is EXCLUDED (strict >): prose captured exactly at
+    the boundary is not causally after the delivered user message."""
+    now = time.time()
+    boundary = now - 2
+    _seed(_SID, message_id="EQ", delta=_PROSE, captured_at=boundary)
+    assert (
+        select_fresh_prose(_SID, now=now, ttl_seconds=8.0, not_before=boundary) is None
+    )
+
+
+def test_select_fresh_prose_not_before_none_is_ttl_only(cc_dir):
+    """not_before=None (default) reproduces today's TTL-only behavior — a prose
+    a boundary WOULD exclude still returns when not_before is None."""
+    now = time.time()
+    _seed(_SID, message_id="OLDISH", delta=_PROSE, captured_at=now - 3)
+    assert (
+        select_fresh_prose(_SID, now=now, ttl_seconds=8.0, not_before=None) is not None
+    )
+    assert select_fresh_prose(_SID, now=now, ttl_seconds=8.0) is not None
+
+
+def test_select_fresh_prose_not_before_and_ttl_both_apply(cc_dir):
+    """Both gates apply: a prose passing not_before but OUTSIDE the TTL is still
+    excluded (the TTL remains the orphan time-bound)."""
+    now = time.time()
+    _seed(_SID, message_id="OLD", delta=_PROSE, captured_at=now - 50)
+    assert (
+        select_fresh_prose(_SID, now=now, ttl_seconds=8.0, not_before=now - 100) is None
+    )
+
+
 # ── Shown-live markers ───────────────────────────────────────────────────────
 
 
