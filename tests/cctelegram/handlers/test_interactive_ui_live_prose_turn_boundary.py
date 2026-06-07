@@ -102,12 +102,15 @@ async def test_prior_turn_prose_not_posted(cc_dir, captured_posts):
 
 @pytest.mark.asyncio
 async def test_current_turn_prose_posted(cc_dir, captured_posts):
-    """The current turn's prose finalized AFTER the boundary passes."""
-    # Stamp the boundary, THEN finalize the current turn's prose just after.
-    message_queue.set_route_user_turn_at(1, 100, "@0")
-    stamp = message_queue.peek_route_user_turn_at(1, 100, "@0")
-    assert stamp is not None
-    _seed(_SID, message_id="CUR", delta="current turn prose", captured_at=stamp + 0.2)
+    """The current turn's prose finalized AFTER the boundary (and BEFORE now)
+    passes. The boundary is set in the recent past so the seeded ``final_at`` is
+    a realistic value strictly between the boundary and the function's internal
+    ``time.time()`` — NOT future-dated relative to ``now`` (Hermes P3)."""
+    now = time.time()
+    # Boundary 1s ago; current-turn prose finalized 0.5s ago — after the
+    # boundary, before the internal now.
+    message_queue._route_user_turn_at[(1, 100, "@0")] = now - 1.0
+    _seed(_SID, message_id="CUR", delta="current turn prose", captured_at=now - 0.5)
 
     await interactive_ui._maybe_post_live_prose(
         AsyncMock(),
@@ -148,10 +151,11 @@ async def test_on_pane_picker_reads_prior_stamp_not_a_new_one(cc_dir, captured_p
 
     (We stamp once for the turn that produced the picker, finalize its prose
     after, and confirm a later un-stamped render still posts it.)"""
-    message_queue.set_route_user_turn_at(1, 100, "@0")
-    stamp = message_queue.peek_route_user_turn_at(1, 100, "@0")
-    assert stamp is not None
-    _seed(_SID, message_id="ONPANE", delta="on-pane prose", captured_at=stamp + 0.1)
+    now = time.time()
+    # The picker's turn was delivered 1s ago; its prose finalized 0.5s ago —
+    # after that boundary, before now (no later turn has clobbered the stamp).
+    message_queue._route_user_turn_at[(1, 100, "@0")] = now - 1.0
+    _seed(_SID, message_id="ONPANE", delta="on-pane prose", captured_at=now - 0.5)
 
     await interactive_ui._maybe_post_live_prose(
         AsyncMock(),
@@ -162,3 +166,33 @@ async def test_on_pane_picker_reads_prior_stamp_not_a_new_one(cc_dir, captured_p
         ui_name="AskUserQuestion",
     )
     assert captured_posts == ["on-pane prose"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_send_clobber_is_bounded_degradation(cc_dir, captured_posts):
+    """Documented residual (Codex diff-review P2 → adversary-confirmed P3): a
+    LATER delivery whose stamp clobbers the route boundary BEFORE an earlier
+    picker first-renders can suppress the earlier turn's prose. This is a BOUNDED
+    DEGRADATION — the JSONL copy still delivers the prose post-resolution (never
+    a wrong post). The common 'send while a picker is on the pane' case is
+    defused UPSTREAM (inbound_telegram renders the picker with the prior stamp
+    before offering the new message); the only residual is delivering into a
+    still-streaming Claude before its picker appears. This test pins the bounded
+    degraded path so it can't silently change."""
+    now = time.time()
+    # Turn A's prose finalized 1s ago; a later delivery (B) then clobbered the
+    # route boundary to 0.2s ago, before A's picker first-rendered.
+    _seed(_SID, message_id="A", delta="turn A prose", captured_at=now - 1.0)
+    message_queue._route_user_turn_at[(1, 100, "@0")] = now - 0.2
+
+    await interactive_ui._maybe_post_live_prose(
+        AsyncMock(),
+        user_id=1,
+        thread_id=100,
+        chat_id=42,
+        window_id="@0",
+        ui_name="AskUserQuestion",
+    )
+    # final_at (now-1.0) <= clobbered boundary (now-0.2) → filtered. The JSONL
+    # copy delivers it post-resolution (the documented degradation).
+    assert captured_posts == []
