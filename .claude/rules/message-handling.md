@@ -370,7 +370,16 @@ in-memory stamp is gone → `not_before=None` → TTL-only (the prior-turn leak 
 NOT fixed across a restart — documented degradation, never a false-negative on the
 live path); a rare **wall-clock-backwards** jump could mis-order a stamp vs a
 `captured_at` (NO epsilon is added — accepted as a rare residual); the per-session
-file's tracked-idle disk retention is unchanged (teardown still owns reclaim).
+file's tracked-idle disk retention is unchanged (teardown still owns reclaim). A
+**concurrent-send clobber** — a LATER delivery whose stamp overwrites the route's
+single boundary BEFORE an earlier, not-yet-rendered picker first-renders — can
+suppress that earlier picker's prose (it then arrives post-resolution via JSONL,
+never a wrong post). The common "send while a picker is on the pane" case is
+defused upstream: `inbound_telegram` renders the on-pane picker with the prior
+stamp BEFORE offering the new message; the only residual is delivering into a
+still-streaming Claude before its picker appears (bounded, degrades to JSONL).
+A per-picker boundary would close it but is disproportionate for this benign,
+already-degenerate edge.
 
 **Dedup (PR-D).** `session_monitor.filter_live_prose_duplicates` runs on the
 poll BATCH before per-message dispatch (the prose text block and its sibling
