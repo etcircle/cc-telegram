@@ -26,6 +26,9 @@ Core responsibilities:
 
 Key components:
   - ``ResolvedAuqSource`` / ``resolve_auq_source`` — the typed resolver.
+  - ``DispatchAuqSource`` / ``resolve_auq_source_for_dispatch`` — the read-TTL-FREE
+    but pane-consistency-CHECKED dispatch source (carries the resolved form); a
+    long-open card never flaps ``side_file``→``pane`` on read-TTL ageout.
   - ``PreToolAskRecord`` / ``resolve_record`` — the side-file trust boundary.
   - ``peek_sticky_source`` — re-resolve the EXACT source a callback was minted
     against (side_file / jsonl_cache), pane-AGNOSTIC, so the ``aqt:`` toggle can
@@ -191,6 +194,80 @@ def resolve_auq_source(
         kind="pane",
         payload=None,
         source_fingerprint=_pane_fingerprint(pane_text),
+    )
+
+
+@dataclass(frozen=True)
+class DispatchAuqSource:
+    """The TTL-free dispatch AUQ source: source identity PLUS the resolved form.
+
+    Distinct from :class:`ResolvedAuqSource` in two ways the dispatch path needs:
+
+      1. It carries the resolved ``form`` (the dispatch compares its
+         ``.fingerprint()`` to the minted fp16 — ``ResolvedAuqSource`` has no
+         form), and
+      2. it is produced by the read-TTL-FREE :func:`resolve_auq_source_for_dispatch`,
+         so a long-open card never flaps ``side_file``→``pane`` purely because it
+         aged past the 300s read-TTL (the item-1 source-drift class).
+
+    ``payload`` is the side-file ``tool_input`` for the ``side_file`` kind and
+    ``None`` for ``pane``; ``form`` may be ``None`` when the pane carries no
+    parseable AUQ form (obscured/empty pane).
+    """
+
+    kind: Literal["side_file", "pane"]
+    payload: dict | None
+    source_fingerprint: str
+    form: AskUserQuestionForm | None
+
+
+def resolve_auq_source_for_dispatch(
+    window_id: str, pane_text: str
+) -> DispatchAuqSource:
+    """Resolve the AUQ dispatch source TTL-FREE but pane-consistency-CHECKED.
+
+    The dispatch path (PR-C; this is added + unit-tested only here) must trust
+    the PreToolUse side file even on a card a user has left open for hours —
+    past the 300s read-TTL :func:`resolve_auq_source` applies — yet must still
+    fail CLOSED if the side file no longer matches the visible pane (a genuine
+    advance/resolution, or a stale not-overwritten file). So it reads the record
+    read-TTL-free (``_read_live_pretool_record(apply_ttl=False)``, which KEEPS
+    the future-skew guard), KEEPS ``_record_consistent_with_pane``, and:
+
+      - consistent side file → ``side_file`` kind with the SIDE-FILE form
+        (``resolve_ask_form(record.tool_input, pane_text)`` — the side file
+        carries the question TITLE the pane form lacks) and
+        ``source_fingerprint=_canonical_dict_fingerprint(record.tool_input)``;
+      - else → ``pane`` kind (``_pane_fingerprint`` + the pane form, which may be
+        ``None`` on an obscured/empty pane).
+
+    MUST NOT mutate ``_pretool_ask_records`` — ``resolve_record`` stays its sole
+    mutator; ``_read_live_pretool_record`` already doesn't write it.
+    """
+    from ..terminal_parser import resolve_ask_form
+
+    pane_form = resolve_ask_form(None, pane_text) if pane_text else None
+    record = _read_live_pretool_record(window_id, apply_ttl=False)
+    if record is not None:
+        consistent, _reason = _record_consistent_with_pane(record, pane_form)
+        if consistent:
+            # The side-file form carries the question title (the pane form has
+            # title=None on single-select panes); build it from the side-file
+            # tool_input + the live pane (for cursor/layout).
+            form = resolve_ask_form(record.tool_input, pane_text)
+            return DispatchAuqSource(
+                kind="side_file",
+                payload=record.tool_input,
+                source_fingerprint=_canonical_dict_fingerprint(record.tool_input),
+                form=form,
+            )
+    # Fall back to the pane: a genuine advance/resolution, an obscured pane, or
+    # no consistent side file.
+    return DispatchAuqSource(
+        kind="pane",
+        payload=None,
+        source_fingerprint=_pane_fingerprint(pane_text),
+        form=pane_form,
     )
 
 
@@ -513,7 +590,9 @@ def _record_consistent_with_pane(
     return True, "ok"
 
 
-def _read_live_pretool_record(window_id: str) -> PreToolAskRecord | None:
+def _read_live_pretool_record(
+    window_id: str, *, apply_ttl: bool = True
+) -> PreToolAskRecord | None:
     """Read the PreToolUse side-file record for ``window_id``, pane-AGNOSTIC.
 
     Everything ``resolve_record`` does EXCEPT the final
@@ -522,6 +601,12 @@ def _read_live_pretool_record(window_id: str) -> PreToolAskRecord | None:
     (``age > _PRETOOL_TTL_SECONDS``) → future-skew guard
     (``age < -_PRETOOL_FUTURE_SKEW_SECONDS``) → return the ``PreToolAskRecord``,
     else ``None``.
+
+    ``apply_ttl=False`` (the dispatch path, ``resolve_auq_source_for_dispatch``)
+    SKIPS only the ``age > _PRETOOL_TTL_SECONDS`` read-TTL block — session-resolve,
+    read, and the future-skew guard are KEPT. A long-open card aged past the
+    read-TTL must not flip the dispatch source side_file→pane (the item-1
+    source-drift class), but a clock-tampered file is still rejected.
 
     DELIBERATELY does NOT write ``_pretool_ask_records``: that cache's
     invariant is "consistent-with-pane records only", so ``resolve_record``
@@ -565,7 +650,7 @@ def _read_live_pretool_record(window_id: str) -> PreToolAskRecord | None:
             safe_fp,
         )
         return None
-    if age > _PRETOOL_TTL_SECONDS:
+    if apply_ttl and age > _PRETOOL_TTL_SECONDS:
         logger.debug(
             "Pretool resolve window=%s reason=stale age=%.1fs fp=%s",
             window_id,
@@ -801,6 +886,19 @@ def side_file_live_for_session(session_id: str) -> bool:
     return True
 
 
+def peek_side_file_tool_use_id(session_id: str) -> str | None:
+    """Return the side file's captured ``tool_use_id`` for ``session_id``.
+
+    Thin public accessor over the private side-file reader so callers (the
+    startup positive-proof reconciler in ``session_monitor``) need not import
+    ``_read_pretool_side_file``. Returns ``None`` when no valid side file exists,
+    or the captured ``tool_use_id`` (which "may be ''" if the hook payload didn't
+    carry one) when it does. Read-only; pane-AGNOSTIC; no TTL.
+    """
+    rec = _read_pretool_side_file(session_id)
+    return rec.tool_use_id if rec else None
+
+
 @dataclass(frozen=True)
 class RecoverySideFile:
     """The read-TTL-free side-file payload + its canonical source fingerprint.
@@ -840,7 +938,7 @@ def read_side_file_for_recovery(session_id: str) -> RecoverySideFile | None:
     )
 
 
-def gc_stale() -> int:
+def gc_stale(*, is_live_session: Callable[[str], bool] | None = None) -> int:
     """Delete AUQ side files older than ``_PRETOOL_GC_AGE_SECONDS``.
 
     Best-effort. Called on bot startup. Returns the number of files
@@ -848,6 +946,18 @@ def gc_stale() -> int:
     Anything older than 1h is presumed stale — TTL on the read path is
     only 5min, so a 1h file definitely cannot be served. Crashes /
     kickstart-between-AUQs are the typical sources of these orphans.
+
+    LIVENESS GATE (mirrors ``md_capture.gc_stale``): Claude BUFFERS the
+    AskUserQuestion tool_use in JSONL until the prompt resolves, so a
+    genuinely-live AUQ left open >1h has a stale-mtime side file that is
+    STILL the card's liveness authority — reaping it on age alone would
+    strand the live card. When ``is_live_session`` is supplied, it is called
+    with the file STEM (= the ``<session_id>``) after the age test passes:
+    True → SKIP (keep the live side file); an EXCEPTION → conservative SKIP
+    (never delete on uncertainty; the raise is caught around the predicate
+    call only so the rest of the pass continues). The predicate is INJECTED
+    — ``auq_source`` stays a leaf and never imports a session module to learn
+    liveness.
     """
     pending_dir = app_dir() / "auq_pending"
     if not pending_dir.is_dir():
@@ -875,6 +985,14 @@ def gc_stale() -> int:
             continue
         if mtime >= cutoff:
             continue
+        if is_live_session is not None:
+            try:
+                if is_live_session(stem):
+                    continue  # live AUQ — keep its side file
+            except Exception:
+                # Never delete on uncertainty; the predicate raising must not
+                # abort the whole GC pass either.
+                continue
         # Codex P2 (chunk 5): re-check mtime just before unlink. The
         # hook may have replaced this side file (atomic temp+rename)
         # between our initial stat and now; if so, skip — deleting a

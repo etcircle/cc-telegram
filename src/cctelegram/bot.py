@@ -1161,7 +1161,14 @@ async def post_init(application: Application) -> None:
         from .handlers.auq_source import gc_stale
         from .handlers.interactive_ui import warn_if_pre_tool_use_hook_missing
 
-        gc_stale()
+        # Liveness gate: Claude buffers the AskUserQuestion tool_use in JSONL
+        # until the prompt resolves, so a live AUQ left open >1h has a
+        # stale-mtime side file that is STILL its card's liveness authority.
+        # Skip reaping it while the session is tracked (same predicate shape as
+        # the md_capture.gc_stale callsite below). The side file stem IS the
+        # <session_id> the monitor tracks; the predicate is INJECTED so
+        # auq_source stays a leaf.
+        gc_stale(is_live_session=lambda sid: monitor.state.get_session(sid) is not None)
         warn_if_pre_tool_use_hook_missing()
     except Exception as e:  # noqa: BLE001
         # Never let cleanup/maintenance crash bot startup.

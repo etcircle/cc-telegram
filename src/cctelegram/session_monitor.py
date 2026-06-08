@@ -1164,24 +1164,28 @@ class SessionMonitor:
                                 upgrade_exc,
                             )
             else:
-                # No pending AUQ in this session's JSONL. If a PreToolUse
-                # side file nonetheless still reports live, it is an ORPHAN:
-                # the AUQ was answered but its tool_result ->
-                # forget_ask_tool_input unlink never ran (the bot was down, or
-                # the message callback errored, while check_for_updates had
-                # already advanced the byte offset past the tool_result, so it
-                # never re-emits). Left in place the orphan would make
-                # auq_source.side_file_live_for_window return True
-                # indefinitely and strand a DEAD card at status_polling's
-                # clear gate — the dead-card class the clear-gate TTL-drop
-                # must not introduce. The JSONL is authoritative that no
-                # question is pending, so unlink the stale side file; the
-                # status poller's hysteresis then clears the stale card on the
-                # next absent polls. (Codex+Hermes 2026-05-31 dual-FAIL on the
-                # AUQ disappearing-card fix.)
+                # No pending AUQ in this session's JSONL. That alone is NOT
+                # proof the side file's AUQ resolved: Claude BUFFERS the
+                # AskUserQuestion tool_use in JSONL until the prompt resolves,
+                # so a genuinely-LIVE AUQ also shows no pending tool_use (and no
+                # tool_result). Unlinking on "no pending AUQ" alone would delete
+                # a LIVE card's liveness authority on startup.
                 #
-                # SESSION-KEYED on purpose: check liveness and unlink the SAME
-                # ``session_id`` (from ``current_map``). The window-keyed
+                # POSITIVE-proof reconcile: unlink the side file ONLY when its
+                # captured ``tool_use_id`` has a matching AUQ ``tool_result`` in
+                # the JSONL — the unambiguous "this AUQ was answered" signal. The
+                # remaining ORPHAN class this still covers: the bot was down (or
+                # the message callback errored) while ``check_for_updates`` had
+                # already advanced the byte offset past the tool_result, so its
+                # forget_ask_tool_input unlink never ran; the tool_result is in
+                # the JSONL but the side file lingers. Without this the orphan
+                # would make ``side_file_live_for_window`` return True forever and
+                # strand a DEAD card at status_polling's clear gate. A
+                # still-BUFFERED tool_use (no tool_result) or an empty captured
+                # tool_use_id (can't be matched) → PRESERVE.
+                #
+                # SESSION-KEYED on purpose: peek the tool_use_id and unlink the
+                # SAME ``session_id`` (from ``current_map``). The window-keyed
                 # ``side_file_live_for_window`` would re-resolve the session via
                 # ``peek_session_id_for_window`` against ``window_states``, which
                 # at this point (hydration runs before the loop's first
@@ -1189,18 +1193,29 @@ class SessionMonitor:
                 # checking one source while unlinking another is exactly the
                 # mint/validate parity trap (Hermes round-2 P2).
                 from .handlers.auq_source import (
-                    side_file_live_for_session,
+                    peek_side_file_tool_use_id,
                     unlink_for_session,
                 )
 
-                if side_file_live_for_session(session_id):
+                side_tuid = peek_side_file_tool_use_id(session_id)
+                if side_tuid is None:
+                    # No valid/live side file → nothing to reconcile.
+                    continue
+                if not side_tuid:
+                    # P3 (Codex R3): an empty captured tool_use_id cannot be
+                    # matched to a tool_result, so "no pending AUQ" is NOT proof
+                    # THIS AUQ resolved. Leave it until session-replacement /
+                    # /clear / 1h GC.
+                    continue
+                if await self._auq_tool_result_present(jsonl_path, side_tuid):
                     unlink_for_session(session_id)
                     logger.info(
-                        "AUQ reconcile: unlinked orphaned side file for "
-                        "window %s session %s (JSONL shows no pending AUQ)",
+                        "AUQ reconcile: unlinked RESOLVED side file for "
+                        "window %s session %s (tool_result present)",
                         window_id,
                         session_id[:8],
                     )
+                # else: live BUFFERED tool_use (no tool_result) → PRESERVE.
 
     async def _find_latest_pending_auq(self, jsonl_path: Path) -> dict | None:
         """Return ``{"id": tool_use_id, "input": tool_input}`` for the most
@@ -1216,6 +1231,61 @@ class SessionMonitor:
         Pairing semantics match ``transcript_parser``'s tool_use_id model:
         an AUQ is "pending" iff its tool_use.id never appears as a sibling
         ``tool_result.tool_use_id`` anywhere in the scanned region.
+        """
+        buf = await self._read_jsonl_tail(jsonl_path)
+        if buf is None:
+            return None
+
+        answered_ids: set[str] = set()
+        candidates: list[dict] = []
+
+        for raw_line in buf.split(b"\n"):
+            if not raw_line.strip():
+                continue
+            try:
+                entry = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(entry, dict):
+                continue
+            msg = entry.get("message")
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                ctype = c.get("type")
+                if ctype == "tool_use" and c.get("name") == "AskUserQuestion":
+                    tid = c.get("id")
+                    inp = c.get("input")
+                    if isinstance(tid, str) and isinstance(inp, dict):
+                        candidates.append({"id": tid, "input": inp})
+                elif ctype == "tool_result":
+                    rid = c.get("tool_use_id")
+                    if isinstance(rid, str):
+                        answered_ids.add(rid)
+
+        # Most recent unanswered AUQ wins. Returns the full candidate
+        # dict (``id`` + ``input``) so the AUQ context-message gate in
+        # ``handlers.interactive_ui`` can dedup per ``tool_use.id``.
+        for cand in reversed(candidates):
+            if cand["id"] not in answered_ids:
+                return cand
+        return None
+
+    async def _read_jsonl_tail(self, jsonl_path: Path) -> bytes | None:
+        """Read the JSONL tail bytes for ``jsonl_path``, resuming at a full line.
+
+        Reads up to ``_AUQ_HYDRATE_TAIL_BYTES`` (hard-capped at
+        ``_AUQ_HYDRATE_HARD_CAP``) from the end of the file. When the read
+        window lands mid-line, the leading partial line is dropped so the caller
+        always sees whole lines. Returns ``None`` on missing/empty file or a read
+        error (the partial-trailing-write case is the caller's split-and-skip).
+        Used by :func:`_find_latest_pending_auq` (the tail is correct there — a
+        recent pending AUQ or a buffered tool_use is near the end of the file).
         """
         try:
             stat = jsonl_path.stat()
@@ -1259,46 +1329,67 @@ class SessionMonitor:
                 if nl < 0:
                     return None
                 buf = buf[nl + 1 :]
+        return buf
 
-        answered_ids: set[str] = set()
-        candidates: list[dict] = []
+    async def _auq_tool_result_present(
+        self, jsonl_path: Path, tool_use_id: str
+    ) -> bool:
+        """True iff the JSONL carries a ``tool_result`` for ``tool_use_id``.
 
-        for raw_line in buf.split(b"\n"):
-            if not raw_line.strip():
-                continue
-            try:
-                entry = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if not isinstance(entry, dict):
-                continue
-            msg = entry.get("message")
-            if not isinstance(msg, dict):
-                continue
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for c in content:
-                if not isinstance(c, dict):
-                    continue
-                ctype = c.get("type")
-                if ctype == "tool_use" and c.get("name") == "AskUserQuestion":
-                    tid = c.get("id")
-                    inp = c.get("input")
-                    if isinstance(tid, str) and isinstance(inp, dict):
-                        candidates.append({"id": tid, "input": inp})
-                elif ctype == "tool_result":
-                    rid = c.get("tool_use_id")
-                    if isinstance(rid, str):
-                        answered_ids.add(rid)
+        The POSITIVE-resolution proof for the startup reconciler: a side file is
+        unlinked only when its captured ``tool_use_id`` has a matching
+        ``tool_result`` in the JSONL — never merely because "no pending AUQ"
+        (which is ALSO true for a LIVE AUQ whose tool_use is buffered until the
+        prompt resolves).
 
-        # Most recent unanswered AUQ wins. Returns the full candidate
-        # dict (``id`` + ``input``) so the AUQ context-message gate in
-        # ``handlers.interactive_ui`` can dedup per ``tool_use.id``.
-        for cand in reversed(candidates):
-            if cand["id"] not in answered_ids:
-                return cand
-        return None
+        Scans the WHOLE file, NOT just the hydrate tail (Hermes PR-B P2): the
+        ``tool_result`` is written at resolution time, so on a long-running
+        session it can scroll arbitrarily far past the 1 MB tail while the AUQ
+        was genuinely answered. A tail-only check would then miss the proof and
+        — combined with the now live-safe ``gc_stale`` skipping the tracked
+        session — strand the orphan's side file unboundedly (the dead-card class
+        PR-B fights). A full scan keeps the live/orphan distinction exact: an
+        orphan's ``tool_result`` exists SOMEWHERE; a live-buffered AUQ's exists
+        NOWHERE. Streams line-by-line (memory-bounded) with a cheap bytes
+        pre-filter + short-circuit, so the orphan case returns as soon as the
+        result line is reached and only the rare live-AUQ case reads to EOF.
+        Runs once per orphan-candidate window at startup. Robust to a missing
+        file / partial lines / read errors → ``False`` (conservative preserve).
+        """
+        if not tool_use_id:
+            return False
+        # Cheap byte pre-filter: only JSON-parse a line that could possibly carry
+        # this tool_result (avoids parsing every line of a multi-MB session).
+        id_bytes = tool_use_id.encode("utf-8")
+        needle = b'"tool_result"'
+        try:
+            async with aiofiles.open(jsonl_path, "rb") as f:
+                async for raw_line in f:
+                    if needle not in raw_line or id_bytes not in raw_line:
+                        continue
+                    try:
+                        entry = json.loads(raw_line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    msg = entry.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    for c in content:
+                        if not isinstance(c, dict):
+                            continue
+                        if (
+                            c.get("type") == "tool_result"
+                            and c.get("tool_use_id") == tool_use_id
+                        ):
+                            return True
+        except OSError:
+            return False
+        return False
 
     async def _monitor_loop(self) -> None:
         """Background loop for checking session updates.

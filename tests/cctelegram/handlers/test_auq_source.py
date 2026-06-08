@@ -17,6 +17,7 @@ is a real picker capture for the ``pane`` kind.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -301,10 +302,11 @@ def _write_side_file_at(
     *,
     written_at: float,
     schema_version: int = 1,
-) -> None:
+) -> dict:
     """Write a (by default) schema-valid side file with a controllable
     ``written_at`` / ``schema_version``, reusing the real affordance
-    ``tool_input`` so the trust-boundary reader accepts the shape.
+    ``tool_input`` so the trust-boundary reader accepts the shape. Returns the
+    written ``tool_input`` (mirrors ``_write_affordance_side_file``).
     """
     sidefile = json.loads(_AFFORDANCE_SIDEFILE.read_text())
     pending = cc_dir / "auq_pending"
@@ -320,6 +322,7 @@ def _write_side_file_at(
             }
         )
     )
+    return sidefile["tool_input"]
 
 
 class TestSideFileLiveForWindow:
@@ -551,3 +554,152 @@ class TestPeekStickySource:
             )
         finally:
             _unbind_window(self._WID)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PR-B (stateless-callback Wave 1) — TTL-free dispatch source + live-safe GC
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestResolveAuqSourceForDispatch:
+    """Plan v3 §4 / §8 test 3 — ``resolve_auq_source_for_dispatch`` is TTL-free
+    but KEEPS the pane-consistency check, so a long-open card's source never
+    flaps side_file→pane (the item-1 source-drift class). Distinct from
+    ``resolve_auq_source`` (read-TTL'd) and ``side_file_live_*`` (a bool).
+    """
+
+    _WID = "@auqsrc-disp"
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    def test_fresh_side_file_resolves_side_file(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_affordance_side_file(_cc_dir, self._SID)
+            pane = _AFFORDANCE_PANE.read_text()
+            src = auq_source.resolve_auq_source_for_dispatch(self._WID, pane)
+            assert src.kind == "side_file"
+            assert src.payload == tool_input
+            assert src.form is not None
+            assert src.source_fingerprint == auq_source._canonical_dict_fingerprint(
+                tool_input
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_aged_side_file_stays_side_file_unlike_resolve_auq_source(self, _cc_dir):
+        """The drift kill: a side file aged PAST the 300s read-TTL flips
+        ``resolve_auq_source`` to ``pane`` but ``..._for_dispatch`` keeps it
+        ``side_file`` (TTL-free), so the dispatch identity does not drift.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_side_file_at(
+                _cc_dir,
+                self._SID,
+                written_at=time.time() - (auq_source._PRETOOL_TTL_SECONDS + 60),
+            )
+            pane = _AFFORDANCE_PANE.read_text()
+
+            # The legacy read-TTL'd resolver drifts to pane on the aged file.
+            assert auq_source.resolve_auq_source(self._WID, None, pane).kind == "pane"
+
+            # The dispatch resolver stays on the side file.
+            src = auq_source.resolve_auq_source_for_dispatch(self._WID, pane)
+            assert src.kind == "side_file"
+            assert src.form is not None
+            assert src.source_fingerprint == auq_source._canonical_dict_fingerprint(
+                tool_input
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_no_side_file_falls_back_to_pane(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            pane = _AFFORDANCE_PANE.read_text()
+            src = auq_source.resolve_auq_source_for_dispatch(self._WID, pane)
+            assert src.kind == "pane"
+            assert src.payload is None
+        finally:
+            _unbind_window(self._WID)
+
+    def test_future_skew_side_file_falls_back_to_pane(self, _cc_dir):
+        """The future-skew guard is RETAINED even though the read-TTL is skipped."""
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_side_file_at(
+                _cc_dir,
+                self._SID,
+                written_at=time.time() + auq_source._PRETOOL_FUTURE_SKEW_SECONDS + 30,
+            )
+            pane = _AFFORDANCE_PANE.read_text()
+            src = auq_source.resolve_auq_source_for_dispatch(self._WID, pane)
+            assert src.kind == "pane"
+        finally:
+            _unbind_window(self._WID)
+
+    def test_pane_inconsistent_side_file_fails_closed_to_pane(self, _cc_dir):
+        """KEEPS ``_record_consistent_with_pane`` (fail-closed): a live side file
+        whose questions do NOT match the visible pane is NOT trusted for dispatch.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_affordance_side_file(_cc_dir, self._SID)
+            # A DIFFERENT picker on the pane — inconsistent with the side file.
+            pane = _BASELINE_PANE.read_text()
+            src = auq_source.resolve_auq_source_for_dispatch(self._WID, pane)
+            assert src.kind == "pane"
+        finally:
+            _unbind_window(self._WID)
+
+
+class TestGcStaleLiveSafe:
+    """Plan v3 §8 tests 11/12 — the startup side-file GC gains an INJECTED
+    ``is_live_session`` predicate (mirroring ``md_capture.gc_stale``) so a
+    long-open live AUQ's side file (>1h, but the prompt is still pending —
+    its tool_use is buffered, never in JSONL) is NOT reaped at startup.
+    ``gc_stale`` keys on the file MTIME, so we age the file via ``os.utime``.
+    """
+
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    def _age_side_file(self, cc_dir: Path, session_id: str) -> Path:
+        _write_side_file_at(cc_dir, session_id, written_at=time.time())
+        path = cc_dir / "auq_pending" / f"{session_id}.json"
+        old = time.time() - (auq_source._PRETOOL_GC_AGE_SECONDS + 600)
+        os.utime(path, (old, old))
+        return path
+
+    def test_live_session_predicate_preserves_old_file(self, _cc_dir):
+        path = self._age_side_file(_cc_dir, self._SID)
+        deleted = auq_source.gc_stale(is_live_session=lambda sid: True)
+        assert deleted == 0
+        assert path.exists()
+
+    def test_dead_session_predicate_deletes_old_file(self, _cc_dir):
+        path = self._age_side_file(_cc_dir, self._SID)
+        deleted = auq_source.gc_stale(is_live_session=lambda sid: False)
+        assert deleted == 1
+        assert not path.exists()
+
+    def test_predicate_raise_is_conservative_skip(self, _cc_dir):
+        def _boom(_sid: str) -> bool:
+            raise RuntimeError("liveness probe failed")
+
+        path = self._age_side_file(_cc_dir, self._SID)
+        deleted = auq_source.gc_stale(is_live_session=_boom)
+        assert deleted == 0
+        assert path.exists()
+
+    def test_no_predicate_keeps_legacy_delete_behavior(self, _cc_dir):
+        path = self._age_side_file(_cc_dir, self._SID)
+        deleted = auq_source.gc_stale()
+        assert deleted == 1
+        assert not path.exists()
+
+    def test_fresh_file_never_deleted_even_with_dead_predicate(self, _cc_dir):
+        _write_side_file_at(_cc_dir, self._SID, written_at=time.time())
+        path = _cc_dir / "auq_pending" / f"{self._SID}.json"
+        deleted = auq_source.gc_stale(is_live_session=lambda sid: False)
+        assert deleted == 0
+        assert path.exists()

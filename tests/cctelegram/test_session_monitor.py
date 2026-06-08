@@ -1129,6 +1129,153 @@ class TestAuqCacheClearOnSessionChange:
             session_manager.window_states.pop("@7", None)
             auq_source.reset_for_tests()
 
+    # ── PR-B (stateless-callback Wave 1): positive-proof reconcile ──────────
+    # Claude BUFFERS the AskUserQuestion tool_use in JSONL until the prompt
+    # resolves, so a genuinely-LIVE AUQ shows NO pending AUQ in JSONL. The
+    # reconciler must unlink ONLY on POSITIVE resolution proof (a matched AUQ
+    # tool_result for the side file's tool_use_id) — never merely on "no pending
+    # AUQ in JSONL", which is ALSO true for a live buffered tool_use.
+
+    @pytest.mark.asyncio
+    async def test_keeps_side_file_when_auq_tool_use_buffered(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """§8.11 — a live AUQ whose tool_use is buffered (NOT in JSONL) shows no
+        pending AUQ AND has no tool_result; the side file must be PRESERVED, not
+        reconciled away. (Current code unlinks on "no pending AUQ" → RED.)
+        """
+        from cctelegram.handlers import auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        sid = "33333333-3333-4333-8333-333333333333"
+        # JSONL carries NO AUQ tool_use (buffered) and NO tool_result.
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(jsonl, [])
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, sid, "buffered-auq")
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            assert auq_source.side_file_live_for_window("@7") is True
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+            assert side.exists(), (
+                "a live buffered-tool_use AUQ side file must be PRESERVED — no "
+                "tool_result means no positive proof of resolution"
+            )
+            assert auq_source.side_file_live_for_window("@7") is True
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_keeps_side_file_when_tool_use_id_empty(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """P3 (Codex R3) — a side file with an empty tool_use_id cannot be matched
+        to a tool_result, so "no pending AUQ" is NOT proof THIS AUQ resolved.
+        Preserve it until session-replacement / clear / 1h GC. (RED today.)
+        """
+        from cctelegram.handlers import auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        sid = "44444444-4444-4444-8444-444444444444"
+        # An UNRELATED answered AUQ (so _find_latest_pending_auq returns None),
+        # but the side file's tool_use_id is "" → cannot prove THIS one resolved.
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("other"), _tool_result_entry("other")],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, sid, "")
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+            assert side.exists(), (
+                "empty tool_use_id → no positive resolution proof → side file "
+                "must be PRESERVED"
+            )
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_reconciles_orphan_when_tool_result_beyond_hydrate_tail(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """Hermes PR-B P2 — a GENUINE orphan (answered, unlink missed) whose
+        matching tool_result scrolled PAST the hydrate tail, on a still-tracked
+        session, must STILL be reconciled. The positive-proof scan reads the
+        WHOLE file (not just the tail), else the now-live-safe gc_stale would
+        skip the tracked session and strand the dead card unboundedly. (RED with
+        a tail-only proof scan: it misses the result → preserves the orphan.)
+        """
+        from cctelegram.handlers import auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+        # Shrink the tail so the answered AUQ + its tool_result fall OUTSIDE it
+        # cheaply (the real tail is 1 MB).
+        monkeypatch.setattr(monitor, "_AUQ_HYDRATE_TAIL_BYTES", 50)
+        monkeypatch.setattr(monitor, "_AUQ_HYDRATE_HARD_CAP", 50)
+
+        sid = "55555555-5555-4555-8555-555555555555"
+        jsonl = tmp_path / "session.jsonl"
+        # The answered AUQ is near the START; many lines follow so the
+        # tool_result is far past the (shrunk) tail.
+        padding = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "filler " * 30}],
+                },
+            }
+            for _ in range(8)
+        ]
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("auq_far"), _tool_result_entry("auq_far"), *padding],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, sid, "auq_far")
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            # Sanity: the tail no longer sees the answered AUQ → reconcile path.
+            assert await monitor._find_latest_pending_auq(jsonl) is None
+            # But the full-file proof scan DOES find the result → unlink.
+            assert await monitor._auq_tool_result_present(jsonl, "auq_far") is True
+
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+            assert not side.exists(), (
+                "an orphan whose tool_result is beyond the hydrate tail must "
+                "still be reconciled (full-file positive-proof scan)"
+            )
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+
 
 class TestLoadCurrentSessionMapLegacyKeyFilter:
     """_load_current_session_map accepts only @-keyed (window_id) entries.
