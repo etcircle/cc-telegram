@@ -334,7 +334,7 @@ async def test_recover_after_restart_dispatches_exactly_once(
     assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
     # The recovered dispatch wrote the ledger lifecycle at the reconstructed key.
     _route_hash, fp8, _opt = picks[1].removeprefix(CB_ASK_PICK).split(":")[:3]
-    ledger_key = auq_ledger.make_ledger_key(
+    ledger_key = auq_ledger.make_legacy_ledger_key(
         auq_ledger.make_route_hash(scenario.user_id, 42, wid), fp8, 2
     )
     entry = auq_ledger.lookup(ledger_key)

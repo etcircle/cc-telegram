@@ -217,7 +217,7 @@ def _build_keyed_callback(
     route_hash = auq_ledger.make_route_hash(user_id, _THREAD_ID, window_id)
     fp8 = fingerprint[:8]
     callback_data = f"{CB_ASK_PICK}{route_hash}:{fp8}:{option_number}:{token}"
-    ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, option_number)
+    ledger_key = auq_ledger.make_legacy_ledger_key(route_hash, fp8, option_number)
     return callback_data, ledger_key
 
 
@@ -428,7 +428,7 @@ class TestOwnerSecurity:
         """
         route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, _WINDOW_ID)
         fp8 = _FINGERPRINT[:8]
-        ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, _OPT)
+        ledger_key = auq_ledger.make_legacy_ledger_key(route_hash, fp8, _OPT)
         _seed_ledger(ledger_key, "dispatched", user_id=_OWNER_ID)
         # Intruder mints their own live token; route_hash differs from
         # owner's because user_id is in the sha1 input.
@@ -467,7 +467,7 @@ class TestOwnerSecurity:
         # Seed owner's ledger row in ``dispatched``.
         route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, _WINDOW_ID)
         fp8 = _FINGERPRINT[:8]
-        ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, _OPT)
+        ledger_key = auq_ledger.make_legacy_ledger_key(route_hash, fp8, _OPT)
         _seed_ledger(ledger_key, "dispatched", user_id=_OWNER_ID)
 
         # Intruder mints their own live token (different real route_hash).

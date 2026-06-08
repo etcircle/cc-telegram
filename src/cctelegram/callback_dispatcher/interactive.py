@@ -1032,7 +1032,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                     text="Card expired, refreshing.",
                 )
                 return
-            ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, opt_num)
+            ledger_key = auq_ledger.make_legacy_ledger_key(route_hash, fp8, opt_num)
             logger.info(
                 "AUQ_PICK entry user=%d window=%s opt=%d fp8=%s token=%s",
                 user.id,

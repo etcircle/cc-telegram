@@ -194,7 +194,7 @@ async def test_dispatched_recorded_only_after_confirmed_resolution() -> None:
     assert picker.resolved
     route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, _WINDOW_ID)
     form = resolve_ask_form(None, _SINGLE_PANE)
-    key = auq_ledger.make_ledger_key(route_hash, form.fingerprint()[:8], 2)
+    key = auq_ledger.make_legacy_ledger_key(route_hash, form.fingerprint()[:8], 2)
     entry = auq_ledger.lookup(key)
     assert entry is not None and entry.state == "dispatched"
 
@@ -234,7 +234,7 @@ async def test_commit_unconfirmed_when_form_does_not_advance() -> None:
     )
     route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, _WINDOW_ID)
     form = resolve_ask_form(None, _SINGLE_PANE)
-    key = auq_ledger.make_ledger_key(route_hash, form.fingerprint()[:8], 1)
+    key = auq_ledger.make_legacy_ledger_key(route_hash, form.fingerprint()[:8], 1)
     entry = auq_ledger.lookup(key)
     assert entry is not None
     assert entry.state == "commit_unconfirmed"
@@ -261,7 +261,7 @@ async def test_cursor_landing_on_wrong_option_does_not_commit() -> None:
     assert ("Enter", False, False) not in keys, "must NOT commit when cursor off target"
     route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, _WINDOW_ID)
     form = resolve_ask_form(None, _SINGLE_PANE)
-    key = auq_ledger.make_ledger_key(route_hash, form.fingerprint()[:8], 3)
+    key = auq_ledger.make_legacy_ledger_key(route_hash, form.fingerprint()[:8], 3)
     entry = auq_ledger.lookup(key)
     assert entry is not None and entry.state == "not_advanced"
 
@@ -281,7 +281,7 @@ async def test_commit_unconfirmed_retap_is_refresh_only_never_second_enter() -> 
     await _run(_mint_callback(1, label), picker)
     route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, _WINDOW_ID)
     form = resolve_ask_form(None, _SINGLE_PANE)
-    key = auq_ledger.make_ledger_key(route_hash, form.fingerprint()[:8], 1)
+    key = auq_ledger.make_legacy_ledger_key(route_hash, form.fingerprint()[:8], 1)
     assert auq_ledger.lookup(key).state == "commit_unconfirmed"
 
     # Re-tap (a fresh card mints a fresh token at the same ledger key); the matrix
