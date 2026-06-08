@@ -75,7 +75,7 @@ async def test_intruder_click_after_dispatch_blocked_without_label_leak(
     route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, wid)
     fp8 = _FINGERPRINT[:8]
     callback_data = f"{CB_ASK_PICK}{route_hash}:{fp8}:{_OPT}:{token}"
-    ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, _OPT)
+    ledger_key = auq_ledger.make_legacy_ledger_key(route_hash, fp8, _OPT)
     auq_ledger.record(
         ledger_key,
         state="accepted",

@@ -64,7 +64,7 @@ def _seed_keyed_pick_token(
     route_hash = auq_ledger.make_route_hash(owner_id, thread_id, window_id)
     fp8 = _FINGERPRINT[:8]
     callback_data = f"{CB_ASK_PICK}{route_hash}:{fp8}:{_OPT}:{token}"
-    ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, _OPT)
+    ledger_key = auq_ledger.make_legacy_ledger_key(route_hash, fp8, _OPT)
     return callback_data, ledger_key
 
 

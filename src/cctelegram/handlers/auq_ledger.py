@@ -63,17 +63,30 @@ to decide whether an ``accepted``/``digit_sent`` entry came from a prior
 process that crashed mid-dispatch (project to ``unknown``) or from the
 current process (keep the real state).
 
-Ledger key shape: ``"<route_hash>:<fp8>:<opt>"`` where
-``route_hash = sha1(f"{user_id}:{thread_id}:{window_id}")[:8]``,
-``fp8`` is the first 8 chars of the pick-token fingerprint, and ``opt``
-is the option number. The key is stable across restarts; the full
-fingerprint + user_id are stored per entry for diagnostics and the
-collision-defense check in the callback handler.
+Ledger key shapes — two coexist during the stateless migration:
+
+  - Legacy triplet (``make_legacy_ledger_key``):
+    ``"<route_hash>:<fp8>:<opt>"`` where
+    ``route_hash = sha1(f"{user_id}:{thread_id}:{window_id}")[:8]``,
+    ``fp8`` is the first 8 chars of the pick-token fingerprint, and ``opt``
+    is the option number. Stable across restarts; the truncation means two
+    distinct routes sharing a fingerprint+option can collide, defended by the
+    callback handler's §7.2 branch. Used by the legacy token path.
+  - Full identity (``make_ledger_key``):
+    ``"<user_id>:<thread_id_or_0>:<window_id>:<fp16>:<opt>"`` — the WHOLE
+    16-hex fingerprint, no truncation, so distinct user/window keys are
+    collision-immune. Used by the stateless self-describing pick path.
+
+The full fingerprint + user_id are also stored per entry for diagnostics and
+the legacy collision-defense check in the callback handler.
 
 ``lookup()`` is a pure read — it returns the latest raw row for a key
 or ``None``. It does NOT enforce owner / collision semantics; that
 classification lives in the callback handler per v4 §7.2 (owner-check
-first, then collision via live-pick-token peek).
+first, then collision via live-pick-token peek). ``state(key)`` is the same
+pure raw read projected to just the persisted ``LedgerState`` — NO
+``process_start_time`` projection (the stateless path keeps ``accepted`` /
+``commit_unconfirmed`` durable across restart).
 """
 
 from __future__ import annotations
@@ -171,14 +184,46 @@ def make_route_hash(user_id: int, thread_id: int | None, window_id: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
 
-def make_ledger_key(route_hash: str, fp8: str, option_number: int) -> str:
-    """Compose the stable ledger key shared between mint + lookup sites.
+def make_legacy_ledger_key(route_hash: str, fp8: str, option_number: int) -> str:
+    """Compose the legacy triplet ledger key shared between mint + lookup sites.
 
     The triplet ``(route_hash, fp8, opt)`` is stable across restarts:
     the same (user, thread, window, form-shape, option) always produces
-    the same key.
+    the same key. Used by the legacy token path during dual-read.
     """
     return f"{route_hash}:{fp8}:{option_number}"
+
+
+def make_ledger_key(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    fp16: str,
+    option_number: int,
+) -> str:
+    """Compose the full-identity ledger key for the stateless pick path.
+
+    Keys idempotency on the FULL identity
+    ``(user_id, thread_id, window_id, fp16, opt)`` instead of the truncated
+    ``(route_hash8, fp8, opt)`` triplet, so two distinct routes that happen to
+    share a fingerprint+option can never collide (collision-immune). ``window_id``
+    is a tmux id (``@N``) with no ``:`` so the key is unambiguous, and
+    ``thread_id or 0`` matches ``make_route_hash``'s None-normalization.
+    """
+    return f"{user_id}:{thread_id or 0}:{window_id}:{fp16}:{option_number}"
+
+
+def state(key: str | None) -> LedgerState | None:
+    """Return the RAW latest persisted state for ``key``, or ``None``.
+
+    Pure raw read — NO ``process_start_time`` projection. The stateless path
+    drops the pre-restart ``unknown`` projection: ``accepted`` /
+    ``commit_unconfirmed`` stay durable across a restart and REFUSE
+    re-dispatch. (The legacy handler still calls ``lookup`` +
+    ``process_start_time`` directly for its projection.)
+    """
+    entry = lookup(key)
+    return entry.state if entry is not None else None
 
 
 def _ledger_path() -> Path:

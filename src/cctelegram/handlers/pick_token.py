@@ -384,13 +384,13 @@ def peek(token: str) -> PickTokenEntry | None:
 def stable_key(entry: PickTokenEntry) -> str:
     """Reconstruct the Wave-3 ledger key from a live pick-token entry.
 
-    Pure derivation over ``make_route_hash`` / ``make_ledger_key`` /
+    Pure derivation over ``make_route_hash`` / ``make_legacy_ledger_key`` /
     ``fingerprint[:8]`` / ``option_number`` — the SAME construction the minter
     uses for callback_data, so the validator's reconstructed key and the
     minter's emitted key come from one function. Used by the callback's
     collision-defense branch.
     """
-    return auq_ledger.make_ledger_key(
+    return auq_ledger.make_legacy_ledger_key(
         auq_ledger.make_route_hash(entry.user_id, entry.thread_id, entry.window_id),
         entry.fingerprint[:8],
         entry.option_number,
@@ -767,7 +767,8 @@ def _any_sibling_claimed(
     missed via collision-suppression (``ledger_key=None``).
     """
     return any(
-        auq_ledger.lookup(auq_ledger.make_ledger_key(route_hash, fp8, n)) is not None
+        auq_ledger.lookup(auq_ledger.make_legacy_ledger_key(route_hash, fp8, n))
+        is not None
         for n in option_numbers
     )
 
@@ -837,7 +838,9 @@ async def recover_and_consume(
         intent.user_id, intent.thread_id, intent.window_id
     )
     fp8 = intent.full_fingerprint[:8]
-    ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, intent.option_number)
+    ledger_key = auq_ledger.make_legacy_ledger_key(
+        route_hash, fp8, intent.option_number
+    )
     cache_key = (
         intent.user_id,
         intent.thread_id or 0,
