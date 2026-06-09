@@ -1276,6 +1276,110 @@ class TestAuqCacheClearOnSessionChange:
             session_manager.window_states.pop("@7", None)
             auq_source.reset_for_tests()
 
+    # ── Wave 0 (review finding 12): TOCTOU re-peek before unlink ────────────
+    # The positive-proof scan (_auq_tool_result_present) is a whole-file JSONL
+    # read that yields the event loop, potentially for seconds. A fresh
+    # PreToolUse(AskUserQuestion) firing during that await atomically replaces
+    # auq_pending/<session_id>.json; a blind unlink afterwards would delete the
+    # NEW live AUQ's side file — the card-liveness authority (the exact class
+    # PR-B exists to close; gc_stale got the sibling re-stat guard in the same
+    # commit).
+
+    @pytest.mark.asyncio
+    async def test_skips_unlink_when_side_file_replaced_during_proof_scan(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """RED (finding 12): the side file is atomically replaced with a NEW
+        live AUQ (tool_use_id B) while _auq_tool_result_present awaits for the
+        ORIGINAL id A. Positive proof for A must NOT unlink B's file — the
+        reconciler must re-peek the tool_use_id immediately before unlink and
+        skip on mismatch.
+        """
+        from cctelegram.handlers import auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        sid = "66666666-6666-4666-8666-666666666666"
+        # Genuine orphan shape for id A: answered AUQ in the JSONL.
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("auq_old"), _tool_result_entry("auq_old")],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, sid, "auq_old")
+
+        real_proof_scan = monitor._auq_tool_result_present
+
+        async def swapping_proof_scan(path, tuid):
+            result = await real_proof_scan(path, tuid)
+            # Mid-await: the live session's PreToolUse hook atomically
+            # replaces the side file with a FRESH AUQ (tool_use_id B).
+            self._write_side_file(tmp_path, sid, "auq_new_live")
+            return result
+
+        monkeypatch.setattr(monitor, "_auq_tool_result_present", swapping_proof_scan)
+
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+            assert side.exists(), (
+                "a fresh live AUQ side file written during the proof scan must "
+                "be PRESERVED — unlinking it destroys the card-liveness "
+                "authority (TOCTOU)"
+            )
+            assert auq_source.peek_side_file_tool_use_id(sid) == "auq_new_live", (
+                "the surviving side file must be the NEW live AUQ's record"
+            )
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_unlinks_orphan_when_side_file_unchanged_after_proof_scan(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """Complement: no mid-await swap → the re-peek matches the original
+        tool_use_id and positive proof still unlinks the orphan (the PR-B
+        reconcile behavior is preserved under the new guard).
+        """
+        from cctelegram.handlers import auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        sid = "77777777-7777-4777-8777-777777777777"
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("auq_done"), _tool_result_entry("auq_done")],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, sid, "auq_done")
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+            assert not side.exists(), (
+                "an unchanged orphan must still be reconciled away under the "
+                "TOCTOU re-peek guard"
+            )
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+
 
 class TestLoadCurrentSessionMapLegacyKeyFilter:
     """_load_current_session_map accepts only @-keyed (window_id) entries.

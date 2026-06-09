@@ -1204,10 +1204,37 @@ class SessionMonitor:
                 if not side_tuid:
                     # P3 (Codex R3): an empty captured tool_use_id cannot be
                     # matched to a tool_result, so "no pending AUQ" is NOT proof
-                    # THIS AUQ resolved. Leave it until session-replacement /
-                    # /clear / 1h GC.
+                    # THIS AUQ resolved. Leave it for session-replacement /
+                    # /clear / topic-close. NOTE (review finding 26): the 1h
+                    # startup GC is NOT a backstop for a TRACKED session —
+                    # gc_stale's injected liveness predicate skips any tracked
+                    # session — so an empty-id orphan on a long-lived tracked
+                    # session is UNBOUNDED. Documented residual, bundled with
+                    # finding 25 for the next architecture wave.
                     continue
                 if await self._auq_tool_result_present(jsonl_path, side_tuid):
+                    # TOCTOU re-peek (review finding 12): the proof scan above
+                    # is a whole-file JSONL read that yields the loop,
+                    # potentially for seconds. A fresh PreToolUse(AUQ) firing
+                    # during that await atomically REPLACES the side file; a
+                    # blind unlink here would delete the NEW live AUQ's record
+                    # (the card-liveness authority). Re-peek the SAME
+                    # current_map session (session-keyed discipline, as above)
+                    # and unlink ONLY if the id is unchanged — mirrors the
+                    # re-stat-before-unlink guard gc_stale got in PR-B.
+                    recheck_tuid = peek_side_file_tool_use_id(session_id)
+                    if recheck_tuid != side_tuid:
+                        logger.info(
+                            "AUQ reconcile: side file for window %s session %s "
+                            "changed during the tool_result scan (peeked %r, "
+                            "now %r) — a fresh PreToolUse replaced it; "
+                            "skipping unlink",
+                            window_id,
+                            session_id[:8],
+                            side_tuid,
+                            recheck_tuid,
+                        )
+                        continue
                     unlink_for_session(session_id)
                     logger.info(
                         "AUQ reconcile: unlinked RESOLVED side file for "
