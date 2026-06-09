@@ -416,6 +416,25 @@ class TmuxManager:
             logger.error(f"Unexpected error capturing pane {window_id}: {e}")
             return None
 
+    @staticmethod
+    def _cmd_send_literal(pane: libtmux.Pane, window_id: str, chars: str) -> bool:
+        """Send literal text via raw ``send-keys -l -- <chars>`` and check stderr.
+
+        libtmux's ``pane.send_keys(..., literal=True)`` omits the ``--``
+        end-of-options separator and never checks stderr, so a payload
+        starting with ``-`` (a bullet list, ``--continue``) makes tmux exit 1
+        with "invalid flag" while the call silently succeeds. The raw command
+        with ``--`` passes dash-leading payloads verbatim; non-empty stderr
+        from the returned ``tmux_cmd`` is treated as failure.
+        """
+        result = pane.cmd("send-keys", "-l", "--", chars)
+        if result.stderr:
+            logger.error(
+                f"tmux send-keys -l failed for window {window_id}: {result.stderr}"
+            )
+            return False
+        return True
+
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
     ) -> bool:
@@ -451,8 +470,7 @@ class TmuxManager:
                     if not pane:
                         logger.error(f"No active pane in window {window_id}")
                         return False
-                    pane.send_keys(chars, enter=False, literal=True)
-                    return True
+                    return self._cmd_send_literal(pane, window_id, chars)
                 except Exception as e:
                     logger.error(f"Failed to send keys to window {window_id}: {e}")
                     return False
@@ -508,6 +526,14 @@ class TmuxManager:
                     logger.error(f"No active pane in window {window_id}")
                     return False
 
+                if literal:
+                    # Raw `send-keys -l --` path: dash-leading payloads pass
+                    # verbatim, tmux errors surface as False (finding 1).
+                    if not self._cmd_send_literal(pane, window_id, text):
+                        return False
+                    if enter:
+                        pane.send_keys("", enter=True, literal=False)
+                    return True
                 pane.send_keys(text, enter=enter, literal=literal)
                 return True
 

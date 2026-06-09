@@ -423,7 +423,9 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Send Escape control character (no enter)
-    await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
+    if not await tmux_manager.send_keys(w.window_id, "\x1b", enter=False):
+        await safe_reply(update.message, "❌ Failed to send — window may be gone")
+        return
     await safe_reply(update.message, "⎋ Sent Escape")
 
 
@@ -447,13 +449,21 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     # Send /usage command to Claude Code TUI
-    await tmux_manager.send_keys(w.window_id, "/usage")
+    if not await tmux_manager.send_keys(w.window_id, "/usage"):
+        await safe_reply(update.message, "❌ Failed to send — window may be gone")
+        return
     # Wait for the modal to render
     await asyncio.sleep(2.0)
     # Capture the pane content
     pane_text = await tmux_manager.capture_pane(w.window_id)
     # Dismiss the modal
-    await tmux_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
+    if not await tmux_manager.send_keys(
+        w.window_id, "Escape", enter=False, literal=False
+    ):
+        # The window vanished mid-command — don't present the capture as
+        # usage output with a modal possibly left stranded on the pane.
+        await safe_reply(update.message, "❌ Failed to send — window may be gone")
+        return
 
     if not pane_text:
         await safe_reply(update.message, "Failed to capture usage info.")

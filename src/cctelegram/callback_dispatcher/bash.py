@@ -56,9 +56,15 @@ async def execute_bash_callback(authorized: Any, adapters: Any) -> None:
             await safe_answer(query, "Window not found", show_alert=True)
             return
 
-        await tmux_manager.send_keys(
+        if not await tmux_manager.send_keys(
             w.window_id, tmux_key, enter=enter, literal=literal
-        )
+        ):
+            # send_keys returns False when the dispatch never reached tmux —
+            # answer honestly and skip the dependent screenshot refresh.
+            await safe_answer(
+                query, "❌ Failed to send — window may be gone", show_alert=True
+            )
+            return
         await safe_answer(query, KEY_LABELS.get(key_id, key_id))
 
         # Refresh screenshot after key press
