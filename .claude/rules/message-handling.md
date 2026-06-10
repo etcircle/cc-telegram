@@ -43,7 +43,8 @@ observer/push channel). Snapshot
 fields: `run_state`, `open_tools`, `waiting_on_user_tools`,
 `context_usage`, `last_event_at`, `idle_clear_at`, `pane_idle_clear_at`,
 `typing_eligible`, `status_card_visible`, `status_card_msg_id`,
-`interactive_pending`. The two
+`interactive_pending`, `notification_pending`, `notification_set_at`,
+`notification_generation`. The two
 idle deadlines are distinct:
 `idle_clear_at` is the run-state `IDLE_RECENT → IDLE_CLEARED` decay
 (armed by a transcript end-of-turn), while `pane_idle_clear_at` is the
@@ -111,6 +112,44 @@ cache, torn down only in the window-gone path — popping it on the bot-less
 interactive-clear seam would mask the post-clear repaint). Pull-only; no
 observer channel (c313657 stays forbidden). The bot-less `_on_interactive_clear`
 seam is UNCHANGED — it touches neither the bit nor `_prev_run_state`.
+
+**Notification-set `WAITING_ON_USER` (Workflow / permission approval "🔔 Waiting
+on you" — Wave B)** — the SECOND lower-authority derivation input,
+`notification_pending`, beside the pane bit above. A Workflow/permission
+approval gate blocks Claude WITH its (non-interactive) `tool_use` open and no
+JSONL trace, so the route sat `RUNNING_TOOL` ("🟡 Busy") forever. The Claude
+Code `Notification` hook writes `notify_pending/<session_id>.json`
+(`{ts, window_key, generation, kind}` — NO message text);
+`handlers/notify_source.py` is the trust boundary (HARD
+`window_key == "tmux_session:window_id"` read predicate — a double-`--resume`
+sibling never lights; schema + future-skew validation; deliberately NO
+read-TTL). The poller consumes it at the TOP of the per-binding path
+(`_consume_notification_signal`, BEFORE the transition repaint and the
+adaptive capture gating — a capture-skipped tick still consumes, and a 🔔
+transition repaints the digest the SAME tick). `mark_notification_pending`
+returns a `NotificationMarkResult` that DRIVES the generation-guarded unlink
+(committed-live → unlink AFTER the commit; redundant-transcript-waiting /
+stale-unlinked → unlink; ignored-no-unlink → never unlink, never seed).
+Deriver precedence: transcript-interactive open id > `notification_pending`
+(over ANY open_tools, incl. the open Workflow id, or empty) >
+`pane_interactive_pending` (empty only) > RUNNING_TOOL > RUNNING — the two
+bits clear INDEPENDENTLY and the pane bit's contract is untouched. The ONE
+idle exception: IDLE(pane) with a non-empty `suspended_tools` stash is
+positive live proof the pane clear was false — the mark RESTORES the stash
+and derives WAITING (the second stash-restore path). CLEAR: a transcript
+`user` event unconditionally; `tool_result` / end-of-turn / assistant events
+only when their JSONL timestamp is strictly NEWER than `notification_set_at`
+(None/older preserves — buffered pre-notification JSONL must not re-hide the
+wait; a preserved bit at end-of-turn keeps WAITING instead of idling; an
+unknown `tool_result` preserves); the poller's pane idle→active EDGE after
+`set_at`; the `NOTIFY_TTL_SECONDS` (30 min) runtime TTL evaluated from the
+SNAPSHOT every tick independent of side-file existence (pending-without-
+set_at = invariant violation = expired); and route teardown
+(`mark_session_reset` / `clear_route` / `clear_routes_for_topic`). Side-file
+lifecycle: unlinked per the mark result, on session replacement / `/clear`
+(OLD session id) / topic close, 24h startup GC with the injected
+`is_live_session` conservative-skip. Pull-only; no observer (c313657 stays
+forbidden).
 
 **AUQ card-liveness authority (pane is lower authority than the
 lifecycle)** — `status_polling`'s pane-absent clear gate must not tombstone

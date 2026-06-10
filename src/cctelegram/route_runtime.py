@@ -91,6 +91,21 @@ Concurrency contract:
     against a transcript-set ``WAITING_ON_USER``). Both run **under the
     route lock** — like every other run-state transition, no sync side-band
     transitions ``run_state``.
+  - ``mark_notification_pending`` / ``mark_notification_cleared`` (Wave B)
+    drive the SECOND lower-authority bit, ``notification_pending`` — set
+    from a window-predicated Notification-hook side-file read by the
+    poller. Unlike the pane bit it outranks ``RUNNING_TOOL`` in the deriver
+    (the Workflow approval gate blocks Claude WITH its tool_use open) and
+    may resurrect an ``IDLE(pane)`` route with a live ``suspended_tools``
+    stash (positive live proof — the second stash-restore path). Transcript
+    clears are timestamp-qualified: a ``user`` event clears unconditionally;
+    tool_result / end-of-turn / assistant events clear only when strictly
+    NEWER than ``notification_set_at`` (buffered pre-notification JSONL
+    must not re-hide the wait). The poller also enforces the
+    ``NOTIFY_TTL_SECONDS`` runtime TTL from the snapshot. The two bits
+    clear INDEPENDENTLY. Both mutators run under the route lock;
+    ``mark_notification_pending`` returns a ``NotificationMarkResult`` that
+    drives the caller's side-file unlink ordering.
 
 Persistence policy:
 
@@ -165,6 +180,34 @@ class ContextUsage:
 # stop_reasons that signal "this assistant turn is over".
 _TURN_END_REASONS = frozenset({"end_turn", "stop_sequence"})
 
+# Runtime-state TTL for the notification_pending bit (Wave B). A product
+# value, not an invariant: approval prompts are normally acted on within a
+# working session; past the TTL the 🔔 silently degrades to 🟡 and the prompt
+# remains discoverable via the pane / screenshot. The poller evaluates
+# ``notification_pending and now - notification_set_at > NOTIFY_TTL_SECONDS``
+# on EVERY tick from the snapshot, independent of side-file existence, so a
+# consumed/unlinked file or a permanently-None-timestamp stream can never
+# strand 🔔 past the TTL (v4 fix 2 strand-proofing).
+NOTIFY_TTL_SECONDS = 1800.0
+
+
+class NotificationMarkResult(Enum):
+    """Outcome of ``mark_notification_pending`` — drives the CALLER's
+    side-file unlink ordering (codex r4 P3 (b)):
+
+      - COMMITTED_LIVE → generation-guarded unlink AFTER the commit.
+      - REDUNDANT_TRANSCRIPT_WAITING / STALE_UNLINK → generation-guarded
+        unlink (the file carries no information the runtime needs).
+      - IGNORED_NO_UNLINK → no unlink (never seed an unseen route; the
+        file may belong to a route the bot hasn't bound yet).
+    """
+
+    COMMITTED_LIVE = "committed-live"
+    REDUNDANT_TRANSCRIPT_WAITING = "redundant-transcript-waiting"
+    STALE_UNLINK = "stale-unlinked"
+    IGNORED_NO_UNLINK = "ignored-no-unlink"
+
+
 # A route observed strictly above this token count must be on the 1M variant.
 _CONTEXT_DETECT_1M_THRESHOLD = 200_001
 
@@ -183,6 +226,12 @@ class TranscriptLifecycleEvent:
     tool_use_id: str | None
     tool_name: str | None
     stop_reason: str | None
+    # JSONL event wall-clock timestamp (epoch seconds), parsed by the adapter
+    # from the ISO8601 ``TranscriptEvent.timestamp``; ``None`` on parse
+    # failure. Read ONLY by the timestamp-qualified notification clears (an
+    # older buffered event must not re-hide a fresh 🔔 — v4 fix 2). Defaults
+    # ``None`` so pre-Wave-B constructors are unchanged.
+    timestamp: float | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +283,18 @@ class RouteRuntimeSnapshot:
     # *pane-set* WAITING_ON_USER (the deriver folds the bit into the
     # empty-``open_tools`` branch). Lower authority than the transcript.
     interactive_pending: bool
+    # Notification-hook "waiting on you" bit (Wave B). Set only by
+    # ``mark_notification_pending`` from a window-predicated side-file read;
+    # outranks RUNNING_TOOL in the deriver (the Workflow approval case) but
+    # stays below a transcript-interactive open id. ``notification_set_at``
+    # is the hook-fire wall clock (``time.time()`` family — the side file's
+    # ``ts``); ``notification_generation`` is the consumed record's
+    # generation so the poller can dedup re-reads and unlink
+    # generation-guarded. Invariant: pending ⟹ set_at is not None (a
+    # violation is treated as TTL-expired by the poller and the clears).
+    notification_pending: bool
+    notification_set_at: float | None
+    notification_generation: str | None
 
 
 @dataclass
@@ -263,6 +324,15 @@ class _RouteState:
     # JSONL); cleared by ``mark_interactive_cleared``, the branch-scoped
     # transcript reclaim in ``_apply_lifecycle_event``, and ``mark_session_reset``.
     pane_interactive_pending: bool = False
+    # Notification-hook derivation input (Wave B) — see the snapshot field
+    # docs. Set/cleared ONLY under the route lock (it transitions run_state
+    # through the deriver). Cleared by: a ``user`` lifecycle event
+    # (unconditional), a strictly-NEWER-timestamped tool_result / end-of-turn
+    # / assistant event, ``mark_notification_cleared`` (pane-activity edge +
+    # runtime TTL), ``mark_session_reset``, and route teardown.
+    notification_pending: bool = False
+    notification_set_at: float | None = None
+    notification_generation: str | None = None
     # Why the route is currently idle (Wave A). "transcript" = the assistant's
     # authoritative end-of-turn; "pane" = a pane-idle reconciliation cleared an
     # ACTIVE route (the only resurrectable flavor — sidechain activity is
@@ -348,31 +418,69 @@ def _now() -> float:
 
 
 def _state_from_open_tools(
-    open_tools: dict[str, bool], *, pane_interactive_pending: bool = False
+    open_tools: dict[str, bool],
+    *,
+    pane_interactive_pending: bool = False,
+    notification_pending: bool = False,
 ) -> RunState:
-    """Derive the run state from the current open-tool set.
+    """Derive the run state from the open-tool set + the two lower bits.
 
-    Transcript is strictly above the pane bit:
+    Exact precedence (plan v3 B1a — top wins):
 
-      - Empty ``open_tools`` → WAITING_ON_USER iff ``pane_interactive_pending``
-        (a buffered interactive ``tool_use`` the transcript can't open yet),
-        else RUNNING (turn still in flight, no tools pending).
-      - Any interactive id open → WAITING_ON_USER (transcript-set; **the pane
-        bit is ignored** — it is only reachable on an empty ``open_tools``).
-      - Otherwise → RUNNING_TOOL (a non-interactive tool is open; pane bit
-        ignored).
+      1. A transcript-interactive open id → WAITING_ON_USER (both bits
+         ignored — the transcript is strictly above them).
+      2. ``notification_pending`` → WAITING_ON_USER over ANY ``open_tools``
+         (including non-interactive — the Workflow approval case) or empty.
+      3. ``pane_interactive_pending`` with EMPTY ``open_tools`` →
+         WAITING_ON_USER (a buffered interactive ``tool_use``).
+      4. Non-interactive ``open_tools`` non-empty → RUNNING_TOOL.
+      5. Empty + active → RUNNING.
 
-    ``pane_interactive_pending`` defaults False so every existing positional
-    caller (``seed_open_tools`` / the transcript reclaim branches) is
-    byte-identical.
+    Both keywords default False so every existing positional caller is
+    byte-identical; the two bits CLEAR independently (each by its own rules).
     """
+    if any(open_tools.values()):
+        return RunState.WAITING_ON_USER
+    if notification_pending:
+        return RunState.WAITING_ON_USER
     if not open_tools:
         return (
             RunState.WAITING_ON_USER if pane_interactive_pending else RunState.RUNNING
         )
-    if any(open_tools.values()):
-        return RunState.WAITING_ON_USER
     return RunState.RUNNING_TOOL
+
+
+def _derived_state(st: _RouteState) -> RunState:
+    """Derive the active run state from ``st``'s open tools + both bits."""
+    return _state_from_open_tools(
+        st.open_tools,
+        pane_interactive_pending=st.pane_interactive_pending,
+        notification_pending=st.notification_pending,
+    )
+
+
+def _clear_notification_in_place(st: _RouteState) -> None:
+    st.notification_pending = False
+    st.notification_set_at = None
+    st.notification_generation = None
+
+
+def _maybe_clear_notification_by_ts(st: _RouteState, event_ts: float | None) -> None:
+    """Timestamp-qualified notification clear (v4 fix 2).
+
+    Clears the bit ONLY when the transcript event's wall-clock timestamp is
+    strictly newer than ``notification_set_at`` — an older or ``None``
+    timestamp PRESERVES it (a monitor running behind must not let buffered
+    pre-notification JSONL re-hide a fresh wait). A pending bit without a
+    set_at violates the invariant and is treated as expired (codex r4 P3 (a)).
+    """
+    if not st.notification_pending:
+        return
+    if st.notification_set_at is None:
+        _clear_notification_in_place(st)
+        return
+    if event_ts is not None and event_ts > st.notification_set_at:
+        _clear_notification_in_place(st)
 
 
 def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
@@ -391,6 +499,9 @@ def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
         interactive_pending=st.pane_interactive_pending,
+        notification_pending=st.notification_pending,
+        notification_set_at=st.notification_set_at,
+        notification_generation=st.notification_generation,
     )
 
 
@@ -415,6 +526,9 @@ def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
         status_card_visible=False,
         status_card_msg_id=None,
         interactive_pending=False,
+        notification_pending=False,
+        notification_set_at=None,
+        notification_generation=None,
     )
 
 
@@ -479,10 +593,12 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         # Transcript reclaim: the buffered turn flushed. An interactive
         # tool_use now opens the id (→ WAITING from open_tools); a
         # non-interactive one → RUNNING_TOOL. Either way the pane bit is
-        # superseded by the transcript — zero it before deriving so the
-        # derived state comes purely from open_tools.
+        # superseded by the transcript — zero it before deriving. The
+        # notification bit clears only if the event is strictly NEWER than
+        # the hook fire (an older buffered Workflow tool_use must keep 🔔).
         st.pane_interactive_pending = False
-        _set_run_state(st, _state_from_open_tools(st.open_tools))
+        _maybe_clear_notification_by_ts(st, event.timestamp)
+        _set_run_state(st, _derived_state(st))
         return
 
     # tool_result: close the slot if known. Stale ids (e.g. pre-startup
@@ -499,15 +615,18 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
             st.open_tools[event.tool_use_id] = st.suspended_tools.pop(event.tool_use_id)
             st.invalidate_tool_cache()
         if event.tool_use_id not in st.open_tools:
-            # Unknown id (stale / pre-startup). Preserve run_state AND the pane
-            # bit — an unknown tool_result must not strand a pane-set WAITING.
+            # Unknown id (stale / pre-startup). Preserve run_state, the pane
+            # bit AND the notification bit — an unknown tool_result is not
+            # proof of resumption and must not strand or re-hide a WAITING.
             return
         st.open_tools.pop(event.tool_use_id, None)
         st.invalidate_tool_cache()
         # Transcript reclaim on a KNOWN id: the buffered turn flushed. Zero
-        # the pane bit before deriving from the remaining open set.
+        # the pane bit before deriving; the notification bit clears only on
+        # a strictly newer event timestamp (v4 fix 2).
         st.pane_interactive_pending = False
-        _set_run_state(st, _state_from_open_tools(st.open_tools))
+        _maybe_clear_notification_by_ts(st, event.timestamp)
+        _set_run_state(st, _derived_state(st))
         return
 
     # End-of-turn: thinking or text with end_turn / stop_sequence AND no
@@ -524,36 +643,59 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         # A transcript-ended turn never resurrects its tools — drop the stash
         # and record the authoritative idle provenance.
         st.suspended_tools.clear()
+        # The notification bit clears only on a strictly NEWER end-of-turn;
+        # an older buffered one must not re-hide the wait (v4 fix 2) — when
+        # the bit survives, the route stays WAITING instead of idling.
+        _maybe_clear_notification_by_ts(st, event.timestamp)
+        if st.notification_pending:
+            _set_run_state(st, _derived_state(st))
+            return
         _set_run_state(st, RunState.IDLE_RECENT)
         st.idle_source = "transcript"
         return
 
     # Plain assistant text: at least RUNNING. Preserve RUNNING_TOOL /
-    # WAITING_ON_USER (open tools still gate).
+    # WAITING_ON_USER (open tools / surviving bits still gate) — but
+    # RE-DERIVE so a notification bit just cleared by a newer-timestamped
+    # event drops its notification-set WAITING.
     if role == "assistant" and block == "text":
+        _maybe_clear_notification_by_ts(st, event.timestamp)
         if st.run_state in (RunState.RUNNING_TOOL, RunState.WAITING_ON_USER):
-            st.last_event_at = _now()
+            derived = _derived_state(st)
+            if derived is st.run_state:
+                st.last_event_at = _now()
+            else:
+                _set_run_state(st, derived)
             return
         _set_run_state(st, RunState.RUNNING)
         return
 
     # Assistant thinking without end-of-turn: light up if route was idle.
-    # Preserve RUNNING_TOOL / WAITING_ON_USER.
+    # Preserve RUNNING_TOOL / WAITING_ON_USER (same re-derive as text).
     if role == "assistant" and block == "thinking":
+        _maybe_clear_notification_by_ts(st, event.timestamp)
         if not st.seen or st.run_state in (
             RunState.IDLE_CLEARED,
             RunState.IDLE_RECENT,
         ):
             _set_run_state(st, RunState.RUNNING)
             return
+        if st.run_state in (RunState.RUNNING_TOOL, RunState.WAITING_ON_USER):
+            derived = _derived_state(st)
+            if derived is not st.run_state:
+                _set_run_state(st, derived)
+                return
         st.last_event_at = _now()
         return
 
     # User non-tool_result: user prompted Claude — RUNNING. A fresh user turn
-    # supersedes any pane-set WAITING (the prompt was answered or replaced)
-    # and any suspended tools (they belong to the superseded turn).
+    # supersedes any pane-set WAITING (the prompt was answered or replaced),
+    # any pending notification (the user acted — the ONE unconditional,
+    # timestamp-free transcript clear), and any suspended tools (they belong
+    # to the superseded turn).
     if role == "user" and block != "tool_result":
         st.pane_interactive_pending = False
+        _clear_notification_in_place(st)
         st.suspended_tools.clear()
         _set_run_state(st, RunState.RUNNING)
         return
@@ -620,6 +762,9 @@ def snapshot(route: Route) -> RouteRuntimeSnapshot:
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
         interactive_pending=st.pane_interactive_pending,
+        notification_pending=st.notification_pending,
+        notification_set_at=st.notification_set_at,
+        notification_generation=st.notification_generation,
     )
 
 
@@ -726,12 +871,103 @@ async def mark_interactive_cleared(route: Route) -> RouteRuntimeSnapshot:
         st = _state_for_route(route)
         if st.run_state is RunState.WAITING_ON_USER and not any(st.open_tools.values()):
             st.pane_interactive_pending = False
-            # Empty / non-interactive open set → RUNNING / RUNNING_TOOL.
-            _set_run_state(st, _state_from_open_tools(st.open_tools))
+            # Re-derive from the remaining inputs: a still-set notification
+            # bit keeps WAITING (the two bits clear INDEPENDENTLY); otherwise
+            # empty / non-interactive open set → RUNNING / RUNNING_TOOL.
+            _set_run_state(st, _derived_state(st))
         else:
             # Transcript-set WAITING (interactive id open) or not-waiting →
             # drop the (already-False) bit only; do NOT transition run_state.
             st.pane_interactive_pending = False
+        snap = _freeze(route, st)
+    return snap
+
+
+async def mark_notification_pending(
+    route: Route, *, set_at: float, generation: str
+) -> NotificationMarkResult:
+    """Light the Notification-hook "waiting on you" bit for ``route`` (Wave B).
+
+    Called ONLY by ``status_polling`` after a window-predicated
+    ``notify_source.notification_pending_for_window`` read. ``set_at`` is the
+    side file's hook-fire wall clock (``ts``); ``generation`` its re-fire
+    nonce. Returns a :class:`NotificationMarkResult` that DRIVES the caller's
+    side-file unlink (codex r4 P3 (b)):
+
+      - Unseen route → ``IGNORED_NO_UNLINK`` (never seeds — the file may
+        belong to a not-yet-bound route).
+      - Transcript-set WAITING (interactive id open) → already 🔔:
+        ``REDUNDANT_TRANSCRIPT_WAITING``, bit NOT set (no stale re-light
+        after the transcript WAITING clears).
+      - Active ``RUNNING`` / ``RUNNING_TOOL`` (incl. a pane-set WAITING —
+        the bits are independent) → set the bit + re-arm the pane-idle
+        debounce → ``COMMITTED_LIVE`` (the deriver promotes over
+        ``RUNNING_TOOL`` — the Workflow approval case).
+      - Idle with ``idle_source == "pane"`` AND a non-empty
+        ``suspended_tools`` stash → POSITIVE LIVE PROOF the pane clear was
+        false (v4 fix 1): RESTORE the stash into ``open_tools``, set the
+        bit, derive → WAITING_ON_USER → ``COMMITTED_LIVE``. The SECOND
+        restore path of the stash (beside the sidechain resurrection) and
+        the ONE exception to "a notification never resurrects idle".
+      - Idle with ``idle_source`` "transcript"/``None``, or pane-idle with
+        an EMPTY stash → ``STALE_UNLINK`` (the turn genuinely ended).
+    """
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state.get(route)
+        if st is None or not st.seen:
+            return NotificationMarkResult.IGNORED_NO_UNLINK
+        if st.run_state is RunState.WAITING_ON_USER and any(st.open_tools.values()):
+            return NotificationMarkResult.REDUNDANT_TRANSCRIPT_WAITING
+        if st.run_state in (
+            RunState.RUNNING,
+            RunState.RUNNING_TOOL,
+            RunState.WAITING_ON_USER,
+        ):
+            st.notification_pending = True
+            st.notification_set_at = set_at
+            st.notification_generation = generation
+            _set_run_state(st, _derived_state(st))
+            _rearm_pane_idle_in_place(st)
+            return NotificationMarkResult.COMMITTED_LIVE
+        # Idle: only IDLE(pane) with a live stash is resurrectable.
+        if st.idle_source == "pane" and st.suspended_tools:
+            st.open_tools.update(st.suspended_tools)
+            st.suspended_tools.clear()
+            st.invalidate_tool_cache()
+            st.notification_pending = True
+            st.notification_set_at = set_at
+            st.notification_generation = generation
+            # _set_run_state's active branch resets idle_source/idle_clear_at.
+            _set_run_state(st, _derived_state(st))
+            _rearm_pane_idle_in_place(st)
+            return NotificationMarkResult.COMMITTED_LIVE
+        return NotificationMarkResult.STALE_UNLINK
+
+
+async def mark_notification_cleared(route: Route) -> RouteRuntimeSnapshot:
+    """Retract the notification bit — the poller-side programmatic clear.
+
+    Called by ``status_polling`` on the pane idle→active edge (the user
+    acted in the terminal) and on runtime-TTL expiry, and usable by any
+    teardown that holds a route. Re-derives the run state when the bit was
+    holding a WAITING with no transcript-interactive id open (a still-set
+    pane bit keeps WAITING — independent clears); a transcript-set WAITING
+    is never stripped. Never seeds an unseen route.
+    """
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state.get(route)
+        if st is None:
+            return _default_snapshot(route)
+        had = st.notification_pending
+        _clear_notification_in_place(st)
+        if (
+            had
+            and st.run_state is RunState.WAITING_ON_USER
+            and not any(st.open_tools.values())
+        ):
+            _set_run_state(st, _derived_state(st))
         snap = _freeze(route, st)
     return snap
 
@@ -977,8 +1213,10 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         # the new session's first idle stretch arms from scratch.
         _rearm_pane_idle_in_place(st)
         # The old session's interactive prompt (if any) is gone with it —
-        # as are any suspended tools and the idle provenance.
+        # as are any pending notification, suspended tools, and the idle
+        # provenance.
         st.pane_interactive_pending = False
+        _clear_notification_in_place(st)
         st.suspended_tools.clear()
         _set_run_state(st, RunState.IDLE_CLEARED)
         st.idle_source = None
@@ -1187,6 +1425,8 @@ def reset_for_tests() -> None:
 
 __all__ = [
     "ContextUsage",
+    "NOTIFY_TTL_SECONDS",
+    "NotificationMarkResult",
     "Route",
     "RouteRuntimeSnapshot",
     "RunState",
@@ -1199,6 +1439,8 @@ __all__ = [
     "mark_inbound_sent",
     "mark_interactive_cleared",
     "mark_interactive_pending",
+    "mark_notification_cleared",
+    "mark_notification_pending",
     "mark_pane_idle",
     "mark_session_reset",
     "mark_status_card_cleared",

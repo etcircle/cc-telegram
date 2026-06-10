@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 from . import route_runtime
 from .route_runtime import Route, RouteRuntimeSnapshot, TranscriptLifecycleEvent
@@ -45,6 +46,17 @@ logger = logging.getLogger(__name__)
 # Once-per-session warning suppression — repeated parse failures on the
 # same session would otherwise flood the log. Keys are session_ids.
 _warned_sessions: set[str] = set()
+
+
+def _parse_event_timestamp(raw: str | None) -> float | None:
+    """Parse the JSONL ISO8601 ``timestamp`` to epoch seconds; ``None`` on
+    any failure (the timestamp-qualified notification clears then PRESERVE)."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def to_lifecycle_event(event: TranscriptEvent) -> TranscriptLifecycleEvent | None:
@@ -79,6 +91,7 @@ def to_lifecycle_event(event: TranscriptEvent) -> TranscriptLifecycleEvent | Non
         tool_use_id=event.tool_use_id,
         tool_name=event.tool_name,
         stop_reason=event.stop_reason,
+        timestamp=_parse_event_timestamp(event.timestamp),
     )
 
 

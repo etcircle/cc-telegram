@@ -22,6 +22,11 @@ Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (1 second)
   - status_poll_loop: Background polling task
   - update_status_message: Poll and enqueue status updates
+  - _consume_notification_signal: Wave B Notification side-file consumption
+    + the runtime notification TTL, at the TOP of the per-binding path so a
+    capture-skipped tick still consumes and a 🔔 transition repaints the
+    digest the same tick; the pane idle→active edge clear lives further
+    down beside ``is_running``.
 """
 
 import asyncio
@@ -49,7 +54,7 @@ from ..terminal_parser import (
 )
 from ..transcript_parser import read_latest_usage
 from ..tmux_manager import TmuxWindow, tmux_manager
-from . import auq_source, pick_token
+from . import auq_source, notify_source, pick_token
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -155,6 +160,67 @@ _absent_streak: dict[tuple[int, int, str], int] = {}
 # the post-clear repaint — the v3 shared P1). Pull-only; no observer channel.
 _UNSEEN = object()
 _prev_run_state: dict[tuple[int, int, str], object] = {}
+
+# Per-route last pane-running observation, keyed by ``(user_id,
+# thread_id_or_0, window_id)``. Drives the Wave B notification pane-activity
+# clear: an idle→active EDGE (False → True) after ``notification_set_at``
+# means the user acted in the terminal, so the 🔔 bit is retracted +
+# the side file unlinked generation-guarded. First observation seeds only
+# (a restart must not fabricate an edge). Written only on capture ticks.
+_prev_pane_running: dict[tuple[int, int, str], bool] = {}
+
+
+async def _consume_notification_signal(
+    user_id: int, thread_id: int | None, window_id: str
+) -> None:
+    """Wave B: runtime-TTL check + Notification side-file consumption.
+
+    Runs at the TOP of the per-binding poll path — BEFORE
+    ``_maybe_repaint_digest_on_transition`` (so a 🔔 transition repaints the
+    digest on the SAME tick via the ordinary transition-repaint seed) and
+    BEFORE the adaptive capture gating / early returns (a capture-skipped
+    tick still consumes; plan v3 B1d).
+
+    Two phases, both pull-only:
+
+      1. Runtime-state TTL (v4 fix 2 strand-proofing): evaluated from the
+         SNAPSHOT every tick, independent of side-file existence — a
+         consumed/unlinked file or a permanently-None-timestamp transcript
+         cannot strand 🔔 past ``NOTIFY_TTL_SECONDS``. A pending bit without
+         a set_at violates the invariant and is treated as expired.
+      2. Window-predicated side-file read → ``mark_notification_pending``.
+         The returned ``NotificationMarkResult`` DRIVES the unlink (codex
+         r4 P3 (b)): committed-live → generation-guarded unlink AFTER the
+         commit; redundant/stale → generation-guarded unlink; ignored → NO
+         unlink (never seed; the file may belong to a not-yet-bound route).
+         An on-disk record older than the TTL is treated as absent and
+         unlinked without ever lighting the bit.
+    """
+    route = (user_id, thread_id or 0, window_id)
+    now = time.time()
+    snap = route_runtime.snapshot(route)
+    if snap.notification_pending and (
+        snap.notification_set_at is None
+        or now - snap.notification_set_at > route_runtime.NOTIFY_TTL_SECONDS
+    ):
+        await route_runtime.mark_notification_cleared(route)
+        snap = route_runtime.snapshot(route)
+
+    rec = notify_source.notification_pending_for_window(window_id)
+    if rec is None:
+        return
+    if snap.notification_pending and snap.notification_generation == rec.generation:
+        return  # already reflected — nothing to do this tick
+    if now - rec.ts > route_runtime.NOTIFY_TTL_SECONDS:
+        # Expired on disk (e.g. written while the bot was down) — treated
+        # absent; unlink so it doesn't re-surface every tick.
+        notify_source.unlink_if_generation_matches(rec.session_id, rec.generation)
+        return
+    result = await route_runtime.mark_notification_pending(
+        route, set_at=rec.ts, generation=rec.generation
+    )
+    if result is not route_runtime.NotificationMarkResult.IGNORED_NO_UNLINK:
+        notify_source.unlink_if_generation_matches(rec.session_id, rec.generation)
 
 
 async def _maybe_repaint_digest_on_transition(
@@ -290,11 +356,18 @@ async def update_status_message(
     ``window`` lets callers (e.g. ``_poll_one_binding``) pass in an already-
     resolved TmuxWindow to avoid a redundant find_window_by_id round-trip.
     """
+    # Wave B: consume the Notification side file + enforce the runtime TTL
+    # BEFORE the transition repaint below — the repaint then observes the
+    # post-consume run_state, so a 🔔 set/clear repaints the digest on the
+    # SAME tick (plan v3 B1d) — and before every capture-gating early return
+    # (a capture-skipped tick still consumes).
+    await _consume_notification_signal(user_id, thread_id, window_id)
     # Repaint the activity-digest header on any run-state transition since the
     # last tick (e.g. a transcript reclaim flushed and flipped WAITING → Done,
-    # or the reconciliation below cleared a stale bit). Placed FIRST so it runs
-    # before every early-return, both directions; pull-only and a no-op when no
-    # digest is on screen, so it is cheap on the common idle tick.
+    # or the reconciliation below cleared a stale bit). Placed FIRST (after the
+    # notification consume) so it runs before every early-return, both
+    # directions; pull-only and a no-op when no digest is on screen, so it is
+    # cheap on the common idle tick.
     await _maybe_repaint_digest_on_transition(bot, user_id, thread_id, window_id)
     if window is None:
         window = await tmux_manager.find_window_by_id(window_id)
@@ -307,6 +380,7 @@ async def update_status_message(
         # Drop the watchdog entry so a re-bind starts fresh.
         _last_pane_capture.pop((user_id, thread_id or 0, window_id), None)
         _last_published_ui_hash.pop((user_id, thread_id or 0, window_id), None)
+        _prev_pane_running.pop((user_id, thread_id or 0, window_id), None)
         # Best-effort teardown of the poller-local repaint-dedup cache (the only
         # _prev_run_state pop; status_polling-local, so import-safe — NOT from
         # message_queue, which would invert the status_polling → message_queue
@@ -663,6 +737,34 @@ async def update_status_message(
     # interrupt", and past-tense summaries don't always omit the spinner.
     is_running = bool(status_line) and is_status_active(pane_text)
 
+    # Wave B: a pane idle→active EDGE after the notification's set_at means
+    # the user acted in the terminal — retract 🔔 + unlink the (possibly
+    # still-present) side file generation-guarded. Edge, not level: a level
+    # check would clear on the very capture frame the notification's own
+    # prompt renders under; the first observation only seeds (a restart must
+    # not fabricate an edge). Placed before the ``skip_status`` return so a
+    # busy queue can't defer the clear.
+    prev_running = _prev_pane_running.get(route)
+    _prev_pane_running[route] = is_running
+    if is_running and prev_running is False:
+        snap = route_runtime.snapshot(route)
+        if (
+            snap.notification_pending
+            and snap.notification_set_at is not None
+            and time.time() > snap.notification_set_at
+        ):
+            cleared_gen = snap.notification_generation
+            await route_runtime.mark_notification_cleared(route)
+            await _maybe_repaint_digest_on_transition(
+                bot, user_id, thread_id, window_id
+            )
+            if cleared_gen:
+                rec = notify_source.notification_pending_for_window(window_id)
+                if rec is not None and rec.generation == cleared_gen:
+                    notify_source.unlink_if_generation_matches(
+                        rec.session_id, cleared_gen
+                    )
+
     # Typing-action delivery is owned by ``typing_action_loop`` (it reads
     # ``route_runtime.snapshot(route).typing_eligible`` directly with no tmux
     # I/O so cadence stays under Telegram's 5s TTL even with many bindings).
@@ -870,6 +972,7 @@ async def _poll_one_binding(bot: Bot, user_id: int, thread_id: int, wid: str) ->
             _last_published_ui_hash.pop(route, None)
             _absent_streak.pop(route, None)
             _prev_run_state.pop(route, None)
+            _prev_pane_running.pop(route, None)
             logger.info(
                 "Cleaned up stale binding: user=%d thread=%d window_id=%s",
                 user_id,

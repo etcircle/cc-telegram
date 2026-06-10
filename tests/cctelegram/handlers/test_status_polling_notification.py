@@ -1,0 +1,307 @@
+"""Wave B unit tests — Notification side-file consumption in ``status_polling``.
+
+Covers the poller seam (plan v2 B4 + v3 B1d + v4 fix 2):
+
+  - Consumption runs at the TOP of the per-binding path, BEFORE the
+    adaptive capture gating — a capture-skipped tick still consumes.
+  - A 🔔 transition repaints the digest the SAME tick.
+  - The unlink ordering is driven by the ``NotificationMarkResult``:
+    committed-live → generation-guarded unlink AFTER the commit;
+    redundant / stale → generation-guarded unlink; ignored → NO unlink.
+  - Runtime-state TTL: expiry clears even with the side file already
+    gone; pending-without-set_at is treated as expired.
+  - An on-disk record older than the TTL is treated absent + unlinked.
+  - Pane idle→active edge after ``notification_set_at`` clears the bit
+    (generation-guarded unlink of a still-present file).
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from cctelegram import route_runtime
+from cctelegram.handlers import status_polling
+from cctelegram.route_runtime import (
+    NOTIFY_TTL_SECONDS,
+    RunState,
+    TranscriptLifecycleEvent,
+)
+from cctelegram.session import WindowState, session_manager
+from cctelegram.tmux_manager import tmux_manager as real_tmux
+
+_SID = "550e8400-e29b-41d4-a716-446655440000"
+_WID = "@5"
+_USER = 1
+_THREAD = 42
+_ROUTE = (_USER, _THREAD, _WID)
+
+_ACTIVE_PANE = (
+    "✻ Cooking for 2s\n"
+    "──────────────────────────────────────\n"
+    "❯ \n"
+    "──────────────────────────────────────\n"
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt\n"
+)
+
+
+@pytest.fixture
+def mock_bot():
+    bot = AsyncMock()
+    sent = MagicMock()
+    sent.message_id = 999
+    bot.send_message.return_value = sent
+    return bot
+
+
+@pytest.fixture
+def _env(tmp_path, monkeypatch):
+    """tmp app_dir + bound window + clean per-route poller state."""
+    monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+    session_manager.window_states[_WID] = WindowState(cwd="/tmp/x", session_id=_SID)
+    route_runtime.reset_for_tests()
+    status_polling._last_pane_capture.clear()
+    status_polling._prev_run_state.clear()
+    status_polling._prev_pane_running.clear()
+    yield tmp_path
+    session_manager.window_states.pop(_WID, None)
+    route_runtime.reset_for_tests()
+    status_polling._last_pane_capture.clear()
+    status_polling._prev_run_state.clear()
+    status_polling._prev_pane_running.clear()
+
+
+def _write_record(
+    cc_dir: Path,
+    *,
+    ts: float | None = None,
+    generation: str = "g1",
+) -> Path:
+    d = cc_dir / "notify_pending"
+    d.mkdir(mode=0o700, exist_ok=True)
+    rec = {
+        "schema_version": 1,
+        "session_id": _SID,
+        "ts": ts if ts is not None else time.time(),
+        "window_key": f"{real_tmux.session_name}:{_WID}",
+        "generation": generation,
+        "kind": "permission",
+    }
+    path = d / f"{_SID}.json"
+    path.write_text(json.dumps(rec))
+    return path
+
+
+def _evt(
+    role: str = "assistant",
+    block: str = "text",
+    *,
+    tool_use_id: str | None = None,
+    tool_name: str | None = None,
+    stop_reason: str | None = None,
+    timestamp: float | None = None,
+) -> TranscriptLifecycleEvent:
+    return TranscriptLifecycleEvent(
+        role=role,  # type: ignore[arg-type]
+        block_type=block,  # type: ignore[arg-type]
+        tool_use_id=tool_use_id,
+        tool_name=tool_name,
+        stop_reason=stop_reason,
+        timestamp=timestamp,
+    )
+
+
+async def _tick(mock_bot, pane_text: str | None = None) -> None:
+    """One update_status_message tick against a fake tmux window."""
+    window = MagicMock()
+    window.window_id = _WID
+    with (
+        patch.object(status_polling, "tmux_manager") as mock_tmux,
+        patch.object(status_polling, "enqueue_status_update", AsyncMock()),
+        # The real resolver clears a bound window's session_id when its JSONL
+        # is missing (as it is under a tmp app_dir) — keep window_states intact.
+        patch.object(
+            status_polling.session_manager,
+            "resolve_session_for_window",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        mock_tmux.find_window_by_id = AsyncMock(return_value=window)
+        mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+        await status_polling.update_status_message(
+            mock_bot, user_id=_USER, window_id=_WID, thread_id=_THREAD
+        )
+
+
+# ── consumption + unlink ordering by mark result ─────────────────────────
+
+
+async def test_committed_live_sets_bit_and_unlinks(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)  # RUNNING
+    path = _write_record(_env, generation="g1")
+    # Within-watchdog capture skip: consumption must STILL run (B4).
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    await _tick(mock_bot)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert not path.exists()  # generation-guarded unlink AFTER the commit
+
+
+async def test_stale_record_unlinked_route_stays_idle(_env, mock_bot):
+    await route_runtime.ingest_transcript_event(
+        _ROUTE, _evt("assistant", "text", stop_reason="end_turn")
+    )
+    path = _write_record(_env)
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    await _tick(mock_bot)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is False
+    assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+    assert not path.exists()
+
+
+async def test_redundant_under_transcript_waiting_unlinked(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    await route_runtime.ingest_transcript_event(
+        _ROUTE,
+        _evt("assistant", "tool_use", tool_use_id="auq-1", tool_name="AskUserQuestion"),
+    )
+    path = _write_record(_env)
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    await _tick(mock_bot)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is False
+    assert snap.run_state is RunState.WAITING_ON_USER  # transcript WAITING intact
+    assert not path.exists()
+
+
+async def test_unseen_route_ignored_file_survives(_env, mock_bot):
+    path = _write_record(_env)
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    await _tick(mock_bot)
+    assert route_runtime.snapshot(_ROUTE).notification_pending is False
+    assert path.exists()  # ignored-no-unlink
+
+
+async def test_already_reflected_generation_not_remarked(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    _write_record(_env, generation="g1")
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    await _tick(mock_bot)
+    set_at_1 = route_runtime.snapshot(_ROUTE).notification_set_at
+    # Same generation re-written (e.g. unlink raced) → second tick is a no-op.
+    _write_record(_env, generation="g1")
+    await _tick(mock_bot)
+    assert route_runtime.snapshot(_ROUTE).notification_set_at == set_at_1
+
+
+async def test_on_disk_record_past_ttl_treated_absent(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    path = _write_record(_env, ts=time.time() - NOTIFY_TTL_SECONDS - 60)
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    await _tick(mock_bot)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is False
+    assert snap.run_state is RunState.RUNNING
+    assert not path.exists()
+
+
+# ── runtime-state TTL (v4 fix 2 strand-proofing) ─────────────────────────
+
+
+async def test_runtime_ttl_expiry_clears_with_file_gone(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=time.time() - NOTIFY_TTL_SECONDS - 60, generation="g1"
+    )
+    assert route_runtime.snapshot(_ROUTE).notification_pending is True
+    # No side file on disk at all — the TTL check is runtime-state-driven.
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    await _tick(mock_bot)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is False
+    assert snap.run_state is RunState.RUNNING
+
+
+async def test_pending_without_set_at_treated_as_expired(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=time.time(), generation="g1"
+    )
+    route_runtime._state[_ROUTE].notification_set_at = None  # invariant violation
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    await _tick(mock_bot)
+    assert route_runtime.snapshot(_ROUTE).notification_pending is False
+
+
+async def test_fresh_notification_survives_tick(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=time.time(), generation="g1"
+    )
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    await _tick(mock_bot)
+    assert route_runtime.snapshot(_ROUTE).notification_pending is True
+
+
+# ── same-tick digest repaint ─────────────────────────────────────────────
+
+
+async def test_notification_set_repaints_digest_same_tick(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    # Seed the repaint-dedup cache with the PRIOR state so the transition
+    # (RUNNING → WAITING via the notification) is detectable this tick.
+    status_polling._prev_run_state[_ROUTE] = RunState.RUNNING
+    _write_record(_env)
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    window = MagicMock()
+    window.window_id = _WID
+    with (
+        patch.object(status_polling, "tmux_manager") as mock_tmux,
+        patch.object(status_polling, "enqueue_status_update", AsyncMock()),
+        patch.object(
+            status_polling, "refresh_activity_digest_if_present", AsyncMock()
+        ) as mock_refresh,
+    ):
+        mock_tmux.find_window_by_id = AsyncMock(return_value=window)
+        mock_tmux.capture_pane = AsyncMock(return_value=None)
+        await status_polling.update_status_message(
+            mock_bot, user_id=_USER, window_id=_WID, thread_id=_THREAD
+        )
+    assert route_runtime.snapshot(_ROUTE).run_state is RunState.WAITING_ON_USER
+    mock_refresh.assert_awaited_once()
+
+
+# ── pane idle→active edge clear ──────────────────────────────────────────
+
+
+async def test_pane_active_edge_clears_bit_and_unlinks(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    set_at = time.time() - 30
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=set_at, generation="g1"
+    )
+    # The side file (same generation) is still on disk — the edge clear must
+    # unlink it generation-guarded.
+    path = _write_record(_env, ts=set_at, generation="g1")
+    status_polling._prev_pane_running[_ROUTE] = False
+    await _tick(mock_bot, pane_text=_ACTIVE_PANE)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is False
+    assert not path.exists()
+
+
+async def test_first_active_observation_is_not_an_edge(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=time.time() - 30, generation="g1"
+    )
+    # No prior pane-running observation → seed only, never clear.
+    await _tick(mock_bot, pane_text=_ACTIVE_PANE)
+    assert route_runtime.snapshot(_ROUTE).notification_pending is True
+    assert status_polling._prev_pane_running.get(_ROUTE) is True

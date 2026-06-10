@@ -10,6 +10,7 @@ Each Telegram topic maps to one tmux window running one Claude Code process. The
 - **Hook-based session tracking** — Claude Code `SessionStart` writes `session_map.json`, so `/clear` and resumed sessions stay attached to the right topic.
 - **AskUserQuestion descriptions and multi-select toggles** — a `PreToolUse` hook captures the structured `AskUserQuestion` payload before Claude renders the picker, so each option's full description shows in Telegram right away. Single-select options submit through the restart-safe `aqp:` pick flow; multi-select options toggle with non-ledgered `aqt:` bare-digit callbacks, then final Submit/Cancel reuses the review-screen `aqp:` flow. A single-select pick / review Submit **navigates the live cursor to the tapped option with arrow keys, then presses Enter**, and only records the dispatch once the pane confirms the expected advance — version-stable on Claude Code v2.1.168, where a bare digit no longer reliably selects. (The `aqt:` multi-select toggle still uses a bare digit.)
 - **Live prose before interactive prompts** — when Claude writes explanatory prose in the same turn as an `AskUserQuestion` / `ExitPlanMode`, Claude Code buffers the whole turn in the session JSONL until the prompt resolves, so without help the Telegram user would see only the picker and choose blind. A lightweight `MessageDisplay` hook captures that prose live (before the picker blocks) so the bot can deliver it ahead of the picker card.
+- **Waiting-on-you detection** — a `Notification` hook writes a window-keyed marker when Claude blocks on a permission / approval prompt (including the Workflow tool's Bash-approval gate, which leaves no JSONL trace), so the topic shows "🔔 Waiting on you" instead of an eternal "🟡 Busy".
 - **Streaming output** — assistant text, thinking, tool use/result summaries, interactive prompts, and local command output flow into Telegram.
 - **Per-route queues** — each `(user_id, thread_id, window_id)` has its own worker, so one noisy topic does not stall another.
 - **Run-state digest** — compact activity digests show tool activity, context-window percentage, and busy/waiting state.
@@ -101,6 +102,7 @@ Under `$CC_TELEGRAM_DIR` (default `~/.cc-telegram/`):
 - `monitor_state.json` — JSONL byte offsets per tracked session (incremental-read progress).
 - `interactive_state.json` — persisted picker message ids + AUQ context markers (survives bot restart so a `launchctl kickstart` doesn't lose interactive state).
 - `auq_pending/<session_id>.json` — `PreToolUse` side files (one per active AUQ; mode `0600` under directory mode `0700`). Multi-select `aqt:` toggles keep the side file alive; it is cleaned when the AUQ `tool_result` runs `forget_ask_tool_input`, on session replacement, or by startup GC.
+- `notify_pending/<session_id>.json` — `Notification` hook side files (mode `0600` under directory mode `0700`): a window-keyed `{ts, window_key, generation, kind}` marker — **no notification message text is stored**. The poller reads it (rejecting any record whose `window_key` doesn't match the asking window), promotes the route to "🔔 Waiting on you", and unlinks it generation-guarded. Cleared by transcript activity newer than the notification, a pane idle→active edge, a 30-minute runtime TTL, session replacement, `/clear`, topic close, or 24h startup GC.
 - `auq_action_ledger.jsonl` — restart-safe write-ahead ledger for AUQ option-pick dispatches (mode `0600`; append-only JSONL; latest line per `(route_hash, fp8, opt)` key wins; the callback handler consults this to detect duplicate taps after a process restart so the same pick is never committed twice). States: `accepted → dispatched` (confirmed advance), `not_advanced` (pre-commit bail — a re-tap falls through), `commit_unconfirmed` (Enter sent, advance unconfirmed — refresh-only), and `released` (the AUQ resolved — appended for the window's rows only on a tool_result-confirmed resolution, at the AUQ tool_result branch in the bot's message handler and by the startup reconciler's positive-proof block, so a re-asked identical question is dispatchable again; generic teardown such as `/clear` or session replacement never releases). 24h retention is enforced on read (load + lookup); the file is rewritten only by over-cap compaction.
 - `pick_intent.jsonl` — D2 restart-recovery: durable per-callback-**token** AUQ pick mint-intent store (mode `0600`; append-only JSONL row + tombstone lines; 24h retention + compaction). Written at the fresh single-select / review-Submit (`aqp:`) render; after a bot restart wipes the in-memory pick tokens, the callback handler reads it to RECOVER and re-dispatch the first token-less tap on a still-open card (row-scoped single-use; owner + stale-window auth; read-TTL-free source parity). Deliberately **not** the `(route_hash, fp8, opt)`-keyed action ledger above — writing recovery state there would clobber a `dispatched` row and re-open double-dispatch. Tombed on AUQ/EPM resolution, `/clear`, and topic close.
 - `md_hook_settings.json` — bot-managed Claude Code settings file registering the `MessageDisplay` hook. Passed to bot-launched sessions via `claude --settings`, so the live-prose hook is scoped to the bot's own windows (it is never written into the global `~/.claude/settings.json`). Re-written on startup and on each window launch if its content drifts.
@@ -127,7 +129,7 @@ If your backend doesn't natively speak OpenAI's STT shape (e.g., a local `whispe
 uv run cc-telegram hook --install
 ```
 
-This writes/updates `~/.claude/settings.json` with two managed hook entries:
+This writes/updates `~/.claude/settings.json` with three managed hook entries:
 
 ```json
 {
@@ -146,12 +148,19 @@ This writes/updates `~/.claude/settings.json` with two managed hook entries:
           { "type": "command", "command": "cc-telegram hook", "timeout": 2 }
         ]
       }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          { "type": "command", "command": "cc-telegram hook", "timeout": 2 }
+        ]
+      }
     ]
   }
 }
 ```
 
-The `SessionStart` hook writes `session_map.json` so the bot can route messages back to the right tmux window. The `PreToolUse` hook (matcher `AskUserQuestion`) captures the structured question payload before Claude renders the picker — see the next section.
+The `SessionStart` hook writes `session_map.json` so the bot can route messages back to the right tmux window. The `PreToolUse` hook (matcher `AskUserQuestion`) captures the structured question payload before Claude renders the picker — see the next section. The `Notification` hook (matcher-less) writes a window-keyed `notify_pending/<session_id>.json` marker when Claude blocks on a permission / approval prompt, so the bot can flip the topic to "🔔 Waiting on you" — the only detection path for approval gates that never reach the session JSONL. No notification text is stored in the marker. If either the `PreToolUse` or the `Notification` entry is missing, the bot logs a one-time startup warning; re-run `cc-telegram hook --install` to repair.
 
 ### AskUserQuestion (AUQ) descriptions
 
@@ -307,6 +316,7 @@ src/cctelegram/handlers/            Telegram interaction layer
   message_sender.py                 safe send/edit/delete with MarkdownV2 fallback
   status_polling.py                 poll loop + typing-action loop
   interactive_ui.py                 AskUserQuestion / ExitPlanMode / permission UI
+  notify_source.py                  Notification-hook side-file trust boundary (waiting-on-you)
   directory_browser.py              directory + session picker
   history.py                        /history paginator
   cleanup.py                        centralized topic teardown

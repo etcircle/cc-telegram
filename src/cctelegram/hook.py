@@ -1,4 +1,5 @@
-"""Hook subcommand for Claude Code session tracking + AUQ description capture.
+"""Hook subcommand for Claude Code session tracking + AUQ description capture
++ Notification waits.
 
 Called by Claude Code's hook system to:
   1. SessionStart: maintain a window↔session mapping in
@@ -10,15 +11,24 @@ Called by Claude Code's hook system to:
      pretool reader (handlers/interactive_ui.py) can post the AUQ
      context message with descriptions at first render instead of
      just labels.
+  3. Notification (Wave B busy-signal): write a window-keyed
+     "Claude is waiting on you" marker to
+     <CC_TELEGRAM_DIR>/notify_pending/<session_id>.json. The bot's
+     poller reads it (handlers/notify_source.py) and promotes the
+     route to WAITING_ON_USER (🔔) — this is the only detection path
+     for Workflow/permission approval gates, which block Claude with
+     no JSONL trace. The notification MESSAGE TEXT is deliberately
+     NOT stored (codex P3-6 — the bit only needs existence +
+     freshness, never the prompt content).
 
-The hook is a pure observer for PreToolUse — exit 0 with no stdout, no
-permission decision. Exceptions are swallowed and logged; the tool call
-must NEVER be blocked by hook bugs.
+The hook is a pure observer for PreToolUse / Notification — exit 0 with
+no stdout, no permission decision. Exceptions are swallowed and logged;
+the tool call must NEVER be blocked by hook bugs.
 
-`--install` installs (or refreshes) both hook entries in
+`--install` installs (or refreshes) all three hook entries in
 ~/.claude/settings.json idempotently. SessionStart keeps a 5s timeout
-(existing); PreToolUse uses 2s (write is sub-ms; observer hooks should
-not delay tool execution beyond a hard ceiling).
+(existing); PreToolUse and Notification use 2s (write is sub-ms;
+observer hooks should not delay execution beyond a hard ceiling).
 
 This module must not import config.py: hooks run inside tmux panes where
 bot env vars are not guaranteed to exist. Config directory resolution
@@ -48,6 +58,7 @@ _HOOK_PATH_PREFIX_RE = re.compile(r"^[A-Za-z0-9_./~@+-]+$")
 _AUQ_MATCHER = "AskUserQuestion"
 _SESSION_START_TIMEOUT_S = 5
 _PRE_TOOL_USE_TIMEOUT_S = 2
+_NOTIFICATION_TIMEOUT_S = 2
 HookStatus = Literal["current", "missing"]
 
 
@@ -134,13 +145,27 @@ def _is_pre_tool_use_installed(settings: dict) -> HookStatus:
     return "missing"
 
 
+def _is_notification_installed(settings: dict) -> HookStatus:
+    """Return whether Notification contains the managed hook command.
+
+    Matcher-less, like SessionStart — the Notification event has no tool
+    matcher; any managed-command entry counts as ``current`` (same loose
+    idempotency trade-off as ``_is_pre_tool_use_installed``).
+    """
+    for entry in settings.get("hooks", {}).get("Notification", []) or []:
+        if isinstance(entry, dict) and _entry_has_managed_command(entry):
+            return "current"
+    return "missing"
+
+
 def _install_hook(settings_file: Path = _CLAUDE_SETTINGS_FILE) -> int:
     """Install or refresh the CC Telegram hooks in Claude settings.json.
 
-    Two events are managed:
+    Three events are managed:
       - SessionStart with timeout 5 (window↔session map)
       - PreToolUse with matcher AskUserQuestion and timeout 2 (AUQ
         descriptions capture)
+      - Notification with timeout 2 (waiting-on-you side file, matcher-less)
 
     Idempotent: missing entries are added, current ones left alone.
     """
@@ -179,6 +204,17 @@ def _install_hook(settings_file: Path = _CLAUDE_SETTINGS_FILE) -> int:
             {"matcher": _AUQ_MATCHER, "hooks": [pre_tool_use_cfg]}
         )
         installed.append(f"PreToolUse({_AUQ_MATCHER})")
+
+    if _is_notification_installed(settings) == "missing":
+        notification_cfg = {
+            "type": "command",
+            "command": hook_cmd,
+            "timeout": _NOTIFICATION_TIMEOUT_S,
+        }
+        settings.setdefault("hooks", {}).setdefault("Notification", []).append(
+            {"hooks": [notification_cfg]}
+        )
+        installed.append("Notification")
 
     if not installed:
         logger.info("All hooks already current in %s", settings_file)
@@ -405,9 +441,87 @@ def _handle_pre_tool_use(payload: dict) -> int:
     return 0
 
 
+def _handle_notification(payload: dict) -> int:
+    """Write the window-keyed "waiting on you" marker (Wave B busy-signal).
+
+    Fires when Claude Code blocks on a permission / approval / idle prompt
+    (incl. the Workflow tool's own Bash-approval gate — the previously
+    invisible wait). Resolves the SAME ``tmux_session:window_id`` key the
+    SessionStart hook writes, so the bot's reader can hard-predicate the
+    record against the route's window (a double-``--resume`` sibling whose
+    pane never shows the prompt is never falsely lit).
+
+    The record deliberately stores NO notification message text — only
+    ``{ts, window_key, generation, kind}``. ``generation`` (ts + random
+    nonce) makes the bot's unlink re-fire-safe: a hook re-fire between the
+    poller's read and unlink writes a new generation, and the
+    generation-guarded unlink leaves it in place.
+
+    Purely observational: exit 0 always; never blocks Claude Code.
+    """
+    session_id = payload["session_id"]  # validated by caller
+
+    pane_id = os.environ.get("TMUX_PANE", "")
+    if not pane_id:
+        logger.warning("Notification: TMUX_PANE not set, cannot key the window")
+        return 0
+    resolved = _resolve_tmux_window_key(pane_id)
+    if resolved is None:
+        return 0
+    tmux_session_name, window_id, _window_name = resolved
+    window_key = f"{tmux_session_name}:{window_id}"
+
+    from .utils import app_dir, atomic_write_json
+
+    pending_dir = app_dir() / "notify_pending"
+    # Same symlink + fail-closed-perms discipline as the AUQ side file:
+    # we own this directory and never want writes redirected or loose.
+    if pending_dir.exists() and pending_dir.is_symlink():
+        logger.error("Notification: %s is a symlink; refusing to write", pending_dir)
+        return 0
+    try:
+        pending_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(pending_dir, 0o700)
+    except OSError as e:
+        logger.error("Notification: prepare %s failed: %s", pending_dir, e)
+        return 0
+
+    ts = time.time()
+    record = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "ts": ts,
+        "window_key": window_key,
+        # ts + random nonce: unique per fire, never derived from content.
+        "generation": f"{ts:.6f}-{os.urandom(4).hex()}",
+        # A coarse classifier only — NEVER the notification message text.
+        "kind": str(payload.get("notification_type", "") or ""),
+    }
+
+    target = pending_dir / f"{session_id}.json"
+    try:
+        atomic_write_json(target, record)
+    except OSError as e:
+        logger.error("Notification: write %s failed: %s", target, e)
+        return 0
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+
+    logger.info(
+        "Notification side file: %s window_key=%s gen=%s",
+        target.name,
+        window_key,
+        record["generation"],
+    )
+    return 0
+
+
 _EVENT_HANDLERS: dict[str, Callable[[dict], int]] = {
     "SessionStart": _handle_session_start,
     "PreToolUse": _handle_pre_tool_use,
+    "Notification": _handle_notification,
 }
 
 
@@ -426,7 +540,10 @@ def hook_main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--install",
         action="store_true",
-        help="Install the hooks (SessionStart + PreToolUse) into ~/.claude/settings.json",
+        help=(
+            "Install the hooks (SessionStart + PreToolUse + Notification) "
+            "into ~/.claude/settings.json"
+        ),
     )
     if argv is None:
         argv = sys.argv[2:]

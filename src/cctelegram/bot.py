@@ -1270,6 +1270,27 @@ async def post_init(application: Application) -> None:
         # Never let cleanup/maintenance crash bot startup.
         logger.warning("AUQ pretool startup maintenance raised: %s", e)
 
+    # Notification side-file maintenance (Wave B busy-signal):
+    #   1. Garbage-collect stale notify_pending/ files (>24h) left by
+    #      crashes / notifications fired while the bot was down. Same
+    #      injected-liveness conservative-skip shape as the AUQ GC above;
+    #      a tracked session's file is left for the runtime TTL / teardown
+    #      seams to reap.
+    #   2. Warn (one-time, with the install command) if the Notification
+    #      hook is missing — the existing hook-health seam extended (plan
+    #      v3 B-misc): without it, Workflow/permission approval waits stay
+    #      an eternal "🟡 Busy" instead of "🔔 Waiting on you".
+    try:
+        from .handlers import notify_source
+        from .handlers.interactive_ui import warn_if_notification_hook_missing
+
+        notify_source.gc_stale(
+            is_live_session=lambda sid: monitor.state.get_session(sid) is not None
+        )
+        warn_if_notification_hook_missing()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Notification startup maintenance raised: %s", e)
+
     # MessageDisplay live-prose capture maintenance (Bug 2 — prose buffered
     # behind a live AUQ / ExitPlanMode):
     #   1. Write the bot-managed --settings file that registers the
