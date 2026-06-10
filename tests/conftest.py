@@ -729,6 +729,7 @@ def _reset_status_polling() -> None:
         "_last_published_ui_hash",
         "_absent_streak",
         "_prev_run_state",
+        "_prev_pane_running",
     ):
         attr = getattr(sp, name, None)
         if isinstance(attr, dict):
@@ -752,6 +753,11 @@ def _reset_all_handler_state() -> None:
     pending_dir = app_dir() / "auq_pending"
     if pending_dir.is_dir():
         for path in pending_dir.glob("*.json"):
+            path.unlink(missing_ok=True)
+    # Wave B: Notification-hook side files share the same leak surface.
+    notify_dir = app_dir() / "notify_pending"
+    if notify_dir.is_dir():
+        for path in notify_dir.glob("*.json"):
             path.unlink(missing_ok=True)
     auq_ledger.reset_for_tests()
     route_runtime.reset_for_tests()

@@ -32,6 +32,7 @@ def _event(
     tool_name: str | None = None,
     stop_reason: str | None = None,
     session_id: str = "sess-A",
+    timestamp: str | None = None,
 ) -> TranscriptEvent:
     return TranscriptEvent(
         session_id=session_id,
@@ -40,7 +41,7 @@ def _event(
         tool_use_id=tool_use_id,
         tool_name=tool_name,
         stop_reason=stop_reason,
-        timestamp=None,
+        timestamp=timestamp,
         text="",
         image_data=None,
     )
@@ -173,3 +174,51 @@ def test_warn_once_suppresses_repeat_session_failures(caplog):
     warn_records = [r for r in caplog.records if r.levelname == "WARNING"]
     # First call logs; second call is suppressed.
     assert len(warn_records) == 1
+
+
+# ── Wave B: event-timestamp plumbing (B1b prerequisite) ─────────────────
+
+
+def test_timestamp_parsed_iso8601_z_suffix():
+    from datetime import datetime, timezone
+
+    out = transcript_event_adapter.to_lifecycle_event(
+        _event(timestamp="2026-06-10T12:00:00.500Z")
+    )
+    assert out is not None
+    expected = datetime(
+        2026, 6, 10, 12, 0, 0, 500000, tzinfo=timezone.utc
+    ).timestamp()
+    assert out.timestamp == pytest.approx(expected)
+
+
+def test_timestamp_parsed_with_explicit_offset():
+    from datetime import datetime, timezone
+
+    out = transcript_event_adapter.to_lifecycle_event(
+        _event(timestamp="2026-06-10T13:00:00+01:00")
+    )
+    assert out is not None
+    expected = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert out.timestamp == pytest.approx(expected)
+
+
+def test_timestamp_garbage_parses_to_none():
+    out = transcript_event_adapter.to_lifecycle_event(_event(timestamp="not-a-time"))
+    assert out is not None
+    assert out.timestamp is None
+
+
+def test_timestamp_absent_is_none():
+    out = transcript_event_adapter.to_lifecycle_event(_event(timestamp=None))
+    assert out is not None
+    assert out.timestamp is None
+
+
+def test_adapter_loc_budget_intact():
+    """The 250-line kill signal from the adapter's charter must hold after
+    the timestamp field addition."""
+    import cctelegram.transcript_event_adapter as mod
+    from pathlib import Path
+
+    assert len(Path(mod.__file__).read_text().splitlines()) <= 250
