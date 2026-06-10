@@ -394,6 +394,15 @@ class FakeBot:
     async def send_photo(self, *, chat_id: int, **kwargs: Any) -> Any:
         return self._record("send_photo", {"chat_id": chat_id, **kwargs})
 
+    async def pin_chat_message(
+        self, *, chat_id: int, message_id: int, **kwargs: Any
+    ) -> bool:
+        self._record(
+            "pin_chat_message",
+            {"chat_id": chat_id, "message_id": message_id, **kwargs},
+        )
+        return True
+
     async def send_document(self, *, chat_id: int, **kwargs: Any) -> Any:
         return self._record("send_document", {"chat_id": chat_id, **kwargs})
 
