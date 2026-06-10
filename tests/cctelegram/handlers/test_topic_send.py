@@ -59,13 +59,31 @@ def test_classify_rate_limited() -> None:
     "message",
     [
         "Bad Request: chat not found",
-        "Bad Request: message to edit not found",
         "Bad Request: can't parse entities",
         "completely unknown error string",
     ],
 )
 def test_classify_other_bad_request(message: str) -> None:
     assert _classify_bad_request(BadRequest(message)) is TopicSendOutcome.OTHER
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Message to edit not found",
+        "Bad Request: message to edit not found",
+        "MESSAGE TO EDIT NOT FOUND",
+    ],
+)
+def test_classify_message_to_edit_not_found(message: str) -> None:
+    # "message to edit not found" gets its own outcome so edit-and-self-heal
+    # callers (dashboard) re-send ONLY when the message is provably gone —
+    # a generic OTHER (timeout / unclassified failure) must never trigger a
+    # re-send, or the old still-live message is orphaned forever (hermes Wave
+    # C review P2-2).
+    assert (
+        _classify_bad_request(BadRequest(message)) is TopicSendOutcome.MESSAGE_NOT_FOUND
+    )
 
 
 def test_classify_message_not_modified() -> None:
@@ -92,6 +110,7 @@ def test_classify_outcome_values_are_stable() -> None:
     assert TopicSendOutcome.TOPIC_CLOSED.value == "TOPIC_CLOSED"
     assert TopicSendOutcome.FORBIDDEN.value == "FORBIDDEN"
     assert TopicSendOutcome.RATE_LIMITED.value == "RATE_LIMITED"
+    assert TopicSendOutcome.MESSAGE_NOT_FOUND.value == "MESSAGE_NOT_FOUND"
     assert TopicSendOutcome.OTHER.value == "OTHER"
 
 

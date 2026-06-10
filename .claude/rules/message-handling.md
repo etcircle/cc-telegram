@@ -485,6 +485,81 @@ concurrent append refreshing the mtime within `max_age` → skip). The predicate
 NEVER imported into `md_capture` (it stays a leaf — only stdlib + `utils`). Pull-only
 throughout (no observer; c313657 forbidden).
 
+## Cross-topic dashboard (Wave C)
+
+One passive, owner+chat-scoped overview message per `(chat_id, owner_user_id)`,
+owned by `handlers/dashboard.py` and persisted as the `dashboards` key in
+`state.json` through SessionManager's single `_load_state`/`_save_state` path
+(sync named mutators: `get/set/clear_dashboard`, `update_dashboard_msg_id`,
+`set_dashboard_pinned`). `/dashboard` in any topic claims THAT topic as the
+host (DM/General rejected; re-run elsewhere MOVES it, old message deleted
+best-effort; `/dashboard pin` is the only pin path — never automatic, persisted
+only on pin-API success). The whole Telegram-I/O-spanning claim/move/self-heal
+flow serializes on a per-`(chat, owner)` `asyncio.Lock` with a post-send
+loser-cleanup re-read (pre-C fix 1).
+
+**Update driver is PULL-ONLY**: `maybe_refresh_dashboards` rides the existing
+1s status-poll sweep (called once per sweep, not per binding — no observer,
+c313657 forbidden). It renders the owner's view from
+`session_manager.iter_thread_bindings()` + `route_runtime.snapshot(route)`,
+**chat-scoped** (hermes review P1): `render_dashboard(owner_id, chat_id)`
+includes only bindings whose persisted `group_chat_ids` mapping
+(`session_manager.get_group_chat_id`) resolves to the dashboard's own chat —
+FAIL CLOSED, an unresolvable chat is excluded from every dashboard, so a
+dashboard in forum A never exposes forum B's topic names/states. That filter is
+only as trustworthy as the mapping, so the **trust boundary** (hermes R2 P1):
+`group_chat_ids` is written ONLY by the genuine bound-topic message seams
+(`text/photo/voice/document_handler`, `forward_command_handler`,
+`topic_edited_handler`) — `/dashboard` itself NEVER writes
+`set_group_chat_id`, because thread ids are chat-local and a host claim in
+chat B's unbound thread N would overwrite the mapping of chat A's bound topic
+N and leak it onto chat B's dashboard. The dashboard instead carries its OWN
+chat explicitly (the command's `effective_chat.id` at claim time, the
+`dashboards` record key afterwards) through every
+`topic_send`/`topic_edit`/`topic_delete` — those helpers take an explicit
+`chat_id` and never resolve via `group_chat_ids`. It hashes the
+rendered body and edits only on change — the hash covers state
+lines, display names, and the binding set, so run-state transitions AND
+bind/unbind/rename all repaint without a dedicated trigger; ages are
+minute-coarse so the hash is stable within the minute (the implicit 60s age
+tick). `MESSAGE_NOT_MODIFIED` is success (W8 precedent). Self-heal (re-send +
+`update_dashboard_msg_id` under the lock) fires ONLY on `MESSAGE_NOT_FOUND` —
+the distinctly-classified "message to edit not found" `BadRequest` in
+`message_sender._classify_bad_request` — meaning the message is provably
+deleted; a generic `OTHER` edit failure (timeout / unclassified transient)
+logs and leaves the persisted msg_id + render hash alone so the next sweep
+retries the edit (review P2-2 — re-sending on a transient would orphan the
+still-live old message, unboundedly). The same rule applies to the same-topic
+`/dashboard` rerun. A topic-shaped outcome
+(`TOPIC_NOT_FOUND`/`TOPIC_CLOSED`/`FORBIDDEN`) clears the record — never a
+self-heal loop into a dead topic — and the **chat-scoped** teardown seam
+`dashboard.clear_dashboards_in_thread(thread_id, chat_id=…)` covers the host
+topic closing: thread ids are chat-local (review P2-3), so only the
+`(chat_id, thread_id)` records are cleared (`chat_id=None` — genuinely
+unresolvable — falls back to the old all-chats sweep WITH a warning, never
+stranding a record silently). Wired from `cleanup.clear_topic_state` (chat
+resolved via `group_chat_ids`) AND from `bot.topic_closed_handler`'s
+no-binding branch (review P2-4): a dedicated dashboard host topic has no
+bound window, so without that branch its record would survive close until the
+send-failure backstop (the host may have no bound window, so binding-centric
+cleanup alone would miss it; pre-C fix 3).
+
+**🔔 unanswered-turn derivation**: a route renders 🔔 when `run_state` is
+`WAITING_ON_USER`, OR when it is idle and
+`snapshot.last_assistant_turn_ended_at > snapshot.last_user_turn_at` — two
+WALL-CLOCK stamps on the same `time.time()` clock. `last_user_turn_at` is
+mirrored into route_runtime INSIDE `message_queue.set_route_user_turn_at`
+(single writer ⇒ same-ts by construction) at the PRE-SEND delivery seams;
+`last_assistant_turn_ended_at` is written only by the authoritative
+end-of-turn branch from the event's JSONL timestamp, max-monotonic by event
+time (out-of-order resume/rewind events never regress it; `None` timestamp
+never updates). Either stamp `None` ⇒ never classified unanswered — the
+documented **restart degradation**: the stamps are in-memory, so after a
+restart the dashboard renders state-only until fresh turns repopulate them.
+Boundary: `dashboard.py` sends via `message_sender` helpers only and never
+touches message-queue internals or mutates route_runtime. Visibility is
+honest: owner-filtered, NOT private — any forum member can read the message.
+
 ## Rate Limiting
 
 - `AIORateLimiter(max_retries=5)` on the Application (30/s global)
