@@ -14,6 +14,7 @@ Key classes: SessionMonitor, NewMessage, SessionInfo.
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Literal
@@ -28,6 +29,13 @@ from .transcript_parser import TranscriptParser
 from .utils import read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
+
+# Fix 11: minimum number of _read_new_lines cycles an unparseable non-empty
+# line must survive (while the file has grown PAST its end) before it is
+# discarded. A genuine partial write parses on the next cycle or two; a line
+# that never parses after the file grew beyond it is a crash-torn fusion that
+# would otherwise wedge the session's byte offset forever.
+_STALL_SKIP_MIN_CYCLES = 3
 
 # Tool names whose buffered turn carries the Bug 2 live-prose surface. Mirrors
 # route_runtime.INTERACTIVE_TOOL_NAMES; duplicated to keep session_monitor free
@@ -247,6 +255,14 @@ class SessionMonitor:
         self._warned_legacy_session_map_keys = False
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
+        # Fix 11: per-session tracking of a non-empty line that repeatedly
+        # fails to parse, so a never-parseable line (crash-torn fusion) can
+        # be skipped instead of wedging the offset forever.
+        # session_id -> (line_start_offset, first_seen_ts, read_count).
+        # At most one entry per session (keyed by session_id; the offset is
+        # stored in the value and resets the entry when it moves). Popped on
+        # skip, on offset progress, and at every session-cleanup site.
+        self._unparseable_stalls: dict[str, tuple[int, float, int]] = {}
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -456,7 +472,40 @@ class SessionMonitor:
                         new_entries.append(data)
                         safe_offset = await f.tell()
                     elif line.strip():
-                        # Partial JSONL line — don't advance offset past it
+                        # Non-empty line that failed to parse. Usually a
+                        # partial trailing write — don't advance past it, retry
+                        # next cycle. But a NEVER-parseable line (a crash-torn
+                        # final line fused with the next append) would wedge
+                        # the session forever: track (offset, first_seen,
+                        # count) and skip the line once the file has grown
+                        # PAST its end (proof it isn't a trailing partial)
+                        # AND it survived >= _STALL_SKIP_MIN_CYCLES re-reads.
+                        line_start = safe_offset
+                        line_end = await f.tell()
+                        sid = session.session_id
+                        prev = self._unparseable_stalls.get(sid)
+                        if prev is None or prev[0] != line_start:
+                            entry = (line_start, time.time(), 1)
+                        else:
+                            entry = (prev[0], prev[1], prev[2] + 1)
+                        self._unparseable_stalls[sid] = entry
+                        # file_size > line_end ⟺ the line ended with '\n' and
+                        # bytes exist beyond it — NEVER skip a line still at
+                        # EOF (a genuine partial write mid-append).
+                        if entry[2] >= _STALL_SKIP_MIN_CYCLES and file_size > line_end:
+                            logger.warning(
+                                "Skipping unparseable JSONL bytes %d-%d in "
+                                "session %s after %d read cycles "
+                                "(stuck %.1fs); discarding the line",
+                                line_start,
+                                line_end,
+                                sid,
+                                entry[2],
+                                time.time() - entry[1],
+                            )
+                            safe_offset = line_end
+                            self._unparseable_stalls.pop(sid, None)
+                            continue
                         logger.warning(
                             "Partial JSONL line in session %s, will retry next cycle",
                             session.session_id,
@@ -467,6 +516,13 @@ class SessionMonitor:
                         safe_offset = await f.tell()
 
                 session.last_byte_offset = safe_offset
+
+                # Fix 11 hygiene: a previously-stuck line that eventually
+                # parsed (or any progress past the tracked offset) clears
+                # its stall entry so the dict stays bounded and accurate.
+                stall = self._unparseable_stalls.get(session.session_id)
+                if stall is not None and stall[0] < safe_offset:
+                    self._unparseable_stalls.pop(session.session_id, None)
 
         except OSError as e:
             logger.error("Error reading session file %s: %s", file_path, e)
@@ -816,6 +872,7 @@ class SessionMonitor:
             self.state.remove_session(k)
             self._file_mtimes.pop(k, None)
             self._pending_tools.pop(k, None)
+            self._unparseable_stalls.pop(k, None)
         if stale:
             logger.info(
                 "Removed %d sidechain tracker(s) for parent %s",
@@ -887,6 +944,10 @@ class SessionMonitor:
             for session_id in stale_sessions:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                # Fix 18: mirror the sidechain paths — the parent's pending
+                # tool_use carry + stall tracking must not outlive it.
+                self._pending_tools.pop(session_id, None)
+                self._unparseable_stalls.pop(session_id, None)
                 self._remove_sidechains_for_parent(session_id)
 
         # Defensive sweep: drop any sidechain trackers whose parent isn't
@@ -914,6 +975,7 @@ class SessionMonitor:
                 self.state.remove_session(sid)
                 self._file_mtimes.pop(sid, None)
                 self._pending_tools.pop(sid, None)
+                self._unparseable_stalls.pop(sid, None)
 
         self.state.save_if_dirty()
 
@@ -978,6 +1040,10 @@ class SessionMonitor:
             for session_id in sessions_to_remove:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                # Fix 18: mirror the sidechain paths — the parent's pending
+                # tool_use carry + stall tracking must not outlive it.
+                self._pending_tools.pop(session_id, None)
+                self._unparseable_stalls.pop(session_id, None)
                 self._remove_sidechains_for_parent(session_id)
             self.state.save_if_dirty()
 

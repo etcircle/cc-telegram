@@ -101,6 +101,208 @@ class TestReadNewLinesOffsetRecovery:
         assert len(result) == 1
 
 
+class TestUnparseableLineStallEscape:
+    """Fix 11 — a never-parseable JSONL line must not wedge a session forever.
+
+    A crash-torn final line fused with the next resume append starts with
+    ``{`` (so the corrupted-offset readline recovery never fires) and never
+    parses, so pre-fix the offset is pinned before it on every 2s poll and
+    all subsequent messages silently stop. The fix skips the stuck line once
+    (a) the file has grown PAST the line's end (proof it isn't a trailing
+    partial write) AND (b) >= N read cycles have elapsed.
+    """
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @staticmethod
+    def _fused_corrupt_line(make_jsonl_entry) -> str:
+        """A torn JSON prefix fused with the next record — starts with '{',
+        never parses."""
+        good = json.dumps(make_jsonl_entry(msg_type="assistant", content="lost"))
+        return '{"type":"assistant","mess' + good
+
+    @pytest.mark.asyncio
+    async def test_corrupt_line_skipped_after_n_cycles_and_growth(
+        self, monitor, tmp_path, make_jsonl_entry, caplog
+    ):
+        """THE STALL: corrupt fused line followed by valid records → after N
+        cycles the monitor skips the corrupt byte range (WARNING logged) and
+        the valid records deliver."""
+        jsonl_file = tmp_path / "session.jsonl"
+        corrupt = self._fused_corrupt_line(make_jsonl_entry)
+        good1 = json.dumps(make_jsonl_entry(msg_type="assistant", content="after one"))
+        good2 = json.dumps(make_jsonl_entry(msg_type="assistant", content="after two"))
+        jsonl_file.write_text(
+            corrupt + "\n" + good1 + "\n" + good2 + "\n", encoding="utf-8"
+        )
+
+        session = TrackedSession(
+            session_id="stall-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        # Bounded poll loop: pre-fix this NEVER progresses (proves the wedge);
+        # post-fix the skip fires within N cycles and the valid records arrive.
+        delivered: list[dict] = []
+        cycles = 0
+        for _ in range(6):
+            cycles += 1
+            delivered.extend(await monitor._read_new_lines(session, jsonl_file))
+            if delivered:
+                break
+
+        assert delivered, (
+            "valid records appended after a never-parseable line must "
+            f"eventually deliver (got nothing after {cycles} cycles — "
+            "the session is wedged forever)"
+        )
+        texts = [
+            b.get("text", "")
+            for d in delivered
+            for b in (d.get("message", {}).get("content") or [])
+            if isinstance(b, dict)
+        ]
+        joined = json.dumps(delivered)
+        assert "after one" in joined and "after two" in joined, texts
+        # Offset advanced to EOF — no re-read of the recovered range.
+        assert session.last_byte_offset == jsonl_file.stat().st_size
+        # The discarded byte range is logged at WARNING.
+        corrupt_end = len((corrupt + "\n").encode("utf-8"))
+        skip_logs = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING" and "Skipping unparseable" in r.getMessage()
+        ]
+        assert skip_logs, "skip must log the discarded byte range at WARNING"
+        assert f"0-{corrupt_end}" in skip_logs[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_trailing_partial_line_at_eof_never_skipped(
+        self, monitor, tmp_path, make_jsonl_entry, caplog
+    ):
+        """A genuinely-partial trailing write (no growth past it) is NEVER
+        skipped, regardless of how many cycles elapse — pin the conservative
+        behavior the old code was right about."""
+        jsonl_file = tmp_path / "session.jsonl"
+        good = json.dumps(make_jsonl_entry(msg_type="assistant", content="ok"))
+        partial = '{"type":"assistant","message":{"content":[{"ty'
+        jsonl_file.write_text(good + "\n" + partial, encoding="utf-8")
+
+        good_end = len((good + "\n").encode("utf-8"))
+        session = TrackedSession(
+            session_id="partial-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        first = await monitor._read_new_lines(session, jsonl_file)
+        assert len(first) == 1
+        assert session.last_byte_offset == good_end
+
+        for _ in range(8):
+            result = await monitor._read_new_lines(session, jsonl_file)
+            assert result == []
+            assert session.last_byte_offset == good_end
+
+        assert not any(
+            "Skipping unparseable" in r.getMessage() for r in caplog.records
+        ), "a trailing partial line at EOF must never be discarded"
+
+    @pytest.mark.asyncio
+    async def test_growth_past_but_fewer_than_n_cycles_not_yet_skipped(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        """File already grew past the corrupt line, but fewer than N read
+        cycles have elapsed → not yet skipped (the cycle bound is real)."""
+        jsonl_file = tmp_path / "session.jsonl"
+        corrupt = self._fused_corrupt_line(make_jsonl_entry)
+        good = json.dumps(make_jsonl_entry(msg_type="assistant", content="later"))
+        jsonl_file.write_text(corrupt + "\n" + good + "\n", encoding="utf-8")
+
+        session = TrackedSession(
+            session_id="cycle-bound-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        # Two cycles: growth-past is satisfied but the cycle bound is not.
+        for _ in range(2):
+            result = await monitor._read_new_lines(session, jsonl_file)
+            assert result == []
+            assert session.last_byte_offset == 0
+
+
+class TestParentCleanupPopsPendingTools:
+    """Fix 18 — both parent-session cleanup paths must pop _pending_tools
+    (and the fix-11 stall entries), mirroring the sidechain paths."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_flip_pops_pending_tools_and_stall_entries(
+        self, monitor, monkeypatch
+    ):
+        """/clear-style flip (_detect_and_cleanup_changes): the OLD session's
+        _pending_tools / stall entries must not leak."""
+        monitor._pending_tools["session-old"] = {"toolu_1": {"name": "Bash"}}
+        monitor._file_mtimes["session-old"] = 1.0
+        monitor._unparseable_stalls["session-old"] = (0, time.time(), 2)
+
+        monitor._last_session_map = {"@11": "session-old"}
+
+        async def fake_load_current_map():
+            return {"@11": "session-new"}
+
+        monkeypatch.setattr(monitor, "_load_current_session_map", fake_load_current_map)
+
+        await monitor._detect_and_cleanup_changes()
+
+        assert "session-old" not in monitor._pending_tools, (
+            "parent cleanup must pop _pending_tools (sidechain paths do — "
+            "the asymmetry is the leak)"
+        )
+        assert "session-old" not in monitor._unparseable_stalls
+        assert "session-old" not in monitor._file_mtimes
+
+    @pytest.mark.asyncio
+    async def test_startup_cleanup_pops_pending_tools_and_stall_entries(
+        self, monitor, monkeypatch
+    ):
+        """Startup path (_cleanup_all_stale_sessions): same pops."""
+        monitor.state.update_session(
+            TrackedSession(
+                session_id="stale-parent",
+                file_path="/tmp/stale.jsonl",
+            )
+        )
+        monitor._pending_tools["stale-parent"] = {"toolu_2": {"name": "Read"}}
+        monitor._file_mtimes["stale-parent"] = 1.0
+        monitor._unparseable_stalls["stale-parent"] = (0, time.time(), 1)
+
+        async def fake_load_current_map():
+            return {}
+
+        monkeypatch.setattr(monitor, "_load_current_session_map", fake_load_current_map)
+
+        await monitor._cleanup_all_stale_sessions()
+
+        assert monitor.state.get_session("stale-parent") is None
+        assert "stale-parent" not in monitor._pending_tools
+        assert "stale-parent" not in monitor._unparseable_stalls
+        assert "stale-parent" not in monitor._file_mtimes
+
+
 class TestRegisterSession:
     """Tests for SessionMonitor.register_session pre-registration."""
 
