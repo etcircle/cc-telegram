@@ -15,6 +15,7 @@ from typing import Any, Literal, cast
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 from cctelegram.handlers import (
@@ -51,6 +52,7 @@ from cctelegram.terminal_parser import (
     _pane_looks_like_picker,
     resolve_ask_form,
 )
+from cctelegram.tmux_manager import tmux_manager as _tmux_singleton
 
 from . import (
     WRONG_USER_PICK_TEXT,
@@ -201,6 +203,107 @@ async def _rerender_picker(
     )
 
 
+@dataclass(frozen=True)
+class _PickPaneOutcome:
+    """Structured outcome of the locked pane-critical dispatch section.
+
+    ``kind`` is the terminal ledger state already recorded inside the lock;
+    ``reason`` carries the bail sub-reason (None on a confirmed dispatch). The
+    unlocked response section renders the callback answer + re-render from it.
+    """
+
+    kind: Literal["dispatched", "not_advanced", "commit_unconfirmed"]
+    reason: str | None = None
+
+
+def _window_send_lock(tmux_mgr: Any, window_id: str) -> asyncio.Lock:
+    """Resolve the per-window send lock for ``window_id``.
+
+    Production passes the real ``TmuxManager`` (which owns the registry —
+    see the lifecycle + leaf rule in ``tmux_manager``'s module docstring);
+    test fakes that don't implement ``window_send_lock`` fall back to the
+    module singleton's registry so the dispatch still serializes per window.
+    """
+    getter = getattr(tmux_mgr, "window_send_lock", None)
+    if getter is not None:
+        return cast(asyncio.Lock, getter(window_id))
+    return _tmux_singleton.window_send_lock(window_id)
+
+
+def _lock_busy(lock: asyncio.Lock) -> bool:
+    """True when the window send lock is held OR has live (non-cancelled) waiters.
+
+    ``lock.locked()`` alone is NOT a busy test (Hermes Wave-3b P2-1):
+    ``release()`` sets the lock free and wakes the first waiter, but until the
+    event loop schedules that waiter it sits in the lock's waiter queue with
+    ``locked() == False``. A bare ``locked()`` check in that gap, followed by
+    ``async with lock``, QUEUES behind the pending waiter and fires the
+    control key late — violating reject-rather-than-queue.
+
+    This reads the CPython-private ``asyncio.Lock._waiters`` deque because
+    there is no public waiter introspection, and the alternative —
+    ``wait_for(lock.acquire(), 0)`` — is scheduling-dependent even for a free
+    lock. The ``getattr`` guard means a future CPython rename degrades to the
+    bare ``locked()`` behavior; the contract test
+    (``test_lock_busy_cpython_contract_free_with_waiter``) constructs the
+    free-with-waiter state against the REAL ``asyncio.Lock`` so such a rename
+    breaks loudly in CI, not silently. Cancelled waiters don't count — that
+    mirrors ``acquire()``'s own all-cancelled synchronous fast path.
+
+    A not-busy verdict followed immediately by ``async with lock`` (with NO
+    await between them) remains atomic on the event loop: a free lock with no
+    live waiters acquires synchronously, so the helper+acquire pair is
+    yield-free — a genuine try-acquire.
+    """
+    if lock.locked():
+        return True
+    waiters = getattr(lock, "_waiters", None)  # CPython asyncio.Lock internal
+    return bool(waiters) and any(not w.cancelled() for w in waiters)
+
+
+# Wave 3b reject-if-held: the busy answer for a single-key control arriving
+# while a multi-keystroke pane transaction (e.g. ``_dispatch_pick``) holds the
+# window's send lock. Shared with the /esc command and the screenshot
+# quick-key path (bot.py / bash.py).
+WINDOW_BUSY_TEXT = "⏳ Action in progress — try again in a second"
+
+
+async def _control_key_or_busy(
+    query: Any,
+    tmux_mgr: Any,
+    window_id: str,
+    key: str,
+    *,
+    literal: bool = False,
+) -> bool | None:
+    """Try-acquire the per-window send lock and send ONE control key under it.
+
+    Wave 3b reject-if-held for the interactive control paths (Up/Down/Left/
+    Right/Escape/Enter/Space/Tab and the ``aqt:`` toggle digit). Returns None
+    when the lock is held — the busy answer has already been sent and the
+    caller must return without dispatching. Otherwise returns the
+    ``send_keys`` bool.
+
+    This is option (b) — a genuine try-acquire, not a bare ``locked()``
+    peek-then-send: the ``_lock_busy`` check (held OR live waiters — the
+    release→waiter-wakeup gap counts as busy) is immediately followed by the
+    acquire with NO await between them, so on the single-threaded event loop
+    the pair is atomic (``asyncio.Lock.acquire`` on a free, waiter-less lock
+    does not yield). The key is then sent UNDER the lock, so it can never
+    interleave inside ``_dispatch_pick_pane_locked``'s verify→Enter critical
+    section — the Hermes R2 P1-1 false-``dispatched`` class a plain
+    peek-then-send would leave open (peek free → dispatch acquires → control
+    key lands mid-transaction). The lock stays a leaf: ``safe_answer`` runs
+    only on the reject path, never while the lock is held.
+    """
+    lock = _window_send_lock(tmux_mgr, window_id)
+    if _lock_busy(lock):
+        await safe_answer(query, WINDOW_BUSY_TEXT)
+        return None
+    async with lock:
+        return await tmux_mgr.send_keys(window_id, key, enter=False, literal=literal)
+
+
 async def _dispatch_pick(
     *,
     query: Any,
@@ -240,25 +343,70 @@ async def _dispatch_pick(
     handler FALLS THROUGH on a re-tap, safe). Once ``Enter`` is sent the outcome
     is either a confirmed ``dispatched`` (idempotency lock) or ``commit_unconfirmed``
     (refresh-only, never auto-redispatch — no re-tap can re-send the commit key).
+
+    Concurrency (Wave 3a, finding 6 / Hermes P1-3): the whole pane-critical
+    section — cursor find, nav sends, settles, verify capture, Enter, confirm
+    capture, ``_classify_advance``, and the terminal ledger write (file I/O,
+    deliberately INSIDE so a concurrent tap can't race the outcome record) —
+    runs in ``_dispatch_pick_pane_locked`` under the per-window send lock. The
+    Telegram response (``safe_answer`` + ``_rerender_picker``) runs strictly
+    AFTER release: the lock is a leaf and no Telegram I/O may run while held.
+    """
+    async with _window_send_lock(tmux_manager, w.window_id):
+        outcome = await _dispatch_pick_pane_locked(
+            user=user,
+            tmux_manager=tmux_manager,
+            w=w,
+            window_id=window_id,
+            fingerprint=fingerprint,
+            option_number=option_number,
+            option_label=option_label,
+            is_review_submit=is_review_submit,
+            current_form=current_form,
+            ledger_key=ledger_key,
+        )
+    # ── Unlocked response section: Telegram I/O only after lock release. ──
+    if outcome.kind == "dispatched":
+        await safe_answer(query, f"{option_number}. {option_label[:32]}")
+    elif outcome.kind == "not_advanced":
+        await safe_answer(query, "Action not registered; refreshing card.")
+    else:  # commit_unconfirmed
+        await safe_answer(query, "Action sent; refreshing card.")
+    await _rerender_picker(context, user, tmux_manager, adapters, window_id, thread_id)
+
+
+async def _dispatch_pick_pane_locked(
+    *,
+    user: Any,
+    tmux_manager: Any,
+    w: Any,
+    window_id: str,
+    fingerprint: str,
+    option_number: int,
+    option_label: str,
+    is_review_submit: bool,
+    current_form: AskUserQuestionForm,
+    ledger_key: str | None,
+) -> _PickPaneOutcome:
+    """Pane-critical section of the pick dispatch — caller holds the window lock.
+
+    Performs the nav→settle→verify→Enter→settle→confirm keystroke transaction
+    plus the TERMINAL ledger write (``dispatched`` / ``not_advanced`` /
+    ``commit_unconfirmed``), and NO Telegram I/O. Returns the structured
+    outcome the unlocked response section in ``_dispatch_pick`` renders from.
     """
 
-    async def _bail_not_advanced(reason: str) -> None:
+    def _bail_not_advanced(reason: str) -> _PickPaneOutcome:
         if ledger_key is not None:
             auq_ledger.record(ledger_key, state="not_advanced", failed_reason=reason)
-        await safe_answer(query, "Action not registered; refreshing card.")
-        await _rerender_picker(
-            context, user, tmux_manager, adapters, window_id, thread_id
-        )
+        return _PickPaneOutcome("not_advanced", reason)
 
-    async def _bail_commit_unconfirmed(reason: str) -> None:
+    def _bail_commit_unconfirmed(reason: str) -> _PickPaneOutcome:
         if ledger_key is not None:
             auq_ledger.record(
                 ledger_key, state="commit_unconfirmed", failed_reason=reason
             )
-        await safe_answer(query, "Action sent; refreshing card.")
-        await _rerender_picker(
-            context, user, tmux_manager, adapters, window_id, thread_id
-        )
+        return _PickPaneOutcome("commit_unconfirmed", reason)
 
     target = option_number
     cur = next((o for o in current_form.options if o.cursor), None)
@@ -269,8 +417,7 @@ async def _dispatch_pick(
             window_id,
             target,
         )
-        await _bail_not_advanced("cursor_unknown")
-        return
+        return _bail_not_advanced("cursor_unknown")
 
     # MONOTONIC navigation: step the cursor one row at a time toward the target —
     # never a wrap-shortcut. ``Down`` increases the number, ``Up`` decreases it.
@@ -286,8 +433,7 @@ async def _dispatch_pick(
                 user.id,
                 window_id,
             )
-            await _bail_not_advanced("nav_send_failed")
-            return
+            return _bail_not_advanced("nav_send_failed")
 
     await asyncio.sleep(NAV_SETTLE)
 
@@ -316,8 +462,7 @@ async def _dispatch_pick(
             or (vform.review_submit_dispatchable(option_label) and vc.number == 1)
         )
     ):
-        await _bail_not_advanced("verify_failed")
-        return
+        return _bail_not_advanced("verify_failed")
 
     # Cursor confirmed on target — commit with the version-stable Enter. A False
     # return means it never reached tmux (contract: send_keys False == not sent),
@@ -330,23 +475,20 @@ async def _dispatch_pick(
             user.id,
             window_id,
         )
-        await _bail_not_advanced("commit_send_failed")
-        return
+        return _bail_not_advanced("commit_send_failed")
 
     await asyncio.sleep(COMMIT_SETTLE)
 
     # ── Enter WAS sent: from here a failure is at worst ``commit_unconfirmed`` ──
     pane2 = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
     if pane2 is None:
-        await _bail_commit_unconfirmed("confirm_capture_failed")
-        return
+        return _bail_commit_unconfirmed("confirm_capture_failed")
     asource = auq_source.resolve_auq_source(window_id, None, pane2)
     aform = resolve_ask_form(asource.payload, pane2) if pane2 else None
     if aform is None:
         if _pane_looks_like_picker(pane2):
             # Markers present but unparseable → AMBIGUOUS; never record dispatched.
-            await _bail_commit_unconfirmed("confirm_parse_failed")
-            return
+            return _bail_commit_unconfirmed("confirm_parse_failed")
         resolved = True  # picker positively GONE → the tool resolved.
     else:
         resolved = False
@@ -355,8 +497,7 @@ async def _dispatch_pick(
         option_number=option_number, is_review_submit=is_review_submit
     )
     if not _classify_advance(current_form, confirm_entry, aform, resolved):
-        await _bail_commit_unconfirmed("commit_unconfirmed")
-        return
+        return _bail_commit_unconfirmed("commit_unconfirmed")
 
     # CONFIRMED expected advance — record the terminal ``dispatched`` (the
     # idempotency lock). Recorded OUTSIDE any further send so a later failure
@@ -370,8 +511,7 @@ async def _dispatch_pick(
         option_number,
         option_label[:24],
     )
-    await safe_answer(query, f"{option_number}. {option_label[:32]}")
-    await _rerender_picker(context, user, tmux_manager, adapters, window_id, thread_id)
+    return _PickPaneOutcome("dispatched")
 
 
 async def _attempt_pick_recovery(
@@ -545,9 +685,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        nav_ok = await tmux_manager.send_keys(
-            w.window_id, "Up", enter=False, literal=False
-        )
+        nav_ok = await _control_key_or_busy(query, tmux_manager, w.window_id, "Up")
+        if nav_ok is None:
+            return
         logger.info(
             "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
             user.id,
@@ -577,9 +717,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        nav_ok = await tmux_manager.send_keys(
-            w.window_id, "Down", enter=False, literal=False
-        )
+        nav_ok = await _control_key_or_busy(query, tmux_manager, w.window_id, "Down")
+        if nav_ok is None:
+            return
         logger.info(
             "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
             user.id,
@@ -609,9 +749,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        nav_ok = await tmux_manager.send_keys(
-            w.window_id, "Left", enter=False, literal=False
-        )
+        nav_ok = await _control_key_or_busy(query, tmux_manager, w.window_id, "Left")
+        if nav_ok is None:
+            return
         logger.info(
             "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
             user.id,
@@ -641,9 +781,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        nav_ok = await tmux_manager.send_keys(
-            w.window_id, "Right", enter=False, literal=False
-        )
+        nav_ok = await _control_key_or_busy(query, tmux_manager, w.window_id, "Right")
+        if nav_ok is None:
+            return
         logger.info(
             "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
             user.id,
@@ -680,9 +820,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             return
         if w is None:
             return
-        nav_ok = await tmux_manager.send_keys(
-            w.window_id, "Escape", enter=False, literal=False
-        )
+        nav_ok = await _control_key_or_busy(query, tmux_manager, w.window_id, "Escape")
+        if nav_ok is None:
+            return
         logger.info(
             "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
             user.id,
@@ -706,9 +846,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        nav_ok = await tmux_manager.send_keys(
-            w.window_id, "Enter", enter=False, literal=False
-        )
+        nav_ok = await _control_key_or_busy(query, tmux_manager, w.window_id, "Enter")
+        if nav_ok is None:
+            return
         logger.info(
             "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
             user.id,
@@ -738,9 +878,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        nav_ok = await tmux_manager.send_keys(
-            w.window_id, "Space", enter=False, literal=False
-        )
+        nav_ok = await _control_key_or_busy(query, tmux_manager, w.window_id, "Space")
+        if nav_ok is None:
+            return
         logger.info(
             "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
             user.id,
@@ -770,9 +910,9 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         )
         if w is None:
             return
-        nav_ok = await tmux_manager.send_keys(
-            w.window_id, "Tab", enter=False, literal=False
-        )
+        nav_ok = await _control_key_or_busy(query, tmux_manager, w.window_id, "Tab")
+        if nav_ok is None:
+            return
         logger.info(
             "AUQ_TAP nav_dispatch user=%d window=%s key=%s send_keys_ok=%s",
             user.id,
@@ -954,9 +1094,11 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             )
             return
 
-        toggle_ok = await tmux_manager.send_keys(
-            w.window_id, str(entry.option_number), enter=False, literal=True
+        toggle_ok = await _control_key_or_busy(
+            query, tmux_manager, w.window_id, str(entry.option_number), literal=True
         )
+        if toggle_ok is None:
+            return
         if not toggle_ok:
             logger.warning(
                 "Toggle-token dispatch: tmux send_keys(digit=%d) returned False for window=%s user=%d",
