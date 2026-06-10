@@ -59,7 +59,6 @@ def test_classify_rate_limited() -> None:
     "message",
     [
         "Bad Request: chat not found",
-        "Bad Request: message to edit not found",
         "Bad Request: can't parse entities",
         "completely unknown error string",
     ],
@@ -111,6 +110,7 @@ def test_classify_outcome_values_are_stable() -> None:
     assert TopicSendOutcome.TOPIC_CLOSED.value == "TOPIC_CLOSED"
     assert TopicSendOutcome.FORBIDDEN.value == "FORBIDDEN"
     assert TopicSendOutcome.RATE_LIMITED.value == "RATE_LIMITED"
+    assert TopicSendOutcome.MESSAGE_NOT_FOUND.value == "MESSAGE_NOT_FOUND"
     assert TopicSendOutcome.OTHER.value == "OTHER"
 
 

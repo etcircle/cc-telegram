@@ -245,21 +245,29 @@ Handler modules (handlers/):
                         read and unlink survives); unlink_for_session is the
                         teardown seam; gc_stale is the 24h startup backstop
                         with the injected is_live_session conservative-skip.
-  dashboard.py        ─ Wave C cross-topic dashboard: one owner-filtered overview
-                        message per (chat_id, owner). Owns /dashboard (claim the
-                        invoking topic as host; re-run elsewhere MOVES it;
-                        /dashboard pin is opt-in), the pure renderer
-                        (render_dashboard — bindings filtered to the owner +
-                        route_runtime.snapshot per route; 🔔 = WAITING_ON_USER or
-                        idle with last_assistant_turn_ended_at >
-                        last_user_turn_at, both non-None; ages minute-coarse from
-                        the monotonic last_event_at), and the PULL-ONLY refresh
-                        driver maybe_refresh_dashboards (called once per
-                        status-poll sweep; rendered-content hash → edit only on
-                        change, so run-state transitions AND bind/unbind/rename
-                        repaint without an observer; MESSAGE_NOT_MODIFIED =
-                        success; edit-404 self-heals via re-send +
-                        update_dashboard_msg_id; a topic-shaped outcome clears
+  dashboard.py        ─ Wave C cross-topic dashboard: one owner+chat-scoped
+                        overview message per (chat_id, owner). Owns /dashboard
+                        (claim the invoking topic as host; re-run elsewhere
+                        MOVES it; /dashboard pin is opt-in), the pure renderer
+                        (render_dashboard(owner_id, chat_id) — bindings filtered
+                        to the owner AND to the dashboard's own chat via
+                        session_manager.get_group_chat_id, FAIL CLOSED: an
+                        unresolvable chat is excluded, never leaked cross-forum
+                        (hermes review P1) + route_runtime.snapshot per route;
+                        🔔 = WAITING_ON_USER or idle with
+                        last_assistant_turn_ended_at > last_user_turn_at, both
+                        non-None; ages minute-coarse from the monotonic
+                        last_event_at), and the PULL-ONLY refresh driver
+                        maybe_refresh_dashboards (called once per status-poll
+                        sweep; rendered-content hash → edit only on change, so
+                        run-state transitions AND bind/unbind/rename repaint
+                        without an observer; MESSAGE_NOT_MODIFIED = success;
+                        MESSAGE_NOT_FOUND — the distinctly-classified "message
+                        to edit not found" — self-heals via re-send +
+                        update_dashboard_msg_id; a generic OTHER edit failure
+                        only logs and retries next sweep, NEVER re-sends
+                        (re-sending on a transient would orphan the still-live
+                        message — review P2-2); a topic-shaped outcome clears
                         the record — never a self-heal loop into a dead topic).
                         A per-(chat_id, owner_id) asyncio.Lock serializes the
                         whole Telegram-I/O-spanning claim/move/self-heal flow
@@ -272,8 +280,14 @@ Handler modules (handlers/):
                         SessionManager-owned (state.json "dashboards" key, sync
                         get/set/clear/update_msg_id/set_pinned methods through
                         the ONE _load_state/_save_state path);
-                        clear_dashboards_in_thread is the topic-teardown seam
-                        wired from cleanup.clear_topic_state.
+                        clear_dashboards_in_thread(thread_id, chat_id=…) is the
+                        CHAT-SCOPED topic-teardown seam (thread ids are
+                        chat-local — review P2-3; chat_id=None falls back to the
+                        all-chats sweep with a warning), wired from
+                        cleanup.clear_topic_state (chat resolved via
+                        group_chat_ids) AND bot.topic_closed_handler's
+                        no-binding branch so a dedicated binding-less dashboard
+                        host topic is cleaned on close (review P2-4).
   pick_intent.py      ─ D2 restart-recovery: durable per-callback-TOKEN AUQ pick
                         mint-intent store (leaf; imports only utils). Append-only
                         JSONL (row + tombstone lines) at pick_intent.jsonl, 24h

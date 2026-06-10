@@ -64,7 +64,7 @@ from .handlers.directory_browser import (
 )
 from .handlers.auq_ledger import release_window as auq_ledger_release_window
 from .handlers.cleanup import clear_topic_state
-from .handlers.dashboard import dashboard_command
+from .handlers.dashboard import clear_dashboards_in_thread, dashboard_command
 from .handlers.history import send_history
 from .handlers.inbound_aggregator import (
     aggregator_flush_route,
@@ -574,6 +574,14 @@ async def topic_closed_handler(
     else:
         logger.debug(
             "Topic closed: no binding (user=%d, thread=%d)", user.id, thread_id
+        )
+        # Hermes Wave C review P2-4: a dedicated dashboard host topic has no
+        # bound window, so the binding-centric clear_topic_state above never
+        # runs for it — still drop any dashboard record hosted in this
+        # (chat, thread). The closed-topic update carries the chat directly.
+        chat = update.effective_chat
+        clear_dashboards_in_thread(
+            thread_id, chat_id=chat.id if chat is not None else None
         )
 
 

@@ -553,6 +553,16 @@ class SessionManager:
                 return group_id
         return user_id
 
+    def get_group_chat_id(self, user_id: int, thread_id: int | None) -> int | None:
+        """Return the stored group chat_id for (user, thread), or None.
+
+        Unlike ``resolve_chat_id`` this NEVER falls back to ``user_id`` — it
+        is the fail-closed lookup for chat-scoped surfaces (the Wave C
+        dashboard render/teardown): an unresolvable mapping must mean
+        "exclude", never "assume some chat".
+        """
+        return self.group_chat_ids.get(f"{user_id}:{thread_id or 0}")
+
     # --- Dashboard record management (Wave C cross-topic dashboard) ---
     #
     # One dashboard message per (chat_id, owner_user_id). All methods are

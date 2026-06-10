@@ -112,8 +112,14 @@ async def clear_topic_state(
 
     # Wave C: a dashboard hosted in this thread dies with the topic (the host
     # topic may have no bound window, so binding-centric cleanup alone would
-    # miss it — pre-C fix 3). The user re-runs /dashboard elsewhere.
-    clear_dashboards_in_thread(thread_id)
+    # miss it — pre-C fix 3). Thread ids are CHAT-LOCAL, so the clear is
+    # scoped to this topic's chat via the persisted group_chat_ids mapping
+    # (review P2-3); an unresolvable chat falls back to the all-chats sweep
+    # with a warning inside clear_dashboards_in_thread. The user re-runs
+    # /dashboard elsewhere.
+    clear_dashboards_in_thread(
+        thread_id, chat_id=session_manager.get_group_chat_id(user_id, thread_id)
+    )
 
     # Tear down ALL route_runtime state for this topic — run-state, open_tools,
     # context_usage, and pane_interactive_pending. ``teardown_route`` above only

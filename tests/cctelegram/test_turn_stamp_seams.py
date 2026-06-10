@@ -104,3 +104,72 @@ def test_effort_seam_uses_the_shared_stamp_function():
     from cctelegram.callback_dispatcher import effort
 
     assert effort.set_route_user_turn_at is message_queue.set_route_user_turn_at
+
+
+@pytest.mark.asyncio
+async def test_effort_callback_end_to_end_stamps_pre_send():
+    """End-to-end through the real /effort callback executor: the user-turn
+    stamp must already be in BOTH stores at the instant send_to_window fires
+    (PRE-send — a fast prose→AUQ turn must not beat the stamp), with the
+    same-ts mirror into route_runtime (hermes review P3)."""
+    from types import SimpleNamespace
+
+    from cctelegram.callback_dispatcher import effort as effort_mod
+
+    user_id, thread_id, window_id = 1, 10, "@5"
+    stamp_at_send: dict[str, float | None] = {}
+
+    class FakeQuery:
+        def __init__(self) -> None:
+            self.data = f"eff:medium:{window_id}"
+            self.message = SimpleNamespace(message_thread_id=thread_id)
+
+        async def answer(self, *args, **kwargs) -> None:
+            pass
+
+        async def edit_message_text(self, *args, **kwargs) -> None:
+            pass
+
+    query = FakeQuery()
+    authorized = SimpleNamespace(
+        command=SimpleNamespace(data=query.data),
+        ctx=SimpleNamespace(
+            query=query,
+            user=SimpleNamespace(id=user_id),
+            user_id=user_id,
+            thread_id=thread_id,
+        ),
+    )
+
+    async def send_to_window(_wid: str, _text: str):
+        # Capture the stamp AT the send instant — must already be there.
+        stamp_at_send["mq"] = message_queue.peek_route_user_turn_at(
+            user_id, thread_id, window_id
+        )
+        stamp_at_send["rr"] = route_runtime.snapshot(
+            (user_id, thread_id, window_id)
+        ).last_user_turn_at
+        return True, "ok"
+
+    adapters = SimpleNamespace(
+        session_manager=SimpleNamespace(
+            resolve_window_for_thread=lambda _u, _t: window_id,
+            send_to_window=send_to_window,
+        ),
+        tmux_manager=SimpleNamespace(
+            find_window_by_id=AsyncMock(
+                return_value=SimpleNamespace(window_id=window_id)
+            )
+        ),
+        route_runtime=SimpleNamespace(mark_inbound_sent=AsyncMock()),
+    )
+
+    await effort_mod.execute_effort_callback(authorized, adapters)
+
+    assert stamp_at_send["mq"] is not None, "stamp missing at send time (post-send?)"
+    assert stamp_at_send["rr"] == stamp_at_send["mq"]
+    # And the stamps persist after the callback completes.
+    assert (
+        message_queue.peek_route_user_turn_at(user_id, thread_id, window_id)
+        == stamp_at_send["mq"]
+    )

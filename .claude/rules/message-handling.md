@@ -487,7 +487,7 @@ throughout (no observer; c313657 forbidden).
 
 ## Cross-topic dashboard (Wave C)
 
-One passive, owner-filtered overview message per `(chat_id, owner_user_id)`,
+One passive, owner+chat-scoped overview message per `(chat_id, owner_user_id)`,
 owned by `handlers/dashboard.py` and persisted as the `dashboards` key in
 `state.json` through SessionManager's single `_load_state`/`_save_state` path
 (sync named mutators: `get/set/clear_dashboard`, `update_dashboard_msg_id`,
@@ -502,17 +502,36 @@ loser-cleanup re-read (pre-C fix 1).
 1s status-poll sweep (called once per sweep, not per binding — no observer,
 c313657 forbidden). It renders the owner's view from
 `session_manager.iter_thread_bindings()` + `route_runtime.snapshot(route)`,
-hashes the rendered body, and edits only on change — the hash covers state
+**chat-scoped** (hermes review P1): `render_dashboard(owner_id, chat_id)`
+includes only bindings whose persisted `group_chat_ids` mapping
+(`session_manager.get_group_chat_id`) resolves to the dashboard's own chat —
+FAIL CLOSED, an unresolvable chat is excluded from every dashboard, so a
+dashboard in forum A never exposes forum B's topic names/states. It hashes the
+rendered body and edits only on change — the hash covers state
 lines, display names, and the binding set, so run-state transitions AND
 bind/unbind/rename all repaint without a dedicated trigger; ages are
 minute-coarse so the hash is stable within the minute (the implicit 60s age
-tick). `MESSAGE_NOT_MODIFIED` is success (W8 precedent); edit-404 self-heals
-(re-send + `update_dashboard_msg_id` under the lock); a topic-shaped outcome
+tick). `MESSAGE_NOT_MODIFIED` is success (W8 precedent). Self-heal (re-send +
+`update_dashboard_msg_id` under the lock) fires ONLY on `MESSAGE_NOT_FOUND` —
+the distinctly-classified "message to edit not found" `BadRequest` in
+`message_sender._classify_bad_request` — meaning the message is provably
+deleted; a generic `OTHER` edit failure (timeout / unclassified transient)
+logs and leaves the persisted msg_id + render hash alone so the next sweep
+retries the edit (review P2-2 — re-sending on a transient would orphan the
+still-live old message, unboundedly). The same rule applies to the same-topic
+`/dashboard` rerun. A topic-shaped outcome
 (`TOPIC_NOT_FOUND`/`TOPIC_CLOSED`/`FORBIDDEN`) clears the record — never a
-self-heal loop into a dead topic — and `cleanup.clear_topic_state` →
-`dashboard.clear_dashboards_in_thread(thread_id)` covers the host topic
-closing (the host may have no bound window, so binding-centric cleanup alone
-would miss it; pre-C fix 3).
+self-heal loop into a dead topic — and the **chat-scoped** teardown seam
+`dashboard.clear_dashboards_in_thread(thread_id, chat_id=…)` covers the host
+topic closing: thread ids are chat-local (review P2-3), so only the
+`(chat_id, thread_id)` records are cleared (`chat_id=None` — genuinely
+unresolvable — falls back to the old all-chats sweep WITH a warning, never
+stranding a record silently). Wired from `cleanup.clear_topic_state` (chat
+resolved via `group_chat_ids`) AND from `bot.topic_closed_handler`'s
+no-binding branch (review P2-4): a dedicated dashboard host topic has no
+bound window, so without that branch its record would survive close until the
+send-failure backstop (the host may have no bound window, so binding-centric
+cleanup alone would miss it; pre-C fix 3).
 
 **🔔 unanswered-turn derivation**: a route renders 🔔 when `run_state` is
 `WAITING_ON_USER`, OR when it is idle and

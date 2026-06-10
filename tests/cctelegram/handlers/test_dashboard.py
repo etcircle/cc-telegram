@@ -68,8 +68,11 @@ def _evt(
     )
 
 
-def _bind(owner: int, thread_id: int, wid: str, name: str) -> None:
+def _bind(owner: int, thread_id: int, wid: str, name: str, chat_id: int = CHAT) -> None:
     session_manager.bind_thread(owner, thread_id, wid, name)
+    # render_dashboard is chat-scoped (review P1) — resolve the binding's
+    # chat like the production message seams do.
+    session_manager.set_group_chat_id(owner, thread_id, chat_id)
 
 
 async def _make_state(route, state: str) -> None:
@@ -105,7 +108,7 @@ async def _make_state(route, state: str) -> None:
 
 
 async def test_renderer_empty_state():
-    text = dashboard.render_dashboard(UID)
+    text = dashboard.render_dashboard(UID, CHAT)
     assert "No bound topics." in text
 
 
@@ -117,7 +120,7 @@ async def test_renderer_groups_needs_attention_first():
     await _make_state((UID, 11, "@2"), "running")
     await _make_state((UID, 12, "@3"), "waiting")
 
-    text = dashboard.render_dashboard(UID)
+    text = dashboard.render_dashboard(UID, CHAT)
     lines = [ln for ln in text.splitlines() if ln.startswith(("🔔", "🟡", "⚪"))]
     assert len(lines) == 3
     assert lines[0].startswith("🔔") and "ask-repo" in lines[0]
@@ -131,7 +134,7 @@ async def test_renderer_groups_needs_attention_first():
 async def test_renderer_waiting_on_user_is_attention():
     _bind(UID, 10, "@1", "repo")
     await _make_state((UID, 10, "@1"), "waiting")
-    text = dashboard.render_dashboard(UID)
+    text = dashboard.render_dashboard(UID, CHAT)
     assert "🔔 repo — waiting on you" in text
 
 
@@ -145,7 +148,7 @@ async def test_renderer_unanswered_turn_is_attention():
     )
     snap = route_runtime.snapshot(route)
     assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
-    text = dashboard.render_dashboard(UID)
+    text = dashboard.render_dashboard(UID, CHAT)
     assert "🔔 repo — waiting on you" in text
 
 
@@ -159,7 +162,7 @@ async def test_renderer_answered_turn_is_idle():
     route_runtime.stamp_user_turn(route, 2000.0)
     # Pane idle reconciliation leaves the route idle with both stamps set.
     await route_runtime.mark_pane_idle(route)
-    text = dashboard.render_dashboard(UID)
+    text = dashboard.render_dashboard(UID, CHAT)
     assert "⚪ repo — idle" in text
     assert "🔔" not in text
 
@@ -172,12 +175,12 @@ async def test_renderer_missing_stamp_never_classifies_unanswered():
         route, _evt("assistant", "text", stop_reason="end_turn", timestamp=1500.0)
     )
     assert route_runtime.snapshot(route).last_user_turn_at is None
-    assert "🔔" not in dashboard.render_dashboard(UID)
+    assert "🔔" not in dashboard.render_dashboard(UID, CHAT)
 
     route_runtime.reset_for_tests()
     # Only the user stamp (no assistant stamp).
     route_runtime.stamp_user_turn(route, 1000.0)
-    assert "🔔" not in dashboard.render_dashboard(UID)
+    assert "🔔" not in dashboard.render_dashboard(UID, CHAT)
 
 
 async def test_renderer_ages_are_minute_coarse():
@@ -185,13 +188,13 @@ async def test_renderer_ages_are_minute_coarse():
     _bind(UID, 10, "@1", "repo")
     await _make_state(route, "running")
     base = route_runtime.snapshot(route).last_event_at
-    t1 = dashboard.render_dashboard(UID, now_mono=base + 125.0)
+    t1 = dashboard.render_dashboard(UID, CHAT, now_mono=base + 125.0)
     assert "2m" in t1
     # Within the same minute bucket → identical render (hash-stable).
-    t2 = dashboard.render_dashboard(UID, now_mono=base + 170.0)
+    t2 = dashboard.render_dashboard(UID, CHAT, now_mono=base + 170.0)
     assert t1 == t2
     # Hours past 60 minutes.
-    t3 = dashboard.render_dashboard(UID, now_mono=base + 2 * 3600 + 30.0)
+    t3 = dashboard.render_dashboard(UID, CHAT, now_mono=base + 2 * 3600 + 30.0)
     assert "2h" in t3
 
 
@@ -199,14 +202,14 @@ async def test_renderer_running_tool_marks_tool():
     route = (UID, 10, "@1")
     _bind(UID, 10, "@1", "repo")
     await _make_state(route, "running_tool")
-    text = dashboard.render_dashboard(UID)
+    text = dashboard.render_dashboard(UID, CHAT)
     assert "🟡 repo — running (tool" in text
 
 
 async def test_renderer_filters_to_owner():
     _bind(UID, 10, "@1", "mine")
     _bind(99999, 20, "@2", "theirs")
-    text = dashboard.render_dashboard(UID)
+    text = dashboard.render_dashboard(UID, CHAT)
     assert "mine" in text
     assert "theirs" not in text
 
@@ -569,10 +572,8 @@ async def test_clear_topic_state_keeps_dashboard_in_other_thread():
 async def test_renderer_scoped_to_chat_no_cross_chat_leak():
     """P1: same owner, bindings in two forums — each chat's dashboard lists
     ONLY that chat's topics (topic names/states must not leak across chats)."""
-    _bind(UID, 10, "@1", "alpha-repo")
-    session_manager.set_group_chat_id(UID, 10, CHAT)
-    _bind(UID, 20, "@2", "beta-repo")
-    session_manager.set_group_chat_id(UID, 20, CHAT_B)
+    _bind(UID, 10, "@1", "alpha-repo", chat_id=CHAT)
+    _bind(UID, 20, "@2", "beta-repo", chat_id=CHAT_B)
 
     text_a = dashboard.render_dashboard(UID, CHAT)
     text_b = dashboard.render_dashboard(UID, CHAT_B)
@@ -585,9 +586,9 @@ async def test_renderer_scoped_to_chat_no_cross_chat_leak():
 async def test_renderer_excludes_unresolvable_chat_binding():
     """P1 fail-closed: a binding whose chat cannot be resolved appears in NO
     dashboard — never leak on uncertainty."""
-    _bind(UID, 10, "@1", "alpha-repo")
-    session_manager.set_group_chat_id(UID, 10, CHAT)
-    _bind(UID, 30, "@3", "ghost-repo")  # no group_chat_id mapping
+    _bind(UID, 10, "@1", "alpha-repo", chat_id=CHAT)
+    # Raw bind WITHOUT a group_chat_ids mapping — the unresolvable shape.
+    session_manager.bind_thread(UID, 30, "@3", "ghost-repo")
 
     assert "ghost-repo" not in dashboard.render_dashboard(UID, CHAT)
     assert "ghost-repo" not in dashboard.render_dashboard(UID, CHAT_B)
@@ -718,5 +719,5 @@ def test_reset_for_tests_clears_module_state():
 def test_renderer_is_pure_no_now_flake():
     """now_mono is injectable; default falls back to time.monotonic."""
     _bind(UID, 10, "@1", "repo")
-    t = dashboard.render_dashboard(UID, now_mono=time.monotonic())
+    t = dashboard.render_dashboard(UID, CHAT, now_mono=time.monotonic())
     assert "repo" in t

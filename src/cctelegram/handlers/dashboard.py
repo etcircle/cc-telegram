@@ -1,4 +1,4 @@
-"""Cross-topic dashboard — one owner-filtered overview message per (chat, owner).
+"""Cross-topic dashboard — one owner+chat-scoped overview message per (chat, owner).
 
 Owns the ``/dashboard`` command and the pull-only refresh driver for the Wave C
 busy-signal dashboard: a single passive text message listing every topic the
@@ -10,7 +10,10 @@ Core responsibilities:
     invoking topic as the user's dashboard host (re-running elsewhere MOVES it;
     ``/dashboard pin`` opt-in pins the existing message — never automatic).
   - ``render_dashboard``: pure renderer over ``session_manager`` bindings +
-    ``route_runtime.snapshot`` per route. 🔔 = ``WAITING_ON_USER`` OR an idle
+    ``route_runtime.snapshot`` per route — scoped to (owner, chat): only
+    bindings whose ``group_chat_ids`` mapping resolves to the dashboard's own
+    chat render; an unresolvable chat is EXCLUDED (fail closed — a dashboard
+    never lists another forum's topics). 🔔 = ``WAITING_ON_USER`` OR an idle
     route whose ``last_assistant_turn_ended_at > last_user_turn_at`` (both
     non-None — after a restart the wall-clock stamps are gone and the
     dashboard renders state-only). Ages are minute-coarse from the monotonic
@@ -18,14 +21,18 @@ Core responsibilities:
   - ``maybe_refresh_dashboards``: called once per status-poll sweep. Edits
     only when the rendered-content hash changed (covers run-state transitions
     AND bind/unbind/rename without one); ``MESSAGE_NOT_MODIFIED`` is success;
-    edit-404 self-heals (re-send + ``update_dashboard_msg_id``); a
-    topic-shaped failure clears the record (no self-heal loop into a dead
-    topic — the user re-runs ``/dashboard`` elsewhere).
+    ``MESSAGE_NOT_FOUND`` (the message is provably deleted) self-heals
+    (re-send + ``update_dashboard_msg_id``) — a generic ``OTHER`` failure
+    only logs and retries next sweep (re-sending on a transient would orphan
+    the still-live message); a topic-shaped failure clears the record (no
+    self-heal loop into a dead topic — the user re-runs ``/dashboard``
+    elsewhere).
   - A per-(chat_id, owner_id) ``asyncio.Lock`` serializes the whole
     Telegram-I/O-spanning claim/move/self-heal flow (pre-C fix 1), with a
     post-send re-read + loser cleanup.
-  - ``clear_dashboards_in_thread``: the topic-teardown seam, called from
-    ``cleanup.clear_topic_state`` (pre-C fix 3).
+  - ``clear_dashboards_in_thread``: the (chat-scoped) topic-teardown seam,
+    called from ``cleanup.clear_topic_state`` and the no-binding branch of
+    ``bot.topic_closed_handler`` (pre-C fix 3 + review P2-3/P2-4).
 
 Boundary contract (architecture.md): this module reads
 ``route_runtime.snapshot`` + ``session_manager`` and sends via the
@@ -124,12 +131,20 @@ def _fmt_age(seconds: float) -> str:
     return f"{minutes // 60}h"
 
 
-def render_dashboard(owner_id: int, *, now_mono: float | None = None) -> str:
-    """Render the owner-filtered dashboard body (plain text, crash-proof).
+def render_dashboard(
+    owner_id: int, chat_id: int, *, now_mono: float | None = None
+) -> str:
+    """Render the owner+chat-scoped dashboard body (plain text, crash-proof).
 
     Reads ``session_manager.iter_thread_bindings()`` filtered to ``owner_id``
-    + ``window_display_names`` + ``route_runtime.snapshot`` per route. Groups
-    needs-attention-first:
+    AND to bindings whose topic lives in ``chat_id`` (hermes Wave C review
+    P1: thread ids are chat-local and the posted message is visible to the
+    whole forum, so a dashboard in chat A must never list chat B's topics).
+    The chat of a binding is the persisted ``group_chat_ids`` mapping via
+    ``session_manager.get_group_chat_id`` — FAIL CLOSED: a binding whose chat
+    cannot be resolved is excluded from every dashboard, never leaked.
+    Then ``window_display_names`` + ``route_runtime.snapshot`` per route.
+    Groups needs-attention-first:
 
       🔔 <name> — waiting on you (Xm): ``WAITING_ON_USER``, or idle with
          ``last_assistant_turn_ended_at > last_user_turn_at`` (both non-None;
@@ -148,6 +163,9 @@ def render_dashboard(owner_id: int, *, now_mono: float | None = None) -> str:
     rows: list[tuple[int, str, str]] = []
     for user_id, thread_id, window_id in session_manager.iter_thread_bindings():
         if user_id != owner_id:
+            continue
+        # Chat scope (P1, fail closed): unresolvable chat ⇒ excluded.
+        if session_manager.get_group_chat_id(user_id, thread_id) != chat_id:
             continue
         route: route_runtime.Route = (owner_id, thread_id or 0, window_id)
         snap = route_runtime.snapshot(route)
@@ -244,7 +262,7 @@ async def _claim_dashboard(
     key = (chat_id, owner_id)
     async with _lock_for(key):
         existing = session_manager.get_dashboard(chat_id, owner_id)
-        text = render_dashboard(owner_id)
+        text = render_dashboard(owner_id, chat_id)
 
         if existing is not None and existing["thread_id"] == thread_id:
             # Re-run in the host topic: refresh the existing message in place.
@@ -269,7 +287,25 @@ async def _claim_dashboard(
                     msg, "❌ This topic looks broken — run /dashboard elsewhere."
                 )
                 return
-            # Edit-404 (or other transient): fall through to a fresh send.
+            if outcome is not TopicSendOutcome.MESSAGE_NOT_FOUND:
+                # Generic OTHER (timeout / unclassified transient): the old
+                # message may still be live — re-sending would orphan it
+                # forever (hermes review P2-2). Leave the persisted msg_id
+                # and the render hash alone; the refresh sweep retries.
+                logger.warning(
+                    "dashboard rerun edit failed (chat=%d owner=%d thread=%d "
+                    "outcome=%s) — keeping existing msg_id; retry next sweep",
+                    chat_id,
+                    owner_id,
+                    thread_id,
+                    outcome.value,
+                )
+                await safe_reply(
+                    msg,
+                    "❌ Could not refresh the dashboard — it will retry shortly.",
+                )
+                return
+            # MESSAGE_NOT_FOUND: the message is provably gone — re-send.
 
         sent, outcome = await topic_send(
             bot,
@@ -363,16 +399,18 @@ async def maybe_refresh_dashboards(bot: Bot) -> None:
     the existing 1s poller; no observer channel. Per dashboard: render →
     content hash → edit only on change, serialized through the same
     per-(chat, owner) lock as the claim flow. ``MESSAGE_NOT_MODIFIED`` is
-    success (W8 precedent). Edit-404 self-heals (re-send +
-    ``update_dashboard_msg_id`` under the lock, with a loser-cleanup
-    re-read); a topic-shaped failure clears the record so we never self-heal
-    into a dead topic (pre-C fix 3). One dashboard's failure never aborts the
-    sweep.
+    success (W8 precedent). ``MESSAGE_NOT_FOUND`` (message provably deleted)
+    self-heals (re-send + ``update_dashboard_msg_id`` under the lock, with a
+    loser-cleanup re-read); a generic ``OTHER`` failure logs and leaves the
+    msg_id + hash alone so the next sweep retries the edit (review P2-2 — a
+    re-send on a transient would orphan the still-live message); a
+    topic-shaped failure clears the record so we never self-heal into a dead
+    topic (pre-C fix 3). One dashboard's failure never aborts the sweep.
     """
     for chat_id, owner_id, _rec in list(session_manager.iter_dashboards()):
         key = (chat_id, owner_id)
         try:
-            text = render_dashboard(owner_id)
+            text = render_dashboard(owner_id, chat_id)
             h = _hash(text)
             if _last_render_hash.get(key) == h:
                 continue
@@ -406,7 +444,22 @@ async def maybe_refresh_dashboards(bot: Bot) -> None:
                     session_manager.clear_dashboard(chat_id, owner_id)
                     _drop_caches(key)
                     continue
-                # OTHER — most commonly the message was deleted (edit-404).
+                if outcome is not TopicSendOutcome.MESSAGE_NOT_FOUND:
+                    # Generic OTHER (timeout / unclassified transient): the
+                    # message may still be live — re-sending here would orphan
+                    # it forever, once per content-hash change (hermes review
+                    # P2-2). Keep the persisted msg_id and do NOT advance the
+                    # hash, so the next sweep retries the edit.
+                    logger.warning(
+                        "dashboard refresh edit failed (chat=%d owner=%d "
+                        "thread=%d outcome=%s) — keeping msg_id; retry next sweep",
+                        chat_id,
+                        owner_id,
+                        rec["thread_id"],
+                        outcome.value,
+                    )
+                    continue
+                # MESSAGE_NOT_FOUND — the message is provably deleted.
                 # Self-heal: re-send into the same host topic.
                 sent, send_outcome = await topic_send(
                     bot,
@@ -449,19 +502,34 @@ async def maybe_refresh_dashboards(bot: Bot) -> None:
 # ── topic-teardown seam ──────────────────────────────────────────────────
 
 
-def clear_dashboards_in_thread(thread_id: int) -> None:
-    """Drop every dashboard record hosted in ``thread_id`` (topic closed /
-    deleted). Called from ``cleanup.clear_topic_state`` so a dead host topic
-    never traps the edit-404 self-heal in a resend loop (pre-C fix 3); the
-    user re-runs ``/dashboard`` elsewhere."""
-    for chat_id, owner_id, rec in list(session_manager.iter_dashboards()):
+def clear_dashboards_in_thread(thread_id: int, *, chat_id: int | None) -> None:
+    """Drop the dashboard record(s) hosted in ``(chat_id, thread_id)`` (topic
+    closed / deleted). Called from ``cleanup.clear_topic_state`` and the
+    no-binding branch of ``bot.topic_closed_handler`` so a dead host topic
+    never traps the self-heal in a resend loop (pre-C fix 3); the user
+    re-runs ``/dashboard`` elsewhere.
+
+    Thread ids are CHAT-LOCAL (hermes review P2-3): chat A's topic 7 closing
+    must not delete a valid dashboard in chat B's topic 7, so the clear is
+    scoped to ``chat_id``. ``chat_id=None`` (the caller genuinely could not
+    resolve the topic's chat) falls back to the old all-chats sweep WITH a
+    warning — never strand a dead-topic record silently."""
+    if chat_id is None:
+        logger.warning(
+            "clear_dashboards_in_thread: chat unresolvable for thread %d — "
+            "falling back to clearing across ALL chats",
+            thread_id,
+        )
+    for rec_chat_id, owner_id, rec in list(session_manager.iter_dashboards()):
         if rec["thread_id"] != thread_id:
             continue
-        session_manager.clear_dashboard(chat_id, owner_id)
-        _drop_caches((chat_id, owner_id))
+        if chat_id is not None and rec_chat_id != chat_id:
+            continue
+        session_manager.clear_dashboard(rec_chat_id, owner_id)
+        _drop_caches((rec_chat_id, owner_id))
         logger.info(
             "dashboard cleared with its host topic (chat=%d owner=%d thread=%d)",
-            chat_id,
+            rec_chat_id,
             owner_id,
             thread_id,
         )

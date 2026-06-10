@@ -46,6 +46,13 @@ class TopicSendOutcome(enum.Enum):
     # is distinguishable from OK so that loud-side-effect callers (e.g.
     # attention.notify_waiting) can avoid re-sending a fresh card.
     MESSAGE_NOT_MODIFIED = "MESSAGE_NOT_MODIFIED"
+    # The edit's TARGET message is gone ("message to edit not found") while
+    # the topic itself may be fine. Distinct from OTHER so edit-and-self-heal
+    # callers (dashboard) re-send only when the message is provably deleted —
+    # a transient/unclassified failure (OTHER) must never trigger a re-send,
+    # or the still-live old message becomes a permanent orphan (hermes Wave C
+    # review P2-2).
+    MESSAGE_NOT_FOUND = "MESSAGE_NOT_FOUND"
     TOPIC_NOT_FOUND = "TOPIC_NOT_FOUND"
     TOPIC_CLOSED = "TOPIC_CLOSED"
     FORBIDDEN = "FORBIDDEN"
@@ -66,6 +73,7 @@ _TOPIC_CLOSED_FRAGMENTS = (
     "topic is closed",
 )
 _MESSAGE_NOT_MODIFIED_FRAGMENTS = ("message is not modified",)
+_MESSAGE_NOT_FOUND_FRAGMENTS = ("message to edit not found",)
 
 
 def _classify_bad_request(exc: BaseException) -> TopicSendOutcome:
@@ -90,6 +98,9 @@ def _classify_bad_request(exc: BaseException) -> TopicSendOutcome:
         for fragment in _MESSAGE_NOT_MODIFIED_FRAGMENTS:
             if fragment in msg:
                 return TopicSendOutcome.MESSAGE_NOT_MODIFIED
+        for fragment in _MESSAGE_NOT_FOUND_FRAGMENTS:
+            if fragment in msg:
+                return TopicSendOutcome.MESSAGE_NOT_FOUND
         return TopicSendOutcome.OTHER
     return TopicSendOutcome.OTHER
 
@@ -614,14 +625,16 @@ async def topic_edit(
         raise
     except Exception as exc:
         outcome = _classify_bad_request(exc)
-        # Topic-shaped failures and the benign "no-op edit" branch must not
-        # retry as plain text — the second attempt would surface the same
-        # error and we would log a misleading OTHER classification.
+        # Topic-shaped failures, the benign "no-op edit" branch, and a
+        # deleted target message must not retry as plain text — the second
+        # attempt would surface the same error and we would log a misleading
+        # OTHER classification.
         if outcome in (
             TopicSendOutcome.TOPIC_NOT_FOUND,
             TopicSendOutcome.TOPIC_CLOSED,
             TopicSendOutcome.FORBIDDEN,
             TopicSendOutcome.MESSAGE_NOT_MODIFIED,
+            TopicSendOutcome.MESSAGE_NOT_FOUND,
         ):
             _log_topic_outcome(
                 op, user_id, chat_id, thread_id, window_id, outcome, "edit", exc
