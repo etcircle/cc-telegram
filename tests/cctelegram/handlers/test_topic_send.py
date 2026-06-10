@@ -68,6 +68,25 @@ def test_classify_other_bad_request(message: str) -> None:
     assert _classify_bad_request(BadRequest(message)) is TopicSendOutcome.OTHER
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Message to edit not found",
+        "Bad Request: message to edit not found",
+        "MESSAGE TO EDIT NOT FOUND",
+    ],
+)
+def test_classify_message_to_edit_not_found(message: str) -> None:
+    # "message to edit not found" gets its own outcome so edit-and-self-heal
+    # callers (dashboard) re-send ONLY when the message is provably gone —
+    # a generic OTHER (timeout / unclassified failure) must never trigger a
+    # re-send, or the old still-live message is orphaned forever (hermes Wave
+    # C review P2-2).
+    assert (
+        _classify_bad_request(BadRequest(message)) is TopicSendOutcome.MESSAGE_NOT_FOUND
+    )
+
+
 def test_classify_message_not_modified() -> None:
     # ``message is not modified`` is a benign no-op edit response — pinned to
     # its own outcome so attention.notify_waiting can short-circuit instead of

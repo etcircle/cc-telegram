@@ -41,6 +41,7 @@ from tests.conftest import FakeBot, make_context, make_update_command
 
 UID = 12345  # in ALLOWED_USERS per the root conftest env bootstrap
 CHAT = -1001234567890
+CHAT_B = -1009876543210  # a second forum, for cross-chat scoping regressions
 
 
 @pytest.fixture(autouse=True)
@@ -560,6 +561,106 @@ async def test_clear_topic_state_keeps_dashboard_in_other_thread():
     await _claim(bot, thread_id=7)
     await clear_topic_state(UID, 8, bot)
     assert session_manager.get_dashboard(CHAT, UID) is not None
+
+
+# ── cross-chat scoping (hermes Wave C review P1 / P2-3) ──────────────────
+
+
+async def test_renderer_scoped_to_chat_no_cross_chat_leak():
+    """P1: same owner, bindings in two forums — each chat's dashboard lists
+    ONLY that chat's topics (topic names/states must not leak across chats)."""
+    _bind(UID, 10, "@1", "alpha-repo")
+    session_manager.set_group_chat_id(UID, 10, CHAT)
+    _bind(UID, 20, "@2", "beta-repo")
+    session_manager.set_group_chat_id(UID, 20, CHAT_B)
+
+    text_a = dashboard.render_dashboard(UID, CHAT)
+    text_b = dashboard.render_dashboard(UID, CHAT_B)
+    assert "alpha-repo" in text_a
+    assert "beta-repo" not in text_a
+    assert "beta-repo" in text_b
+    assert "alpha-repo" not in text_b
+
+
+async def test_renderer_excludes_unresolvable_chat_binding():
+    """P1 fail-closed: a binding whose chat cannot be resolved appears in NO
+    dashboard — never leak on uncertainty."""
+    _bind(UID, 10, "@1", "alpha-repo")
+    session_manager.set_group_chat_id(UID, 10, CHAT)
+    _bind(UID, 30, "@3", "ghost-repo")  # no group_chat_id mapping
+
+    assert "ghost-repo" not in dashboard.render_dashboard(UID, CHAT)
+    assert "ghost-repo" not in dashboard.render_dashboard(UID, CHAT_B)
+
+
+def test_clear_dashboards_in_thread_is_chat_scoped():
+    """P2-3: thread ids are chat-local — clearing (CHAT, 7) must not touch a
+    dashboard hosted in CHAT_B's numerically-identical thread 7."""
+    other = 67890
+    session_manager.set_dashboard(CHAT, UID, 7, 111)
+    session_manager.set_dashboard(CHAT_B, other, 7, 222)
+
+    dashboard.clear_dashboards_in_thread(7, chat_id=CHAT)
+
+    assert session_manager.get_dashboard(CHAT, UID) is None
+    assert session_manager.get_dashboard(CHAT_B, other) is not None
+
+
+@pytest.mark.asyncio
+async def test_clear_topic_state_clears_only_this_chats_dashboard():
+    """P2-3 end-to-end: clear_topic_state resolves the topic's chat via
+    group_chat_ids and clears only that (chat, thread) record."""
+    from cctelegram.handlers.cleanup import clear_topic_state
+
+    other = 67890
+    session_manager.set_group_chat_id(UID, 7, CHAT)
+    session_manager.set_dashboard(CHAT, UID, 7, 111)
+    session_manager.set_dashboard(CHAT_B, other, 7, 222)
+
+    await clear_topic_state(UID, 7, FakeBot())
+
+    assert session_manager.get_dashboard(CHAT, UID) is None
+    assert session_manager.get_dashboard(CHAT_B, other) is not None
+
+
+# ── OTHER-vs-NOT_FOUND self-heal classification (hermes review P2-2) ─────
+
+
+@pytest.mark.asyncio
+async def test_driver_other_edit_failure_no_self_heal_msg_id_unchanged():
+    """P2-2: a generic/transient edit failure (OTHER) must NOT re-send — the
+    persisted msg_id stays, and the next sweep retries the edit (hash not
+    advanced). Re-sending on OTHER orphans the old live message forever."""
+    bot = _EditRaisesBot("some completely unknown transient error")
+    _bind(UID, 10, "@1", "repo")
+    rec = await _claim(bot)
+    await _make_state((UID, 10, "@1"), "running")
+
+    await dashboard.maybe_refresh_dashboards(bot)
+
+    assert session_manager.get_dashboard(CHAT, UID) == rec
+    sends = [s for s in bot.sent if s.method == "send_message"]
+    assert len(sends) == 1  # only the original claim — no self-heal send
+    # Retry next sweep: the hash must not have advanced.
+    attempts = len([s for s in bot.sent if s.method == "edit_message_text_attempt"])
+    await dashboard.maybe_refresh_dashboards(bot)
+    assert (
+        len([s for s in bot.sent if s.method == "edit_message_text_attempt"])
+        == attempts + 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_rerun_other_edit_failure_keeps_msg_id_no_resend():
+    """P2-2 (same-topic /dashboard rerun): a generic OTHER edit failure must
+    not fall through to a fresh send — record stays as-is."""
+    rec = await _claim(FakeBot())
+    bot2 = _EditRaisesBot("some completely unknown transient error")
+    await dashboard.dashboard_command(
+        make_update_command("dashboard", thread_id=7), make_context(bot=bot2)
+    )
+    assert session_manager.get_dashboard(CHAT, UID) == rec
+    assert [s for s in bot2.sent if s.method == "send_message"] == []
 
 
 # ── multi-user isolation ─────────────────────────────────────────────────

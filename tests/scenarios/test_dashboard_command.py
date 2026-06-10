@@ -67,6 +67,33 @@ async def test_dashboard_in_bound_topic_not_forwarded_to_tmux(
 
 
 @pytest.mark.asyncio
+async def test_topic_close_of_unbound_dashboard_host_clears_record(
+    scenario: ScenarioHarness,
+) -> None:
+    """Hermes Wave C review P2-4: a dedicated dashboard host topic has NO
+    bound window, so topic_closed_handler's no-binding branch must still
+    clear the dashboard record for that (chat, thread) — not leave it to the
+    eventual send-failure backstop."""
+    from tests.conftest import make_update_topic_closed
+
+    update = make_update_command("dashboard", thread_id=7)
+    await dashboard_command(update, scenario.context)
+    assert (
+        scenario.session_manager.get_dashboard(scenario.chat_id, scenario.user_id)
+        is not None
+    )
+
+    close = make_update_topic_closed(thread_id=7)
+    await bot_module.topic_closed_handler(close, scenario.context)
+
+    assert (
+        scenario.session_manager.get_dashboard(scenario.chat_id, scenario.user_id)
+        is None
+    )
+    assert scenario.tmux.kill_calls == []  # still a no-window no-op otherwise
+
+
+@pytest.mark.asyncio
 async def test_dashboard_rejects_general_topic(scenario: ScenarioHarness) -> None:
     update = make_update_command("dashboard", thread_id=None)
     await dashboard_command(update, scenario.context)
