@@ -506,7 +506,18 @@ c313657 forbidden). It renders the owner's view from
 includes only bindings whose persisted `group_chat_ids` mapping
 (`session_manager.get_group_chat_id`) resolves to the dashboard's own chat —
 FAIL CLOSED, an unresolvable chat is excluded from every dashboard, so a
-dashboard in forum A never exposes forum B's topic names/states. It hashes the
+dashboard in forum A never exposes forum B's topic names/states. That filter is
+only as trustworthy as the mapping, so the **trust boundary** (hermes R2 P1):
+`group_chat_ids` is written ONLY by the genuine bound-topic message seams
+(`text/photo/voice/document_handler`, `forward_command_handler`,
+`topic_edited_handler`) — `/dashboard` itself NEVER writes
+`set_group_chat_id`, because thread ids are chat-local and a host claim in
+chat B's unbound thread N would overwrite the mapping of chat A's bound topic
+N and leak it onto chat B's dashboard. The dashboard instead carries its OWN
+chat explicitly (the command's `effective_chat.id` at claim time, the
+`dashboards` record key afterwards) through every
+`topic_send`/`topic_edit`/`topic_delete` — those helpers take an explicit
+`chat_id` and never resolve via `group_chat_ids`. It hashes the
 rendered body and edits only on change — the hash covers state
 lines, display names, and the binding set, so run-state transitions AND
 bind/unbind/rename all repaint without a dedicated trigger; ages are

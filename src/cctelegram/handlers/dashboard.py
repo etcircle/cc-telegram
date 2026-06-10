@@ -9,6 +9,13 @@ Core responsibilities:
   - ``dashboard_command``: gate on the allowlist, reject DM/General, claim the
     invoking topic as the user's dashboard host (re-running elsewhere MOVES it;
     ``/dashboard pin`` opt-in pins the existing message — never automatic).
+    It NEVER writes ``set_group_chat_id`` (hermes R2 P1): thread ids are
+    chat-local, so a host claim in chat B would poison the mapping of a bound
+    topic with the same thread number in chat A and leak it onto chat B's
+    dashboard. ``group_chat_ids`` is written only by the genuine bound-topic
+    message seams; the dashboard carries its OWN chat (the command's
+    ``effective_chat`` at claim time, the record key afterwards) explicitly
+    through every ``topic_send``/``topic_edit``/``topic_delete``.
   - ``render_dashboard``: pure renderer over ``session_manager`` bindings +
     ``route_runtime.snapshot`` per route — scoped to (owner, chat): only
     bindings whose ``group_chat_ids`` mapping resolves to the dashboard's own
@@ -237,9 +244,14 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     chat_id = msg.chat_id
-    # Persist the supergroup chat_id for this (user, thread) like every other
-    # topic seam, so resolve_chat_id-based surfaces stay consistent.
-    session_manager.set_group_chat_id(user.id, thread_id, chat_id)
+    # Deliberately NO set_group_chat_id here (hermes R2 P1): thread ids are
+    # CHAT-LOCAL, so writing (user, thread)→chat for an UNBOUND dashboard host
+    # topic in chat B would overwrite the mapping of a bound topic with the
+    # same thread number in chat A — and render_dashboard's chat filter would
+    # then leak chat A's binding onto chat B's dashboard. The mapping is
+    # written ONLY by the genuine bound-topic message seams; the dashboard
+    # carries its own chat (this command's chat_id at claim time, the record
+    # key afterwards) through every send/edit/delete.
 
     parts = (msg.text or "").split()
     sub = parts[1].lower() if len(parts) > 1 else ""

@@ -253,7 +253,16 @@ Handler modules (handlers/):
                         to the owner AND to the dashboard's own chat via
                         session_manager.get_group_chat_id, FAIL CLOSED: an
                         unresolvable chat is excluded, never leaked cross-forum
-                        (hermes review P1) + route_runtime.snapshot per route;
+                        (hermes review P1) + route_runtime.snapshot per route.
+                        TRUST BOUNDARY (hermes R2 P1): /dashboard NEVER writes
+                        set_group_chat_id — thread ids are chat-local, so a
+                        host claim in chat B's unbound thread N would poison
+                        the mapping of chat A's bound topic N and leak it onto
+                        chat B's dashboard; group_chat_ids is written ONLY by
+                        the genuine bound-topic message seams, and the
+                        dashboard carries its OWN chat (effective_chat.id at
+                        claim, the record key afterwards) explicitly through
+                        every topic_send/topic_edit/topic_delete;
                         🔔 = WAITING_ON_USER or idle with
                         last_assistant_turn_ended_at > last_user_turn_at, both
                         non-None; ages minute-coarse from the monotonic
