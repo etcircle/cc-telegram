@@ -371,6 +371,23 @@ def record(
             failed_reason=failed_reason,
         )
     else:
+        # Campaign final-gate P2: `released` is TERMINAL for the resolved
+        # instance against late non-`accepted` writes. The aqp: callback's
+        # post-Enter confirm settle can still be sleeping when a fast AUQ
+        # resolution releases the window's rows (bot.handle_new_message's
+        # tool_result branch); the late `dispatched`/`commit_unconfirmed`
+        # would otherwise overwrite the tombstone and re-lock the same-day
+        # byte-identical re-ask until retention. Only a fresh `accepted`
+        # (a NEW instance claiming the key) may follow `released`.
+        if existing.state == "released" and state != "accepted":
+            logger.info(
+                "auq_ledger: dropping late %s over released key %s "
+                "(instance already resolved)",
+                state,
+                key,
+            )
+            return existing
+
         # Hermes P3-1: a fresh `accepted` over a `released` latest entry is a
         # NEW instance reusing the same content-derived key (the intended
         # same-day byte-identical re-ask — or, rarely, an fp8 collision).

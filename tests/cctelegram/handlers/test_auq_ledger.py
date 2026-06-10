@@ -561,3 +561,38 @@ class TestRecordRefreshesAcceptedAt:
         clock.tick(500.0)
         entry = auq_ledger.record("k:1", state="dispatched")
         assert entry.accepted_at == 1000.0
+
+
+class TestReleasedIsTerminalAgainstLateWrites:
+    """Campaign final-gate P2: a fast AUQ resolution can release the window's
+    rows while the aqp: callback is still in its post-Enter confirm settle;
+    the late terminal write must NOT overwrite the tombstone and re-lock the
+    same-day byte-identical re-ask. Only a fresh `accepted` (a NEW instance)
+    may follow `released`."""
+
+    def test_late_dispatched_over_released_is_dropped(self, setup_ledger):
+        auq_ledger.record("k:1", **_first_write_kwargs(state="accepted"))
+        assert auq_ledger.release_window("@7") == 1
+        returned = auq_ledger.record("k:1", state="dispatched")
+        assert returned.state == "released"
+        assert auq_ledger.lookup("k:1") is None, (
+            "late dispatched over released re-locked the key — the tombstone "
+            "must be terminal for the resolved instance"
+        )
+
+    def test_late_commit_unconfirmed_over_released_is_dropped(self, setup_ledger):
+        auq_ledger.record("k:1", **_first_write_kwargs(state="accepted"))
+        assert auq_ledger.release_window("@7") == 1
+        returned = auq_ledger.record("k:1", state="commit_unconfirmed")
+        assert returned.state == "released"
+        assert auq_ledger.lookup("k:1") is None
+
+    def test_fresh_accepted_over_released_still_claims(self, setup_ledger):
+        """The intended re-ask path is untouched: a NEW instance's accepted
+        claim still follows released (Wave 2 fix 3b semantics)."""
+        auq_ledger.record("k:1", **_first_write_kwargs(state="accepted"))
+        auq_ledger.release_window("@7")
+        returned = auq_ledger.record("k:1", **_first_write_kwargs(state="accepted"))
+        assert returned.state == "accepted"
+        entry = auq_ledger.lookup("k:1")
+        assert entry is not None and entry.state == "accepted"
