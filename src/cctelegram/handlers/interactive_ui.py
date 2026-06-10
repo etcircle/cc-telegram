@@ -496,6 +496,52 @@ def warn_if_pre_tool_use_hook_missing(
     return False
 
 
+def warn_if_notification_hook_missing(
+    settings_file: Path = _CLAUDE_SETTINGS_FILE_FOR_WARN,
+) -> bool:
+    """Warn (via log) if the Notification hook entry is missing from
+    Claude Code's settings.json.
+
+    The Wave B extension of the EXISTING bot-startup hook-health seam
+    (plan v3 B-misc): without the Notification hook, Workflow / permission
+    approval gates have no detection path and the topic shows "🟡 Busy"
+    forever instead of "🔔 Waiting on you".
+
+    Returns True if a warning was emitted, False if the hook is current.
+    """
+    if not settings_file.exists():
+        logger.warning(
+            "Claude Code settings file not found at %s — run "
+            "'cc-telegram hook --install' to enable waiting-on-you "
+            "notifications",
+            settings_file,
+        )
+        return True
+    try:
+        settings = json.loads(settings_file.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(
+            "Claude Code settings file unreadable (%s); "
+            "waiting-on-you notifications may be disabled: %s",
+            settings_file,
+            e,
+        )
+        return True
+    # Reuse the hook module's own check — single source of truth for
+    # "what counts as installed".
+    from ..hook import _is_notification_installed
+
+    if _is_notification_installed(settings) == "missing":
+        logger.warning(
+            "Notification hook not registered in %s; Workflow/permission "
+            "approval waits will not surface as '🔔 Waiting on you'. "
+            "Run 'cc-telegram hook --install' to enable.",
+            settings_file,
+        )
+        return True
+    return False
+
+
 def claim_auq_context_post_in_memory(window_id: str, dedup_key: str) -> str | None:
     """Two-phase context-post gate, phase 1 (Wave 1, plan §5.1).
 

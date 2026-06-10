@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cctelegram import route_runtime
-from cctelegram.handlers import notify_source, status_polling
+from cctelegram.handlers import status_polling
 from cctelegram.route_runtime import (
     NOTIFY_TTL_SECONDS,
     RunState,

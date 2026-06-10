@@ -87,7 +87,9 @@ async def _mk_running_tool(
     )
 
 
-async def _mark(set_at: float = SET_AT, generation: str = GEN) -> NotificationMarkResult:
+async def _mark(
+    set_at: float = SET_AT, generation: str = GEN
+) -> NotificationMarkResult:
     return await route_runtime.mark_notification_pending(
         ROUTE, set_at=set_at, generation=generation
     )

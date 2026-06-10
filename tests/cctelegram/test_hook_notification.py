@@ -100,9 +100,7 @@ class TestNotificationHandler:
             sys, "stdin", io.StringIO(json.dumps(_notification_payload()))
         )
         monkeypatch.setenv("TMUX_PANE", "%3")
-        monkeypatch.setattr(
-            hook_mod, "_resolve_tmux_window_key", lambda pane_id: None
-        )
+        monkeypatch.setattr(hook_mod, "_resolve_tmux_window_key", lambda pane_id: None)
         assert hook_main() == 0
         assert not (tmp_path / "notify_pending").exists()
 

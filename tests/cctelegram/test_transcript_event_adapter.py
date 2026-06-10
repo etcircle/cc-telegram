@@ -186,9 +186,7 @@ def test_timestamp_parsed_iso8601_z_suffix():
         _event(timestamp="2026-06-10T12:00:00.500Z")
     )
     assert out is not None
-    expected = datetime(
-        2026, 6, 10, 12, 0, 0, 500000, tzinfo=timezone.utc
-    ).timestamp()
+    expected = datetime(2026, 6, 10, 12, 0, 0, 500000, tzinfo=timezone.utc).timestamp()
     assert out.timestamp == pytest.approx(expected)
 
 
