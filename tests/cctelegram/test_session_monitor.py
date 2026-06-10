@@ -784,10 +784,12 @@ class TestSidechainTailing:
         assert "tool_result" in kinds
 
     @pytest.mark.asyncio
-    async def test_show_tool_calls_false_short_circuits(
+    async def test_show_tool_calls_false_suppresses_display_only(
         self, monitor, tmp_path, monkeypatch, make_jsonl_entry, make_tool_use_block
     ):
-        """When show_tool_calls is disabled, no sidechain messages are emitted."""
+        """Wave A: with show_tool_calls disabled, sidechain files are STILL
+        tracked/parsed and activity reported — only NewMessage emission is
+        suppressed (spec test 6)."""
         from cctelegram.session_monitor import config as monitor_config
 
         monkeypatch.setattr(monitor_config, "show_tool_calls", False)
@@ -795,18 +797,77 @@ class TestSidechainTailing:
         parent_sid = "parent-sid"
         _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
         sc_file = sub_dir / "agent-abc.jsonl"
+        sc_file.write_text("")
+
+        # First call registers the empty file at offset 0 — tracking runs
+        # unconditionally now.
+        msgs = await monitor.check_sidechain_updates({parent_sid})
+        assert msgs == []
+        assert monitor.state.get_session(f"sub:{parent_sid}:agent-abc") is not None
+        assert monitor.pop_sidechain_active_parents() == set()
+
         entry = make_jsonl_entry(
             "assistant",
             [make_tool_use_block("t1", "Bash", {"command": "ls"})],
             session_id="x",
         )
-        self._write_jsonl(sc_file, [entry])
+        self._append_jsonl(sc_file, [entry])
 
         msgs = await monitor.check_sidechain_updates({parent_sid})
 
+        # No display, but the parent's sidechain activity IS reported.
         assert msgs == []
-        # Also: no tracker registered, since we bailed before the scan.
-        assert monitor.state.get_session(f"sub:{parent_sid}:agent-abc") is None
+        assert monitor.pop_sidechain_active_parents() == {parent_sid}
+
+    @pytest.mark.asyncio
+    async def test_sidechain_activity_reported_for_new_parsed_entries(
+        self, monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+    ):
+        """Parents whose sidechains produced new parsed entries this tick are
+        reported via pop_sidechain_active_parents (consume-once)."""
+        parent_sid = "parent-sid"
+        _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
+        sc_file = sub_dir / "agent-abc.jsonl"
+        sc_file.write_text("")
+
+        await monitor.check_sidechain_updates({parent_sid})
+        assert monitor.pop_sidechain_active_parents() == set()
+
+        entry = make_jsonl_entry(
+            "assistant",
+            [make_tool_use_block("t1", "Bash", {"command": "ls"})],
+            session_id="x",
+        )
+        self._append_jsonl(sc_file, [entry])
+        msgs = await monitor.check_sidechain_updates({parent_sid})
+        assert len(msgs) == 1
+
+        # Reported once, then the accessor drains.
+        assert monitor.pop_sidechain_active_parents() == {parent_sid}
+        assert monitor.pop_sidechain_active_parents() == set()
+
+    @pytest.mark.asyncio
+    async def test_sidechain_discovered_at_eof_then_quiet_reports_no_activity(
+        self, monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+    ):
+        """Spec test 7: a sidechain file discovered at EOF and then quiet must
+        never report activity (no false busy)."""
+        parent_sid = "parent-sid"
+        _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
+        sc_file = sub_dir / "agent-abc.jsonl"
+        old_entry = make_jsonl_entry(
+            "assistant",
+            [make_tool_use_block("t1", "Bash", {"command": "ls"})],
+            session_id="x",
+        )
+        self._write_jsonl(sc_file, [old_entry])
+
+        await monitor.check_sidechain_updates({parent_sid})  # registers at EOF
+        assert monitor.pop_sidechain_active_parents() == set()
+
+        # Quiet tick — no new bytes, no activity.
+        await monitor.check_sidechain_updates({parent_sid})
+        assert monitor.pop_sidechain_active_parents() == set()
 
     def test_remove_sidechains_for_parent_drops_all(self, monitor, tmp_path):
         """_remove_sidechains_for_parent clears trackers + caches for one parent only."""
