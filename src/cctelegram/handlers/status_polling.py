@@ -792,7 +792,15 @@ async def update_status_message(
     # rather than scanning the status text for keywords because Claude's
     # working statuses ("Reading file …") don't always include "esc to
     # interrupt", and past-tense summaries don't always omit the spinner.
-    is_running = bool(status_line) and is_status_active(pane_text)
+    # ``active_marker`` alone (visible run chrome with an UNPARSEABLE
+    # status line — a parser-hostile TUI variant) still proves execution:
+    # the idle-clear path treats it as running, and the Wave B notification
+    # clear below must share that contract or a parser-hostile active pane
+    # strands 🔔 until transcript/TTL (hermes P2, 2026-06-11). ``is_running``
+    # (marker + parseable status) remains the gate only where the parsed
+    # status TEXT is needed.
+    active_marker = is_status_active(pane_text)
+    is_running = bool(status_line) and active_marker
 
     # Wave B: a pane observed RUNNING at a capture taken strictly after
     # ``set_at + NOTIFY_PANE_CLEAR_MARGIN_S`` means the user acted in the
@@ -805,8 +813,10 @@ async def update_status_message(
     # running (gate P2-1); the margin keeps a same-tick capture of the
     # pre-prompt frame from clearing early (see NOTIFY_PANE_CLEAR_MARGIN_S).
     # Placed before the ``skip_status`` return so a busy queue can't defer
-    # the clear.
-    if is_running:
+    # the clear. Gated on ``active_marker`` (NOT ``is_running``): visible
+    # run chrome is the execution proof; requiring a parseable status line
+    # would strand the bit on a parser-hostile active pane.
+    if active_marker:
         snap = route_runtime.snapshot(route)
         if (
             snap.notification_pending

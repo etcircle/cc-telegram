@@ -1885,7 +1885,8 @@ def has_pane_chrome(pane_text: str) -> bool:
     """Return True iff the frame contains Claude Code's bottom-chrome anchor.
 
     The anchor is the chrome separator — a full line of ``─`` (≥20 chars) in
-    the last 10 lines — the SAME structural anchor ``parse_status_line`` and
+    the last ``_CHROME_SCAN_LINES`` (20) lines — the SAME structural anchor
+    ``parse_status_line`` and
     ``strip_pane_chrome`` already trust to locate the bottom chrome. Its
     presence is positive evidence the capture is a fully-rendered live
     Claude Code pane (not an empty/truncated/mid-redraw frame). Used by
