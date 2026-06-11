@@ -304,3 +304,22 @@ async def test_suspended_stash_restore_still_wins_over_early_results():
     # t1 was NOT in early_tool_results, so this (id-reuse, impossible in
     # practice) opens normally — proving the stash path didn't record.
     assert "t1" in snap.open_tools
+
+
+async def test_end_of_turn_blocked_log_is_bounded(caplog):
+    """W3: a genuine end_turn blocked by open tools logs route + count + a
+    BOUNDED id sample (first 8), never the whole set."""
+    import logging
+
+    await _ingest(_evt("assistant", "text"))
+    for i in range(12):
+        await _ingest(
+            _evt("assistant", "tool_use", tool_use_id=f"blk-{i:02d}", tool_name="Bash")
+        )
+    with caplog.at_level(logging.INFO, logger="cctelegram.route_runtime"):
+        await _ingest(_evt("assistant", "text", stop_reason="end_turn"))
+    blocked = [r for r in caplog.records if "end_of_turn blocked" in r.getMessage()]
+    assert len(blocked) == 1
+    msg = blocked[0].getMessage()
+    assert "count=12" in msg
+    assert msg.count("blk-") == 8  # bounded sample, not the whole set

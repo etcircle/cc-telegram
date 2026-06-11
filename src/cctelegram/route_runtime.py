@@ -769,10 +769,12 @@ def _apply_lifecycle_event(
         and st.open_tools
     ):
         logger.info(
-            "end_of_turn blocked by open tools route=%s count=%d sample=%s ts=%s",
+            "end_of_turn blocked by open tools route=%s count=%d sample=%s "
+            "stop_reason=%s ts=%s",
             route,
             len(st.open_tools),
             sorted(st.open_tools)[:8],
+            stop_reason,
             event.timestamp,
         )
 
@@ -1051,8 +1053,19 @@ async def mark_notification_pending(
     async with lock:
         st = _state.get(route)
         if st is None or not st.seen:
+            logger.info(
+                "notification_pending ignored (unseen route) route=%s set_at=%s",
+                route,
+                set_at,
+            )
             return NotificationMarkResult.IGNORED_NO_UNLINK
         if st.run_state is RunState.WAITING_ON_USER and any(st.open_tools.values()):
+            logger.info(
+                "notification_pending redundant (transcript WAITING) route=%s "
+                "set_at=%s",
+                route,
+                set_at,
+            )
             return NotificationMarkResult.REDUNDANT_TRANSCRIPT_WAITING
         if st.run_state in (
             RunState.RUNNING,
@@ -1093,6 +1106,12 @@ async def mark_notification_pending(
                 restored,
             )
             return NotificationMarkResult.COMMITTED_LIVE
+        logger.info(
+            "notification_pending stale (idle route) route=%s set_at=%s idle_source=%s",
+            route,
+            set_at,
+            st.idle_source,
+        )
         return NotificationMarkResult.STALE_UNLINK
 
 
@@ -1311,11 +1330,13 @@ async def commit_pane_idle_clear(route: Route, *, now: float) -> bool:
     Returns ``True`` iff the armed deadline was still due at lock time — i.e.
     the debounce *fired*: the deadline was dropped and the ``pane_idle_cleared``
     sentinel latched. ``False`` if it no-op'd (re-armed / cancelled / not yet
-    due). Callers enqueue the card clear ONLY on ``True``. **NOTE:** ``True``
-    does NOT imply ``run_state`` changed — ``_reconcile_pane_idle_in_place``
-    *preserves* a ``WAITING_ON_USER`` route (transcript- or pane-set; pane has
-    lower authority), so for WAITING the deadline is consumed and ``True`` is
-    returned while the run-state is left untouched. Only ``RUNNING`` /
+    due — or the route is WAITING, see below). Callers enqueue the card clear
+    ONLY on ``True``. **NOTE (GH #42 leg 2, W2a):** a ``WAITING_ON_USER``
+    route (transcript- or pane-set; pane has lower authority) is NOT
+    reconcilable — the commit returns ``False`` WITHOUT consuming the deadline
+    and WITHOUT latching, so the net still works when the WAITING is later
+    retracted (TTL / mode-ended). The pre-fix consume+latch here permanently
+    disarmed the 2026-06-11 incident route. Only ``RUNNING`` /
     ``RUNNING_TOOL`` are reconciled to ``IDLE_CLEARED``.
 
     TOCTOU re-validation (Codex 8b P1): the caller checks
