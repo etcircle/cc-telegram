@@ -74,6 +74,31 @@ def test_explicit_env_show_tool_calls_false_maps_full_suppression(monkeypatch):
     assert prefs.thinking_line is True
 
 
+def test_stored_preset_overrides_legacy_env_tool_suppression(monkeypatch):
+    """Hermes PR-1 review P1: an explicit SHOW_TOOL_CALLS=false is a DEFAULT,
+    not a ceiling — a stored /settings preset choice re-enables the tool /
+    Agent / sub-agent surfaces."""
+    monkeypatch.setattr(config, "env_show_tool_calls_set", True)
+    monkeypatch.setattr(config, "show_tool_calls", False)
+    # No stored choice: env default applies.
+    assert output_prefs.resolve(_UID).tool_activity is False
+    # Stored preset choice: the user's baseline wins over the env layer.
+    session_manager.user_settings[_UID] = {"verbosity": "verbose"}
+    prefs = output_prefs.resolve(_UID)
+    assert prefs.tool_activity is True
+    assert prefs.subagent_cards == output_prefs.SUBAGENT_CARDS_KEEP
+
+
+def test_stored_preset_overrides_all_explicit_env_defaults(monkeypatch):
+    """The stored-preset override covers the WHOLE env layer: with standard
+    chosen, an explicit SHOW_USER_MESSAGES=true no longer re-enables the
+    echo — stored choice > env default, both directions."""
+    monkeypatch.setattr(config, "env_show_user_messages_set", True)
+    monkeypatch.setattr(config, "show_user_messages", True)
+    session_manager.user_settings[_UID] = {"verbosity": "standard"}
+    assert output_prefs.resolve(_UID).user_echo is False
+
+
 def test_explicit_env_user_messages_false_is_default_not_ceiling(monkeypatch):
     monkeypatch.setattr(config, "env_show_user_messages_set", True)
     monkeypatch.setattr(config, "show_user_messages", False)

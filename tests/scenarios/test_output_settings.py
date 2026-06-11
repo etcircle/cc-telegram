@@ -325,6 +325,25 @@ async def test_legacy_env_tool_calls_false_drops_agent_surfaces(
 
     assert scenario.bot.sent == []
 
+    # Hermes PR-1 review P1: the env is a DEFAULT, not a ceiling — once the
+    # user picks a preset via /settings, tool surfaces come back.
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "verbose")
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**Agent**(explore again)",
+            content_type="tool_use",
+            tool_use_id="agent-t2",
+            tool_name="Agent",
+            tool_input={"subagent_type": "Explore", "description": "again"},
+            role="assistant",
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    sends = [s for s in scenario.bot.sent if s.method == "send_message"]
+    assert any("🤖 Subagent dispatched" in s.kwargs.get("text", "") for s in sends)
+
 
 @pytest.mark.asyncio
 async def test_digest_line_budget_follows_recipient_preset(

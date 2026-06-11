@@ -203,13 +203,23 @@ def resolve(user_id: int) -> OutputPrefs:
     Stateless and cheap (two dict lookups + dataclass copies) — call at each
     emission point rather than caching, so a /settings tap applies from the
     next rendered surface onward.
+
+    Layering: a STORED preset choice is a user override of the entire legacy
+    env-default layer (hermes PR-1 review P1) — the env translation exists
+    to map ``CC_TELEGRAM_SHOW_*`` for users who never touched ``/settings``;
+    once a user picks a preset, their choice fully defines the baseline and
+    an explicit ``SHOW_TOOL_CALLS=false`` can no longer act as a ceiling.
+    Stored per-knob overrides (without a preset choice) still win over the
+    env layer per-knob via ``_override_layer``.
     """
     stored = session_manager.get_user_settings(user_id)
-    preset_name = stored.get("verbosity")
-    if preset_name not in PRESETS:
+    user_chose_preset = stored.get("verbosity") in PRESETS
+    if user_chose_preset:
+        preset_name = stored["verbosity"]
+    else:
         preset_name = config.default_verbosity
         if preset_name not in PRESETS:
             preset_name = DEFAULT_PRESET
     base = PRESETS[preset_name]
-    layered = _env_layer(base)
+    layered = base if user_chose_preset else _env_layer(base)
     return _override_layer(layered, stored)
