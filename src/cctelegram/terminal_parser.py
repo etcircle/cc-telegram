@@ -1853,10 +1853,27 @@ def _jsonl_resolved_select_mode(
 # Spinner characters Claude Code uses in its status line
 STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
 
+# Leading characters of the spinner's attached task-progress block — the
+# ``⎿ ✔ …`` / ``✔ …`` / ``◼ …`` todo lines Claude Code (v2.1.168) renders
+# BETWEEN the spinner line and the chrome separator while a run is in
+# flight. ``parse_status_line`` skips these (like blanks) when walking up
+# from the separator; treating them as "not a spinner → no status" read an
+# ACTIVE pane as idle and let the pane-idle clear falsely commit mid-run
+# (2026-06-11 @4 stuck-route incident).
+_TASK_PROGRESS_PREFIXES = ("⎿", "✔", "✗", "◼", "☐", "□", "■")
+
+# How many lines the chrome-anchor scan covers from the bottom of the
+# capture. Sized for the v2.1.168 agent task-list footer, which renders
+# BELOW the ``⏵⏵ … esc to interrupt`` chrome line (one row per agent) and
+# would push the separator out of the previous 10-line window on busy
+# multi-agent runs. Captures here are visible-only (no scrollback), so the
+# wider window stays bottom-anchored.
+_CHROME_SCAN_LINES = 20
+
 
 def _find_chrome_separator(lines: list[str]) -> int | None:
-    """Locate the topmost ``──`` chrome separator in the last 10 lines."""
-    search_start = max(0, len(lines) - 10)
+    """Locate the topmost ``──`` chrome separator in the bottom scan window."""
+    search_start = max(0, len(lines) - _CHROME_SCAN_LINES)
     for i in range(search_start, len(lines)):
         stripped = lines[i].strip()
         if len(stripped) >= 20 and all(c == "─" for c in stripped):
@@ -1868,7 +1885,8 @@ def has_pane_chrome(pane_text: str) -> bool:
     """Return True iff the frame contains Claude Code's bottom-chrome anchor.
 
     The anchor is the chrome separator — a full line of ``─`` (≥20 chars) in
-    the last 10 lines — the SAME structural anchor ``parse_status_line`` and
+    the last ``_CHROME_SCAN_LINES`` (20) lines — the SAME structural anchor
+    ``parse_status_line`` and
     ``strip_pane_chrome`` already trust to locate the bottom chrome. Its
     presence is positive evidence the capture is a fully-rendered live
     Claude Code pane (not an empty/truncated/mid-redraw frame). Used by
@@ -1889,10 +1907,13 @@ def parse_status_line(pane_text: str) -> str | None:
     positives from ``·`` bullets in Claude's regular output.
 
     Returns the text after the spinner, or None if no status line found.
-    Note: blank lines between the spinner and the chrome are tolerated
-    here (the post-completion summary case). To distinguish "Claude is
-    actively running" from "post-completion summary", use
-    ``is_status_active`` instead.
+    Note: blank lines AND the spinner's attached task-progress block
+    (``⎿ ✔ …`` / ``◼ …`` todo lines — rendered between the spinner and the
+    separator while a run is in flight on v2.1.168) are tolerated here
+    (the latter was the 2026-06-11 stuck-route incident: returning None on
+    an active pane fed ``is_running=False`` into the pane-idle clear). To
+    distinguish "Claude is actively running" from "post-completion
+    summary", use ``is_status_active`` instead.
     """
     if not pane_text:
         return None
@@ -1902,14 +1923,17 @@ def parse_status_line(pane_text: str) -> str | None:
     if chrome_idx is None:
         return None  # No chrome visible — can't determine status
 
-    # Check lines just above the separator (skip blanks, up to 4 lines)
-    for i in range(chrome_idx - 1, max(chrome_idx - 5, -1), -1):
+    # Walk up from the separator, skipping blanks and task-progress lines
+    # (bounded — the spinner sits at most a small block above the chrome).
+    for i in range(chrome_idx - 1, max(chrome_idx - 16, -1), -1):
         line = lines[i].strip()
         if not line:
             continue
         if line[0] in STATUS_SPINNERS:
             return line[1:].strip()
-        # First non-empty line above separator isn't a spinner → no status
+        if line.startswith(_TASK_PROGRESS_PREFIXES):
+            continue
+        # First other non-empty line above the separator → no status
         return None
     return None
 
@@ -1947,10 +1971,17 @@ def is_status_active(pane_text: str) -> bool:
     if not pane_text:
         return False
 
-    # Search the last 8 lines so we catch the bottom chrome bar without
-    # paying for a full pane scan on every poll.
-    last_lines = pane_text.split("\n")[-8:]
-    return any("esc to interrupt" in line.lower() for line in last_lines)
+    # Anchor on the chrome separator when present: the ``⏵⏵ …`` chrome bar
+    # carrying the marker sits a fixed few lines below it, but the v2.1.168
+    # agent task-list footer renders BELOW the chrome bar (one row per
+    # agent), so a fixed bottom window can push the marker out of scope on
+    # busy multi-agent runs and read an ACTIVE pane as idle (the 2026-06-11
+    # @4 false pane-idle clear class). Fall back to the last 8 lines when
+    # no separator is found (e.g. heavily truncated frames).
+    lines = pane_text.split("\n")
+    chrome_idx = _find_chrome_separator(lines)
+    scan = lines[chrome_idx:] if chrome_idx is not None else lines[-8:]
+    return any("esc to interrupt" in line.lower() for line in scan)
 
 
 # ── Context-window indicator ─────────────────────────────────────────────

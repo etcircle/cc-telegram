@@ -403,6 +403,36 @@ async def test_slow_capture_observing_within_margin_does_not_clear(
     assert path.exists()
 
 
+async def test_parser_hostile_active_pane_still_clears_notification(_env, mock_bot):
+    """Hermes P2 (2026-06-11 stuck-route follow-up): the Wave B pane clear
+    must gate on the ACTIVE MARKER alone, not ``is_running`` (marker +
+    parseable status). A parser-hostile active frame — visible "esc to
+    interrupt" run chrome but no parseable spinner line — proves execution
+    resumed exactly as well as a parseable one; requiring the parsed status
+    stranded 🔔 until transcript/TTL while the idle-clear path already
+    treated the same frame as running.
+    """
+    hostile_active_pane = (
+        "⏺ Bash(long foreground run)\n"
+        "  ⎿  Running…\n"
+        "\n" + "─" * 40 + "\n"
+        "❯ \n" + "─" * 40 + "\n"
+        "  ⏵⏵ bypass permissions on · esc to interrupt\n"
+    )
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    set_at = time.time() - 30
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=set_at, generation="g1"
+    )
+    path = _write_record(_env, ts=set_at, generation="g1")
+    await _tick(mock_bot, pane_text=hostile_active_pane)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is False
+    assert snap.run_state is RunState.RUNNING
+    assert snap.typing_eligible is True
+    assert not path.exists()
+
+
 async def test_idle_pane_after_set_at_does_not_clear(_env, mock_bot):
     """A NON-running capture after set_at preserves the bit — the prompt is
     (presumably) still on the pane; only positive running proof clears."""
