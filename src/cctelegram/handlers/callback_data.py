@@ -60,6 +60,15 @@ CB_SESSION_CANCEL = "rs:cancel"  # cancel
 # window_id is embedded so a stale button after topic rebind is rejected.
 CB_EFFORT = "eff:"  # eff:<level>:<window_id>  e.g. eff:xhigh:@28
 
+# Per-user output verbosity panel (/settings). The owner's user_id is
+# embedded so a second allowed user tapping someone else's panel is rejected
+# without mutating anything (plan v4 §6). Fields/values are short enum
+# tokens validated against output_prefs; namespaced "stg:" (not "set:") to
+# stay collision-safe (hermes r2 P2-10).
+CB_SETTINGS = (
+    "stg:"  # stg:<field>:<value>:<owner_user_id>  e.g. stg:preset:compact:12345
+)
+
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
 

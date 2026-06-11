@@ -16,6 +16,7 @@ from ..config import config
 from ..session import session_manager
 from ..telegram_sender import split_message
 from ..transcript_parser import TranscriptParser
+from . import output_prefs
 from .callback_data import CB_HISTORY_NEXT, CB_HISTORY_PREV, checked_callback_data
 from .message_sender import safe_edit, safe_reply, safe_send
 
@@ -122,11 +123,16 @@ async def send_history(
         _start = TranscriptParser.EXPANDABLE_QUOTE_START
         _end = TranscriptParser.EXPANDABLE_QUOTE_END
 
-        # Filter messages based on config
-        if config.show_user_messages:
-            # Keep both user and assistant messages
-            pass
+        # Per-recipient user-echo pref (plan v4 §4): the user_echo knob is
+        # the ONLY output pref /history honors — history stays full-fidelity
+        # for tool/thinking content regardless of preset (it is the deep-dive
+        # escape hatch the live digest collapse relies on). Falls back to the
+        # global env default when no user context is available.
+        if user_id is not None:
+            show_user = output_prefs.resolve(user_id).user_echo
         else:
+            show_user = config.show_user_messages
+        if not show_user:
             # Filter to assistant messages only
             messages = [m for m in messages if m["role"] == "assistant"]
         total = len(messages)

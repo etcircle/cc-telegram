@@ -153,9 +153,7 @@ async def test_user_echo_gated_per_recipient(scenario: ScenarioHarness) -> None:
         session_id="sess-1",
     )
     route = (scenario.user_id, _THREAD_ID, wid)
-    scenario.session_manager.set_user_setting(
-        scenario.user_id, "verbosity", "standard"
-    )
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "standard")
 
     await bot_module.handle_new_message(
         NewMessage(
@@ -200,9 +198,7 @@ async def test_task_notification_envelope_exempt_from_echo_gate(
         session_id="sess-1",
     )
     route = (scenario.user_id, _THREAD_ID, wid)
-    scenario.session_manager.set_user_setting(
-        scenario.user_id, "verbosity", "standard"
-    )
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "standard")
 
     envelope = (
         "<task-notification><task-id>b12345</task-id>"
@@ -240,9 +236,7 @@ async def test_digest_line_budget_follows_recipient_preset(
         session_id="sess-1",
     )
     route = (scenario.user_id, _THREAD_ID, wid)
-    scenario.session_manager.set_user_setting(
-        scenario.user_id, "verbosity", "standard"
-    )
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "standard")
 
     long_cmd = "x" * 380  # under verbose's 400, over standard's 160
     await bot_module.handle_new_message(

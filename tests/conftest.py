@@ -723,6 +723,7 @@ def _reset_session_manager() -> None:
     _real_sm.window_display_names.clear()
     _real_sm.group_chat_ids.clear()
     _real_sm.dashboards.clear()
+    _real_sm.user_settings.clear()
 
 
 def _reset_aggregator() -> None:

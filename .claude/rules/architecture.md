@@ -175,6 +175,45 @@ Additional modules:
 
 Handler modules (handlers/):
   message_sender.py   ─ safe_reply/safe_edit/safe_send + rate_limit_send
+  output_prefs.py     ─ Per-user output-verbosity resolution (plan v4 PR-1):
+                        frozen OutputPrefs snapshot per recipient, layering
+                        "stored user override > EXPLICITLY-set legacy env
+                        default > preset" (env vars are defaults, never
+                        ceilings). PRESETS verbose (≡ pre-settings behavior;
+                        PR-1 default) / standard / compact / quiet. Stateless
+                        leaf (imports config + session only); resolve(user_id)
+                        is consulted at every emission point: the per-recipient
+                        👤-echo gate in bot.handle_new_message (top of the
+                        per-user loop, mirroring the removed monitor skip;
+                        <task-notification> envelopes exempt via the public
+                        response_builder.is_task_notification), the legacy
+                        tool_activity gate at the old SHOW_TOOL_CALLS position
+                        (drops ALL tool surfaces incl. Agent/Task — the
+                        faithful env-false mapping; presets never set it),
+                        digest line/snippet/live-line budgets in
+                        _compact_*_line/_render_*_digest (live_lines=0 ⇒
+                        header-only, NO hidden-events line), quiet's
+                        digest_card=False (no digest state EVER created — incl.
+                        _bump_agent_activity_counter, hermes r3 P1-1; images +
+                        attention-dismiss still fire), subagent_cards=off (no
+                        sidechain card; Wave A keep-alive unaffected),
+                        agent_dispatch_msg=False (🤖 dispatch bubble suppressed
+                        INSIDE _process_agent_task AFTER the _agent_tool_ids
+                        stash, so the 🤖✅ report still renders — codex r2
+                        P1-1), todo_card, context_footer, and /history's
+                        user-echo filter (the ONLY pref history honors —
+                        history stays the full-fidelity escape hatch). The
+                        monitor-level user-entry skip + sidechain display drop
+                        are REMOVED (session_monitor always emits;
+                        consume_bot_sent_text stays in the monitor —
+                        single-consumer). Stored per-user in state.json
+                        "user_settings" via SessionManager named mutators
+                        (downgrade loss accepted). UI: /settings command +
+                        stg:<field>:<value>:<owner_user_id> callbacks in
+                        callback_dispatcher/settings.py — owner check rejects
+                        another allowed user's tap; preset tap = clean-slate
+                        replace_user_settings. digest_on_done / subagent_cards
+                        "summary" collapse mechanics land in PR-2.
   message_queue.py    ─ Per-user queue + worker (merge, status dedup)
   status_polling.py   ─ Background status line polling (1s interval). Its
                         pane-absent AUQ-card clear gate consults
@@ -312,7 +351,11 @@ State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
                              read offsets + dashboards ("<chat_id>:<owner_id>" →
                              {thread_id, msg_id, pinned} — the /dashboard host
                              record; SessionManager-owned so the fixed-dict
-                             state rewrite round-trips it)
+                             state rewrite round-trips it) + user_settings
+                             ("<user_id>" → {verbosity, knob overrides} — the
+                             per-user /settings output-verbosity store;
+                             shape-validated on load, knob values re-validated
+                             by output_prefs on read; downgrade loss accepted)
   session_map.json         ─ hook-generated window_id→session mapping (SessionStart)
   monitor_state.json       ─ poll progress (byte offset) per JSONL file
   interactive_state.json   ─ persisted picker msg ids + AUQ context markers

@@ -56,12 +56,14 @@ from .config import config
 from .callback_dispatcher import DispatcherAdapters, dispatch_callback
 from .callback_dispatcher.effort import build_effort_keyboard as _build_effort_keyboard
 from .callback_dispatcher.interactive import _lock_busy
+from .callback_dispatcher.settings import settings_command
 from .callback_dispatcher.screenshot import (
     build_screenshot_keyboard as _build_screenshot_keyboard,
 )
 from .handlers.directory_browser import (
     clear_browse_state,
 )
+from .handlers import output_prefs
 from .handlers.auq_ledger import release_window as auq_ledger_release_window
 from .handlers.cleanup import clear_topic_state
 from .handlers.dashboard import clear_dashboards_in_thread, dashboard_command
@@ -137,7 +139,7 @@ from .handlers.message_sender import (
     safe_edit,  # noqa: F401 - re-exported for callback dispatcher override tests
     safe_reply,
 )
-from .handlers.response_builder import build_response_parts
+from .handlers.response_builder import build_response_parts, is_task_notification
 from .handlers.status_polling import status_poll_loop, typing_action_loop
 from . import route_runtime, terminal_parser, transcript_event_adapter
 from .screenshot import text_to_image
@@ -851,6 +853,22 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         return
 
     for user_id, wid, thread_id in active_users:
+        prefs = output_prefs.resolve(user_id)
+
+        # Per-recipient 👤 user-echo gate (plan v4 §4). Sits at the TOP of
+        # the loop body, mirroring the monitor-level skip it replaced
+        # (session_monitor previously dropped user entries globally on
+        # CC_TELEGRAM_SHOW_USER_MESSAGES=false) — so a gated entry fires no
+        # side effects, exactly like today's env-false behavior. External
+        # <task-notification> envelopes are EXEMPT: they are system events
+        # rendered as their own card, not an echo of the user's words.
+        if (
+            msg.role == "user"
+            and not prefs.user_echo
+            and not is_task_notification(msg.text)
+        ):
+            continue
+
         # Handle interactive tools specially - capture terminal and send UI.
         # Sub-agent (sidechain) tool calls are routed to the per-sub-agent
         # digest regardless of tool name; their interactive prompts don't
@@ -972,8 +990,14 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             )
             forget_ask_tool_input(wid)
 
-        # Skip tool call notifications when CC_TELEGRAM_SHOW_TOOL_CALLS=false
-        if not config.show_tool_calls and msg.content_type in (
+        # Per-recipient legacy tool-call suppression — the faithful
+        # CC_TELEGRAM_SHOW_TOOL_CALLS=false mapping (plan v4 §4): drops ALL
+        # tool surfaces including Agent/Task, exactly like the old global
+        # gate at this same position (the AUQ tool_result seam above stays
+        # ahead of it). Presets never set tool_activity=False — quiet's
+        # digest suppression lives in the digest path instead, so the 🤖✅
+        # Agent report survives there (codex r2 P1-1).
+        if not prefs.tool_activity and msg.content_type in (
             "tool_use",
             "tool_result",
         ):
@@ -987,7 +1011,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # the per-sub-agent digest.
         text = msg.text
         if (
-            config.context_in_message_footer
+            prefs.context_footer
             and msg.role == "assistant"
             and msg.content_type == "text"
             and msg.stop_reason in _TURN_END_STOP_REASONS
@@ -1422,6 +1446,9 @@ def create_bot() -> Application:
     # it is a bot-owned command and must never be forwarded to Claude Code
     # (Wave C, pre-C/P2-5).
     application.add_handler(CommandHandler("dashboard", dashboard_command))
+    # /settings is bot-owned for the same reason (plan v4 PR-1 / codex r1
+    # P2-7): registered before the catch-all forwarder or it lands in tmux.
+    application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(

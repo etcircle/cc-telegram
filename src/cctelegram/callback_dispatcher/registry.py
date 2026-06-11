@@ -39,6 +39,7 @@ from cctelegram.handlers.callback_data import (
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
+    CB_SETTINGS,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -281,6 +282,14 @@ CALLBACK_REGISTRY: tuple[CallbackRegistryEntry, ...] = (
         "cctelegram.callback_dispatcher.effort",
         "tests/scenarios",
         "execute_effort_callback",
+    ),
+    CallbackRegistryEntry(
+        CB_SETTINGS,
+        "SettingsCommand",
+        "cctelegram.callback_dispatcher.settings.build_settings_keyboard",
+        "cctelegram.callback_dispatcher.settings",
+        "tests/scenarios/test_output_settings.py",
+        "execute_settings_callback",
     ),
 )
 

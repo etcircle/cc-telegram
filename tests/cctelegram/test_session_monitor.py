@@ -784,12 +784,15 @@ class TestSidechainTailing:
         assert "tool_result" in kinds
 
     @pytest.mark.asyncio
-    async def test_show_tool_calls_false_suppresses_display_only(
+    async def test_show_tool_calls_false_still_emits_sidechain_blocks(
         self, monitor, tmp_path, monkeypatch, make_jsonl_entry, make_tool_use_block
     ):
-        """Wave A: with show_tool_calls disabled, sidechain files are STILL
-        tracked/parsed and activity reported — only NewMessage emission is
-        suppressed (spec test 6)."""
+        """Plan v4 §4 gate relocation: the monitor ALWAYS emits sidechain
+        blocks regardless of show_tool_calls — display suppression is now
+        per-recipient (output_prefs maps the env to subagent_cards=off and
+        the message_queue digest path drops it there). A monitor-level drop
+        would make a stored user override unable to re-enable the cards.
+        Activity keep-alive reporting is unchanged (Wave A)."""
         from cctelegram.session_monitor import config as monitor_config
 
         monkeypatch.setattr(monitor_config, "show_tool_calls", False)
@@ -815,8 +818,9 @@ class TestSidechainTailing:
 
         msgs = await monitor.check_sidechain_updates({parent_sid})
 
-        # No display, but the parent's sidechain activity IS reported.
-        assert msgs == []
+        # Blocks ARE emitted (per-recipient gating happens downstream), and
+        # the parent's sidechain activity is reported as before.
+        assert [m.subagent_key for m in msgs] == [f"sub:{parent_sid}:agent-abc"]
         assert monitor.pop_sidechain_active_parents() == {parent_sid}
 
     @pytest.mark.asyncio

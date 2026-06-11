@@ -182,6 +182,16 @@ class SessionManager:
     # _load_state/_save_state path; the unknown-key-dropping state.json
     # rewrite is exactly why an ad-hoc second writer is forbidden.
     dashboards: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # user_id -> {"verbosity": str, "<knob>": value, ...} — per-user output
+    # verbosity settings (plan v4 PR-1; resolved by handlers/output_prefs).
+    # Owned HERE for the same reason as dashboards: the unknown-key-dropping
+    # state.json rewrite means only SessionManager fields round-trip. Values
+    # are validated permissively on load (shape only) — output_prefs
+    # re-validates knob values on every read, so stale junk is inert.
+    # Downgrade loss is ACCEPTED: an older binary saving state.json drops
+    # this key; settings are re-settable preferences with no correctness
+    # coupling (plan v4 §6 / codex r1 P2-5).
+    user_settings: dict[int, dict[str, Any]] = field(default_factory=dict)
     # window_id -> display name (window_name)
     window_display_names: dict[str, str] = field(default_factory=dict)
     # "user_id:thread_id" -> group chat_id (for supergroup forum topic routing)
@@ -210,6 +220,9 @@ class SessionManager:
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
             "dashboards": self.dashboards,
+            "user_settings": {
+                str(uid): settings for uid, settings in self.user_settings.items()
+            },
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -240,6 +253,9 @@ class SessionManager:
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
                 self.dashboards = self._parse_dashboards(state.get("dashboards", {}))
+                self.user_settings = self._parse_user_settings(
+                    state.get("user_settings", {})
+                )
 
             except (json.JSONDecodeError, ValueError, OSError) as e:
                 # OSError included (finding 19): the singleton constructs at
@@ -253,7 +269,29 @@ class SessionManager:
                 self.window_display_names = {}
                 self.group_chat_ids = {}
                 self.dashboards = {}
+                self.user_settings = {}
                 pass
+
+    @staticmethod
+    def _parse_user_settings(raw: Any) -> dict[int, dict[str, Any]]:
+        """Validate the persisted ``user_settings`` map shape; drop malformed.
+
+        Shape-only validation (int-able key, dict value) — knob VALUES are
+        re-validated by ``output_prefs`` on every read, so an unknown or
+        stale knob entry is inert rather than load-fatal.
+        """
+        parsed: dict[int, dict[str, Any]] = {}
+        if not isinstance(raw, dict):
+            return parsed
+        for key, rec in raw.items():
+            try:
+                uid = int(key)
+                if not isinstance(rec, dict):
+                    raise ValueError("record is not a dict")
+                parsed[uid] = dict(rec)
+            except (TypeError, ValueError) as e:
+                logger.warning("Dropping malformed user_settings entry %r: %s", key, e)
+        return parsed
 
     @staticmethod
     def _parse_dashboards(raw: Any) -> dict[str, dict[str, Any]]:
@@ -624,6 +662,31 @@ class SessionManager:
             return
         rec["pinned"] = bool(pinned)
         self._save_state()
+
+    # --- Per-user output settings (plan v4 PR-1) ---
+    #
+    # Synchronous mutate + _save_state, mirroring the dashboard record style.
+    # Values are opaque here; handlers/output_prefs owns knob semantics and
+    # validates on read.
+
+    def get_user_settings(self, user_id: int) -> dict[str, Any]:
+        """Return a copy of the user's stored output settings ({} if none)."""
+        rec = self.user_settings.get(user_id)
+        return dict(rec) if rec is not None else {}
+
+    def set_user_setting(self, user_id: int, key: str, value: Any) -> None:
+        """Set one stored knob/preset value and persist."""
+        rec = self.user_settings.setdefault(user_id, {})
+        rec[key] = value
+        self._save_state()
+        logger.info("User setting saved: user=%d %s=%r", user_id, key, value)
+
+    def replace_user_settings(self, user_id: int, settings: dict[str, Any]) -> None:
+        """Replace the user's stored settings wholesale (preset tap = clean
+        slate: choosing a preset drops stale per-knob overrides)."""
+        self.user_settings[user_id] = dict(settings)
+        self._save_state()
+        logger.info("User settings replaced: user=%d %r", user_id, settings)
 
     def iter_dashboards(self) -> Iterator[tuple[int, int, dict[str, Any]]]:
         """Iterate all dashboards as ``(chat_id, owner_id, record_copy)``."""

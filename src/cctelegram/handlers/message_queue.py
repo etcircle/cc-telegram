@@ -40,6 +40,7 @@ from ..session import session_id_for_window, session_manager
 from ..terminal_parser import is_status_active, parse_status_line
 from ..tmux_manager import tmux_manager
 from . import attention
+from . import output_prefs
 from ..route_runtime import RunState
 from .message_sender import (
     TopicSendOutcome,
@@ -1214,8 +1215,18 @@ def _status_display_text(window_id: str, text: str) -> str:
     return f"🟡 Busy — {display}\n{text}"
 
 
-def _compact_activity_line(task: MessageTask) -> str:
-    """Render a compact single-line activity entry."""
+def _compact_activity_line(
+    task: MessageTask,
+    *,
+    line_chars: int = ACTIVITY_DIGEST_MAX_LINE_LENGTH,
+    snippet_chars: int = ACTIVITY_DIGEST_RESULT_SNIPPET_LENGTH,
+) -> str:
+    """Render a compact single-line activity entry.
+
+    ``line_chars`` / ``snippet_chars`` come from the recipient's resolved
+    ``OutputPrefs`` (plan v4 §4); the module constants stay as the
+    ``verbose``-preset defaults.
+    """
     if task.content_type == "thinking":
         return "💭 Thinking"
 
@@ -1233,14 +1244,12 @@ def _compact_activity_line(task: MessageTask) -> str:
         # path lists. Subsequent lines are dropped to keep the digest
         # compact; the user can still expand the topic for the full reply.
         first_line = rest.split("\n", 1)[0].strip()
-        if len(first_line) > ACTIVITY_DIGEST_RESULT_SNIPPET_LENGTH:
-            first_line = (
-                first_line[: ACTIVITY_DIGEST_RESULT_SNIPPET_LENGTH - 1].rstrip() + "…"
-            )
+        if len(first_line) > snippet_chars:
+            first_line = first_line[: snippet_chars - 1].rstrip() + "…"
         raw = f"{left} — {first_line}" if first_line else left
 
-    if len(raw) > ACTIVITY_DIGEST_MAX_LINE_LENGTH:
-        raw = raw[: ACTIVITY_DIGEST_MAX_LINE_LENGTH - 1].rstrip() + "…"
+    if len(raw) > line_chars:
+        raw = raw[: line_chars - 1].rstrip() + "…"
 
     if task.content_type == "tool_result":
         if "error" in raw.lower():
@@ -1287,6 +1296,7 @@ def _render_activity_digest(
     *,
     waiting: bool = False,
     route: Route | None = None,
+    live_lines: int = ACTIVITY_DIGEST_MAX_LINES,
 ) -> str:
     """Render the editable activity digest card.
 
@@ -1294,6 +1304,10 @@ def _render_activity_digest(
     ``route_runtime.snapshot``) rather than ``state.done`` + ``waiting``.
     Without a route (e.g. the rare digest with no resolvable route), it
     falls back to the ``waiting`` / ``state.done`` flags.
+
+    ``live_lines`` is the recipient's body budget (plan v4 §5): 0 renders
+    header + counts ONLY — no body lines and no hidden-events line (the
+    ``compact`` preset's header-only card).
     """
     display = _display_name(state.window_id)
     if route is not None:
@@ -1325,11 +1339,12 @@ def _render_activity_digest(
     else:
         lines.append("Activity: thinking")
 
-    shown = state.lines[-ACTIVITY_DIGEST_MAX_LINES:]
-    hidden = max(0, len(state.lines) - len(shown))
-    if hidden:
-        lines.append(f"• … {hidden} earlier event(s)")
-    lines.extend(f"• {line}" for line in shown)
+    shown = state.lines[-live_lines:] if live_lines > 0 else []
+    if shown:
+        hidden = max(0, len(state.lines) - len(shown))
+        if hidden:
+            lines.append(f"• … {hidden} earlier event(s)")
+        lines.extend(f"• {line}" for line in shown)
     return "\n".join(lines)
 
 
@@ -1356,6 +1371,7 @@ async def _upsert_activity_digest(
         state,
         waiting=attention.is_waiting(user_id, thread_id),
         route=route,
+        live_lines=output_prefs.resolve(user_id).digest_live_lines,
     )
     if text == state.last_text:
         return
@@ -1501,11 +1517,35 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
     """Collapse noisy thinking/tool events into one editable activity message."""
     wid = task.window_id or ""
     tid = task.thread_id or 0
+    prefs = output_prefs.resolve(user_id)
+
+    # quiet (digest_card=False): no digest card AT ALL for this recipient —
+    # no state slot is ever created, so the flush/refresh/repaint paths have
+    # nothing to send (plan v4 §2). The two non-display side effects stay:
+    # images are real output, and a tool_use still dismisses the attention
+    # card (interaction semantics, not display).
+    if not prefs.digest_card:
+        if task.content_type == "tool_use":
+            await attention.dismiss(bot, user_id=user_id, thread_id=task.thread_id)
+        if task.image_data:
+            chat_id, effective_thread_id = _delivery_target(user_id, task.thread_id)
+            await _send_task_images(bot, chat_id, task, effective_thread_id)
+        return
+
+    # thinking_line=False (compact/quiet): the 💭 keep-alive line is noise
+    # for this recipient — no state mutation, no flush.
+    if task.content_type == "thinking" and not prefs.thinking_line:
+        return
+
     state = _activity_msg_info.get((user_id, tid))
     if state is None or state.window_id != wid or state.done:
         state = ActivityDigestState(message_id=0, window_id=wid)
 
-    line = _compact_activity_line(task)
+    line = _compact_activity_line(
+        task,
+        line_chars=prefs.digest_line_chars,
+        snippet_chars=prefs.result_snippet_chars,
+    )
     if task.content_type == "tool_use":
         state.tool_count += 1
         state.lines.append(line)
@@ -1565,13 +1605,20 @@ def _short_subagent_id(key: str) -> str:
     return suffix[-6:] if len(suffix) > 6 else suffix
 
 
-def _compact_subagent_line(task: MessageTask) -> str:
+def _compact_subagent_line(
+    task: MessageTask,
+    *,
+    line_chars: int = SUBAGENT_DIGEST_MAX_LINE_LENGTH,
+    snippet_chars: int = SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH,
+) -> str:
     """Render one line for the sub-agent digest from a sub-agent task.
 
     Mirrors ``_compact_activity_line`` for tool_use / tool_result / thinking
     so the per-sub-agent digest reads like the parent activity card. Text
     blocks (assistant prose) are truncated to a snippet — full prose still
     lives in the parent transcript / file system; the digest is a peek.
+    ``line_chars`` / ``snippet_chars`` come from the recipient's resolved
+    ``OutputPrefs``; the module constants stay as the ``verbose`` defaults.
     """
     if task.content_type == "thinking":
         return "💭 Thinking"
@@ -1584,8 +1631,8 @@ def _compact_subagent_line(task: MessageTask) -> str:
 
     if task.content_type == "text":
         snippet = raw
-        if len(snippet) > SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH:
-            snippet = snippet[: SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH - 1].rstrip() + "…"
+        if len(snippet) > snippet_chars:
+            snippet = snippet[: snippet_chars - 1].rstrip() + "…"
         return f"📝 {snippet}"
 
     # tool_use / tool_result share the activity-card formatting: the parent's
@@ -1594,14 +1641,12 @@ def _compact_subagent_line(task: MessageTask) -> str:
     if "  ⎿  " in raw:
         left, rest = raw.split("  ⎿  ", 1)
         first_line = rest.split("\n", 1)[0].strip()
-        if len(first_line) > SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH:
-            first_line = (
-                first_line[: SUBAGENT_DIGEST_TEXT_SNIPPET_LENGTH - 1].rstrip() + "…"
-            )
+        if len(first_line) > snippet_chars:
+            first_line = first_line[: snippet_chars - 1].rstrip() + "…"
         raw = f"{left} — {first_line}" if first_line else left
 
-    if len(raw) > SUBAGENT_DIGEST_MAX_LINE_LENGTH:
-        raw = raw[: SUBAGENT_DIGEST_MAX_LINE_LENGTH - 1].rstrip() + "…"
+    if len(raw) > line_chars:
+        raw = raw[: line_chars - 1].rstrip() + "…"
 
     if task.content_type == "tool_result":
         if "error" in raw.lower():
@@ -1612,8 +1657,16 @@ def _compact_subagent_line(task: MessageTask) -> str:
     return f"⚙️ {raw}"
 
 
-def _render_subagent_digest(state: SubagentDigestState) -> str:
-    """Render the editable per-sub-agent digest card."""
+def _render_subagent_digest(
+    state: SubagentDigestState,
+    *,
+    live_lines: int = SUBAGENT_DIGEST_MAX_LINES,
+) -> str:
+    """Render the editable per-sub-agent digest card.
+
+    ``live_lines`` mirrors the activity digest's recipient budget; 0 renders
+    header + counts only (no body lines, no hidden-events line).
+    """
     sid = _short_subagent_id(state.subagent_key)
     header = f"↳ Sub-agent · {sid}"
     if state.tool_count or state.completed_count:
@@ -1624,11 +1677,12 @@ def _render_subagent_digest(state: SubagentDigestState) -> str:
         progress = "Activity: thinking"
     lines = [header, progress]
 
-    shown = state.lines[-SUBAGENT_DIGEST_MAX_LINES:]
-    hidden = max(0, len(state.lines) - len(shown))
-    if hidden:
-        lines.append(f"• … {hidden} earlier event(s)")
-    lines.extend(f"• {line}" for line in shown)
+    shown = state.lines[-live_lines:] if live_lines > 0 else []
+    if shown:
+        hidden = max(0, len(state.lines) - len(shown))
+        if hidden:
+            lines.append(f"• … {hidden} earlier event(s)")
+        lines.extend(f"• {line}" for line in shown)
     return "\n".join(lines)
 
 
@@ -1661,7 +1715,10 @@ async def _upsert_subagent_digest(
     now-stale topic.
     """
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
-    text = _render_subagent_digest(state)
+    text = _render_subagent_digest(
+        state,
+        live_lines=output_prefs.resolve(user_id).subagent_live_lines,
+    )
     if text == state.last_text:
         return
 
@@ -1757,6 +1814,14 @@ async def _process_subagent_activity_task(
     """Collapse one sub-agent run's blocks into a single editable digest."""
     if not task.subagent_key:
         return
+    prefs = output_prefs.resolve(user_id)
+    # subagent_cards == "off" (compact/quiet, or the legacy env-false
+    # mapping): no play-by-play card for this recipient — no state slot is
+    # ever created, so the debounced flush path has nothing to send. The
+    # sidechain keep-alive is unaffected (it fires from session_monitor, not
+    # from this display path — Wave A contract).
+    if prefs.subagent_cards == output_prefs.SUBAGENT_CARDS_OFF:
+        return
     wid = task.window_id or ""
     tid = task.thread_id or 0
     subagent_key = task.subagent_key
@@ -1769,7 +1834,11 @@ async def _process_subagent_activity_task(
             subagent_key=subagent_key,
         )
 
-    line = _compact_subagent_line(task)
+    line = _compact_subagent_line(
+        task,
+        line_chars=prefs.digest_line_chars,
+        snippet_chars=prefs.result_snippet_chars,
+    )
     if task.content_type == "tool_use":
         state.tool_count += 1
         state.lines.append(line)
@@ -2068,6 +2137,10 @@ def _schedule_todo_flush(
 
 async def _process_todo_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     """Route a parent TodoWrite tool_use to the per-route todo digest."""
+    # quiet: the 📋 task-list card is display-only — skip it entirely for
+    # this recipient (no state slot, nothing for the flush to send).
+    if not output_prefs.resolve(user_id).todo_card:
+        return
     if not task.tool_input:
         return
     todos_raw = task.tool_input.get("todos")
@@ -2104,19 +2177,26 @@ async def _process_todo_task(bot: Bot, user_id: int, task: MessageTask) -> None:
 def _render_agent_tool_use(
     input_data: dict[str, object] | None,
     tool_name: str,
+    preview_chars: int | None = None,
 ) -> str:
     """Render the top-level "Subagent dispatched" message body.
 
     Returns a single rendered string. The caller wraps it in a list when the
     surrounding ``MessageTask`` expects ``parts``; the send layer's
     ``split_message`` already handles Telegram's 4096-char limit.
+    ``preview_chars`` comes from the recipient's resolved ``OutputPrefs``;
+    None falls back to the global env default.
     """
     inp = input_data if isinstance(input_data, dict) else {}
     subagent_type = str(inp.get("subagent_type") or "general-purpose")
     description = str(inp.get("description") or "")
     prompt_text = str(inp.get("prompt") or "")
 
-    cap = config.agent_prompt_preview_chars
+    cap = (
+        preview_chars
+        if preview_chars is not None
+        else config.agent_prompt_preview_chars
+    )
     excerpt = prompt_text.strip()
     if len(excerpt) > cap:
         excerpt = excerpt[: cap - 1].rstrip() + "…"
@@ -2190,7 +2270,13 @@ async def _bump_agent_activity_counter(
     body of the digest, however, would be misleading if Agent showed up as
     a generic "⚙️ Agent(...)" line — Stage 4.c routes the body to the
     top-level message instead.
+
+    Prefs-aware (hermes r3 P1-1): under a no-digest policy (quiet) this MUST
+    NOT create ``ActivityDigestState`` or schedule a flush — a pure Agent
+    turn would otherwise paint a digest card off the counter path alone.
     """
+    if not output_prefs.resolve(user_id).digest_card:
+        return
     wid = task.window_id or ""
     tid = task.thread_id or 0
     state = _activity_msg_info.get((user_id, tid))
@@ -2238,19 +2324,33 @@ async def _process_agent_task(bot: Bot, user_id: int, task: MessageTask) -> None
             _agent_tool_ids.pop((task.tool_use_id, user_id, tid), None)
         await _bump_agent_activity_counter(bot, user_id, task)
         return
+    prefs = output_prefs.resolve(user_id)
     rendered: str
     if task.content_type == "tool_use":
-        rendered = _render_agent_tool_use(
-            task.tool_input,
-            task.tool_name or "Agent",
-        )
         if task.tool_use_id:
             # Stash the input dict so the matching tool_result can render
             # the same description / subagent_type (tool_result blocks
-            # don't carry the original input).
+            # don't carry the original input). Stashed even when the
+            # dispatch bubble is suppressed below — the 🤖✅ result render
+            # and ``_is_agent_tool_result`` routing both depend on it
+            # (codex r2 P1-1).
             _agent_tool_ids[(task.tool_use_id, user_id, tid)] = (
                 task.tool_input if isinstance(task.tool_input, dict) else {}
             )
+        if not prefs.agent_dispatch_msg:
+            # quiet: no "🤖 Subagent dispatched" bubble. The later
+            # tool_result renders the 🤖✅ report as a fresh message (or via
+            # the status→content conversion — both shapes are the contract,
+            # hermes r3 P2-2). Counter bump keeps header math right for
+            # recipients that do show a digest (no-op under quiet's
+            # digest_card=False).
+            await _bump_agent_activity_counter(bot, user_id, task)
+            return
+        rendered = _render_agent_tool_use(
+            task.tool_input,
+            task.tool_name or "Agent",
+            preview_chars=prefs.agent_prompt_preview_chars,
+        )
     else:
         status = _agent_result_status(task.text or "\n\n".join(task.parts))
         # Look up the original tool_use input first; fall back to whatever

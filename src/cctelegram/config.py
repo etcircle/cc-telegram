@@ -96,6 +96,26 @@ class Config:
             os.getenv("CC_TELEGRAM_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
 
+        # Per-user output verbosity (handlers/output_prefs.py). The preset a
+        # user with NO stored /settings choice resolves to. The legacy
+        # CC_TELEGRAM_SHOW_* vars above remain honored as knob-precise
+        # DEFAULTS (not ceilings) — applied only when explicitly set, which
+        # the env_*_set flags below record. A stored per-user override wins
+        # over both.
+        self.default_verbosity = os.getenv("CC_TELEGRAM_VERBOSITY", "verbose")
+        self.env_show_user_messages_set = (
+            os.getenv("CC_TELEGRAM_SHOW_USER_MESSAGES") is not None
+        )
+        self.env_show_tool_calls_set = (
+            os.getenv("CC_TELEGRAM_SHOW_TOOL_CALLS") is not None
+        )
+        self.env_context_footer_set = (
+            os.getenv("CC_TELEGRAM_CONTEXT_IN_MESSAGE_FOOTER") is not None
+        )
+        self.env_agent_preview_set = (
+            os.getenv("CC_TELEGRAM_AGENT_PROMPT_PREVIEW_CHARS") is not None
+        )
+
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
             os.getenv("CC_TELEGRAM_SHOW_HIDDEN_DIRS", "").lower() == "true"
