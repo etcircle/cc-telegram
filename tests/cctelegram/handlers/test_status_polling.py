@@ -1331,9 +1331,7 @@ class TestActivePaneNeverCommitsIdleClear:
         )
 
     @pytest.mark.asyncio
-    async def test_task_block_frame_keeps_route_running_tool(
-        self, mock_bot: AsyncMock
-    ):
+    async def test_task_block_frame_keeps_route_running_tool(self, mock_bot: AsyncMock):
         """The live incident frame: RUNNING_TOOL with an open Bash, watchdog
         captures returning the ACTIVE task-block pane across ticks spanning
         the debounce delay — the route must stay RUNNING_TOOL (typing

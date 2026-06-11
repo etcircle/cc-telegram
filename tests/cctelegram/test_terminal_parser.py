@@ -84,8 +84,7 @@ class TestParseStatusLine:
             "\n" + chrome
         )
         assert (
-            parse_status_line(pane)
-            == "Building wave 5… (2h 4m 6s · ↓ 198.9k tokens)"
+            parse_status_line(pane) == "Building wave 5… (2h 4m 6s · ↓ 198.9k tokens)"
         )
 
     def test_task_progress_block_idle_pane_still_none(self, chrome: str):

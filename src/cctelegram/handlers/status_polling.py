@@ -841,7 +841,7 @@ async def update_status_message(
     # transcript / inbound activity re-arms (cancels) the pending clear
     # inside route_runtime.
     await _drive_pane_idle_clear(
-        bot, user_id, window_id, thread_id, is_running, status_line
+        bot, user_id, window_id, thread_id, is_running, status_line, pane_text
     )
 
 
@@ -852,6 +852,7 @@ async def _drive_pane_idle_clear(
     thread_id: int | None,
     is_running: bool,
     status_line: str | None,
+    pane_text: str,
 ) -> None:
     """Pane-idle card-clear driver.
 
@@ -860,12 +861,23 @@ async def _drive_pane_idle_clear(
 
       - **Running pane** → cancel any pending pane-idle clear so a fresh idle
         stretch re-arms from scratch, then enqueue the live status line.
+      - **Active-run marker without a parseable status line** → treat as
+        running (cancel, no status text to enqueue). ``is_running`` is
+        ``status_line AND is_status_active``, so a chrome variant that
+        defeats ``parse_status_line`` while the pane is demonstrably mid-run
+        must not fall into the idle branch — that's the 2026-06-11 @4
+        stuck-route incident (the v2.1.168 task-progress block made every
+        capture read ``is_running=False`` and the rolling deadline
+        eventually committed mid-Bash).
       - **Idle pane, not yet due** → ``arm_pane_idle_clear`` (idempotent;
         sets the deadline on the first confirmed-idle observation, then
         waits it out).
-      - **Idle pane, deadline due** → ``commit_pane_idle_clear`` (reconciles
-        run-state to IDLE_CLEARED, latches the cleared sentinel) + enqueue
-        the card clear.
+      - **Idle pane, deadline due** → commit ONLY on the same positive idle
+        evidence ``_process_idle_clear_only`` demands (``has_pane_chrome``
+        — a rendered Claude pane at rest); a chrome-less/truncated frame
+        re-arms instead of committing. Then ``commit_pane_idle_clear``
+        (reconciles run-state to IDLE_CLEARED, latches the cleared
+        sentinel) + enqueue the card clear.
 
     A single ``now`` is read once and threaded through arm/due so the
     decision is consistent within the tick.
@@ -884,8 +896,24 @@ async def _drive_pane_idle_clear(
         )
         return
 
+    if is_status_active(pane_text):
+        # No parseable status line, but the active-run marker is on the
+        # pane: Claude is mid-run and the frame just defeated the status
+        # parser. NEVER arm or commit off such a frame — cancel like the
+        # running branch (positive-active evidence; a genuine idle stretch
+        # re-arms from a fresh confirmed-idle scrape).
+        route_runtime.reset_pane_idle_clear(route)
+        return
+
     now = time.monotonic()
     if route_runtime.pane_idle_clear_due(route, now=now):
+        if not has_pane_chrome(pane_text):
+            # Not positive idle evidence (truncated / mid-redraw / chrome-less
+            # frame) — mirror _process_idle_clear_only: re-arm so the next due
+            # tick re-validates against a fresh frame, never commit blind.
+            route_runtime.reset_pane_idle_clear(route)
+            route_runtime.arm_pane_idle_clear(route, now=now)
+            return
         # Debounce elapsed — clear once. ``commit_pane_idle_clear``
         # reconciles run-state (no-op for WAITING_ON_USER, the same guard
         # the interactive branch above already enforces) and
@@ -963,8 +991,16 @@ async def _process_idle_clear_only(
         and not is_status_active(pane_text)
     )
     if not second_frame_idle:
-        # Busy, empty, or chrome-less (malformed/truncated/mid-redraw)
-        # re-capture — re-arm instead of committing.
+        if pane_text and is_status_active(pane_text):
+            # Positively ACTIVE re-capture ("esc to interrupt" visible) —
+            # cancel the deadline outright, exactly like the full path's
+            # running branch. Keeping a rolling re-armed deadline alive for
+            # the whole run was the fuel for the 2026-06-11 @4 false commit
+            # (a watchdog full-capture tick eventually landed past it).
+            route_runtime.reset_pane_idle_clear(route)
+            return
+        # Empty or chrome-less (malformed/truncated/mid-redraw) re-capture —
+        # unknown frame: re-arm so the next due tick re-validates.
         route_runtime.reset_pane_idle_clear(route)
         route_runtime.arm_pane_idle_clear(route, now=now)
         return
