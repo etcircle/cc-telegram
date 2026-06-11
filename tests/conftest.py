@@ -834,6 +834,23 @@ def fake_bot() -> FakeBot:
     return FakeBot()
 
 
+@pytest.fixture(autouse=True)
+def _pin_default_verbosity():
+    """Pin the suite-wide default preset to "verbose" (≡ pre-settings
+    behavior) for EVERY test, deterministically — PR-2 flipped the
+    production default to "standard" (plan v4 §9), and an order-dependent
+    pin (reset-seam only) would let a solo-run unit test see the production
+    default. Tests exercising the new presets set a stored user setting (or
+    monkeypatch ``config.default_verbosity``) explicitly.
+    """
+    from cctelegram.config import config as _cfg
+
+    prev = _cfg.default_verbosity
+    _cfg.default_verbosity = "verbose"
+    yield
+    _cfg.default_verbosity = prev
+
+
 @pytest.fixture
 def fresh_handler_state() -> Any:
     """Wipe all handler module state before AND after the test.
