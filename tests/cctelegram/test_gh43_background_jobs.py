@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 from cctelegram import route_runtime
-from cctelegram.route_runtime import RunState, TranscriptLifecycleEvent
+from cctelegram.route_runtime import TranscriptLifecycleEvent
 from cctelegram.terminal_parser import parse_background_jobs
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gh43_bg_shell_frame.txt"
@@ -206,9 +206,7 @@ async def test_collapsed_done_card_gains_bg_jobs_suffix():
         started_at=100.0,
         finalized_at=321.0,
     )
-    text = message_queue._render_activity_digest(
-        state, route=ROUTE, collapse_done=True
-    )
+    text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
     assert "⏳ 1 background job" in text
     assert text.startswith("✅ Done")
 
@@ -217,27 +215,19 @@ async def test_collapsed_done_card_no_suffix_when_zero_or_stale():
     from cctelegram.handlers import message_queue, pane_signals
 
     await _idle_route(ROUTE)
-    state = message_queue.ActivityDigestState(
-        message_id=1, window_id="@7", done=True
-    )
+    state = message_queue.ActivityDigestState(message_id=1, window_id="@7", done=True)
     # No record at all.
-    text = message_queue._render_activity_digest(
-        state, route=ROUTE, collapse_done=True
-    )
+    text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
     assert "background job" not in text
     # Zero recorded.
     pane_signals.record_background_jobs(ROUTE, 0, now=time.time())
-    text = message_queue._render_activity_digest(
-        state, route=ROUTE, collapse_done=True
-    )
+    text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
     assert "background job" not in text
     # Stale record.
     pane_signals.record_background_jobs(
         ROUTE, 2, now=time.time() - pane_signals.BG_JOBS_MAX_AGE_S - 1.0
     )
-    text = message_queue._render_activity_digest(
-        state, route=ROUTE, collapse_done=True
-    )
+    text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
     assert "background job" not in text
 
 
@@ -248,12 +238,8 @@ async def test_running_route_never_renders_bg_suffix():
 
     await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
     pane_signals.record_background_jobs(ROUTE, 1, now=time.time())
-    state = message_queue.ActivityDigestState(
-        message_id=1, window_id="@7", done=True
-    )
-    text = message_queue._render_activity_digest(
-        state, route=ROUTE, collapse_done=True
-    )
+    state = message_queue.ActivityDigestState(message_id=1, window_id="@7", done=True)
+    text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
     assert "background job" not in text
 
 
@@ -320,3 +306,64 @@ async def test_dashboard_idle_no_bg_jobs_stays_white(fresh_handler_state):
     text = dashboard.render_dashboard(uid, chat)
     assert "⚪ di-copilot-2" in text
     assert "⏳" not in text
+
+
+# ── W4c: poller wiring ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_poller_records_bg_jobs_and_repaints_on_change():
+    """A full pane capture records the parsed count into pane_signals and
+    triggers a digest refresh when the count CHANGED (pull-side repaint —
+    the collapsed done-card otherwise never re-renders on shell-count
+    changes)."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from cctelegram.handlers import pane_signals, status_polling
+
+    window_id = "@7"
+    route: route_runtime.Route = (1, 42, window_id)
+    await _idle_route(route)
+
+    mock_window = MagicMock()
+    mock_window.window_id = window_id
+    frame = FIXTURE.read_text()
+
+    with (
+        patch.object(status_polling, "tmux_manager") as mock_tmux,
+        patch.object(status_polling, "enqueue_status_update", new_callable=AsyncMock),
+        patch.object(status_polling, "handle_interactive_ui", new_callable=AsyncMock),
+        patch.object(
+            status_polling,
+            "refresh_activity_digest_if_present",
+            new_callable=AsyncMock,
+        ) as mock_refresh,
+    ):
+        mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+        mock_tmux.capture_pane = AsyncMock(return_value=frame)
+        await status_polling.update_status_message(
+            AsyncMock(), user_id=1, window_id=window_id, thread_id=42
+        )
+        assert pane_signals.peek_background_jobs(route, now=time.time()) == 1
+        first_refreshes = mock_refresh.await_count
+        assert first_refreshes >= 1  # changed (first observation) → repaint
+        # Same count again → no additional change-repaint.
+        await status_polling.update_status_message(
+            AsyncMock(), user_id=1, window_id=window_id, thread_id=42
+        )
+        assert mock_refresh.await_count == first_refreshes
+
+
+@pytest.mark.asyncio
+async def test_topic_teardown_clears_bg_jobs():
+    """cleanup.clear_topic_state drops the topic's pane_signals records
+    (the GH #43 teardown seam beside route_runtime.clear_routes_for_topic)."""
+    from cctelegram.handlers import cleanup, pane_signals
+    from cctelegram.session import session_manager
+
+    uid = 12345
+    session_manager.bind_thread(uid, 42, "@7", "x")
+    route = (uid, 42, "@7")
+    pane_signals.record_background_jobs(route, 1, now=time.time())
+    await cleanup.clear_topic_state(uid, 42)
+    assert pane_signals.peek_background_jobs(route, now=time.time()) is None
