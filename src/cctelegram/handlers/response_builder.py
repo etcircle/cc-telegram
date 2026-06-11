@@ -27,6 +27,16 @@ _TASK_NOTIF_TAG_RE = re.compile(
 )
 
 
+def is_task_notification(text: str) -> bool:
+    """True when the text is an external ``<task-notification>`` envelope.
+
+    Public predicate (plan v4 / codex r2 P3-5): the per-user echo gate in
+    ``bot.handle_new_message`` must EXEMPT these system events from user-echo
+    suppression without duplicating the envelope regexes.
+    """
+    return _TASK_NOTIF_RE.match(text or "") is not None
+
+
 def _render_task_notification(text: str) -> str | None:
     """Render an external `<task-notification>` envelope as a clean card.
 

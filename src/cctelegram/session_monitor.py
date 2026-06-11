@@ -693,9 +693,11 @@ class SessionMonitor:
 
                     if not entry.text and not entry.image_data:
                         continue
-                    # Skip user messages unless show_user_messages is enabled
-                    if entry.role == "user" and not config.show_user_messages:
-                        continue
+                    # User entries are always emitted; the 👤 echo gate is
+                    # PER-RECIPIENT in bot.handle_new_message (plan v4 §4 —
+                    # output_prefs.user_echo, env CC_TELEGRAM_SHOW_USER_MESSAGES
+                    # is its default layer). A monitor-level drop here would
+                    # make a stored user override unable to re-enable echoes.
                     # Suppress user-message echoes for text we just typed
                     # into the pane via send_to_window — the user already
                     # saw their own bubble in Telegram. Direct typing into
@@ -856,10 +858,12 @@ class SessionMonitor:
                 if parsed_entries:
                     self._sidechain_active_parents.add(parent_session_id)
 
-                if not config.show_tool_calls:
-                    # Display suppressed — activity already recorded above.
-                    self.state.update_session(tracked)
-                    continue
+                # Sidechain blocks are always emitted (keep-alive above is
+                # already unconditional); display gating is PER-RECIPIENT via
+                # output_prefs (subagent_cards / tool_activity) in the
+                # message_queue digest path — a monitor-level drop here would
+                # make a stored user override unable to re-enable the cards
+                # (plan v4 §4).
 
                 for entry in parsed_entries:
                     # Each block (text / thinking / tool_use / tool_result)

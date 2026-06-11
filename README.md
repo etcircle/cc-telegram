@@ -14,6 +14,7 @@ Each Telegram topic maps to one tmux window running one Claude Code process. The
 - **Streaming output** — assistant text, thinking, tool use/result summaries, interactive prompts, and local command output flow into Telegram.
 - **Per-route queues** — each `(user_id, thread_id, window_id)` has its own worker, so one noisy topic does not stall another.
 - **Run-state digest** — compact activity digests show tool activity, context-window percentage, and busy/waiting state.
+- **Per-user output verbosity** — `/settings` (any topic or DM) opens a personal panel with presets (`verbose` / `standard` / `compact` / `quiet`) plus quick knobs (tool-line length, 👤 echo, 📊 footer). Choices persist in `state.json` and apply to everything the bot sends *to you*, in every topic; another allowed user tapping your panel changes nothing. Errors, interactive prompts, and the 🤖✅ sub-agent report stay visible at every preset.
 - **Cross-topic dashboard** — `/dashboard` run inside any forum topic claims that topic as your dashboard host: one passive message listing every topic you have bound **in that forum** (per-chat scoped — a dashboard never lists another chat's topics, and a topic whose chat can't be resolved is excluded, fail-closed), grouped needs-attention-first (🔔 waiting on you · 🟡 running · ⚪ idle), repainted by the status poller when content changes. Re-running `/dashboard` in another topic moves it; `/dashboard pin` pins the message (opt-in only — never automatic). 🔔 also covers an idle topic whose last assistant turn ended after your last message (the "unanswered turn"); after a bot restart those in-memory wall-clock stamps are gone, so the dashboard renders state-only until fresh turns repopulate them. **Visibility note:** the dashboard is owner-*filtered*, not private — any member of the shared forum can read it.
 - **Reply context** — Telegram replies/quotes are injected into Claude with fenced, role-aware context for text, voice, photo, and document messages.
 - **Photos and voice** — photos are forwarded as base64 image blocks; voice notes are transcribed through OpenAI-compatible transcription.
@@ -75,11 +76,20 @@ Core variables:
 
 Useful behavior knobs:
 
+- `CC_TELEGRAM_VERBOSITY` — default output preset (`verbose` / `standard` /
+  `compact` / `quiet`) for users who have not picked one via `/settings`;
+  default `verbose`. Per-user `/settings` choices always win over env
+  defaults — the env vars below are knob-precise **defaults, not ceilings**.
 - `CC_TELEGRAM_SHOW_USER_MESSAGES` — echo user messages from tmux; default `true`.
+  When set explicitly it becomes the default for the per-user 👤-echo
+  preference; a user's stored `/settings` choice overrides it.
 - `CC_TELEGRAM_SHOW_TOOL_CALLS` — show tool use/result stream; default `true`.
-  Setting it to `false` suppresses **display only**: sub-agent (sidechain)
-  transcripts are still tailed and their activity still feeds the run-state
-  truth (busy indicator / typing), so a long subagent run doesn't read as idle.
+  Setting it to `false` suppresses **display only** (the faithful legacy
+  mapping: all tool surfaces including the 🤖 sub-agent dispatch/report and
+  the per-sub-agent cards): sidechain transcripts are still tailed and their
+  activity still feeds the run-state truth (busy indicator / typing), so a
+  long subagent run doesn't read as idle. A user's stored `/settings` choice
+  overrides it.
 - `CC_TELEGRAM_SHOW_HIDDEN_DIRS` — show dot-directories in picker; default `false`.
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` — max input shown in `**Tool**(...)`; default `40`.
 - `CC_TELEGRAM_AGENT_PROMPT_PREVIEW_CHARS` — subagent dispatch excerpt; default `400`.
@@ -98,7 +108,7 @@ Useful behavior knobs:
 
 Under `$CC_TELEGRAM_DIR` (default `~/.cc-telegram/`):
 
-- `state.json` — thread bindings, window states, display names, read offsets, and the `dashboards` map (`"<chat_id>:<owner_user_id>" → {thread_id, msg_id, pinned}` — the `/dashboard` host record, one per chat+owner; cleared when its host topic closes or breaks).
+- `state.json` — thread bindings, window states, display names, read offsets, the `dashboards` map (`"<chat_id>:<owner_user_id>" → {thread_id, msg_id, pinned}` — the `/dashboard` host record, one per chat+owner; cleared when its host topic closes or breaks), and the `user_settings` map (`"<user_id>" → {verbosity, knob overrides}` — per-user `/settings` output-verbosity choices; lost if an **older** binary rewrites state.json, which is accepted: they are re-settable preferences).
 - `session_map.json` — hook-generated `window_id → session` mapping (written by the `SessionStart` hook).
 - `monitor_state.json` — JSONL byte offsets per tracked session (incremental-read progress).
 - `interactive_state.json` — persisted picker message ids + AUQ context markers (survives bot restart so a `launchctl kickstart` doesn't lose interactive state).
@@ -315,6 +325,7 @@ src/cctelegram/handlers/            Telegram interaction layer
   reply_context.py                  Telegram reply/quote → Claude context
   message_queue.py                  per-route FIFO worker
   message_sender.py                 safe send/edit/delete with MarkdownV2 fallback
+  output_prefs.py                   per-user verbosity resolution (preset/env/override layering)
   status_polling.py                 poll loop + typing-action loop
   interactive_ui.py                 AskUserQuestion / ExitPlanMode / permission UI
   notify_source.py                  Notification-hook side-file trust boundary (waiting-on-you)
