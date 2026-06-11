@@ -221,6 +221,112 @@ async def test_task_notification_envelope_exempt_from_echo_gate(
 
 
 @pytest.mark.asyncio
+async def test_quiet_preset_suppresses_dispatch_but_keeps_agent_report(
+    scenario: ScenarioHarness,
+) -> None:
+    """Quiet: no 🤖 dispatch bubble, no digest card off the Agent counter
+    path (hermes r3 P1-1) — but the 🤖✅ report STILL arrives (codex r2
+    P1-1: the _agent_tool_ids stash happens even with the bubble off)."""
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(
+        thread_id=_THREAD_ID,
+        window_id=wid,
+        display_name="repo",
+        cwd="/repo",
+        session_id="sess-1",
+    )
+    route = (scenario.user_id, _THREAD_ID, wid)
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "quiet")
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**Agent**(explore the repo)",
+            content_type="tool_use",
+            tool_use_id="agent-t1",
+            tool_name="Agent",
+            tool_input={
+                "subagent_type": "Explore",
+                "description": "explore the repo",
+                "prompt": "Find the rendering seams.",
+            },
+            role="assistant",
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    assert scenario.bot.sent == [], "quiet must suppress the dispatch bubble"
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="The rendering seams are in message_queue.py.",
+            content_type="tool_result",
+            tool_use_id="agent-t1",
+            tool_name="Agent",
+            role="assistant",
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    sends = [s for s in scenario.bot.sent if s.method == "send_message"]
+    assert len(sends) == 1, "the 🤖✅ report must survive quiet"
+    assert "🤖✅" in sends[0].kwargs["text"]
+    assert "rendering seams" in sends[0].kwargs["text"]
+    assert not any(
+        "Activity:" in s.kwargs.get("text", "") for s in scenario.bot.sent
+    ), "no digest card may be created off the Agent counter path under quiet"
+
+
+@pytest.mark.asyncio
+async def test_legacy_env_tool_calls_false_drops_agent_surfaces(
+    scenario: ScenarioHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The faithful legacy mapping: an EXPLICIT CC_TELEGRAM_SHOW_TOOL_CALLS=
+    false drops ALL tool surfaces including the 🤖 dispatch/report — exactly
+    like the old global gate (plan v4 §4; contrast with quiet above)."""
+    from cctelegram.config import config as live_config
+
+    monkeypatch.setattr(live_config, "env_show_tool_calls_set", True)
+    monkeypatch.setattr(live_config, "show_tool_calls", False)
+
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(
+        thread_id=_THREAD_ID,
+        window_id=wid,
+        display_name="repo",
+        cwd="/repo",
+        session_id="sess-1",
+    )
+    route = (scenario.user_id, _THREAD_ID, wid)
+
+    for msg in (
+        NewMessage(
+            session_id="sess-1",
+            text="**Agent**(explore the repo)",
+            content_type="tool_use",
+            tool_use_id="agent-t1",
+            tool_name="Agent",
+            tool_input={"subagent_type": "Explore", "description": "x"},
+            role="assistant",
+        ),
+        NewMessage(
+            session_id="sess-1",
+            text="report text",
+            content_type="tool_result",
+            tool_use_id="agent-t1",
+            tool_name="Agent",
+            role="assistant",
+        ),
+    ):
+        await bot_module.handle_new_message(msg, scenario.bot)
+        await _drain_route(route)
+
+    assert scenario.bot.sent == []
+
+
+@pytest.mark.asyncio
 async def test_digest_line_budget_follows_recipient_preset(
     scenario: ScenarioHarness,
 ) -> None:

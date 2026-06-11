@@ -188,7 +188,10 @@ def _override_layer(base: OutputPrefs, stored: dict[str, Any]) -> OutputPrefs:
         choices = KNOB_CHOICES[knob]
         raw = stored[knob]
         for value in choices.values():
-            if raw == value:
+            # Type-strict (codex PR-1 review P2-2): Python's `1 == True` /
+            # `0 == False` would let malformed stored JSON pass as a bool
+            # knob — junk must stay inert, not coerce.
+            if type(raw) is type(value) and raw == value:
                 out = replace(out, **{field_name: value})
                 break
     return out

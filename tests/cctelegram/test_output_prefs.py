@@ -100,3 +100,12 @@ def test_junk_stored_values_are_inert():
     prefs = output_prefs.resolve(_UID)
     assert prefs.digest_line_chars == 400
     assert prefs.user_echo is True
+
+
+def test_bool_knob_validation_is_type_strict():
+    """Codex PR-1 review P2-2: `1 == True` in Python — malformed stored JSON
+    like {"echo": 1} must stay inert, never coerce into a bool knob."""
+    session_manager.user_settings[_UID] = {"echo": 0, "footer": 1}
+    prefs = output_prefs.resolve(_UID)
+    assert prefs.user_echo is True  # verbose preset value, junk ignored
+    assert prefs.context_footer is True
