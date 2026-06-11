@@ -127,6 +127,13 @@ def test_junk_stored_values_are_inert():
     assert prefs.user_echo is True
 
 
+def test_unhashable_stored_verbosity_is_inert():
+    """Dual r2 P2: {"verbosity": []} must fall back to the default preset,
+    not raise TypeError from the `in PRESETS` membership test."""
+    session_manager.user_settings[_UID] = {"verbosity": []}
+    assert output_prefs.resolve(_UID).verbosity == output_prefs.DEFAULT_PRESET
+
+
 def test_bool_knob_validation_is_type_strict():
     """Codex PR-1 review P2-2: `1 == True` in Python — malformed stored JSON
     like {"echo": 1} must stay inert, never coerce into a bool knob."""

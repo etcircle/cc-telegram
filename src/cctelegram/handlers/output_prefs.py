@@ -213,13 +213,18 @@ def resolve(user_id: int) -> OutputPrefs:
     env layer per-knob via ``_override_layer``.
     """
     stored = session_manager.get_user_settings(user_id)
-    user_chose_preset = stored.get("verbosity") in PRESETS
-    if user_chose_preset:
-        preset_name = stored["verbosity"]
+    # isinstance guard before the membership test: stored values are only
+    # shape-validated on load, so unhashable junk like {"verbosity": []}
+    # must fall through to the default, not raise (dual r2 P2).
+    stored_verbosity = stored.get("verbosity")
+    if isinstance(stored_verbosity, str) and stored_verbosity in PRESETS:
+        preset_name: str = stored_verbosity
+        user_chose_preset = True
     else:
         preset_name = config.default_verbosity
         if preset_name not in PRESETS:
             preset_name = DEFAULT_PRESET
+        user_chose_preset = False
     base = PRESETS[preset_name]
     layered = base if user_chose_preset else _env_layer(base)
     return _override_layer(layered, stored)
