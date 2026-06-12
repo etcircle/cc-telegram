@@ -101,22 +101,30 @@ Additional modules:
                                 teardown) plus a suspended_tools stash: the pane-idle
                                 reconciliation MOVES open_tools (ids + interactive
                                 flags) into the stash instead of dropping them.
-                                Restore paths: mark_subagent_activity resurrection, and
+                                Restore paths: mark_background_agent_activity
+                                resurrection (the keyed GH #44 successor of Wave A's
+                                retired mark_subagent_activity), and
                                 a transcript tool_result for a suspended id (checked
                                 BEFORE the unknown-id branch — restores+closes via the
                                 normal pairing). Drop paths: authoritative end-of-turn,
-                                user lifecycle event, mark_inbound_sent,
+                                user lifecycle event (genuine only — a
+                                task-notification user event PRESERVES the stash),
+                                mark_inbound_sent,
                                 mark_session_reset, route teardown. In-memory only
                                 (restart recovery stays parse_pending_tools_from_jsonl
-                                + seed_open_tools). mark_subagent_activity(route) is
-                                the sidechain keep-alive mutator: on RUNNING /
+                                + seed_open_tools).
+                                mark_background_agent_activity(route, key, ts) is
+                                the keyed sidechain keep-alive mutator: on RUNNING /
                                 RUNNING_TOOL it refreshes last_event_at + re-arms the
                                 pane-idle debounce (no open_tools mutation); on idle
                                 with idle_source=="pane" it RESURRECTS (restores the
                                 stash → RUNNING_TOOL, or RUNNING on an empty stash;
-                                clears idle deadlines); on transcript-idle / None it
-                                no-ops; it never overrides WAITING_ON_USER (transcript-
-                                or pane-bit-set) and never seeds an unseen route. Card
+                                clears idle deadlines — UNqualified, positive live
+                                proof); on transcript-idle / None it leaves the
+                                STORED state untouched (the GH #44 projection lifts
+                                the visible state instead — see below); it never
+                                overrides WAITING_ON_USER (transcript- or
+                                pane-bit-set) and never seeds an unseen route. Card
                                 claim NARROWED: a status clear already enqueued before
                                 resurrection MAY still delete the Busy card (no queue
                                 generation-guard; no send-layer authority) — it

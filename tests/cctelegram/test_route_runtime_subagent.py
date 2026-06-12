@@ -468,3 +468,49 @@ async def test_bot_fanout_applies_per_route_per_key_marks(monkeypatch):
     assert calls.index(("activity", route, "k2", 110.0)) < calls.index(
         ("done", route, "k2", None)
     )
+
+
+async def test_bot_fanout_same_key_launch_activity_done_in_one_tick(monkeypatch):
+    """Plan §7: ONE key appearing in launched, ticks (saw_end_of_turn=True),
+    AND completed in a single tick must see exactly launch → activity → done
+    (twice — sidechain end-of-turn + task-notification) in that order."""
+    from cctelegram import bot as bot_module
+    from cctelegram.session_monitor import ParentSidechainActivity, SidechainTick
+
+    calls: list[tuple[str, str]] = []
+
+    async def fake_activity(route, key, ts):
+        calls.append(("activity", key))
+        return route_runtime.snapshot(route)
+
+    async def fake_launched(route, key):
+        calls.append(("launched", key))
+        return route_runtime.snapshot(route)
+
+    async def fake_done(route, key):
+        calls.append(("done", key))
+        return route_runtime.snapshot(route)
+
+    monkeypatch.setattr(route_runtime, "mark_background_agent_activity", fake_activity)
+    monkeypatch.setattr(route_runtime, "mark_background_agent_launched", fake_launched)
+    monkeypatch.setattr(route_runtime, "mark_background_agent_done", fake_done)
+
+    async def fake_find(session_id: str):
+        return [(1, "@7", 42)]
+
+    monkeypatch.setattr(bot_module.session_manager, "find_users_for_session", fake_find)
+
+    activity = {
+        "parent-a": ParentSidechainActivity(
+            launched={"k1"},
+            completed={"k1"},
+            ticks={"k1": SidechainTick(max_event_ts=100.0, saw_end_of_turn=True)},
+        )
+    }
+    await bot_module.apply_sidechain_activity(activity)
+    assert calls == [
+        ("launched", "k1"),
+        ("activity", "k1"),
+        ("done", "k1"),
+        ("done", "k1"),
+    ]

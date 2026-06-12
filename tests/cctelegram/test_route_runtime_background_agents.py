@@ -473,6 +473,22 @@ async def test_task_notification_preserves_suspended_tools():
     assert _st().suspended_tools == {"t1": False}  # stash untouched
 
 
+async def test_task_notification_fires_activity_side_effects():
+    """Plan §7 ("ages/debounce fire"): a task-notification user event
+    refreshes last_event_at, cancels a pending pane-idle deadline, and
+    resets the cleared sentinel — full activity treatment."""
+    await _idle_transcript(end_ts=100.0)
+    route_runtime.arm_pane_idle_clear(ROUTE, now=1000.0)
+    _st().pane_idle_cleared = True  # simulate a prior cleared stretch
+    before = _st().last_event_at
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "text", timestamp=200.0, is_task_notification=True)
+    )
+    assert _st().last_event_at >= before
+    assert _st().pane_idle_clear_at is None  # deadline cancelled (re-armed)
+    assert _st().pane_idle_cleared is False  # sentinel reset
+
+
 async def test_task_notification_counts_as_activity():
     await _idle_transcript(end_ts=100.0)
     snap = await route_runtime.ingest_transcript_event(

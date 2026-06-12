@@ -1,7 +1,10 @@
-"""GH #44 fixture gate — the plan's empirical premises, pinned on real JSONL.
+"""GH #44 fixture gate — the plan's empirical premises, pinned on JSONL.
 
-Four PII-trimmed fixtures captured from the live 2026-06-12 episode
-(di-copilot-2 @4, background agent ``a092b6b478733eef0``):
+Four SYNTHETIC, schema-minimal fixtures modeled 1:1 on a real captured
+episode (2026-06-12; live shapes verified in-session against the actual
+parent + sidechain transcripts, then re-keyed and stripped to only the
+fields the parser/extractors read — no prompt bodies, session ids, branch
+names, paths, or signatures survive into git history):
 
   (a) ``parent_task_notification_user.jsonl`` — the parent ``user`` entry the
       harness writes when a background agent completes; carries
@@ -35,9 +38,10 @@ from cctelegram.utils import parse_iso_timestamp
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "gh44"
 
-# The live episode's agent — every fixture references it.
-AGENT_KEY = "a092b6b478733eef0"
-SIDECHAIN_STEM = "agent-a092b6b478733eef0"
+# The synthetic agent key — every fixture references it (shape mirrors the
+# real hex agentIds).
+AGENT_KEY = "a1b2c3d4e5f6a7b89"
+SIDECHAIN_STEM = "agent-a1b2c3d4e5f6a7b89"
 
 
 def _parse_fixture(name: str):
