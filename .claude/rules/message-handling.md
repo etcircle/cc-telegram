@@ -57,7 +57,14 @@ display path). The collapsed slot is a tombstone: late re-detected blocks
 never re-inflate the play-by-play; a new run has a new key. `off` never
 creates a card. The 🤖✅ report message (full, expandable) is untouched at
 every policy; sidechain keep-alive (Wave A) fires from session_monitor and
-is unaffected.
+is unaffected. **Fix 5 (ISSUE-6): the Workflow sub-agent shape rides this
+SAME contract** — it collapses on its own `end_turn`+`text` (path 1), via
+the unchanged parent-finalize backstop (path 2), AND via a new deterministic
+**route-FIFO close collapse** (path 3: the `<task-notification>` close marks
+the bracket `closing`, `check_sidechain_updates` tails the final tail then
+emits a `NewMessage(subagent_collapse_prefix)` → `enqueue_subagent_collapse`
+→ a summary-gated `subagent_collapse` control task) that guarantees an
+empty-final Workflow card collapses even when paths 1/2 can't fire.
 
 ## Status Message Handling
 
@@ -81,7 +88,8 @@ fields: `run_state`, `open_tools`, `waiting_on_user_tools`,
 `context_usage`, `last_event_at`, `idle_clear_at`, `pane_idle_clear_at`,
 `typing_eligible`, `status_card_visible`, `status_card_msg_id`,
 `interactive_pending`, `notification_pending`, `notification_set_at`,
-`notification_generation`, `notification_clear_reason`. The two
+`notification_generation`, `notification_clear_reason`, `background_agents`.
+The two
 idle deadlines are distinct:
 `idle_clear_at` is the run-state `IDLE_RECENT → IDLE_CLEARED` decay
 (armed by a transcript end-of-turn), while `pane_idle_clear_at` is the
@@ -312,16 +320,54 @@ writes → the key ages out via the 30-min `BG_AGENT_TTL_SECONDS` (the dead/
 never-completed backstop); a `wf_dir`-less bracket never heartbeats (ages out
 one TTL from `launch_wall`). **Close = GATE-ON-BRACKET ONLY:** the
 `<task-notification>` emits the `wf-task:<id>` close key (→
-`mark_background_agent_done` tombstone) + drops the bracket IFF a live open
-bracket exists — never guessing a Workflow id from its character set; an
-isolated close with no bracket has no route_runtime key to tombstone, so the
-bare key suffices. Out-of-order done-before-launch fail-closes (the done
-tombstone no-ops the later launch). This `wf-task:` key is ALSO what makes
-ISSUE-5 arm B fire: a stored-idle route with a live `wf-task:` key lets
-`mark_notification_pending` re-commit (§3.6) instead of STALE_UNLINK, so a 🔔
-raised by the Workflow's own approval gate is durable. The `↳` sub-agent
-DISPLAY cards for Workflow sidechains are a deferred fast-follow (Fix 5) — not
-in this wave; typing + 🟡 + 🔔 do not depend on them. Pull-only; no observer.
+`mark_background_agent_done` tombstone) IFF a live open bracket exists — never
+guessing a Workflow id from its character set; an isolated close with no
+bracket has no route_runtime key to tombstone, so the bare key suffices.
+Out-of-order done-before-launch fail-closes (the done tombstone no-ops the
+later launch). The bracket is now MARKED `closing` (not popped immediately) so
+the Fix 5 display path tails its `wf_dir` one final time before teardown (see
+below); `_emit_workflow_bracket_heartbeats` skips closing brackets. This
+`wf-task:` key is ALSO what makes ISSUE-5 arm B fire: a stored-idle route with
+a live `wf-task:` key lets `mark_notification_pending` re-commit (§3.6) instead
+of STALE_UNLINK, so a 🔔 raised by the Workflow's own approval gate is durable.
+
+**Fix 5 (ISSUE-6 owner decision #2 — SHIPPED): the `↳` sub-agent DISPLAY cards
+for Workflow sidechains.** A Workflow's sub-agents live one level deeper at
+`subagents/workflows/wf_<runid>/agent-*.jsonl`, so a single-level glob missed
+them. `check_sidechain_updates` adds a SECOND, anchored
+`bracket.wf_dir.glob("agent-*.jsonl")` enumeration over THIS parent's OPEN
+brackets (the SAME `wf_dir` the heartbeat stats — one shared discovery), driven
+through the shared `_track_and_emit_sidechain_file(..., feed_run_state=False)`
+helper so Workflow sidechain ENTRIES NEVER feed run-state (the `wf-task:`
+bracket + mtime heartbeat stay the SOLE Workflow run-state input — `ticks` stays
+empty, `route_runtime`/`apply_sidechain_activity`/`_finalize_activity_digest`
+UNCHANGED). The tracking key is run-id-qualified `sub:<parent>:<runid>:<stem>`
+(two concurrent runs under one parent never collide on a same-stem agent file;
+keeps the `sub:<parent>:` teardown prefix; `_short_subagent_id`'s
+`rsplit(":", 1)[-1]` lands on the `agent-<id>` stem so the rendered header is
+identical to an Agent/Task card). DISPLAY ONLY — these cards ride the existing
+per-recipient `subagent_cards` gating + the W2 collapse-on-done, identically to
+the Agent/Task shape (path 1 = the agent's own `text`+`end_turn`; path 2 = the
+unchanged parent-finalize backstop). PLUS a THIRD, **deterministic close
+collapse on the route FIFO** for the empty-final case (a Workflow agent ending
+lifecycle-only never self-collapses and may have no later parent finalize):
+the `<task-notification>` marks the bracket `closing` (not popped);
+`check_sidechain_updates` tails the closing bracket's `wf_dir` ONE final time
+(final display tail), THEN appends a `NewMessage(subagent_collapse_prefix=
+"sub:<parent>:<runid>:")` AFTER the cards, THEN pops the bracket;
+`bot.handle_new_message` routes that marker to
+`message_queue.enqueue_subagent_collapse(route, prefix)` → a
+`task_type="subagent_collapse"` route-FIFO control task that the per-route
+worker runs AFTER the run's content tasks (the cards exist when it fires) →
+the summary-gated `collapse_subagent_cards_with_prefix` (early-returns on
+`keep`/verbose — the play-by-play stays live — and `off` has no slot). The
+control task is ordered + retryable like content (`_RETRYABLE_TASK_TYPES =
+{"content", "subagent_collapse"}` at the three `_run_with_retry` flood/retry
+gates) so a flood-control window or a `RetryAfter` during the collapse's own
+edit never silently drops it (the collapse is idempotent). Discovery is
+bracket-gated (live only) and anchored (never `rglob`); restart degrades in
+lockstep with run-state (in-memory brackets ⇒ no cards until a fresh launch
+re-opens a bracket). Pull-only; no observer.
 
 **AUQ card-liveness authority (pane is lower authority than the
 lifecycle)** — `status_polling`'s pane-absent clear gate must not tombstone

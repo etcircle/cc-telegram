@@ -67,7 +67,7 @@ MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
 class MessageTask:
     """Message task for queue processing."""
 
-    task_type: Literal["content", "status_update", "status_clear"]
+    task_type: Literal["content", "status_update", "status_clear", "subagent_collapse"]
     text: str | None = None
     window_id: str | None = None
     # content type fields
@@ -114,6 +114,11 @@ class MessageTask:
     # task object, which is dropped after ``_run_with_retry`` returns or
     # exhausts its attempts.
     agent_promoted: "MessageTask | None" = None
+    # Fix 5 PR-B: for a ``subagent_collapse`` control task — the
+    # ``sub:<parent>:<runid>:`` key prefix of a CLOSED Workflow run whose live
+    # ``↳`` cards this task collapses (summary-gated). Runs on the route FIFO
+    # AFTER the run's content tasks so the cards exist when it fires.
+    subagent_collapse_prefix: str | None = None
 
 
 @dataclass
@@ -645,6 +650,14 @@ async def _merge_content_tasks(
 
 CONTENT_RETRY_MAX_ATTEMPTS = 3
 
+# Fix 5 PR-B (v5 — Hermes v4 P1): task types that are ORDERED + retryable like
+# content under flood-control. The ``subagent_collapse`` control task carries
+# the deterministic Workflow-close collapse; dropping it under ``_flood_until``
+# / a ``RetryAfter`` would strand an empty-final card live, voiding the
+# guarantee. It is idempotent (already-collapsed → flush; tombstoned → no-op),
+# so a retry re-run is safe. Status tasks stay ephemeral (dropped on flood).
+_RETRYABLE_TASK_TYPES = {"content", "subagent_collapse"}
+
 
 def _retry_after_seconds(exc: RetryAfter) -> int:
     """Coerce ``RetryAfter.retry_after`` (int or timedelta) into seconds."""
@@ -735,6 +748,17 @@ async def _dispatch_task(
             merged_holder.append(merged_task)
         await _process_content_task(bot, user_id, merged_task)
         return merged_task
+    if task.task_type == "subagent_collapse":
+        # Fix 5 PR-B: the deterministic Workflow-close collapse on the route
+        # FIFO. Capture into merged_holder (param is ``merged_holder``, not
+        # ``holder`` — Hermes v5 nit) so a RetryAfter retry re-runs the
+        # (idempotent) collapse via ``_dispatch_already_merged``.
+        if merged_holder is not None:
+            merged_holder.append(task)
+        await collapse_subagent_cards_with_prefix(
+            bot, user_id, task.thread_id, task.subagent_collapse_prefix or ""
+        )
+        return task
     if task.task_type == "status_update":
         await _process_status_update_task(bot, user_id, task)
         return task
@@ -775,6 +799,11 @@ async def _dispatch_already_merged(
             return
         await _process_content_task(bot, user_id, task)
         return
+    if task.task_type == "subagent_collapse":
+        await collapse_subagent_cards_with_prefix(
+            bot, user_id, task.thread_id, task.subagent_collapse_prefix or ""
+        )
+        return
     if task.task_type == "status_update":
         await _process_status_update_task(bot, user_id, task)
         return
@@ -794,11 +823,15 @@ async def _run_with_retry(
     if flood_end > 0:
         remaining = flood_end - time.monotonic()
         if remaining > 0:
-            if task.task_type != "content":
+            # Fix 5 PR-B: retryable tasks (content + subagent_collapse) WAIT out
+            # the ban rather than drop — a dropped collapse strands an
+            # empty-final card.
+            if task.task_type not in _RETRYABLE_TASK_TYPES:
                 return
             logger.debug(
-                "Flood controlled: waiting %.0fs for content (user %d)",
+                "Flood controlled: waiting %.0fs for %s (user %d)",
                 remaining,
+                task.task_type,
                 user_id,
             )
             await asyncio.sleep(remaining)
@@ -806,7 +839,7 @@ async def _run_with_retry(
         logger.info("Flood control lifted for user %d", user_id)
 
     attempts_remaining = (
-        CONTENT_RETRY_MAX_ATTEMPTS if task.task_type == "content" else 1
+        CONTENT_RETRY_MAX_ATTEMPTS if task.task_type in _RETRYABLE_TASK_TYPES else 1
     )
     dispatched: MessageTask | None = None
     while attempts_remaining > 0:
@@ -852,14 +885,18 @@ async def _run_with_retry(
                     attempts_remaining,
                 )
 
-            if task.task_type != "content":
+            # Fix 5 PR-B: retryable tasks (content + subagent_collapse) sleep +
+            # retry; ephemeral status tasks drop.
+            if task.task_type not in _RETRYABLE_TASK_TYPES:
                 return
 
             if attempts_remaining <= 0:
                 logger.error(
-                    "Content task dropped for user %d after %d RetryAfter retries (window=%s)",
+                    "Retryable task dropped for user %d after %d RetryAfter retries "
+                    "(task_type=%s, window=%s)",
                     user_id,
                     CONTENT_RETRY_MAX_ATTEMPTS,
+                    task.task_type,
                     task.window_id,
                 )
                 return
@@ -1708,8 +1745,12 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
 def _short_subagent_id(key: str) -> str:
     """Compact display id from a sidechain tracking key.
 
-    Tracking keys look like ``sub:<parent_session>:agent-<id>``; the
-    user-visible suffix is the trailing 6 chars of the agent id.
+    Tracking keys look like ``sub:<parent_session>:agent-<id>`` (Agent/Task) or
+    the Fix 5 PR-B run-id-qualified Workflow form
+    ``sub:<parent_session>:<runid>:agent-<id>``; either way the user-visible
+    suffix is the trailing 6 chars of the agent id. ``rsplit(":", 1)[-1]`` lands
+    on the ``agent-<id>`` stem regardless of any run-id middle segment, so the
+    rendered header is identical for both shapes (the run id is never shown).
     """
     suffix = key.rsplit(":", 1)[-1]
     if suffix.startswith("agent-"):
@@ -2070,6 +2111,41 @@ async def _flush_subagent_digest_now(
         return
     async with _get_subagent_lock(user_id, tid, subagent_key):
         await _upsert_subagent_digest(bot, user_id, thread_id, state)
+
+
+async def collapse_subagent_cards_with_prefix(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    key_prefix: str,
+) -> None:
+    """Deterministically collapse every live ``↳`` sub-agent card whose
+    ``subagent_key`` starts with ``key_prefix`` (a closed Workflow run's
+    ``sub:<parent>:<runid>:``) — Fix 5 PR-B path 3.
+
+    Summary-gated (matches the W2 self-collapse + the parent-finalize backstop —
+    ``keep``/verbose stays live, ``off`` has no slot to begin with); mirrors the
+    per-card branch of ``_finalize_activity_digest`` (collapsed → flush-now,
+    else → collapse), so a workflow card collapses to the identical one-liner.
+    Idempotent (a re-run after a RetryAfter retry is safe). Pull-only — invoked
+    by the route worker's ``subagent_collapse`` control task (FIFO after the
+    run's content tasks), never an observer; NO route_runtime read.
+    """
+    if (
+        output_prefs.resolve(user_id).subagent_cards
+        != output_prefs.SUBAGENT_CARDS_SUMMARY
+    ):
+        return  # v4 P1-3: keep/off untouched
+    tid = thread_id or 0  # v4 P2: normalize INTERNALLY for the state-key match
+    for (s_uid, s_tid, s_key), s_state in list(_subagent_msg_info.items()):
+        if s_uid != user_id or s_tid != tid or not s_key.startswith(key_prefix):
+            continue
+        # Pass the ORIGINAL thread_id through to the primitives (they normalize
+        # internally too); never leak route-key normalization into the seam.
+        if s_state.collapsed:
+            await _flush_subagent_digest_now(bot, user_id, thread_id, s_key)
+        else:
+            await _collapse_subagent_digest(bot, user_id, thread_id, s_key)
 
 
 # ── To-do list digest ────────────────────────────────────────────────────
@@ -3426,6 +3502,36 @@ async def enqueue_content_message(
         stop_reason=stop_reason,
     )
     queue.put_nowait(task)
+
+
+async def enqueue_subagent_collapse(
+    bot: Bot,
+    route: Route,
+    key_prefix: str,
+) -> None:
+    """Enqueue the Fix 5 PR-B deterministic Workflow-close collapse as a
+    ``subagent_collapse`` control task into the route's FIFO.
+
+    Lands in the SAME per-route queue as the run's content tasks (via
+    ``_get_or_create_route``), so the per-route worker — which processes FIFO —
+    runs the run's content (creating/updating the ``↳`` cards) FIRST and the
+    collapse SECOND (the card always exists when it fires). The control task is
+    ordered + retryable like content (``_RETRYABLE_TASK_TYPES``). ``bot`` is
+    required to spawn the route worker if the route is new.
+    """
+    if route in _route_tearing_down:
+        # Mirror enqueue_content_message: a teardown is in flight — dropping the
+        # collapse is correct (the route's cards are going away anyway).
+        return
+    queue = _get_or_create_route(bot, route)
+    queue.put_nowait(
+        MessageTask(
+            task_type="subagent_collapse",
+            thread_id=route[1],
+            window_id=route[2],
+            subagent_collapse_prefix=key_prefix,
+        )
+    )
 
 
 async def enqueue_status_update(

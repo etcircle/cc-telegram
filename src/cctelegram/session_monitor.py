@@ -115,6 +115,12 @@ class _WorkflowBracket:
     wf_dir: Path | None
     last_seen_mtime: float
     launch_wall: float
+    # Fix 5 PR-B: set at the ``<task-notification>`` close INSTEAD of popping the
+    # bracket, so ``check_sidechain_updates`` tails the ``wf_dir`` ONE final time
+    # (final display tail) and emits the route-FIFO collapse signal BEFORE the
+    # bracket is removed. ``_emit_workflow_bracket_heartbeats`` skips closing
+    # brackets (the run-state done already fired via ``rec.completed``).
+    closing: bool = False
 
 
 def _is_window_id(key: str) -> bool:
@@ -184,6 +190,14 @@ class NewMessage:
     # so a multi-step run renders as one editable message instead of one
     # bubble per block.
     subagent_key: str | None = None
+    # Fix 5 PR-B: a display-control marker (mutually exclusive with content
+    # fields) emitted on the ``new_messages`` lane AFTER a closed Workflow run's
+    # final display cards. ``bot.handle_new_message`` routes it to
+    # ``message_queue.enqueue_subagent_collapse(route, prefix)`` — a route-FIFO
+    # ``subagent_collapse`` control task that collapses every live ``↳`` card
+    # whose ``subagent_key`` starts with this prefix (``sub:<parent>:<runid>:``).
+    # DISPLAY ONLY; never a run-state input.
+    subagent_collapse_prefix: str | None = None
     # JSONL ``message.stop_reason``, propagated from ParsedEntry. Used by
     # the bot adapter to identify end-of-turn assistant text bubbles, where
     # the per-message context-window footer is appended.
@@ -458,7 +472,12 @@ class SessionMonitor:
         if not brackets:
             return
         for task_id, bracket in brackets.items():
-            if bracket.wf_dir is None:
+            # Fix 5 PR-B: a closing bracket does NOT heartbeat — the run-state
+            # done already fired via rec.completed at the <task-notification>,
+            # and the bot fan-out processes completed AFTER bracket_heartbeats,
+            # so a stray heartbeat would lose to the done anyway; skipping is
+            # cleaner and avoids the activity→done churn.
+            if bracket.wf_dir is None or bracket.closing:
                 continue
             try:
                 latest = max(
@@ -919,9 +938,17 @@ class SessionMonitor:
                                 session_info.session_id, task_id
                             ):
                                 rec.completed.add(f"wf-task:{task_id}")
-                                self._close_workflow_bracket(
-                                    session_info.session_id, task_id
-                                )
+                                # Fix 5 PR-B: do NOT pop yet — let
+                                # check_sidechain_updates tail the wf_dir ONE
+                                # final time (capture the last display blocks)
+                                # and emit the route-FIFO collapse signal,
+                                # THEN remove the bracket. Popping here would
+                                # make the bracket-gated discovery skip the
+                                # final tail (Hermes-delta P1-2). The run-state
+                                # done already fired via rec.completed above.
+                                self._open_workflow_brackets[session_info.session_id][
+                                    task_id
+                                ].closing = True
 
                     # Lifecycle-only entries exist purely to drive the
                     # busy indicator; they have no visible content and must
@@ -1012,6 +1039,21 @@ class SessionMonitor:
         The shared per-file body lives in ``_track_and_emit_sidechain_file``;
         the top-level Agent/Task loop drives it with ``feed_run_state=True``
         (Fix 5 PR-A extraction).
+
+        Fix 5 PR-B adds a SECOND, nested enumeration (DISPLAY ONLY): a
+        Workflow's sub-agents live one level deeper at
+        ``subagents/workflows/wf_<runid>/agent-*.jsonl``. They are discovered via
+        THIS parent's OPEN brackets' ``wf_dir`` — the SAME dir
+        ``_emit_workflow_bracket_heartbeats`` stats — with an anchored
+        ``glob("agent-*.jsonl")`` and a run-id-qualified
+        ``sub:<parent>:<runid>:<stem>`` key, driven through the shared helper
+        with ``feed_run_state=False`` so Workflow sidechain ENTRIES NEVER feed
+        run-state (the ``wf-task:`` bracket + its mtime heartbeat stay the SOLE
+        Workflow run-state input). A bracket marked ``closing`` (its
+        ``<task-notification>`` landed this tick) is tailed ONE final time here,
+        then a ``NewMessage(subagent_collapse_prefix=...)`` is appended to the
+        display lane AFTER its cards and the bracket is popped — the
+        deterministic route-FIFO close collapse.
         """
         new_messages: list[NewMessage] = []
 
@@ -1054,6 +1096,61 @@ class SessionMonitor:
                     new_messages=new_messages,
                     feed_run_state=True,
                 )
+
+            # ISSUE-6 / Fix 5 PR-B (DISPLAY ONLY): a Workflow's sub-agents live
+            # one level deeper at subagents/workflows/wf_<runid>/agent-*.jsonl.
+            # Enumerate them via THIS parent's OPEN brackets' wf_dir — the SAME
+            # dir _emit_workflow_bracket_heartbeats stats above — so display +
+            # run-state share one discovery. Emit the cards WITHOUT feeding
+            # run-state (feed_run_state=False): the wf-task: bracket + its mtime
+            # heartbeat stay the SOLE run-state input for Workflow. INSIDE the
+            # per-parent loop, so parent_session_id is unambiguous and an empty
+            # parent_files never references it (v2 P1 placement).
+            for task_id, bracket in self._open_workflow_brackets.get(
+                parent_session_id, {}
+            ).items():
+                if bracket.wf_dir is None:
+                    continue
+                try:
+                    # ANCHORED to the validated wf_<runid> dir — never rglob.
+                    wf_files = list(bracket.wf_dir.glob("agent-*.jsonl"))
+                except OSError:
+                    continue
+                # Run-id-qualified key (v2 §3.5): wf_dir.name == "wf_<runid>", so
+                # two concurrent runs under one parent never collide on a
+                # same-stem agent file. Keeps the sub:<parent>: teardown prefix.
+                run_id = bracket.wf_dir.name
+                for sc_file in wf_files:
+                    tracking_key = f"sub:{parent_session_id}:{run_id}:{sc_file.stem}"
+                    await self._track_and_emit_sidechain_file(
+                        parent_session_id=parent_session_id,
+                        sc_file=sc_file,
+                        tracking_key=tracking_key,
+                        new_messages=new_messages,
+                        feed_run_state=False,
+                    )
+
+            # Fix 5 PR-B: a bracket marked ``closing`` (its <task-notification>
+            # landed this tick) was just tailed ONE final time above. Now append
+            # the route-FIFO collapse signal AFTER its display cards and pop the
+            # bracket — the deterministic close collapse. ``list(...)`` so the
+            # pop inside the loop doesn't mutate the dict under iteration.
+            for task_id, bracket in list(
+                self._open_workflow_brackets.get(parent_session_id, {}).items()
+            ):
+                if not bracket.closing:
+                    continue
+                if bracket.wf_dir is not None:
+                    new_messages.append(
+                        NewMessage(
+                            session_id=parent_session_id,
+                            text="",
+                            subagent_collapse_prefix=(
+                                f"sub:{parent_session_id}:{bracket.wf_dir.name}:"
+                            ),
+                        )
+                    )
+                self._close_workflow_bracket(parent_session_id, task_id)
 
         self.state.save_if_dirty()
         return new_messages

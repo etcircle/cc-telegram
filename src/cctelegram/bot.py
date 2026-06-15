@@ -129,6 +129,7 @@ from .handlers.interactive_ui import (
 )
 from .handlers.message_queue import (
     enqueue_content_message,
+    enqueue_subagent_collapse,
     get_content_queue,
     probe_topic_liveness,
     set_route_user_turn_at,
@@ -890,6 +891,21 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
     for user_id, wid, thread_id in active_users:
         prefs = output_prefs.resolve(user_id)
+
+        # Fix 5 PR-B: a Workflow-close collapse marker (NOT content — carries no
+        # text to render, no subagent_key, just the closed run's key prefix).
+        # The monitor appends it on the display lane AFTER the run's final cards,
+        # so enqueueing it into the SAME route FIFO makes the per-route worker
+        # run the content (creating/updating the ↳ cards) FIRST and the
+        # summary-gated collapse SECOND — the deterministic close collapse. No
+        # echo / footer / tool gate applies; route it and skip the rest.
+        if msg.subagent_collapse_prefix is not None:
+            await enqueue_subagent_collapse(
+                bot,
+                (user_id, thread_id or 0, wid),
+                msg.subagent_collapse_prefix,
+            )
+            continue
 
         # Per-recipient 👤 user-echo gate (plan v4 §4). Sits at the TOP of
         # the loop body, mirroring the monitor-level skip it replaced

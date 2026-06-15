@@ -394,3 +394,88 @@ async def test_digest_line_budget_follows_recipient_preset(
     # verbose 400 budget (line carries "• ⚙️ " chrome on top of the raw cap).
     assert len(line) <= 170
     assert "…" in line
+
+
+# ── Fix 5 PR-B: per-recipient gating of the Workflow ↳ display cards (the ─────
+#   widened nested emission lands on the subagent_cards gate, NOT the parent
+#   gate). Synthetic ids/content (no PII).
+
+_WF_RUN = "wf_run01abcd"
+_WF_KEY = f"sub:sess-1:{_WF_RUN}:agent-aaa111"
+
+
+def _bind_repo(scenario: ScenarioHarness) -> tuple[str, tuple[int, int, str]]:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(
+        thread_id=_THREAD_ID,
+        window_id=wid,
+        display_name="repo",
+        cwd="/repo",
+        session_id="sess-1",
+    )
+    return wid, (scenario.user_id, _THREAD_ID, wid)
+
+
+@pytest.mark.asyncio
+async def test_workflow_card_off_recipient_gets_no_card_or_slot(
+    scenario: ScenarioHarness,
+) -> None:
+    """B-d: under ``compact`` (subagent_cards=off) a workflow-stem block creates
+    NO ↳ card AND NO _subagent_msg_info slot (the OFF early-return). This proves
+    the block landed on the subagent_cards gate, not the parent/Agent gate."""
+    _, route = _bind_repo(scenario)
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "compact")
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**Bash**(pnpm test)",
+            content_type="tool_use",
+            tool_use_id="wt1",
+            tool_name="Bash",
+            role="assistant",
+            subagent_key=_WF_KEY,
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+
+    assert not any("↳ Sub" in s.kwargs.get("text", "") for s in scenario.bot.sent)
+    assert (
+        scenario.user_id,
+        _THREAD_ID,
+        _WF_KEY,
+    ) not in message_queue._subagent_msg_info
+
+
+@pytest.mark.asyncio
+async def test_workflow_card_keep_recipient_full_playbyplay(
+    scenario: ScenarioHarness,
+) -> None:
+    """B-d: under ``verbose`` (subagent_cards=keep) the workflow ↳ card renders
+    full play-by-play and does NOT collapse on its own."""
+    _, route = _bind_repo(scenario)
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "verbose")
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**Bash**(pnpm test)",
+            content_type="tool_use",
+            tool_use_id="wt1",
+            tool_name="Bash",
+            role="assistant",
+            subagent_key=_WF_KEY,
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    await message_queue._flush_subagent_digest_now(
+        scenario.bot, scenario.user_id, _THREAD_ID, _WF_KEY
+    )
+
+    state = message_queue._subagent_msg_info.get(
+        (scenario.user_id, _THREAD_ID, _WF_KEY)
+    )
+    assert state is not None
+    assert state.collapsed is False
