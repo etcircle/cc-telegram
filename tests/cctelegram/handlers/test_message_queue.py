@@ -305,8 +305,10 @@ class TestRetryAfterContentRetry:
                 pass
 
         assert len(attempts) == message_queue.CONTENT_RETRY_MAX_ATTEMPTS
-        assert any("Content task dropped" in rec.message for rec in caplog.records), (
-            "expected an ERROR log when content is finally dropped"
+        # Fix 5 PR-B generalized the drop-log wording from "Content task
+        # dropped" to "Retryable task dropped" (content + subagent_collapse).
+        assert any("Retryable task dropped" in rec.message for rec in caplog.records), (
+            "expected an ERROR log when a retryable task is finally dropped"
         )
 
 

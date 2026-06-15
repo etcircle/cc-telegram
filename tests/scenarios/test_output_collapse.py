@@ -356,6 +356,254 @@ async def test_late_sidechain_block_does_not_reinflate_collapsed_card(
     )
 
 
+# ── Fix 5 PR-B: the Workflow ↳ shape rides the W2 collapse contract + the ────
+#   deterministic route-FIFO close collapse (run-id-qualified key). DISPLAY
+#   ONLY — synthetic ids, no PII.
+
+_WF_RUN = "wf_run01abcd"
+_WF_PREFIX = f"sub:sess-1:{_WF_RUN}:"
+_WF_KEY = f"{_WF_PREFIX}agent-aaa111"
+
+
+@pytest.mark.asyncio
+async def test_workflow_card_collapses_on_own_end_of_turn(
+    scenario: ScenarioHarness,
+) -> None:
+    """⭐ B-i path 1 / B-c: a run-id-qualified workflow ↳ card collapses to one
+    line on its OWN end-of-turn under summary — identical to the Agent shape."""
+    _, route = _bind(scenario)
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "standard")
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**Read**(syn.py)\n  ⎿  Read 10 lines",
+            content_type="tool_use",
+            tool_use_id="wst1",
+            tool_name="Read",
+            role="assistant",
+            subagent_key=_WF_KEY,
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    await message_queue._flush_subagent_digest_now(
+        scenario.bot, scenario.user_id, _THREAD_ID, _WF_KEY
+    )
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="my final report",
+            content_type="text",
+            role="assistant",
+            subagent_key=_WF_KEY,
+            stop_reason="end_turn",
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+
+    sub_paints = [
+        s.kwargs.get("text", "")
+        for s in scenario.bot.sent
+        if "↳ Sub" in s.kwargs.get("text", "")
+    ]
+    final = sub_paints[-1]
+    assert "✅" in final
+    assert "1 tool" in final
+    assert "•" not in final
+    # The run-id middle segment never reaches the rendered header (id6 only).
+    assert _WF_RUN not in final
+
+
+@pytest.mark.asyncio
+async def test_workflow_late_block_does_not_reinflate_after_collapse(
+    scenario: ScenarioHarness,
+) -> None:
+    """B-c tombstone: a workflow keeps writing post-collapse; a late block must
+    not re-inflate the play-by-play."""
+    _, route = _bind(scenario)
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "standard")
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="final words",
+            content_type="text",
+            role="assistant",
+            subagent_key=_WF_KEY,
+            stop_reason="end_turn",
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    paints_before = len(
+        [s for s in scenario.bot.sent if "↳ Sub" in s.kwargs.get("text", "")]
+    )
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**Bash**(echo late)",
+            content_type="tool_use",
+            tool_use_id="late1",
+            tool_name="Bash",
+            role="assistant",
+            subagent_key=_WF_KEY,
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    await message_queue._flush_subagent_digest_now(
+        scenario.bot, scenario.user_id, _THREAD_ID, _WF_KEY
+    )
+    paints_after = [
+        s.kwargs.get("text", "")
+        for s in scenario.bot.sent
+        if "↳ Sub" in s.kwargs.get("text", "")
+    ]
+    assert len(paints_after) == paints_before or "•" not in paints_after[-1]
+
+
+@pytest.mark.asyncio
+async def test_empty_final_workflow_card_collapsed_on_bracket_close(
+    scenario: ScenarioHarness,
+) -> None:
+    """⭐ B-i path 3 (Hermes-delta P1-2, end-to-end): an empty-final workflow
+    card (lifecycle-only last entry — never self-collapses via path 1) is
+    collapsed by the route-FIFO close collapse. The monitor emits a
+    NewMessage(subagent_collapse_prefix=...) AFTER the run's content; the bot
+    enqueues a subagent_collapse control task; the worker collapses the card."""
+    _, route = _bind(scenario)
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "standard")
+
+    # The agent renders a tool_use but NEVER a visible text+end_turn (so path 1
+    # cannot fire). The card stays expanded.
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**Grep**(pattern)\n  ⎿  Found 2 matches",
+            content_type="tool_use",
+            tool_use_id="wst2",
+            tool_name="Grep",
+            role="assistant",
+            subagent_key=_WF_KEY,
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    await message_queue._flush_subagent_digest_now(
+        scenario.bot, scenario.user_id, _THREAD_ID, _WF_KEY
+    )
+    state_key = (scenario.user_id, _THREAD_ID, _WF_KEY)
+    assert message_queue._subagent_msg_info[state_key].collapsed is False
+
+    # The bracket close → the monitor appends the collapse marker on the
+    # display lane (after the content). The bot routes it to the route FIFO.
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="",
+            role="assistant",
+            subagent_collapse_prefix=_WF_PREFIX,
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+
+    assert message_queue._subagent_msg_info[state_key].collapsed is True
+    sub_paints = [
+        s.kwargs.get("text", "")
+        for s in scenario.bot.sent
+        if "↳ Sub" in s.kwargs.get("text", "")
+    ]
+    assert sub_paints
+    assert "✅" in sub_paints[-1]
+    assert "•" not in sub_paints[-1]
+
+
+@pytest.mark.asyncio
+async def test_keep_recipient_not_collapsed_on_close(
+    scenario: ScenarioHarness,
+) -> None:
+    """⭐ B-i (Hermes-delta P1-3): under keep (verbose) the bracket close does
+    NOT collapse the run's cards — the play-by-play stays live."""
+    _, route = _bind(scenario)
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "verbose")
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**Grep**(pattern)\n  ⎿  Found 2 matches",
+            content_type="tool_use",
+            tool_use_id="wst3",
+            tool_name="Grep",
+            role="assistant",
+            subagent_key=_WF_KEY,
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    await message_queue._flush_subagent_digest_now(
+        scenario.bot, scenario.user_id, _THREAD_ID, _WF_KEY
+    )
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="",
+            role="assistant",
+            subagent_collapse_prefix=_WF_PREFIX,
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+
+    state_key = (scenario.user_id, _THREAD_ID, _WF_KEY)
+    assert message_queue._subagent_msg_info[state_key].collapsed is False
+
+
+@pytest.mark.asyncio
+async def test_foreground_agent_card_still_collapsed_by_parent_finalize(
+    scenario: ScenarioHarness,
+) -> None:
+    """⭐ B-i path 2 (no regression): a foreground Agent card (no bracket) is
+    STILL collapsed by the UNCHANGED parent-finalize backstop under summary —
+    Fix 5 added no skip there."""
+    _, route = _bind(scenario)
+    scenario.session_manager.set_user_setting(scenario.user_id, "verbosity", "standard")
+    sub_key = "sub:sess-1:agent-fg9999"
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**Bash**(ls)\n  ⎿  3 lines",
+            content_type="tool_use",
+            tool_use_id="fg1",
+            tool_name="Bash",
+            role="assistant",
+            subagent_key=sub_key,
+        ),
+        scenario.bot,
+    )
+    await _drain_route(route)
+    await message_queue._flush_subagent_digest_now(
+        scenario.bot, scenario.user_id, _THREAD_ID, sub_key
+    )
+
+    await _finalize_turn(scenario, route)
+
+    sub_paints = [
+        s.kwargs.get("text", "")
+        for s in scenario.bot.sent
+        if "↳ Sub" in s.kwargs.get("text", "")
+    ]
+    assert sub_paints
+    assert "✅" in sub_paints[-1]
+    assert "•" not in sub_paints[-1]
+
+
 @pytest.mark.asyncio
 async def test_settings_panel_exposes_collapse_knobs(
     scenario: ScenarioHarness,
