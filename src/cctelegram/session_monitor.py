@@ -1078,13 +1078,19 @@ class SessionMonitor:
             # Agent/Task sidechain).
             self._emit_workflow_bracket_heartbeats(parent_session_id)
 
+            # hermes P2: a missing/unreadable top-level ``subagents`` dir means
+            # NO top-level Agent/Task sidechains THIS tick — default to ``[]``
+            # WITHOUT ``continue``. A bare ``continue`` here would also skip the
+            # Workflow ``wf_dir`` enumeration AND the ``closing``-bracket
+            # collapse/pop below (same per-parent loop body), stranding a
+            # ``wf_dir=None`` closing bracket in ``_open_workflow_brackets``.
             sub_dir = parent_jsonl.parent / parent_session_id / "subagents"
+            sidechain_files: list[Path] = []
             try:
-                if not sub_dir.is_dir():
-                    continue
-                sidechain_files = list(sub_dir.glob("agent-*.jsonl"))
+                if sub_dir.is_dir():
+                    sidechain_files = list(sub_dir.glob("agent-*.jsonl"))
             except OSError:
-                continue
+                sidechain_files = []
 
             for sc_file in sidechain_files:
                 # sc_file.stem looks like "agent-a05666f9d196136af"

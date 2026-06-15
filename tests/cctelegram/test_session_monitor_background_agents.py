@@ -1113,3 +1113,48 @@ async def test_wf_dir_none_closing_bracket_emits_no_collapse_just_pops(
     msgs = await monitor.check_sidechain_updates({PARENT})
     assert not any(m.subagent_collapse_prefix for m in msgs)
     assert PARENT not in monitor._open_workflow_brackets
+
+
+@pytest.mark.asyncio
+async def test_wf_dir_none_closing_bracket_pops_even_without_toplevel_subagents_dir(
+    monitor, tmp_path
+):
+    """hermes P2 sibling of the test above: a wf_dir-less closing bracket on a
+    parent with NO top-level ``subagents`` dir at all must still be POPPED — the
+    missing-dir guard must default ``sidechain_files`` to ``[]`` WITHOUT
+    ``continue``, so the workflow enumeration + closing-pop below still run.
+    (The sibling test above creates ``sub_dir`` via ``_setup_parent`` and so
+    misses this edge — a bare ``continue`` would strand the bracket.)"""
+    from cctelegram.handlers.response_builder import WorkflowLaunchInfo
+
+    # Mirror _setup_parent BUT deliberately do NOT create the subagents dir.
+    proj_dir = tmp_path / "projects" / "-tmp-fake"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    parent_jsonl = proj_dir / f"{PARENT}.jsonl"
+    parent_jsonl.write_text("")
+    # NOTE: proj_dir / PARENT / "subagents" intentionally absent.
+    assert not (proj_dir / PARENT / "subagents").exists()
+    monitor.state.update_session(
+        TrackedSession(
+            session_id=PARENT,
+            file_path=str(parent_jsonl),
+            last_byte_offset=parent_jsonl.stat().st_size,
+        )
+    )
+
+    async def _scan():
+        return [SessionInfo(session_id=PARENT, file_path=parent_jsonl)]
+
+    monitor.scan_projects = _scan  # type: ignore[method-assign]
+
+    monitor._open_workflow_bracket(
+        PARENT, WorkflowLaunchInfo(task_id=_WF_TASK, run_id=None, transcript_dir=None)
+    )
+    monitor._open_workflow_brackets[PARENT][_WF_TASK].closing = True
+
+    msgs = await monitor.check_sidechain_updates({PARENT})
+
+    # wf_dir is None → no display cards → no collapse marker emitted.
+    assert not any(m.subagent_collapse_prefix for m in msgs)
+    # The decisive assertion: the bracket is POPPED, not stranded.
+    assert PARENT not in monitor._open_workflow_brackets
