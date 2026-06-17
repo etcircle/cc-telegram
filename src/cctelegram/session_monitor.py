@@ -1124,11 +1124,38 @@ class SessionMonitor:
                         # normalize — the wf-task: namespace is isolated from
                         # the Agent/Task agentId space) and open a persistent
                         # bracket for the Fix 2c mtime heartbeat.
+                        #
+                        # PR-2: anchor on the STRUCTURED entry-level
+                        # ``toolUseResult`` ({status, taskId, runId,
+                        # transcriptDir}) — the robust, version-drift-proof
+                        # source. The prose regex is the fallback ONLY when the
+                        # structured field is genuinely ABSENT (``tool_result_meta
+                        # is None`` — older Claude Code, a future whole-field
+                        # rename, or a non-dict coerced to None by the parser).
+                        # A PRESENT structured dict that does NOT parse as an
+                        # async_launched Workflow is AUTHORITATIVE ("not a
+                        # Workflow launch") — we must NOT fall back to a stale /
+                        # quoted ``Task ID:`` line in the prose and open a bogus
+                        # bracket (hermes P2). A WARNING on the absent-fallback
+                        # makes drift detectable. ``transcriptDir`` → ``wf_dir``
+                        # directly (no run-id-topology derivation, no glob): the
+                        # structured dir IS the validated path.
                         from .handlers.response_builder import (
                             extract_workflow_launch_info,
+                            workflow_launch_info_from_meta,
                         )
 
-                        info = extract_workflow_launch_info(entry.text)
+                        info = workflow_launch_info_from_meta(entry.tool_result_meta)
+                        if info is None and entry.tool_result_meta is None:
+                            info = extract_workflow_launch_info(entry.text)
+                            if info and info.task_id:
+                                logger.warning(
+                                    "Workflow launch: structured toolUseResult "
+                                    "absent, fell back to prose regex "
+                                    "(task_id=%s) — Claude Code launch-result "
+                                    "format may have drifted",
+                                    info.task_id,
+                                )
                         if info and info.task_id:
                             key = f"wf-task:{info.task_id}"
                             self._parent_activity(session_info.session_id).launched.add(

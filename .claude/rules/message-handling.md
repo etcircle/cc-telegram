@@ -304,10 +304,31 @@ launch tool_result with `Task ID:` mid-line and a separate `Run ID`, and a
 idle (no typing). The fix reuses the SAME `background_agents` machinery via a
 **parent-transcript bracket** keyed `wf-task:<task_id>` (passes
 `normalize_background_agent_key` as identity — no `agent-` prefix — so it never
-aliases the Agent/Task namespace): `response_builder.extract_workflow_launch_info`
-parses the launch (regex `(?im)^.*\bTask ID:\s*…` — Task ID is MID-LINE,
-verified against real launches; the captured id == the `<task-notification>`
-close key, the open/close parity invariant); `session_monitor` adds the raw
+aliases the Agent/Task namespace). **Launch anchor = STRUCTURED-primary (PR-2):**
+the launch parse reads the ENTRY-level `toolUseResult`
+(`{status:"async_launched", taskId, runId, transcriptDir, …}`, plumbed onto the
+tool_result `ParsedEntry` as `tool_result_meta` by `transcript_parser`) via
+`response_builder.workflow_launch_info_from_meta` — the robust,
+version-drift-proof source; `transcriptDir` IS the validated `wf_dir` (no
+run-id-topology derivation, no glob). It keys on the Workflow fields (`taskId`),
+NEVER on `status` alone — the Agent/Task `run_in_background` async launch ALSO
+carries `status=="async_launched"` but a DIFFERENT shape (`agentId`, no
+`taskId`; verified 54-vs-40 in the JSONL history) and must return None.
+`response_builder.extract_workflow_launch_info` (regex `(?im)^.*\bTask ID:\s*…` —
+Task ID is MID-LINE, verified against real launches; the captured id ==
+the `<task-notification>` close key, the open/close parity invariant) is the
+PROSE FALLBACK, used ONLY when the structured field is genuinely ABSENT
+(`tool_result_meta is None`: older Claude Code / a future whole-field rename /
+a non-dict coerced to None) and logged with a WARNING for drift detectability.
+A PRESENT structured dict that does not parse as an async_launched Workflow is
+AUTHORITATIVE — the prose is NOT consulted (so a stale/quoted `Task ID:` line
+can't open a bogus bracket; hermes P2). NOTE: this structured-primary anchor is
+the LIVE-MONITOR path only — the PR-1 startup reconciler
+`_scan_workflow_launches_and_closes` (below) stays PROSE-only by design (a
+disclosed follow-up: widening its `Task ID` byte-prefilter to `async_launched`
+to read the structured field there would JSON-parse the common Agent
+async-launch lines and turn one malformed line into a fail-closed no-lift for an
+unrelated live Workflow). `session_monitor` adds the raw
 `wf-task:<id>` to `.launched` (→ `mark_background_agent_launched`,
 `is_background=True`, survives the parent end-of-turn prune → typing + 🟡) and
 opens a persistent `_WorkflowBracket`. **Fix 2c heartbeat (DESIGN B — separate

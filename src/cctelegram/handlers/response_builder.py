@@ -141,6 +141,44 @@ def extract_workflow_launch_info(text: str) -> WorkflowLaunchInfo | None:
     return WorkflowLaunchInfo(task_id=task_id, run_id=run_id, transcript_dir=tdir)
 
 
+def workflow_launch_info_from_meta(meta: object) -> WorkflowLaunchInfo | None:
+    """Parse a Workflow launch from the STRUCTURED entry-level ``toolUseResult``
+    (PR-2 — the PRIMARY anchor; ``extract_workflow_launch_info`` prose regex is
+    the fallback).
+
+    ``meta`` is the raw ``ParsedEntry.tool_result_meta`` (the JSONL
+    ``toolUseResult`` dict, or ``None`` / a non-dict). Returns the Task ID +
+    (optional) Run ID + (validated) Transcript dir, or ``None`` when ``meta`` is
+    not a Workflow ``async_launched`` result.
+
+    Discrimination note: the Agent/Task ``run_in_background`` async launch ALSO
+    carries ``status == "async_launched"`` but a DIFFERENT shape (``agentId``,
+    NO ``taskId``) — verified 54-vs-40 in the project JSONL history. So we key on
+    the Workflow fields (``taskId``), NEVER on ``status`` alone; an Agent shape
+    returns ``None`` (its caller is the ``tool_name == "Workflow"`` branch, so it
+    never reaches here in practice, but the guard makes it fail-safe).
+
+    ``transcriptDir`` reuses the SAME drop-to-None guard as the prose parser
+    (a path not under ``subagents/workflows/wf_`` is dropped, so only a real
+    Workflow sidechain dir feeds the Fix 2c mtime heartbeat).
+    """
+    if not isinstance(meta, dict):
+        return None
+    if meta.get("status") != "async_launched":
+        return None
+    task_id = meta.get("taskId")
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    run_id_raw = meta.get("runId")
+    run_id = run_id_raw if isinstance(run_id_raw, str) and run_id_raw else None
+    tdir_raw = meta.get("transcriptDir")
+    tdir = tdir_raw if isinstance(tdir_raw, str) and tdir_raw else None
+    if tdir and "subagents/workflows/wf_" not in tdir:
+        # Only a real Workflow transcript dir feeds the Fix 2c mtime heartbeat.
+        tdir = None
+    return WorkflowLaunchInfo(task_id=task_id, run_id=run_id, transcript_dir=tdir)
+
+
 def extract_workflow_launch_task_id(text: str) -> str | None:
     """The Workflow launch Task ID — parity with the close key.
 

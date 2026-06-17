@@ -390,6 +390,113 @@ class TestParseEntries:
         assert tool_result_entries[0].tool_use_id == "t1"
         assert not pending
 
+    def test_tool_result_carries_entry_level_tool_use_result_meta(
+        self,
+        make_jsonl_entry,
+        make_tool_use_block,
+        make_tool_result_block,
+    ):
+        """PR-2: the ENTRY-level ``toolUseResult`` (sibling of ``message``) is
+        plumbed onto the entry's ``tool_result`` ParsedEntry as
+        ``tool_result_meta`` so the session_monitor Workflow-launch branch can
+        anchor on the structured field instead of the drift-prone launch prose."""
+        meta = {
+            "status": "async_launched",
+            "taskId": "wtask01abc",
+            "runId": "wf_run01abcd-ef0",
+            "transcriptDir": "/p/SID/subagents/workflows/wf_run01abcd-ef0",
+        }
+        entries = [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t1", "Workflow", {"script": "..."})],
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t1", "Workflow launched.")],
+                tool_use_result=meta,
+            ),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+        tr = [e for e in result if e.content_type == "tool_result"]
+        assert len(tr) == 1
+        assert tr[0].tool_result_meta == meta
+
+    def test_tool_result_meta_none_when_absent(
+        self,
+        make_jsonl_entry,
+        make_tool_use_block,
+        make_tool_result_block,
+    ):
+        """No entry-level ``toolUseResult`` → ``tool_result_meta`` is None (the
+        common case for ordinary tool results)."""
+        entries = [
+            make_jsonl_entry("assistant", [make_tool_use_block("t1", "Read", {})]),
+            make_jsonl_entry("user", [make_tool_result_block("t1", "contents")]),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+        tr = [e for e in result if e.content_type == "tool_result"]
+        assert len(tr) == 1
+        assert tr[0].tool_result_meta is None
+
+    def test_tool_result_meta_non_dict_ignored(self, make_tool_result_block):
+        """hermes P3: a non-dict ``toolUseResult`` (garbage/corruption) is coerced
+        to None at the parser — never propagated as ``tool_result_meta``."""
+        entry = {
+            "type": "user",
+            "message": {"content": [make_tool_result_block("t1", "contents")]},
+            "toolUseResult": "not-a-dict",
+            "timestamp": "2026-06-17T08:00:00.000Z",
+        }
+        result, _ = TranscriptParser.parse_entries([entry])
+        tr = [e for e in result if e.content_type == "tool_result"]
+        assert len(tr) == 1
+        assert tr[0].tool_result_meta is None
+
+    def test_tool_result_meta_stamped_on_every_result_of_multi_result_entry(
+        self, make_jsonl_entry, make_tool_result_block
+    ):
+        """hermes P3: the entry-level ``toolUseResult`` is shared across EVERY
+        tool_result of a (rare) multi-tool_result user entry (it is entry-level,
+        not per-block)."""
+        meta = {"status": "async_launched", "taskId": "wtask01abc"}
+        entries = [
+            make_jsonl_entry(
+                "user",
+                [
+                    make_tool_result_block("t1", "first result"),
+                    make_tool_result_block("t2", "second result"),
+                ],
+                tool_use_result=meta,
+            ),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+        tr = [e for e in result if e.content_type == "tool_result"]
+        assert len(tr) == 2
+        assert all(e.tool_result_meta == meta for e in tr)
+
+    def test_tool_result_meta_not_stamped_on_sibling_user_text(
+        self, make_jsonl_entry, make_text_block, make_tool_result_block
+    ):
+        """hermes P3: a user entry carrying BOTH a tool_result and plain user text
+        stamps only the tool_result entry — the user-text entry stays meta-free."""
+        meta = {"status": "async_launched", "taskId": "wtask01abc"}
+        entries = [
+            make_jsonl_entry(
+                "user",
+                [
+                    make_tool_result_block("t1", "result text"),
+                    make_text_block("a trailing user note"),
+                ],
+                tool_use_result=meta,
+            ),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+        tr = [e for e in result if e.content_type == "tool_result"]
+        user_text = [e for e in result if e.content_type == "text" and e.role == "user"]
+        assert len(tr) == 1 and tr[0].tool_result_meta == meta
+        assert len(user_text) == 1 and user_text[0].tool_result_meta is None
+
     def test_tool_result_carries_tool_name_from_pending_tools(
         self,
         make_jsonl_entry,
