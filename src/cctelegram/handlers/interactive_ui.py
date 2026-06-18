@@ -2991,21 +2991,29 @@ async def handle_interactive_ui(
                 text = structured
             if partial_options_notice:
                 text = f"{text}\n\n{partial_options_notice}"
-            if p14_suppress_picks:
-                pass
-            elif not render_source.dispatch_trusted:
-                # PR-3 PR-B RESCUE: render the card DISPLAY-ONLY. Mint NO pick
-                # tokens (the busy/unparseable pane means a tapped digit can't be
-                # verified against the live picker — mint/validate parity would
-                # break → dead-tap), drop any prior tokens for this route, and
-                # tell the user to navigate manually.
+            if not render_source.dispatch_trusted:
+                # PR-3 PR-B DISPLAY-ONLY (rescue OR a partial-pane bail): mint NO
+                # pick tokens (the busy/unparseable/partial pane means a tapped
+                # digit can't be verified against the live picker — mint/validate
+                # parity would break → dead-tap). CRITICAL (hermes round-2): prune
+                # any prior tokens for this route UNCONDITIONALLY here — BEFORE
+                # the p14 branch — because an untrusted bail is ALSO
+                # p14_suppress_picks (its pane starts at option >1), and leaving a
+                # stale trusted side_file/pane token row would make
+                # status_polling._remint_on_source_drift see minted!=live every
+                # tick → the exact re-render loop this PR kills. (The trusted path
+                # self-prunes prior rows via mint_row's stale-row hygiene; only
+                # this no-mint path needs the explicit prune.)
                 pick_token.prune_for_route(user_id, thread_id, window_id)
-                text = (
-                    f"{text}\n\n⚠️ The live screen is busy, so the option "
-                    "buttons are disabled — use ↑/↓/Tab below or send your "
-                    "answer as text."
-                )
-            else:
+                if not p14_suppress_picks:
+                    # p14 already appended its own "only options X-Y visible"
+                    # notice; add the busy-screen notice only when it didn't.
+                    text = (
+                        f"{text}\n\n⚠️ The live screen is busy, so the option "
+                        "buttons are disabled — use ↑/↓/Tab below or send your "
+                        "answer as text."
+                    )
+            elif not p14_suppress_picks:
                 built = _build_pick_button_rows(
                     user_id, thread_id, window_id, form, resolved_source
                 )

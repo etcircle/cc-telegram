@@ -567,9 +567,14 @@ render the side file's full content DISPLAY-ONLY (`dispatch_trusted=False`, PURE
 `build_form_from_tool_input` form — no pane overlay so the render identity can't
 leak pane/scrollback churn); **explicit_jsonl / jsonl_cache / pane** — no side file
 → the pre-existing fallback (all trusted). `dispatch_trusted` GATES token minting
-at the `_build_pick_button_rows` callsite: rescue mints NO `pick_token` /
-`pick_intent` rows, calls `prune_for_route`, and adds a manual-nav notice (a
-busy-pane digit can't be verified against the live picker → would dead-tap). The ctx
+at the `_build_pick_button_rows` callsite: ANY untrusted render (rescue OR a
+partial-pane bail) mints NO `pick_token` / `pick_intent` rows, calls
+`prune_for_route` UNCONDITIONALLY — BEFORE the `p14_suppress_picks` skip, since an
+untrusted partial bail is also p14 (hermes round-2: leaving a stale trusted token
+row would make `_remint_on_source_drift` see minted≠live every tick → the very
+re-render loop this PR kills; the trusted path self-prunes via `mint_row`'s
+stale-row hygiene) — and adds a manual-nav notice (a busy/partial-pane digit can't
+be verified against the live picker → would dead-tap). The ctx
 (📋 full-descriptions) card is driven off the decision: side_file_ok / rescue post
 the side file's descriptions (rescue is the V1/V2 fix — the card was previously
 DROPPED because `resolve_record`'s pane-consistency check rejected on the busy pane);
