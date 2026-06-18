@@ -2533,7 +2533,6 @@ class TestPollerSourceDriftRemint:
         live re-resolved source, the same-hash idle tick must NOT re-render — it
         only refreshes deadlines. This is the loop-termination condition: after a
         re-mint to ``pane`` the next tick sees pane==pane → no re-render storm."""
-        import hashlib
         from pathlib import Path
 
         from cctelegram.handlers import auq_source, pick_token, status_polling
@@ -2555,7 +2554,11 @@ class TestPollerSourceDriftRemint:
 
             ui_content = extract_interactive_content(auq_pane)
             assert ui_content is not None
-            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            # PR-3 PR-B: the AUQ loop dedup hashes the render IDENTITY (stable
+            # under scrollback churn), not the raw content excerpt — seed the
+            # SAME basis the poller computes so this is a genuine same-hash idle
+            # tick. The loop-termination condition under test is unchanged.
+            ui_hash = auq_source.peek_render_identity(window_id, auq_pane)
             status_polling._last_published_ui_hash[route] = ui_hash
 
             # Seed the row minted from the REAL live `pane` source — no drift, so

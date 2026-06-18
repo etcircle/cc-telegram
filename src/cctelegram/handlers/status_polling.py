@@ -499,6 +499,24 @@ def _on_interactive_clear(
 register_clear_callback(_on_interactive_clear)
 
 
+def _ui_render_hash(window_id: str, pane_text: str, ui_content) -> str:
+    """Dedup hash for the status-poll loop's "did the live UI change?" check.
+
+    PR-3 PR-B loop kill: for AskUserQuestion the basis is the render IDENTITY
+    (``auq_source.peek_render_identity`` — the resolved render decision + the
+    render-determining form fields), NOT the raw interactive-content excerpt.
+    The raw excerpt CHURNS as unrelated scrollback scrolls under a live picker,
+    so a busy topic re-rendered the card every tick (the owner's duplicate-card
+    loop). The render identity is stable under scrollback churn (a rescue's pure
+    side-file form has no pane fields) yet changes on every genuine transition.
+    Other interactive UIs (ExitPlanMode / permission prompts) keep the raw
+    content hash — they have no AUQ render resolver.
+    """
+    if ui_content.name == "AskUserQuestion":
+        return auq_source.peek_render_identity(window_id, pane_text)
+    return hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+
+
 async def _remint_on_source_drift(
     bot: Bot,
     user_id: int,
@@ -773,7 +791,7 @@ async def update_status_message(
             await _maybe_repaint_digest_on_transition(
                 bot, user_id, thread_id, window_id
             )
-            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            ui_hash = _ui_render_hash(window_id, pane_text, ui_content)
             if ui_hash == _last_published_ui_hash.get(route):
                 # Same UI as last publish — user is mid-interaction, skip the
                 # re-render. D3-β: BUT re-stamp this live card's pick-token
@@ -989,9 +1007,9 @@ async def update_status_message(
         # the route waits for same-route content to drain; refreshes must stay
         # fast so Q2→Q3 transitions do not stall every poll.
         is_first_publish_for_route = route not in _last_published_ui_hash
-        _last_published_ui_hash[route] = hashlib.sha256(
-            ui_content.content.encode("utf-8")
-        ).hexdigest()
+        _last_published_ui_hash[route] = _ui_render_hash(
+            window_id, pane_text, ui_content
+        )
         if is_first_publish_for_route:
             await _drain_content_queue_before_first_picker_publish(route)
         published = await handle_interactive_ui(

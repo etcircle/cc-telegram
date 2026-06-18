@@ -741,3 +741,275 @@ class TestGcStaleLiveSafe:
         deleted = auq_source.gc_stale(is_live_session=lambda sid: False)
         assert deleted == 0
         assert path.exists()
+
+
+# ── RENDER-path resolver + render identity (PR-3 PR-B) ───────────────────────
+
+_BAIL_PANE = (
+    "Pick a deploy target for this change:\n"
+    "\n"
+    "❯ 1. Staging\n"
+    "     Push to the staging cluster first.\n"
+    "  2. Production\n"
+    "     Go straight to prod.\n"
+    "  3. Type something.\n"
+    "────────────────────────────────────\n"
+    "  4. Chat about this\n"
+    "\n"
+    "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+)
+
+
+class TestRenderResolver:
+    _WID = "@auqsrc-render"
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    def test_consistent_pane_is_side_file_ok_trusted(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_affordance_side_file(_cc_dir, self._SID)
+            pane = _AFFORDANCE_PANE.read_text()
+            r = auq_source.resolve_auq_source_for_render(self._WID, pane)
+            assert r.decision == "side_file_ok"
+            assert r.kind == "side_file"
+            assert r.dispatch_trusted is True
+            assert r.payload == tool_input
+            # Mint/validate parity: the trusted source tags match the strict
+            # resolver's (kind + canonical-dict fingerprint).
+            strict = auq_source.resolve_auq_source(self._WID, None, pane)
+            assert (r.kind, r.source_fingerprint) == (
+                strict.kind,
+                strict.source_fingerprint,
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_unparseable_pane_is_rescue_untrusted(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_affordance_side_file(_cc_dir, self._SID)
+            # Busy scrollback that carries no picker at all → unparseable pane.
+            pane = "\n".join(f"  trace {i}: tool output churn" for i in range(40))
+            r = auq_source.resolve_auq_source_for_render(self._WID, pane)
+            assert r.decision == "rescue"
+            assert r.dispatch_trusted is False
+            assert r.kind == "side_file"
+            # Rescue still renders the FULL side-file content (options present).
+            assert r.form is not None and len(r.form.options) >= 1
+        finally:
+            _unbind_window(self._WID)
+
+    def test_empty_pane_is_rescue_untrusted(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_affordance_side_file(_cc_dir, self._SID)
+            r = auq_source.resolve_auq_source_for_render(self._WID, "")
+            assert r.decision == "rescue"
+            assert r.dispatch_trusted is False
+        finally:
+            _unbind_window(self._WID)
+
+    def test_different_complete_pane_bails_to_pane_trusted(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_affordance_side_file(_cc_dir, self._SID)
+            # The live pane shows a DIFFERENT, COMPLETE picker → never serve the
+            # stale side file; bail to the pane (trusted).
+            r = auq_source.resolve_auq_source_for_render(self._WID, _BAIL_PANE)
+            assert r.decision == "bail"
+            assert r.kind == "pane"
+            assert r.dispatch_trusted is True
+            assert r.payload is None
+        finally:
+            _unbind_window(self._WID)
+
+    def test_different_incomplete_pane_renders_pane_not_stale_side_file(self, _cc_dir):
+        """Wrong-question fix (hermes + internal review): when the live pane
+        parses a DIFFERENT, INCOMPLETE picker (scrolled/partial), the resolver
+        must render the PANE display-only — NEVER rescue the STALE side file's
+        question. Rescue is reserved for a genuinely UNPARSEABLE pane
+        (pane_form is None). dispatch_trusted=False (partial → no safe dispatch);
+        kind=pane so NO stale side-file ctx card is posted.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_affordance_side_file(_cc_dir, self._SID)
+            # A genuinely DIFFERENT live picker, scrolled so option 1 is off the
+            # top (options start at 3 → not contiguous-from-1 → incomplete).
+            pane = (
+                "  3. Rebase onto main\n"
+                "     Replay your commits onto the updated base.\n"
+                "❯ 4. Type something.\n"
+                "────────────────────────────────────\n"
+                "  5. Chat about this\n"
+                "\n"
+                "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+            )
+            r = auq_source.resolve_auq_source_for_render(self._WID, pane)
+            assert r.decision == "bail"
+            assert r.kind == "pane"
+            assert r.dispatch_trusted is False
+            assert r.reason.startswith("bail_partial")
+            # It serves the LIVE pane's (partial) options exactly — option 3
+            # only (4/5 are dropped affordances) — NOT the stale side file's
+            # question/options.
+            assert r.form is not None
+            assert [o.label for o in r.form.options] == ["Rebase onto main"]
+        finally:
+            _unbind_window(self._WID)
+
+    def test_aged_consistent_side_file_does_not_mint_trusted(self, _cc_dir):
+        """A consistent side file PAST the read-TTL must NOT yield a trusted
+        side_file_ok token (the TTL'd validate path would reject it → dead-tap).
+        With a complete consistent pane it bails to the pane instead.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            sidefile = json.loads(_AFFORDANCE_SIDEFILE.read_text())
+            pending = _cc_dir / "auq_pending"
+            pending.mkdir(mode=0o700, exist_ok=True)
+            (pending / f"{self._SID}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "session_id": self._SID,
+                        "tool_use_id": sidefile["tool_use_id"],
+                        # Aged well past the 300s read-TTL.
+                        "written_at": time.time() - 1000,
+                        "tool_input": sidefile["tool_input"],
+                    }
+                )
+            )
+            pane = _AFFORDANCE_PANE.read_text()
+            r = auq_source.resolve_auq_source_for_render(self._WID, pane)
+            assert r.decision != "side_file_ok"
+            # The affordance pane is a complete picker → bail to it (trusted via
+            # the pane source, which the TTL'd validate path also resolves to).
+            assert r.decision == "bail"
+        finally:
+            _unbind_window(self._WID)
+
+    def test_no_side_file_falls_back_to_pane(self, _cc_dir):
+        _bind_window(self._WID, self._SID)
+        try:
+            r = auq_source.resolve_auq_source_for_render(self._WID, _BAIL_PANE)
+            assert r.decision == "pane"
+            assert r.dispatch_trusted is True
+        finally:
+            _unbind_window(self._WID)
+
+
+class TestRenderIdentity:
+    _WID = "@auqsrc-identity"
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    def test_rescue_identity_stable_under_scrollback_churn(self, _cc_dir):
+        """The loop kill: a rescue card's render identity is INVARIANT as
+        unrelated scrollback scrolls under it (the pure side-file form has no
+        pane fields), so the poller never re-renders it every tick.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_affordance_side_file(_cc_dir, self._SID)
+            churn_a = "\n".join(f"trace {i}: alpha" for i in range(30))
+            churn_b = "\n".join(f"DIFFERENT line {i}: beta gamma" for i in range(55))
+            id_a = auq_source.peek_render_identity(self._WID, churn_a)
+            id_b = auq_source.peek_render_identity(self._WID, churn_b)
+            # Both rescue; identity unchanged despite totally different scrollback.
+            assert (
+                auq_source.resolve_auq_source_for_render(self._WID, churn_a).decision
+                == "rescue"
+            )
+            assert id_a == id_b
+        finally:
+            _unbind_window(self._WID)
+
+    def test_title_less_pane_identity_stable_under_scrollback_churn(self, _cc_dir):
+        """Regression (internal review): the DOMINANT live single-select shape —
+        a `pane` / `bail` decision whose `current_question_title` is None (Claude
+        hasn't flushed the AUQ tool_use to JSONL) — must stay STABLE under
+        scrollback churn. The first cut folded `pane_walkback_title` (scraped
+        from churning scrollback above the option block) into render_signature,
+        which re-rendered the card every tick. render_signature now uses
+        current_question_title ONLY, matching the OLD content hash's stability.
+        """
+        # No side file → `pane` decision; identical complete picker block, two
+        # totally different busy-topic scrollbacks above it (the line just above
+        # the options becomes pane_walkback_title).
+        picker = (
+            "❯ 1. Staging\n"
+            "     Push to the staging cluster first.\n"
+            "  2. Production\n"
+            "     Go straight to prod.\n"
+            "  3. Type something.\n"
+            "────────────────────────────────────\n"
+            "  4. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        pane_a = "⏺ Bash(build 12)\n⏺ Bash(build 13)\n" + picker
+        pane_b = "⎿ test 98 ok\n⎿ test 99 ok\n" + picker
+        # Sanity: this IS the title-less pane decision, and the walkback titles
+        # genuinely DIFFER (so a regression would be caught).
+        ra = auq_source.resolve_auq_source_for_render(self._WID, pane_a)
+        rb = auq_source.resolve_auq_source_for_render(self._WID, pane_b)
+        assert ra.decision == "pane" and rb.decision == "pane"
+        assert ra.form is not None and ra.form.current_question_title is None
+        assert ra.form.pane_walkback_title != rb.form.pane_walkback_title
+        # The render identity must be EQUAL despite the differing scrollback.
+        assert auq_source.peek_render_identity(
+            self._WID, pane_a
+        ) == auq_source.peek_render_identity(self._WID, pane_b)
+
+    def test_render_signature_changes_on_cursor_move(self):
+        from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
+
+        base = AskUserQuestionForm(
+            current_question_title="Pick one.",
+            options=(
+                AskOption(label="A", recommended=False, cursor=True, number=1),
+                AskOption(label="B", recommended=False, cursor=False, number=2),
+            ),
+            select_mode="single",
+        )
+        moved = AskUserQuestionForm(
+            current_question_title="Pick one.",
+            options=(
+                AskOption(label="A", recommended=False, cursor=False, number=1),
+                AskOption(label="B", recommended=False, cursor=True, number=2),
+            ),
+            select_mode="single",
+        )
+        # The pick-token fingerprint is cursor-BLIND (stable token); the render
+        # signature is cursor-AWARE (the renderer paints ❯) → it MUST change.
+        assert base.fingerprint() == moved.fingerprint()
+        assert auq_source.render_signature(base) != auq_source.render_signature(moved)
+
+    def test_render_signature_changes_on_multiselect_toggle(self):
+        from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
+
+        base = AskUserQuestionForm(
+            current_question_title="Pick several.",
+            options=(
+                AskOption(
+                    label="A", recommended=False, cursor=True, number=1, selected=False
+                ),
+                AskOption(
+                    label="B", recommended=False, cursor=False, number=2, selected=False
+                ),
+            ),
+            select_mode="multi",
+        )
+        toggled = AskUserQuestionForm(
+            current_question_title="Pick several.",
+            options=(
+                AskOption(
+                    label="A", recommended=False, cursor=True, number=1, selected=True
+                ),
+                AskOption(
+                    label="B", recommended=False, cursor=False, number=2, selected=False
+                ),
+            ),
+            select_mode="multi",
+        )
+        assert auq_source.render_signature(base) != auq_source.render_signature(toggled)

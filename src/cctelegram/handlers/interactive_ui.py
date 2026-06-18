@@ -40,10 +40,8 @@ from ..session import (
 from ..terminal_parser import (
     REVIEW_SUBMIT_LABEL,
     AskUserQuestionForm,
-    build_form_from_tool_input,
     extract_interactive_content,
     parse_ask_user_question,
-    resolve_ask_form,
     visible_pane_liveness,
 )
 from .. import md_capture
@@ -2885,11 +2883,12 @@ async def handle_interactive_ui(
     # text reply.
     text = content.content
     pick_rows: list[list[InlineKeyboardButton]] | None = None
-    # Hoisted so the context-message gate site below can read it under the
+    # Hoisted so the context-message gate site below can read them under the
     # route lock without an unbound-variable risk when content.name isn't
     # AskUserQuestion (the gate site short-circuits on name, but pyright
     # narrows on declarations, not control flow across blocks).
     form: AskUserQuestionForm | None = None
+    render_source: auq_source.RenderAuqSource | None = None
     if content.name == "AskUserQuestion":
         # Unified resolver feeds both render and validate paths the same
         # form. Combines JSONL tool_input (full option list with
@@ -2899,18 +2898,42 @@ async def handle_interactive_ui(
         # ``current_tab_inferred``; the FA5+ guard in
         # ``_build_pick_button_rows`` suppresses pick buttons when False so
         # we don't dispatch a digit against the wrong tab.
-        resolved_source = auq_source.resolve_auq_source(
-            window_id, tool_input, pane_text
+        # PR-3 PR-B: the RENDER-path resolver decides which source to render
+        # from AND whether a tap can be TRUSTED to dispatch. side_file_ok
+        # (side file consistent with the pane AND within the read-TTL) → trusted
+        # side-file render; bail → the pane is a genuinely different live picker
+        # → render the pane (trusted); rescue → busy / unparseable pane → render
+        # the side file's full content DISPLAY-ONLY (no pick tokens). The
+        # read-TTL-FREE read lets a busy >TTL pane still rescue, while
+        # side_file_ok mirrors the TTL'd resolver ``validate_and_consume``
+        # re-resolves → mint/validate parity, no dead-tap.
+        render_source = auq_source.resolve_auq_source_for_render(
+            window_id, pane_text, explicit=tool_input
         )
-        resolved_input = resolved_source.payload
-        form = resolve_ask_form(resolved_input, pane_text)
+        form = render_source.form
         if form is None:
-            # Belt-and-braces fallback. resolve_ask_form already tries
-            # pane parse internally; this only fires when both inputs
-            # are useless.
-            form = build_form_from_tool_input(resolved_input)
-            if form is None:
-                form = parse_ask_user_question(pane_text)
+            # Belt-and-braces: the resolver returns a form for every structured
+            # decision; this only fires on a pane carrying no AUQ at all.
+            form = parse_ask_user_question(pane_text)
+        # The trusted-mint source tags fed to ``_build_pick_button_rows`` /
+        # ``pick_token.mint_row``; ``validate_and_consume`` re-resolves the same
+        # (kind, fingerprint) via the strict resolver. Only consulted when
+        # ``render_source.dispatch_trusted`` is True (gated below).
+        resolved_source = auq_source.ResolvedAuqSource(
+            kind=render_source.kind,
+            payload=render_source.payload,
+            source_fingerprint=render_source.source_fingerprint,
+        )
+        logger.info(
+            "AUQ render resolve: window=%s from_poller=%s decision=%s reason=%s "
+            "trusted=%s kind=%s",
+            window_id,
+            from_poller,
+            render_source.decision,
+            render_source.reason,
+            render_source.dispatch_trusted,
+            render_source.kind,
+        )
 
         # Active AUQs do not have a live JSONL payload: Claude Code buffers
         # the AskUserQuestion ``tool_use`` line until the user answers. The
@@ -2968,7 +2991,21 @@ async def handle_interactive_ui(
                 text = structured
             if partial_options_notice:
                 text = f"{text}\n\n{partial_options_notice}"
-            if not p14_suppress_picks:
+            if p14_suppress_picks:
+                pass
+            elif not render_source.dispatch_trusted:
+                # PR-3 PR-B RESCUE: render the card DISPLAY-ONLY. Mint NO pick
+                # tokens (the busy/unparseable pane means a tapped digit can't be
+                # verified against the live picker — mint/validate parity would
+                # break → dead-tap), drop any prior tokens for this route, and
+                # tell the user to navigate manually.
+                pick_token.prune_for_route(user_id, thread_id, window_id)
+                text = (
+                    f"{text}\n\n⚠️ The live screen is busy, so the option "
+                    "buttons are disabled — use ↑/↓/Tab below or send your "
+                    "answer as text."
+                )
+            else:
                 built = _build_pick_button_rows(
                     user_id, thread_id, window_id, form, resolved_source
                 )
@@ -3017,31 +3054,34 @@ async def handle_interactive_ui(
             # routes through dict_via_hook before falling back to form.
             ctx_input = _resolve_ask_tool_input(window_id, tool_input)
             cached_tool_use_id = _last_auq_tool_use_id.get(window_id)
+            # render_source is bound whenever content.name == "AskUserQuestion"
+            # (set in the pre-lock block above gated on the same condition);
+            # pyright can't correlate the two blocks, so assert the invariant.
+            assert render_source is not None
 
-            # Resolve the PreToolUse-hook record only when JSONL is silent
-            # (the common case for live AUQs). auq_source.resolve_record
-            # revalidates the cached record against the live pane on
-            # every call (v4 plan cache invariant).
-            pretool_record: auq_source.PreToolAskRecord | None = (
-                auq_source.resolve_record(window_id, form)
-                if ctx_input is None
-                else None
-            )
-
+            # PR-3 PR-B: the ctx (📋 full-descriptions) source is driven off the
+            # render DECISION, not a second resolve_record call. side_file_ok /
+            # rescue → post the side file's full per-option descriptions (rescue
+            # is the V1/V2 fix — the card was previously DROPPED because the
+            # pane-consistency check rejected on the busy pane). bail → the pane
+            # is a genuinely different live picker, so NEVER post the stale
+            # side-file descriptions.
             ctx_source: dict | AskUserQuestionForm | None
             source_tag: str
             if ctx_input is not None and cached_tool_use_id:
                 ctx_source = ctx_input
                 dedup_key = cached_tool_use_id
                 source_tag = "dict_via_jsonl"
-            elif pretool_record is not None:
-                ctx_source = pretool_record.tool_input
-                dedup_key = (
-                    f"pretool:{pretool_record.tool_use_id}"
-                    if pretool_record.tool_use_id
-                    else f"pretool:{pretool_record.input_fingerprint}"
-                )
-                source_tag = "dict_via_hook"
+            elif render_source.decision in ("side_file_ok", "rescue") and isinstance(
+                render_source.payload, dict
+            ):
+                ctx_source = render_source.payload
+                dedup_key = f"pretool:{render_source.source_fingerprint[:16]}"
+                source_tag = f"dict_via_render_{render_source.decision}"
+            elif render_source.decision == "bail":
+                ctx_source = None
+                dedup_key = ""
+                source_tag = "bail_no_ctx"
             elif form is not None:
                 ctx_source = form
                 dedup_key = f"form:{form.fingerprint()}"
@@ -3053,18 +3093,14 @@ async def handle_interactive_ui(
             logger.info(
                 "AUQ context gate eval: window=%s from_poller=%s "
                 "explicit_input=%s cached_input=%s tool_use_id=%s "
-                "pretool=%s ctx_source=%s dedup_key=%s should_post=%s "
+                "decision=%s ctx_source=%s dedup_key=%s should_post=%s "
                 "already_posted=%s",
                 window_id,
                 from_poller,
                 tool_input is not None,
                 _last_completed_ask_tool_input.get(window_id) is not None,
                 cached_tool_use_id,
-                (
-                    pretool_record.input_fingerprint
-                    if pretool_record is not None
-                    else "<none>"
-                ),
+                render_source.decision,
                 source_tag,
                 dedup_key or "<empty>",
                 _should_post_auq_context(ctx_source),

@@ -271,6 +271,267 @@ def resolve_auq_source_for_dispatch(
     )
 
 
+# ── The RENDER-path AUQ source (PR-3 PR-B) ───────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RenderAuqSource:
+    """The RENDER-path AUQ source: which source to render from + whether a tap
+    on the resulting card can be TRUSTED to dispatch.
+
+    Distinct from :class:`ResolvedAuqSource` (mint/validate parity) and
+    :class:`DispatchAuqSource` (the dispatch keystroke source). The render path
+    must handle a BUSY-topic pane that mis-parses or is unparseable while the
+    PreToolUse side file holds the real question — WITHOUT ever serving a STALE
+    side file over a genuinely different live picker. ``decision`` records the
+    branch:
+
+      - ``side_file_ok`` — the side file is consistent with the live pane AND
+        within the read-TTL → render from it, mint TRUSTED tokens. The ONLY
+        trusted side-file path (mirrors the TTL'd strict resolver that
+        ``pick_token.validate_and_consume`` re-resolves at tap, so mint/validate
+        parity holds).
+      - ``bail`` — the pane is itself a COMPLETE coherent picker that disagrees
+        with the side file (a genuinely different / advanced live question) or a
+        consistent-but-TTL-aged one → render from the PANE (trusted; never serve
+        the stale side file).
+      - ``rescue`` — the pane is unparseable / incomplete (busy scrollback) and
+        the side file is the truth → render the side file's full content
+        DISPLAY-ONLY (``dispatch_trusted=False`` → NO pick tokens, manual-nav
+        notice). Read-TTL-FREE so an aged-but-present side file still rescues.
+      - ``explicit_jsonl`` / ``jsonl_cache`` / ``pane`` — no side file: the
+        pre-existing explicit > jsonl_cache > pane fallback (all trusted).
+
+    ``dispatch_trusted`` GATES token minting at the ``_build_pick_button_rows``
+    callsite: a False value means render the card but mint NO ``pick_token`` /
+    ``pick_intent`` rows (so a tap can never dispatch an unverified digit).
+    ``form`` is the form to render (never None for a decision that renders a
+    structured card). ``source_fingerprint`` + ``kind`` feed the trusted mint so
+    validate re-resolves the same tags.
+    """
+
+    decision: Literal[
+        "side_file_ok", "bail", "rescue", "explicit_jsonl", "jsonl_cache", "pane"
+    ]
+    kind: Literal["side_file", "jsonl_cache", "pane"]
+    payload: dict | None
+    form: AskUserQuestionForm | None
+    source_fingerprint: str
+    dispatch_trusted: bool
+    reason: str
+
+
+def pane_form_is_complete_picker(form: AskUserQuestionForm | None) -> bool:
+    """True when ``form`` is a COMPLETE, coherent live picker (PR-3 PR-B).
+
+    Used by :func:`resolve_auq_source_for_render` to distinguish a genuinely
+    different / advanced live question (the pane shows a full picker → BAIL to
+    it) from a busy-scrollback mis-parse / unparseable pane (→ RESCUE from the
+    side file). "Complete" = options present, numbered contiguously from 1, AND
+    the bottom-of-list affordance row was captured (``options_complete``, which
+    proves the whole list is on screen rather than a scrolled tail) — OR a
+    review/Submit screen (whose two Submit/Cancel rows are the complete picker).
+    Conservative: anything short of that is treated as NOT-complete so the
+    resolver prefers the side-file rescue over serving a partial pane.
+    """
+    if form is None or not form.options:
+        return False
+    if form.is_review_screen:
+        return form.options_contiguous_from_one()
+    return form.options_complete
+
+
+def resolve_auq_source_for_render(
+    window_id: str, pane_text: str, explicit: dict | None = None
+) -> RenderAuqSource:
+    """Resolve the RENDER-path AUQ source + trust for a window (PR-3 PR-B).
+
+    Decision tree (side-file-centric; the live AUQ's ``tool_use`` is buffered in
+    JSONL, so the PreToolUse side file is the authoritative source):
+
+      record read READ-TTL-FREE (so a busy >TTL pane can still RESCUE):
+        - consistent-with-pane AND within the read-TTL → ``side_file_ok``
+          (TRUSTED; mirrors the TTL'd strict resolver ``validate_and_consume``
+          re-resolves → mint/validate parity, no dead-tap);
+        - else, pane is a COMPLETE coherent picker → ``bail`` to the pane
+          (trusted; a genuinely different/advanced question, or a
+          consistent-but-aged one — never serve the stale side file);
+        - else (pane unparseable / incomplete) → ``rescue`` from the side file
+          DISPLAY-ONLY (``dispatch_trusted=False``; pure
+          ``build_form_from_tool_input`` form so the render identity can't leak
+          pane/scrollback churn).
+      no side file → the pre-existing explicit > jsonl_cache > pane fallback.
+
+    READ-TTL-FREE only changes the RESCUE liveness — ``side_file_ok`` applies
+    the SAME TTL the strict resolver does, so a long-open consistent card flips
+    cleanly to ``bail`` (pane) at the TTL boundary instead of stranding a
+    trusted side-file token a TTL'd ``validate_and_consume`` would reject. MUST
+    NOT mutate ``_pretool_ask_records`` (``resolve_record`` stays its sole
+    mutator; ``_read_live_pretool_record`` doesn't write it).
+    """
+    from ..terminal_parser import build_form_from_tool_input, resolve_ask_form
+
+    pane_form = resolve_ask_form(None, pane_text) if pane_text else None
+    record = _read_live_pretool_record(window_id, apply_ttl=False)
+    if record is not None:
+        consistent, reason = _record_consistent_with_pane(record, pane_form)
+        within_ttl = (time.time() - record.written_at) <= _PRETOOL_TTL_SECONDS
+        if consistent and within_ttl:
+            # The side file carries the question TITLE the pane lacks; overlay
+            # the live pane (cursor / tab / review) onto it.
+            form = resolve_ask_form(record.tool_input, pane_text)
+            return RenderAuqSource(
+                decision="side_file_ok",
+                kind="side_file",
+                payload=record.tool_input,
+                form=form,
+                source_fingerprint=_canonical_dict_fingerprint(record.tool_input),
+                dispatch_trusted=True,
+                reason="consistent",
+            )
+        if pane_form is None:
+            # The pane carries NO parseable picker AT ALL (busy scrollback /
+            # obscured) — the side file is the ONLY content we have. RESCUE it
+            # DISPLAY-ONLY. This is the SOLE branch that serves the side file
+            # OVER the pane, and it is reserved for "the pane proves nothing",
+            # so a (possibly STALE) side file can NEVER overwrite a
+            # genuinely-different LIVE picker that the pane DID parse (hermes +
+            # internal-review wrong-question fix). PURE side-file form (no pane
+            # overlay) → render identity stable under scrollback churn.
+            side_form = build_form_from_tool_input(record.tool_input)
+            return RenderAuqSource(
+                decision="rescue",
+                kind="side_file",
+                payload=record.tool_input,
+                form=side_form,
+                source_fingerprint=_canonical_dict_fingerprint(record.tool_input),
+                dispatch_trusted=False,
+                reason="unparseable_rescue",
+            )
+        if pane_form_is_complete_picker(pane_form):
+            # The pane is itself a COMPLETE live picker — a different/advanced
+            # question (inconsistent) or a consistent-but-aged one. BAIL to it
+            # (trusted; the whole list is on screen so a tap is safe).
+            return RenderAuqSource(
+                decision="bail",
+                kind="pane",
+                payload=None,
+                form=pane_form,
+                source_fingerprint=_pane_fingerprint(pane_text),
+                dispatch_trusted=True,
+                reason=("bail_aged" if consistent else f"bail_{reason}"),
+            )
+        # The pane parses a DIFFERENT, INCOMPLETE picker (scrolled/partial,
+        # inconsistent or TTL-aged). Render the PANE display-only — NEVER the
+        # stale side file (the wrong-question fix: a parseable live picker, even
+        # partial, is the user's real current question). Picks are suppressed
+        # (incomplete → unsafe to dispatch); no stale side-file ctx card (bail).
+        return RenderAuqSource(
+            decision="bail",
+            kind="pane",
+            payload=None,
+            form=pane_form,
+            source_fingerprint=_pane_fingerprint(pane_text),
+            dispatch_trusted=False,
+            reason=f"bail_partial_{reason}",
+        )
+    # No side file — preserve the existing explicit > jsonl_cache > pane order.
+    if explicit is not None:
+        return RenderAuqSource(
+            decision="explicit_jsonl",
+            kind="jsonl_cache",
+            payload=explicit,
+            form=resolve_ask_form(explicit, pane_text),
+            source_fingerprint=_canonical_dict_fingerprint(explicit),
+            dispatch_trusted=True,
+            reason="explicit",
+        )
+    cached = _jsonl_cache_getter(window_id)
+    if cached is not None:
+        return RenderAuqSource(
+            decision="jsonl_cache",
+            kind="jsonl_cache",
+            payload=cached,
+            form=resolve_ask_form(cached, pane_text),
+            source_fingerprint=_canonical_dict_fingerprint(cached),
+            dispatch_trusted=True,
+            reason="jsonl_cache",
+        )
+    return RenderAuqSource(
+        decision="pane",
+        kind="pane",
+        payload=None,
+        form=pane_form,
+        source_fingerprint=_pane_fingerprint(pane_text),
+        dispatch_trusted=True,
+        reason="pane",
+    )
+
+
+def render_signature(form: AskUserQuestionForm | None) -> str:
+    """Stable signature over ALL render/keyboard-determining form fields (PR-3 PR-B).
+
+    The status-poll loop dedup hashed the raw interactive-content excerpt
+    (``ui_content.content``), which CHURNS as unrelated scrollback scrolls under
+    a live picker → a fresh re-render every tick → the owner's duplicate-card
+    loop. This signature instead covers exactly the fields the renderer +
+    keyboard display, so it is STABLE under scrollback churn (a pure side-file
+    rescue form has no pane fields at all) yet changes on every REAL transition
+    (cursor move, multi-select toggle, tab advance, review screen, complete↔
+    incomplete, title change, free-text toggle, tab-inference loss).
+
+    NEVER the cursor-blind pick-token ``fingerprint()`` — that is deliberately
+    cursor/selection-blind for token stability, but the renderer DOES paint the
+    ``❯`` cursor and ``selected`` glyphs, so a cursor/selection change must
+    re-render. This is a SEPARATE render-only signature.
+    """
+    if form is None:
+        return ""
+    parts: list[str] = [
+        "|".join(
+            f"{t.label}:{'A' if t.answered else 'E'}"
+            f":{'C' if t.is_current else '_'}:{'S' if t.is_submit else '_'}"
+            for t in form.tabs
+        ),
+        f"FT:{int(form.is_free_text)}",
+        f"SEL:{form.select_mode}",
+        f"RVW:{int(form.is_review_screen)}",
+        f"CMP:{int(form.options_complete)}",
+        f"INF:{int(form.current_tab_inferred)}",
+        f"NQ:{len(form.questions)}",
+        # current_question_title ONLY — NEVER pane_walkback_title. The walkback
+        # title is scraped from the line(s) above the option block, which in a
+        # BUSY topic is arbitrary churning scrollback; folding it in re-renders
+        # the title-less bail/pane card every tick (defeats the loop kill for
+        # the dominant live single-select shape). Mirrors _canonical_repr (which
+        # excludes pane_walkback_title) and the OLD ui_content.content hash
+        # (which hashed only the extracted picker block, never the title region
+        # above it) — so this stays STABLE under scrollback churn.
+        f"T:{form.current_question_title or ''}",
+    ]
+    for o in form.options:
+        parts.append(
+            f"{o.number}|{o.label}|{int(bool(o.cursor))}"
+            f"|{o.selected}|{int(bool(o.recommended))}"
+        )
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def peek_render_identity(window_id: str, pane_text: str) -> str:
+    """Render-identity hash for the status-poll loop dedup (PR-3 PR-B).
+
+    Hashes the render DECISION (``decision``/``reason``/``dispatch_trusted``/
+    ``kind`` from :func:`resolve_auq_source_for_render`) PLUS
+    :func:`render_signature` of the resolved form. Stable under scrollback churn
+    (so a long-open rescue / side_file_ok card does not re-render every tick),
+    re-renders on every genuine render transition (decision flip, cursor/tab/
+    selection/review/title change). Read-only; never mutates resolver state.
+    """
+    r = resolve_auq_source_for_render(window_id, pane_text)
+    head = f"{r.decision}|{r.reason}|{int(r.dispatch_trusted)}|{r.kind}"
+    return hashlib.sha256(f"{head}|{render_signature(r.form)}".encode()).hexdigest()
+
+
 # ── The PreToolUse-hook side-file trust boundary ─────────────────────────────
 
 

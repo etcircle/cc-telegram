@@ -4681,8 +4681,13 @@ class TestContextGateRouting:
                 )
 
         source_tag = _extract_gate_source_tag(caplog)
-        assert source_tag == "dict_via_hook", (
-            f"expected dict_via_hook, got {source_tag!r}. "
+        # PR-3 PR-B renamed the hook route: a consistent live side file now
+        # routes via the render DECISION (side_file_ok) rather than a second
+        # resolve_record call, but the R2 P1 invariant is UNCHANGED — the gate
+        # posts the side file's full descriptions (a dict source), never
+        # silently falling back to "form".
+        assert source_tag == "dict_via_render_side_file_ok", (
+            f"expected dict_via_render_side_file_ok, got {source_tag!r}. "
             f"This is the R2 P1 regression test — failure means the gate "
             f"is silently falling back to form despite a valid hook record."
         )
