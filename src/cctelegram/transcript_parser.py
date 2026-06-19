@@ -101,6 +101,16 @@ class ParsedEntry:
     # end_turn assistant message with no text/thinking) but still matter
     # to lifecycle bookkeeping.
     lifecycle_only: bool = False
+    # JSONL ``toolUseResult`` — Claude Code's structured tool-result metadata,
+    # an ENTRY-level field (sibling of ``message`` / ``uuid``), distinct from
+    # the per-BLOCK ``tool_result`` content. Stamped onto every ``tool_result``
+    # ParsedEntry derived from this line (PR-2). The Workflow-launch shape is
+    # ``{status: "async_launched", taskId, runId, transcriptDir, …}`` — the
+    # session_monitor Workflow branch anchors on it (PRIMARY) instead of the
+    # drift-prone launch prose. None on entries with no structured field (the
+    # common case) and on non-tool_result entries; for a (rare) multi-tool_result
+    # entry every tool_result entry carries the same entry-level dict.
+    tool_result_meta: dict[str, Any] | None = None
 
 
 @dataclass
@@ -585,6 +595,15 @@ class TranscriptParser:
             entry_message_id = (
                 raw_message_id if isinstance(raw_message_id, str) else None
             )
+            # PR-2: ENTRY-level ``toolUseResult`` (sibling of ``message``) —
+            # stamped onto this entry's ``tool_result`` ParsedEntry(s) below so
+            # the session_monitor Workflow branch can anchor on the structured
+            # launch fields instead of the prose. Absent / non-dict on ordinary
+            # results.
+            raw_tool_result_meta = data.get("toolUseResult")
+            entry_tool_result_meta = (
+                raw_tool_result_meta if isinstance(raw_tool_result_meta, dict) else None
+            )
             content = message.get("content", "")
             if not isinstance(content, list):
                 content = [{"type": "text", "text": str(content)}] if content else []
@@ -792,6 +811,11 @@ class TranscriptParser:
             elif msg_type == "user":
                 # Check for tool_result blocks and merge with pending tools
                 user_text_parts: list[str] = []
+                # PR-2: index of the first entry this user line appends, so the
+                # entry-level ``toolUseResult`` can be backfilled onto its
+                # tool_result entries below (mirrors the assistant message_id
+                # backfill rather than threading a kwarg through 5 constructors).
+                _user_result_start = len(result)
 
                 for block in content:
                     if not isinstance(block, dict):
@@ -997,6 +1021,15 @@ class TranscriptParser:
                         # falsely re-arm the warning mid-tool-loop.
                         seen_user_prompt = True
                         assistant_emitted_after_prompt = False
+
+                # PR-2: backfill the ENTRY-level toolUseResult onto every
+                # tool_result entry this user line produced (a trailing user-text
+                # entry is skipped). For a Workflow launch it is one result per
+                # entry; a rare multi-tool_result entry shares the one dict.
+                if entry_tool_result_meta is not None:
+                    for _entry in result[_user_result_start:]:
+                        if _entry.content_type == "tool_result":
+                            _entry.tool_result_meta = entry_tool_result_meta
 
         # Flush remaining pending tools at end.
         # In carry-over mode (monitor), keep them pending for the next call

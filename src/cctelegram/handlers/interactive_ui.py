@@ -40,10 +40,8 @@ from ..session import (
 from ..terminal_parser import (
     REVIEW_SUBMIT_LABEL,
     AskUserQuestionForm,
-    build_form_from_tool_input,
     extract_interactive_content,
     parse_ask_user_question,
-    resolve_ask_form,
     visible_pane_liveness,
 )
 from .. import md_capture
@@ -2632,11 +2630,14 @@ def _build_interactive_keyboard(
 # which walks tabs in place by editing body+keyboard as the picker advances.
 
 
-# Bug 2 live-prose: the bounded retry budget when the picker is detected before
-# the matching MessageDisplay ``final`` delta has landed. The prose finalizes
-# ~0.68s BEFORE the picker blocks, so in practice the first read hits and no
-# retry runs; this only covers the rare same-tick race. Held under the route
-# lock, so it is intentionally short.
+# Bug 2 live-prose: the bounded retry budget when the picker is DETECTED before
+# the matching MessageDisplay ``final`` delta has landed. NOTE (PR-1): the prose
+# finalizes a meaningful gap BEFORE the picker is detected (~5.44s idle, ~20.7s
+# loaded — NOT the old inverted "~0.68s" claim), so in practice the final has
+# landed by the time the picker is detected and the first read hits; this only
+# covers the rare same-tick race. The freshness gate that recovers a large gap is
+# the emission-anchor additive-OR (``select_fresh_prose``), NOT this retry. Held
+# under the route lock, so it is intentionally short.
 _LIVE_PROSE_RETRY_BUDGET_S = 0.25
 _LIVE_PROSE_RETRY_STEP_S = 0.05
 
@@ -2669,6 +2670,8 @@ async def _maybe_post_live_prose(
     """
     session_id = session_id_for_window(window_id)
     if not session_id:
+        # A6 observability: the next miss should be classifiable.
+        logger.debug("Bug2 live-prose skip window=%s reason=no_session", window_id)
         return
     # If an interactive card already exists for this route we are PAST the first
     # render (a re-render / poll re-detect / UI change). Posting prose now would
@@ -2677,20 +2680,39 @@ async def _maybe_post_live_prose(
     # NOT back-filled below the card; it falls back to post-resolution JSONL
     # delivery (panel PR-C+D P2). ``was_shown_live`` below is the second guard.
     if _interactive_msgs.get((user_id, thread_id or 0)) is not None:
+        logger.debug("Bug2 live-prose skip window=%s reason=card_exists", window_id)
         return
-    ttl = (
-        md_capture.EPM_PROSE_TTL_S
-        if ui_name == "ExitPlanMode"
-        else md_capture.AUQ_PROSE_TTL_S
-    )
+    # PR-1: select the freshness TTL AND the emission anchor (+ its eps/lookback
+    # tolerances) by modality. The emission anchor is a STABLE picker-emission
+    # instant fed to ``select_fresh_prose``'s additive-OR leg so a prose the
+    # render-time TTL aged out (the poller detected the picker tens of seconds
+    # after the prose finalized — live: 20.7s) is still posted above the card:
+    #   * AUQ → the PreToolUse side-file ``written_at`` (the tool_use invocation);
+    #   * ExitPlanMode → the poller's first-detect stamp (EPM has no side file).
+    # The poller stamp import is function-local: ``status_polling`` imports this
+    # module at top, so the reverse edge must stay function-local.
+    if ui_name == "ExitPlanMode":
+        from .status_polling import peek_epm_surface_emitted_at
+
+        ttl = md_capture.EPM_PROSE_TTL_S
+        emitted_at = peek_epm_surface_emitted_at(user_id, thread_id, window_id)
+        emit_eps = md_capture._EMIT_ANCHOR_EPS_EPM_S
+        emit_lookback = md_capture._EMIT_ANCHOR_LOOKBACK_EPM_S
+    else:
+        ttl = md_capture.AUQ_PROSE_TTL_S
+        emitted_at = auq_source.peek_side_file_written_at(session_id)
+        emit_eps = md_capture._EMIT_ANCHOR_EPS_S
+        emit_lookback = md_capture._EMIT_ANCHOR_LOOKBACK_S
     # Item 3 / P2-1: the turn-boundary anchor — the wall-clock instant the bot
     # delivered THIS route's current user turn into tmux (same clock as the prose
     # ``captured_at``). Resolved INSIDE this function (not threaded through
     # ``handle_interactive_ui``'s 22 callers) so the inbound:1061 + restart
     # first-render holes auto-close. ``None`` (e.g. after a restart that wiped the
-    # in-memory stamp) degrades to TTL-only — never a false-negative on the live
-    # path. Filters out a PRIOR turn's leftover prose (final_at <= boundary)
-    # whose own turn produced no prose for this picker.
+    # in-memory stamp) DISABLES the turn-boundary filter — never a false-negative
+    # on the live path; the emission-anchor OR leg above still applies if its
+    # ``emitted_at`` is non-None (only ``emitted_at=None`` falls to TTL-only). The
+    # filter (when present) drops a PRIOR turn's leftover prose (final_at <=
+    # boundary) whose own turn produced no prose for this picker.
     from .message_queue import peek_route_user_turn_at
 
     nb = peek_route_user_turn_at(user_id, thread_id, window_id)
@@ -2698,17 +2720,55 @@ async def _maybe_post_live_prose(
     candidate: md_capture.ProseRecord | None = None
     while True:
         candidate = md_capture.select_fresh_prose(
-            session_id, now=time.time(), ttl_seconds=ttl, not_before=nb
+            session_id,
+            now=time.time(),
+            ttl_seconds=ttl,
+            not_before=nb,
+            emitted_at=emitted_at,
+            emit_anchor_eps_s=emit_eps,
+            emit_anchor_lookback_s=emit_lookback,
         )
         if candidate is not None or time.monotonic() >= deadline:
             break
         await asyncio.sleep(_LIVE_PROSE_RETRY_STEP_S)
     if candidate is None or not candidate.text.strip():
+        # A6 observability: classify the miss (capture-absent vs TTL/anchor-reject
+        # vs not_before-reject vs empty) so the next failure is diagnosable. Gated
+        # on DEBUG so the classification re-read only runs when it would be logged.
+        if logger.isEnabledFor(logging.DEBUG):
+            if candidate is not None:
+                reason = "empty_text"
+                n = 1
+            else:
+                recs = md_capture.read_prose_records(session_id)
+                n = len(recs)
+                if not recs:
+                    reason = "capture_absent"
+                elif nb is not None and all(r.final_at <= nb for r in recs):
+                    reason = "not_before_reject"
+                else:
+                    reason = "ttl_and_anchor_reject"
+            logger.debug(
+                "Bug2 live-prose miss window=%s reason=%s ui=%s n=%d ttl=%.1f "
+                "emitted_at=%s not_before=%s",
+                window_id,
+                reason,
+                ui_name,
+                n,
+                ttl,
+                emitted_at,
+                nb,
+            )
         return
     # Already delivered live (re-render / poll re-detect / post-kickstart /
     # after the dedup consumed its marker) → don't double-post. Uses the
     # consumed-inclusive guard, NOT the unconsumed-marker set.
     if md_capture.was_shown_live(session_id, candidate.md_message_id):
+        logger.debug(
+            "Bug2 live-prose skip window=%s reason=already_shown_live md_msg=%s",
+            window_id,
+            candidate.md_message_id[:8],
+        )
         return
     sent, _outcome = await topic_send(
         bot,
@@ -2823,11 +2883,12 @@ async def handle_interactive_ui(
     # text reply.
     text = content.content
     pick_rows: list[list[InlineKeyboardButton]] | None = None
-    # Hoisted so the context-message gate site below can read it under the
+    # Hoisted so the context-message gate site below can read them under the
     # route lock without an unbound-variable risk when content.name isn't
     # AskUserQuestion (the gate site short-circuits on name, but pyright
     # narrows on declarations, not control flow across blocks).
     form: AskUserQuestionForm | None = None
+    render_source: auq_source.RenderAuqSource | None = None
     if content.name == "AskUserQuestion":
         # Unified resolver feeds both render and validate paths the same
         # form. Combines JSONL tool_input (full option list with
@@ -2837,18 +2898,42 @@ async def handle_interactive_ui(
         # ``current_tab_inferred``; the FA5+ guard in
         # ``_build_pick_button_rows`` suppresses pick buttons when False so
         # we don't dispatch a digit against the wrong tab.
-        resolved_source = auq_source.resolve_auq_source(
-            window_id, tool_input, pane_text
+        # PR-3 PR-B: the RENDER-path resolver decides which source to render
+        # from AND whether a tap can be TRUSTED to dispatch. side_file_ok
+        # (side file consistent with the pane AND within the read-TTL) → trusted
+        # side-file render; bail → the pane is a genuinely different live picker
+        # → render the pane (trusted); rescue → busy / unparseable pane → render
+        # the side file's full content DISPLAY-ONLY (no pick tokens). The
+        # read-TTL-FREE read lets a busy >TTL pane still rescue, while
+        # side_file_ok mirrors the TTL'd resolver ``validate_and_consume``
+        # re-resolves → mint/validate parity, no dead-tap.
+        render_source = auq_source.resolve_auq_source_for_render(
+            window_id, pane_text, explicit=tool_input
         )
-        resolved_input = resolved_source.payload
-        form = resolve_ask_form(resolved_input, pane_text)
+        form = render_source.form
         if form is None:
-            # Belt-and-braces fallback. resolve_ask_form already tries
-            # pane parse internally; this only fires when both inputs
-            # are useless.
-            form = build_form_from_tool_input(resolved_input)
-            if form is None:
-                form = parse_ask_user_question(pane_text)
+            # Belt-and-braces: the resolver returns a form for every structured
+            # decision; this only fires on a pane carrying no AUQ at all.
+            form = parse_ask_user_question(pane_text)
+        # The trusted-mint source tags fed to ``_build_pick_button_rows`` /
+        # ``pick_token.mint_row``; ``validate_and_consume`` re-resolves the same
+        # (kind, fingerprint) via the strict resolver. Only consulted when
+        # ``render_source.dispatch_trusted`` is True (gated below).
+        resolved_source = auq_source.ResolvedAuqSource(
+            kind=render_source.kind,
+            payload=render_source.payload,
+            source_fingerprint=render_source.source_fingerprint,
+        )
+        logger.info(
+            "AUQ render resolve: window=%s from_poller=%s decision=%s reason=%s "
+            "trusted=%s kind=%s",
+            window_id,
+            from_poller,
+            render_source.decision,
+            render_source.reason,
+            render_source.dispatch_trusted,
+            render_source.kind,
+        )
 
         # Active AUQs do not have a live JSONL payload: Claude Code buffers
         # the AskUserQuestion ``tool_use`` line until the user answers. The
@@ -2906,7 +2991,29 @@ async def handle_interactive_ui(
                 text = structured
             if partial_options_notice:
                 text = f"{text}\n\n{partial_options_notice}"
-            if not p14_suppress_picks:
+            if not render_source.dispatch_trusted:
+                # PR-3 PR-B DISPLAY-ONLY (rescue OR a partial-pane bail): mint NO
+                # pick tokens (the busy/unparseable/partial pane means a tapped
+                # digit can't be verified against the live picker — mint/validate
+                # parity would break → dead-tap). CRITICAL (hermes round-2): prune
+                # any prior tokens for this route UNCONDITIONALLY here — BEFORE
+                # the p14 branch — because an untrusted bail is ALSO
+                # p14_suppress_picks (its pane starts at option >1), and leaving a
+                # stale trusted side_file/pane token row would make
+                # status_polling._remint_on_source_drift see minted!=live every
+                # tick → the exact re-render loop this PR kills. (The trusted path
+                # self-prunes prior rows via mint_row's stale-row hygiene; only
+                # this no-mint path needs the explicit prune.)
+                pick_token.prune_for_route(user_id, thread_id, window_id)
+                if not p14_suppress_picks:
+                    # p14 already appended its own "only options X-Y visible"
+                    # notice; add the busy-screen notice only when it didn't.
+                    text = (
+                        f"{text}\n\n⚠️ The live screen is busy, so the option "
+                        "buttons are disabled — use ↑/↓/Tab below or send your "
+                        "answer as text."
+                    )
+            elif not p14_suppress_picks:
                 built = _build_pick_button_rows(
                     user_id, thread_id, window_id, form, resolved_source
                 )
@@ -2955,31 +3062,34 @@ async def handle_interactive_ui(
             # routes through dict_via_hook before falling back to form.
             ctx_input = _resolve_ask_tool_input(window_id, tool_input)
             cached_tool_use_id = _last_auq_tool_use_id.get(window_id)
+            # render_source is bound whenever content.name == "AskUserQuestion"
+            # (set in the pre-lock block above gated on the same condition);
+            # pyright can't correlate the two blocks, so assert the invariant.
+            assert render_source is not None
 
-            # Resolve the PreToolUse-hook record only when JSONL is silent
-            # (the common case for live AUQs). auq_source.resolve_record
-            # revalidates the cached record against the live pane on
-            # every call (v4 plan cache invariant).
-            pretool_record: auq_source.PreToolAskRecord | None = (
-                auq_source.resolve_record(window_id, form)
-                if ctx_input is None
-                else None
-            )
-
+            # PR-3 PR-B: the ctx (📋 full-descriptions) source is driven off the
+            # render DECISION, not a second resolve_record call. side_file_ok /
+            # rescue → post the side file's full per-option descriptions (rescue
+            # is the V1/V2 fix — the card was previously DROPPED because the
+            # pane-consistency check rejected on the busy pane). bail → the pane
+            # is a genuinely different live picker, so NEVER post the stale
+            # side-file descriptions.
             ctx_source: dict | AskUserQuestionForm | None
             source_tag: str
             if ctx_input is not None and cached_tool_use_id:
                 ctx_source = ctx_input
                 dedup_key = cached_tool_use_id
                 source_tag = "dict_via_jsonl"
-            elif pretool_record is not None:
-                ctx_source = pretool_record.tool_input
-                dedup_key = (
-                    f"pretool:{pretool_record.tool_use_id}"
-                    if pretool_record.tool_use_id
-                    else f"pretool:{pretool_record.input_fingerprint}"
-                )
-                source_tag = "dict_via_hook"
+            elif render_source.decision in ("side_file_ok", "rescue") and isinstance(
+                render_source.payload, dict
+            ):
+                ctx_source = render_source.payload
+                dedup_key = f"pretool:{render_source.source_fingerprint[:16]}"
+                source_tag = f"dict_via_render_{render_source.decision}"
+            elif render_source.decision == "bail":
+                ctx_source = None
+                dedup_key = ""
+                source_tag = "bail_no_ctx"
             elif form is not None:
                 ctx_source = form
                 dedup_key = f"form:{form.fingerprint()}"
@@ -2991,18 +3101,14 @@ async def handle_interactive_ui(
             logger.info(
                 "AUQ context gate eval: window=%s from_poller=%s "
                 "explicit_input=%s cached_input=%s tool_use_id=%s "
-                "pretool=%s ctx_source=%s dedup_key=%s should_post=%s "
+                "decision=%s ctx_source=%s dedup_key=%s should_post=%s "
                 "already_posted=%s",
                 window_id,
                 from_poller,
                 tool_input is not None,
                 _last_completed_ask_tool_input.get(window_id) is not None,
                 cached_tool_use_id,
-                (
-                    pretool_record.input_fingerprint
-                    if pretool_record is not None
-                    else "<none>"
-                ),
+                render_source.decision,
                 source_tag,
                 dedup_key or "<empty>",
                 _should_post_auq_context(ctx_source),

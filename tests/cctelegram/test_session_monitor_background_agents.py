@@ -354,6 +354,227 @@ async def test_isolated_task_notification_without_bracket_emits_no_wf_task_key(
     assert f"wf-task:{_WF_TASK}" not in completed
 
 
+# ── PR-2: structured toolUseResult is the PRIMARY Workflow-launch anchor ──────
+#
+# The entry-level ``toolUseResult`` ({status: async_launched, taskId, runId,
+# transcriptDir}) is the robust, drift-proof anchor; the launch prose regex is
+# the FALLBACK (with a WARNING for drift detectability).
+
+
+def _wf_struct_meta(wf_dir, task_id: str = _WF_TASK, run_id: str = _WF_RUN) -> dict:
+    return {
+        "status": "async_launched",
+        "taskId": task_id,
+        "runId": run_id,
+        "summary": "background work",
+        "transcriptDir": str(wf_dir),
+        "scriptPath": "/x/scripts/x.js",
+    }
+
+
+@pytest.mark.asyncio
+async def test_workflow_launch_structured_meta_is_primary_anchor(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+):
+    """The entry-level ``toolUseResult`` yields the wf-task: key + the bracket
+    ``wf_dir`` even when the prose carries NO parseable Task ID line."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    wf_dir = sub_dir / "workflows" / _WF_RUN
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t9", "Workflow", {"script": "..."})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                # Prose has NO "Task ID:" line — the structured field is the only
+                # anchor.
+                [make_tool_result_block("t9", "Workflow scheduled.")],
+                session_id=PARENT,
+                tool_use_result=_wf_struct_meta(wf_dir),
+            ),
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    assert f"wf-task:{_WF_TASK}" in activity[PARENT].launched
+    brackets = monitor._open_workflow_brackets.get(PARENT, {})
+    assert _WF_TASK in brackets
+    assert brackets[_WF_TASK].wf_dir == wf_dir
+
+
+@pytest.mark.asyncio
+async def test_workflow_launch_prose_fallback_when_structured_absent(
+    monitor,
+    tmp_path,
+    make_jsonl_entry,
+    make_tool_use_block,
+    make_tool_result_block,
+    caplog,
+):
+    """No structured ``toolUseResult`` (older Claude Code / a future drop) →
+    fall back to the prose regex AND log a WARNING for drift detectability."""
+    import logging
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    wf_dir = sub_dir / "workflows" / _WF_RUN
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t9", "Workflow", {"script": "..."})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t9", _wf_launch_text(wf_dir))],
+                session_id=PARENT,
+                # tool_use_result omitted → structured absent
+            ),
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    assert f"wf-task:{_WF_TASK}" in activity[PARENT].launched
+    assert any(
+        "structured" in r.message.lower() and "prose" in r.message.lower()
+        for r in caplog.records
+    ), "expected a WARNING that the structured field was absent and prose was used"
+
+
+@pytest.mark.asyncio
+async def test_workflow_launch_structured_wins_over_prose(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+):
+    """Structured + prose BOTH present and DISAGREEING → structured wins (the
+    authoritative entry-level field beats the drift-prone prose)."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    wf_dir = sub_dir / "workflows" / _WF_RUN
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    prose_other = (
+        "Workflow launched in background. Task ID: proseonlyid\n"
+        f"Transcript dir: {wf_dir}\n"
+        f"Run ID: {_WF_RUN}\n"
+    )
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t9", "Workflow", {"script": "..."})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t9", prose_other)],
+                session_id=PARENT,
+                tool_use_result=_wf_struct_meta(wf_dir, task_id=_WF_TASK),
+            ),
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    launched = monitor.pop_sidechain_activity()[PARENT].launched
+    assert f"wf-task:{_WF_TASK}" in launched
+    assert "wf-task:proseonlyid" not in launched
+
+
+@pytest.mark.asyncio
+async def test_workflow_structured_present_but_rejected_does_not_prose_fallback(
+    monitor,
+    tmp_path,
+    make_jsonl_entry,
+    make_tool_use_block,
+    make_tool_result_block,
+    caplog,
+):
+    """hermes P2: the prose fallback is ABSENT-only, NOT reject-driven. A PRESENT
+    structured dict that is not an async_launched Workflow (e.g. a non-launch
+    Workflow result) is AUTHORITATIVE — the bot must NOT fall back to a stale /
+    quoted ``Task ID:`` line in the prose and open a bogus bracket, and must NOT
+    log the 'structured absent' warning."""
+    import logging
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    wf_dir = sub_dir / "workflows" / _WF_RUN
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    # A PRESENT but non-launch structured dict + a prose line that LOOKS like a
+    # launch (stale / quoted / diagnostic).
+    stale_prose = (
+        "Workflow result.\n"
+        "Workflow launched in background. Task ID: proseonlyid\n"
+        f"Transcript dir: {wf_dir}\n"
+        f"Run ID: {_WF_RUN}\n"
+    )
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t9", "Workflow", {"script": "..."})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t9", stale_prose)],
+                session_id=PARENT,
+                tool_use_result={"status": "completed", "result": "done"},
+            ),
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    launched = activity[PARENT].launched if PARENT in activity else set()
+    assert "wf-task:proseonlyid" not in launched
+    assert monitor._open_workflow_brackets.get(PARENT, {}) == {}
+    assert not any("structured" in r.message.lower() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_workflow_launch_structured_present_logs_no_warning(
+    monitor,
+    tmp_path,
+    make_jsonl_entry,
+    make_tool_use_block,
+    make_tool_result_block,
+    caplog,
+):
+    """The drift WARNING fires ONLY on the prose-fallback path — a normal launch
+    with the structured field present must stay silent (no false drift alarm)."""
+    import logging
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    wf_dir = sub_dir / "workflows" / _WF_RUN
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t9", "Workflow", {"script": "..."})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t9", _wf_launch_text(wf_dir))],
+                session_id=PARENT,
+                tool_use_result=_wf_struct_meta(wf_dir),
+            ),
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        await monitor.check_for_updates({PARENT})
+    assert f"wf-task:{_WF_TASK}" in monitor.pop_sidechain_activity()[PARENT].launched
+    assert not any("structured" in r.message.lower() for r in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_workflow_bracket_heartbeats_only_on_mtime_advance(
     monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block

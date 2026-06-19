@@ -22,6 +22,7 @@ def make_jsonl_entry():
         timestamp: str | None = None,
         session_id: str = "test-session-id",
         cwd: str = "/tmp/test",
+        tool_use_result: dict | None = None,
     ) -> dict:
         entry: dict = {
             "type": msg_type,
@@ -33,6 +34,11 @@ def make_jsonl_entry():
             entry["timestamp"] = timestamp
         else:
             entry["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        # PR-2: the ENTRY-level ``toolUseResult`` field (sibling of ``message``)
+        # — Claude Code's structured tool-result metadata, e.g. a Workflow
+        # launch's ``{status, taskId, runId, transcriptDir, ...}``.
+        if tool_use_result is not None:
+            entry["toolUseResult"] = tool_use_result
         return entry
 
     return _make

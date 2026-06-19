@@ -4681,11 +4681,97 @@ class TestContextGateRouting:
                 )
 
         source_tag = _extract_gate_source_tag(caplog)
-        assert source_tag == "dict_via_hook", (
-            f"expected dict_via_hook, got {source_tag!r}. "
+        # PR-3 PR-B renamed the hook route: a consistent live side file now
+        # routes via the render DECISION (side_file_ok) rather than a second
+        # resolve_record call, but the R2 P1 invariant is UNCHANGED — the gate
+        # posts the side file's full descriptions (a dict source), never
+        # silently falling back to "form".
+        assert source_tag == "dict_via_render_side_file_ok", (
+            f"expected dict_via_render_side_file_ok, got {source_tag!r}. "
             f"This is the R2 P1 regression test — failure means the gate "
             f"is silently falling back to form despite a valid hook record."
         )
+
+    @pytest.mark.asyncio
+    async def test_untrusted_partial_bail_prunes_stale_tokens(
+        self, mock_bot: AsyncMock, _pretool_gate_setup
+    ):
+        """PR-3 PR-B hermes round-2 fix: a DISPLAY-ONLY bail (a DIFFERENT,
+        INCOMPLETE live pane → dispatch_trusted=False, which is ALSO
+        p14_suppress_picks) must PRUNE any prior pick tokens for the route.
+        Otherwise a stale trusted side_file/pane token row survives and
+        status_polling._remint_on_source_drift sees minted!=live every tick →
+        the re-render loop this PR kills. The prune must run BEFORE the p14 skip.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers import pick_token
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+
+        pick_token.reset_for_tests()
+        window_id = "@partialbail"
+        session_id = "550e8400-e29b-41d4-a716-44665544aaaa"
+        user_id, thread_id = 7, 88
+        _bind_window(window_id, session_id)
+        # Side file holds a DIFFERENT question than the live pane.
+        _write_pretool_side_file(
+            _pretool_gate_setup,
+            session_id=session_id,
+            questions=[
+                {
+                    "question": "Old stale question?",
+                    "options": [
+                        {"label": "Alpha", "description": "a"},
+                        {"label": "Beta", "description": "b"},
+                        {"label": "Gamma", "description": "c"},
+                    ],
+                }
+            ],
+        )
+        # Seed a stale TRUSTED side_file token row for the route (as a prior
+        # trusted render would have left).
+        _pick_token_cache[(user_id, thread_id, window_id, "stalefp")] = _CacheRow(
+            tokens=["staletok"],
+            row_generation=1,
+            source_kind="side_file",
+            source_fingerprint="deadbeefdeadbeef",
+            consumed_generation=None,
+        )
+        assert pick_token.peek_route_source(user_id, thread_id, window_id) is not None
+
+        # Live pane: a genuinely DIFFERENT picker scrolled so option 1 is off the
+        # top (starts at 3 → incomplete → bail, dispatch_trusted=False, p14).
+        pane = (
+            "  3. Rebase onto main\n"
+            "     Replay your commits onto the updated base.\n"
+            "❯ 4. Type something.\n"
+            "────────────────────────────────────\n"
+            "  5. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        with (
+            patch.object(iui, "tmux_manager") as mock_tmux,
+            patch.object(iui, "session_manager") as mock_sm_iu,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.window_states = {
+                window_id: type(
+                    "WS",
+                    (),
+                    {"window_id": window_id, "session_id": session_id, "cwd": "/t"},
+                )()
+            }
+            await handle_interactive_ui(
+                mock_bot, user_id=user_id, window_id=window_id, thread_id=thread_id
+            )
+
+        # The stale token row was PRUNED → _remint_on_source_drift can't fire.
+        assert pick_token.peek_route_source(user_id, thread_id, window_id) is None
+        pick_token.reset_for_tests()
 
     @pytest.mark.asyncio
     async def test_gate_routes_to_form_when_no_pretool_record(

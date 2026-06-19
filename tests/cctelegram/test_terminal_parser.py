@@ -3305,3 +3305,222 @@ class TestNonReviewFingerprintCursorBlind:
         assert [o.cursor for o in base.options] == [True, False, False]
         assert [o.cursor for o in moved.options] == [False, True, False]
         assert base.fingerprint() == moved.fingerprint()
+
+
+class TestStaleHeaderOverLivePickerDemotion:
+    """PR-3 PR-A — footer-anchored stale-tab-header demotion.
+
+    A previously-answered multi-tab AUQ leaves its ``←…→`` tab header in
+    deep scrollback. When a NEW live single-tab picker renders below it
+    (footer-anchored at ``Enter to select``), the multi-tab branch must NOT
+    win just because the stale header exists: it governs the option parse
+    ONLY when it is CONTIGUOUS with the footer-anchored live block (reachable
+    crossing only blanks + question-title prose — no picker-structure marker:
+    no ─ separator, prior ←…→ header, or ☐/☒ checkbox-glyph row). Otherwise the
+    parser demotes to the footer-anchored walk and returns the LIVE picker's
+    real options.
+
+    Keystone fixture is a PII-scrubbed capture of the owner's real failing
+    pane (di-copilot KG decommission AUQ, 2026-06-17): a stale 3-tab header
+    ~150 lines up, a numbered PROSE list below it the multi-tab branch
+    wrongly grabbed as 2 options + a prose title, then the live 3-option
+    picker at the bottom.
+    """
+
+    def test_keystone_stale_header_demotes_to_live_footer_picker(self):
+        form = parse_ask_user_question(
+            _fixture("auq_stale_tabheader_over_live_picker_S500.txt")
+        )
+        assert form is not None
+        # The stale header is DEMOTED — no tabs are parsed from it.
+        assert form.tabs == ()
+        # The footer-anchored live picker's 3 REAL options (the two affordance
+        # rows "Type something." / "Chat about this" are dropped per existing
+        # _parse_numbered_options semantics).
+        assert [o.label for o in form.options] == [
+            "Keep driving now",
+            "Checkpoint here, resume fresh",
+            "Gate W1 only, then pause",
+        ]
+        assert form.options_contiguous_from_one()
+        # The mis-parse prose title is gone; the live question prose is the
+        # walkback title (renderer reads current_question_title or
+        # pane_walkback_title).
+        title = (form.current_question_title or form.pane_walkback_title or "").lower()
+        assert "surfaces only derived rows" not in title
+        assert "pace" in title
+
+    def test_genuine_multi_tab_multiparagraph_title_still_governs(self):
+        """GREEN regression (hermes review): a GENUINE multi-tab picker whose
+        question title is a MULTI-PARAGRAPH (blank-separated) prose block must
+        STILL parse tabs. Demoting on "second paragraph" was a false-demote; the
+        demotion signal is picker-STRUCTURE markers (separator / prior header /
+        ☐☒ glyph), which a prose title never contains.
+        """
+        pane = (
+            "⏺ Earlier assistant turn\n"
+            "────────────────────────────────────\n"
+            "←  ☐ Scope  ☐ Risk  ✔ Submit  →\n"
+            "\n"
+            "How much should we cover in this first pass?\n"
+            "\n"
+            "Context: the legacy suite is flaky and the deadline is tight, so\n"
+            "there is a real tradeoff between depth and speed here.\n"
+            "\n"
+            "❯ 1. Full coverage\n"
+            "     Cover every module end to end.\n"
+            "  2. Core paths only\n"
+            "     Just the happy path and top failures.\n"
+            "  3. Type something.\n"
+            "────────────────────────────────────\n"
+            "  4. Chat about this\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        # The header is contiguous (only blanks + prose between it and the
+        # option block) → it GOVERNS even across the blank-line paragraph break.
+        assert len(form.tabs) >= 2
+        assert form.current_question_title == (
+            "How much should we cover in this first pass?"
+        )
+        assert [o.number for o in form.options] == [1, 2]
+
+    def test_no_footer_review_screen_with_tab_header_still_governs(self):
+        """GREEN (hermes review): a multi-Q review/Submit screen has a live
+        ``←…→`` header but NO ``Enter to select`` footer (its footer is
+        ``Ready to submit your answers?``). With ``footer_idx`` None the header
+        governs unconditionally — the review screen must still parse.
+        """
+        form = parse_ask_user_question(_fixture("auq_multiq_submit_pane.txt"))
+        assert form is not None
+        assert form.is_review_screen is True
+        assert [o.label for o in form.options] == ["Submit answers", "Cancel"]
+
+    def test_genuine_multi_tab_still_governs(self):
+        """GREEN: a genuine multi-tab picker whose header is DIRECTLY contiguous
+        with the footer-anchored option block (blank + single title line
+        between, no separator) MUST still parse tabs.
+        """
+        form = parse_ask_user_question(_fixture("auq_multiq_q1_pane.txt"))
+        assert form is not None
+        assert len(form.tabs) >= 2
+        assert form.current_question_title == (
+            "Which implementation approach should we take for the new caching layer?"
+        )
+        assert [o.number for o in form.options] == [1, 2, 3]
+
+    # --- PR-3 PR-A fast-follow: direct branch coverage of the demotion helper.
+    # The keystone fixture only exercises the ☐/☒ glyph branch; these lock the
+    # other demote branches (── separator, prior ←…→ header) and both arms of
+    # the degenerate guard, plus the blanks+prose contiguous-govern fall-through,
+    # at the unit level so the demotion contract can't silently drift. Coverage
+    # backfill on already-correct code → GREEN on write (RED-first is for
+    # behavior changes; this is contract-locking).
+
+    def test_helper_demotes_on_separator_marker(self):
+        """A ``──`` separator row between the header and the live block top is a
+        PRIOR picker's structure → NOT contiguous → demote (False).
+        ``terminal_parser._footer_block_contiguous_with_header`` separator branch.
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = [
+            "←  ☐ Scope  ☒ Risk  ✔ Submit  →",  # 0: stale tab header (governing arg)
+            "",  # 1
+            "────────────────────────────────",  # 2: prior picker separator
+            "",  # 3
+            "❯ 1. Live option",  # 4: live footer-anchored block top
+        ]
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=4, tab_header_idx=0
+            )
+            is False
+        )
+
+    def test_helper_demotes_on_prior_tab_header_marker(self):
+        """A SECOND ``←…→`` header between the governing header and the live
+        block top is a prior picker's structure → demote (False). The
+        prior-tab-header branch.
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = [
+            "←  ☐ Scope  ✔ Submit  →",  # 0: the header under test
+            "",  # 1
+            "←  ☐ Other  ✔ Submit  →",  # 2: a prior (second) tab header
+            "",  # 3
+            "❯ 1. Live option",  # 4: live block top
+        ]
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=4, tab_header_idx=0
+            )
+            is False
+        )
+
+    def test_helper_demotes_on_checkbox_glyph_marker(self):
+        """Unit mirror of the keystone: a ``☐``/``☒`` answered-option glyph row
+        between header and block → demote (False). The glyph branch.
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = [
+            "←  ☐ Scope  ✔ Submit  →",  # 0
+            "",  # 1
+            "☒ Risk accepted",  # 2: prior answered-option glyph row
+            "",  # 3
+            "❯ 1. Live option",  # 4
+        ]
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=4, tab_header_idx=0
+            )
+            is False
+        )
+
+    def test_helper_governs_on_degenerate_block_at_or_above_header(self):
+        """The degenerate guard: when the block top is at or above the header
+        index the header governs unconditionally (True) — both arms.
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = ["⏺ prose", "←  ☐ A  ✔ Submit  →", "❯ 1. opt"]
+        # block top strictly ABOVE the header
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=0, tab_header_idx=1
+            )
+            is True
+        )
+        # block top EQUAL to the header index
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=1, tab_header_idx=1
+            )
+            is True
+        )
+
+    def test_helper_governs_on_blanks_and_prose_only(self):
+        """The contiguous-govern fall-through: only blanks + multi-paragraph
+        title prose (no structural marker) between header and block → contiguous
+        → govern (True).
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = [
+            "←  ☐ Scope  ✔ Submit  →",  # 0: header
+            "",  # 1
+            "How much should we cover in this first pass?",  # 2: title prose
+            "",  # 3: paragraph break (must NOT demote)
+            "Context spanning a second prose paragraph.",  # 4: more prose
+            "❯ 1. Live option",  # 5: live block top
+        ]
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=5, tab_header_idx=0
+            )
+            is True
+        )

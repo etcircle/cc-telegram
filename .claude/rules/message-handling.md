@@ -304,10 +304,31 @@ launch tool_result with `Task ID:` mid-line and a separate `Run ID`, and a
 idle (no typing). The fix reuses the SAME `background_agents` machinery via a
 **parent-transcript bracket** keyed `wf-task:<task_id>` (passes
 `normalize_background_agent_key` as identity — no `agent-` prefix — so it never
-aliases the Agent/Task namespace): `response_builder.extract_workflow_launch_info`
-parses the launch (regex `(?im)^.*\bTask ID:\s*…` — Task ID is MID-LINE,
-verified against real launches; the captured id == the `<task-notification>`
-close key, the open/close parity invariant); `session_monitor` adds the raw
+aliases the Agent/Task namespace). **Launch anchor = STRUCTURED-primary (PR-2):**
+the launch parse reads the ENTRY-level `toolUseResult`
+(`{status:"async_launched", taskId, runId, transcriptDir, …}`, plumbed onto the
+tool_result `ParsedEntry` as `tool_result_meta` by `transcript_parser`) via
+`response_builder.workflow_launch_info_from_meta` — the robust,
+version-drift-proof source; `transcriptDir` IS the validated `wf_dir` (no
+run-id-topology derivation, no glob). It keys on the Workflow fields (`taskId`),
+NEVER on `status` alone — the Agent/Task `run_in_background` async launch ALSO
+carries `status=="async_launched"` but a DIFFERENT shape (`agentId`, no
+`taskId`; verified 54-vs-40 in the JSONL history) and must return None.
+`response_builder.extract_workflow_launch_info` (regex `(?im)^.*\bTask ID:\s*…` —
+Task ID is MID-LINE, verified against real launches; the captured id ==
+the `<task-notification>` close key, the open/close parity invariant) is the
+PROSE FALLBACK, used ONLY when the structured field is genuinely ABSENT
+(`tool_result_meta is None`: older Claude Code / a future whole-field rename /
+a non-dict coerced to None) and logged with a WARNING for drift detectability.
+A PRESENT structured dict that does not parse as an async_launched Workflow is
+AUTHORITATIVE — the prose is NOT consulted (so a stale/quoted `Task ID:` line
+can't open a bogus bracket; hermes P2). NOTE: this structured-primary anchor is
+the LIVE-MONITOR path only — the PR-1 startup reconciler
+`_scan_workflow_launches_and_closes` (below) stays PROSE-only by design (a
+disclosed follow-up: widening its `Task ID` byte-prefilter to `async_launched`
+to read the structured field there would JSON-parse the common Agent
+async-launch lines and turn one malformed line into a fail-closed no-lift for an
+unrelated live Workflow). `session_monitor` adds the raw
 `wf-task:<id>` to `.launched` (→ `mark_background_agent_launched`,
 `is_background=True`, survives the parent end-of-turn prune → typing + 🟡) and
 opens a persistent `_WorkflowBracket`. **Fix 2c heartbeat (DESIGN B — separate
@@ -330,6 +351,41 @@ below); `_emit_workflow_bracket_heartbeats` skips closing brackets. This
 `wf-task:` key is ALSO what makes ISSUE-5 arm B fire: a stored-idle route with
 a live `wf-task:` key lets `mark_notification_pending` re-commit (§3.6) instead
 of STALE_UNLINK, so a 🔔 raised by the Workflow's own approval gate is durable.
+
+**BUSY restart reconciler (PR-1 Half B — re-arm typing + 🟡 + ↳ from the
+filesystem after `launchctl kickstart`).** All the bracket / `background_agents`
+state above is IN-MEMORY, so a restart of a still-running Workflow renders the
+topic idle until a fresh parent turn — the owner's highest-frequency symptom.
+`session_monitor._reconcile_workflow_brackets_on_startup(current_map)` runs ONCE
+in `_monitor_loop` startup (beside `_hydrate_ask_tool_input_cache`, before the
+poll loop): for each tracked parent with NO live open bracket (idempotency —
+skip a parent that already has one), STAT-glob
+`<project>/<parent_sid>/subagents/workflows/wf_*` (anchored, never `rglob`) and,
+for any `wf_*` dir whose freshest `*.jsonl` mtime is within
+`_RECONCILE_FRESH_WINDOW_S` (1800s, mirrors `BG_AGENT_TTL_SECONDS` without
+importing route_runtime), recover its Task ID + close-state from ONE bounded
+parent-JSONL scan (`_scan_workflow_launches_and_closes` — the
+`_auq_tool_result_present` byte-prefilter pattern, matching the launch's Run ID /
+Transcript-dir basename to `wf_dir.name`; fail-closed `({}, set())` on any read
+error). **Three-state rule:** (1) task_id recovered + NO `<task-notification>`
+close → LIFT: reopen a `_WorkflowBracket` (steady-state heartbeat + Fix-5 ↳
+display resume) AND emit the raw `wf-task:<id>` into
+`_parent_activity(sid).launched` — the bot fan-out
+(`apply_sidechain_activity` → `route_runtime.seed_idle_and_mark_background_agent_
+launched`) SEEDS the unseeded parent route IDLE and lifts it to projected
+RUNNING (the B1-FIX: a bare `mark_background_agent_launched` would no-op on the
+unseeded route); (2) close FOUND → NO runtime lift (a Workflow that finished just
+before the deploy must not false-relight) — open a DISPLAY-ONLY `closing` bracket
+for the final ↳ tail + collapse, then it's dropped; (3) task_id UNRECOVERABLE /
+scan failed → DO NOT LIFT (fail-closed — prefer dark-until-next-turn over a false
+🟡). STAT-only discovery (the parent JSONL is read ONLY when a fresh `wf_*` dir
+exists — the cost-bound property), a per-tick `_RECONCILE_MAX_WF_DIRS` cap (16),
+and the whole pass try/except-guarded so it can never break startup. No-reflood:
+a reopened bracket's sub-files resume from the persisted `monitor_state.json`
+offset and a first-seen post-restart file starts at EOF
+(`_track_and_emit_sidechain_file`), so pre-restart ↳ blocks never replay. The
+steady-state idle-route re-scan (B3b) is deferred — the startup pass covers the
+post-kickstart symptom. Pull-only; no observer.
 
 **Fix 5 (ISSUE-6 owner decision #2 — SHIPPED): the `↳` sub-agent DISPLAY cards
 for Workflow sidechains.** A Workflow's sub-agents live one level deeper at
@@ -484,6 +540,85 @@ fingerprint-agnostic, the route-based lookup also fixes the MULTI-question shape
 existing source_drift re-render, the 2nd dispatches); and a scrolled pane (visible
 options start >1) where the re-mint drops the keyboard (`p14_suppress_picks`).
 
+**Render-only rescue resolver + render-identity loop kill (PR-3 PR-B — the busy
+long-card render + duplicate-card loop).** A long-description AUQ in a BUSY topic
+rendered BROKEN and SPAMMED duplicate "📋 details" cards every ~20s: the live tmux
+pane mis-parsed / churned while the PreToolUse side file held the real question,
+and the render path was gated behind a successful pane parse (so the side-file
+rescue + the 📋 card were dropped exactly when needed), while the 1 Hz dedup hash
+over the raw interactive-content excerpt CHURNED as scrollback scrolled under the
+picker → a fresh re-render every tick. PR-A fixed the parser mis-parse; PR-B fixes
+the render path + the loop. `auq_source.resolve_auq_source_for_render(window_id,
+pane_text, explicit)` is the RENDER-path resolver (DISTINCT from the strict
+`resolve_auq_source` that `validate_and_consume` + `_remint_on_source_drift` still
+use UNCHANGED). It reads the side file READ-TTL-FREE then decides: **side_file_ok**
+— side file consistent with the pane AND within the 300s read-TTL → render from it
++ mint TRUSTED tokens (the ONLY trusted side-file path; the `within_ttl` gate makes
+it mirror the TTL'd strict resolver `validate_and_consume` re-resolves, so
+mint/validate parity holds and a long-open card flips cleanly to `bail` at the TTL
+boundary instead of stranding a trusted token the TTL'd validate rejects — no
+dead-tap, and `_remint_on_source_drift` stays loop-safe because render's trusted
+decision still agrees with the strict resolver it compares against); **bail** — the
+pane is itself a COMPLETE coherent picker (`pane_form_is_complete_picker`) that
+disagrees with the side file → a genuinely different / advanced live question →
+render the PANE (trusted; never serve the stale side file); **rescue** — the pane
+is unparseable / incomplete (busy scrollback) and the side file is the truth →
+render the side file's full content DISPLAY-ONLY (`dispatch_trusted=False`, PURE
+`build_form_from_tool_input` form — no pane overlay so the render identity can't
+leak pane/scrollback churn); **explicit_jsonl / jsonl_cache / pane** — no side file
+→ the pre-existing fallback (all trusted). `dispatch_trusted` GATES token minting
+at the `_build_pick_button_rows` callsite: ANY untrusted render (rescue OR a
+partial-pane bail) mints NO `pick_token` / `pick_intent` rows, calls
+`prune_for_route` UNCONDITIONALLY — BEFORE the `p14_suppress_picks` skip, since an
+untrusted partial bail is also p14 (hermes round-2: leaving a stale trusted token
+row would make `_remint_on_source_drift` see minted≠live every tick → the very
+re-render loop this PR kills; the trusted path self-prunes via `mint_row`'s
+stale-row hygiene) — and adds a manual-nav notice (a busy/partial-pane digit can't
+be verified against the live picker → would dead-tap). The ctx
+(📋 full-descriptions) card is driven off the decision: side_file_ok / rescue post
+the side file's descriptions (rescue is the V1/V2 fix — the card was previously
+DROPPED because `resolve_record`'s pane-consistency check rejected on the busy pane);
+**bail posts NO stale side-file card**. **Loop kill:** both `status_polling` dedup
+hash sites (`_ui_render_hash`) hash the render IDENTITY for AskUserQuestion
+(`auq_source.peek_render_identity` = the render decision + `render_signature` over
+the render/keyboard-determining form fields — tabs, is_free_text, select_mode,
+is_review_screen, options_complete, current_tab_inferred, len(questions),
+`current_question_title`, and per-option number/label/cursor/selected/recommended)
+instead of the raw interactive-content excerpt. `render_signature` uses
+`current_question_title` ONLY — NEVER `pane_walkback_title` (scraped from the
+churning scrollback above the option block; folding it in re-rendered the
+title-less `bail`/`pane` card every tick, the dominant live single-select shape —
+internal-review regression catch). This mirrors `_canonical_repr` and the OLD
+`ui_content.content` hash, both of which excluded the title region above the
+picker block, so the identity stays STABLE under scrollback churn (a rescue's
+pure side-file form has no pane fields; a complete picker's parsed form ignores
+scrollback above it) yet changes on every GENUINE transition (cursor move,
+multi-select toggle, tab advance, review screen, complete↔incomplete,
+JSONL-title, free-text, tab-inference loss). NEVER the cursor-blind pick-token
+`fingerprint()` (the renderer paints the `❯` cursor + `selected` glyphs, so a
+cursor/selection change MUST re-render — a separate render-only signature).
+Non-AUQ interactive UIs (ExitPlanMode / permission) keep the raw-content hash.
+**Disclosed residuals (all untrusted-display, never a wrong dispatch).** (1) The
+≤1-poll-cycle boundary race at the 300s ageout (unchanged from item-1) — a
+side_file_ok token minted just before the TTL and tapped just after it (before the
+poller re-mints to `bail`/pane) routes through the existing source_drift
+re-render and the 2nd tap dispatches; PR-B does not worsen it (it cleans the
+>300s STEADY state, where render now picks `bail`→pane matching the strict
+validate resolver). (2) A `rescue` renders the side-file question even if the side
+file is STALE relative to a genuinely-different INCOMPLETE live pane (the OLD path
+showed the partial live pane). Bounded — the PreToolUse hook overwrites the side
+file on every AUQ, so the common sequential case stays fresh; staleness requires a
+double-`--resume` sibling (session-keyed side file), a restart orphan, or a hook
+write lag. dispatch_trusted=False (no buttons) so it is wrong-DISPLAY only, and it
+is strictly better than the pre-PR-3 broken render (a raw scrollback blob); the
+loop-kill FREEZES the rescue card so it self-corrects only when the side file is
+overwritten / the pane becomes a complete picker. (3) A multi-question `rescue`
+renders Q1 (`build_form_from_tool_input` defaults to the first question) even if
+the live picker is on an advanced tab — only reachable when the pane is so
+degraded its `←…→` tab header is unparseable (else PR-A → bail/side_file_ok with
+the inferred tab); untrusted, and the 📋 ctx card still enumerates ALL questions.
+Pull-only; no observer (c313657 forbidden).
+
 **Restart re-dispatch (D2 — the durable mint-intent net for the case D3-β can't
 cover).** D3-β keeps a live card's tokens alive only while the process is up; a
 bot **restart** wipes the in-memory `_pick_tokens`/`_pick_token_cache`, and the
@@ -609,16 +744,55 @@ prose by matching it).
 **Live delivery (PR-C).** `interactive_ui.handle_interactive_ui`, under the
 route lock and BEFORE the picker card / AUQ context message,
 `_maybe_post_live_prose` reads the freshest finalized capture
-(`md_capture.select_fresh_prose`, freshness = `final_at` within a per-mode TTL
-of now — `AUQ_PROSE_TTL_S` / `EPM_PROSE_TTL_S`, a previous turn's leftover ages
-out), posts it as its own message, and records a **shown-live marker** in the
-same per-session capture file. Idempotent via `md_capture.was_shown_live`
-(consume-INCLUSIVE: a re-render / poll re-detect / post-`kickstart` / the dedup
-having consumed the marker all skip a re-post). A miss is a silent no-op — the
-JSONL copy delivers post-resolution exactly as before (no marker, no dedup,
-never a delayed picker). A bounded ≤250ms retry covers the rare same-tick race
-(the prose finalizes ~0.68s before the picker blocks, so it almost never fires).
-Render-path state only — NOT a RouteRuntime field (Bug-1 contract intact).
+(`md_capture.select_fresh_prose`), posts it as its own message, and records a
+**shown-live marker** in the same per-session capture file. Idempotent via
+`md_capture.was_shown_live` (consume-INCLUSIVE: a re-render / poll re-detect /
+post-`kickstart` / the dedup having consumed the marker all skip a re-post). A
+miss is a silent no-op — the JSONL copy delivers post-resolution exactly as
+before (no marker, no dedup, never a delayed picker). A bounded ≤250ms retry
+covers the rare same-tick race. Render-path state only — NOT a RouteRuntime
+field (Bug-1 contract intact). The four `_maybe_post_live_prose` early returns
+log a miss-classification line (`no_session` / `card_exists` / `capture_absent`
+/ `not_before_reject` / `ttl_and_anchor_reject` / `empty_text` /
+`already_shown_live`) so the next miss is diagnosable (PR-1 A6).
+
+**Emission-anchor freshness — the additive-OR (PR-1, the dominant-miss fix).**
+The original freshness was render-time `now` only: `now - final_at <= TTL`
+(`AUQ_PROSE_TTL_S` 8s / `EPM_PROSE_TTL_S` 12s). The baked-in premise that "the
+prose finalizes ~0.68s before the picker blocks" was INVERTED — measured (Wave-0
+capture, Claude Code 2.1.172) the prose finalizes a gap BEFORE the picker is
+DETECTED: ~5.44s idle, up to ~20.7s under bot load (the poller only scrapes on
+its ~1s cadence and the adaptive watchdog can skip the blocked frame). So a fixed
+render-time TTL routinely aged the matching prose out and the prose never posted.
+`select_fresh_prose` now ORs the TTL leg with an **emission-anchor leg** keyed to
+a STABLE picker-emission instant `emitted_at`: keep `r` iff
+`(now - final_at <= ttl)  OR  (emitted_at is not None and  emitted_at -
+emit_anchor_lookback_s <= final_at <= emitted_at + emit_anchor_eps_s)`, all still
+AND-ed with the `not_before` turn boundary below. The OR can only WIDEN over the
+TTL leg → provably non-regressive on the upper bound. The anchor SOURCE + its
+eps/lookback constants are selected by modality in `_maybe_post_live_prose`:
+**AUQ** → `auq_source.peek_side_file_written_at(session_id)` (the PreToolUse
+side-file `written_at` ≈ the tool_use invocation; read-TTL-free, future-skew
+guarded) with `_EMIT_ANCHOR_EPS_S` (2s) / `_EMIT_ANCHOR_LOOKBACK_S` (10s);
+**ExitPlanMode** → `status_polling.peek_epm_surface_emitted_at(...)` (the poller's
+FIRST-DETECTION stamp — EPM has no side file) with `_EMIT_ANCHOR_EPS_EPM_S` (2s)
+/ `_EMIT_ANCHOR_LOOKBACK_EPM_S` (30s). The EPM lookback is LARGER because its
+poller-stamp anchor lags the tool_use by the whole detect latency, whereas AUQ's
+hook stamp sits ~at the tool_use; the AUQ lookback stays tight because it is ALSO
+the restart-asymmetry guard — across a restart the on-disk AUQ `written_at`
+survives (so `emitted_at` is non-None) while the in-memory `not_before` delivery
+stamp is wiped to None, so the lookback is the ONLY floor left and must reject a
+stale prior-turn prose finalized well before this picker's tool_use (EPM has no
+on-disk anchor → `emitted_at` is None post-restart → the OR leg simply doesn't
+fire, so its generous lookback is safe). The EPM stamp is poller-local
+state: `status_polling._epm_surface_first_seen_at[route]`, `setdefault`-stamped
+(first-detect, never a sliding window) wherever `ui_content.name ==
+"ExitPlanMode"` is observed (the new-UI dispatch + the in-mode block), POPPED at
+every EPM lifecycle end (the interactive-clear callback PRIMARY, the poller
+mode-end / in-mode-absence / window-switch / window-gone seams, and
+`clear_route_caches_for_topic`) so the NEXT EPM in the topic anchors to its OWN
+instant; route-keyed so a double-`--resume` sibling never lights. Pull-only; no
+observer.
 
 **Turn-boundary anchor (Item 3 / P2-1 — the prior-turn-prose leak).** Freshness
 was session + TTL only, so a PRIOR turn's leftover prose (still in the per-session
@@ -640,9 +814,12 @@ shares the appender's `captured_at` clock, so they compare directly. The store i
 torn down with the route (beside `_route_last_user_message`) and cleared by
 `reset_for_tests`; it is **render/callback-path state, NOT a RouteRuntime field**
 (pull-only; c313657 forbidden). **Residuals (all safe):** after a **restart** the
-in-memory stamp is gone → `not_before=None` → TTL-only (the prior-turn leak is
-NOT fixed across a restart — documented degradation, never a false-negative on the
-live path); a rare **wall-clock-backwards** jump could mis-order a stamp vs a
+in-memory stamp is gone → `not_before=None` disables THIS turn-boundary filter
+(PR-1 NOTE: the AUQ emission-anchor `written_at` survives the restart, so its
+lookback lower bound now carries the restart-asymmetry prior-turn guard — see the
+additive-OR; the freshness falls to pure TTL-only only when `emitted_at` is ALSO
+None, e.g. EPM or no side file — documented degradation, never a false-negative
+on the live path); a rare **wall-clock-backwards** jump could mis-order a stamp vs a
 `captured_at` (NO epsilon is added — accepted as a rare residual); the per-session
 file's tracked-idle disk retention is unchanged (teardown still owns reclaim). A
 **concurrent-send clobber** — a LATER delivery whose stamp overwrites the route's
