@@ -4736,9 +4736,7 @@ class TestContextGateRouting:
             source_fingerprint="deadbeefdeadbeef",
             consumed_generation=None,
         )
-        assert (
-            pick_token.peek_route_source(user_id, thread_id, window_id) is not None
-        )
+        assert pick_token.peek_route_source(user_id, thread_id, window_id) is not None
 
         # Live pane: a genuinely DIFFERENT picker scrolled so option 1 is off the
         # top (starts at 3 → incomplete → bail, dispatch_trusted=False, p14).
