@@ -2359,7 +2359,6 @@ class TestPollerSourceDriftRemint:
         # form key, NOT the pane-form key the poller computes. The drift detector
         # must find the displayed card by ROUTE (regardless of fingerprint) and
         # re-mint; a fingerprint-keyed lookup misses it and the bug is unfixed.
-        import hashlib
         import json
         from pathlib import Path
 
@@ -2382,10 +2381,16 @@ class TestPollerSourceDriftRemint:
             mock_window.window_id = window_id
             _interactive_mode[(1, 42)] = window_id
 
-            # Pin the published hash to the LIVE pane's hash → same-hash branch.
+            # Pin the SAME render-identity hash production computes
+            # (``_ui_render_hash`` → ``peek_render_identity`` for AUQ) so the
+            # poller takes the same-hash idle branch and reaches the drift
+            # detector. Seeding the RAW content hash diverged from production's
+            # render-identity basis (raw != identity for an AUQ pane), so the
+            # poller took the NEW-UI re-render branch instead → false-green
+            # (the assertion passed via the wrong path; both await handle_ui).
             ui_content = extract_interactive_content(pane)
             assert ui_content is not None
-            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            ui_hash = status_polling._ui_render_hash(window_id, pane, ui_content)
             status_polling._last_published_ui_hash[route] = ui_hash
 
             # Production mints at the SIDE-FILE form fingerprint (title present),
@@ -2432,6 +2437,89 @@ class TestPollerSourceDriftRemint:
         finally:
             pick_token.reset_for_tests()
 
+    async def test_same_hash_pane_to_pane_drift_does_not_remint(
+        self, mock_bot: AsyncMock
+    ):
+        """Fix A (di-copilot picker churn): a PANE↔PANE source "drift" is just
+        capture noise and must NOT re-mint. The poller resolves the live source
+        from a scrollback=0 capture while the card's pane token was minted (by
+        handle_interactive_ui) from a scrollback=500 capture, so the two
+        ``_pane_fingerprint`` values differ PERMANENTLY for a busy/scrolled
+        long-open AUQ even though the source (the pane) never changed. Re-minting
+        on that phantom drift re-renders the card every ~1s tick → the
+        duplicate-card churn. Only a genuine ``side_file``→pane FLIP (minted kind
+        != ``pane``) is a real source change.
+
+        RED pre-fix / GREEN post-fix: on current main ``_remint_on_source_drift``
+        compares fingerprints only, so a pane↔pane mismatch re-renders (awaits
+        ``handle_interactive_ui``).
+        """
+        from pathlib import Path
+
+        from cctelegram.handlers import pick_token, status_polling
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.handlers.status_polling import extract_interactive_content
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        pick_token.reset_for_tests()
+        try:
+            fx = Path(__file__).parents[1] / "fixtures"
+            pane = (fx / "auq_single_select_with_affordances_pane.txt").read_text()
+            window_id = "@5"
+            route = (1, 42, window_id)
+            mock_window = MagicMock()
+            mock_window.window_id = window_id
+            _interactive_mode[(1, 42)] = window_id
+
+            ui_content = extract_interactive_content(pane)
+            assert ui_content is not None
+            # Pin the SAME render-identity hash production uses (peek_render_identity
+            # for AUQ), so the poller takes the same-hash branch and reaches
+            # ``_remint_on_source_drift`` — NOT the new-UI re-render branch.
+            ui_hash = status_polling._ui_render_hash(window_id, pane, ui_content)
+            status_polling._last_published_ui_hash[route] = ui_hash
+
+            # Card token minted kind="pane" from a DIFFERENT capture (the
+            # 500-line render pane) → its source_fingerprint is NOT the poller's
+            # live 0-line pane fingerprint. peek_route_source is route-based, so
+            # the cache-key fingerprint is irrelevant to the lookup.
+            pane_form = resolve_ask_form(None, pane)
+            assert pane_form is not None
+            _pick_token_cache[(1, 42, window_id, pane_form.fingerprint())] = _CacheRow(
+                tokens=["panetok"],
+                row_generation=1,
+                source_kind="pane",
+                source_fingerprint="minted-from-500line-capture",
+                consumed_generation=None,
+            )
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ) as mock_refresh,
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=pane)
+
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+            # Live source is pane (real fp) ≠ the minted "pane" fp, but BOTH are
+            # kind=pane → capture noise → NO re-mint. The poller refreshes
+            # deadlines instead (the live-card-preserve path).
+            mock_handle_ui.assert_not_awaited()
+            mock_refresh.assert_awaited()
+        finally:
+            pick_token.reset_for_tests()
+
     async def test_drift_remint_terminates_next_tick_does_not_remint(
         self, mock_bot: AsyncMock
     ):
@@ -2442,7 +2530,6 @@ class TestPollerSourceDriftRemint:
         minting the pane source and hygiene-dropping the old side_file-fp row.
         Tick 2 now sees live pane == minted pane → no drift → exactly ONE
         re-mint over the two ticks."""
-        import hashlib
         import json
         from pathlib import Path
 
@@ -2467,7 +2554,10 @@ class TestPollerSourceDriftRemint:
 
             ui_content = extract_interactive_content(pane)
             assert ui_content is not None
-            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            # Production render-identity basis (see the source-drift test) so
+            # tick 1 genuinely takes the same-hash branch and detects the
+            # side_file→pane drift — not the new-UI re-render branch.
+            ui_hash = status_polling._ui_render_hash(window_id, pane, ui_content)
             status_polling._last_published_ui_hash[route] = ui_hash
 
             # Tick-1 seed: side_file-fp row (production mint shape), drifted.
@@ -2605,8 +2695,6 @@ class TestPollerSourceDriftRemint:
         no AskUserQuestionForm, so the drift check must bail (``resolve_ask_form``
         is None) — no re-mint, just the deadline refresh. Guards against a
         spurious re-mint / crash on a non-AUQ same-hash idle tick."""
-        import hashlib
-
         from cctelegram.handlers import pick_token, status_polling
         from cctelegram.handlers.interactive_ui import _interactive_mode
         from cctelegram.handlers.status_polling import extract_interactive_content
@@ -2627,7 +2715,12 @@ class TestPollerSourceDriftRemint:
 
             ui_content = extract_interactive_content(settings_pane)
             assert ui_content is not None
-            ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+            # Non-AUQ pane: ``_ui_render_hash`` returns the raw content hash (no
+            # AUQ render resolver), so this is production-faithful and the poller
+            # takes the same-hash idle branch.
+            ui_hash = status_polling._ui_render_hash(
+                window_id, settings_pane, ui_content
+            )
             status_polling._last_published_ui_hash[route] = ui_hash
 
             with (
