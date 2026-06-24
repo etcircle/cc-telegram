@@ -40,7 +40,8 @@ import hashlib
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from typing import Any, Final, Literal
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,17 @@ class UIPattern:
     # 220 because AUQ #A's footer had been collapsed; the bot rendered
     # AUQ #A's options on the live card).
     bail_markers: tuple[re.Pattern[str], ...] = ()
+    # OPTIONAL strict post-validation gate (S-8 fail-closed). When set, a loose
+    # top/bottom match is NOT sufficient: ``extract_interactive_content`` runs
+    # ``validator(full_pane_text)`` (the WHOLE pane, so the validator can apply
+    # its own bottom-terminal requirement) and only returns this pattern when
+    # the validator returns a non-None form — whose ``pane_excerpt`` becomes the
+    # returned content. ``None`` (the default) keeps the loose-match-only
+    # behavior — AUQ / EPM / Settings / RestoreCheckpoint stay byte-identical.
+    # Used ONLY by the flag-gated Permission / Workflow approval gates, whose
+    # loose anchors would otherwise light a card on assistant prose that QUOTES
+    # a gate (verified false positives, 2026-06-24 peer review).
+    validator: "Callable[[str], AskUserQuestionForm | None] | None" = None
 
 
 # Marks a collapsed Claude Code TUI region — Bash output, file reads, or an
@@ -193,20 +205,17 @@ _RE_WORKFLOW_TOP = (
     re.compile(r"^\s*This dynamic workflow will\b"),
     re.compile(r"^\s*Dynamic workflows can use\b"),
 )
-# Workflow BOTTOM — anchored on the ``Esc to cancel`` / ``Tab to amend``
-# footer line (they co-occur on ONE line: ``Esc to cancel · Tab to amend``).
-# ``ctrl+g to edit script`` is DELIBERATELY EXCLUDED as a bottom anchor: it
-# renders on its OWN line BELOW the ``Esc to cancel · Tab to amend`` line, so
-# including it would make ``_try_extract``'s bottom-up scan anchor on the
-# lower ``ctrl+g`` line and then cross the ``Esc to cancel`` line during the
-# walk-back to the top — tripping the pre-top-found bail (an OLDER bottom
-# marker between bottom and top) and returning None. Anchoring on the upper
-# footer line avoids the cross-bail; the strict ``parse_workflow_approval``
-# validates the full shape independently.
-_RE_WORKFLOW_BOTTOM = (
-    re.compile(r"^\s*Esc to cancel\b"),
-    re.compile(r"^\s*Tab to amend\b"),
-)
+# Workflow BOTTOM — anchored on the ``Esc to cancel`` footer line (the real
+# v2.1.190 footer is ``Esc to cancel · Tab to amend`` on ONE line, so the
+# ``Esc to cancel`` prefix matches it). The bare ``^\s*Tab to amend`` alt was
+# DROPPED (codex P3): it never matches the real one-line footer (which leads
+# with ``Esc to cancel``) and only widened the anchor surface — the strict
+# ``parse_workflow_approval`` validates the full footer + label shape. The
+# ``ctrl+g to edit script`` line is also EXCLUDED: it renders on its OWN line
+# BELOW the ``Esc to cancel`` footer, so anchoring there would make the
+# bottom-up scan cross the upper footer during walk-back and trip the
+# pre-top-found bail. Anchoring on the upper footer line avoids the cross-bail.
+_RE_WORKFLOW_BOTTOM = (re.compile(r"^\s*Esc to cancel\b"),)
 
 # A trailing ``(esc)`` / ``(Esc)`` affordance on a permission option label —
 # stripped deterministically + identically on every parse (so the cursor-blind
@@ -490,8 +499,26 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
     lines = pane_text.strip().split("\n")
     for pattern in _active_ui_patterns():
         result = _try_extract(lines, pattern)
-        if result:
-            return result
+        if not result:
+            continue
+        # S-8 fail-closed strict post-validation: a loose top/bottom match is
+        # not enough for a validated pattern (the gate patterns) — run the
+        # strict variant parser over the FULL pane (so its bottom-terminal
+        # requirement applies) and only return the gate when it parses. On a
+        # None we CONTINUE the pattern loop (a quoted/non-bottom gate must not
+        # win — and must not block a later pattern). Use the strict form's
+        # ``pane_excerpt`` as the content (the trusted gate region, not the
+        # looser ``_try_extract`` slice). AUQ/EPM/Settings/RestoreCheckpoint
+        # have no validator → byte-identical behavior.
+        if pattern.validator is not None:
+            form = pattern.validator(pane_text)
+            if form is None:
+                continue
+            return InteractiveUIContent(
+                content=_shorten_separators(form.pane_excerpt.rstrip()),
+                name=pattern.name,
+            )
+        return result
     return None
 
 
@@ -1803,24 +1830,53 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
 
 
 def _gate_options_above(lines: list[str], footer_idx: int) -> tuple[AskOption, ...]:
-    """Collect the contiguous ``❯ N. <label>`` option block above ``footer_idx``.
+    """Collect the BOTTOM-MOST contiguous ``❯ N. <label>`` option block above
+    ``footer_idx``.
 
     Walks UP from the footer over blank / separator / option / indented-
-    description lines to find the option block's top, then reuses
-    ``_parse_numbered_options`` (contiguity + cursor + checkbox handling).
-    A trailing ``(esc)`` affordance is stripped from each label
-    deterministically (S-6 full-label parity on mint==verify).
+    description lines, but ONLY extends across a numbered line while it keeps the
+    block contiguous DOWNWARD (its ``N`` is exactly one less than the topmost
+    option seen so far). This isolates the live option block (``1. Yes, run it /
+    2. View raw script / 3. No``) from a SEPARATE numbered run higher up — the
+    Workflow phase list (``1. Sweep / 2. Verify / 3. Dossier``), which sits above
+    the option block and would otherwise be absorbed as the options (codex P2).
+    The bottom-most block's first number resets the contiguity, so the walk-up
+    stops at the phase list's footer-side boundary. Then reuses
+    ``_parse_numbered_options`` (contiguity + cursor + checkbox handling). A
+    trailing ``(esc)`` affordance is stripped from each label deterministically
+    (S-6 full-label parity on mint==verify).
     """
     start_idx = footer_idx
+    # The lowest option number seen so far in the contiguous block (the block is
+    # bottom-up, so this tracks the TOP of the run as it grows upward).
+    block_top_num: int | None = None
     for j in range(footer_idx - 1, -1, -1):
         line = lines[j]
         stripped = line.strip()
         if not stripped:
             start_idx = j
             continue
-        if _RE_NUMBERED_OPTION.match(line):
-            start_idx = j
-            continue
+        m = _RE_NUMBERED_OPTION.match(line)
+        if m is not None:
+            try:
+                num = int(m.group("num"))
+            except ValueError:
+                break
+            if block_top_num is None:
+                # First (bottom-most) numbered line — anchors the block.
+                block_top_num = num
+                start_idx = j
+                continue
+            if num == block_top_num - 1:
+                # Extends the contiguous run upward (3 ← 2 ← 1).
+                block_top_num = num
+                start_idx = j
+                continue
+            # A numbered line that does NOT continue the run (a reset, e.g. a
+            # higher phase ``3.`` directly above the option block's ``1.``) — the
+            # bottom-most block is complete. Stop here so the phase list is not
+            # folded in.
+            break
         if all(c == "─" for c in stripped):
             start_idx = j
             continue
@@ -1847,16 +1903,81 @@ def _gate_options_above(lines: list[str], footer_idx: int) -> tuple[AskOption, .
     )
 
 
+# ── Bottom-terminal requirement (S-8 fail-closed) ─────────────────────────
+#
+# A genuine LIVE approval gate is the ACTIVE prompt: its option block + footer
+# sit at/near the pane bottom, with nothing but KNOWN chrome below the footer.
+# Assistant prose that QUOTES a complete gate and then keeps talking (the
+# Hermes third repro) leaves arbitrary non-chrome text below the footer — so
+# requiring "only chrome follows the footer" rejects the quoted block while
+# keeping the live gate (whose visible-pane capture ends at/near the footer,
+# at most the input-box / status-bar chrome below).
+#
+# DEFERRED RESIDUAL (PR-2, do NOT fix in PR-1): a fully-quoted gate that is
+# LITERALLY the last thing in the pane (nothing — not even chrome — after the
+# footer) is indistinguishable from a live gate by pane content alone, so it
+# still passes this check. In PR-1 (display-only) that is at worst a cosmetic
+# bogus card — no dispatch, no auto-approval. The definitive fix belongs in PR-2
+# (where dispatch makes it matter): gate the gate-card render/promotion on the
+# route's ``route_runtime.snapshot(route).notification_pending`` bit — a GENUINE
+# gate fires the Notification hook; quoted prose does not. It is deliberately
+# NOT coupled here in PR-1: tying render to the notification bit risks delaying a
+# legitimate card on the hook's timing, and PR-1 ships no dispatch.
+
+# The Workflow ``ctrl+g to edit script in $EDITOR`` line is legitimate chrome
+# rendered on its OWN line BELOW the ``Esc to cancel`` footer.
+_RE_GATE_TRAILING_CTRLG = re.compile(r"^\s*ctrl[+-]g to edit script\b")
+# Claude Code input-box / status-bar chrome that can render below a live gate:
+# box-drawing corners/edges, the empty ``❯`` prompt, the model/context status
+# bar, and the run-interrupt hint. Anything else NON-BLANK below the footer is
+# treated as assistant prose → the gate is NOT the live bottom prompt.
+_RE_GATE_TRAILING_CHROME = re.compile(
+    r"^\s*(?:"
+    r"[─╌╭╮╰╯│┌┐└┘├┤┬┴┼━┃▐▌▛▜▝▘▗▖█\s]+"  # box-drawing / separator / banner
+    r"|❯\s*$"  # empty input prompt
+    r"|❯\s+\S.*$"  # input prompt with queued text (chrome, not gate prose)
+    r"|.*\besc to interrupt\b.*"  # run-interrupt hint
+    r"|⏵.*"  # auto-accept chrome
+    r"|.*Context(?: left)?:\s*\d+%.*"  # context status bar
+    r"|/[a-z-]+ for .*"  # slash-command hint footer
+    r")$"
+)
+
+
+def _only_chrome_below(lines: list[str], footer_idx: int) -> bool:
+    """True iff every non-blank line BELOW ``footer_idx`` is known chrome.
+
+    The bottom-terminal requirement: a live gate's footer is at/near the pane
+    bottom (S-8). A blank line, a separator/box-drawing/banner line, the
+    Workflow ``ctrl+g to edit script`` line, the empty ``❯`` prompt, the
+    context/model status bar, and the run-interrupt hint are all chrome; any
+    other non-blank line is assistant prose ⇒ the gate is QUOTED, not live.
+    """
+    for i in range(footer_idx + 1, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            continue
+        if _RE_GATE_TRAILING_CTRLG.match(line):
+            continue
+        if _RE_GATE_TRAILING_CHROME.match(line):
+            continue
+        return False
+    return True
+
+
 def parse_permission_prompt(pane_text: str) -> AskUserQuestionForm | None:
     """Strict-or-None parse of a tool-permission approval gate (Gate A).
 
-    Anchors on a ``Do you want to …`` / ``Claude wants to …`` TOP line and a
-    bottom anchor that is EITHER an inline ``(esc)``-tailed option (WebFetch,
-    no footer) OR an ``Esc to cancel`` footer (Bash / Write). Returns a
-    single-question ``AskUserQuestionForm`` (``select_mode="single"``) with the
-    full, affordance-stripped option labels, or ``None`` when the pane is not a
-    recognizable permission gate. Cursor / number / checkbox handling and
-    contiguity are inherited from ``_parse_numbered_options``.
+    Anchors on a ``Do you want to <verb>…?`` question TOP line (REQUIRED — the
+    ``Claude wants to …`` preamble is OPTIONAL context only, never a sufficient
+    standalone anchor; Hermes P2) and a bottom anchor that is EITHER an inline
+    ``(esc)``-tailed option (WebFetch, no footer) OR an ``Esc to cancel`` footer
+    (Bash / Write). Enforces the bottom-terminal requirement (only chrome below
+    the footer — S-8). Returns a single-question ``AskUserQuestionForm``
+    (``select_mode="single"``) with the full, affordance-stripped option labels,
+    or ``None`` when the pane is not a recognizable LIVE permission gate. Cursor
+    / number / checkbox handling and contiguity are inherited from
+    ``_parse_numbered_options``.
     """
     if not pane_text:
         return None
@@ -1874,8 +1995,16 @@ def parse_permission_prompt(pane_text: str) -> AskUserQuestionForm | None:
     if footer_idx is None:
         return None
 
-    # TOP question line — the lowest ``Do you want to …`` ABOVE the footer.
-    # Fall back to the ``Claude wants to …`` preamble for the display title.
+    # Bottom-terminal requirement (S-8): only chrome may follow the footer, else
+    # this is a QUOTED gate (prose continues below) — not the live prompt.
+    if not _only_chrome_below(lines, footer_idx):
+        return None
+
+    # TOP question line — the lowest ``Do you want to <verb>…?`` ABOVE the
+    # footer. REQUIRED (Hermes P2): the ``Claude wants to …`` preamble is OPTIONAL
+    # context (it enriches the card body / preamble) and is NOT a sufficient
+    # standalone anchor — a quoted ``Claude wants to …`` line without the real
+    # question must not light a card.
     question_idx: int | None = None
     preamble_idx: int | None = None
     for i in range(footer_idx, -1, -1):
@@ -1883,18 +2012,20 @@ def parse_permission_prompt(pane_text: str) -> AskUserQuestionForm | None:
             question_idx = i
         if preamble_idx is None and _RE_PERMISSION_TOP_PREAMBLE.match(lines[i]):
             preamble_idx = i
-    if question_idx is None and preamble_idx is None:
+    if question_idx is None:
         return None
 
     options = _gate_options_above(lines, footer_idx)
     if not options:
         return None
 
-    title_idx = question_idx if question_idx is not None else preamble_idx
-    assert title_idx is not None
-    title = lines[title_idx].strip()
+    title = lines[question_idx].strip()
 
-    excerpt_start = min(idx for idx in (question_idx, preamble_idx) if idx is not None)
+    # Body excerpt starts at the optional ``Claude wants to …`` preamble when it
+    # sits just above the question (display context), else the question line.
+    excerpt_start = question_idx
+    if preamble_idx is not None and preamble_idx < question_idx:
+        excerpt_start = preamble_idx
     pane_excerpt = "\n".join(lines[excerpt_start : footer_idx + 1]).rstrip()
 
     return AskUserQuestionForm(
@@ -1910,6 +2041,31 @@ def parse_permission_prompt(pane_text: str) -> AskUserQuestionForm | None:
 
 # Workflow body lines: the token-cost warning sentence + the phase list.
 _RE_WORKFLOW_WARNING = re.compile(r"Dynamic workflows can use\b")
+
+# Known Workflow option labels (codex P2). The launch gate is a fixed
+# 3-option shape: ``Yes, run it`` / ``View raw script`` / ``No``. Validating the
+# parsed labels against this shape rejects a numbered block that is actually the
+# PHASE list (``Sweep`` / ``Verify`` / ``Dossier``) — the option-1 ``Yes`` anchor
+# is the load-bearing check (the costly resolving option), with ``View raw
+# script`` as a secondary confirmation that this is the launch gate and not some
+# other numbered region. Case-insensitive substring tolerates trailing drift.
+_RE_WORKFLOW_OPT_YES = re.compile(r"^\s*Yes,\s*run it\b", re.IGNORECASE)
+_RE_WORKFLOW_OPT_VIEW = re.compile(r"\bView raw script\b", re.IGNORECASE)
+
+
+def _is_workflow_option_shape(options: tuple[AskOption, ...]) -> bool:
+    """True iff ``options`` look like the Workflow launch gate's 3-option shape.
+
+    Requires option 1 == ``Yes, run it`` (the costly resolving option, S-6
+    load-bearing) AND that a ``View raw script`` option is present — so the
+    Workflow PHASE list (``1. Sweep / 2. Verify / 3. Dossier``), which shares the
+    ``N. <text>`` shape, is rejected (codex P2).
+    """
+    if not options:
+        return False
+    if not _RE_WORKFLOW_OPT_YES.match(options[0].label):
+        return False
+    return any(_RE_WORKFLOW_OPT_VIEW.search(o.label) for o in options)
 
 
 def parse_workflow_approval(pane_text: str) -> AskUserQuestionForm | None:
@@ -1928,13 +2084,19 @@ def parse_workflow_approval(pane_text: str) -> AskUserQuestionForm | None:
         return None
     lines = pane_text.split("\n")
 
-    # Footer (lowest-on-screen) — ``Esc to cancel`` / ``Tab to amend``.
+    # Footer (lowest-on-screen) — the ``Esc to cancel`` footer line.
     footer_idx: int | None = None
     for i in range(len(lines) - 1, -1, -1):
         if any(p.match(lines[i]) for p in _RE_WORKFLOW_BOTTOM):
             footer_idx = i
             break
     if footer_idx is None:
+        return None
+
+    # Bottom-terminal requirement (S-8): only chrome may follow the footer (the
+    # ``ctrl+g to edit script`` line is chrome) — else this is a QUOTED gate
+    # (assistant prose continues below the footer), not the live prompt.
+    if not _only_chrome_below(lines, footer_idx):
         return None
 
     # TOP — anchor the region on the FIRST (topmost) Workflow anchor line that
@@ -1952,6 +2114,12 @@ def parse_workflow_approval(pane_text: str) -> AskUserQuestionForm | None:
 
     options = _gate_options_above(lines, footer_idx)
     if not options:
+        return None
+
+    # Option-shape validation (codex P2): the parsed block must be the Workflow
+    # launch options (``Yes, run it`` / ``View raw script`` / ``No``), not the
+    # PHASE list (``Sweep`` / ``Verify`` / ``Dossier``) — same ``N. <text>`` shape.
+    if not _is_workflow_option_shape(options):
         return None
 
     # The question title prefers the ``Run a dynamic workflow?`` line when
@@ -1995,6 +2163,23 @@ def parse_workflow_approval(pane_text: str) -> AskUserQuestionForm | None:
             "has_token_warning": "1" if has_warning else "0",
         },
     )
+
+
+# Wire the strict variant parsers as the gate patterns' S-8 post-validators
+# (the parsers are defined here, far below ``UI_PATTERNS``; ``UIPattern`` is
+# frozen, so rebuild the two gate entries in place via ``replace``). After this,
+# ``extract_interactive_content`` runs ``parse_permission_prompt`` /
+# ``parse_workflow_approval`` after a loose match and only returns the gate when
+# it strictly parses — closing the quoted-prompt false positives (S-8). The
+# ordering (gates LAST) is preserved (same list positions).
+UI_PATTERNS = [
+    replace(p, validator=parse_permission_prompt)
+    if p.name == "Permission"
+    else replace(p, validator=parse_workflow_approval)
+    if p.name == "Workflow"
+    else p
+    for p in UI_PATTERNS
+]
 
 
 def _infer_current_tab_idx(
