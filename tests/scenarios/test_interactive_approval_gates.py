@@ -255,3 +255,86 @@ async def test_flag_off_no_card_no_promotion(scenario: ScenarioHarness) -> None:
     assert snap.run_state is RunState.RUNNING  # NOT promoted
     assert snap.interactive_pending is False
     assert not interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID)
+
+
+# ── S-8 fail-closed: quoted-prompt shapes post NO card (P1b, flag ON) ──────
+#
+# The dangerous false-positive shapes the strict-parse + bottom-terminal gate
+# must reject — proven at the public seam (no card AND no WAITING promotion)
+# even with the flag ON. RED-first against HEAD (where the loose UIPattern
+# match alone lit a card).
+
+# (a) "Claude wants to ..." + footer, NO numbered options.
+_NEG_CLAUDE_WANTS_NO_OPTIONS = (
+    "When Claude wants to fetch a URL it shows a prompt.\n"
+    "\n"
+    " Claude wants to fetch content from example.com\n"
+    " Some prose explaining what that means, with no option block at all.\n"
+    " Esc to cancel . Tab to amend\n"
+)
+# (b) A permission question + numbered prose + footer, NOT at the pane bottom
+# (assistant prose follows the footer).
+_NEG_PERMISSION_NOT_AT_BOTTOM = (
+    "For reference, the prompt looks like this:\n"
+    "\n"
+    " Do you want to proceed?\n"
+    " 1. Yes\n"
+    "   2. Yes, and always allow\n"
+    "   3. No\n"
+    " Esc to cancel . Tab to amend\n"
+    "\n"
+    "So you would normally pick option 1. But I have already finished, so\n"
+    "there is nothing for you to approve right now.\n"
+)
+# (c) "Run a dynamic workflow?" / "Dynamic workflows can use ..." quoted, footer,
+# NO live option block.
+_NEG_WORKFLOW_NO_OPTIONS = (
+    "A dynamic workflow gate normally shows:\n"
+    "\n"
+    " Run a dynamic workflow?\n"
+    " Dynamic workflows can use a lot of tokens quickly by running subagents.\n"
+    " Esc to cancel . Tab to amend\n"
+)
+# (d) A COMPLETE quoted Workflow block FOLLOWED BY trailing assistant prose.
+_NEG_WORKFLOW_COMPLETE_THEN_PROSE = (
+    "Here is what the workflow gate looks like when it appears:\n"
+    "\n"
+    " Run a dynamic workflow?\n"
+    " This dynamic workflow will spin up subagents.\n"
+    " Dynamic workflows can use a lot of tokens quickly.\n"
+    " 1. Yes, run it\n"
+    "   2. View raw script\n"
+    "   3. No\n"
+    " Esc to cancel . Tab to amend\n"
+    "\n"
+    "As you can see, you would tap option 1 to proceed. Tell me what to do.\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _NEG_CLAUDE_WANTS_NO_OPTIONS,
+        _NEG_PERMISSION_NOT_AT_BOTTOM,
+        _NEG_WORKFLOW_NO_OPTIONS,
+        _NEG_WORKFLOW_COMPLETE_THEN_PROSE,
+    ],
+)
+async def test_quoted_gate_shapes_post_no_card(
+    scenario: ScenarioHarness, gate_on, pane: str
+) -> None:
+    """With the flag ON, a quoted / explained / non-bottom gate posts NO card
+    and does NOT promote the route to WAITING_ON_USER (S-8 fail-closed, P1b)."""
+    wid = _bind(scenario, pane)
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)  # RUNNING
+
+    assert not await _render(scenario, wid)  # no detection → no card
+    await _poll(scenario, wid, 3)
+
+    assert _last_interactive_card_text(scenario) is None
+    assert not interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID)
+    snap = route_runtime.snapshot(route)
+    assert snap.run_state is RunState.RUNNING  # NOT promoted
+    assert snap.interactive_pending is False

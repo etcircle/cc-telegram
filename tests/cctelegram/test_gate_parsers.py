@@ -25,6 +25,9 @@ leaks. Tests that need the gate ON call ``set_permission_prompts_enabled(True)``
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -312,3 +315,232 @@ def test_webfetch_no_footer_visible_liveness_present(gate_on) -> None:
     pane) lights it "present" with the gate flag ON."""
     visible = _load("permission_webfetch_v2.1.190.txt")
     assert visible_pane_liveness(visible) == "present"
+
+
+# ── S-8 fail-closed: quoted-prompt false positives must NOT detect (P1) ────
+#
+# The loose top+bottom ``UIPattern`` regexes alone matched assistant prose
+# that QUOTES a gate (and even a fully-quoted gate followed by more prose).
+# ``extract_interactive_content`` MUST run the strict variant parser AND a
+# bottom-terminal requirement (a live gate's footer is at/near the pane
+# bottom — only known chrome may follow it). These RED-first negatives pin
+# the fail-closed behavior; each is a pane that LOOKS like a gate but is not
+# the live active prompt.
+
+# (a) "Claude wants to ..." + footer, NO numbered options. The preamble is
+# OPTIONAL context only (Hermes P2) -- without the real question line AND an
+# option block it must not light a Permission card.
+_NEG_CLAUDE_WANTS_NO_OPTIONS = (
+    "When Claude wants to fetch a URL it shows a prompt.\n"
+    "\n"
+    " Claude wants to fetch content from example.com\n"
+    " Some prose explaining what that means, with no option block at all.\n"
+    " Esc to cancel . Tab to amend\n"
+)
+
+# (b) A permission question + numbered-looking prose + footer, but the gate is
+# NOT at the pane bottom -- assistant prose follows the footer (a quoted /
+# explained prompt, not the live active one).
+_NEG_PERMISSION_NOT_AT_BOTTOM = (
+    "For reference, the prompt looks like this:\n"
+    "\n"
+    " Do you want to proceed?\n"
+    " 1. Yes\n"
+    "   2. Yes, and always allow\n"
+    "   3. No\n"
+    " Esc to cancel . Tab to amend\n"
+    "\n"
+    "So you would normally pick option 1. But I have already finished, so\n"
+    "there is nothing for you to approve right now.\n"
+)
+
+# (c) "Run a dynamic workflow?" / "Dynamic workflows can use ..." quoted in
+# prose, footer present, NO live option block.
+_NEG_WORKFLOW_NO_OPTIONS = (
+    "A dynamic workflow gate normally shows:\n"
+    "\n"
+    " Run a dynamic workflow?\n"
+    " Dynamic workflows can use a lot of tokens quickly by running subagents.\n"
+    " Esc to cancel . Tab to amend\n"
+)
+
+# (d) A COMPLETE quoted Workflow block (real-looking options + footer) FOLLOWED
+# BY trailing assistant prose -- the third Hermes repro (passes the strict
+# parse on its own, so only the bottom-terminal requirement rejects it).
+_NEG_WORKFLOW_COMPLETE_THEN_PROSE = (
+    "Here is what the workflow gate looks like when it appears:\n"
+    "\n"
+    " Run a dynamic workflow?\n"
+    " This dynamic workflow will spin up subagents.\n"
+    " Dynamic workflows can use a lot of tokens quickly.\n"
+    " 1. Yes, run it\n"
+    "   2. View raw script\n"
+    "   3. No\n"
+    " Esc to cancel . Tab to amend\n"
+    "\n"
+    "As you can see, you would tap option 1 to proceed. Tell me what to do.\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("pane", "gate"),
+    [
+        (_NEG_CLAUDE_WANTS_NO_OPTIONS, "Permission"),
+        (_NEG_PERMISSION_NOT_AT_BOTTOM, "Permission"),
+        (_NEG_WORKFLOW_NO_OPTIONS, "Workflow"),
+        (_NEG_WORKFLOW_COMPLETE_THEN_PROSE, "Workflow"),
+    ],
+)
+def test_quoted_prompt_shapes_do_not_detect(gate_on, pane: str, gate: str) -> None:
+    """S-8 fail-closed: a quoted / explained / non-bottom gate must NOT light a
+    card even with the flag ON (the strict-parse + bottom-terminal gate)."""
+    assert extract_interactive_content(pane) is None, gate
+
+
+def test_claude_wants_to_without_question_or_options_no_match(gate_on) -> None:
+    """Hermes P2: ``Claude wants to `` is OPTIONAL context, never a sufficient
+    standalone top anchor -- without the real ``Do you want to ...?`` question
+    line + an option block, no Permission card."""
+    pane = (
+        "Earlier today:\n"
+        "\n"
+        " Claude wants to fetch content from evil.example.com\n"
+        "   3. No, and tell Claude what to do differently (esc)\n"
+    )
+    assert extract_interactive_content(pane) is None
+    assert parse_permission_prompt(pane) is None
+
+
+def test_complete_quoted_workflow_then_prose_strict_parse_rejects(gate_on) -> None:
+    """The bottom-terminal requirement: a complete-looking Workflow block with
+    trailing assistant prose is NOT the live gate -- ``parse_workflow_approval``
+    returns None (the footer is not at/near the pane bottom)."""
+    assert parse_workflow_approval(_NEG_WORKFLOW_COMPLETE_THEN_PROSE) is None
+
+
+def test_complete_quoted_permission_then_prose_strict_parse_rejects(gate_on) -> None:
+    """Same bottom-terminal requirement for the Permission variant."""
+    assert parse_permission_prompt(_NEG_PERMISSION_NOT_AT_BOTTOM) is None
+
+
+# ── Codex P2: Workflow phase lines must NOT be absorbed as options ─────────
+
+
+def test_workflow_phase_list_adjacent_to_options_parses_real_options(gate_on) -> None:
+    """A Workflow whose numbered PHASE list sits directly above the option
+    block (no intervening prose paragraph) must still parse the REAL options
+    (``Yes, run it`` / ``View raw script`` / ``No``), not the phase lines.
+    The parser anchors on the bottom-most contiguous numbered block above the
+    footer + validates the Workflow label shape."""
+    pane = (
+        "Workflow(Do a thing)\n"
+        "\n"
+        "-----------------------------------------------------------------\n"
+        " Run a dynamic workflow?\n"
+        "\n"
+        "  This dynamic workflow will spin up multiple subagents across the\n"
+        "  following phases:\n"
+        "  1. Sweep - 5 parallel researchers\n"
+        "  2. Verify - re-check the riskiest claims\n"
+        "  3. Dossier - one agent builds the dossier\n"
+        "  1. Yes, run it\n"
+        "    2. View raw script\n"
+        "    3. No\n"
+        "  Esc to cancel . Tab to amend\n"
+        "  ctrl+g to edit script in $EDITOR\n"
+    )
+    form = parse_workflow_approval(pane)
+    assert form is not None
+    assert [o.label for o in form.options] == ["Yes, run it", "View raw script", "No"]
+    assert [o.number for o in form.options] == [1, 2, 3]
+    result = extract_interactive_content(pane)
+    assert result is not None and result.name == "Workflow"
+
+
+def test_workflow_wrong_option_labels_rejected(gate_on) -> None:
+    """The Workflow strict parser validates the option labels against the known
+    shape -- a numbered block that is NOT the Yes/View/No options (only the
+    phase list, no real option block) returns None rather than a bogus form."""
+    pane = (
+        "Workflow(Do a thing)\n"
+        "\n"
+        "-----------------------------------------------------------------\n"
+        " Run a dynamic workflow?\n"
+        "  This dynamic workflow will spin up subagents across phases:\n"
+        "  1. Sweep - 5 parallel researchers\n"
+        "  2. Verify - re-check the riskiest claims\n"
+        "  3. Dossier - one agent builds the dossier\n"
+        " Esc to cancel . Tab to amend\n"
+    )
+    assert parse_workflow_approval(pane) is None
+    assert extract_interactive_content(pane) is None
+
+
+# ── Codex P2: terminal_parser imports config-free (ISOLATED subprocess) ────
+
+
+def test_terminal_parser_imports_without_config_isolated() -> None:
+    """``terminal_parser`` is a pure stdlib leaf — importing it AND reading the
+    gate flag accessor must succeed with NO ``TELEGRAM_BOT_TOKEN`` /
+    ``ALLOWED_USERS`` in the environment (``config`` RAISES without them). The
+    in-suite ``test_flag_off_no_detection`` can't prove this — the root conftest
+    sets a dummy token before collection, so the parent process already has one.
+    Run a FRESH subprocess with the token vars stripped: a non-zero exit (or any
+    stderr) would mean ``terminal_parser`` pulled in ``config`` at module load
+    (the leaf-purity break the kill-switch design forbids, Hermes P2-3)."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in ("TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "CC_TELEGRAM_PERMISSION_PROMPTS")
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import cctelegram.terminal_parser as tp; "
+            "print(tp.permission_prompts_enabled())",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, (
+        "`import cctelegram.terminal_parser` failed with no bot token — the "
+        "leaf likely imports `config` at module load.\n"
+        f"--- stderr ---\n{result.stderr}"
+    )
+    # Flag OFF by default (no env var) — and the import had no config side effect.
+    assert result.stdout.strip() == "False", result.stdout
+
+
+# ── Bottom-terminal: trailing input-box chrome does NOT false-reject ───────
+
+
+@pytest.mark.parametrize("fixture", _PERMISSION_FIXTURES)
+def test_permission_with_trailing_input_box_chrome_still_detects(
+    gate_on, fixture: str
+) -> None:
+    """A LIVE permission gate followed by the Claude Code input-box / status-bar
+    chrome (the real live-pane shape) still detects — the bottom-terminal check
+    only rejects arbitrary assistant PROSE below the footer, not chrome."""
+    live = _load(fixture) + (
+        "\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "  Opus 4.8 · Context left: 42%\n"
+    )
+    result = extract_interactive_content(live)
+    assert result is not None, fixture
+    assert result.name == "Permission", fixture
+
+
+def test_workflow_with_trailing_ctrlg_and_chrome_still_detects(gate_on) -> None:
+    """The Workflow ``ctrl+g to edit script`` line + input-box chrome below the
+    footer are known chrome — the gate still detects."""
+    live = _load("workflow_dynamic_launch_v2.1.190.txt") + (
+        "\n────────────────────────────────────────\n❯ \n  Opus 4.8 · Context: 42%\n"
+    )
+    result = extract_interactive_content(live)
+    assert result is not None and result.name == "Workflow"
