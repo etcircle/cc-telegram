@@ -1894,9 +1894,7 @@ def parse_permission_prompt(pane_text: str) -> AskUserQuestionForm | None:
     assert title_idx is not None
     title = lines[title_idx].strip()
 
-    excerpt_start = min(
-        idx for idx in (question_idx, preamble_idx) if idx is not None
-    )
+    excerpt_start = min(idx for idx in (question_idx, preamble_idx) if idx is not None)
     pane_excerpt = "\n".join(lines[excerpt_start : footer_idx + 1]).rstrip()
 
     return AskUserQuestionForm(

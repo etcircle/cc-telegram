@@ -174,9 +174,7 @@ def test_gate_parsers_decline_other_uis(gate_on) -> None:
         ),
     ],
 )
-def test_parse_permission_options(
-    fixture: str, title: str, labels: list[str]
-) -> None:
+def test_parse_permission_options(fixture: str, title: str, labels: list[str]) -> None:
     form = parse_permission_prompt(_load(fixture))
     assert form is not None, fixture
     assert form.select_mode == "single"

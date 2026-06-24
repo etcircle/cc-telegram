@@ -131,10 +131,9 @@ class Config:
         # SAME env var via a LOCAL ``os.getenv`` (it must not import config,
         # which raises without a bot token), so this attribute is intentionally
         # not the runtime authority — the parser flag is.
-        self.permission_prompts_enabled = (
-            os.getenv("CC_TELEGRAM_PERMISSION_PROMPTS", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
+        self.permission_prompts_enabled = os.getenv(
+            "CC_TELEGRAM_PERMISSION_PROMPTS", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
 
         # Max length of the per-tool input string surfaced in tool_use summary
         # lines (e.g. "**Bash**(<command>)", "**Read**(<path>)"). Long inputs
