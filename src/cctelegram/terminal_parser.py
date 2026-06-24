@@ -2,31 +2,93 @@
 
 Parses captured tmux pane content to detect:
   - Interactive UIs (AskUserQuestion, ExitPlanMode, RestoreCheckpoint,
-    Settings) via regex-based UIPattern matching with top/bottom
-    delimiters.
+    Settings, and — behind the ``CC_TELEGRAM_PERMISSION_PROMPTS`` flag —
+    Permission and Workflow approval gates) via regex-based UIPattern
+    matching with top/bottom delimiters.
   - Status line (spinner characters + working text) by scanning from bottom up.
 
 All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
-PermissionPrompt and BashApproval detection has been intentionally removed:
-the deployment runs Claude Code with ``--dangerously-skip-permissions``
-(YOLO mode), so neither prompt ever renders in the pane and the patterns
-were dead code wasting capture cycles. ExitPlanMode and AskUserQuestion
-remain because they still appear in the JSONL stream as ``tool_use``
-events and are also detected via pane scrape as a redundant safety net.
+Permission / Workflow approval-gate detection is RE-ENABLED behind the
+``CC_TELEGRAM_PERMISSION_PROMPTS`` flag (default OFF). It was removed in
+Wave 2 on the assumption the deployment always runs Claude Code with
+``--dangerously-skip-permissions`` — but bridged user-launched (resumed,
+non-bypass) sessions DO render tool-permission prompts, and the ``Workflow``
+tool's own dynamic-workflow-launch gate fires even under bypass. When the
+flag is ON, ``Permission`` (tool-permission prompts) and ``Workflow`` (the
+dynamic-workflow-launch approval) surface as cards. As of PR-1 they are
+DISPLAY-ONLY (a labels card + the existing manual ↑/↓/⏎/Esc nav keyboard);
+no semantic option-button dispatch yet. ExitPlanMode and AskUserQuestion
+remain detected unconditionally (they also appear in the JSONL stream as
+``tool_use`` events and are detected via pane scrape as a redundant safety
+net).
+
+The flag is a LOCAL ``os.getenv`` read (``_PERMISSION_PROMPTS_ENABLED``,
+re-readable via ``reset_for_tests`` / ``set_permission_prompts_enabled``) —
+this module is a pure stdlib leaf and MUST NOT import ``config`` (it raises
+without a bot token, which would force a token into parser unit tests). The
+bot's ``config.py`` owns the canonical ``CC_TELEGRAM_PERMISSION_PROMPTS``
+declaration for documentation; the parser just reads the same env var.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
-parse_status_line(), strip_pane_chrome(), extract_bash_output().
+parse_status_line(), strip_pane_chrome(), extract_bash_output(),
+parse_permission_prompt(), parse_workflow_approval().
 """
 
 import hashlib
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
 logger = logging.getLogger(__name__)
+
+
+# ── Permission / Workflow approval-gate detector kill-switch ──────────────
+#
+# A LOCAL parser flag (Hermes P2-3): ``terminal_parser`` is a pure stdlib
+# leaf and must NOT ``from .config import config`` (config raises without a
+# bot token). The bot's ``config.py`` OWNS the canonical
+# ``CC_TELEGRAM_PERMISSION_PROMPTS`` declaration for docs / the README sync
+# rule; this module reads the same env var locally so parser unit tests can
+# toggle it WITHOUT a token, via the ``reset_for_tests`` /
+# ``set_permission_prompts_enabled`` seam (the repo's reset-seam protocol).
+
+
+def _read_permission_prompts_env() -> bool:
+    """Truthiness of ``CC_TELEGRAM_PERMISSION_PROMPTS`` (default OFF)."""
+    return os.getenv("CC_TELEGRAM_PERMISSION_PROMPTS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+_PERMISSION_PROMPTS_ENABLED: bool = _read_permission_prompts_env()
+
+
+def permission_prompts_enabled() -> bool:
+    """True when Permission/Workflow gate detection is enabled (flag ON)."""
+    return _PERMISSION_PROMPTS_ENABLED
+
+
+def set_permission_prompts_enabled(value: bool) -> None:
+    """Test/runtime seam: override the gate-detection flag explicitly."""
+    global _PERMISSION_PROMPTS_ENABLED  # noqa: PLW0603
+    _PERMISSION_PROMPTS_ENABLED = bool(value)
+
+
+def reset_for_tests() -> None:
+    """Re-read the gate-detection flag from the environment (reset-seam).
+
+    Registered in the leaf's conftest reset protocol so a test that set the
+    flag (or the env var) does not leak into the next test.
+    """
+    global _PERMISSION_PROMPTS_ENABLED  # noqa: PLW0603
+    _PERMISSION_PROMPTS_ENABLED = _read_permission_prompts_env()
 
 
 @dataclass
@@ -86,6 +148,81 @@ class UIPattern:
 _RE_COLLAPSED_REGION = re.compile(
     r"^\s*(?:…|\.\.\.)\s+\+\d+\s+lines?\s+\(ctrl[+-]o\s+to\s+expand\)\s*$"
 )
+
+
+# ── Permission / Workflow approval-gate anchors (flag-gated patterns) ──────
+#
+# Verified against the Wave-0 v2.1.190 fixtures
+# (``tests/cctelegram/fixtures/permission_*.txt`` / ``workflow_*.txt``).
+# Corrections to plan v4 §1 are folded per
+# ``gate_fixtures_v2.1.190_NOTES.md``:
+#   - Permission TOP verbs vary (allow / proceed / create); the verb set is
+#     broadened and the ``Claude wants to`` alternative is kept.
+#   - Permission BOTTOM accepts EITHER an inline ``(esc)``-tailed option line
+#     (WebFetch — no separate footer) OR an ``Esc to cancel · Tab to amend``
+#     footer (Bash / Write).
+#   - The footer family (``Esc to cancel`` / ``Tab to amend`` / ``ctrl+g to
+#     edit script``) collides across Permission / Workflow / EPM; the patterns
+#     are ordered LAST and disambiguated on their TOP anchors.
+
+# Permission TOP — the verb set is intentionally broad (NOTES correction #1):
+# the co-occurring option-block + bottom footer carry the specificity, so a
+# loose verb here cannot light a card on prose alone (S-8: the bottom anchor
+# must co-occur within ``min_gap``).
+_RE_PERMISSION_TOP_QUESTION = re.compile(
+    r"^\s*Do you want to (?:allow|proceed|make|create|run|read|edit|write|"
+    r"fetch|search|delete|move|install|update|execute|apply|modify)\b"
+)
+# The "Claude wants to …" preamble line (WebFetch / Bash variants render it
+# above the question).
+_RE_PERMISSION_TOP_PREAMBLE = re.compile(r"^\s*Claude wants to ")
+
+# Permission BOTTOM (any match) — char-class tolerant for ``(Esc)`` / drift.
+#   (a) an inline ``(esc)``-tailed numbered option (the "No, … (esc)" row —
+#       WebFetch carries the affordance inline and has NO separate footer);
+#   (b) the ``Esc to cancel · Tab to amend`` footer (Bash / Write).
+_RE_PERMISSION_BOTTOM_INLINE_ESC = re.compile(
+    r"^\s*[❯›▶*)>↓\s]?\s*\d+\.\s+.*\([eE]sc\)\s*$"
+)
+_RE_PERMISSION_BOTTOM_FOOTER = re.compile(r"^\s*Esc to cancel\b")
+
+# Workflow TOP (any match) — ``Run a dynamic workflow?`` is the tightest
+# (NOTES correction #5); the other two appear in the body.
+_RE_WORKFLOW_TOP = (
+    re.compile(r"^\s*Run a dynamic workflow\?"),
+    re.compile(r"^\s*This dynamic workflow will\b"),
+    re.compile(r"^\s*Dynamic workflows can use\b"),
+)
+# Workflow BOTTOM — anchored on the ``Esc to cancel`` / ``Tab to amend``
+# footer line (they co-occur on ONE line: ``Esc to cancel · Tab to amend``).
+# ``ctrl+g to edit script`` is DELIBERATELY EXCLUDED as a bottom anchor: it
+# renders on its OWN line BELOW the ``Esc to cancel · Tab to amend`` line, so
+# including it would make ``_try_extract``'s bottom-up scan anchor on the
+# lower ``ctrl+g`` line and then cross the ``Esc to cancel`` line during the
+# walk-back to the top — tripping the pre-top-found bail (an OLDER bottom
+# marker between bottom and top) and returning None. Anchoring on the upper
+# footer line avoids the cross-bail; the strict ``parse_workflow_approval``
+# validates the full shape independently.
+_RE_WORKFLOW_BOTTOM = (
+    re.compile(r"^\s*Esc to cancel\b"),
+    re.compile(r"^\s*Tab to amend\b"),
+)
+
+# A trailing ``(esc)`` / ``(Esc)`` affordance on a permission option label —
+# stripped deterministically + identically on every parse (so the cursor-blind
+# fingerprint and the label match see the same text on mint and re-parse).
+_RE_ESC_AFFORDANCE_SUFFIX = re.compile(r"\s*\([eE]sc\)\s*$")
+
+
+def _strip_esc_affordance(label: str) -> str:
+    """Remove a trailing ``(esc)`` / ``(Esc)`` affordance from an option label.
+
+    Deterministic + idempotent: ``parse_permission_prompt`` carries the FULL
+    option text (S-6: "Yes" vs "Yes, and don't ask again" must not collide),
+    minus only the terminal-affordance hint. Applied on every parse so the
+    minted label and any verify re-parse compare equal.
+    """
+    return _RE_ESC_AFFORDANCE_SUFFIX.sub("", label).rstrip()
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
@@ -161,7 +298,46 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Type to filter"),
         ),
     ),
+    # ── Interactive approval gates (ordered LAST; flag-gated) ─────────────
+    # These two MUST come after every AUQ/EPM/Settings/RestoreCheckpoint
+    # pattern so first-match-wins never lets a gate steal an AUQ/EPM/Settings
+    # pane (and vice-versa). They are filtered OUT of the detector when
+    # ``CC_TELEGRAM_PERMISSION_PROMPTS`` is OFF (see
+    # ``_active_ui_patterns``) — a flag-OFF deploy adds ZERO new detection.
+    # Each is disambiguated on its TOP anchor (the footer family overlaps).
+    UIPattern(
+        name="Permission",
+        top=(_RE_PERMISSION_TOP_QUESTION, _RE_PERMISSION_TOP_PREAMBLE),
+        bottom=(_RE_PERMISSION_BOTTOM_INLINE_ESC, _RE_PERMISSION_BOTTOM_FOOTER),
+        min_gap=1,
+        bottom_up=True,
+        bail_markers=(_RE_COLLAPSED_REGION,),
+    ),
+    UIPattern(
+        name="Workflow",
+        top=_RE_WORKFLOW_TOP,
+        bottom=_RE_WORKFLOW_BOTTOM,
+        min_gap=1,
+        bottom_up=True,
+        bail_markers=(_RE_COLLAPSED_REGION,),
+    ),
 ]
+
+# Names of the flag-gated approval-gate patterns. The detector filters these
+# out of ``UI_PATTERNS`` when ``CC_TELEGRAM_PERMISSION_PROMPTS`` is OFF.
+_GATE_PATTERN_NAMES: Final[frozenset[str]] = frozenset({"Permission", "Workflow"})
+
+
+def _active_ui_patterns() -> list[UIPattern]:
+    """``UI_PATTERNS`` with the approval-gate patterns filtered by the flag.
+
+    When ``CC_TELEGRAM_PERMISSION_PROMPTS`` is OFF (default) the ``Permission``
+    / ``Workflow`` patterns are excluded — a flag-OFF deploy adds NO detection,
+    no card, no ``WAITING_ON_USER`` promotion (S-9, gated at the DETECTOR).
+    """
+    if _PERMISSION_PROMPTS_ENABLED:
+        return UI_PATTERNS
+    return [p for p in UI_PATTERNS if p.name not in _GATE_PATTERN_NAMES]
 
 
 # ── ExitPlanMode plan-file footer ─────────────────────────────────────────
@@ -312,7 +488,7 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
         return None
 
     lines = pane_text.strip().split("\n")
-    for pattern in UI_PATTERNS:
+    for pattern in _active_ui_patterns():
         result = _try_extract(lines, pattern)
         if result:
             return result
@@ -1612,6 +1788,214 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
         pane_walkback_title=pane_walkback_title,
         select_mode=select_mode,
         options_complete=options_complete,
+    )
+
+
+# ── Interactive approval-gate parsers (Permission / Workflow) ─────────────
+#
+# Strict-or-``None`` parsers modeled on ``parse_ask_user_question``. Each
+# emits a single-question ``AskUserQuestionForm`` (``select_mode="single"``,
+# ``is_review_screen=False``) whose ``AskOption`` rows come from the
+# ``❯ N. <label>`` block above the gate footer. The FULL option label is
+# carried (only a trailing ``(esc)`` affordance is stripped — deterministic
+# on every parse) so PR-2's ``_loose_label_match`` cannot confuse
+# "Yes" with "Yes, and don't ask again …" (S-6). DISPLAY-ONLY in PR-1.
+
+
+def _gate_options_above(lines: list[str], footer_idx: int) -> tuple[AskOption, ...]:
+    """Collect the contiguous ``❯ N. <label>`` option block above ``footer_idx``.
+
+    Walks UP from the footer over blank / separator / option / indented-
+    description lines to find the option block's top, then reuses
+    ``_parse_numbered_options`` (contiguity + cursor + checkbox handling).
+    A trailing ``(esc)`` affordance is stripped from each label
+    deterministically (S-6 full-label parity on mint==verify).
+    """
+    start_idx = footer_idx
+    for j in range(footer_idx - 1, -1, -1):
+        line = lines[j]
+        stripped = line.strip()
+        if not stripped:
+            start_idx = j
+            continue
+        if _RE_NUMBERED_OPTION.match(line):
+            start_idx = j
+            continue
+        if all(c == "─" for c in stripped):
+            start_idx = j
+            continue
+        # Indented description continuation within a few lines of an option.
+        if line.startswith(("  ", "\t")) and any(
+            _RE_NUMBERED_OPTION.match(lines[k])
+            for k in range(j + 1, min(j + 6, footer_idx + 1))
+        ):
+            start_idx = j
+            continue
+        break
+    region = lines[start_idx : footer_idx + 1]
+    raw = _parse_numbered_options(region)
+    return tuple(
+        AskOption(
+            label=_strip_esc_affordance(o.label),
+            recommended=o.recommended,
+            cursor=o.cursor,
+            number=o.number,
+            description=o.description,
+            selected=o.selected,
+        )
+        for o in raw
+    )
+
+
+def parse_permission_prompt(pane_text: str) -> AskUserQuestionForm | None:
+    """Strict-or-None parse of a tool-permission approval gate (Gate A).
+
+    Anchors on a ``Do you want to …`` / ``Claude wants to …`` TOP line and a
+    bottom anchor that is EITHER an inline ``(esc)``-tailed option (WebFetch,
+    no footer) OR an ``Esc to cancel`` footer (Bash / Write). Returns a
+    single-question ``AskUserQuestionForm`` (``select_mode="single"``) with the
+    full, affordance-stripped option labels, or ``None`` when the pane is not a
+    recognizable permission gate. Cursor / number / checkbox handling and
+    contiguity are inherited from ``_parse_numbered_options``.
+    """
+    if not pane_text:
+        return None
+    lines = pane_text.split("\n")
+
+    # Bottom anchor — lowest-on-screen match wins (live footer beats a stale
+    # scrollback one). Accept EITHER the inline ``(esc)`` option OR the footer.
+    footer_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _RE_PERMISSION_BOTTOM_INLINE_ESC.match(
+            lines[i]
+        ) or _RE_PERMISSION_BOTTOM_FOOTER.match(lines[i]):
+            footer_idx = i
+            break
+    if footer_idx is None:
+        return None
+
+    # TOP question line — the lowest ``Do you want to …`` ABOVE the footer.
+    # Fall back to the ``Claude wants to …`` preamble for the display title.
+    question_idx: int | None = None
+    preamble_idx: int | None = None
+    for i in range(footer_idx, -1, -1):
+        if question_idx is None and _RE_PERMISSION_TOP_QUESTION.match(lines[i]):
+            question_idx = i
+        if preamble_idx is None and _RE_PERMISSION_TOP_PREAMBLE.match(lines[i]):
+            preamble_idx = i
+    if question_idx is None and preamble_idx is None:
+        return None
+
+    options = _gate_options_above(lines, footer_idx)
+    if not options:
+        return None
+
+    title_idx = question_idx if question_idx is not None else preamble_idx
+    assert title_idx is not None
+    title = lines[title_idx].strip()
+
+    excerpt_start = min(
+        idx for idx in (question_idx, preamble_idx) if idx is not None
+    )
+    pane_excerpt = "\n".join(lines[excerpt_start : footer_idx + 1]).rstrip()
+
+    return AskUserQuestionForm(
+        current_question_title=title,
+        options=options,
+        is_review_screen=False,
+        is_free_text=False,
+        pane_excerpt=pane_excerpt,
+        select_mode="single",
+        options_complete=options[0].number == 1,
+    )
+
+
+# Workflow body lines: the token-cost warning sentence + the phase list.
+_RE_WORKFLOW_WARNING = re.compile(r"Dynamic workflows can use\b")
+
+
+def parse_workflow_approval(pane_text: str) -> AskUserQuestionForm | None:
+    """Strict-or-None parse of the dynamic-workflow-launch approval gate (Gate B).
+
+    Anchors on a Workflow TOP (``Run a dynamic workflow?`` /
+    ``This dynamic workflow will`` / ``Dynamic workflows can use``) and the
+    ``Esc to cancel`` / ``Tab to amend`` footer. Returns a single-question
+    ``AskUserQuestionForm`` (``select_mode="single"``) with the full option
+    labels (``Yes, run it`` / ``View raw script`` / ``No``). The phases list
+    and the token-cost warning are stashed in ``_meta`` (display-only body
+    text for the card) so PR-1 can surface them without re-scraping. Returns
+    ``None`` when the pane is not a recognizable Workflow gate.
+    """
+    if not pane_text:
+        return None
+    lines = pane_text.split("\n")
+
+    # Footer (lowest-on-screen) — ``Esc to cancel`` / ``Tab to amend``.
+    footer_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if any(p.match(lines[i]) for p in _RE_WORKFLOW_BOTTOM):
+            footer_idx = i
+            break
+    if footer_idx is None:
+        return None
+
+    # TOP — anchor the region on the FIRST (topmost) Workflow anchor line that
+    # belongs to the live gate, i.e. the topmost anchor in the CONTIGUOUS run
+    # of anchor / body / option / blank / separator lines above the footer.
+    # ``Run a dynamic workflow?`` heads the gate; the phase list + token-cost
+    # warning sit between it and the options. Walking up from the footer over
+    # those line kinds captures the whole gate region (phases included).
+    top_anchor_idx: int | None = None
+    for i in range(footer_idx, -1, -1):
+        if any(p.match(lines[i]) for p in _RE_WORKFLOW_TOP):
+            top_anchor_idx = i
+    if top_anchor_idx is None:
+        return None
+
+    options = _gate_options_above(lines, footer_idx)
+    if not options:
+        return None
+
+    # The question title prefers the ``Run a dynamic workflow?`` line when
+    # present (the gate's heading), else the topmost matched anchor line.
+    title = lines[top_anchor_idx].strip()
+    for i in range(top_anchor_idx, footer_idx + 1):
+        if re.match(r"^\s*Run a dynamic workflow\?", lines[i]):
+            title = lines[i].strip()
+            break
+
+    # Region: from the gate heading (``Run a dynamic workflow?`` when present,
+    # else the topmost anchor) down to the footer, so the phases + warning are
+    # in the body.
+    region_start = top_anchor_idx
+    for i in range(top_anchor_idx, footer_idx + 1):
+        if re.match(r"^\s*Run a dynamic workflow\?", lines[i]):
+            region_start = i
+            break
+    region = lines[region_start : footer_idx + 1]
+    pane_excerpt = "\n".join(region).rstrip()
+
+    # Display-only body text for the card: the phase list + the token-cost
+    # warning. The whole gate region (``pane_excerpt``) reliably carries both,
+    # and the phase bullets (``1. Summarize …``) are visually
+    # indistinguishable from the option block by regex alone (both are
+    # ``N. <text>``), so we deliberately surface the full region rather than a
+    # fragile body slice. Stashed in ``_meta`` (excluded from the fingerprint —
+    # display-only) so PR-1's render branch can show phases + warning without
+    # re-scraping the pane. ``has_token_warning`` flags the warning sentence.
+    has_warning = any(_RE_WORKFLOW_WARNING.search(line) for line in region)
+    return AskUserQuestionForm(
+        current_question_title=title,
+        options=options,
+        is_review_screen=False,
+        is_free_text=False,
+        pane_excerpt=pane_excerpt,
+        select_mode="single",
+        options_complete=options[0].number == 1,
+        _meta={
+            "workflow_body": pane_excerpt,
+            "has_token_warning": "1" if has_warning else "0",
+        },
     )
 
 
