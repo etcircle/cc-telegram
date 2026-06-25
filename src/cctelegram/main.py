@@ -66,6 +66,19 @@ def _run_bot() -> None:
     logger.info("Allowed users: %s", config.allowed_users)
     logger.info("Claude projects path: %s", config.claude_projects_path)
 
+    # Apply the CC_TELEGRAM_PERMISSION_PROMPTS flag to terminal_parser at
+    # startup. The parser reads the env var via a LOCAL os.getenv AT IMPORT,
+    # which can run before config's load_dotenv — so a value set only in .env
+    # would be missed (an import-order race). config is the env authority (it
+    # loads .env), so seed the parser from it here, import-order-independently.
+    from . import terminal_parser
+
+    terminal_parser.set_permission_prompts_enabled(config.permission_prompts_enabled)
+    logger.info(
+        "Permission/Workflow gate cards: %s",
+        "ON" if config.permission_prompts_enabled else "OFF",
+    )
+
     session = tmux_manager.get_or_create_session()
     logger.info("Tmux session '%s' ready", session.session_name)
 

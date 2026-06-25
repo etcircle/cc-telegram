@@ -129,8 +129,11 @@ class Config:
         # config OWNS this canonical declaration for documentation + the README
         # sync rule; ``terminal_parser`` is a pure stdlib leaf and reads the
         # SAME env var via a LOCAL ``os.getenv`` (it must not import config,
-        # which raises without a bot token), so this attribute is intentionally
-        # not the runtime authority — the parser flag is.
+        # which raises without a bot token). The parser's flag is the runtime
+        # authority, but its import-time read can race ``load_dotenv``; so
+        # ``main._run`` SEEDS the parser from THIS value at startup
+        # (``terminal_parser.set_permission_prompts_enabled``), making a
+        # .env-only value reliable regardless of import order.
         self.permission_prompts_enabled = os.getenv(
             "CC_TELEGRAM_PERMISSION_PROMPTS", ""
         ).strip().lower() in ("1", "true", "yes", "on")
