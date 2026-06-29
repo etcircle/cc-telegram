@@ -1774,3 +1774,213 @@ class TestRecoverConsistentSideFileForCtx:
             )
         finally:
             interactive_ui.reset_for_tests()
+
+
+# ── Side-file freshness floor (keep a LIVE aged AUQ card tappable past TTL) ───
+#
+# A tall single-select card whose top options scroll off the 80×24 pane stays
+# on the trusted ``side_file_ok`` path only while ``written_at`` is within the
+# 300s read-TTL; past that it drops to ``bail_partial`` (no pick buttons). The
+# in-memory ``_side_file_freshness`` floor — refreshed by the status poller at
+# the observed-live preserve branches — raises the effective freshness so a
+# still-live aged card stays trusted + tappable, WITHOUT mutating the on-disk
+# ``written_at`` (the prose anchor + future-skew guard keep the RAW stamp).
+
+
+def _partial_affordance_pane() -> str:
+    """The affordance pane with the TOP options (1–2) scrolled OFF the visible
+    region — the live-reproduced tall-card shape. The visible block starts at
+    option 3, so the pane is an INCOMPLETE (untrusted) picker that bails
+    ``bail_partial`` past the TTL — but is still CONSISTENT with the side file
+    by numbered slot, so the freshness floor flips it back to ``side_file_ok``.
+    """
+    lines = _AFFORDANCE_PANE.read_text().split("\n")
+    idx = next(
+        i for i, ln in enumerate(lines) if ln.strip().lstrip("❯ ").startswith("3.")
+    )
+    return "\n".join(lines[idx:])
+
+
+_PARTIAL_AFFORDANCE_PANE = _partial_affordance_pane()
+
+
+class TestSideFileFreshnessFloor:
+    _WID = "@auqsrc-floor"
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    def test_freshness_floor_keeps_side_file_ok_past_ttl(self, _cc_dir):
+        """An aged record on a PARTIAL (top-scrolled-off) pane renders an
+        untrusted ``bail`` with no floor; after a refresh it renders
+        ``side_file_ok`` / ``dispatch_trusted=True`` (the live-repro shape)."""
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_side_file_at(
+                _cc_dir,
+                self._SID,
+                written_at=time.time() - (auq_source._PRETOOL_TTL_SECONDS + 60),
+            )
+            pane = _PARTIAL_AFFORDANCE_PANE
+
+            # No floor: the aged side file is consistent but past the read-TTL,
+            # and the visible pane is a PARTIAL picker → untrusted partial bail.
+            before = auq_source.resolve_auq_source_for_render(self._WID, pane)
+            assert before.decision == "bail"
+            assert before.dispatch_trusted is False
+
+            # Observe the card live → raise the freshness floor for this window.
+            auq_source.refresh_side_file_freshness(self._WID)
+
+            after = auq_source.resolve_auq_source_for_render(self._WID, pane)
+            assert after.decision == "side_file_ok"
+            assert after.kind == "side_file"
+            assert after.dispatch_trusted is True
+        finally:
+            _unbind_window(self._WID)
+
+    def test_strict_resolver_parity_with_floor(self, _cc_dir):
+        """The strict ``resolve_auq_source`` returns ``side_file`` (not ``pane``)
+        under the floor for the same aged record — mint/validate parity, so a
+        trusted render token does not ``source_drift`` at validate."""
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_side_file_at(
+                _cc_dir,
+                self._SID,
+                written_at=time.time() - (auq_source._PRETOOL_TTL_SECONDS + 60),
+            )
+            pane = _AFFORDANCE_PANE.read_text()
+
+            # Without the floor the strict resolver drifts to the pane.
+            assert auq_source.resolve_auq_source(self._WID, None, pane).kind == "pane"
+
+            auq_source.refresh_side_file_freshness(self._WID)
+            strict = auq_source.resolve_auq_source(self._WID, None, pane)
+            assert strict.kind == "side_file"
+            assert strict.source_fingerprint == auq_source._canonical_dict_fingerprint(
+                tool_input
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_remint_on_source_drift_noop_under_floor(self, _cc_dir):
+        """The render decision + strict source agree under the floor, so the
+        poller's drift compare sees minted==live and does NOT re-render (loop
+        safety): render kind == strict kind == ``side_file``."""
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_side_file_at(
+                _cc_dir,
+                self._SID,
+                written_at=time.time() - (auq_source._PRETOOL_TTL_SECONDS + 60),
+            )
+            pane = _AFFORDANCE_PANE.read_text()
+            auq_source.refresh_side_file_freshness(self._WID)
+
+            render = auq_source.resolve_auq_source_for_render(self._WID, pane)
+            strict = auq_source.resolve_auq_source(self._WID, None, pane)
+            # Render mints side_file; strict resolves side_file → no drift.
+            assert render.kind == strict.kind == "side_file"
+            assert render.source_fingerprint == strict.source_fingerprint
+        finally:
+            _unbind_window(self._WID)
+
+    def test_multiselect_sticky_source_past_ttl_under_floor(self, _cc_dir):
+        """``peek_sticky_source`` (the multi-select ``aqt:`` pin) stays
+        ``side_file`` under the floor — the floor keeps a multi-select toggle
+        card alive past the TTL too."""
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_side_file_at(
+                _cc_dir,
+                self._SID,
+                written_at=time.time() - (auq_source._PRETOOL_TTL_SECONDS + 60),
+            )
+            minted_fp = auq_source._canonical_dict_fingerprint(tool_input)
+
+            # Without the floor the sticky source is TTL-aged → None.
+            assert (
+                auq_source.peek_sticky_source(self._WID, "side_file", minted_fp) is None
+            )
+
+            auq_source.refresh_side_file_freshness(self._WID)
+            got = auq_source.peek_sticky_source(self._WID, "side_file", minted_fp)
+            assert got == tool_input
+        finally:
+            _unbind_window(self._WID)
+
+    def test_floor_does_not_mutate_written_at(self, _cc_dir):
+        """``peek_side_file_written_at`` (the prose anchor) returns the ORIGINAL
+        stamp after a refresh — the floor never re-stamps the record."""
+        _bind_window(self._WID, self._SID)
+        try:
+            ts = time.time() - (auq_source._PRETOOL_TTL_SECONDS + 60)
+            _write_side_file_at(_cc_dir, self._SID, written_at=ts)
+            auq_source.refresh_side_file_freshness(self._WID)
+            assert auq_source.peek_side_file_written_at(self._SID) == pytest.approx(ts)
+        finally:
+            _unbind_window(self._WID)
+
+    def test_floor_expires_when_unobserved(self, _cc_dir, monkeypatch):
+        """Once the poller stops refreshing, the floor ages out: at
+        ``now > floor + TTL`` the card bails again."""
+        _bind_window(self._WID, self._SID)
+        try:
+            now = time.time()
+            _write_side_file_at(_cc_dir, self._SID, written_at=now - 1000)
+            pane = _AFFORDANCE_PANE.read_text()
+
+            # Refresh at t0, then advance the wall clock past floor+TTL.
+            monkeypatch.setattr(auq_source.time, "time", lambda: now)
+            auq_source.refresh_side_file_freshness(self._WID)
+            assert (
+                auq_source.resolve_auq_source_for_render(self._WID, pane).decision
+                == "side_file_ok"
+            )
+
+            later = now + auq_source._PRETOOL_TTL_SECONDS + 1
+            monkeypatch.setattr(auq_source.time, "time", lambda: later)
+            assert (
+                auq_source.resolve_auq_source_for_render(self._WID, pane).decision
+                == "bail"
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_future_skew_still_rejected_under_floor(self, _cc_dir):
+        """A future-stamped file is still rejected even with a floor — the
+        future-skew guard uses the RAW age, never the floored age."""
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_side_file_at(
+                _cc_dir,
+                self._SID,
+                written_at=time.time() + auq_source._PRETOOL_FUTURE_SKEW_SECONDS + 30,
+            )
+            pane = _AFFORDANCE_PANE.read_text()
+            auq_source.refresh_side_file_freshness(self._WID)
+            # The future-skew record is rejected → falls back to the pane.
+            assert auq_source.resolve_auq_source(self._WID, None, pane).kind == "pane"
+            r = auq_source.resolve_auq_source_for_render(self._WID, pane)
+            assert r.decision != "side_file_ok"
+        finally:
+            _unbind_window(self._WID)
+
+    def test_reset_for_tests_clears_freshness(self, _cc_dir):
+        """``reset_for_tests`` clears ``_side_file_freshness`` so the floor does
+        not leak between tests."""
+        auq_source.refresh_side_file_freshness(self._WID)
+        assert auq_source._side_file_freshness  # populated
+        auq_source.reset_for_tests()
+        assert not auq_source._side_file_freshness  # cleared
+
+    def test_forget_for_window_clears_floor(self, _cc_dir):
+        """The floor is cleared at teardown (``forget_for_window``)."""
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_side_file_at(_cc_dir, self._SID, written_at=time.time())
+            auq_source.refresh_side_file_freshness(self._WID)
+            assert self._WID in auq_source._side_file_freshness
+            auq_source.forget_for_window(self._WID)
+            assert self._WID not in auq_source._side_file_freshness
+        finally:
+            _unbind_window(self._WID)

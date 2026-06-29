@@ -375,7 +375,12 @@ def resolve_auq_source_for_render(
     record = _read_live_pretool_record(window_id, apply_ttl=False)
     if record is not None:
         consistent, reason = _record_consistent_with_pane(record, pane_form)
-        within_ttl = (time.time() - record.written_at) <= _PRETOOL_TTL_SECONDS
+        # The freshness floor keeps a LIVE side-file card trusted past the read-TTL
+        # (the poller refreshes it at every observed-live preserve branch). Folded
+        # via ``max(written_at, floor)`` — the on-disk ``written_at`` is unchanged.
+        within_ttl = (
+            time.time() - max(record.written_at, _freshness_floor(window_id))
+        ) <= _PRETOOL_TTL_SECONDS
         if consistent and within_ttl:
             # The side file carries the question TITLE the pane lacks; overlay
             # the live pane (cursor / tab / review) onto it.
@@ -559,6 +564,21 @@ class PreToolAskRecord:
 # stale-serve). Cleared by ``forget_for_window`` when the AUQ resolves.
 _pretool_ask_records: dict[str, PreToolAskRecord] = {}
 
+# Per-window in-memory "freshness floor" (window_id → last observed-live WALL
+# time). The status poller calls ``refresh_side_file_freshness`` at every
+# observed-live preserve branch (the same gating as the pick-token deadline
+# refresh), so a LIVE side-file card whose user left it open past the 300s
+# read-TTL keeps its trusted ``side_file_ok`` render (and thus its tappable
+# option buttons) instead of dropping to an untrusted ``bail_partial``. The
+# floor is folded into the TTL age via ``max(record.written_at, floor)`` at the
+# two TTL trust-gate sites ONLY — it NEVER mutates the on-disk ``written_at``
+# (the prose anchor + the future-skew guard keep the RAW stamp). Deliberately on
+# the ``time.time()`` WALL clock (a different clock from the pick-token TTL's
+# ``monotonic``), so the two never contaminate each other. Cleared at teardown
+# (``forget_for_window``) and ``reset_for_tests``; restart wipes it (an aged
+# card then ages normally post-restart — disclosed degradation).
+_side_file_freshness: dict[str, float] = {}
+
 _PRETOOL_TTL_SECONDS = 300  # 5 minutes (v4 plan; lowered from v2's 10)
 # Codex chunk-3 P1: future-timestamp guard. A side file with
 # ``written_at`` far in the future (clock skew, time tamper) would
@@ -588,6 +608,27 @@ _SESSION_ID_RE = re.compile(
 # value. Defense-in-depth: also reject anything that isn't a strict
 # 12-char hex digest before it enters the log surface.
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def refresh_side_file_freshness(window_id: str) -> None:
+    """Record that ``window_id``'s AUQ side-file card was just observed LIVE.
+
+    Stamps the per-window freshness floor to ``time.time()``. Called by
+    ``status_polling`` at the observed-live preserve branches (the same gating as
+    the pick-token deadline refresh), so a long-open LIVE side-file card stays on
+    the trusted ``side_file_ok`` render path — and keeps its tappable option
+    buttons — past the 300s read-TTL. Never touches the on-disk record.
+    """
+    _side_file_freshness[window_id] = time.time()
+
+
+def _freshness_floor(window_id: str) -> float:
+    """Return the freshness floor (last observed-live wall time) for ``window_id``.
+
+    ``0.0`` when never observed, so ``max(record.written_at, 0.0)`` is a no-op for
+    a window the poller never refreshed — the floor only ever WIDENS freshness.
+    """
+    return _side_file_freshness.get(window_id, 0.0)
 
 
 def _pretool_side_file_path(session_id: str) -> Path | None:
@@ -923,8 +964,12 @@ def _read_live_pretool_record(
 
     # TTL check + future-skew guard (codex chunk-3 P1). Negative age
     # (timestamp in the future) is rejected to prevent a tampered or
-    # clock-skewed file from staying valid indefinitely.
-    age = time.time() - record.written_at
+    # clock-skewed file from staying valid indefinitely. The future-skew guard
+    # uses the RAW ``age`` (NEVER the floor — a freshness floor must not mask a
+    # clock-tampered/future-stamped file); the read-TTL uses a SEPARATE
+    # floored ``ttl_age`` so a still-live long-open card stays trusted.
+    now = time.time()
+    age = now - record.written_at
     if age < -_PRETOOL_FUTURE_SKEW_SECONDS:
         logger.debug(
             "Pretool resolve window=%s reason=future_skew age=%.1fs fp=%s",
@@ -933,14 +978,16 @@ def _read_live_pretool_record(
             safe_fp,
         )
         return None
-    if apply_ttl and age > _PRETOOL_TTL_SECONDS:
-        logger.debug(
-            "Pretool resolve window=%s reason=stale age=%.1fs fp=%s",
-            window_id,
-            age,
-            safe_fp,
-        )
-        return None
+    if apply_ttl:
+        ttl_age = now - max(record.written_at, _freshness_floor(window_id))
+        if ttl_age > _PRETOOL_TTL_SECONDS:
+            logger.debug(
+                "Pretool resolve window=%s reason=stale age=%.1fs fp=%s",
+                window_id,
+                ttl_age,
+                safe_fp,
+            )
+            return None
 
     return record
 
@@ -1070,6 +1117,10 @@ def forget_for_window(window_id: str) -> None:
     ``unlink_for_session`` with the old id.
     """
     _pretool_ask_records.pop(window_id, None)
+    # Drop the freshness floor co-located with the side-file cache eviction (the
+    # natural teardown — sole caller is ``forget_ask_tool_input`` at AUQ/EPM
+    # resolution; covers the /clear race).
+    _side_file_freshness.pop(window_id, None)
     session_id = peek_session_id_for_window(window_id)
     if not session_id:
         return
@@ -1456,4 +1507,5 @@ def reset_for_tests() -> None:
     """
     global _jsonl_cache_getter
     _pretool_ask_records.clear()
+    _side_file_freshness.clear()
     _jsonl_cache_getter = lambda _window_id: None  # noqa: E731

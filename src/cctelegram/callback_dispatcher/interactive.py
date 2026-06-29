@@ -408,6 +408,35 @@ async def _dispatch_pick_pane_locked(
             )
         return _PickPaneOutcome("commit_unconfirmed", reason)
 
+    # Synthetic-cursor SAFETY guard (BEFORE any keystroke). On the side-file
+    # render path ``current_form`` carries the live pane's cursor overlaid onto
+    # the full side-file options — but ``terminal_parser._overlay_cursor_and_selection``
+    # DEFAULTS the cursor to option 1 when the live pane shows no ``❯`` (the real
+    # cursor scrolled off a tall card whose top options are above the captured
+    # region). That PHANTOM cursor at option 1 makes a tap on option 1 compute
+    # ``delta = 0`` (no nav), verify-pass the same phantom, and commit ``Enter``
+    # against whatever the REAL (off-screen) cursor is on — a WRONG dispatch.
+    # Re-parse a PANE-ONLY form: when it carries NO real ``cursor=True`` option
+    # while ``current_form`` does, ``current_form``'s cursor is the synthetic
+    # default → BAIL ``not_advanced`` before any keystroke (the callback falls
+    # through; the user re-taps once the cursor is visible, or uses manual nav).
+    # Enter is NEVER sent on a synthetic cursor. Visible-cursor dispatch is
+    # byte-identical — only the no-real-pane-cursor case changes behavior.
+    # (Making an off-screen option-1 tap actually dispatch is a separate
+    # follow-up; here it SAFELY no-ops.)
+    if any(o.cursor for o in current_form.options):
+        gpane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+        gpane_form = resolve_ask_form(None, gpane) if gpane else None
+        if gpane_form is not None and not any(o.cursor for o in gpane_form.options):
+            logger.info(
+                "AUQ_PICK nav cursor_synthetic user=%d window=%s opt=%d "
+                "(no real pane cursor; phantom default — bailing before keystroke)",
+                user.id,
+                window_id,
+                option_number,
+            )
+            return _bail_not_advanced("cursor_synthetic")
+
     target = option_number
     cur = next((o for o in current_form.options if o.cursor), None)
     if cur is None or cur.number is None:
