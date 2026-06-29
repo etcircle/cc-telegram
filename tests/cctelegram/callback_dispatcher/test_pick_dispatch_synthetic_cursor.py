@@ -53,6 +53,15 @@ _PANE_WITH_CURSOR = (_FX / "auq_single_select_with_affordances_pane.txt").read_t
 # The same picker captured with the ❯ cursor scrolled OFF the visible region
 # (the tall-card off-screen-cursor case): no ``❯`` anywhere in the options.
 _PANE_NO_CURSOR = _PANE_WITH_CURSOR.replace("❯ ", "  ")
+# The same picker with a REAL ❯ cursor on option 3 (a visible start cursor for
+# the navigate-into-view positive case). Cursor-blind fingerprint is identical.
+_PANE_CURSOR_ON_3 = _PANE_NO_CURSOR.replace(
+    "  3. Descriptions only", "❯ 3. Descriptions only"
+)
+# A non-picker pane (no AUQ markers / cursor rows) — the picker positively GONE
+# after a committing Enter, so the confirm step classifies a resolved single-Q
+# pick as ``dispatched``.
+_PANE_RESOLVED = "$ \n"
 
 
 def _write_side_file(cc_dir: Path) -> dict:
@@ -104,6 +113,46 @@ class _StaticPicker:
         return True
 
 
+class _SequencedPicker:
+    """A fake tmux whose pane changes per successive ``capture_pane`` call.
+
+    The dispatch flow captures in a fixed order — validate (in
+    ``pick_token.validate_and_consume``), then guard, verify, and confirm in
+    ``_dispatch_pick_pane_locked`` — so a per-call frame list lets a test STAGE
+    the validate/guard/verify frames independently (e.g. a real cursor at guard
+    but a cursorless frame at verify, the TOCTOU case). Once the list is
+    exhausted the LAST frame repeats (so a happy path doesn't run dry). Records
+    every ``send_keys`` so the test can assert NO ``Enter`` was ever sent.
+    """
+
+    def __init__(self, window_id: str, frames: list[str]) -> None:
+        self.window_id = window_id
+        self.frames = frames
+        self._idx = 0
+        self.sent: list[tuple[str, str, bool, bool]] = []
+
+    async def capture_pane(
+        self, window_id: str, with_ansi: bool = False, scrollback_lines: int = 0
+    ) -> str:
+        del with_ansi, scrollback_lines
+        if window_id != self.window_id:
+            return ""
+        frame = self.frames[min(self._idx, len(self.frames) - 1)]
+        self._idx += 1
+        return frame
+
+    async def find_window_by_id(self, window_id: str) -> Any:
+        if window_id != self.window_id:
+            return None
+        return SimpleNamespace(window_id=self.window_id, window_name="repo")
+
+    async def send_keys(
+        self, window_id: str, keys: str, enter: bool = True, literal: bool = True
+    ) -> bool:
+        self.sent.append((window_id, keys, enter, literal))
+        return True
+
+
 class FakeQuery:
     def __init__(self, data: str) -> None:
         self.data = data
@@ -139,7 +188,7 @@ def _ctx(query: FakeQuery, user_id: int = _OWNER_ID) -> SimpleNamespace:
     )
 
 
-def _adapters(picker: _StaticPicker) -> DispatcherAdapters:
+def _adapters(picker: Any) -> DispatcherAdapters:
     return DispatcherAdapters(
         session_manager=FakeSessionManager(),
         tmux_manager=picker,
@@ -209,7 +258,7 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     auq_source.reset_for_tests()
 
 
-async def _run(callback_data: str, picker: _StaticPicker) -> FakeQuery:
+async def _run(callback_data: str, picker: Any) -> FakeQuery:
     query = FakeQuery(callback_data)
     authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
     await execute(authorized, _adapters(picker))
@@ -269,3 +318,121 @@ async def test_visible_cursor_dispatch_unchanged(tmp_path: Path) -> None:
     keys = [(k, e, lit) for _w, k, e, lit in picker.sent]
     # Cursor already on option 1 → only Enter (the version-stable commit).
     assert keys == [("Enter", False, False)]
+
+
+# ── sequenced frames: the two paths the static guard MISSED ──────────────────
+#
+# Capture order along the dispatch flow (one frame consumed per call):
+#   [0] validate  — pick_token.validate_and_consume (produces ``current_form``)
+#   [1] guard     — _dispatch_pick_pane_locked synthetic-cursor pre-guard
+#   [2] verify    — the post-nav verify re-parse (the load-bearing gate)
+#   [3] confirm   — the post-Enter confirm (only reached if Enter is sent)
+
+
+@pytest.mark.asyncio
+async def test_no_enter_when_guard_capture_empty_and_verify_cursorless(
+    tmp_path: Path,
+) -> None:
+    """(a) Empty/unparseable guard capture must NOT slip through to a commit.
+
+    The validate frame is a cursorless picker (``current_form`` carries the
+    overlay's PHANTOM cursor at option 1). The guard frame is empty ("") so the
+    pre-guard's pane proof is ABSENT — the fail-closed pre-guard must bail. Even
+    if it didn't, the verify frame is cursorless (no real pane ❯) so the
+    pane-only real-cursor requirement bails. Either way: NO keystroke is ever
+    sent against the unknown off-screen cursor.
+    """
+    _write_side_file(tmp_path)
+    picker = _SequencedPicker(
+        _WINDOW_ID,
+        [
+            _PANE_NO_CURSOR,  # [0] validate
+            "",  # [1] guard — empty/unparseable
+            _PANE_NO_CURSOR,  # [2] verify — still cursorless
+        ],
+    )
+    await _run(
+        _mint_callback(
+            1,
+            "Full fix: descriptions + ordering + first-render robustness",
+            _PANE_NO_CURSOR,
+        ),
+        picker,
+    )
+    assert picker.sent == [], "no keystroke may be sent when the cursor is unproven"
+    assert _ledger_state(1, _PANE_NO_CURSOR) == "not_advanced"
+
+
+@pytest.mark.asyncio
+async def test_no_enter_when_guard_visible_but_verify_loses_cursor(
+    tmp_path: Path,
+) -> None:
+    """(b) TOCTOU: a real cursor at guard, then a cursorless verify frame.
+
+    The guard frame HAS a real ❯ (so the pre-guard passes), but the pane scrolls
+    /repaints before verify and the verify frame is cursorless. The verify
+    hardening (pane-only real-cursor requirement) must bail BEFORE Enter — the
+    static pre-guard alone could not catch this. Target option 1 with a phantom
+    ``current_form`` cursor at 1 ⇒ delta 0 ⇒ no nav keystrokes, then the bail.
+    """
+    _write_side_file(tmp_path)
+    picker = _SequencedPicker(
+        _WINDOW_ID,
+        [
+            _PANE_NO_CURSOR,  # [0] validate — phantom cursor at 1
+            _PANE_WITH_CURSOR,  # [1] guard — real ❯ visible (pre-guard PASSES)
+            _PANE_NO_CURSOR,  # [2] verify — cursor lost (TOCTOU)
+        ],
+    )
+    await _run(
+        _mint_callback(
+            1,
+            "Full fix: descriptions + ordering + first-render robustness",
+            _PANE_NO_CURSOR,
+        ),
+        picker,
+    )
+    assert "Enter" not in [k for _w, k, _e, _lit in picker.sent], (
+        "Enter must never be sent when verify loses the real cursor"
+    )
+    assert _ledger_state(1, _PANE_NO_CURSOR) == "not_advanced"
+
+
+@pytest.mark.asyncio
+async def test_navigate_to_offscreen_target_with_visible_start_cursor(
+    tmp_path: Path,
+) -> None:
+    """Positive: a legitimate navigate-into-view still dispatches (no over-bail).
+
+    Start cursor VISIBLE at option 3 (real ❯), target = option 1. The guard
+    sees a real cursor (passes); nav sends Up×2; the verify frame shows a REAL ❯
+    on option 1 (navigated into view) ⇒ verify passes; the confirm frame is a
+    non-picker pane ⇒ resolved ⇒ ``dispatched``. Enter IS sent — the verify
+    hardening must not reject a genuine navigate-into-view.
+    """
+    _write_side_file(tmp_path)
+    picker = _SequencedPicker(
+        _WINDOW_ID,
+        [
+            _PANE_CURSOR_ON_3,  # [0] validate — real cursor at 3
+            _PANE_CURSOR_ON_3,  # [1] guard — real cursor visible
+            _PANE_WITH_CURSOR,  # [2] verify — real ❯ navigated onto option 1
+            _PANE_RESOLVED,  # [3] confirm — picker gone (resolved)
+        ],
+    )
+    await _run(
+        _mint_callback(
+            1,
+            "Full fix: descriptions + ordering + first-render robustness",
+            _PANE_CURSOR_ON_3,
+        ),
+        picker,
+    )
+    keys = [(k, e, lit) for _w, k, e, lit in picker.sent]
+    # Up×2 (3 → 1) then Enter — the genuine navigate-into-view commit.
+    assert keys == [
+        ("Up", False, False),
+        ("Up", False, False),
+        ("Enter", False, False),
+    ]
+    assert _ledger_state(1, _PANE_CURSOR_ON_3) == "dispatched"

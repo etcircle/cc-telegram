@@ -7,6 +7,7 @@ on its next 1s tick.
 
 import asyncio
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2436,6 +2437,111 @@ class TestPollerSourceDriftRemint:
             mock_refresh.assert_not_awaited()
         finally:
             pick_token.reset_for_tests()
+
+    async def test_remint_on_source_drift_noop_under_floor(
+        self,
+        mock_bot: AsyncMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Hermes P3: ``_remint_on_source_drift`` is a NO-OP under the floor.
+
+        A long-open side_file card whose PreToolUse side file aged past the 300s
+        read-TTL would, WITHOUT the floor, have ``resolve_auq_source`` flip
+        ``side_file`` → ``pane`` while the card's tokens are minted from
+        ``side_file`` — the drift compare then mismatches and the poller
+        re-renders via ``handle_interactive_ui`` every tick (the churn the floor
+        kills). With the floor raised (the poller raises it BEFORE the drift
+        compare at every observed-live preserve branch), the live source stays
+        ``side_file`` so minted==live → ``_remint_on_source_drift`` returns False
+        and does NOT call ``handle_interactive_ui``.
+
+        Tested at the ``_remint_on_source_drift`` seam directly (deterministic,
+        no full-poll branch selection). The RED contrast: WITHOUT the floor the
+        same call DOES re-mint.
+        """
+        import json
+        import time
+        from pathlib import Path
+
+        from cctelegram.handlers import auq_source, pick_token, status_polling
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.session import WindowState, session_manager
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        sid = "4766fb07-7057-4981-9832-93e524ab943e"
+        window_id = "@5"
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        pick_token.reset_for_tests()
+        auq_source.reset_for_tests()
+        try:
+            fx = Path(__file__).parents[1] / "fixtures"
+            pane = (fx / "auq_single_select_with_affordances_pane.txt").read_text()
+            tool_input = json.loads(
+                (fx / "auq_single_select_with_affordances_sidefile.json").read_text()
+            )["tool_input"]
+
+            # Side file ON DISK but AGED past the read-TTL, bound to the window's
+            # session — without the floor it drifts to ``pane``.
+            pending = tmp_path / "auq_pending"
+            pending.mkdir(mode=0o700, exist_ok=True)
+            (pending / f"{sid}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "session_id": sid,
+                        "tool_use_id": "tu-1",
+                        "written_at": time.time()
+                        - (auq_source._PRETOOL_TTL_SECONDS + 120),
+                        "tool_input": tool_input,
+                    }
+                )
+            )
+            session_manager.window_states[window_id] = WindowState(
+                cwd="/tmp/cwd", session_id=sid
+            )
+
+            # The card was minted from the side_file source (title present); seed
+            # the cache row at the side-file form fingerprint with the side_file
+            # source tags, so the route-based drift compare sees minted==live only
+            # when the live source is ALSO ``side_file`` (i.e. only under the floor).
+            side_file_form = resolve_ask_form(tool_input, pane)
+            assert side_file_form is not None
+            sf_fp = auq_source._canonical_dict_fingerprint(tool_input)
+            _pick_token_cache[(1, 42, window_id, side_file_form.fingerprint())] = (
+                _CacheRow(
+                    tokens=["floortok"],
+                    row_generation=1,
+                    source_kind="side_file",
+                    source_fingerprint=sf_fp,
+                    consumed_generation=None,
+                )
+            )
+
+            with patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ) as mock_handle_ui:
+                # RED contrast: WITHOUT the floor the aged side file drifts to
+                # pane → minted side_file != live pane → re-mint fires.
+                drifted = await status_polling._remint_on_source_drift(
+                    mock_bot, 1, 42, window_id, pane
+                )
+                assert drifted is True
+                mock_handle_ui.assert_awaited()
+
+                # Raise the floor (what the poller does at the observed-live
+                # preserve branch), then re-run: live stays side_file → no drift.
+                mock_handle_ui.reset_mock()
+                auq_source.refresh_side_file_freshness(window_id)
+                drifted = await status_polling._remint_on_source_drift(
+                    mock_bot, 1, 42, window_id, pane
+                )
+                assert drifted is False, "the floor must keep the card on side_file"
+                mock_handle_ui.assert_not_awaited()
+        finally:
+            session_manager.window_states.pop(window_id, None)
+            pick_token.reset_for_tests()
+            auq_source.reset_for_tests()
 
     async def test_same_hash_pane_to_pane_drift_does_not_remint(
         self, mock_bot: AsyncMock

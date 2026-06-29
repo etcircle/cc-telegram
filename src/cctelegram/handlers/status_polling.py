@@ -850,9 +850,14 @@ async def update_status_message(
                 # BEFORE the drift re-mint: this is an observed-live card, so
                 # raise its side-file freshness floor (same gating as the
                 # deadline refresh) — a long-open side_file_ok card aged past the
-                # 300s read-TTL stays TRUSTED + tappable. Placed before the
-                # re-mint so an already-aged-but-live card recovers on THIS tick
-                # rather than re-rendering once to the aged (pane) source.
+                # 300s read-TTL stays TRUSTED + tappable. The ``ui_hash`` here was
+                # already computed against the pre-floor source, so an
+                # already-aged-but-live card (deploy/restart with the floor wiped)
+                # recovers on the NEXT tick rather than this one; placing the
+                # raise before the re-mint avoids an extra re-render to the aged
+                # (pane) source in the meantime. Steady-state long-open cards
+                # never drop to bail (the floor was raised on the prior tick), so
+                # there is no flicker.
                 auq_source.refresh_side_file_freshness(window_id)
                 if await _remint_on_source_drift(
                     bot, user_id, thread_id, window_id, pane_text, ui_hash=ui_hash
