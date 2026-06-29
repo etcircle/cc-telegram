@@ -96,11 +96,12 @@ async def clear_topic_state(
         # provided by recovery-time re-validation + the 24h GC, but tombing here
         # keeps the store hygienic.
         pick_intent.teardown_window(route[2])
-        # Drop the per-window AUQ side-file freshness floor on topic close /
-        # window-delete (window-keyed; route[2] is the window_id). Harmless to
-        # leak by correctness (max()-only-widens + the pane-consistency brake),
-        # but cleared here for hygiene beside the other per-window teardowns.
-        auq_source.forget_for_window(route[2])
+        # Drop ONLY the per-window AUQ side-file freshness floor on topic close /
+        # window-delete (window-keyed; route[2] is the window_id). Floor-only — NOT
+        # forget_for_window, which would ALSO unlink the session-keyed side file and
+        # strand a double-`--resume` sibling's live AUQ. Harmless to leak by
+        # correctness (max()-only-widens), cleared here for hygiene.
+        auq_source.clear_side_file_freshness(route[2])
         await teardown_route(route, drop_pending=drop_pending)
 
     # Clear status message tracking

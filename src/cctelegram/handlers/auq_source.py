@@ -631,6 +631,21 @@ def _freshness_floor(window_id: str) -> float:
     return _side_file_freshness.get(window_id, 0.0)
 
 
+def clear_side_file_freshness(window_id: str) -> None:
+    """Drop ONLY the in-memory freshness floor for ``window_id`` — never the side file.
+
+    The narrow, side-effect-free teardown for seams that close/unbind a window
+    WITHOUT resolving its AUQ (``cleanup.clear_topic_state`` on topic-close /
+    window-delete). Distinct from ``forget_for_window``, which ALSO unlinks the
+    session-keyed side file — unsafe at topic-close because a double-``--resume``
+    sibling window may still hold a LIVE AUQ on the same session, and deleting the
+    shared side file would strand the sibling's selection card on pane-only render.
+    The floor is in-memory and ``max()``-only-widens, so dropping it here can never
+    affect another window's card.
+    """
+    _side_file_freshness.pop(window_id, None)
+
+
 def _pretool_side_file_path(session_id: str) -> Path | None:
     """Resolve the side-file path for ``session_id`` after UUID validation.
 

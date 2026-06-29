@@ -1984,3 +1984,24 @@ class TestSideFileFreshnessFloor:
             assert self._WID not in auq_source._side_file_freshness
         finally:
             _unbind_window(self._WID)
+
+    def test_clear_side_file_freshness_is_floor_only(self, _cc_dir):
+        """``clear_side_file_freshness`` drops the floor but PRESERVES the side
+        file — unlike ``forget_for_window`` — so the topic-close teardown can never
+        unlink a session-keyed side file out from under a double-``--resume``
+        sibling's still-live AUQ (the P2 regression guard)."""
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_side_file_at(_cc_dir, self._SID, written_at=time.time())
+            auq_source.refresh_side_file_freshness(self._WID)
+            assert self._WID in auq_source._side_file_freshness
+            assert auq_source.side_file_live_for_window(self._WID)  # side file present
+
+            auq_source.clear_side_file_freshness(self._WID)
+
+            assert self._WID not in auq_source._side_file_freshness  # floor cleared
+            # The side file is UNTOUCHED (the regression a bare forget_for_window
+            # at topic-close would cause).
+            assert auq_source.side_file_live_for_window(self._WID)
+        finally:
+            _unbind_window(self._WID)
