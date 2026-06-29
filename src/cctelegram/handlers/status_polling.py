@@ -846,6 +846,19 @@ async def update_status_message(
                 # the re-mint to pane, the next tick sees pane==pane → no drift).
                 # Shared with preserve-site (b) via _remint_on_source_drift
                 # (review finding 15) — same comparison, same loop-safety.
+                #
+                # BEFORE the drift re-mint: this is an observed-live card, so
+                # raise its side-file freshness floor (same gating as the
+                # deadline refresh) — a long-open side_file_ok card aged past the
+                # 300s read-TTL stays TRUSTED + tappable. The ``ui_hash`` here was
+                # already computed against the pre-floor source, so an
+                # already-aged-but-live card (deploy/restart with the floor wiped)
+                # recovers on the NEXT tick rather than this one; placing the
+                # raise before the re-mint avoids an extra re-render to the aged
+                # (pane) source in the meantime. Steady-state long-open cards
+                # never drop to bail (the floor was raised on the prior tick), so
+                # there is no flicker.
+                auq_source.refresh_side_file_freshness(window_id)
                 if await _remint_on_source_drift(
                     bot, user_id, thread_id, window_id, pane_text, ui_hash=ui_hash
                 ):
@@ -925,6 +938,10 @@ async def update_status_message(
             # the SAME drift comparison as the same-hash branch BEFORE the
             # deadline refresh; on a re-mint, return (the next tick converges:
             # live == minted → no further re-render, then SET (b) re-asserts).
+            # BEFORE the re-mint: raise the side-file freshness floor (this is an
+            # observed-live Submit/picker card) so a long-open side_file_ok card
+            # stays trusted + tappable past the 300s read-TTL.
+            auq_source.refresh_side_file_freshness(window_id)
             if await _remint_on_source_drift(
                 bot, user_id, thread_id, window_id, pane_text
             ):
@@ -954,6 +971,12 @@ async def update_status_message(
         # the overlay this must survive.
         if auq_source.side_file_live_for_window(window_id):
             _absent_streak.pop(route, None)
+            # Observed-live (the side file says the AUQ is still pending though
+            # the pane is obscured) — raise the side-file freshness floor so a
+            # long-open side_file_ok card stays trusted + tappable past the 300s
+            # read-TTL. (No drift re-mint here: the pane is obscured, so there is
+            # no live form to compare; the floor still keeps the trusted token.)
+            auq_source.refresh_side_file_freshness(window_id)
             # D3-β: card preserved on side-file liveness (pane obscured by a
             # task-list overlay / scrolled Submit / tool spam) — keep its tokens
             # alive so a tap after a long obscured idle still dispatches.

@@ -408,6 +408,42 @@ async def _dispatch_pick_pane_locked(
             )
         return _PickPaneOutcome("commit_unconfirmed", reason)
 
+    # Synthetic-cursor SAFETY guard (BEFORE any keystroke; defense in depth — the
+    # load-bearing fail-closed gate is the pane-only real-cursor check at verify).
+    # On the side-file render path ``current_form`` carries the live pane's cursor
+    # overlaid onto the full side-file options — but
+    # ``terminal_parser._overlay_cursor_and_selection`` DEFAULTS the cursor to
+    # option 1 when the live pane shows no ``❯`` (the real cursor scrolled off a
+    # tall card whose top options are above the captured region). That PHANTOM
+    # cursor at option 1 makes a tap on option 1 compute ``delta = 0`` (no nav),
+    # verify-pass the same phantom, and commit ``Enter`` against whatever the REAL
+    # (off-screen) cursor is on — a WRONG dispatch.
+    # Re-parse a PANE-ONLY form: when ``current_form`` claims a cursor but the
+    # fresh pane proof is ABSENT (empty/unparseable capture ⇒ ``gpane_form is
+    # None``) OR carries NO real ``cursor=True`` option, ``current_form``'s cursor
+    # is unprovable / the synthetic default → BAIL ``not_advanced`` before any
+    # keystroke (the callback falls through; the user re-taps once the cursor is
+    # visible, or uses manual nav). FAIL-CLOSED: a missing pane proof is treated
+    # as no-real-cursor. Enter is NEVER sent on a synthetic cursor. A real visible
+    # pane cursor ⇒ no bail (visible-cursor dispatch is byte-identical).
+    # (Making an off-screen option-1 tap actually dispatch is a separate
+    # follow-up; here it SAFELY no-ops.)
+    if any(o.cursor for o in current_form.options):
+        gpane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+        gpane_form = resolve_ask_form(None, gpane) if gpane else None
+        if gpane_form is None or not any(o.cursor for o in gpane_form.options):
+            logger.info(
+                "AUQ_PICK nav cursor_synthetic user=%d window=%s opt=%d "
+                "(no real pane cursor%s — bailing before keystroke)",
+                user.id,
+                window_id,
+                option_number,
+                "; capture empty/unparseable"
+                if gpane_form is None
+                else "; phantom default",
+            )
+            return _bail_not_advanced("cursor_synthetic")
+
     target = option_number
     cur = next((o for o in current_form.options if o.cursor), None)
     if cur is None or cur.number is None:
@@ -443,13 +479,29 @@ async def _dispatch_pick_pane_locked(
         vsource = auq_source.resolve_auq_source(window_id, None, vpane)
         vform = resolve_ask_form(vsource.payload, vpane)
     vc = next((o for o in vform.options if o.cursor), None) if vform else None
+    # PANE-ONLY real-cursor requirement (the load-bearing fail-closed gate). The
+    # overlaid ``vform`` cursor above may be the SYNTHETIC default that
+    # ``_overlay_cursor_and_selection`` plants on option 1 when the live pane
+    # shows no ``❯`` (a tall card whose real cursor scrolled off-screen, OR a
+    # TOCTOU repaint between the pre-guard and here). Re-parse a PANE-ONLY form
+    # (``tool_input=None`` ⇒ pure pane, no side-file overlay, no phantom default)
+    # and require a REAL pane ``❯`` provably on the target — so ``Enter`` is
+    # NEVER sent against an off-screen cursor. A legitimate navigate-into-view
+    # scrolls the real cursor onto the captured region, so the pane-only form
+    # WILL carry a real cursor at the target on the happy path.
+    vpane_only = resolve_ask_form(None, vpane) if vpane else None
+    vpane_real_cursor = (
+        next((o for o in vpane_only.options if o.cursor), None) if vpane_only else None
+    )
     logger.info(
-        "AUQ_PICK nav_verify user=%d window=%s target=%d cursor_num=%s cursor_label=%s",
+        "AUQ_PICK nav_verify user=%d window=%s target=%d cursor_num=%s "
+        "cursor_label=%s real_cursor_num=%s",
         user.id,
         window_id,
         target,
         vc.number if vc else None,
         (vc.label[:24] if vc else None),
+        vpane_real_cursor.number if vpane_real_cursor else None,
     )
     if not (
         vform is not None
@@ -461,6 +513,12 @@ async def _dispatch_pick_pane_locked(
             not is_review_submit
             or (vform.review_submit_dispatchable(option_label) and vc.number == 1)
         )
+        # A REAL pane cursor must be provably on the target — a synthetic/phantom
+        # cursor (no pane ``❯``, or the ``❯`` elsewhere) fails closed here even if
+        # the pre-guard let this tap through (TOCTOU). Enter never commits against
+        # an off-screen cursor.
+        and vpane_real_cursor is not None
+        and vpane_real_cursor.number == target
     ):
         return _bail_not_advanced("verify_failed")
 
