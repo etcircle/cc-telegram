@@ -445,3 +445,67 @@ async def test_afk_edit_failure_no_delete_fallback() -> None:
     assert bot.deletes == [], "edit failure must not fall back to delete"
     # Phase 1 still committed.
     assert interactive_ui.has_interactive_surface(USER_ID, THREAD_ID) is False
+
+
+# ── Codex round-2 P2: Phase 2 must be genuinely never-raise ───────────────
+
+
+@pytest.mark.asyncio
+async def test_afk_phase2_retry_after_swallowed_no_strand(caplog, monkeypatch) -> None:
+    """[Codex r2 P2] topic_edit RE-RAISES RetryAfter, and asyncio.shield does
+    NOT contain exceptions raised INSIDE the shielded coroutine — so a
+    RetryAfter from the Phase-2 edit escaped to the caller AFTER Phase 1
+    committed (the stranded-dead-card class via a different exit path). The
+    converter must return normally: Phase-1 state stays torn down, ONE
+    WARNING logged, and dismiss_if_kind is still attempted."""
+    from unittest.mock import AsyncMock
+
+    from telegram.error import RetryAfter
+
+    from cctelegram.handlers import attention
+
+    class _RetryAfterBot(_RecordingBot):
+        async def edit_message_text(self, **kw: Any):
+            raise RetryAfter(7)
+
+    _seed_surface()
+    bot = _RetryAfterBot()
+    dismiss = AsyncMock()
+    monkeypatch.setattr(attention, "dismiss_if_kind", dismiss)
+
+    with caplog.at_level(logging.WARNING, logger="cctelegram.handlers.interactive_ui"):
+        # Must NOT raise — a raise here is exactly the stranded-card escape.
+        await _convert(bot)
+
+    assert interactive_ui.has_interactive_surface(USER_ID, THREAD_ID) is False, (
+        "Phase 1 stays committed"
+    )
+    assert bot.deletes == [], "no delete fallback on an edit raise"
+    assert any(
+        "AFK_CONVERT" in r.getMessage() and "edit raised" in r.getMessage()
+        for r in caplog.records
+    ), "one WARNING must record the edit raise (no delete fallback)"
+    dismiss.assert_awaited_once(), "dismiss_if_kind must still be attempted"
+
+
+@pytest.mark.asyncio
+async def test_afk_phase2_dismiss_raise_swallowed(caplog, monkeypatch) -> None:
+    """[Codex r2 P2] a raise from attention.dismiss_if_kind must not escape
+    the converter either — best-effort, warning logged."""
+    from cctelegram.handlers import attention
+
+    async def _dismiss_boom(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("dismiss boom")
+
+    _seed_surface()
+    bot = _RecordingBot()
+    monkeypatch.setattr(attention, "dismiss_if_kind", _dismiss_boom)
+
+    with caplog.at_level(logging.WARNING, logger="cctelegram.handlers.interactive_ui"):
+        await _convert(bot)  # must NOT raise
+
+    assert len(bot.edits) == 1, "the card edit still landed"
+    assert any(
+        "AFK_CONVERT" in r.getMessage() and "dismiss" in r.getMessage()
+        for r in caplog.records
+    )

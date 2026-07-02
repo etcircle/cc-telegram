@@ -4074,36 +4074,74 @@ async def convert_interactive_msg_to_late_answer(
             )
         text = late_answer.card_text(q_clipped, with_keyboard=with_keyboard)
         chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
-        outcome = await topic_edit(
-            bot,
-            op="interactive",
-            user_id=user_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            window_id=cleared_window_id,
-            message_id=single_msg_id,
-            text=text,
-            plain=True,
-            reply_markup=reply_markup,
-        )
-        if outcome not in (
-            TopicSendOutcome.OK,
-            TopicSendOutcome.MESSAGE_NOT_MODIFIED,
-        ):
-            # Edit failure → log only, NO delete-fallback (the tombstone
-            # rule: a missing card beats a phantom delete).
+        # [Codex r2 P2] Phase 2 must be GENUINELY never-raise: topic_edit
+        # RE-RAISES RetryAfter (``except RetryAfter: raise``), and
+        # asyncio.shield only protects against OUTER cancellation — it does
+        # NOT contain exceptions raised INSIDE this coroutine, so an escaping
+        # RetryAfter after Phase 1 committed would strand the old picker
+        # visibly tappable with all state/tokens gone (the same class the
+        # [R2 P2-2] shield closed, via a different exit path) and violate the
+        # "edit failure → log, no delete-fallback" contract (a raise IS an
+        # edit failure). Tightly scoped around THIS await only — the
+        # mint/keyboard-build region above must not silently swallow bugs.
+        # ``except Exception`` deliberately (CancelledError is BaseException
+        # and must pass through). No retry/sleep inside the shield (it would
+        # prolong shutdown; the logged no-delete-fallback rule is the plan
+        # contract).
+        try:
+            outcome = await topic_edit(
+                bot,
+                op="interactive",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=cleared_window_id,
+                message_id=single_msg_id,
+                text=text,
+                plain=True,
+                reply_markup=reply_markup,
+            )
+        except Exception as exc:
             logger.warning(
-                "AFK_CONVERT edit failed user=%d thread=%s window=%s "
-                "msg=%s outcome=%s (no delete fallback)",
+                "AFK_CONVERT edit raised user=%d thread=%s window=%s "
+                "msg=%s: %s (no delete fallback)",
                 user_id,
                 thread_id,
                 window_id,
                 single_msg_id,
-                outcome.value,
+                exc,
             )
-        await attention.dismiss_if_kind(
-            bot, user_id=user_id, thread_id=thread_id, kind="interactive_ui"
-        )
+        else:
+            if outcome not in (
+                TopicSendOutcome.OK,
+                TopicSendOutcome.MESSAGE_NOT_MODIFIED,
+            ):
+                # Edit failure → log only, NO delete-fallback (the tombstone
+                # rule: a missing card beats a phantom delete).
+                logger.warning(
+                    "AFK_CONVERT edit failed user=%d thread=%s window=%s "
+                    "msg=%s outcome=%s (no delete fallback)",
+                    user_id,
+                    thread_id,
+                    window_id,
+                    single_msg_id,
+                    outcome.value,
+                )
+        # Best-effort too [Codex r2 P2]: a dismiss raise must not strand
+        # either. Own tight try/except so an edit raise above never skips
+        # the dismiss attempt and vice versa.
+        try:
+            await attention.dismiss_if_kind(
+                bot, user_id=user_id, thread_id=thread_id, kind="interactive_ui"
+            )
+        except Exception as exc:
+            logger.warning(
+                "AFK_CONVERT attention dismiss raised user=%d thread=%s window=%s: %s",
+                user_id,
+                thread_id,
+                window_id,
+                exc,
+            )
 
     await asyncio.shield(_phase2())
 
