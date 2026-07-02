@@ -53,7 +53,7 @@ from ..terminal_parser import (
 from .. import md_capture
 from ..tmux_manager import tmux_manager
 from ..utils import atomic_write_json
-from . import attention, auq_source, late_answer, pick_intent, pick_token
+from . import attention, auq_ledger, auq_source, late_answer, pick_intent, pick_token
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -1089,6 +1089,16 @@ def resolve_ask_tool_input(window_id: str) -> dict | None:
     the two paths produce byte-identical fingerprints.
     """
     return _last_completed_ask_tool_input.get(window_id)
+
+
+def peek_ask_tool_use_id(window_id: str) -> str | None:
+    """Return the cached AUQ ``tool_use.id`` for ``window_id`` (Wave A §A3).
+
+    The AFK conversion's snapshot trust gate compares this against the AFK
+    tool_result's ``tool_use_id`` — the cached ``tool_input`` is trusted only
+    when the ids match OR either is unknown.
+    """
+    return _last_auq_tool_use_id.get(window_id)
 
 
 # ── Per-route asyncio.Lock ───────────────────────────────────────────────
@@ -3879,6 +3889,223 @@ async def clear_interactive_msg(
     await attention.dismiss_if_kind(
         bot, user_id=user_id, thread_id=thread_id, kind="interactive_ui"
     )
+
+
+# ── Wave A: AFK auto-resolve conversion (plan §A3/§A4) ────────────────────
+
+
+def _trusted_afk_snapshot(
+    window_id: str, expected_tool_use_id: str | None
+) -> dict | None:
+    """Pick the AFK conversion's question snapshot under the id-parity rule.
+
+    Primary source: the window-keyed ``_last_completed_ask_tool_input`` cache,
+    trusted only when its cached ``tool_use_id`` equals the AFK tool_result's
+    ``expected_tool_use_id`` OR either id is unknown. On mismatch/miss, fall
+    back to the read-TTL-free side file
+    (``auq_source.read_side_file_for_recovery``) under the same parity rule
+    against ``auq_source.peek_side_file_tool_use_id``. Both mistrusted →
+    None (the generic text-only notice). The side file's captured id "may be
+    ''" (hook payload without one) — an EMPTY id is treated as unknown, like
+    None, never as a disqualifying mismatch.
+
+    Sync + read-only (called inside the route-lock critical section — the
+    side-file read is a small local file, matching the sync
+    ``_persist_interactive_state`` disk-write precedent under the lock).
+    """
+    cached = _last_completed_ask_tool_input.get(window_id)
+    if cached is not None:
+        cached_id = _last_auq_tool_use_id.get(window_id)
+        if (
+            not cached_id
+            or not expected_tool_use_id
+            or cached_id == expected_tool_use_id
+        ):
+            return cached
+    sid = session_id_for_window(window_id)
+    if not sid:
+        return None
+    rec = auq_source.read_side_file_for_recovery(sid)
+    if rec is None:
+        return None
+    side_id = auq_source.peek_side_file_tool_use_id(sid)
+    if not side_id or not expected_tool_use_id or side_id == expected_tool_use_id:
+        return rec.payload
+    return None
+
+
+def _afk_card_fields(snap: dict | None) -> tuple[str | None, dict[int, str]]:
+    """Derive (clipped question, {n: label}) for the converted card.
+
+    The labels dict is non-empty ONLY for the single-question single-select
+    shape (§A4 v1 scope) — multi-question / multi-select / malformed
+    snapshots get the text-only notice. Numbering is the option's true
+    1-based position so the buttons mirror the terminal picker order.
+    """
+    if not isinstance(snap, dict):
+        return None, {}
+    questions = snap.get("questions")
+    if (
+        not isinstance(questions, list)
+        or not questions
+        or not isinstance(questions[0], dict)
+    ):
+        return None, {}
+    q_raw = questions[0].get("question")
+    q_clipped = (
+        _clip_card_title(q_raw) if isinstance(q_raw, str) and q_raw.strip() else None
+    )
+    labels: dict[int, str] = {}
+    if len(questions) == 1 and not questions[0].get("multiSelect"):
+        opts = questions[0].get("options")
+        if isinstance(opts, list):
+            for n, opt in enumerate(opts, start=1):
+                label = opt.get("label") if isinstance(opt, dict) else None
+                if isinstance(label, str) and label.strip():
+                    labels[n] = label
+    return q_clipped, labels
+
+
+async def convert_interactive_msg_to_late_answer(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    *,
+    expected_tool_use_id: str | None,
+    session_mgr=None,
+) -> None:
+    """Convert the route's live picker card into the ⏰ late-answer card.
+
+    Called ONLY from ``bot.handle_new_message``'s explicit AUQ tool_result
+    branch when ``late_answer.is_afk_auto_resolve`` fired (Wave A §A3). Owns
+    the ENTIRE teardown+conversion inside a single ``_get_route_lock``
+    critical section with NO await between its steps: (1) snapshot under the
+    id-parity trust rule, (2) the Phase-1 pop mirroring
+    ``clear_interactive_msg`` exactly — ``_clear_interactive_msg`` +
+    ``_interactive_mode.pop`` + ``pick_token.prune_for_route`` on the POPPED
+    window ONLY [R2 Hermes P2-1], (3) ``forget_ask_tool_input`` (side-file
+    unlink still before ANY awaited Telegram I/O — the documented
+    orphan-safety ordering; ``late_answer.invalidate_window`` fires inside
+    it, safe — the mint happens later), (4) ``auq_ledger.release_window``
+    (the AUQ genuinely resolved; the tombstone is correct for AFK too).
+
+    If a poller render holds the route lock the converter waits; a poller
+    tick that meanwhile tombstoned the card degrades this to the disclosed
+    no-surface skip (never a re-posted picker, never a live token left
+    behind). Pre-lock cancellation: nothing has been torn down. Post-lock
+    [R2 Hermes P2-2]: once Phase 1 commits, the post-lock steps
+    (``_fire_clear`` + the Phase-2 edit) run best-effort SHIELDED — the W1
+    delete-protocol precedent — so a caller cancellation cannot strand the
+    OLD picker visibly tappable with all state gone.
+
+    Phase 2 is EDIT-only (v1): no surface → log ``AFK_CONVERT no_surface``
+    and return; an edit failure logs with NO delete-fallback (mirror of the
+    tombstone rule — a missing card beats a phantom delete). The converted
+    card is NOT a live interactive surface (``has_interactive_surface`` goes
+    False); run-state clears via the transcript path exactly as today — NO
+    route_runtime change. Pull-only; no observer (c313657 forbidden).
+    """
+    if session_mgr is None:
+        session_mgr = session_manager
+    ikey = (user_id, thread_id or 0)
+
+    # ── Phase 1: ONE critical section, no awaits between steps ────────
+    lock = _get_route_lock(user_id, thread_id)
+    async with lock:
+        # (1) snapshot BEFORE forget_ask_tool_input drops the cache + side file.
+        snap = _trusted_afk_snapshot(window_id, expected_tool_use_id)
+        # (2) the exact clear_interactive_msg Phase-1 mirror.
+        single_msg_id = _clear_interactive_msg(ikey)
+        cleared_window_id = _interactive_mode.pop(ikey, None)
+        if cleared_window_id is not None:
+            if cleared_window_id != window_id:
+                logger.warning(
+                    "AFK_CONVERT interactive-mode window mismatch: cleared=%s "
+                    "caller=%s user=%d thread=%s — pruning the POPPED window",
+                    cleared_window_id,
+                    window_id,
+                    user_id,
+                    thread_id,
+                )
+            # Prune the POPPED window, never the caller's wid blindly
+            # [R2 Hermes P2-1] — clear_interactive_msg prunes
+            # cleared_window_id; pruning wid on a stale _interactive_mode
+            # mismatch would leave the cleared surface's tokens alive.
+            pick_token.prune_for_route(user_id, thread_id, cleared_window_id)
+        # (3) cache + side-file teardown (sync; before any Telegram I/O).
+        forget_ask_tool_input(window_id)
+        # (4) the AUQ genuinely resolved — the ledger tombstone is correct
+        # for AFK too (same seam as the genuine tool_result path).
+        auq_ledger.release_window(window_id)
+
+    # ── Post-lock: best-effort SHIELDED once Phase 1 committed ────────
+    async def _phase2() -> None:
+        if cleared_window_id is not None:
+            _fire_clear(user_id, thread_id or 0, cleared_window_id)
+        if single_msg_id is None:
+            logger.info(
+                "AFK_CONVERT no_surface user=%d thread=%s window=%s",
+                user_id,
+                thread_id,
+                window_id,
+            )
+            return
+        q_clipped, labels = _afk_card_fields(snap)
+        with_keyboard = bool(labels) and q_clipped is not None
+        reply_markup = None
+        if with_keyboard:
+            assert q_clipped is not None
+            token = late_answer.mint_card(
+                owner_id=user_id,
+                thread_id=thread_id or 0,
+                window_id=window_id,
+                msg_id=single_msg_id,
+                question=q_clipped,
+                labels=labels,
+            )
+            reply_markup = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(label, callback_data=data)]
+                    for label, data in late_answer.keyboard_rows(
+                        window_id, labels, token
+                    )
+                ]
+            )
+        text = late_answer.card_text(q_clipped, with_keyboard=with_keyboard)
+        chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
+        outcome = await topic_edit(
+            bot,
+            op="interactive",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=cleared_window_id,
+            message_id=single_msg_id,
+            text=text,
+            plain=True,
+            reply_markup=reply_markup,
+        )
+        if outcome not in (
+            TopicSendOutcome.OK,
+            TopicSendOutcome.MESSAGE_NOT_MODIFIED,
+        ):
+            # Edit failure → log only, NO delete-fallback (the tombstone
+            # rule: a missing card beats a phantom delete).
+            logger.warning(
+                "AFK_CONVERT edit failed user=%d thread=%s window=%s "
+                "msg=%s outcome=%s (no delete fallback)",
+                user_id,
+                thread_id,
+                window_id,
+                single_msg_id,
+                outcome.value,
+            )
+        await attention.dismiss_if_kind(
+            bot, user_id=user_id, thread_id=thread_id, kind="interactive_ui"
+        )
+
+    await asyncio.shield(_phase2())
 
 
 def reset_for_tests() -> None:

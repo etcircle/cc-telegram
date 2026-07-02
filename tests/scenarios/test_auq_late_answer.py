@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 
 from cctelegram import bot as bot_module
-from cctelegram.handlers import interactive_ui, late_answer
+from cctelegram.handlers import auq_ledger, interactive_ui, late_answer
 from cctelegram.handlers.callback_data import CB_ASK_LATE
 from cctelegram.session_monitor import NewMessage
 from cctelegram.transcript_parser import TranscriptParser
@@ -164,6 +164,124 @@ def _answer_texts(update: Any) -> list[str]:
 
 def _sent_texts(scenario: ScenarioHarness, wid: str) -> list[str]:
     return [keys for w, keys, _e, _l in scenario.tmux.sent_keys if w == wid]
+
+
+# ── AFK conversion (the bot.py tool_result seam) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_afk_tool_result_converts_card_not_delete(
+    scenario: ScenarioHarness,
+) -> None:
+    """The AFK tool_result EDITS the picker card into the ⏰ late-answer card
+    (aql keyboard), never deletes it; the surface is dropped; both
+    forget_ask_tool_input and the ledger release still fire. (RED: today
+    deletes.)"""
+    wid = _bind(scenario)
+    _seed_live_auq_surface(scenario, wid)
+    auq_ledger.record(
+        "rh:fp:1",
+        state="accepted",
+        user_id=scenario.user_id,
+        window_id=wid,
+        full_fingerprint="ff" * 20,
+        option_number=1,
+        option_label="x",
+    )
+    auq_ledger.record("rh:fp:1", state="dispatched")
+
+    await _afk_tool_result(scenario)
+
+    # Card EDITED in place — not deleted.
+    deletes = [s for s in scenario.bot.sent if s.method == "delete_message"]
+    assert deletes == [], "AFK conversion must never topic_delete the picker"
+    edits = [
+        s
+        for s in scenario.bot.sent
+        if s.method == "edit_message_text" and s.message_id == 777
+    ]
+    assert edits, "the picker message must be edited into the late-answer card"
+    text = edits[-1].kwargs.get("text") or ""
+    assert "⏰ Claude proceeded after ~60s (no response)." in text
+    assert _QUESTION in text
+    assert "Tap an option to send a correction:" in text
+    markup = edits[-1].kwargs.get("reply_markup")
+    assert markup is not None, "single-question single-select gets aql buttons"
+    all_buttons = [b for row in markup.inline_keyboard for b in row]
+    assert [b.text for b in all_buttons] == [_LABELS[1], _LABELS[2]]
+    assert all(b.callback_data.startswith(CB_ASK_LATE) for b in all_buttons)
+    # The converted card is NOT a live interactive surface.
+    assert interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID) is False
+    # Teardown halves both fired: cache invalidated + ledger released.
+    assert interactive_ui.resolve_ask_tool_input(wid) is None
+    row = auq_ledger.lookup("rh:fp:1")
+    assert row is None or row.state == "released"
+
+
+@pytest.mark.asyncio
+async def test_genuine_tool_result_path_byte_identical(
+    scenario: ScenarioHarness,
+) -> None:
+    """A genuine (answered) AUQ tool_result keeps today's teardown: card
+    deleted (not converted), cache invalidated, ledger released — the non-AFK
+    path is byte-identical (regression pin)."""
+    wid = _bind(scenario)
+    _seed_live_auq_surface(scenario, wid)
+
+    genuine_content = (
+        'Your questions have been answered: "What should we work on in this '
+        f'session?"="{_LABELS[1]}". You can now continue with these answers in mind.'
+    )
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id=_SESSION_ID,
+            text=TranscriptParser._format_tool_result_text(
+                genuine_content, "AskUserQuestion", None
+            ),
+            content_type="tool_result",
+            tool_use_id=_TOOL_USE_ID,
+            role="assistant",
+            tool_name="AskUserQuestion",
+            tool_result_meta={
+                "questions": _TOOL_INPUT["questions"],
+                "answers": {_QUESTION: _LABELS[1]},
+                "annotations": {},
+            },
+        ),
+        scenario.bot,
+    )
+
+    deletes = [s for s in scenario.bot.sent if s.method == "delete_message"]
+    assert [d.kwargs["message_id"] for d in deletes] == [777], (
+        "a genuine answer must still delete the picker card (today's teardown)"
+    )
+    assert interactive_ui.has_interactive_surface(scenario.user_id, _THREAD_ID) is False
+    assert interactive_ui.resolve_ask_tool_input(wid) is None
+    # No late-answer card minted on the genuine path.
+    late_edits = [
+        s
+        for s in scenario.bot.sent
+        if s.method == "edit_message_text"
+        and "⏰ Claude proceeded" in (s.kwargs.get("text") or "")
+    ]
+    assert late_edits == []
+
+
+@pytest.mark.asyncio
+async def test_afk_no_surface_skips_quietly(scenario: ScenarioHarness) -> None:
+    """AFK tool_result with no tracked surface (poller tombstoned first /
+    render never happened) → v1 EDIT-only: no edit, no delete, no card
+    (disclosed residual A10.2)."""
+    wid = _bind(scenario)
+    interactive_ui.remember_ask_tool_input(wid, _TOOL_INPUT, _TOOL_USE_ID)
+    # NO _interactive_msgs entry — surface already gone.
+
+    await _afk_tool_result(scenario)
+
+    assert [s for s in scenario.bot.sent if s.method == "delete_message"] == []
+    assert [s for s in scenario.bot.sent if s.method == "edit_message_text"] == []
+    # Teardown still ran (cache invalidated).
+    assert interactive_ui.resolve_ask_tool_input(wid) is None
 
 
 # ── aql: tap — delivery ──────────────────────────────────────────────────
