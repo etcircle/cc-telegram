@@ -120,6 +120,7 @@ from .handlers.inbound_telegram import (  # noqa: F401
 from .handlers.interactive_ui import (
     clear_interactive_mode,
     clear_interactive_msg,
+    convert_interactive_msg_to_late_answer,
     forget_ask_tool_input,
     handle_interactive_ui,
     has_interactive_surface,
@@ -127,6 +128,7 @@ from .handlers.interactive_ui import (
     remember_ask_tool_input,
     set_interactive_mode,
 )
+from .handlers.late_answer import is_afk_auto_resolve
 from .handlers.message_queue import (
     enqueue_content_message,
     enqueue_subagent_collapse,
@@ -1030,27 +1032,52 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             and msg.tool_name == "AskUserQuestion"
             and msg.content_type == "tool_result"
         ):
-            forget_ask_tool_input(wid)
-            # Wave 2 fix 3b (P1-1 placement): tombstone this window's
-            # action-ledger rows ONLY here — the AUQ ``tool_result`` is the
-            # positive resolution proof. The ledger key is content-derived
-            # (no per-instance entropy), so a same-day byte-identical AUQ
-            # reconstructs the same (route_hash, fp8, opt) triplet — without
-            # the `released` tombstone a stale `dispatched` row would answer
-            # "Action already received" forever. Deliberately NOT inside
-            # ``forget_ask_tool_input`` (a generic teardown helper also fired
-            # from `/clear` / session replacement / the generic surface clear
-            # below — none of which prove resolution; releasing there would
-            # remove the durable single-use brake on a dispatched-but-
-            # UNRESOLVED instance). ExitPlanMode needs no release: ledger
-            # rows are minted only by AUQ ``aqp:`` picks (pick buttons are
-            # built only for ``content.name == "AskUserQuestion"``). The
-            # crash window (bot down between the tool_result and this seam)
-            # is covered by the startup reconciler's tool_result-proven
-            # release in ``session_monitor``. WINDOW-scoped: a
-            # double-`--resume` sibling window's unresolved card keeps its
-            # rows.
-            auq_ledger_release_window(wid)
+            if is_afk_auto_resolve(msg.text, msg.tool_result_meta):
+                # Wave A (§A3): the ~60s AFK auto-resolve (Claude Code
+                # ≥2.1.198) is NOT a genuine answer — instead of tearing the
+                # picker down like one, ONE call owns the ENTIRE
+                # teardown+conversion inside a single route-lock critical
+                # section (snapshot → Phase-1 pop → forget_ask_tool_input →
+                # ledger release, no await gaps), then edits the card into
+                # the ⏰ late-answer card with aql: buttons. The converted
+                # card is NOT a live interactive surface, so the generic
+                # ``has_interactive_surface`` teardown below sees no surface
+                # and skips. ExitPlanMode is OUT of scope (60s behavior
+                # unobserved for EPM). The sidechain gate above is INHERITED
+                # — a background agent's AUQ tool_result never converts the
+                # parent's card.
+                await convert_interactive_msg_to_late_answer(
+                    bot,
+                    user_id,
+                    thread_id,
+                    wid,
+                    expected_tool_use_id=msg.tool_use_id,
+                    session_mgr=session_manager,
+                )
+            else:
+                # Non-AFK (genuine answer / Esc rejection): today's teardown,
+                # byte-identical — both calls at their exact prior positions.
+                forget_ask_tool_input(wid)
+                # Wave 2 fix 3b (P1-1 placement): tombstone this window's
+                # action-ledger rows ONLY here — the AUQ ``tool_result`` is the
+                # positive resolution proof. The ledger key is content-derived
+                # (no per-instance entropy), so a same-day byte-identical AUQ
+                # reconstructs the same (route_hash, fp8, opt) triplet — without
+                # the `released` tombstone a stale `dispatched` row would answer
+                # "Action already received" forever. Deliberately NOT inside
+                # ``forget_ask_tool_input`` (a generic teardown helper also fired
+                # from `/clear` / session replacement / the generic surface clear
+                # below — none of which prove resolution; releasing there would
+                # remove the durable single-use brake on a dispatched-but-
+                # UNRESOLVED instance). ExitPlanMode needs no release: ledger
+                # rows are minted only by AUQ ``aqp:`` picks (pick buttons are
+                # built only for ``content.name == "AskUserQuestion"``). The
+                # crash window (bot down between the tool_result and this seam)
+                # is covered by the startup reconciler's tool_result-proven
+                # release in ``session_monitor``. WINDOW-scoped: a
+                # double-`--resume` sibling window's unresolved card keeps its
+                # rows.
+                auq_ledger_release_window(wid)
 
         # Any non-interactive message from the PARENT means the interaction is
         # complete — delete the UI card. ``has_interactive_surface`` is the bool
