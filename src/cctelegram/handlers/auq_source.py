@@ -864,11 +864,13 @@ def _read_live_pretool_record(
     else ``None``.
 
     ``apply_ttl=False`` (the render resolver ``resolve_auq_source_for_render``
-    and the D2 recovery reader ``read_side_file_for_recovery``) SKIPS only the
-    ``age > _PRETOOL_TTL_SECONDS`` read-TTL block — session-resolve, read, and
-    the future-skew guard are KEPT. A long-open card aged past the read-TTL
-    must not lose its side-file truth (the item-1 source-drift class), but a
-    clock-tampered file is still rejected.
+    and the ctx recovery ``recover_consistent_side_file_for_ctx``) SKIPS only
+    the ``age > _PRETOOL_TTL_SECONDS`` read-TTL block — session-resolve, read,
+    and the future-skew guard are KEPT. A long-open card aged past the
+    read-TTL must not lose its side-file truth (the item-1 source-drift
+    class), but a clock-tampered file is still rejected. (The session-keyed D2
+    recovery reader ``read_side_file_for_recovery`` is read-TTL-free too, but
+    reads ``_read_pretool_side_file`` directly — it is not a caller here.)
 
     DELIBERATELY does NOT write ``_pretool_ask_records``: that cache's
     invariant is "consistent-with-pane records only", so ``resolve_record``
