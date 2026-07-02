@@ -48,4 +48,3 @@ trust automated review to catch what matters — which default process weight sh
   6. Chat about this
 
 Enter to select · ↑/↓ to navigate · Esc to cancel
-

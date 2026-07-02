@@ -122,6 +122,7 @@ class TestConfigWindowGeometry:
             "160x4",  # height below sanity floor (5)
             "160x301",  # height above sanity ceiling (300)
             "",  # explicitly empty
+            f"{'9' * 5000}x50",  # digit run past int()'s conversion limit (hermes P2)
         ],
     )
     def test_window_geometry_invalid_falls_back_with_warning(

@@ -134,7 +134,10 @@ class Config:
         # parse/bounds failure falls back to the default with one WARNING.
         _geometry_default = (160, 50)
         _geometry_raw = os.getenv("CC_TELEGRAM_WINDOW_GEOMETRY", "160x50")
-        _geometry_match = re.fullmatch(r"(\d+)x(\d+)", _geometry_raw)
+        # {1,4} bounds the digit runs so a pathological value can never make
+        # int() raise (Python's int-digit-limit); anything longer is already
+        # far out of the sanity bounds and falls to the WARNING branch.
+        _geometry_match = re.fullmatch(r"(\d{1,4})x(\d{1,4})", _geometry_raw)
         if _geometry_match:
             _width = int(_geometry_match.group(1))
             _height = int(_geometry_match.group(2))
