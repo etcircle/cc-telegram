@@ -43,6 +43,7 @@ from cctelegram.handlers import (
     dashboard,
     inbound_aggregator,
     interactive_ui,
+    late_answer,
     message_queue,
     pick_intent,
     pick_token,
@@ -783,6 +784,9 @@ def _reset_all_handler_state() -> None:
     attention.reset_for_tests()
     message_queue.reset_for_tests()
     interactive_ui.reset_for_tests()
+    # Wave A: the in-memory aql: late-answer card registry (R3 reset-seam
+    # protocol — co-located reset called by direct module reference).
+    late_answer.reset_for_tests()
     pick_token.reset_for_tests()
     pick_intent.reset_for_tests()
     auq_source.reset_for_tests()
