@@ -42,7 +42,9 @@ import os
 import shlex
 import shutil
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 # Cache the resolved tmux binary path before libtmux is used. Every
@@ -97,6 +99,41 @@ def _compose_launch_command(
     if resume_session_id:
         cmd = f"{cmd} --resume {shlex.quote(resume_session_id)}"
     return cmd
+
+
+class RestartOutcome(Enum):
+    """Result of an in-place ``restart_claude_in_window`` attempt (``/update``)."""
+
+    RESTARTED = "restarted"  # Claude quit + relaunched, routing re-associated
+    SKIPPED_BUSY_LOCKED = "skipped_busy_locked"  # window send lock held
+    SKIPPED_NOT_IDLE = "skipped_not_idle"  # idle re-check under the lock failed
+    SKIPPED_NO_EXIT = "skipped_no_exit"  # pane never dropped to a shell (fail-closed)
+    ERROR = "error"  # a keystroke send returned False (window gone?)
+
+
+# Shells the pane drops to once Claude Code has quit. ``pane_current_command``
+# reports the shell NAME at the prompt — possibly login-prefixed ("-zsh") — and
+# the Claude Code VERSION string (e.g. "2.1.201") while the TUI runs, NEVER
+# "node" (A.0 live capture, CC 2.1.20x). Any value NOT in this set is treated as
+# "Claude still running", so the fail-closed relaunch gate never launches into a
+# live TUI.
+_KNOWN_SHELLS = frozenset(
+    {"zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "ash"}
+)
+
+
+def pane_command_is_shell(cmd: str | None) -> bool:
+    """True iff ``cmd`` (a ``pane_current_command`` value) is a known shell.
+
+    Login shells report themselves as ``-zsh``; a full path
+    (``/bin/zsh``) reduces to its basename. Anything else — the Claude Code
+    version string while the TUI runs, ``node``, ``None`` (query failure) — is
+    NOT a shell, so the restart gate keeps waiting / fails closed.
+    """
+    if not cmd:
+        return False
+    base = os.path.basename(cmd.strip()).lstrip("-")
+    return base in _KNOWN_SHELLS
 
 
 @dataclass
@@ -806,6 +843,162 @@ class TmuxManager:
         # visible to the next list_windows call from the resume flow.
         self._invalidate_list_cache()
         return result
+
+    async def pane_current_command(self, window_id: str) -> str | None:
+        """Real-time read of a window's active-pane foreground command.
+
+        Runs ``tmux display-message -p -t <wid> '#{pane_current_command}'`` as a
+        FRESH subprocess (NOT the 1s ``list_windows`` cache) so the ``/update``
+        restart gate sees the live value while polling for Claude Code to quit.
+        stderr-checked — tmux / libtmux swallow errors silently (the repo
+        gotcha, mirroring ``_cmd_send_literal`` / ``_cmd_resize_window``): a
+        non-zero exit OR non-empty stderr returns ``None``, which the caller
+        treats as "unknown → still running" (fail-closed).
+        """
+        tmux_bin = _TMUX_BIN if _TMUX_BIN is not None else "tmux"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                tmux_bin,
+                "display-message",
+                "-p",
+                "-t",
+                window_id,
+                "#{pane_current_command}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+        except Exception as e:
+            logger.error(
+                "pane_current_command subprocess failed for %s: %s", window_id, e
+            )
+            return None
+        err = stderr.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0 or err:
+            logger.error(
+                "tmux display-message failed for %s (rc=%s): %s",
+                window_id,
+                proc.returncode,
+                err,
+            )
+            return None
+        return stdout.decode("utf-8", errors="replace").strip()
+
+    async def restart_claude_in_window(
+        self,
+        window_id: str,
+        tracked_session_id: str,
+        md_settings: str,
+        *,
+        claude_command: str,
+        idle_recheck: Callable[[], Awaitable[bool]],
+        reassociate: Callable[[], Awaitable[None]],
+        quit_keys: str = "/exit",
+        shell_poll_timeout_s: float = 5.0,
+        shell_poll_interval_s: float = 0.3,
+        relaunch_settle_s: float = 1.0,
+    ) -> RestartOutcome:
+        """Restart Claude Code IN PLACE inside its existing tmux window.
+
+        The ``/update`` per-window mechanic — quit Claude, wait for the pane to
+        drop to a shell, relaunch ``claude_command --resume <tracked_session_id>``
+        so it adopts the freshly-updated on-disk version. Runs ENTIRELY inside
+        the per-window send lock (the same lock every keystroke path takes), with
+        the ``esc_command`` reject-if-held pattern so a concurrent send / pick
+        dispatch is never interrupted.
+
+        ``claude_command`` is the launch command to relaunch with (threaded from
+        the caller — the SAME value passed to ``run_update``, not read from the
+        global config here, so the relaunch target is an explicit contract).
+
+        Collaborators are INJECTED so this stays a tmux leaf:
+          - ``idle_recheck()`` — re-checks the route is genuinely idle (run-state
+            + pane ground-truth) INSIDE the lock, immediately before quitting.
+          - ``reassociate()`` — re-associates routing (ws.session_id override +
+            monitor offset at the post-relaunch settled EOF), also inside the
+            lock, only after a successful relaunch.
+
+        FAIL-CLOSED: if the pane does not become a shell within
+        ``shell_poll_timeout_s`` the relaunch is ABORTED (never launch into a
+        live TUI). Every ``send_keys`` return is checked (it returns False
+        silently on a vanished window). A ``reassociate()`` raise AFTER a
+        successful relaunch is caught and returned as ``ERROR`` (never
+        propagated — the caller's per-window isolation still records it).
+        """
+        # Lazy import dodges the tmux_manager ← callback_dispatcher module-level
+        # cycle (callback_dispatcher.interactive imports this module). The busy
+        # check + acquire pair below has NO await between them, so it is a
+        # genuine try-acquire (see ``_lock_busy``'s contract).
+        from .callback_dispatcher.interactive import _lock_busy
+
+        lock = self.window_send_lock(window_id)
+        if _lock_busy(lock):
+            logger.info("restart %s: send lock busy — skipping", window_id)
+            return RestartOutcome.SKIPPED_BUSY_LOCKED
+        async with lock:
+            # (1) Re-check idle INSIDE the lock. A concurrent user send can't
+            # race us (it takes this SAME lock), but the monitor poll could have
+            # ingested a fresh generation since the caller's cheap pre-gate.
+            if not await idle_recheck():
+                logger.info("restart %s: not idle at lock time — skipping", window_id)
+                return RestartOutcome.SKIPPED_NOT_IDLE
+
+            # (2) Quit keystroke (A.4: "/exit" + Enter cleanly quits Claude).
+            if not await self.send_keys(window_id, quit_keys, enter=True, literal=True):
+                logger.warning(
+                    "restart %s: quit keystroke send failed (window gone?)", window_id
+                )
+                return RestartOutcome.ERROR
+
+            # (3) Poll the real-time pane command until it becomes a shell.
+            # FAIL-CLOSED: never relaunch on top of a still-live TUI.
+            deadline = time.monotonic() + shell_poll_timeout_s
+            last_cmd: str | None = None
+            became_shell = False
+            while time.monotonic() < deadline:
+                await asyncio.sleep(shell_poll_interval_s)
+                last_cmd = await self.pane_current_command(window_id)
+                if pane_command_is_shell(last_cmd):
+                    became_shell = True
+                    break
+            if not became_shell:
+                logger.warning(
+                    "restart %s: pane never became a shell within %.1fs "
+                    "(last cmd=%r) — ABORTING, not relaunching",
+                    window_id,
+                    shell_poll_timeout_s,
+                    last_cmd,
+                )
+                return RestartOutcome.SKIPPED_NO_EXIT
+
+            # (4) Relaunch with --resume so the resumed process adopts the new
+            # on-disk version (A.0 result #6).
+            cmd_line = _compose_launch_command(
+                claude_command, md_settings, tracked_session_id
+            )
+            if not await self.send_keys(window_id, cmd_line, enter=True, literal=True):
+                logger.error("restart %s: relaunch keystroke send failed", window_id)
+                return RestartOutcome.ERROR
+
+            # (5) Let the resumed transcript settle, then re-associate routing
+            # (ws override + monitor offset at the post-replay settled EOF). A
+            # re-association raise here is caught (the relaunch already
+            # succeeded) and surfaced as ERROR — never propagated to abort the
+            # caller's per-window sweep (Hermes P2).
+            await asyncio.sleep(relaunch_settle_s)
+            try:
+                await reassociate()
+            except Exception:
+                logger.exception(
+                    "restart %s: reassociation failed after relaunch", window_id
+                )
+                return RestartOutcome.ERROR
+            logger.info(
+                "restart %s: relaunched 'claude --resume %s'",
+                window_id,
+                tracked_session_id,
+            )
+            return RestartOutcome.RESTARTED
 
 
 # Global instance with default session name

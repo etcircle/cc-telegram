@@ -536,6 +536,54 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"```\n{trimmed}\n```")
 
 
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: update the Claude Code CLI and restart idle sessions in place.
+
+    Updates the ``claude`` binary, then restarts each IDLE bound session inside
+    its existing tmux window (preserving the window id, via ``--resume`` so it
+    adopts the new version). Busy sessions are deferred. Fail-closed + idle-only:
+    it never restarts a session that is mid-work or waiting on a prompt.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    from .handlers import updater
+
+    # Progressive status message we edit in place through the run.
+    status_msg = await safe_reply(update.message, "🔄 Updating…")
+
+    async def _report(text: str) -> None:
+        try:
+            await status_msg.edit_text(text)
+        except Exception:
+            # A transient edit failure (or an identical-text "not modified")
+            # is non-fatal — the next report edits again.
+            pass
+
+    # Resolve the bot-managed MessageDisplay --settings once (mirrors
+    # create_window) so relaunched sessions keep the live-prose hook.
+    md_settings = ""
+    try:
+        from . import md_capture
+
+        md_path = md_capture.ensure_capture_settings()
+        md_settings = str(md_path) if md_path.exists() else ""
+    except Exception as e:  # noqa: BLE001
+        logger.warning("update: could not prepare MessageDisplay settings: %s", e)
+
+    await updater.run_update(
+        report=_report,
+        session_mgr=session_manager,
+        tmux=tmux_manager,
+        monitor=session_monitor,
+        claude_command=config.claude_command,
+        md_settings=md_settings,
+    )
+
+
 # --- Screenshot and effort callback keyboards ---
 
 # Builders live in callback_dispatcher so the 64-byte callback-data assertion
@@ -1311,6 +1359,7 @@ async def post_init(application: Application) -> None:
         BotCommand("kill", "Kill session, leave topic open"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("update", "Update Claude Code CLI + restart idle sessions"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -1611,6 +1660,9 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    # /update is bot-owned (update the CLI + restart idle sessions in place) —
+    # register before the catch-all forwarder below so it never lands in tmux.
+    application.add_handler(CommandHandler("update", update_command))
     # /dashboard MUST register before the catch-all command forwarder below —
     # it is a bot-owned command and must never be forwarded to Claude Code
     # (Wave C, pre-C/P2-5).
