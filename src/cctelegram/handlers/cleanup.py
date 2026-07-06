@@ -15,6 +15,7 @@ from telegram import Bot
 
 from .. import md_capture, route_runtime
 from ..session import session_id_for_window, session_manager
+from ..tmux_manager import tmux_manager
 
 from . import (
     attention,
@@ -109,6 +110,10 @@ async def clear_topic_state(
         # strand a double-`--resume` sibling's live AUQ. Harmless to leak by
         # correctness (max()-only-widens), cleared here for hygiene.
         auq_source.clear_side_file_freshness(route[2])
+        # P1: a closed topic's window keeps no post-/exit quarantine — a later
+        # window reusing the id must not inherit it (kill_window also pops it;
+        # this covers the close-without-kill path).
+        tmux_manager.clear_window_quarantine(route[2], reason="topic teardown")
         await teardown_route(route, drop_pending=drop_pending)
 
     # Clear status message tracking

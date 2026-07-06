@@ -30,6 +30,13 @@ Concurrency (Wave 3a):
     route locks / route_runtime / message_queue internals while holding it,
     and (with the single exception of an already-in-flight callback answer)
     no Telegram I/O may run while it is held.
+  - mark/clear/window_quarantined is the post-/exit quarantine registry
+    (Hermes P1): a /update restart that irrevocably sent /exit but could not
+    confirm a relaunch quarantines the window, and SessionManager.
+    send_to_window re-checks pane_current_command before typing user text
+    into it (a bare shell would EXECUTE the message). In-memory only; cleared
+    on proof of life, a later successful restart, kill_window, and the topic
+    teardown seams.
 
 Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 """
@@ -209,6 +216,14 @@ class TmuxManager:
         self._window_send_locks: dict[
             str, tuple[asyncio.Lock, asyncio.AbstractEventLoop]
         ] = {}
+        # Post-/exit quarantine registry (Hermes P1): window_id → wall stamp.
+        # A restart that irrevocably sent /exit but could not confirm a
+        # relaunch leaves the pane in an UNKNOWN state (it may drop to a bare
+        # shell AFTER the wait expires, in a still-bound topic);
+        # SessionManager.send_to_window re-checks pane_current_command for a
+        # quarantined window before typing user text. In-memory only — a bot
+        # restart clears it (documented residual).
+        self._quarantined_windows: dict[str, float] = {}
 
     @property
     def server(self) -> libtmux.Server:
@@ -603,6 +618,40 @@ class TmuxManager:
         """Drop all per-window send locks (test isolation seam)."""
         self._window_send_locks.clear()
 
+    # ── Post-/exit window quarantine (Hermes P1) ───────────────────────────
+    #
+    # ``/exit`` is irrevocable. When ``restart_claude_in_window`` cannot
+    # confirm a relaunch afterwards — the shell-wait expired
+    # (``SKIPPED_NO_EXIT``) or the relaunch keystroke send failed on a
+    # confirmed-shell pane — the topic stays BOUND to a pane that is (or may
+    # later become) a bare shell, and a Telegram message queued on the send
+    # lock during the wait would be typed into (and executed by) that shell.
+    # The quarantine makes ``send_to_window`` re-check the live pane command
+    # first: a non-shell command (Claude's version string) is positive proof
+    # of life and clears the bit; a shell or a failed query REFUSES the send.
+
+    def mark_window_quarantined(self, window_id: str) -> None:
+        """Mark ``window_id`` post-/exit UNKNOWN — sends must re-check first."""
+        self._quarantined_windows[window_id] = time.time()
+        logger.warning(
+            "window %s QUARANTINED — /exit sent but no relaunch confirmed; "
+            "user sends will be refused until Claude is observed alive",
+            window_id,
+        )
+
+    def window_quarantined(self, window_id: str) -> bool:
+        """True iff ``window_id`` is marked post-/exit unknown."""
+        return window_id in self._quarantined_windows
+
+    def clear_window_quarantine(self, window_id: str, *, reason: str) -> None:
+        """Clear a quarantine (positive proof of life, or window teardown)."""
+        if self._quarantined_windows.pop(window_id, None) is not None:
+            logger.info("window %s quarantine cleared (%s)", window_id, reason)
+
+    def reset_window_quarantines_for_tests(self) -> None:
+        """Drop all window quarantines (test isolation seam)."""
+        self._quarantined_windows.clear()
+
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
     ) -> bool:
@@ -762,6 +811,9 @@ class TmuxManager:
         # bound (module docstring).
         if result:
             self._window_send_locks.pop(window_id, None)
+            # A killed window's quarantine must not leak onto a later window
+            # that reuses the id (tmux ids reset on server restart).
+            self._quarantined_windows.pop(window_id, None)
         return result
 
     async def create_window(
@@ -1011,6 +1063,9 @@ class TmuxManager:
                     shell_poll_grace_s,
                     last_cmd,
                 )
+                # /exit is already out; the pane may still drop to a bare
+                # shell later — refuse user sends until proven alive (P1).
+                self.mark_window_quarantined(window_id)
                 return RestartOutcome.SKIPPED_NO_EXIT
             if time.monotonic() > primary_deadline:
                 logger.info(
@@ -1029,7 +1084,14 @@ class TmuxManager:
             )
             if not await self.send_keys(window_id, cmd_line, enter=True, literal=True):
                 logger.error("restart %s: relaunch keystroke send failed", window_id)
+                # The pane was CONFIRMED a bare shell and no Claude was
+                # launched into it — quarantine (P1).
+                self.mark_window_quarantined(window_id)
                 return RestartOutcome.ERROR
+            # Claude is being relaunched into the pane — a prior quarantine is
+            # resolved by this positive relaunch (covers the RESTARTED return
+            # AND the reassociate-failure ERROR below, where Claude is alive).
+            self.clear_window_quarantine(window_id, reason="relaunched")
 
             # (5) Give the resumed transcript a head start, then re-associate
             # routing (ws override + monitor offset at the post-replay

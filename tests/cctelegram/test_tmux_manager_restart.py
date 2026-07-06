@@ -295,6 +295,122 @@ class TestRestartClaudeInWindow:
         reassoc.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_skipped_no_exit_marks_window_quarantined(self):
+        # Hermes P1: /exit is irrevocable — an expired shell-wait leaves the
+        # pane in an UNKNOWN state inside a still-bound topic, so the window
+        # must be QUARANTINED (send_to_window re-checks before typing).
+        tm = _fresh_tm()
+        tm.send_keys = _record_send([])  # type: ignore[assignment]
+        tm.pane_current_command = AsyncMock(return_value="2.1.201")  # type: ignore[assignment]
+
+        outcome = await tm.restart_claude_in_window(
+            "@1",
+            "sid",
+            "",
+            claude_command="claude",
+            idle_recheck=AsyncMock(return_value=True),
+            reassociate=AsyncMock(),
+            shell_poll_timeout_s=0.02,
+            shell_poll_grace_s=0.02,
+            shell_poll_interval_s=0.01,
+            relaunch_settle_s=0.0,
+        )
+
+        assert outcome is RestartOutcome.SKIPPED_NO_EXIT
+        assert tm.window_quarantined("@1") is True
+
+    @pytest.mark.asyncio
+    async def test_relaunch_send_failed_marks_quarantined(self):
+        # The pane was CONFIRMED a bare shell and the relaunch keystroke send
+        # returned False — no Claude was launched, so the bound topic now
+        # fronts a bare shell: quarantine.
+        tm = _fresh_tm()
+        tm.send_keys = AsyncMock(side_effect=[True, False])  # type: ignore[assignment]
+        tm.pane_current_command = AsyncMock(return_value="zsh")  # type: ignore[assignment]
+
+        outcome = await tm.restart_claude_in_window(
+            "@1",
+            "sid",
+            "",
+            claude_command="claude",
+            idle_recheck=AsyncMock(return_value=True),
+            reassociate=AsyncMock(),
+            shell_poll_timeout_s=1.0,
+            shell_poll_interval_s=0.01,
+            relaunch_settle_s=0.0,
+        )
+
+        assert outcome is RestartOutcome.ERROR
+        assert tm.window_quarantined("@1") is True
+
+    @pytest.mark.asyncio
+    async def test_reassociate_failure_is_not_quarantined(self):
+        # Claude WAS relaunched successfully before reassociate raised — a
+        # live TUI owns the pane, so this ERROR path is NOT quarantined.
+        tm = _fresh_tm()
+        tm.send_keys = AsyncMock(return_value=True)  # type: ignore[assignment]
+        tm.pane_current_command = AsyncMock(return_value="zsh")  # type: ignore[assignment]
+
+        outcome = await tm.restart_claude_in_window(
+            "@1",
+            "sid",
+            "",
+            claude_command="claude",
+            idle_recheck=AsyncMock(return_value=True),
+            reassociate=AsyncMock(side_effect=RuntimeError("monitor blew up")),
+            shell_poll_timeout_s=1.0,
+            shell_poll_interval_s=0.01,
+            relaunch_settle_s=0.0,
+        )
+
+        assert outcome is RestartOutcome.ERROR
+        assert tm.window_quarantined("@1") is False
+
+    @pytest.mark.asyncio
+    async def test_quit_send_failed_is_not_quarantined(self):
+        # The /exit keystroke send returned False — /exit provably never
+        # reached the pane, so Claude still owns it: no quarantine.
+        tm = _fresh_tm()
+        tm.send_keys = AsyncMock(return_value=False)  # type: ignore[assignment]
+        tm.pane_current_command = AsyncMock()  # type: ignore[assignment]
+
+        outcome = await tm.restart_claude_in_window(
+            "@1",
+            "sid",
+            "",
+            claude_command="claude",
+            idle_recheck=AsyncMock(return_value=True),
+            reassociate=AsyncMock(),
+        )
+
+        assert outcome is RestartOutcome.ERROR
+        assert tm.window_quarantined("@1") is False
+
+    @pytest.mark.asyncio
+    async def test_successful_restart_clears_prior_quarantine(self):
+        # A later successful restart is positive proof Claude owns the pane
+        # again — a stale quarantine from an earlier attempt clears.
+        tm = _fresh_tm()
+        tm.mark_window_quarantined("@1")
+        tm.send_keys = AsyncMock(return_value=True)  # type: ignore[assignment]
+        tm.pane_current_command = AsyncMock(return_value="zsh")  # type: ignore[assignment]
+
+        outcome = await tm.restart_claude_in_window(
+            "@1",
+            "sid",
+            "",
+            claude_command="claude",
+            idle_recheck=AsyncMock(return_value=True),
+            reassociate=AsyncMock(),
+            shell_poll_timeout_s=1.0,
+            shell_poll_interval_s=0.01,
+            relaunch_settle_s=0.0,
+        )
+
+        assert outcome is RestartOutcome.RESTARTED
+        assert tm.window_quarantined("@1") is False
+
+    @pytest.mark.asyncio
     async def test_busy_send_lock_skips_without_any_keystroke(self):
         tm = _fresh_tm()
         lock = tm.window_send_lock("@1")

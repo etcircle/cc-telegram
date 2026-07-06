@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from cctelegram import session as session_mod
 from cctelegram.session import session_manager
 from cctelegram.tmux_manager import TmuxManager, tmux_manager as real_tmux
 
@@ -158,6 +160,127 @@ async def test_successful_kill_drops_lock_entry(
     monkeypatch.setattr(mgr, "get_session", lambda: _FakeSession())
     assert await mgr.kill_window("@1") is True
     assert mgr.window_send_lock("@1") is not lock1
+
+
+# ── P1 post-/exit quarantine gate at the send seam ─────────────────────────
+#
+# A /update that irrevocably sent /exit but could not confirm a relaunch
+# quarantines the window; ``send_to_window`` must re-check the live pane
+# command BEFORE typing user text into what may be a bare shell.
+
+
+@pytest.fixture
+def _fresh_quarantine():
+    real_tmux.reset_window_quarantines_for_tests()
+    yield
+    real_tmux.reset_window_quarantines_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_quarantined_window_shell_pane_refuses_send(
+    monkeypatch: pytest.MonkeyPatch, _fresh_quarantine
+) -> None:
+    """THE P1 scenario: a message queued behind the restart's lock flushes
+    after SKIPPED_NO_EXIT and the pane is now a bare shell — the send must be
+    REFUSED (nothing typed; typing + Enter would EXECUTE it)."""
+    events: list[Event] = []
+    monkeypatch.setattr(real_tmux, "find_window_by_id", _fake_find)
+    monkeypatch.setattr(real_tmux, "send_keys", _recording_send(events))
+    monkeypatch.setattr(
+        real_tmux, "pane_current_command", AsyncMock(return_value="zsh")
+    )
+    real_tmux.mark_window_quarantined("@1")
+
+    ok, msg = await session_manager.send_to_window("@1", "rm -rf ./scratch")
+
+    assert ok is False
+    assert msg == session_mod.QUARANTINE_SEND_REFUSED_MSG
+    assert "NOT delivered" in msg and "/update" in msg
+    assert events == []  # nothing was typed into the bare shell
+    assert real_tmux.window_quarantined("@1") is True  # kept — still a shell
+
+
+@pytest.mark.asyncio
+async def test_quarantined_window_claude_running_clears_and_delivers(
+    monkeypatch: pytest.MonkeyPatch, _fresh_quarantine
+) -> None:
+    """Claude alive (version-string pane command) is positive proof — the
+    quarantine clears and the message is delivered normally."""
+    events: list[Event] = []
+    monkeypatch.setattr(real_tmux, "find_window_by_id", _fake_find)
+    monkeypatch.setattr(real_tmux, "send_keys", _recording_send(events))
+    monkeypatch.setattr(
+        real_tmux, "pane_current_command", AsyncMock(return_value="2.1.201")
+    )
+    real_tmux.mark_window_quarantined("@1")
+
+    ok, _ = await session_manager.send_to_window("@1", "hello")
+
+    assert ok is True
+    assert ("enter", "@1", "hello") in events
+    assert real_tmux.window_quarantined("@1") is False
+
+
+@pytest.mark.asyncio
+async def test_quarantined_window_query_failure_refuses(
+    monkeypatch: pytest.MonkeyPatch, _fresh_quarantine
+) -> None:
+    """A failed pane_current_command query (None) is NOT proof of life —
+    fail closed: refuse, keep the quarantine."""
+    events: list[Event] = []
+    monkeypatch.setattr(real_tmux, "find_window_by_id", _fake_find)
+    monkeypatch.setattr(real_tmux, "send_keys", _recording_send(events))
+    monkeypatch.setattr(real_tmux, "pane_current_command", AsyncMock(return_value=None))
+    real_tmux.mark_window_quarantined("@1")
+
+    ok, msg = await session_manager.send_to_window("@1", "hello")
+
+    assert ok is False
+    assert msg == session_mod.QUARANTINE_SEND_REFUSED_MSG
+    assert events == []
+    assert real_tmux.window_quarantined("@1") is True
+
+
+@pytest.mark.asyncio
+async def test_unquarantined_send_never_queries_pane(
+    monkeypatch: pytest.MonkeyPatch, _fresh_quarantine
+) -> None:
+    """Zero overhead for normal windows: no pane_current_command subprocess."""
+    events: list[Event] = []
+    pcc = AsyncMock()
+    monkeypatch.setattr(real_tmux, "find_window_by_id", _fake_find)
+    monkeypatch.setattr(real_tmux, "send_keys", _recording_send(events))
+    monkeypatch.setattr(real_tmux, "pane_current_command", pcc)
+
+    ok, _ = await session_manager.send_to_window("@1", "hello")
+
+    assert ok is True
+    pcc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_successful_kill_clears_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown seam: a killed window's quarantine must not leak onto a later
+    window that reuses the id (tmux ids reset on server restart)."""
+
+    class _FakeWindow:
+        def kill(self) -> None:
+            pass
+
+    class _FakeWindows:
+        def get(self, window_id: str) -> _FakeWindow:
+            return _FakeWindow()
+
+    class _FakeSession:
+        windows = _FakeWindows()
+
+    mgr = TmuxManager(session_name="lock-test")
+    mgr.mark_window_quarantined("@1")
+    monkeypatch.setattr(mgr, "get_session", lambda: _FakeSession())
+    assert await mgr.kill_window("@1") is True
+    assert mgr.window_quarantined("@1") is False
 
 
 def test_window_send_lock_survives_event_loop_replacement() -> None:

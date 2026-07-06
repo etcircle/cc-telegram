@@ -28,10 +28,12 @@ import logging
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ..config import config
-from ..session import session_manager
+from ..session import QUARANTINE_SEND_REFUSED_MSG, session_manager
 from .message_queue import set_route_user_turn_at
+from .message_sender import safe_send
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,11 @@ class _PendingBundle:
     # media-group when the user sets it on the album, so without dedup we
     # emit the caption N times.
     seen_captions: set[str] = field(default_factory=set)
+    # The offering handler's bot (P1 quarantine surfacing): the debounced
+    # flush outlives the handler, so a quarantine-refused delivery needs a
+    # captured bot to post the in-topic "NOT delivered" notice. None (older
+    # callers / replay) degrades to log-only.
+    bot: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +163,30 @@ def _pop_bundle_locked(route: Route) -> _PendingBundle | None:
     return bundle
 
 
+async def _report_quarantine_refusal(route: Route, bundle: _PendingBundle) -> None:
+    """Best-effort in-topic disclosure of a quarantine-refused delivery.
+
+    Reuses the normal in-topic send path (``safe_send``) with the bundle's
+    captured bot; the fail-closed lookups (no captured bot / unresolvable
+    chat) degrade to the caller's log line — never a crash, never a DM
+    fallback.
+    """
+    if bundle.bot is None:
+        return
+    chat_id = session_manager.get_group_chat_id(route[0], route[1])
+    if chat_id is None:
+        return
+    try:
+        await safe_send(
+            bundle.bot,
+            chat_id,
+            f"❌ {QUARANTINE_SEND_REFUSED_MSG}",
+            message_thread_id=route[1] or None,
+        )
+    except Exception:
+        logger.exception("quarantine refusal notice failed for route %s", route)
+
+
 async def _send_bundle(route: Route, bundle: _PendingBundle) -> bool:
     """Render and send a popped bundle. Caller must NOT hold the route lock."""
     text_to_send = _format_bundle(bundle)
@@ -176,6 +207,13 @@ async def _send_bundle(route: Route, bundle: _PendingBundle) -> bool:
                 route,
                 message,
             )
+            # P1 quarantine refusal: this flush is fire-and-forget (the
+            # Telegram handler returned long ago), so without an explicit
+            # notice the user would believe the message reached Claude.
+            # Scoped to the quarantine refusal — other failures keep the
+            # pre-existing log-only shape.
+            if message == QUARANTINE_SEND_REFUSED_MSG:
+                await _report_quarantine_refusal(route, bundle)
             return False
     except Exception as exc:
         logger.error(
@@ -205,13 +243,17 @@ async def _flush(route: Route) -> bool:
     return await _send_bundle(route, bundle)
 
 
-async def aggregator_offer_text(route: Route, text: str) -> None:
+async def aggregator_offer_text(
+    route: Route, text: str, *, bot: Any | None = None
+) -> None:
     """Append a text part to the route's bundle and (re)schedule flush.
 
     The aggregator is intentionally independent of
     ``config.reply_context_enabled``. The kill switch only governs the
     quote→prompt rendering and the outbound ``reply_parameters`` anchor —
     bundling Telegram updates into one Claude turn is correct in both modes.
+    ``bot`` (the offering handler's) is captured on the bundle for the P1
+    quarantine-refusal notice; None preserves the log-only degradation.
     """
     if not text:
         return
@@ -219,12 +261,15 @@ async def aggregator_offer_text(route: Route, text: str) -> None:
     async with lock:
         bundle = _get_or_create_bundle(route)
         bundle.text_parts.append(text)
+        bundle.bot = bot or bundle.bot
         _schedule_flush(route, bundle)
 
 
-async def aggregator_offer_voice(route: Route, transcribed_text: str) -> None:
+async def aggregator_offer_voice(
+    route: Route, transcribed_text: str, *, bot: Any | None = None
+) -> None:
     """Voice transcripts ride the same path as text."""
-    await aggregator_offer_text(route, transcribed_text)
+    await aggregator_offer_text(route, transcribed_text, bot=bot)
 
 
 async def _offer_attachment(
@@ -232,6 +277,8 @@ async def _offer_attachment(
     path: Path,
     caption: str | None,
     media_group_id: str | None,
+    *,
+    bot: Any | None = None,
 ) -> None:
     """Append an attachment (and any caption) to the route's bundle.
 
@@ -243,6 +290,7 @@ async def _offer_attachment(
     flush_now = False
     async with lock:
         bundle = _get_or_create_bundle(route)
+        bundle.bot = bot or bundle.bot
 
         # Boundary force-flush: a new media-group arriving inside the
         # debounce window must not merge with the previous group's items.
@@ -285,8 +333,10 @@ async def aggregator_offer_photo(
     path: Path,
     caption: str | None,
     media_group_id: str | None,
+    *,
+    bot: Any | None = None,
 ) -> None:
-    await _offer_attachment(route, path, caption, media_group_id)
+    await _offer_attachment(route, path, caption, media_group_id, bot=bot)
 
 
 async def aggregator_offer_document(
@@ -294,8 +344,10 @@ async def aggregator_offer_document(
     path: Path,
     caption: str | None,
     media_group_id: str | None,
+    *,
+    bot: Any | None = None,
 ) -> None:
-    await _offer_attachment(route, path, caption, media_group_id)
+    await _offer_attachment(route, path, caption, media_group_id, bot=bot)
 
 
 async def aggregator_replay_payload(
