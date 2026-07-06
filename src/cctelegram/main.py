@@ -78,6 +78,14 @@ def _run_bot() -> None:
         "Permission/Workflow gate cards: %s",
         "ON" if config.permission_prompts_enabled else "OFF",
     )
+    # Same import-order-race seeding for the independent Decision-cards flag
+    # (Stage B1). config is the env authority (it loads .env); seed the parser
+    # from it so a .env-only value is reliable regardless of import order.
+    terminal_parser.set_decision_cards_enabled(config.decision_cards_enabled)
+    logger.info(
+        "Generic decision cards: %s",
+        "ON" if config.decision_cards_enabled else "OFF",
+    )
 
     session = tmux_manager.get_or_create_session()
     logger.info("Tmux session '%s' ready", session.session_name)

@@ -172,6 +172,24 @@ class Config:
             "CC_TELEGRAM_PERMISSION_PROMPTS", ""
         ).strip().lower() in ("1", "true", "yes", "on")
 
+        # Generic decision-prompt cards (Stage B1). Default OFF. When ON, the
+        # last-priority ``Decision`` pattern surfaces titled numbered-option
+        # confirmation prompts that no NAMED interactive pattern covers (the
+        # "Switch model?" confirmation / folder-trust family) as a display-only
+        # card with the manual ↑/↓/⏎/Esc nav keyboard (no one-tap option button
+        # yet). Independent of ``CC_TELEGRAM_PERMISSION_PROMPTS`` above. config
+        # OWNS this canonical declaration for documentation + the README sync
+        # rule; ``terminal_parser`` is a pure stdlib leaf and reads the SAME env
+        # var via a LOCAL ``os.getenv`` (it must not import config, which raises
+        # without a bot token). The parser's flag is the runtime authority, but
+        # its import-time read can race ``load_dotenv``; so ``main._run_bot``
+        # SEEDS the parser from THIS value at startup
+        # (``terminal_parser.set_decision_cards_enabled``), making a .env-only
+        # value reliable regardless of import order.
+        self.decision_cards_enabled = os.getenv(
+            "CC_TELEGRAM_DECISION_CARDS", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+
         # Max length of the per-tool input string surfaced in tool_use summary
         # lines (e.g. "**Bash**(<command>)", "**Read**(<path>)"). Long inputs
         # are truncated with a "…" marker. Default 40 keeps the activity feed
