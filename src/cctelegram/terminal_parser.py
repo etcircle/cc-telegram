@@ -24,16 +24,25 @@ remain detected unconditionally (they also appear in the JSONL stream as
 ``tool_use`` events and are detected via pane scrape as a redundant safety
 net).
 
-The flag is a LOCAL ``os.getenv`` read (``_PERMISSION_PROMPTS_ENABLED``,
-re-readable via ``reset_for_tests`` / ``set_permission_prompts_enabled``) —
-this module is a pure stdlib leaf and MUST NOT import ``config`` (it raises
-without a bot token, which would force a token into parser unit tests). The
-bot's ``config.py`` owns the canonical ``CC_TELEGRAM_PERMISSION_PROMPTS``
-declaration for documentation; the parser just reads the same env var.
+A SECOND, independent flag ``CC_TELEGRAM_DECISION_CARDS`` (default OFF) gates a
+last-priority generic ``Decision`` pattern (Stage B1) that surfaces titled
+numbered-option confirmation prompts no NAMED pattern covers (the "Switch
+model?" / folder-trust family) as a display-only card. It is strict-or-None
+with a Permission/Workflow veto so it never shadows a named pattern or
+re-surfaces a flag-OFF gate.
+
+Both flags are LOCAL ``os.getenv`` reads (``_PERMISSION_PROMPTS_ENABLED`` /
+``_DECISION_CARDS_ENABLED``, re-readable via ``reset_for_tests`` /
+``set_permission_prompts_enabled`` / ``set_decision_cards_enabled``) — this
+module is a pure stdlib leaf and MUST NOT import ``config`` (it raises without a
+bot token, which would force a token into parser unit tests). The bot's
+``config.py`` owns the canonical ``CC_TELEGRAM_PERMISSION_PROMPTS`` /
+``CC_TELEGRAM_DECISION_CARDS`` declarations for documentation; the parser just
+reads the same env vars.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
 parse_status_line(), strip_pane_chrome(), extract_bash_output(),
-parse_permission_prompt(), parse_workflow_approval().
+parse_permission_prompt(), parse_workflow_approval(), parse_generic_decision().
 """
 
 import hashlib
@@ -82,14 +91,54 @@ def set_permission_prompts_enabled(value: bool) -> None:
     _PERMISSION_PROMPTS_ENABLED = bool(value)
 
 
-def reset_for_tests() -> None:
-    """Re-read the gate-detection flag from the environment (reset-seam).
+# ── Generic "Decision" prompt detector kill-switch ────────────────────────
+#
+# A SECOND LOCAL parser flag (Stage B1), independent of the Permission /
+# Workflow flag above and seeded the same way (``main._run_bot`` reads
+# ``config`` and calls ``set_decision_cards_enabled`` to dodge the import-order
+# race). When ON, the last-priority ``Decision`` ``UIPattern`` surfaces generic
+# titled numbered-option confirmation prompts (the "Switch model?" / folder-trust
+# family) that no NAMED pattern covers as a DISPLAY-ONLY card. Default OFF — a
+# flag-OFF deploy adds ZERO new detection (``_active_ui_patterns`` drops it).
+# ``config.py`` owns the canonical ``CC_TELEGRAM_DECISION_CARDS`` declaration for
+# docs / the README sync rule; the parser reads the same env var locally so it
+# stays a config-free stdlib leaf.
 
-    Registered in the leaf's conftest reset protocol so a test that set the
-    flag (or the env var) does not leak into the next test.
+
+def _read_decision_cards_env() -> bool:
+    """Truthiness of ``CC_TELEGRAM_DECISION_CARDS`` (default OFF)."""
+    return os.getenv("CC_TELEGRAM_DECISION_CARDS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+_DECISION_CARDS_ENABLED: bool = _read_decision_cards_env()
+
+
+def decision_cards_enabled() -> bool:
+    """True when the generic Decision-prompt detector is enabled (flag ON)."""
+    return _DECISION_CARDS_ENABLED
+
+
+def set_decision_cards_enabled(value: bool) -> None:
+    """Test/runtime seam: override the Decision-detection flag explicitly."""
+    global _DECISION_CARDS_ENABLED  # noqa: PLW0603
+    _DECISION_CARDS_ENABLED = bool(value)
+
+
+def reset_for_tests() -> None:
+    """Re-read BOTH parser flags from the environment (reset-seam).
+
+    Registered in the leaf's conftest reset protocol so a test that set either
+    flag (or its env var) does not leak into the next test.
     """
     global _PERMISSION_PROMPTS_ENABLED  # noqa: PLW0603
+    global _DECISION_CARDS_ENABLED  # noqa: PLW0603
     _PERMISSION_PROMPTS_ENABLED = _read_permission_prompts_env()
+    _DECISION_CARDS_ENABLED = _read_decision_cards_env()
 
 
 @dataclass
@@ -234,6 +283,26 @@ def _strip_esc_affordance(label: str) -> str:
     return _RE_ESC_AFFORDANCE_SUFFIX.sub("", label).rstrip()
 
 
+# ── Generic "Decision" prompt anchors (Stage B1, flag-gated, LAST) ────────
+#
+# A generic titled numbered-option confirmation prompt (the "Switch model?"
+# confirmation, the folder-trust prompt, and peers) that no NAMED pattern
+# covers. Its footer MUST carry a live ``Enter to (confirm|continue)`` component
+# — the affirmative-commit half of a confirmation dialog (verified on both real
+# targets: ``Enter to confirm · Esc to cancel``). It deliberately EXCLUDES
+# ``Enter to select`` (AUQ pattern 3's footer — first-match-wins already routes
+# those to AUQ). Requiring ``Enter to (confirm|continue)`` (rather than accepting
+# a bare ``Esc to cancel`` / ``Esc to exit``) STRUCTURALLY closes the verb-drift
+# veto bypass (Codex P2): the Permission / EPM footer family
+# (``Esc to cancel · Tab to amend``, bare ``Esc to cancel``) has NO
+# ``Enter to confirm`` line, so a permission gate whose verb is outside
+# ``parse_permission_prompt``'s whitelist (e.g. ``Do you want to open …?``) can
+# no longer match Decision's footer at all — independent of the strict veto,
+# which is KEPT as defense-in-depth. Ordered LAST + flag-gated.
+_RE_DECISION_TOP_OPTION = re.compile(r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S")
+_RE_DECISION_FOOTER = re.compile(r"\bEnter to (?:confirm|continue)\b")
+
+
 # ── UI pattern definitions (order matters — first match wins) ────────────
 
 UI_PATTERNS: list[UIPattern] = [
@@ -330,23 +399,50 @@ UI_PATTERNS: list[UIPattern] = [
         bottom_up=True,
         bail_markers=(_RE_COLLAPSED_REGION,),
     ),
+    # ── Generic decision prompt (ordered LAST; flag-gated) ────────────────
+    # Appended AFTER every named pattern (incl. the Permission / Workflow
+    # gates) so first-match-wins never lets it steal a named pane. Filtered
+    # OUT of the detector when ``CC_TELEGRAM_DECISION_CARDS`` is OFF (see
+    # ``_active_ui_patterns``). ``parse_generic_decision`` is the strict-or-None
+    # validator (wired below via ``replace``) and carries a Permission /
+    # Workflow veto so a flag-OFF gate is never re-surfaced here.
+    UIPattern(
+        name="Decision",
+        top=(_RE_DECISION_TOP_OPTION,),
+        bottom=(_RE_DECISION_FOOTER,),
+        min_gap=1,
+        bottom_up=True,
+        bail_markers=(_RE_COLLAPSED_REGION,),
+    ),
 ]
 
 # Names of the flag-gated approval-gate patterns. The detector filters these
 # out of ``UI_PATTERNS`` when ``CC_TELEGRAM_PERMISSION_PROMPTS`` is OFF.
 _GATE_PATTERN_NAMES: Final[frozenset[str]] = frozenset({"Permission", "Workflow"})
 
+# The last-priority generic decision pattern. Filtered out of the detector when
+# ``CC_TELEGRAM_DECISION_CARDS`` is OFF (its OWN flag, independent of the gate
+# flag above).
+_DECISION_PATTERN_NAME: Final[str] = "Decision"
+
 
 def _active_ui_patterns() -> list[UIPattern]:
-    """``UI_PATTERNS`` with the approval-gate patterns filtered by the flag.
+    """``UI_PATTERNS`` with the flag-gated patterns filtered by their flags.
 
     When ``CC_TELEGRAM_PERMISSION_PROMPTS`` is OFF (default) the ``Permission``
-    / ``Workflow`` patterns are excluded — a flag-OFF deploy adds NO detection,
-    no card, no ``WAITING_ON_USER`` promotion (S-9, gated at the DETECTOR).
+    / ``Workflow`` patterns are excluded; when ``CC_TELEGRAM_DECISION_CARDS`` is
+    OFF (default) the ``Decision`` pattern is excluded. Each flag is
+    independent — a flag-OFF deploy adds NO detection, no card, no
+    ``WAITING_ON_USER`` promotion for its patterns (gated at the DETECTOR).
     """
-    if _PERMISSION_PROMPTS_ENABLED:
+    if _PERMISSION_PROMPTS_ENABLED and _DECISION_CARDS_ENABLED:
         return UI_PATTERNS
-    return [p for p in UI_PATTERNS if p.name not in _GATE_PATTERN_NAMES]
+    active = UI_PATTERNS
+    if not _PERMISSION_PROMPTS_ENABLED:
+        active = [p for p in active if p.name not in _GATE_PATTERN_NAMES]
+    if not _DECISION_CARDS_ENABLED:
+        active = [p for p in active if p.name != _DECISION_PATTERN_NAME]
+    return active
 
 
 # ── ExitPlanMode plan-file footer ─────────────────────────────────────────
@@ -2190,18 +2286,217 @@ def parse_workflow_approval(pane_text: str) -> AskUserQuestionForm | None:
     )
 
 
+# ── Generic decision-prompt parser (Stage B1, flag-gated, LAST) ───────────
+
+
+def _decision_option_block_top(lines: list[str], footer_idx: int) -> int | None:
+    """Index of the TOP-most line of the bottom-most contiguous ``N. <label>``
+    option block above ``footer_idx``.
+
+    Mirrors ``_gate_options_above``'s contiguity walk (extends across a numbered
+    line ONLY while its ``N`` keeps the run monotonic downward, so a separate
+    higher numbered run — a stray list above the prompt — is not folded in), so
+    the Decision title search starts just above the REAL option block. Returns
+    ``None`` when no numbered option is found.
+    """
+    block_top_idx: int | None = None
+    block_top_num: int | None = None
+    for j in range(footer_idx - 1, -1, -1):
+        stripped = lines[j].strip()
+        if not stripped:
+            continue
+        m = _RE_NUMBERED_OPTION.match(lines[j])
+        if m is not None:
+            try:
+                num = int(m.group("num"))
+            except ValueError:
+                break
+            if block_top_num is None:
+                block_top_num = num
+                block_top_idx = j
+                continue
+            if num == block_top_num - 1:
+                block_top_num = num
+                block_top_idx = j
+                continue
+            break
+        if all(c == "─" for c in stripped):
+            continue
+        # An indented description continuation within a few lines of an option.
+        if lines[j].startswith(("  ", "\t")) and any(
+            _RE_NUMBERED_OPTION.match(lines[k])
+            for k in range(j + 1, min(j + 6, footer_idx + 1))
+        ):
+            continue
+        break
+    return block_top_idx
+
+
+# The prompt block above the option block can span several lines (a heading, a
+# subtitle, a body paragraph) separated by SINGLE blank lines. The card must
+# show the heading, so the excerpt extends UP through that contiguous block —
+# bounded so a runaway scrollback walk can't absorb unrelated content.
+_DECISION_PROMPT_BLOCK_MAX_LINES: Final[int] = 10
+
+
+def _decision_prompt_block_top(lines: list[str], block_top_idx: int) -> int | None:
+    """Index of the TOP meaningful line of the contiguous prompt block above the
+    option block at ``block_top_idx`` (the heading the display-only card shows).
+
+    Walks UP from just above the option block, tolerating SINGLE blank lines
+    (paragraph spacing WITHIN one prompt), and STOPS at: a run of ≥2 consecutive
+    blank lines (a gap to unrelated scrollback), a chrome / box-drawing separator
+    line (the welcome banner / rule above the prompt), or the
+    ``_DECISION_PROMPT_BLOCK_MAX_LINES`` bound. Returns the top meaningful line's
+    index, or ``None`` when there is no prompt content above the options.
+    """
+    top_idx: int | None = None
+    blank_run = 0
+    meaningful = 0
+    for j in range(block_top_idx - 1, -1, -1):
+        stripped = lines[j].strip()
+        if not stripped:
+            blank_run += 1
+            if blank_run >= 2:
+                break
+            continue
+        if all(c == "─" for c in stripped) or _RE_GATE_TRAILING_SEPARATOR.match(
+            lines[j]
+        ):
+            break
+        blank_run = 0
+        meaningful += 1
+        if meaningful > _DECISION_PROMPT_BLOCK_MAX_LINES:
+            break
+        top_idx = j
+    return top_idx
+
+
+def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
+    """Strict-or-None parse of a GENERIC titled numbered-option confirmation
+    prompt (Stage B1 — the "Switch model?" confirmation, the folder-trust
+    prompt, and peers that no NAMED pattern covers).
+
+    Behind the ``CC_TELEGRAM_DECISION_CARDS`` flag (default OFF) and ordered
+    LAST in ``UI_PATTERNS`` (``extract_interactive_content`` reaches it only
+    when every named pattern — AUQ / EPM / Settings / RestoreCheckpoint /
+    Permission / Workflow — declined first-match-wins). All requirements
+    fail-closed → ``None``:
+
+      1. a bottom-most footer carrying a live ``Enter to (confirm|continue)``
+         component (the affirmative-commit half of a confirmation dialog —
+         verified on both real targets: ``Enter to confirm · Esc to cancel``).
+         REQUIRING ``Enter to (confirm|continue)`` — rather than accepting a
+         bare ``Esc to cancel`` / ``Esc to exit`` — STRUCTURALLY closes the
+         verb-drift veto bypass (Codex P2): the Permission / EPM footer family
+         (``Esc to cancel · Tab to amend``) has no ``Enter to confirm`` line, so
+         a permission gate whose verb is outside ``parse_permission_prompt``'s
+         whitelist (e.g. ``Do you want to open …?``) can no longer match here at
+         all, independent of the veto below. ``Enter to select`` is DELIBERATELY
+         excluded (AUQ pattern 3's footer);
+      2. ``_only_chrome_below`` True — the live-bottom-prompt guard: a QUOTED
+         prompt with a ready-for-input input box / status bar below it rejects;
+      3. ``_gate_options_above`` → ≥2 contiguous numbered options AND a
+         resolved live ``❯`` cursor;
+      4. the STRICT-VALIDATOR VETO (Hermes P2-4; KEPT as defense-in-depth beside
+         the footer narrowing): if ``parse_permission_prompt`` OR
+         ``parse_workflow_approval`` parses this pane, return ``None`` — a real
+         permission / workflow gate is NEVER re-surfaced as a generic Decision
+         even when its OWN flag (``CC_TELEGRAM_PERMISSION_PROMPTS``) is OFF (the
+         cross-flag re-exposure fix; strict validators, never a loose regex).
+
+    Returns a single-question ``AskUserQuestionForm`` (``select_mode="single"``,
+    ``is_review_screen=False``). ``current_question_title`` is the TOP meaningful
+    line of the contiguous prompt block above the options (the heading, e.g.
+    "Switch model?"); ``pane_excerpt`` spans that whole block → footer so the
+    card body shows the heading + context + options (Hermes P3 / Codex).
+
+    ACCEPTED NARROW RESIDUAL (Codex P1 / Hermes P2, flag-OFF by default,
+    display-only): a QUOTED decision block that is the LITERAL last content in
+    the pane with NO ready-for-input chrome below it (no input box / status bar)
+    passes ``_only_chrome_below`` and would surface + promote RUNNING→WAITING.
+    In a REAL running pane the input box + status bar are ALWAYS below the prose
+    and ``_only_chrome_below`` rejects it, so this is a narrow capture-race case
+    (the frame landed between the prose and the input box) — the SAME class as
+    the existing Permission / Workflow gate residual. Cosmetic-only in Stage B1
+    (no dispatch); the definitive live-signal close (gate on
+    ``notification_pending``) is deferred to Stage B2, where dispatch makes it
+    matter. Deliberately NOT closed with a heading/family allowlist — the
+    detector is intentionally GENERIC.
+    """
+    if not pane_text:
+        return None
+    lines = pane_text.split("\n")
+
+    # (1) Bottom-most confirmation footer (live footer beats a stale scrollback
+    # one).
+    footer_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _RE_DECISION_FOOTER.search(lines[i]):
+            footer_idx = i
+            break
+    if footer_idx is None:
+        return None
+
+    # (2) Bottom-terminal requirement — only the prompt's own chrome may follow.
+    if not _only_chrome_below(lines, footer_idx):
+        return None
+
+    # (3) Option block: ≥2 contiguous numbered options + a resolved live cursor.
+    options = _gate_options_above(lines, footer_idx)
+    if len(options) < 2:
+        return None
+    if not any(o.cursor for o in options):
+        return None
+
+    # (4) STRICT-VALIDATOR VETO — never re-surface a permission / workflow gate
+    # (even when its own flag filtered it out of the detector).
+    if parse_permission_prompt(pane_text) is not None:
+        return None
+    if parse_workflow_approval(pane_text) is not None:
+        return None
+
+    # Title + excerpt (Hermes P3 / Codex): capture the FULL contiguous prompt
+    # block above the option block so the actual heading is visible in the
+    # display-only card (not just the body line nearest the options). Title =
+    # the TOP meaningful line of that block; ``pane_excerpt`` = block heading →
+    # footer (the trusted region shown as the card body).
+    block_top_idx = _decision_option_block_top(lines, footer_idx)
+    title: str | None = None
+    excerpt_start = block_top_idx if block_top_idx is not None else footer_idx
+    if block_top_idx is not None:
+        prompt_top_idx = _decision_prompt_block_top(lines, block_top_idx)
+        if prompt_top_idx is not None:
+            title = lines[prompt_top_idx].strip()
+            excerpt_start = prompt_top_idx
+    pane_excerpt = "\n".join(lines[excerpt_start : footer_idx + 1]).rstrip()
+
+    return AskUserQuestionForm(
+        current_question_title=title,
+        options=options,
+        is_review_screen=False,
+        is_free_text=False,
+        pane_excerpt=pane_excerpt,
+        select_mode="single",
+        options_complete=options[0].number == 1,
+    )
+
+
 # Wire the strict variant parsers as the gate patterns' S-8 post-validators
 # (the parsers are defined here, far below ``UI_PATTERNS``; ``UIPattern`` is
-# frozen, so rebuild the two gate entries in place via ``replace``). After this,
-# ``extract_interactive_content`` runs ``parse_permission_prompt`` /
-# ``parse_workflow_approval`` after a loose match and only returns the gate when
-# it strictly parses — closing the quoted-prompt false positives (S-8). The
-# ordering (gates LAST) is preserved (same list positions).
+# frozen, so rebuild the validated entries in place via ``replace``). After
+# this, ``extract_interactive_content`` runs ``parse_permission_prompt`` /
+# ``parse_workflow_approval`` / ``parse_generic_decision`` after a loose match
+# and only returns the pattern when it strictly parses — closing the
+# quoted-prompt false positives (S-8). The ordering (gates + Decision LAST) is
+# preserved (same list positions).
 UI_PATTERNS = [
     replace(p, validator=parse_permission_prompt)
     if p.name == "Permission"
     else replace(p, validator=parse_workflow_approval)
     if p.name == "Workflow"
+    else replace(p, validator=parse_generic_decision)
+    if p.name == "Decision"
     else p
     for p in UI_PATTERNS
 ]

@@ -1,0 +1,12 @@
+ For reference, a folder-trust prompt looks like this:
+
+ Delete all local branches?
+ ❯ 1. Yes, delete them
+   2. No, keep them
+ Enter to confirm · Esc to cancel
+
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+  ? for shortcuts · ← for agents
+  ◉ xhigh · /effort

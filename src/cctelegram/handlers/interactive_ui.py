@@ -2713,7 +2713,11 @@ def _build_interactive_keyboard(
 # carries the full pane region (extracted question + options + — for Workflow
 # — phases + token warning), so the user reads the choices before acting.
 
-_GATE_RENDER_NAMES: frozenset[str] = frozenset({"Permission", "Workflow"})
+# "Decision" (Stage B1, generic titled numbered-option confirmation prompts)
+# rides the SAME display-only branch as Permission / Workflow: title + options
+# in the card body + the manual ↑/↓/⏎/Esc nav keyboard + the honest
+# raw-keystroke notice, and the AUQ/EPM-only live-prose post is skipped for it.
+_GATE_RENDER_NAMES: frozenset[str] = frozenset({"Permission", "Workflow", "Decision"})
 
 _GATE_NAV_NOTICE = (
     "⚠️ These controls type directly into the live terminal and are NOT "
