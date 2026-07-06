@@ -27,7 +27,11 @@ from typing import Any
 
 from .. import route_runtime, terminal_parser
 from ..monitor_state import TrackedSession
-from ..tmux_manager import SHELL_WAIT_TOTAL_S, RestartOutcome
+from ..tmux_manager import (
+    RELAUNCH_CONFIRM_TIMEOUT_S,
+    SHELL_WAIT_TOTAL_S,
+    RestartOutcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,16 @@ _NO_EXIT_REASON = (
 # stat of the file, so ``offset <= filesize`` holds regardless.
 _SETTLE_STAT_INTERVAL_S = 0.3
 _SETTLE_STAT_MAX_WAIT_S = 5.0
+
+# RELAUNCH_UNCONFIRMED disclosure (r2 P1-A): the relaunch keystroke was typed
+# onto a confirmed-shell pane but Claude was never OBSERVED running within the
+# confirm budget — the window stays quarantined (sends refuse until the strict
+# proof-of-life re-check sees Claude), so the summary must say so.
+_RELAUNCH_UNCONFIRMED_REASON = (
+    f"relaunched but Claude wasn't seen running within "
+    f"{RELAUNCH_CONFIRM_TIMEOUT_S:.0f}s — check the window; sends stay blocked "
+    "until Claude is seen alive"
+)
 
 
 def reset_for_tests() -> None:
@@ -236,6 +250,8 @@ async def run_update(
                 deferred.append(name)
             elif outcome is RestartOutcome.SKIPPED_NO_EXIT:
                 skipped.append((name, _NO_EXIT_REASON))
+            elif outcome is RestartOutcome.RELAUNCH_UNCONFIRMED:
+                skipped.append((name, _RELAUNCH_UNCONFIRMED_REASON))
             else:  # RestartOutcome.ERROR
                 skipped.append((name, "restart error"))
 

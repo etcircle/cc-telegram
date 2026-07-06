@@ -507,3 +507,41 @@ class TestQuarantineRefusalSurfacing:
         ok = await inbound_aggregator.aggregator_flush_route(route)
 
         assert ok is False  # no bot captured → refusal logged, never a crash
+
+    @pytest.mark.asyncio
+    async def test_media_group_boundary_second_bundle_keeps_notice(self, monkeypatch):
+        # r2 P2: the media-group boundary force-flush pops the old bundle and
+        # creates a FRESH one — which must re-capture the bot, or the second
+        # bundle's quarantine refusal silently degrades to log-only.
+        from cctelegram import session as session_mod
+
+        route = (1, 42, "@1")
+        bot = AsyncMock()
+        monkeypatch.setattr(
+            inbound_aggregator.session_manager,
+            "send_to_window",
+            AsyncMock(return_value=(False, session_mod.QUARANTINE_SEND_REFUSED_MSG)),
+        )
+        monkeypatch.setattr(
+            inbound_aggregator.session_manager,
+            "get_group_chat_id",
+            lambda user_id, thread_id: -100500,
+        )
+
+        await inbound_aggregator.aggregator_offer_photo(
+            route, Path("/tmp/a.jpg"), "cap1", "group-1", bot=bot
+        )
+        # A DIFFERENT media-group inside the debounce window force-flushes the
+        # first bundle (backgrounded) and starts a FRESH bundle.
+        await inbound_aggregator.aggregator_offer_photo(
+            route, Path("/tmp/b.jpg"), "cap2", "group-2", bot=bot
+        )
+        ok = await inbound_aggregator.aggregator_flush_route(route)
+        # Drain the backgrounded first-bundle flush.
+        for task in list(inbound_aggregator._background_tasks):
+            await task
+
+        assert ok is False
+        # BOTH refused bundles surfaced a notice — the fresh post-boundary
+        # bundle did not lose the captured bot.
+        assert bot.send_message.await_count == 2

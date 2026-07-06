@@ -204,8 +204,9 @@ async def test_quarantined_window_shell_pane_refuses_send(
 async def test_quarantined_window_claude_running_clears_and_delivers(
     monkeypatch: pytest.MonkeyPatch, _fresh_quarantine
 ) -> None:
-    """Claude alive (version-string pane command) is positive proof — the
-    quarantine clears and the message is delivered normally."""
+    """Claude alive — STRICTLY the version-string pane command
+    (``pane_command_is_claude``) — is positive proof: the quarantine clears
+    and the message is delivered normally."""
     events: list[Event] = []
     monkeypatch.setattr(real_tmux, "find_window_by_id", _fake_find)
     monkeypatch.setattr(real_tmux, "send_keys", _recording_send(events))
@@ -219,6 +220,31 @@ async def test_quarantined_window_claude_running_clears_and_delivers(
     assert ok is True
     assert ("enter", "@1", "hello") in events
     assert real_tmux.window_quarantined("@1") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_cmd", ["vim", "python", "node", "ssh"])
+async def test_quarantined_window_foreign_command_refuses(
+    monkeypatch: pytest.MonkeyPatch, _fresh_quarantine, foreign_cmd: str
+) -> None:
+    """r2 P1-B: "any non-shell" is NOT "Claude alive" — a user who followed
+    the summary's "check the window" advice and ran vim/python/ssh in the
+    stranded pane must NOT clear the quarantine; typing + Enter would land in
+    THAT program. Only the strict version-string shape is proof of life."""
+    events: list[Event] = []
+    monkeypatch.setattr(real_tmux, "find_window_by_id", _fake_find)
+    monkeypatch.setattr(real_tmux, "send_keys", _recording_send(events))
+    monkeypatch.setattr(
+        real_tmux, "pane_current_command", AsyncMock(return_value=foreign_cmd)
+    )
+    real_tmux.mark_window_quarantined("@1")
+
+    ok, msg = await session_manager.send_to_window("@1", "hello")
+
+    assert ok is False
+    assert msg == session_mod.QUARANTINE_SEND_REFUSED_MSG
+    assert events == []  # nothing typed into vim/python/ssh
+    assert real_tmux.window_quarantined("@1") is True
 
 
 @pytest.mark.asyncio

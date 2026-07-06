@@ -32,11 +32,15 @@ Concurrency (Wave 3a):
     no Telegram I/O may run while it is held.
   - mark/clear/window_quarantined is the post-/exit quarantine registry
     (Hermes P1): a /update restart that irrevocably sent /exit but could not
-    confirm a relaunch quarantines the window, and SessionManager.
-    send_to_window re-checks pane_current_command before typing user text
-    into it (a bare shell would EXECUTE the message). In-memory only; cleared
-    on proof of life, a later successful restart, kill_window, and the topic
-    teardown seams.
+    CONFIRM a relaunch (the shell-wait expired, the relaunch keystroke send
+    failed, or the post-relaunch confirm poll never observed Claude — r2
+    P1-A) quarantines the window, and SessionManager.send_to_window re-checks
+    pane_current_command before typing user text into it (a bare shell would
+    EXECUTE the message). Proof of life is STRICTLY pane_command_is_claude
+    (the A.0 version-string shape) — "not a shell" is not proof (vim/python/
+    ssh in the stranded pane must keep refusing; r2 P1-B). In-memory only;
+    cleared on that positive proof, a later CONFIRMED restart, kill_window,
+    and the topic teardown seams.
 
 Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 """
@@ -46,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shlex
 import shutil
 import time
@@ -111,10 +116,16 @@ def _compose_launch_command(
 class RestartOutcome(Enum):
     """Result of an in-place ``restart_claude_in_window`` attempt (``/update``)."""
 
-    RESTARTED = "restarted"  # Claude quit + relaunched, routing re-associated
+    RESTARTED = "restarted"  # Claude quit + relaunched (confirmed), re-associated
     SKIPPED_BUSY_LOCKED = "skipped_busy_locked"  # window send lock held
     SKIPPED_NOT_IDLE = "skipped_not_idle"  # idle re-check under the lock failed
     SKIPPED_NO_EXIT = "skipped_no_exit"  # pane never dropped to a shell (fail-closed)
+    # Relaunch keystroke typed onto a confirmed-shell pane, but Claude was
+    # never OBSERVED running within the confirm budget (r2 P1-A: keystroke
+    # acceptance is not launch proof — broken CLAUDE_COMMAND / auth failure /
+    # instant crash). The window stays quarantined; a late boot self-heals at
+    # the next send's re-check.
+    RELAUNCH_UNCONFIRMED = "relaunch_unconfirmed"
     ERROR = "error"  # a keystroke send returned False (window gone?)
 
 
@@ -154,6 +165,14 @@ _SHELL_POLL_TIMEOUT_S = 5.0
 _SHELL_POLL_GRACE_S = 10.0
 SHELL_WAIT_TOTAL_S = _SHELL_POLL_TIMEOUT_S + _SHELL_POLL_GRACE_S
 
+# Bounded post-relaunch confirmation budget (r2 P1-A): after the relaunch
+# keystroke is ACCEPTED, poll until the pane reports the Claude version string.
+# Keystroke acceptance is not launch proof — a broken CLAUDE_COMMAND / invalid
+# auth / instant crash drops straight back to the shell, and clearing the
+# quarantine on the keystroke would strand a bare shell with no refusal net.
+# Public so the updater's summary can disclose the budget honestly.
+RELAUNCH_CONFIRM_TIMEOUT_S = 10.0
+
 
 def pane_command_is_shell(cmd: str | None) -> bool:
     """True iff ``cmd`` (a ``pane_current_command`` value) is a known shell.
@@ -167,6 +186,31 @@ def pane_command_is_shell(cmd: str | None) -> bool:
         return False
     base = os.path.basename(cmd.strip()).lstrip("-")
     return base in _KNOWN_SHELLS
+
+
+# The A.0 empirical contract (CC 2.1.20x): while the Claude Code TUI runs,
+# ``pane_current_command`` reports its VERSION STRING (e.g. "2.1.201") — never
+# "claude" or "node". A version-led token; a suffix ("2.1.201-beta") is
+# tolerated, a LEADING name ("v2.1.201", "claude 2.1.201") never is.
+# VERSION-DRIFT RESIDUAL (fail-closed by design): if a future CC changes the
+# reported shape, quarantined sends keep REFUSING — recoverable via a /update
+# rerun, a window recreate, or a bot restart. The next TUI-drift audit must
+# re-verify this predicate alongside the shell set above.
+_RE_CLAUDE_VERSION_CMD = re.compile(r"\d+\.\d+\.\d+\S*")
+
+
+def pane_command_is_claude(cmd: str | None) -> bool:
+    """True iff ``cmd`` is POSITIVE proof the Claude Code TUI owns the pane.
+
+    Strictly the version-string shape (r2 P1-B) — "not a shell" is NOT proof
+    of life: a user checking a stranded window may be running vim / python /
+    ssh there, and typing user text + Enter into those is the exact hazard the
+    quarantine exists to stop. Used by the quarantined send-seam re-check AND
+    the post-relaunch confirmation poll.
+    """
+    if not cmd:
+        return False
+    return _RE_CLAUDE_VERSION_CMD.fullmatch(cmd.strip()) is not None
 
 
 @dataclass
@@ -975,6 +1019,7 @@ class TmuxManager:
         shell_poll_timeout_s: float = _SHELL_POLL_TIMEOUT_S,
         shell_poll_grace_s: float = _SHELL_POLL_GRACE_S,
         shell_poll_interval_s: float = 0.3,
+        claude_confirm_timeout_s: float = RELAUNCH_CONFIRM_TIMEOUT_S,
         relaunch_settle_s: float = 1.0,
     ) -> RestartOutcome:
         """Restart Claude Code IN PLACE inside its existing tmux window.
@@ -1004,10 +1049,17 @@ class TmuxManager:
         into a live TUI). The grace exists because ``/exit`` is IRREVOCABLE: a
         pane that drops to a shell only after the primary window is recovered
         with a normal relaunch (INFO-logged) instead of stranding a bare shell
-        in a still-bound topic. Every ``send_keys`` return is checked (it
-        returns False silently on a vanished window). A ``reassociate()`` raise
-        AFTER a successful relaunch is caught and returned as ``ERROR`` (never
-        propagated — the caller's per-window isolation still records it).
+        in a still-bound topic. After the relaunch keystroke, Claude is
+        CONFIRMED by a second bounded poll (``claude_confirm_timeout_s``) for
+        the strict version-string proof (``pane_command_is_claude``) — the
+        keystroke being accepted is not launch proof (r2 P1-A); an unconfirmed
+        relaunch keeps the quarantine and returns ``RELAUNCH_UNCONFIRMED``
+        (a late boot self-heals at the next send's re-check). Every
+        ``send_keys`` return is checked (it returns False silently on a
+        vanished window). A ``reassociate()`` raise AFTER a confirmed relaunch
+        is caught and returned as ``ERROR`` (never propagated — the caller's
+        per-window isolation still records it; Claude is proven alive, so it
+        is NOT quarantined).
         """
         # Lazy import dodges the tmux_manager ← callback_dispatcher module-level
         # cycle (callback_dispatcher.interactive imports this module). The busy
@@ -1088,10 +1140,41 @@ class TmuxManager:
                 # launched into it — quarantine (P1).
                 self.mark_window_quarantined(window_id)
                 return RestartOutcome.ERROR
-            # Claude is being relaunched into the pane — a prior quarantine is
-            # resolved by this positive relaunch (covers the RESTARTED return
-            # AND the reassociate-failure ERROR below, where Claude is alive).
-            self.clear_window_quarantine(window_id, reason="relaunched")
+
+            # (4b) CONFIRM Claude actually came up (r2 P1-A): the keystroke
+            # being accepted is not launch proof — a broken CLAUDE_COMMAND /
+            # auth failure / instant crash drops straight back to the shell,
+            # and clearing the quarantine on the keystroke alone would strand
+            # a bare shell with no refusal net. Poll for the strict positive
+            # version-string proof (pane_command_is_claude — never "any
+            # non-shell").
+            confirm_deadline = time.monotonic() + claude_confirm_timeout_s
+            confirm_cmd: str | None = None
+            claude_confirmed = False
+            while time.monotonic() < confirm_deadline:
+                await asyncio.sleep(shell_poll_interval_s)
+                confirm_cmd = await self.pane_current_command(window_id)
+                if pane_command_is_claude(confirm_cmd):
+                    claude_confirmed = True
+                    break
+            if not claude_confirmed:
+                logger.error(
+                    "restart %s: relaunch typed but Claude was not observed "
+                    "running within %.1fs (last cmd=%r) — window stays "
+                    "QUARANTINED; a late boot self-heals at the next send's "
+                    "re-check",
+                    window_id,
+                    claude_confirm_timeout_s,
+                    confirm_cmd,
+                )
+                self.mark_window_quarantined(window_id)
+                return RestartOutcome.RELAUNCH_UNCONFIRMED
+            # Claude OBSERVED running — a (possibly pre-existing) quarantine
+            # is resolved by this positive proof; the reassociate-failure
+            # ERROR below stays unquarantined (Claude is alive).
+            self.clear_window_quarantine(
+                window_id, reason="claude confirmed post-relaunch"
+            )
 
             # (5) Give the resumed transcript a head start, then re-associate
             # routing (ws override + monitor offset at the post-replay

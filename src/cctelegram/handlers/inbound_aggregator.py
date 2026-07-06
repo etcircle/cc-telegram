@@ -307,6 +307,11 @@ async def _offer_attachment(
             if old_bundle is not None:
                 _spawn_background(_send_bundle(route, old_bundle))
             bundle = _get_or_create_bundle(route)
+            # r2 P2: the FRESH post-boundary bundle must re-capture the bot
+            # (the set above landed on the popped bundle) — otherwise a
+            # quarantine-refused flush of this second bundle silently loses
+            # its in-topic notice. Carry the old bundle's bot as fallback.
+            bundle.bot = bot or (old_bundle.bot if old_bundle else None)
 
         if caption and caption not in bundle.seen_captions:
             bundle.text_parts.append(caption)

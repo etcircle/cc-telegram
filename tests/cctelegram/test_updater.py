@@ -200,20 +200,21 @@ class TestRunUpdateBucketing:
 
     @pytest.mark.asyncio
     async def test_outcome_bucketing(self, monkeypatch):
-        bindings = [(1, i * 10, f"@{i}") for i in range(1, 6)]
+        bindings = [(1, i * 10, f"@{i}") for i in range(1, 7)]
         _patch_snapshot(monkeypatch, {})  # all IDLE_CLEARED
         sm = FakeSessionMgr(
             bindings,
-            window_states={f"@{i}": _WS(session_id=f"s{i}") for i in range(1, 6)},
+            window_states={f"@{i}": _WS(session_id=f"s{i}") for i in range(1, 7)},
         )
         tmux = FakeTmux(
-            windows={f"@{i}" for i in range(1, 6)},
+            windows={f"@{i}" for i in range(1, 7)},
             outcome_map={
                 "@1": RestartOutcome.RESTARTED,
                 "@2": RestartOutcome.SKIPPED_BUSY_LOCKED,  # deferred
                 "@3": RestartOutcome.SKIPPED_NOT_IDLE,  # deferred
                 "@4": RestartOutcome.SKIPPED_NO_EXIT,  # skipped (didn't exit)
                 "@5": RestartOutcome.ERROR,  # skipped (restart error)
+                "@6": RestartOutcome.RELAUNCH_UNCONFIRMED,  # skipped (r2 P1-A)
             },
         )
         reports: list[str] = []
@@ -239,6 +240,10 @@ class TestRunUpdateBucketing:
         assert "the session may be dead" in summary
         assert "check the window before sending messages" in summary
         assert "@5 (restart error)" in summary
+        # r2 P1-A: an unconfirmed relaunch gets its own honest disclosure — the
+        # relaunch was typed but Claude was never observed running.
+        assert "@6 (relaunched but Claude wasn't seen running" in summary
+        assert "sends stay blocked" in summary
 
     @pytest.mark.asyncio
     async def test_single_flight_rejects_concurrent(self, monkeypatch):
