@@ -7,6 +7,7 @@
 │  - /history: Paginated message history (default: latest page)      │
 │  - /screenshot: Capture tmux pane as PNG                           │
 │  - /esc: Send Escape to interrupt Claude                           │
+│  - /update: Update CLI + restart idle sessions in place            │
 │  - Send text → Claude Code via tmux keystrokes                     │
 │  - Forward /commands to Claude Code                                │
 │  - Create sessions via directory browser in unbound topics         │
@@ -431,6 +432,26 @@ Handler modules (handlers/):
                         group_chat_ids) AND bot.topic_closed_handler's
                         no-binding branch so a dedicated binding-less dashboard
                         host topic is cleaned on close (review P2-4).
+  updater.py          ─ /update orchestration (owner-only manual command, no
+                        scheduler). run_update: (1) updates the CLI binary via
+                        shlex.split(config.claude_command)[0] + ["update"]
+                        (create_subprocess_exec, NO shell=True; non-zero is
+                        non-fatal), (2) walks iter_thread_bindings and restarts
+                        each IDLE_CLEARED + pane-idle route IN PLACE via
+                        tmux_manager.restart_claude_in_window (reusing the window
+                        id → routing preserved), SEQUENTIALLY; a route projected
+                        RUNNING (background agent) or WAITING (pending prompt) is
+                        deferred. Idle gate is TWO-factor: route_is_idle =
+                        run_state IDLE_CLEARED AND terminal_parser.pane_looks_idle
+                        (the pane ground-truth, since run-state can lag a
+                        mid-generation pane). reassociate_routing mirrors the
+                        proven directory-browser resume path (ws.session_id
+                        override + monitor register/offset at the POST-RELAUNCH
+                        settled EOF — offset <= filesize so a truncating replay
+                        never trips the reset-to-0 flood). Module-level
+                        single-flight guard rejects a concurrent /update.
+                        Collaborators (session_mgr / tmux / monitor) injected;
+                        pull-only, no route_runtime mutation, no observer.
   pick_intent.py      ─ D2 restart-recovery: durable per-callback-TOKEN AUQ pick
                         mint-intent store (leaf; imports only utils). Append-only
                         JSONL (row + tombstone lines) at pick_intent.jsonl, 24h
@@ -571,6 +592,7 @@ State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
 
 ## Key Design Decisions
 
+- **`/update` in-place session restart (owner-only, fail-closed, idle-only)** — updating `~/.local/bin/claude` repoints a symlink; a running `claude` process stays pinned to its launch-time version until restarted. `/update` (`handlers/updater.run_update`) updates the CLI, then restarts each **idle** bound session IN PLACE inside its existing tmux window so it adopts the new version WITHOUT touching `window_id` / `thread_bindings` / routing. `tmux_manager.restart_claude_in_window` runs the per-window mechanic ENTIRELY inside `window_send_lock(window_id)` (the `esc_command` reject-if-held pattern): re-check idle → send `/exit`+Enter → POLL a fresh stderr-checked `pane_current_command` query until the pane drops to a shell (`pane_command_is_shell`; `~5s` timeout) → **FAIL-CLOSED: never relaunch into a live TUI** → relaunch `_compose_launch_command(config.claude_command, md_settings, tracked_session_id)` → re-associate routing (`reassociate_routing`: ws.session_id override + monitor offset at the post-relaunch settled EOF). Every `send_keys` return is checked (silent False on a vanished window). Empirically de-risked (A.0, CC 2.1.20x): `claude --resume` reports the SAME session id and pure-appends to the same JSONL, so NO alias / monitor-authority change is needed — the register-at-settled-EOF keeps `offset <= filesize` so a truncating replay never trips the `_read_new_lines` reset-to-0 history flood. Idle is TWO-factor (`route_runtime` `IDLE_CLEARED` AND `terminal_parser.pane_looks_idle`), restarts run SEQUENTIALLY, a module-level single-flight guard rejects a concurrent `/update`, and busy/waiting/background-agent routes are deferred. `pane_looks_idle` is STRUCTURAL + positive-evidence + fail-closed: no `esc to interrupt` / no live `is_interactive_ui` surface, the input row must be the EMPTY `❯` prompt bracketed by the BOTTOM pair of `──` rule separators (a body `> blockquote` is above that pair, and a typed-but-unsent draft is rejected), AND a ready-for-input status-bar marker must be present below the box (a dropped-footer mid-redraw has none → fails closed rather than reading absence as idle). Per-window failures are ISOLATED (a raise in one restart is bucketed as an error and the loop continues; a `reassociate` raise after a successful relaunch returns `ERROR`, never propagates). `config.claude_command` may carry flags, so the update binary is `shlex.split(...)[0]` + `["update"]` (never `shell=True`, bounded by a 120s `wait_for` + kill-on-timeout); a non-zero/timed-out update is non-fatal (the restart adopts on-disk). The relaunch `claude_command` is THREADED from `run_update` through `restart_claude_in_window` (not read from the global config there). Pull-only; no route_runtime mutation; no observer.
 - **Topic-centric** — Each Telegram topic binds to one tmux window. No centralized session list; topics *are* the session list.
 - **Window ID-centric** — All internal state keyed by tmux window ID (e.g. `@0`, `@12`), not window names. Window IDs are guaranteed unique within a tmux server session. Window names are kept as display names via `window_display_names` map. Same directory can have multiple windows.
 - **Machine-surface window geometry (Wave B)** — bot windows are `160x50` by default (`CC_TELEGRAM_WINDOW_GEOMETRY`, `config.window_width`/`window_height`): terminals are a MACHINE surface (nobody attaches), so geometry serves the parser — 50 rows keep a tall AUQ picker fully on-screen (real `❯` from frame 1), 160 cols shrink the `N.Label` overflow class. ONE mechanism, `TmuxManager._cmd_resize_window` (per-window `resize-window -x -y`, stderr-checked, flips `window-size=manual`; never session-level `default-size`/`aggressive-resize`/`window-size` options), at TWO callsites: `create_window` resizes BEFORE the claude launch (a failure logs WARNING and still launches), and `bot._reconcile_window_geometry` resizes every listed window once in `post_init` after `resolve_stale_ids` (idempotent, per-window failures non-fatal). Dispatch logic untouched.

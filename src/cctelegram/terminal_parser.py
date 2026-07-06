@@ -2796,6 +2796,101 @@ def is_status_active(pane_text: str) -> bool:
     return any("esc to interrupt" in line.lower() for line in scan)
 
 
+# The bottom-chrome ``──`` rule separator (≥20 dashes) — the SAME anchor
+# ``_find_chrome_separator`` trusts. Claude Code brackets its input box with a
+# PAIR of these (top + bottom); the input row lives strictly between them.
+_RE_RULE_SEPARATOR = re.compile(r"^─{20,}$")
+
+# Positive ready-for-input status-bar markers Claude Code renders BELOW the
+# input box when it is NOT running (the mode indicator, the shortcuts hint, the
+# agents/manage bar, the effort indicator). Their PRESENCE is positive proof the
+# frame is a fully-rendered idle status bar — a mid-redraw capture that dropped
+# the footer has NONE of them and therefore fails closed. (``is_status_active``
+# separately rejects the ACTIVE bar, which carries ``esc to interrupt`` on this
+# same line.)
+_READY_STATUS_MARKERS = (
+    "? for shortcuts",
+    "shift+tab to cycle",
+    "← for agents",
+    "↓ to manage",
+    "/effort",
+    "bypass permissions on",
+    "accept edits on",
+    "plan mode on",
+)
+
+
+def _is_rule_separator(line: str) -> bool:
+    """True iff ``line`` is a full ``──`` chrome rule separator (≥20 dashes)."""
+    return bool(_RE_RULE_SEPARATOR.match(line.strip()))
+
+
+def pane_looks_idle(visible_pane: str | None) -> bool:
+    """Ground-truth cross-check that a pane is idle at an EMPTY input box.
+
+    The ``/update`` command's REQUIRED second gate beside
+    ``route_runtime.snapshot(route).run_state == IDLE_CLEARED`` — the run-state
+    machine can LAG a pane that just started a new generation, so a pane read is
+    the authoritative "not mid-work" proof before a restart quits Claude.
+
+    STRUCTURAL + POSITIVE-EVIDENCE + FAIL-CLOSED. Returns True ONLY when ALL
+    hold:
+
+      1. No active-run signal (``is_status_active`` — the reliable
+         ``esc to interrupt`` scan over the whole bottom chrome region).
+      2. No live interactive surface (``is_interactive_ui`` — AUQ / ExitPlanMode
+         / Permission / Workflow / Settings).
+      3. The BOTTOM pair of ``──`` rule separators brackets an input row that is
+         the EMPTY ``❯`` prompt (only whitespace after the cursor glyph). A body
+         Markdown ``> blockquote`` line sits ABOVE this pair, so it can NEVER
+         satisfy the proof; a typed-but-unsent draft (``❯ some text``) is NOT
+         idle (a restart would discard it).
+      4. POSITIVE ready-for-input status-bar chrome is present below the box (a
+         ``_READY_STATUS_MARKERS`` hit) — so a mid-redraw capture that dropped
+         the footer, or any frame without the rendered idle status bar, fails
+         closed rather than being read as idle on absence alone.
+
+    Anything else returns False so ``/update`` DEFERS the window rather than risk
+    ``/exit``-ing into live work.
+    """
+    if not visible_pane:
+        return False
+    lines = visible_pane.split("\n")
+    # (1) Active generation → not idle.
+    if is_status_active(visible_pane):
+        return False
+    # (2) A live interactive surface is "waiting on the user", not idle.
+    if is_interactive_ui(visible_pane):
+        return False
+    # (3) Locate the input box STRUCTURALLY: the bottom pair of rule separators.
+    search_start = max(0, len(lines) - _CHROME_SCAN_LINES)
+    sep_idxs = [
+        i for i in range(search_start, len(lines)) if _is_rule_separator(lines[i])
+    ]
+    if len(sep_idxs) < 2:
+        return False  # no rendered input-box bracket → fail closed
+    top, bottom = sep_idxs[-2], sep_idxs[-1]
+    prompt_seen = False
+    for i in range(top + 1, bottom):
+        s = lines[i].strip()
+        if not s:
+            continue
+        # Only the ``❯`` prompt cursor may sit inside the box.
+        if s[0] not in ("❯", "›", ">"):
+            return False
+        # The input row must be EMPTY — a typed draft is not restart-safe.
+        if s[1:].strip():
+            return False
+        prompt_seen = True
+    if not prompt_seen:
+        return False
+    # (4) POSITIVE ready-for-input chrome below the box (idle status bar).
+    below = "\n".join(lines[bottom + 1 :])
+    if not any(marker in below for marker in _READY_STATUS_MARKERS):
+        return False
+    return True
+
+
 # ── Context-window indicator ─────────────────────────────────────────────
 
 # Matches Claude Code's chrome footer line, e.g.
