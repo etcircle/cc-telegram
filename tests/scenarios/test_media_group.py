@@ -74,6 +74,8 @@ async def test_media_group_coalesces_caption_and_paths(
         path: Path,
         caption: str | None,
         media_group_id: str | None,
+        *,
+        bot: object | None = None,
     ) -> None:
         offered.append((route, path, caption, media_group_id))
 

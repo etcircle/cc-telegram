@@ -35,6 +35,18 @@ IDLE_PANE = f"""\
   ⏵⏵ bypass permissions on (shift+tab to cycle)
 """
 
+# Otherwise idle, but the GH #43 ``· N shell`` status-bar token shows live
+# background jobs — ``pane_looks_idle`` must reject it so the in-lock recheck
+# DEFERS the window (Fix 2 / P2-2).
+IDLE_PANE_BG_SHELLS = f"""\
+✻ Cooked for 2s
+
+{_SEP}
+❯
+{_SEP}
+  ⏵⏵ bypass permissions on · 2 shells · ← for agents
+"""
+
 
 @pytest.fixture(autouse=True)
 def _reset_singleflight(monkeypatch):
@@ -188,20 +200,21 @@ class TestRunUpdateBucketing:
 
     @pytest.mark.asyncio
     async def test_outcome_bucketing(self, monkeypatch):
-        bindings = [(1, i * 10, f"@{i}") for i in range(1, 6)]
+        bindings = [(1, i * 10, f"@{i}") for i in range(1, 7)]
         _patch_snapshot(monkeypatch, {})  # all IDLE_CLEARED
         sm = FakeSessionMgr(
             bindings,
-            window_states={f"@{i}": _WS(session_id=f"s{i}") for i in range(1, 6)},
+            window_states={f"@{i}": _WS(session_id=f"s{i}") for i in range(1, 7)},
         )
         tmux = FakeTmux(
-            windows={f"@{i}" for i in range(1, 6)},
+            windows={f"@{i}" for i in range(1, 7)},
             outcome_map={
                 "@1": RestartOutcome.RESTARTED,
                 "@2": RestartOutcome.SKIPPED_BUSY_LOCKED,  # deferred
                 "@3": RestartOutcome.SKIPPED_NOT_IDLE,  # deferred
                 "@4": RestartOutcome.SKIPPED_NO_EXIT,  # skipped (didn't exit)
                 "@5": RestartOutcome.ERROR,  # skipped (restart error)
+                "@6": RestartOutcome.RELAUNCH_UNCONFIRMED,  # skipped (r2 P1-A)
             },
         )
         reports: list[str] = []
@@ -220,8 +233,17 @@ class TestRunUpdateBucketing:
         summary = reports[-1]
         assert "Restarted 1 idle: @1" in summary
         assert "Deferred 2 busy: @2, @3" in summary
-        assert "@4 (didn't exit)" in summary
+        # P2-1: the SKIPPED_NO_EXIT bucket must honestly disclose the aftermath
+        # (/exit was already sent — a late exit leaves a bare shell in the
+        # still-bound topic), not just "didn't exit".
+        assert "@4 (sent /exit but the pane didn't drop to a shell" in summary
+        assert "the session may be dead" in summary
+        assert "check the window before sending messages" in summary
         assert "@5 (restart error)" in summary
+        # r2 P1-A: an unconfirmed relaunch gets its own honest disclosure — the
+        # relaunch was typed but Claude was never observed running.
+        assert "@6 (relaunched but Claude wasn't seen running" in summary
+        assert "sends stay blocked" in summary
 
     @pytest.mark.asyncio
     async def test_single_flight_rejects_concurrent(self, monkeypatch):
@@ -442,6 +464,52 @@ class TestReassociateRouting:
         assert new == []
         assert tracked.last_byte_offset == fsize  # unchanged; no reset-to-0
 
+    @pytest.mark.asyncio
+    async def test_settle_registers_final_size_when_file_grows(self, tmp_path):
+        # Fix 3 (P3): the "settled EOF" is a bounded stat-until-stable loop, not
+        # a single stat — a resume replay still appending at the first stat must
+        # register at the FINAL (post-growth) size, never the first observation.
+        monitor = SessionMonitor(
+            projects_path=tmp_path / "projects", state_file=tmp_path / "ms.json"
+        )
+        sid = "sess-grow"
+        real = tmp_path / "sess.jsonl"
+
+        class GrowingPath:
+            """stat() reports a growing file: 10 → 25 → 25 (stable)."""
+
+            def __init__(self):
+                self.sizes = [10, 25, 25]
+                self.calls = 0
+
+            def stat(self):
+                size = self.sizes[min(self.calls, len(self.sizes) - 1)]
+                self.calls += 1
+                return SimpleNamespace(st_size=size)
+
+            def __str__(self):
+                return str(real)
+
+        gp = GrowingPath()
+
+        class SM:
+            def get_window_state(self, wid):
+                return _WS(session_id=sid, cwd="/proj")
+
+            def _save_state(self):
+                pass
+
+            def _build_session_file_path(self, s, cwd):
+                return gp
+
+        await updater.reassociate_routing(
+            SM(), monitor, "@1", sid, settle_interval_s=0.0, settle_max_wait_s=1.0
+        )
+        tracked = monitor.state.get_session(sid)
+        assert tracked is not None
+        assert gp.calls >= 3  # re-statted until stable — not a single stat
+        assert tracked.last_byte_offset == 25  # the FINAL size, not the first
+
 
 class TestRunUpdateEndToEnd:
     @pytest.mark.asyncio
@@ -476,6 +544,31 @@ class TestRunUpdateEndToEnd:
         assert "Restarted 1 idle: @1" in reports[-1]
         # Re-association registered the session at EOF.
         assert monitor.state.get_session("s1").last_byte_offset == jsonl.stat().st_size
+
+    @pytest.mark.asyncio
+    async def test_background_shells_pane_defers_at_the_idle_recheck(self, monkeypatch):
+        # Fix 2 (P2-2): an IDLE_CLEARED route whose pane carries the GH #43
+        # ``· N shell`` token fails ``pane_looks_idle`` at the in-lock recheck →
+        # SKIPPED_NOT_IDLE → the DEFERRED summary bucket (never ``/exit``-ed).
+        _patch_snapshot(monkeypatch, {})  # IDLE_CLEARED
+        sm = FakeSessionMgr([(1, 10, "@1")], window_states={"@1": _WS(session_id="s1")})
+        tmux = FakeTmux(windows={"@1"}, invoke_closures=True, pane=IDLE_PANE_BG_SHELLS)
+        reports: list[str] = []
+
+        async def report(t):
+            reports.append(t)
+
+        await updater.run_update(
+            report=report,
+            session_mgr=sm,
+            tmux=tmux,
+            monitor=None,
+            claude_command="claude",
+            md_settings="",
+        )
+        summary = reports[-1]
+        assert "Restarted 0 idle" in summary
+        assert "Deferred 1 busy: @1" in summary
 
     @pytest.mark.asyncio
     async def test_mid_loop_window_error_still_summarizes_remaining(self, monkeypatch):

@@ -547,6 +547,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # P1: the vanished window's post-/exit quarantine dies with the
+        # binding — a later window reusing the id must not inherit it.
+        tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -577,7 +580,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # shape so a media-group with one caption stops fragmenting across
     # N Claude turns.
     route = (user.id, thread_id, wid)
-    await aggregator_offer_photo(route, file_path, caption, media_group_id)
+    await aggregator_offer_photo(
+        route, file_path, caption, media_group_id, bot=context.bot
+    )
 
     # Confirm to user
     await safe_reply(update.message, "📷 Image sent to Claude Code.")
@@ -631,6 +636,9 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # P1: the vanished window's post-/exit quarantine dies with the
+        # binding — a later window reusing the id must not inherit it.
+        tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -677,7 +685,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # rendered text is what Claude actually sees.
     echo = text
     rendered = await _apply_reply_context(update.message, user.id, thread_id, text)
-    await aggregator_offer_voice(route, rendered)
+    await aggregator_offer_voice(route, rendered, bot=context.bot)
 
     await safe_reply(update.message, f'🎤 "{echo}"')
 
@@ -805,6 +813,9 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # P1: the vanished window's post-/exit quarantine dies with the
+        # binding — a later window reusing the id must not inherit it.
+        tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -824,7 +835,9 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
     route = (user.id, thread_id, wid)
-    await aggregator_offer_document(route, file_path, caption, media_group_id)
+    await aggregator_offer_document(
+        route, file_path, caption, media_group_id, bot=context.bot
+    )
 
     await safe_reply(update.message, "📎 File sent to Claude Code.")
 
@@ -1075,6 +1088,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # P1: the vanished window's post-/exit quarantine dies with the
+        # binding — a later window reusing the id must not inherit it.
+        tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -1120,7 +1136,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # and lands in Claude as one coherent turn alongside any caption /
     # photo / fast-follow text within the debounce window.
     route = (user.id, thread_id, wid)
-    await aggregator_offer_text(route, text)
+    await aggregator_offer_text(route, text, bot=context.bot)
 
     # User just replied → Claude is no longer waiting. Flip the topic-first
     # attention card back to idle so the next idle→waiting transition fires

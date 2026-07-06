@@ -21,12 +21,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .. import route_runtime, terminal_parser
 from ..monitor_state import TrackedSession
-from ..tmux_manager import RestartOutcome
+from ..tmux_manager import (
+    RELAUNCH_CONFIRM_TIMEOUT_S,
+    SHELL_WAIT_TOTAL_S,
+    RestartOutcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,34 @@ _update_running = False
 # Hard ceiling on the ``claude update`` subprocess (Hermes P2) — a stalled
 # update must not hang the whole command / wedge the single-flight guard.
 _CLI_UPDATE_TIMEOUT_S = 120.0
+
+# SKIPPED_NO_EXIT aftermath disclosure (P2-1). ``/exit`` was already sent when
+# the shell-wait expired, so the window is in an UNKNOWN state: either Claude is
+# still alive (harmless), or it exits later and leaves a bare shell in the
+# still-BOUND topic — whose next Telegram message would be typed into (and
+# executed by) that shell. The summary must say so, not just "didn't exit".
+_NO_EXIT_REASON = (
+    f"sent /exit but the pane didn't drop to a shell within {SHELL_WAIT_TOTAL_S:.0f}s "
+    "— the session may be dead; check the window before sending messages"
+)
+
+# Bounded stat-until-stable window for the post-relaunch EOF registration: the
+# resume replay may still be appending when the first stat lands, so re-stat
+# until the size is unchanged across two consecutive stats (hard-capped). The
+# cap expiring just uses the LAST observed size — the offset is always a real
+# stat of the file, so ``offset <= filesize`` holds regardless.
+_SETTLE_STAT_INTERVAL_S = 0.3
+_SETTLE_STAT_MAX_WAIT_S = 5.0
+
+# RELAUNCH_UNCONFIRMED disclosure (r2 P1-A): the relaunch keystroke was typed
+# onto a confirmed-shell pane but Claude was never OBSERVED running within the
+# confirm budget — the window stays quarantined (sends refuse until the strict
+# proof-of-life re-check sees Claude), so the summary must say so.
+_RELAUNCH_UNCONFIRMED_REASON = (
+    f"relaunched but Claude wasn't seen running within "
+    f"{RELAUNCH_CONFIRM_TIMEOUT_S:.0f}s — check the window; sends stay blocked "
+    "until Claude is seen alive"
+)
 
 
 def reset_for_tests() -> None:
@@ -216,7 +249,9 @@ async def run_update(
             ):
                 deferred.append(name)
             elif outcome is RestartOutcome.SKIPPED_NO_EXIT:
-                skipped.append((name, "didn't exit"))
+                skipped.append((name, _NO_EXIT_REASON))
+            elif outcome is RestartOutcome.RELAUNCH_UNCONFIRMED:
+                skipped.append((name, _RELAUNCH_UNCONFIRMED_REASON))
             else:  # RestartOutcome.ERROR
                 skipped.append((name, "restart error"))
 
@@ -241,8 +276,43 @@ async def route_is_idle(route: route_runtime.Route, window_id: str, tmux: Any) -
     return terminal_parser.pane_looks_idle(pane)
 
 
+async def _settled_file_size(
+    file_path: Any, *, interval_s: float, max_wait_s: float
+) -> int | None:
+    """Stat ``file_path`` until its size is STABLE (unchanged across two
+    consecutive stats), bounded by ``max_wait_s``.
+
+    A still-growing file at cap expiry yields its LAST observed size — every
+    return value is a real stat of the file, so the caller's
+    ``offset <= filesize`` invariant holds either way. Returns ``None`` when a
+    stat fails (caller skips the registration, matching the prior single-stat
+    behavior).
+    """
+    try:
+        last = file_path.stat().st_size
+    except OSError:
+        return None
+    deadline = time.monotonic() + max_wait_s
+    while time.monotonic() < deadline:
+        await asyncio.sleep(interval_s)
+        try:
+            cur = file_path.stat().st_size
+        except OSError:
+            return None
+        if cur == last:
+            return cur
+        last = cur
+    return last
+
+
 async def reassociate_routing(
-    session_mgr: Any, monitor: Any, window_id: str, tracked_sid: str
+    session_mgr: Any,
+    monitor: Any,
+    window_id: str,
+    tracked_sid: str,
+    *,
+    settle_interval_s: float = _SETTLE_STAT_INTERVAL_S,
+    settle_max_wait_s: float = _SETTLE_STAT_MAX_WAIT_S,
 ) -> None:
     """Re-associate routing after an in-place relaunch (ws override + offset).
 
@@ -250,12 +320,16 @@ async def reassociate_routing(
     SessionStart hook diverged. Near-no-op on CC 2.1.20x (the ``--resume`` id is
     STABLE, A.0), kept defensive to mirror the proven directory-browser path.
 
-    (b) Register the monitor at the POST-RELAUNCH settled EOF. The idle session's
-    transcript is fully consumed, so registering at EOF skips the small
-    resume-startup append AND guarantees ``offset <= filesize`` — a
-    truncating/rewriting replay can never leave ``tracked_offset > filesize``,
-    which would reset the offset to 0 and re-deliver the whole transcript
-    (``session_monitor._read_new_lines``).
+    (b) Register the monitor at the POST-RELAUNCH stat-stable EOF: a small
+    bounded stat-until-stable loop (``_settled_file_size`` — re-stat every
+    ``settle_interval_s`` until the size is unchanged across two consecutive
+    stats, hard-capped at ``settle_max_wait_s``; a still-growing file at the cap
+    uses the LAST observed size). The idle session's transcript is fully
+    consumed, so registering at that EOF skips the small resume-startup append
+    AND guarantees ``offset <= filesize`` (the offset is always a real stat) —
+    a truncating/rewriting replay can never leave ``tracked_offset >
+    filesize``, which would reset the offset to 0 and re-deliver the whole
+    transcript (``session_monitor._read_new_lines``).
     """
     ws = session_mgr.get_window_state(window_id)
     if ws.session_id != tracked_sid:
@@ -273,9 +347,10 @@ async def reassociate_routing(
     file_path = session_mgr._build_session_file_path(tracked_sid, ws.cwd)
     if file_path is None:
         return
-    try:
-        settled_eof = file_path.stat().st_size
-    except OSError:
+    settled_eof = await _settled_file_size(
+        file_path, interval_s=settle_interval_s, max_wait_s=settle_max_wait_s
+    )
+    if settled_eof is None:
         return
     existing = monitor.state.get_session(tracked_sid)
     if existing is None:

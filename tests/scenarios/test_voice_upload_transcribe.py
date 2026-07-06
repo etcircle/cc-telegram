@@ -55,7 +55,9 @@ async def test_voice_message_transcribes_and_offers_to_aggregator(
     # Aggregator offer (substrate to inbound aggregator) — record the call.
     offered: list[tuple[tuple[int, int, str], str]] = []
 
-    async def fake_offer(route: tuple[int, int, str], text: str) -> None:
+    async def fake_offer(
+        route: tuple[int, int, str], text: str, *, bot: object | None = None
+    ) -> None:
         offered.append((route, text))
 
     monkeypatch.setattr(inbound_module, "aggregator_offer_voice", fake_offer)

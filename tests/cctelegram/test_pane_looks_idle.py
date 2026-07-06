@@ -71,6 +71,39 @@ BLOCKQUOTE_BETWEEN_SEPARATORS = f"""\
   ⏵⏵ bypass permissions on (shift+tab to cycle)
 """
 
+# Otherwise fully idle, but the GH #43 ``· N shell`` status-bar token shows live
+# background jobs — a restart would silently kill them, so NOT restart-safe
+# (Fix 2 / P2-2). Status-bar shape mirrors the real capture pinned in
+# test_gh43_background_jobs.py.
+IDLE_PANE_BG_SHELLS = f"""\
+✻ Cooked for 2s
+
+{_SEP}
+❯
+{_SEP}
+  ⏵⏵ bypass permissions on · 2 shells · ← for agents
+"""
+
+IDLE_PANE_BG_SHELL_SINGULAR = f"""\
+✻ Cooked for 2s
+
+{_SEP}
+❯
+{_SEP}
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents
+"""
+
+# The SAME status-bar shape WITHOUT the shells token — stays idle (regression:
+# a chrome-present-no-token parse of 0 must not block the restart).
+IDLE_PANE_AGENTS_BAR_NO_SHELLS = f"""\
+✻ Cooked for 2s
+
+{_SEP}
+❯
+{_SEP}
+  ⏵⏵ bypass permissions on · ← for agents
+"""
+
 
 def test_idle_pane_at_empty_input_box_is_idle():
     assert pane_looks_idle(IDLE_PANE) is True
@@ -90,6 +123,18 @@ def test_body_blockquote_with_dropped_footer_is_not_idle():
 
 def test_blockquote_between_separators_is_not_idle():
     assert pane_looks_idle(BLOCKQUOTE_BETWEEN_SEPARATORS) is False
+
+
+def test_idle_pane_with_background_shells_is_not_idle():
+    assert pane_looks_idle(IDLE_PANE_BG_SHELLS) is False
+
+
+def test_idle_pane_with_single_background_shell_is_not_idle():
+    assert pane_looks_idle(IDLE_PANE_BG_SHELL_SINGULAR) is False
+
+
+def test_idle_pane_same_bar_without_shells_token_stays_idle():
+    assert pane_looks_idle(IDLE_PANE_AGENTS_BAR_NO_SHELLS) is True
 
 
 def test_none_is_not_idle():

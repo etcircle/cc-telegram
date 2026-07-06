@@ -36,11 +36,23 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .tmux_manager import tmux_manager
+from .tmux_manager import pane_command_is_claude, tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
+
+
+# Post-/exit quarantine refusal (Hermes P1). The EXACT string is the contract
+# between ``send_to_window`` and the aggregator's in-topic disclosure
+# (compared by equality, never substring) — see ``tmux_manager``'s quarantine
+# registry. Covers both the confirmed-shell and the unknown (query-failed)
+# pane state, hence the hedged wording.
+QUARANTINE_SEND_REFUSED_MSG = (
+    "Message NOT delivered — the session appears to have exited during "
+    "/update and the pane may be a bare shell. Check the window / restart "
+    "the session, then resend."
+)
 
 
 # ── Bot-sent text tracking (for user-message dedup) ──────────────────────
@@ -1080,6 +1092,32 @@ class SessionManager:
             window = await tmux_manager.find_window_by_id(window_id)
             if not window:
                 return False, "Window not found (may have been closed)"
+            # Post-/exit quarantine re-check-before-typing (Hermes P1): a
+            # /update that sent /exit without a confirmed relaunch may leave
+            # this pane a bare shell — typing user text + Enter there would
+            # EXECUTE it. Proof of life is STRICTLY the Claude version-string
+            # pane command (pane_command_is_claude): "not a shell" is NOT
+            # proof (r2 P1-B — a user checking the stranded window may be
+            # running vim/python/ssh there, the exact hazard). Anything else
+            # (shell, editor, REPL, None) refuses fail-closed. Zero overhead
+            # for unquarantined windows (one dict lookup), and the query runs
+            # INSIDE the send lock the restart mechanic itself holds — no new
+            # lock ordering.
+            if tmux_manager.window_quarantined(window_id):
+                cmd = await tmux_manager.pane_current_command(window_id)
+                if pane_command_is_claude(cmd):
+                    tmux_manager.clear_window_quarantine(
+                        window_id, reason="claude alive at send re-check"
+                    )
+                else:
+                    logger.warning(
+                        "send_to_window: window %s quarantined (pane cmd=%r is "
+                        "not Claude) — REFUSING delivery of %d chars",
+                        window_id,
+                        cmd,
+                        len(text),
+                    )
+                    return False, QUARANTINE_SEND_REFUSED_MSG
             success = await tmux_manager.send_keys(window.window_id, text)
         if success:
             # Record the bot-originated send so the session_monitor can
