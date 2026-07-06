@@ -114,12 +114,38 @@ class RestartOutcome(Enum):
 # Shells the pane drops to once Claude Code has quit. ``pane_current_command``
 # reports the shell NAME at the prompt — possibly login-prefixed ("-zsh") — and
 # the Claude Code VERSION string (e.g. "2.1.201") while the TUI runs, NEVER
-# "node" (A.0 live capture, CC 2.1.20x). Any value NOT in this set is treated as
-# "Claude still running", so the fail-closed relaunch gate never launches into a
-# live TUI.
+# "node" (A.0 live capture, CC 2.1.20x). Alternative interactive shells (nu /
+# pwsh / xonsh) are included so their users' panes are recognized too. Any value
+# NOT in this set is treated as "Claude still running", so the fail-closed
+# relaunch gate never launches into a live TUI.
 _KNOWN_SHELLS = frozenset(
-    {"zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "ash"}
+    {
+        "zsh",
+        "bash",
+        "sh",
+        "fish",
+        "dash",
+        "ksh",
+        "tcsh",
+        "csh",
+        "ash",
+        "nu",
+        "pwsh",
+        "xonsh",
+    }
 )
+
+# Bounded post-``/exit`` shell-wait budget (P2-1). ``/exit`` is IRREVOCABLE, so
+# the wait is TWO-phase: normal quits land well inside the PRIMARY window; the
+# GRACE extension recovers a LATE exit with a normal relaunch (INFO-logged).
+# Without the grace, a pane dropping to a shell just past the primary window
+# was a bare shell in a still-BOUND topic — the next Telegram message would be
+# typed into (and executed by) that shell. Both phases expiring returns
+# ``SKIPPED_NO_EXIT``; the updater's summary uses ``SHELL_WAIT_TOTAL_S`` to
+# disclose the may-be-dead aftermath honestly.
+_SHELL_POLL_TIMEOUT_S = 5.0
+_SHELL_POLL_GRACE_S = 10.0
+SHELL_WAIT_TOTAL_S = _SHELL_POLL_TIMEOUT_S + _SHELL_POLL_GRACE_S
 
 
 def pane_command_is_shell(cmd: str | None) -> bool:
@@ -894,7 +920,8 @@ class TmuxManager:
         idle_recheck: Callable[[], Awaitable[bool]],
         reassociate: Callable[[], Awaitable[None]],
         quit_keys: str = "/exit",
-        shell_poll_timeout_s: float = 5.0,
+        shell_poll_timeout_s: float = _SHELL_POLL_TIMEOUT_S,
+        shell_poll_grace_s: float = _SHELL_POLL_GRACE_S,
         shell_poll_interval_s: float = 0.3,
         relaunch_settle_s: float = 1.0,
     ) -> RestartOutcome:
@@ -915,14 +942,19 @@ class TmuxManager:
           - ``idle_recheck()`` — re-checks the route is genuinely idle (run-state
             + pane ground-truth) INSIDE the lock, immediately before quitting.
           - ``reassociate()`` — re-associates routing (ws.session_id override +
-            monitor offset at the post-relaunch settled EOF), also inside the
+            monitor offset at the post-relaunch stat-stable EOF — the bounded
+            stat-until-stable loop lives in the collaborator), also inside the
             lock, only after a successful relaunch.
 
-        FAIL-CLOSED: if the pane does not become a shell within
-        ``shell_poll_timeout_s`` the relaunch is ABORTED (never launch into a
-        live TUI). Every ``send_keys`` return is checked (it returns False
-        silently on a vanished window). A ``reassociate()`` raise AFTER a
-        successful relaunch is caught and returned as ``ERROR`` (never
+        FAIL-CLOSED: if the pane does not become a shell within the TWO-phase
+        bounded wait — ``shell_poll_timeout_s`` (primary) plus
+        ``shell_poll_grace_s`` (grace) — the relaunch is ABORTED (never launch
+        into a live TUI). The grace exists because ``/exit`` is IRREVOCABLE: a
+        pane that drops to a shell only after the primary window is recovered
+        with a normal relaunch (INFO-logged) instead of stranding a bare shell
+        in a still-bound topic. Every ``send_keys`` return is checked (it
+        returns False silently on a vanished window). A ``reassociate()`` raise
+        AFTER a successful relaunch is caught and returned as ``ERROR`` (never
         propagated — the caller's per-window isolation still records it).
         """
         # Lazy import dodges the tmux_manager ← callback_dispatcher module-level
@@ -951,11 +983,17 @@ class TmuxManager:
                 return RestartOutcome.ERROR
 
             # (3) Poll the real-time pane command until it becomes a shell.
-            # FAIL-CLOSED: never relaunch on top of a still-live TUI.
-            deadline = time.monotonic() + shell_poll_timeout_s
+            # FAIL-CLOSED: never relaunch on top of a still-live TUI. TWO-phase
+            # wait: ``/exit`` is already irrevocably sent, so a LATE exit inside
+            # the grace extension must be recovered with a normal relaunch —
+            # aborting at the primary window would strand a bare shell in a
+            # still-bound topic that executes the next Telegram message.
+            start = time.monotonic()
+            primary_deadline = start + shell_poll_timeout_s
+            final_deadline = primary_deadline + shell_poll_grace_s
             last_cmd: str | None = None
             became_shell = False
-            while time.monotonic() < deadline:
+            while time.monotonic() < final_deadline:
                 await asyncio.sleep(shell_poll_interval_s)
                 last_cmd = await self.pane_current_command(window_id)
                 if pane_command_is_shell(last_cmd):
@@ -964,12 +1002,25 @@ class TmuxManager:
             if not became_shell:
                 logger.warning(
                     "restart %s: pane never became a shell within %.1fs "
-                    "(last cmd=%r) — ABORTING, not relaunching",
+                    "(primary %.1fs + grace %.1fs; last cmd=%r) — ABORTING, not "
+                    "relaunching; the session may be dead — a post-deadline "
+                    "/exit leaves a bare shell in the still-bound window",
                     window_id,
+                    shell_poll_timeout_s + shell_poll_grace_s,
                     shell_poll_timeout_s,
+                    shell_poll_grace_s,
                     last_cmd,
                 )
                 return RestartOutcome.SKIPPED_NO_EXIT
+            if time.monotonic() > primary_deadline:
+                logger.info(
+                    "restart %s: LATE exit — pane dropped to a shell %.1fs "
+                    "after /exit (past the %.1fs primary window); recovering "
+                    "with a normal relaunch",
+                    window_id,
+                    time.monotonic() - start,
+                    shell_poll_timeout_s,
+                )
 
             # (4) Relaunch with --resume so the resumed process adopts the new
             # on-disk version (A.0 result #6).
@@ -980,8 +1031,9 @@ class TmuxManager:
                 logger.error("restart %s: relaunch keystroke send failed", window_id)
                 return RestartOutcome.ERROR
 
-            # (5) Let the resumed transcript settle, then re-associate routing
-            # (ws override + monitor offset at the post-replay settled EOF). A
+            # (5) Give the resumed transcript a head start, then re-associate
+            # routing (ws override + monitor offset at the post-replay
+            # stat-stable EOF — the settle loop lives in ``reassociate``). A
             # re-association raise here is caught (the relaunch already
             # succeeded) and surfaced as ERROR — never propagated to abort the
             # caller's per-window sweep (Hermes P2).

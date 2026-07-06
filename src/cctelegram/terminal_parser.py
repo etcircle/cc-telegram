@@ -3144,6 +3144,13 @@ def pane_looks_idle(visible_pane: str | None) -> bool:
          ``_READY_STATUS_MARKERS`` hit) — so a mid-redraw capture that dropped
          the footer, or any frame without the rendered idle status bar, fails
          closed rather than being read as idle on absence alone.
+      5. No LIVE background shells: ``parse_background_jobs`` (the GH #43
+         chrome-anchored ``· N shell`` token scan) reads a count ≥ 1 → not
+         restart-safe (``/exit`` would silently kill the user's backgrounded
+         jobs). ``None`` (no chrome parse) and ``0`` (chrome present, no token)
+         do NOT block — the frame already passed the positive ready-chrome
+         proof above, and refusing on an unknown count would make ``/update``
+         defer every restart.
 
     Anything else returns False so ``/update`` DEFERS the window rather than risk
     ``/exit``-ing into live work.
@@ -3182,6 +3189,11 @@ def pane_looks_idle(visible_pane: str | None) -> bool:
     # (4) POSITIVE ready-for-input chrome below the box (idle status bar).
     below = "\n".join(lines[bottom + 1 :])
     if not any(marker in below for marker in _READY_STATUS_MARKERS):
+        return False
+    # (5) Live background shells (GH #43 `· N shell` chrome token) → a restart
+    # would silently kill them. None/0 never block (see the docstring).
+    jobs = parse_background_jobs(visible_pane)
+    if jobs is not None and jobs >= 1:
         return False
     return True
 

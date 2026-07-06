@@ -30,6 +30,10 @@ class TestPaneCommandIsShell:
             ("bash", True),
             ("/bin/zsh", True),  # full path → basename
             ("  zsh  ", True),  # whitespace tolerated
+            ("nu", True),  # nushell (P2-1 alt-shell fold)
+            ("pwsh", True),  # PowerShell
+            ("xonsh", True),
+            ("-nu", True),  # login-prefixed alt shell
             ("2.1.201", False),  # Claude Code version string → still running
             ("node", False),
             ("claude", False),
@@ -133,9 +137,48 @@ class TestRestartClaudeInWindow:
         reassoc.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_late_exit_within_grace_is_recovered_and_relaunched(self):
+        # P2-1: ``/exit`` is irrevocable — a pane that drops to a shell only
+        # AFTER the primary window (but within the grace) must be RECOVERED with
+        # a normal relaunch, not stranded as a bare shell in a still-bound topic.
+        tm = _fresh_tm()
+        sent: list[tuple] = []
+        tm.send_keys = _record_send(sent)  # type: ignore[assignment]
+        # 10 not-a-shell polls at ≥0.01s apiece put the shell observation
+        # strictly past the 0.05s primary window; the injected grace still has
+        # ample room (the budgets are injected — no real 15s waits, mirroring
+        # the suite's fake-timing pattern).
+        tm.pane_current_command = AsyncMock(  # type: ignore[assignment]
+            side_effect=["2.1.201"] * 10 + ["zsh"]
+        )
+        reassoc = AsyncMock()
+
+        outcome = await tm.restart_claude_in_window(
+            "@1",
+            "sid-0",
+            "",
+            claude_command="claude",
+            idle_recheck=AsyncMock(return_value=True),
+            reassociate=reassoc,
+            shell_poll_timeout_s=0.05,
+            shell_poll_grace_s=2.0,
+            shell_poll_interval_s=0.01,
+            relaunch_settle_s=0.0,
+        )
+
+        assert outcome is RestartOutcome.RESTARTED
+        # The relaunch WAS sent — and only after the (late) shell was observed.
+        assert sent[0][0:2] == ("@1", "/exit")
+        assert "--resume sid-0" in sent[1][1]
+        assert len(sent) == 2
+        assert tm.pane_current_command.await_count == 11
+        reassoc.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_fail_closed_pane_never_becomes_shell_no_relaunch(self):
-        # THE critical safety test: if the pane never drops to a shell, ABORT —
-        # never relaunch into a live TUI, never re-associate.
+        # THE critical safety test: if the pane never drops to a shell — through
+        # the primary window AND the grace extension — ABORT: never relaunch
+        # into a live TUI, never re-associate.
         tm = _fresh_tm()
         sent: list[tuple] = []
         tm.send_keys = _record_send(sent)  # type: ignore[assignment]
@@ -150,6 +193,7 @@ class TestRestartClaudeInWindow:
             idle_recheck=AsyncMock(return_value=True),
             reassociate=reassoc,
             shell_poll_timeout_s=0.05,
+            shell_poll_grace_s=0.05,
             shell_poll_interval_s=0.01,
             relaunch_settle_s=0.0,
         )

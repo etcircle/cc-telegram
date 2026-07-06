@@ -197,6 +197,39 @@ def test_settings_model_list_stays_settings_never_decision(both_gates_on) -> Non
     assert result.name == "Settings"
 
 
+def test_settings_confirm_footer_stays_settings_never_decision(
+    both_gates_on, sample_pane_settings: str
+) -> None:
+    """B1 P3-2: the v2.1.200 fixture above has an ``Enter to set as default …``
+    footer that ``_RE_DECISION_FOOTER`` can never match, so that pin proves
+    non-overlap only. The OLDER /model variant's footer (``Enter to confirm ·
+    Esc to exit``) DOES carry Decision's required ``Enter to confirm`` — this
+    pin genuinely exercises the load-bearing first-match-wins ordering
+    (Settings is ordered before Decision)."""
+    result = extract_interactive_content(sample_pane_settings)
+    assert result is not None
+    assert result.name == "Settings"
+
+    # Teeth: the same variant minus the ``Use /fast …`` prose row (which breaks
+    # ``_gate_options_above``'s contiguity walk) STRICTLY parses under
+    # Decision's own validator — so ONLY the ordering keeps it Settings.
+    trimmed = (
+        " Select model\n"
+        " Switch between Claude models. Applies to this session and future"
+        " Claude Code sessions.\n"
+        "\n"
+        "   1. Default (recommended)  Opus 4.6 · Most capable for complex work\n"
+        " ❯ 2. Sonnet                 Sonnet 4.6 · Best for everyday tasks\n"
+        "   3. Haiku                  Haiku 4.5 · Fastest for quick answers\n"
+        "\n"
+        " Enter to confirm · Esc to exit\n"
+    )
+    assert parse_generic_decision(trimmed) is not None
+    result = extract_interactive_content(trimmed)
+    assert result is not None
+    assert result.name == "Settings"
+
+
 def test_auq_pane_stays_askuserquestion(both_gates_on) -> None:
     """A plain single-select AUQ (footer ``Enter to select``) stays
     AskUserQuestion — Decision's footer family deliberately excludes
