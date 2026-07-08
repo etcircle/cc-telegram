@@ -257,6 +257,19 @@ def test_family_positive_from_real_fixture_and_license() -> None:
     assert dt.lookup("folder-trust", "2.1.201") is False
 
 
+def test_family_positive_on_the_licensed_v2_1_204_fixture() -> None:
+    """The ONLY licensed version's own live fixture must identify (wave-2
+    review fold — Codex P3 / Hermes P2): the table says "2.1.204", so a
+    family-signature/title drift that leaves ``lookup("folder-trust",
+    "2.1.204")`` green while the real .204 shape stops identifying would
+    silently render the only licensed version display-only. This test dies
+    with the drift instead."""
+    form = parse_generic_decision(_load("decision_trust_folder_v2.1.204.txt"))
+    assert form is not None
+    assert dt.identify_family(form) == "folder-trust"
+    assert dt.lookup("folder-trust", "2.1.204") is True
+
+
 def test_family_negative_option_tuple_mismatch() -> None:
     form = AskUserQuestionForm(
         current_question_title="Accessing workspace:",

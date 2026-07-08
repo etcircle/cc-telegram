@@ -2611,9 +2611,15 @@ def decision_prompt_fingerprint(form: AskUserQuestionForm) -> str:
     body_lines: list[str] = []
     excerpt_lines = form.pane_excerpt.split("\n") if form.pane_excerpt else []
     if excerpt_lines:
+        # The strict footer predicate, NOT the bare _RE_DECISION_FOOTER: a
+        # validated form's excerpt always ends at a strict footer, so both
+        # find the same line on parser-produced forms — but a manually built
+        # form (or a future non-parser caller) must never have its body
+        # boundary picked by the poisoned-label-tolerant bare regex the
+        # B2.1 hardening exists to reject (wave-2 review fold, Hermes P3).
         footer_idx: int | None = None
         for i in range(len(excerpt_lines) - 1, -1, -1):
-            if _RE_DECISION_FOOTER.search(excerpt_lines[i]):
+            if _is_decision_footer_line(excerpt_lines[i]):
                 footer_idx = i
                 break
         option_top = (
