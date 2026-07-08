@@ -19,6 +19,7 @@ Key classes: SessionMonitor, NewMessage, SessionInfo.
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,17 @@ logger = logging.getLogger(__name__)
 # that never parses after the file grew beyond it is a crash-torn fusion that
 # would otherwise wedge the session's byte offset forever.
 _STALL_SKIP_MIN_CYCLES = 3
+
+# typing-unification T1.6 (2026-07-08): the prose an interactive-shell
+# ``run_in_background`` Bash launch writes into its tool_result content. Used
+# ONLY to detect structured-meta DRIFT (warn once per tool_use_id) — never to
+# lift: the structured ``toolUseResult.backgroundTaskId`` is the SOLE launch
+# anchor (T1.2). Scoped by the caller to ``tool_name == "Bash"`` tool_results,
+# so a quoted "Command running in background…" in user/assistant prose or
+# another tool's output never warns.
+_BG_BASH_LAUNCH_PROSE_RE = re.compile(
+    r"Command running in background with ID:", re.IGNORECASE
+)
 
 # Tool names whose buffered turn carries the Bug 2 live-prose surface. Mirrors
 # route_runtime.INTERACTIVE_TOOL_NAMES; duplicated to keep session_monitor free
@@ -108,8 +120,9 @@ class _WorkflowBracket:
     ``subagents/workflows/wf_<runid>`` Path whose freshest ``*.jsonl`` mtime is
     stat'd each poll (the heartbeat gate); ``None`` when the launch carried no
     Run ID / Transcript dir → the bracket NEVER heartbeats and its key ages
-    out one ``BG_AGENT_TTL_SECONDS`` from ``launch_wall``. ``last_seen_mtime``
-    is the advance-only gate; ``launch_wall`` is the no-dir TTL basis.
+    out one ``BG_BACKGROUND_TTL_SECONDS`` from ``launch_wall`` (the wf-task: key
+    is ``is_background=True`` — typing-unification T2). ``last_seen_mtime`` is
+    the advance-only gate; ``launch_wall`` is the no-dir TTL basis.
     """
 
     wf_dir: Path | None
@@ -419,6 +432,10 @@ class SessionMonitor:
         # removed at the matching <task-notification> close OR any sidechain
         # teardown. NOT per-tick — survives ticks until close.
         self._open_workflow_brackets: dict[str, dict[str, _WorkflowBracket]] = {}
+        # typing-unification T1.6: tool_use_ids for which a background-Bash
+        # structured-meta DRIFT warning has already fired (rate-limit — once per
+        # launch tool_result, never re-warn every poll).
+        self._bg_bash_drift_warned: set[str] = set()
         # Per-tick fan-out for sidechain activity (wired from bot.post_init,
         # like ``_message_callback`` / ``_event_callback``).
         self._subagent_activity_callback: (
@@ -546,12 +563,15 @@ class SessionMonitor:
                 ] = latest
 
     # PR-1 Half B (BUSY restart reconciler). The fresh-mtime window for a wf_*
-    # dir to be considered a still-running Workflow — mirrors
-    # ``route_runtime.BG_AGENT_TTL_SECONDS`` (1800s) WITHOUT importing it (this
-    # module deliberately carries no route_runtime import). PER-PARENT cap on the
-    # FRESH wf_* candidates (newest-first), so a pathological many-run parent can't
-    # blow the first sweep AND a parent's stale dirs never starve a fresh one.
-    _RECONCILE_FRESH_WINDOW_S = 1800.0
+    # dir / agent sidechain to be considered a still-running background launch —
+    # mirrors ``route_runtime.BG_BACKGROUND_TTL_SECONDS`` (7200s, the
+    # ``is_background=True`` TTL — the reconciler ONLY relights LAUNCHED
+    # background Workflows/Agents, which age by that constant post-split;
+    # typing-unification T2.2) WITHOUT importing it (this module deliberately
+    # carries no route_runtime import). PER-PARENT cap on the FRESH wf_*
+    # candidates (newest-first), so a pathological many-run parent can't blow the
+    # first sweep AND a parent's stale dirs never starve a fresh one.
+    _RECONCILE_FRESH_WINDOW_S = 7200.0
     _RECONCILE_MAX_WF_DIRS = 16
     # Fix #5: the same cap for plain ``run_in_background`` Agent sidechains
     # (``subagents/agent-*.jsonl``) — bounds a pathological many-agent parent's
@@ -1404,6 +1424,50 @@ class SessionMonitor:
                                 key
                             )
                             self._open_workflow_bracket(session_info.session_id, info)
+                    elif (
+                        entry.content_type == "tool_result"
+                        and entry.tool_name == "Bash"
+                    ):
+                        # typing-unification T1.2 (2026-07-08): a
+                        # ``run_in_background`` Bash launch writes a tool_result
+                        # whose entry-level ``toolUseResult`` carries a non-empty
+                        # ``backgroundTaskId``. Record the BARE id as a launched
+                        # key (== the <task-notification> close key — no wf-task:
+                        # namespace) so the bot fan-out lifts the parent to
+                        # projected RUNNING (typing + 🟡) for the whole run.
+                        # STRUCTURED-ONLY — never lift from prose (T1.6). NO
+                        # bracket: a background Bash has no sidechain dir to
+                        # heartbeat; the key ages out via the background TTL and
+                        # closes on its <task-notification>.
+                        from .handlers.response_builder import (
+                            background_bash_task_id_from_meta,
+                        )
+
+                        bash_task_id = background_bash_task_id_from_meta(
+                            entry.tool_result_meta
+                        )
+                        if bash_task_id:
+                            self._parent_activity(session_info.session_id).launched.add(
+                                normalize_background_agent_key(bash_task_id)
+                            )
+                        elif entry.text and _BG_BASH_LAUNCH_PROSE_RE.search(entry.text):
+                            # T1.6 drift detector (WARNING-only, no lift): the
+                            # prose announces a background launch but the
+                            # structured backgroundTaskId is absent/malformed —
+                            # the launch-result format may have drifted. Warn
+                            # ONCE per tool_use_id (rate-limited).
+                            tuid = entry.tool_use_id or ""
+                            if tuid not in self._bg_bash_drift_warned:
+                                self._bg_bash_drift_warned.add(tuid)
+                                logger.warning(
+                                    "background Bash launch: prose announces a "
+                                    "background task but the structured "
+                                    "toolUseResult.backgroundTaskId is "
+                                    "absent/malformed (tool_use_id=%s) — Claude "
+                                    "Code launch-result format may have drifted; "
+                                    "NOT lifting from prose",
+                                    tuid or "?",
+                                )
                     elif (
                         entry.role == "user"
                         and entry.content_type == "text"

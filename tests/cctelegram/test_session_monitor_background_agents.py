@@ -1379,3 +1379,253 @@ async def test_wf_dir_none_closing_bracket_pops_even_without_toplevel_subagents_
     assert not any(m.subagent_collapse_prefix for m in msgs)
     # The decisive assertion: the bracket is POPPED, not stranded.
     assert PARENT not in monitor._open_workflow_brackets
+
+
+# ── typing-unification T1.2 / T1.6: background-Bash launch (2026-07-08) ───────
+#
+# A ``run_in_background`` Bash launch's tool_result carries a structured
+# entry-level ``toolUseResult.backgroundTaskId``. The monitor adds the BARE id
+# (== the <task-notification> close key) as a launched key, STRUCTURED-ONLY —
+# never lifting from prose. The T1.6 drift detector warns (once per tool_use_id)
+# only when the Bash prose announces a background launch but the structured id
+# is absent/malformed.
+
+from pathlib import Path  # noqa: E402
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _bg_bash_launch_fixture_lines() -> list[str]:
+    """The REAL Bash tool_use + background tool_result launch pair (Claude Code
+    2.1.197 capture)."""
+    return (_FIXTURES / "bg_bash_launch_v2.1.197.jsonl").read_text().splitlines()
+
+
+@pytest.mark.asyncio
+async def test_parent_background_bash_launch_recorded_from_fixture(monitor, tmp_path):
+    """The REAL launch pair → the bare ``byziqxhyh`` key in ``.launched``."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    with open(parent_jsonl, "a") as f:
+        for line in _bg_bash_launch_fixture_lines():
+            f.write(line + "\n")
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    assert activity[PARENT].launched == {"byziqxhyh"}
+
+
+@pytest.mark.asyncio
+async def test_background_bash_launch_recorded_from_structured_meta(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+):
+    """Bash-branch-gated: a Bash tool_result carrying ``backgroundTaskId`` →
+    the bare launched key."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("tb", "Bash", {"command": "sleep 999"})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [
+                    make_tool_result_block(
+                        "tb", "Command running in background with ID: byziqxhyh."
+                    )
+                ],
+                session_id=PARENT,
+                tool_use_result={
+                    "stdout": "",
+                    "stderr": "",
+                    "interrupted": False,
+                    "isImage": False,
+                    "noOutputExpected": False,
+                    "backgroundTaskId": "byziqxhyh",
+                },
+            ),
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    assert activity[PARENT].launched == {"byziqxhyh"}
+
+
+@pytest.mark.asyncio
+async def test_foreground_bash_result_records_nothing(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+):
+    """A plain (foreground) Bash tool_result — no ``backgroundTaskId``, ordinary
+    prose — records NOTHING and never warns (guards the existing contract)."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("tb", "Bash", {"command": "ls"})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("tb", "file1\nfile2")],
+                session_id=PARENT,
+            ),
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    assert monitor.pop_sidechain_activity() == {}
+
+
+@pytest.mark.asyncio
+async def test_bg_bash_prose_without_structured_meta_warns_and_no_lift(
+    monitor,
+    tmp_path,
+    make_jsonl_entry,
+    make_tool_use_block,
+    make_tool_result_block,
+    caplog,
+):
+    """T1.6: the Bash prose announces a background launch but the structured
+    ``backgroundTaskId`` is absent → a single WARNING and NO lift (never lift
+    from prose)."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("tb", "Bash", {"command": "sleep 999"})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [
+                    make_tool_result_block(
+                        "tb", "Command running in background with ID: byziqxhyh."
+                    )
+                ],
+                session_id=PARENT,
+                # NO tool_use_result — structured meta absent (the drift case).
+            ),
+        ],
+    )
+    with caplog.at_level("WARNING"):
+        await monitor.check_for_updates({PARENT})
+    assert monitor.pop_sidechain_activity() == {}  # NO lift from prose
+    drift = [
+        r for r in caplog.records if "backgroundTaskId is absent/malformed" in r.message
+    ]
+    assert len(drift) == 1
+
+
+@pytest.mark.asyncio
+async def test_bg_bash_drift_warning_is_rate_limited_per_tool_use_id(
+    monitor,
+    tmp_path,
+    make_jsonl_entry,
+    make_tool_use_block,
+    make_tool_result_block,
+    caplog,
+):
+    """T1.6 rate-limit: the same drift tool_result re-observed across polls warns
+    ONCE (keyed by tool_use_id)."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    entries = [
+        make_jsonl_entry(
+            "assistant",
+            [make_tool_use_block("tb", "Bash", {"command": "sleep 999"})],
+            session_id=PARENT,
+        ),
+        make_jsonl_entry(
+            "user",
+            [
+                make_tool_result_block(
+                    "tb", "Command running in background with ID: byziqxhyh."
+                )
+            ],
+            session_id=PARENT,
+        ),
+    ]
+    with caplog.at_level("WARNING"):
+        _append(parent_jsonl, entries)
+        await monitor.check_for_updates({PARENT})
+        # Re-append the SAME launch tool_result (same tool_use_id) — a second
+        # observation must not re-warn.
+        _append(parent_jsonl, [entries[1]])
+        await monitor.check_for_updates({PARENT})
+    drift = [
+        r for r in caplog.records if "backgroundTaskId is absent/malformed" in r.message
+    ]
+    assert len(drift) == 1
+
+
+@pytest.mark.asyncio
+async def test_bg_bash_prose_in_assistant_text_never_warns_or_lifts(
+    monitor, tmp_path, make_jsonl_entry, make_text_block, caplog
+):
+    """T1.6 negative: the SAME prose QUOTED in assistant text (not a Bash
+    tool_result) must never warn or lift — the branch is tool_result+Bash
+    gated."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [
+                    make_text_block(
+                        "The tool said: Command running in background with ID: "
+                        "byziqxhyh."
+                    )
+                ],
+                session_id=PARENT,
+            )
+        ],
+    )
+    with caplog.at_level("WARNING"):
+        await monitor.check_for_updates({PARENT})
+    assert monitor.pop_sidechain_activity() == {}
+    assert not any(
+        "backgroundTaskId is absent/malformed" in r.message for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_bg_bash_prose_in_non_bash_tool_result_never_warns(
+    monitor,
+    tmp_path,
+    make_jsonl_entry,
+    make_tool_use_block,
+    make_tool_result_block,
+    caplog,
+):
+    """T1.6 negative: the prose in a NON-Bash tool_result (e.g. Read) never
+    warns — the drift detector is Bash-scoped."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("tr", "Read", {"file_path": "/x"})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [
+                    make_tool_result_block(
+                        "tr", "Command running in background with ID: byziqxhyh."
+                    )
+                ],
+                session_id=PARENT,
+            ),
+        ],
+    )
+    with caplog.at_level("WARNING"):
+        await monitor.check_for_updates({PARENT})
+    assert monitor.pop_sidechain_activity() == {}
+    assert not any(
+        "backgroundTaskId is absent/malformed" in r.message for r in caplog.records
+    )

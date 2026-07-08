@@ -23,11 +23,16 @@ Pins the plan-v4 contract:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from cctelegram import route_runtime
+from cctelegram.handlers.response_builder import extract_task_notification_task_id
 from cctelegram.route_runtime import (
     BG_AGENT_TTL_SECONDS,
+    BG_BACKGROUND_TTL_SECONDS,
     NotificationClearReason,
     NotificationMarkResult,
     RunState,
@@ -35,6 +40,35 @@ from cctelegram.route_runtime import (
 )
 
 WF_KEY = "wf-task:wrnmrbn3s"
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _bash_launch_task_id() -> str:
+    """The real background-Bash task id from the launch fixture's structured
+    ``toolUseResult`` (2026-07-06 capture, Claude Code 2.1.197)."""
+    for line in (_FIXTURES / "bg_bash_launch_v2.1.197.jsonl").read_text().splitlines():
+        meta = json.loads(line).get("toolUseResult")
+        if isinstance(meta, dict) and meta.get("backgroundTaskId"):
+            return meta["backgroundTaskId"]
+    raise AssertionError("bg_bash_launch fixture missing backgroundTaskId")
+
+
+def _bash_close_task_id() -> str:
+    """The real ``<task-id>`` from the task-notification fixture (== the launch
+    id — the bare launch/close key parity)."""
+    for line in (
+        (_FIXTURES / "bg_bash_task_notification_v2.1.197.jsonl")
+        .read_text()
+        .splitlines()
+    ):
+        content = json.loads(line).get("message", {}).get("content")
+        if isinstance(content, str):
+            tid = extract_task_notification_task_id(content)
+            if tid:
+                return tid
+    raise AssertionError("bg_bash_task_notification fixture missing task-id")
+
 
 ROUTE: route_runtime.Route = (1, 42, "@7")
 KEY = "a1b2c3d4e5f6a7b89"
@@ -279,11 +313,12 @@ async def test_launch_upgrade_preserves_last_event_ts():
 
 
 async def test_ttl_expiry_is_lazy_at_snapshot_time(monkeypatch: pytest.MonkeyPatch):
+    # T2: KEY is is_background=True (post-turn idle mark) → the 2h background TTL.
     await _idle_transcript(end_ts=100.0)
     await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
     assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING
     monkeypatch.setattr(
-        route_runtime, "_wall_now", lambda: T0 + BG_AGENT_TTL_SECONDS + 1
+        route_runtime, "_wall_now", lambda: T0 + BG_BACKGROUND_TTL_SECONDS + 1
     )
     snap = route_runtime.snapshot(ROUTE)
     assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
@@ -314,15 +349,57 @@ async def test_expired_key_cannot_relift_via_existing_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """hermes r2 P1-3: step-0 expire-before-classify — a late None-ts batch
-    for an expired key re-runs FULL qualification and fails closed."""
+    for an expired key re-runs FULL qualification and fails closed. T2: KEY is
+    is_background=True → the expiry bound is BG_BACKGROUND_TTL_SECONDS."""
     await _idle_transcript(end_ts=100.0)
     await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
     monkeypatch.setattr(
-        route_runtime, "_wall_now", lambda: T0 + BG_AGENT_TTL_SECONDS + 1
+        route_runtime, "_wall_now", lambda: T0 + BG_BACKGROUND_TTL_SECONDS + 1
     )
     snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, None)
     assert snap.background_agents == ()
     assert KEY not in _st().background_agents  # deleted, not refreshed
+
+
+async def test_per_key_ttl_selection_foreground_vs_background(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """T2 per-key TTL selection: a foreground-presumed key (is_background=False)
+    ages by BG_AGENT_TTL_SECONDS; a launched background key (is_background=True)
+    by the longer BG_BACKGROUND_TTL_SECONDS. Asserted via the NEW constant and
+    the live-key filter — never pinning the foreground constant for the
+    background key."""
+    # A foreground-presumed key — recorded while the route is ACTIVE.
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
+    )
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 50.0)
+    assert _st().background_agents[KEY].is_background is False
+    # A launched background key — survives the end-of-turn prune.
+    await route_runtime.mark_background_agent_launched(ROUTE, KEY2)
+    assert _st().background_agents[KEY2].is_background is True
+
+    # Direct per-key TTL selection.
+    assert (
+        route_runtime._bg_ttl_for(_st().background_agents[KEY]) == BG_AGENT_TTL_SECONDS
+    )
+    assert (
+        route_runtime._bg_ttl_for(_st().background_agents[KEY2])
+        == BG_BACKGROUND_TTL_SECONDS
+    )
+
+    # Between the two bounds: the foreground key has expired, the background key
+    # is still live.
+    live = route_runtime._live_background_keys(
+        _st(), now_wall=T0 + BG_AGENT_TTL_SECONDS + 100
+    )
+    assert KEY not in live and KEY2 in live
+    # Past the background bound: both expire (expire-before-classify deletes them).
+    monkeypatch.setattr(
+        route_runtime, "_wall_now", lambda: T0 + BG_BACKGROUND_TTL_SECONDS + 1
+    )
+    route_runtime._expire_background_agents_in_place(_st())
+    assert _st().background_agents == {}
 
 
 # ── tombstones ────────────────────────────────────────────────────────────
@@ -395,11 +472,12 @@ async def test_notification_still_stale_on_idle_without_bg_keys():
 
 
 async def test_notification_ignores_expired_bg_key(monkeypatch: pytest.MonkeyPatch):
-    """codex r3 P3-2: the §3.6 liveness check shares the TTL filter."""
+    """codex r3 P3-2: the §3.6 liveness check shares the TTL filter. T2: KEY is
+    is_background=True → the expiry bound is BG_BACKGROUND_TTL_SECONDS."""
     await _idle_transcript(end_ts=100.0)
     await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
     monkeypatch.setattr(
-        route_runtime, "_wall_now", lambda: T0 + BG_AGENT_TTL_SECONDS + 1
+        route_runtime, "_wall_now", lambda: T0 + BG_BACKGROUND_TTL_SECONDS + 1
     )
     result = await route_runtime.mark_notification_pending(
         ROUTE, set_at=T0 + 10, generation="g1"
@@ -448,15 +526,23 @@ async def test_task_notification_with_pane_bit_keeps_waiting():
 
 
 async def test_task_notification_clears_notification_only_when_newer():
+    # typing-unification T1.3 (temp/2026-07-08-typing-unification-plan.md): this
+    # case is DELIBERATELY the STORED-WAITING path, NOT the stored-idle preserve.
+    # The §3.6 notification commit on a RUNNING route sets the STORED run_state to
+    # WAITING_ON_USER, so when the newer task-notification clears the bit the
+    # preserve guard (stored idle) does NOT apply and the route correctly
+    # re-derives RUNNING — distinct from the stored-idle no-gates case
+    # (test_task_notification_counts_as_activity), which now preserves idle.
     await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
     await route_runtime.mark_notification_pending(ROUTE, set_at=500.0, generation="g")
+    assert _st().run_state is RunState.WAITING_ON_USER  # stored WAITING (not idle)
     # Older task-notification → preserved.
     snap = await route_runtime.ingest_transcript_event(
         ROUTE, _evt("user", "text", timestamp=400.0, is_task_notification=True)
     )
     assert snap.notification_pending is True
     assert snap.run_state is RunState.WAITING_ON_USER
-    # Newer task-notification → cleared, route derives RUNNING.
+    # Newer task-notification → cleared; stored was WAITING (not idle) → derives RUNNING.
     snap = await route_runtime.ingest_transcript_event(
         ROUTE, _evt("user", "text", timestamp=600.0, is_task_notification=True)
     )
@@ -493,12 +579,22 @@ async def test_task_notification_fires_activity_side_effects():
 
 
 async def test_task_notification_counts_as_activity():
+    # typing-unification T1.3 RE-PIN (temp/2026-07-08-typing-unification-plan.md).
+    # WAS: a task-notification on a stored-idle route with NO gates derived
+    # RUNNING and cleared idle_source. NOW: a machine task-notification NEVER
+    # forces RUNNING ("RE-DERIVES with preserved gates — never a forced
+    # RUNNING") — it PRESERVES the stored idle (so a completing background
+    # bash/agent's paired done tombstone leaves a clean idle snapshot instead of
+    # stranding typing) while STILL counting as activity (last_event_at
+    # refreshed + the pane-idle debounce re-armed).
     await _idle_transcript(end_ts=100.0)
+    _st().last_event_at = 0.0  # sentinel to prove the activity refresh
     snap = await route_runtime.ingest_transcript_event(
         ROUTE, _evt("user", "text", timestamp=200.0, is_task_notification=True)
     )
-    assert snap.run_state is RunState.RUNNING  # ungated → parent resumed
-    assert _st().idle_source is None
+    assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)  # idle kept
+    assert _st().idle_source == "transcript"  # provenance preserved (no forced RUNNING)
+    assert _st().last_event_at > 0.0  # still counts as activity
 
 
 async def test_genuine_user_turn_keeps_todays_unconditional_behavior():
@@ -549,6 +645,60 @@ async def test_pane_idle_card_clear_proceeds_while_projected_running():
     assert fired is True
     assert _st().pane_idle_cleared is True
     assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING
+
+
+# ── T1: background-bash busy lift (typing-unification 2026-07-08) ─────────────
+
+
+async def test_full_order_background_bash_launch_notification_done_drops_typing():
+    """T1.3 FULL-ORDER regression (temp/2026-07-08-typing-unification-plan.md).
+
+    A real background-Bash run in live ORDER: user turn → launch → parent
+    end-of-turn → the MACHINE ``<task-notification>`` → the completed fan-out.
+    The task-notification must NOT force stored RUNNING: after the done
+    tombstone no live key remains to project idle, so a forced RUNNING would
+    strand typing until the parent's next end-of-turn (the round-1 Hermes P1,
+    reproduced). A launch→done-only shortcut is FORBIDDEN — it goes green while
+    this ORDER misbehaves.
+    """
+    bash_key = route_runtime.normalize_background_agent_key(_bash_launch_task_id())
+    close_key = route_runtime.normalize_background_agent_key(_bash_close_task_id())
+    assert bash_key == close_key  # bare launch/close key parity
+
+    # User prompts; Claude launches the background bash mid-turn.
+    await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
+    await route_runtime.mark_background_agent_launched(ROUTE, bash_key)
+
+    # Parent end-of-turn: the launched (is_background) key survives the prune,
+    # the route goes stored-idle but PROJECTS RUNNING (typing on).
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "text", stop_reason="end_turn", timestamp=100.0)
+    )
+    assert _st().run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+    assert snap.run_state is RunState.RUNNING  # projected
+    assert snap.typing_eligible is True
+    assert snap.background_agents == (bash_key,)
+
+    # The machine task-notification (the bg bash completed) must PRESERVE the
+    # stored idle (never a forced RUNNING) yet still count as activity.
+    _st().last_event_at = 0.0  # sentinel to prove the refresh
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "text", timestamp=200.0, is_task_notification=True)
+    )
+    assert _st().run_state in (
+        RunState.IDLE_RECENT,
+        RunState.IDLE_CLEARED,
+    )  # STILL idle
+    assert _st().last_event_at > 0.0  # last_event_at refreshed (Codex P3)
+    # The bg key is still live at this instant (done fan-out lands next), so the
+    # projection still reports RUNNING — typing stays on until close.
+    assert snap.run_state is RunState.RUNNING
+
+    # The completed fan-out tombstones the key → clean idle snapshot, typing off.
+    snap = await route_runtime.mark_background_agent_done(ROUTE, bash_key)
+    assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
 
 
 # ── ISSUE-6: the Workflow-tool bracket key (`wf-task:<id>`) ────────────────
@@ -626,8 +776,9 @@ async def test_wf_task_out_of_order_done_before_launch_stays_closed():
 async def test_wf_task_heartbeat_backstop_ages_out(monkeypatch: pytest.MonkeyPatch):
     """Fix 2c backstop (codex R4 P2): an open bracket whose sidechain stops
     writing (no further mtime-advance heartbeat) freezes its last_seen_wall
-    and ages out via BG_AGENT_TTL_SECONDS — a dead/never-closed Workflow
-    never lifts Busy indefinitely."""
+    and ages out via BG_BACKGROUND_TTL_SECONDS — a dead/never-closed Workflow
+    never lifts Busy indefinitely (T2: a launched wf-task: key is
+    is_background=True → the 2h background TTL, not 30 min)."""
     await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
     await route_runtime.mark_background_agent_launched(ROUTE, WF_KEY)
     snap = await route_runtime.ingest_transcript_event(
@@ -635,7 +786,7 @@ async def test_wf_task_heartbeat_backstop_ages_out(monkeypatch: pytest.MonkeyPat
     )
     assert snap.run_state is RunState.RUNNING  # lifted while open
     monkeypatch.setattr(
-        route_runtime, "_wall_now", lambda: T0 + BG_AGENT_TTL_SECONDS + 1
+        route_runtime, "_wall_now", lambda: T0 + BG_BACKGROUND_TTL_SECONDS + 1
     )
     snap = route_runtime.snapshot(ROUTE)
     assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
@@ -834,11 +985,12 @@ async def test_no_live_bg_key_holds_notification(monkeypatch):
     a heartbeat whose own key fails the idle re-record qualification leaves the
     live set empty, so the singleton gate cannot clear."""
     await _idle_with_committed_bg_notification(set_at=T0 + 10)
-    # Jump the wall clock past the BG_AGENT_TTL so the recorded key expires, and
-    # send an OLDER event_ts so the NEW-key idle re-record qualification fails
-    # (event_ts must exceed last_assistant_turn_ended_at = T0+5).
+    # Jump the wall clock past the background TTL so the recorded is_background
+    # key expires (T2), and send an OLDER event_ts so the NEW-key idle re-record
+    # qualification fails (event_ts must exceed last_assistant_turn_ended_at =
+    # T0+5).
     monkeypatch.setattr(
-        route_runtime, "_wall_now", lambda: T0 + BG_AGENT_TTL_SECONDS + 5
+        route_runtime, "_wall_now", lambda: T0 + BG_BACKGROUND_TTL_SECONDS + 5
     )
     snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 4)
     assert snap.notification_pending is True

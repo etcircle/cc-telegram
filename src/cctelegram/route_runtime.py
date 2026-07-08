@@ -196,7 +196,18 @@ _TURN_END_REASONS = TURN_END_REASONS  # internal alias (historic name)
 # silent agent can hold the projected-Busy lift; a healthy agent refreshes on
 # every sidechain write, so multi-hour agents stay lifted as long as no single
 # internal tool call exceeds the TTL. Product value, mirrors NOTIFY_TTL_SECONDS.
+#
+# typing-unification T2 (2026-07-08): the TTL is now PER-KEY (``_bg_ttl_for``).
+# ``BG_AGENT_TTL_SECONDS`` (30 min) governs FOREGROUND-presumed keys
+# (``is_background=False``) — the original heartbeat-staleness bound. A LAUNCHED
+# / post-turn background key (``is_background=True``) is positive structured
+# proof of a KNOWN-async task (Agent ``agentId`` / Workflow ``wf-task:`` /
+# background Bash ``backgroundTaskId``), whose lifetime is not heartbeat
+# staleness, so it uses the longer ``BG_BACKGROUND_TTL_SECONDS`` (2 h). Both are
+# applied at BOTH runtime TTL seams (``_live_background_keys`` filter +
+# ``_expire_background_agents_in_place`` expire-before-classify).
 BG_AGENT_TTL_SECONDS = 1800.0
+BG_BACKGROUND_TTL_SECONDS = 7200.0
 
 # A background-agent key carrying this prefix is a Workflow run (``wf-task:<id>``,
 # normalize_background_agent_key keeps it verbatim). Its heartbeat is a DIR-WIDE
@@ -603,6 +614,15 @@ def _wall_now() -> float:
     return time.time()
 
 
+def _bg_ttl_for(rec: _BgAgent) -> float:
+    """The per-key heartbeat-silence TTL (typing-unification T2). A launched /
+    post-turn background key (``is_background=True``) is positive structured
+    proof of a known-async task, so it gets the longer
+    ``BG_BACKGROUND_TTL_SECONDS``; a foreground-presumed key keeps the shorter
+    ``BG_AGENT_TTL_SECONDS`` (the original heartbeat-staleness bound)."""
+    return BG_BACKGROUND_TTL_SECONDS if rec.is_background else BG_AGENT_TTL_SECONDS
+
+
 def _live_background_keys(
     st: _RouteState, now_wall: float | None = None
 ) -> tuple[str, ...]:
@@ -612,7 +632,7 @@ def _live_background_keys(
     AND the §3.6 notification-commit check (codex r3 P3-2: never the raw
     dict). Read-only; expiry DELETION happens in the marks' step-0
     (expire-before-classify) so an expired key must re-pass full NEW
-    qualification.
+    qualification. Per-key TTL (``_bg_ttl_for``): T2 split.
     """
     if not st.background_agents:
         return ()
@@ -620,21 +640,22 @@ def _live_background_keys(
     return tuple(
         k
         for k, rec in st.background_agents.items()
-        if now - rec.last_seen_wall < BG_AGENT_TTL_SECONDS
+        if now - rec.last_seen_wall < _bg_ttl_for(rec)
     )
 
 
 def _expire_background_agents_in_place(st: _RouteState) -> None:
     """Step 0 of the background marks: DELETE expired records before
     NEW/EXISTING classification (hermes r2 P1-3 — a late ``None``-timestamp
-    batch must not refresh a corpse past the idle qualification)."""
+    batch must not refresh a corpse past the idle qualification). Per-key TTL
+    (``_bg_ttl_for``): T2 split."""
     if not st.background_agents:
         return
     now = _wall_now()
     for k in [
         k
         for k, rec in st.background_agents.items()
-        if now - rec.last_seen_wall >= BG_AGENT_TTL_SECONDS
+        if now - rec.last_seen_wall >= _bg_ttl_for(rec)
     ]:
         del st.background_agents[k]
 
@@ -1100,6 +1121,33 @@ def _apply_lifecycle_event(
         _maybe_clear_notification_by_ts(
             st, event.timestamp, reason=NotificationClearReason.TASK_NOTIFICATION
         )
+        # typing-unification T1.3 (2026-07-08,
+        # temp/2026-07-08-typing-unification-plan.md): a task-notification is
+        # machine-initiated (a background task completed) — NOT the human
+        # resuming. On a STORED-idle route with no open tools and NO preserved
+        # gate, re-deriving RUNNING here forces a false Busy. Worse, for a
+        # background bash/agent whose paired ``mark_background_agent_done``
+        # tombstone is applied by the LATER bot fan-out, once the last live key
+        # is gone there is nothing left to project idle again — so a forced
+        # RUNNING strands typing until the parent's next end-of-turn. Preserve
+        # the stored idle instead (the documented contract: "RE-DERIVES with
+        # preserved gates — never a forced RUNNING"); the done tombstone then
+        # leaves a clean idle snapshot and typing drops at close. If the parent
+        # actually wakes to handle the notification, its OWN assistant lifecycle
+        # events re-light RUNNING. A preserved gate (a surviving notification
+        # bit, the pane bit, or a suspended-tools stash) still derives WAITING
+        # via the standard deriver, byte-identical to before. This branch is
+        # SHARED with Agent/Workflow task-notifications — the change applies to
+        # them equally and is the contract-conformant direction.
+        if (
+            st.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+            and not st.open_tools
+            and not st.notification_pending
+            and not st.pane_interactive_pending
+            and not st.suspended_tools
+        ):
+            st.last_event_at = _now()  # still counts as activity (Codex P3)
+            return True
         _set_run_state(st, _derived_state(st))
         return True
 
@@ -1618,13 +1666,16 @@ async def mark_background_agent_launched(
 ) -> RouteRuntimeSnapshot:
     """Async-launch evidence for ``agent_key`` on this route (GH #44 §3.2a).
 
-    Called by the bot fan-out when the parent transcript's Agent
-    ``tool_result`` carries the ``agentId:`` line (a ``run_in_background``
-    launch — synchronous agents never produce one). Registers/upgrades the
-    key with ``is_background=True`` so the end-of-turn prune never drops it —
-    the key exists with background provenance from the moment of launch,
-    independent of sidechain batching (the codex/hermes r2 silent-tool-gap
-    P1). An EXISTING (foreground-presumed) key is upgraded in place with its
+    Called by the bot fan-out for EVERY structured background-launch key the
+    monitor's parent parse collects: a plain Agent/Task ``agentId`` (the
+    ``agentId:`` tool_result line), a Workflow ``wf-task:<taskId>`` bracket key,
+    and (typing-unification T1.2) a background Bash ``backgroundTaskId`` — all
+    ``run_in_background`` launches (synchronous tools never produce one).
+    Registers/upgrades the key with ``is_background=True`` so the end-of-turn
+    prune never drops it and it ages by the longer ``BG_BACKGROUND_TTL_SECONDS``
+    (T2) — the key exists with background provenance from the moment of launch,
+    independent of sidechain batching (the codex/hermes r2 silent-tool-gap P1).
+    An EXISTING (foreground-presumed) key is upgraded in place with its
     ``last_event_ts`` PRESERVED (hermes r3 P3-1). Tombstoned key → no-op;
     never seeds an unseen route; no stored-state mutation.
     """
@@ -2187,6 +2238,7 @@ __all__ = [
     "Route",
     "RouteRuntimeSnapshot",
     "BG_AGENT_TTL_SECONDS",
+    "BG_BACKGROUND_TTL_SECONDS",
     "RunState",
     "TURN_END_REASONS",
     "TranscriptLifecycleEvent",
