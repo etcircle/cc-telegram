@@ -2,17 +2,20 @@
 
 Isolated rig capture, 2026-07-08. Production tmux sessions (`ccbot`, `auqcap`)
 were never touched — the rig ran in a throwaway session `b2rig-<pid>` in a fresh
-`mktemp -d` scratch dir, `CC_TELEGRAM_DIR` pointed at the scratch, and
-`DISABLE_AUTOUPDATER=1` set to pin the version across instances.
+`mktemp -d` scratch dir with `CC_TELEGRAM_DIR` pointed at the scratch.
 
-**CC version:** `2.1.204 (Claude Code)`. `pane_current_command` reports the bare
-version string `2.1.204` while `claude` runs (the Feature-A tap-gate assumption
-holds on this version). NOTE: the plan (§1) characterized this family on
-`2.1.201`; the live binary auto-updated `2.1.201 → 2.1.203 → 2.1.204` during the
-session's lifetime, so this capture set + transcript is pinned to **2.1.204**.
-The keystroke SEMANTICS below are UNCHANGED from the plan's `2.1.201` findings —
-only the version number differs (the expected per-version re-characterization,
-O-5).
+**CC version: `2.1.204 (Claude Code)` — provenance, unambiguous.** The plan
+(§1) characterized this family on `2.1.201`. The live binary auto-updated
+`2.1.201 → 2.1.203 → 2.1.204` during the rig's FIRST, discarded launches —
+BEFORE any committed capture was (re)taken. Once the binary reached `2.1.204`,
+`DISABLE_AUTOUPDATER=1` was set on every subsequent rig instance, FREEZING
+`2.1.204` for the entire committed set: **every committed frame in this fixture
+set, and every E1/E2/E3 keystroke observation below, is from `2.1.204`** (no
+committed artifact is from `.201` or `.203`). `pane_current_command` reports the
+bare version string `2.1.204` while `claude` runs (the Feature-A tap-gate
+assumption holds on this version). The keystroke SEMANTICS below are UNCHANGED
+from the plan's `2.1.201` findings — only the version number differs (the
+expected per-version re-characterization, O-5).
 
 ## Prompt shape (unchanged from .200/.201)
 

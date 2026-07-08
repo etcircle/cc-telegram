@@ -2399,12 +2399,25 @@ def _decision_prompt_block_top(lines: list[str], block_top_idx: int) -> int | No
 # once the B2 buttons dispatch. Each ``·``-segment must be a ``<key> to
 # <action>`` hint; over-strict is the safe direction (a footer with an
 # unrecognized segment simply isn't detected — it costs only detection).
+#
+# WHOLE-segment validation with a BOUNDED action tail (Codex wave-1 P1): each
+# segment must FULLMATCH ``<key(s)> to <word>`` + at most TWO further words. A
+# prefix-only ``.match`` accepted ``Esc to cancel was shown in a quoted
+# example`` (a quoted/prose footer line — a false-Decision enabler, violating
+# the §4 "decompose ENTIRELY into key-hint segments" contract); a bare
+# end-anchor over a GREEDY word tail would accept the same prose. The ≤3-word
+# tail fits every REAL observed footer hint (``Enter to confirm`` / ``Enter to
+# continue`` / ``Esc to cancel`` / ``Esc to exit`` / ``Tab to amend`` /
+# ``Shift+Tab to navigate`` / ``ctrl+g to edit script`` / ``ctrl+e to explain``
+# / ``↑/↓ to navigate`` — pinned by test) while a prose continuation overruns
+# the bound and fails.
 _RE_DECISION_HINT_SEGMENT = re.compile(
-    r"^(?:"
-    r"(?:enter|esc|escape|tab|space|return|shift[+-]tab|del|delete)\s+to\s+\S"
-    r"|ctrl[+-]\S+\s+to\s+\S"
-    r"|[↑↓←→](?:\s*/\s*[↑↓←→])*\s+to\s+\S"
-    r")",
+    r"(?:"
+    r"(?:enter|esc|escape|tab|space|return|shift[+-]tab|del|delete)"
+    r"|ctrl[+-]\S+"
+    r"|[↑↓←→](?:\s*/\s*[↑↓←→])*"
+    r")"
+    r"\s+to\s+\S+(?:\s+\S+){0,2}",
     re.IGNORECASE,
 )
 
@@ -2415,10 +2428,12 @@ def _is_decision_footer_line(line: str) -> bool:
     Beyond carrying the required ``Enter to (confirm|continue)`` component, a
     footer candidate must (i) NOT be a numbered option, (ii) NOT be a
     ``❯``-cursored prompt row, and (iii) be footer-SHAPED — decompose ENTIRELY
-    into ``·``-separated key-hint segments (``_RE_DECISION_HINT_SEGMENT``). This
-    rejects a mid-redraw AUQ option row whose LABEL embeds the footer phrase,
-    which the bare ``_RE_DECISION_FOOTER.search`` would accept. Mirrors
-    ``_only_chrome_below``'s allow-list approach.
+    into ``·``-separated key-hint segments, each FULLMATCHING the bounded
+    ``_RE_DECISION_HINT_SEGMENT`` shape (Codex wave-1 P1: prefix-only matching
+    accepted a hint head with a prose tail). This rejects a mid-redraw AUQ
+    option row whose LABEL embeds the footer phrase and a quoted/prose footer
+    line, both of which the bare ``_RE_DECISION_FOOTER.search`` would accept.
+    Mirrors ``_only_chrome_below``'s allow-list approach.
     """
     stripped = line.strip()
     if not stripped:
@@ -2432,9 +2447,10 @@ def _is_decision_footer_line(line: str) -> bool:
     # (ii) a cursored prompt row is never a footer.
     if stripped[0] in "❯›▶*":
         return False
-    # (iii-b) every ·-separated segment must be a recognized key hint.
+    # (iii-b) every ·-separated segment must be ENTIRELY a recognized, bounded
+    # key hint (fullmatch — a hint head with a prose tail fails).
     return all(
-        seg.strip() != "" and _RE_DECISION_HINT_SEGMENT.match(seg.strip())
+        seg.strip() != "" and _RE_DECISION_HINT_SEGMENT.fullmatch(seg.strip())
         for seg in stripped.split("·")
     )
 

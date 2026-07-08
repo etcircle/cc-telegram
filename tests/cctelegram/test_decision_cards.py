@@ -124,11 +124,14 @@ def test_parse_switch_model() -> None:
 
 
 def test_parse_trust_folder_live_2_1_204_cursor_tracks_arrows(decision_on) -> None:
-    """B2.0 premise gate: the fresh CC v2.1.204 folder-trust captures (real
-    ``tmux capture-pane``) parse as a single-select Decision whose ``❯`` cursor
-    tracks the arrow keys — initial + after ``Up`` sit on option 1, after
-    ``Down`` on option 2. This pins the live-fixture shape the B2.2 dispatch
-    table will key on (family signature + arrow-move-only semantics — E2)."""
+    """B2.0 PREMISE / FIXTURE PIN — NOT parser-hardening coverage (hermes wave-1
+    P2b): this test pins the EMPIRICAL rig captures, not any B2.1 code change.
+    The fresh CC v2.1.204 folder-trust captures (real ``tmux capture-pane``)
+    parse as a single-select Decision whose ``❯`` cursor tracks the arrow keys —
+    initial + after ``Up`` sit on option 1, after ``Down`` on option 2 — pinning
+    the live-fixture shape the B2.2 dispatch table will key on (family
+    signature + arrow-move-only semantics, E2). A failure here means the
+    FIXTURE PREMISE broke (TUI drift / re-capture needed), not a parser bug."""
     initial = parse_generic_decision(_load(_TRUST_204))
     down = parse_generic_decision(_load(_TRUST_204_DOWN))
     up = parse_generic_decision(_load(_TRUST_204_UP))
@@ -415,9 +418,14 @@ def test_footer_scan_rejects_numbered_option_with_footer_label() -> None:
 
 
 def test_footer_scan_rejects_cursored_footer_label() -> None:
-    """A ``❯``-cursored line carrying the footer phrase (a live-cursor option row
-    mid-redraw, no leading number) is likewise not a footer — fail closed."""
-    pane = " Proceed?\n   1. Yes\n   2. No\n ❯ Enter to confirm · Esc to cancel\n"
+    """A ``❯``-cursored line carrying the footer phrase (a live-cursor row
+    mid-redraw, no leading number) is not a footer — fail closed. The option
+    block above carries a live ``❯`` cursor so every OTHER Decision requirement
+    (≥2 contiguous options + resolved cursor + chrome-below) is satisfied and
+    ONLY the new cursored-row footer rejection can produce the None (pre-B2.1
+    this pane PARSED as a Decision with the cursored line as its footer —
+    verified against the pre-diff parser; hermes wave-1 P2a reshape)."""
+    pane = " Proceed?\n ❯ 1. Yes\n   2. No\n ❯ Enter to confirm · Esc to cancel\n"
     assert parse_generic_decision(pane) is None
 
 
@@ -433,6 +441,57 @@ def test_footer_scan_rejects_non_hint_trailing_segment() -> None:
         " Enter to confirm · here is some prose that is not a hint\n"
     )
     assert parse_generic_decision(pane) is None
+
+
+def test_footer_scan_rejects_hint_head_with_prose_tail() -> None:
+    """Codex wave-1 P1: a ``·``-segment that STARTS with a valid hint head
+    (``Esc to cancel``) but continues into prose (``… was shown in a quoted
+    example``) must NOT count as footer-shaped — prefix-only ``.match``
+    validation accepted it, violating the §4 "decompose ENTIRELY into key-hint
+    segments" contract (a quoted/prose footer line is a false-Decision
+    enabler). The whole segment must be a bounded key hint (fullmatch)."""
+    pane = (
+        " Proceed?\n"
+        " ❯ 1. Yes\n"
+        "   2. No\n"
+        " Enter to confirm · Esc to cancel was shown in a quoted example\n"
+    )
+    assert parse_generic_decision(pane) is None
+
+
+def test_footer_shape_accepts_all_real_hint_segments() -> None:
+    """Positive pin for the bounded-tail hint shape: every REAL observed footer
+    hint (across the Decision / gate / EPM footer family) must stay
+    footer-shaped when composed with the required ``Enter to (confirm|continue)``
+    component — the fullmatch tightening must not cost genuine detection."""
+    from cctelegram.terminal_parser import _is_decision_footer_line
+
+    real_hints = [
+        "Enter to confirm",
+        "Enter to continue",
+        "Esc to cancel",
+        "Esc to exit",
+        "Tab to amend",
+        "Shift+Tab to navigate",
+        "ctrl+g to edit script",
+        "ctrl+e to explain",
+        "↑/↓ to navigate",
+    ]
+    # The two real captured footers, verbatim.
+    assert _is_decision_footer_line(" Enter to confirm · Esc to cancel")
+    assert _is_decision_footer_line(" Enter to continue · Esc to cancel")
+    # Every real hint composes into a footer-shaped line (paired with the
+    # required affirmative-commit component).
+    for hint in real_hints:
+        line = f" Enter to confirm · {hint}"
+        assert _is_decision_footer_line(line), line
+    # Prose continuations after a valid hint head must FAIL (the Codex P1).
+    for bad in [
+        " Enter to confirm · Esc to cancel was shown in a quoted example",
+        " Enter to confirm and then it continues into a full prose sentence",
+        " Enter to confirm · the user should press Esc to cancel the dialog now",
+    ]:
+        assert not _is_decision_footer_line(bad), bad
 
 
 def test_footer_shaped_real_footer_still_parses() -> None:
