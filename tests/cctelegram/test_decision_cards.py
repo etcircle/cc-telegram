@@ -55,6 +55,12 @@ _SETTINGS_MODEL = "settings_select_model_v2.1.200.txt"
 _NEG_QUOTED = "decision_negative_quoted_scrollback_v2.1.200.txt"
 _NEG_PERMISSION_PROSE = "permission_negative_prose_v2.1.190.txt"
 
+# B2.0 rig captures (CC v2.1.204 — real `tmux capture-pane`; keystroke transcript
+# in decision_trust_folder_v2.1.204_keystrokes.md).
+_TRUST_204 = "decision_trust_folder_v2.1.204.txt"
+_TRUST_204_DOWN = "decision_trust_folder_postdown_v2.1.204.txt"
+_TRUST_204_UP = "decision_trust_folder_postup_v2.1.204.txt"
+
 
 @pytest.fixture
 def decision_on():
@@ -115,6 +121,32 @@ def test_parse_switch_model() -> None:
     ]
     assert [o.number for o in form.options] == [1, 2]
     assert form.options[0].cursor is True
+
+
+def test_parse_trust_folder_live_2_1_204_cursor_tracks_arrows(decision_on) -> None:
+    """B2.0 premise gate: the fresh CC v2.1.204 folder-trust captures (real
+    ``tmux capture-pane``) parse as a single-select Decision whose ``❯`` cursor
+    tracks the arrow keys — initial + after ``Up`` sit on option 1, after
+    ``Down`` on option 2. This pins the live-fixture shape the B2.2 dispatch
+    table will key on (family signature + arrow-move-only semantics — E2)."""
+    initial = parse_generic_decision(_load(_TRUST_204))
+    down = parse_generic_decision(_load(_TRUST_204_DOWN))
+    up = parse_generic_decision(_load(_TRUST_204_UP))
+    for form in (initial, down, up):
+        assert form is not None
+        assert form.select_mode == "single"
+        assert form.current_question_title == "Accessing workspace:"
+        assert [o.label for o in form.options] == [
+            "Yes, I trust this folder",
+            "No, exit",
+        ]
+        assert [o.number for o in form.options] == [1, 2]
+    # Cursor tracks the arrow keys (E2 = arrows move the ❯ without committing).
+    assert (initial.options[0].cursor, initial.options[1].cursor) == (True, False)
+    assert (down.options[0].cursor, down.options[1].cursor) == (False, True)
+    assert (up.options[0].cursor, up.options[1].cursor) == (True, False)
+    # Detected as a Decision through the full extractor (flag ON).
+    assert extract_interactive_content(_load(_TRUST_204)).name == "Decision"  # type: ignore[union-attr]
 
 
 def test_parse_is_flag_independent() -> None:
@@ -354,6 +386,114 @@ def test_permission_gate_not_reexposed_with_permission_flag_off(decision_on) -> 
         "workflow_dynamic_launch_v2.1.190.txt",
     ):
         assert extract_interactive_content(_load(fixture)) is None, fixture
+
+
+# ── B2.1 parser hardening: footer-shape guard (§4 / P3-1) ─────────────────
+#
+# A Decision footer candidate must be footer-SHAPED, not merely CONTAIN the
+# affirmative-commit phrase. A mid-redraw AUQ frame can transiently render the
+# footer text INSIDE a numbered option's label ("3. Enter to confirm · Esc to
+# cancel"); the bare ``_RE_DECISION_FOOTER.search`` accepted that option row as
+# the footer and (with the B2 dispatch buttons) would mint a wrong-target card.
+
+
+def test_footer_scan_rejects_numbered_option_with_footer_label() -> None:
+    """§4 / P3-1: a numbered OPTION whose label embeds the confirmation-footer
+    phrase must NOT be treated as the footer — so a mid-redraw AUQ-like frame
+    does not classify as a Decision. Before the fix the option row
+    ``3. Enter to confirm · Esc to cancel`` was accepted as the footer and folded
+    into the option block; now the footer scan requires a genuinely
+    footer-SHAPED line (not a numbered option / not ``❯``-cursored / all
+    ``·``-separated key-hint segments), so there is no footer → None."""
+    pane = (
+        " Which option?\n"
+        " ❯ 1. Do the thing\n"
+        "   2. Skip it\n"
+        "   3. Enter to confirm · Esc to cancel\n"
+    )
+    assert parse_generic_decision(pane) is None
+
+
+def test_footer_scan_rejects_cursored_footer_label() -> None:
+    """A ``❯``-cursored line carrying the footer phrase (a live-cursor option row
+    mid-redraw, no leading number) is likewise not a footer — fail closed."""
+    pane = " Proceed?\n   1. Yes\n   2. No\n ❯ Enter to confirm · Esc to cancel\n"
+    assert parse_generic_decision(pane) is None
+
+
+def test_footer_scan_rejects_non_hint_trailing_segment() -> None:
+    """A line that carries ``Enter to confirm`` but ALSO trailing NON-hint prose
+    after a ``·`` (e.g. assistant narration quoting the footer) is not
+    footer-SHAPED — every ``·``-segment must be a key hint. Over-strict is the
+    safe direction (costs only detection)."""
+    pane = (
+        " Proceed?\n"
+        " ❯ 1. Yes\n"
+        "   2. No\n"
+        " Enter to confirm · here is some prose that is not a hint\n"
+    )
+    assert parse_generic_decision(pane) is None
+
+
+def test_footer_shaped_real_footer_still_parses() -> None:
+    """The genuine ``Enter to confirm · Esc to cancel`` footer stays
+    footer-SHAPED and the real prompt still parses (no positive regression)."""
+    pane = (
+        " Proceed with the change?\n"
+        " ❯ 1. Yes, do it\n"
+        "   2. No, cancel\n"
+        " Enter to confirm · Esc to cancel\n"
+    )
+    form = parse_generic_decision(pane)
+    assert form is not None
+    assert [o.number for o in form.options] == [1, 2]
+
+
+# ── B2.1 parser hardening: title-instability on bound overflow (§5a/P3-3) ──
+
+
+def test_decision_title_none_on_prompt_block_bound_overflow() -> None:
+    """§5a / P3-3: when the upward prompt-block scan runs past the 10-line bound
+    WITHOUT hitting a clean terminator (≥2 blank lines / a separator / a chrome
+    line), the title becomes None — never a mid-paragraph fragment. The card
+    still renders title-less (options + footer intact)."""
+    body = "\n".join(f" paragraph line {i}" for i in range(1, 16))  # 15 lines, no gaps
+    pane = body + "\n ❯ 1. Yes\n   2. No\n Enter to confirm · Esc to cancel\n"
+    form = parse_generic_decision(pane)
+    assert form is not None
+    assert form.current_question_title is None
+    # Still a usable form — the options + footer survive the title loss.
+    assert [o.label for o in form.options] == ["Yes", "No"]
+    assert [o.number for o in form.options] == [1, 2]
+    assert form.options[0].cursor is True
+
+
+def test_decision_title_kept_when_terminator_within_bound() -> None:
+    """A short prompt block bounded by a clean terminator (a separator line)
+    keeps its top line as the title — the bound-overflow None path fires ONLY on
+    an unterminated run past the bound."""
+    pane = (
+        "────────────────────────────────────────\n"
+        " Switch the branch?\n"
+        " some context about the branch switch\n"
+        " ❯ 1. Yes\n"
+        "   2. No\n"
+        " Enter to confirm · Esc to cancel\n"
+    )
+    form = parse_generic_decision(pane)
+    assert form is not None
+    assert form.current_question_title == "Switch the branch?"
+
+
+def test_extract_title_none_decision_detected_flag_on(decision_on) -> None:
+    """End-to-end: a title-less (bound-overflow) Decision pane is still DETECTED
+    as a Decision through ``extract_interactive_content`` (the render path
+    tolerates a None title — no mint gate is added in B2.1)."""
+    body = "\n".join(f" paragraph line {i}" for i in range(1, 16))
+    pane = body + "\n ❯ 1. Yes\n   2. No\n Enter to confirm · Esc to cancel\n"
+    result = extract_interactive_content(pane)
+    assert result is not None
+    assert result.name == "Decision"
 
 
 # ── Flag seeding contract (Hermes P2-1) ───────────────────────────────────

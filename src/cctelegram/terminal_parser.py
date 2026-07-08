@@ -2344,11 +2344,20 @@ def _decision_prompt_block_top(lines: list[str], block_top_idx: int) -> int | No
     option block at ``block_top_idx`` (the heading the display-only card shows).
 
     Walks UP from just above the option block, tolerating SINGLE blank lines
-    (paragraph spacing WITHIN one prompt), and STOPS at: a run of ≥2 consecutive
-    blank lines (a gap to unrelated scrollback), a chrome / box-drawing separator
-    line (the welcome banner / rule above the prompt), or the
-    ``_DECISION_PROMPT_BLOCK_MAX_LINES`` bound. Returns the top meaningful line's
-    index, or ``None`` when there is no prompt content above the options.
+    (paragraph spacing WITHIN one prompt), and STOPS at a CLEAN TERMINATOR — a
+    run of ≥2 consecutive blank lines (a gap to unrelated scrollback), a chrome /
+    box-drawing separator line (the welcome banner / rule above the prompt), or
+    the top of the pane (BOF) — returning the top meaningful line seen so far.
+
+    §5a / P3-3 fix: when the ``_DECISION_PROMPT_BLOCK_MAX_LINES`` bound is
+    exhausted WITHOUT hitting a clean terminator (an unbounded paragraph runs
+    straight into the options), the title becomes **None** rather than a
+    mid-paragraph fragment — the fragment fed the card, the confirmation text,
+    and (in B2) BOTH dispatch fingerprints, so a stray mid-line was a stability
+    hazard. A title-less Decision still renders (the excerpt falls back to the
+    option block). Returns the top meaningful line's index, ``None`` on
+    bound-overflow-without-terminator, or ``None`` when there is no prompt
+    content above the options at all.
     """
     top_idx: int | None = None
     blank_run = 0
@@ -2358,18 +2367,76 @@ def _decision_prompt_block_top(lines: list[str], block_top_idx: int) -> int | No
         if not stripped:
             blank_run += 1
             if blank_run >= 2:
-                break
+                # Clean terminator: a ≥2-blank gap to unrelated scrollback.
+                return top_idx
             continue
         if all(c == "─" for c in stripped) or _RE_GATE_TRAILING_SEPARATOR.match(
             lines[j]
         ):
-            break
+            # Clean terminator: a chrome / box-drawing separator line.
+            return top_idx
         blank_run = 0
         meaningful += 1
         if meaningful > _DECISION_PROMPT_BLOCK_MAX_LINES:
-            break
+            # §5a / P3-3: bound exhausted with NO clean terminator — the block
+            # runs into an unbounded paragraph. Return None (a title-less
+            # Decision still renders) instead of a mid-paragraph fragment.
+            return None
         top_idx = j
+    # Reached the top of the pane (BOF) — a clean start-of-block boundary.
     return top_idx
+
+
+# ── Decision footer-shape allow-list (§4 / P3-1) ──────────────────────────
+#
+# A live Decision confirmation FOOTER is a single line of ``·``-separated
+# KEY-HINT segments (``Enter to confirm`` / ``Esc to cancel`` / ``Tab to amend``
+# / ``ctrl+g to edit script`` / ``↑/↓ to navigate``) — NOT a numbered option
+# that merely CONTAINS the footer phrase. A mid-redraw AUQ frame can transiently
+# render the footer text INSIDE an option label (``3. Enter to confirm · Esc to
+# cancel``); the bare ``_RE_DECISION_FOOTER.search`` accepted that option row as
+# the footer and folded it into the option block, a wrong-target mint hazard
+# once the B2 buttons dispatch. Each ``·``-segment must be a ``<key> to
+# <action>`` hint; over-strict is the safe direction (a footer with an
+# unrecognized segment simply isn't detected — it costs only detection).
+_RE_DECISION_HINT_SEGMENT = re.compile(
+    r"^(?:"
+    r"(?:enter|esc|escape|tab|space|return|shift[+-]tab|del|delete)\s+to\s+\S"
+    r"|ctrl[+-]\S+\s+to\s+\S"
+    r"|[↑↓←→](?:\s*/\s*[↑↓←→])*\s+to\s+\S"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_decision_footer_line(line: str) -> bool:
+    """True iff ``line`` is a live Decision confirmation FOOTER (§4 / P3-1).
+
+    Beyond carrying the required ``Enter to (confirm|continue)`` component, a
+    footer candidate must (i) NOT be a numbered option, (ii) NOT be a
+    ``❯``-cursored prompt row, and (iii) be footer-SHAPED — decompose ENTIRELY
+    into ``·``-separated key-hint segments (``_RE_DECISION_HINT_SEGMENT``). This
+    rejects a mid-redraw AUQ option row whose LABEL embeds the footer phrase,
+    which the bare ``_RE_DECISION_FOOTER.search`` would accept. Mirrors
+    ``_only_chrome_below``'s allow-list approach.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # (iii-a) the required affirmative-commit component.
+    if not _RE_DECISION_FOOTER.search(line):
+        return False
+    # (i) a numbered option is never a footer (the poisoned-label case).
+    if _RE_NUMBERED_OPTION.match(line):
+        return False
+    # (ii) a cursored prompt row is never a footer.
+    if stripped[0] in "❯›▶*":
+        return False
+    # (iii-b) every ·-separated segment must be a recognized key hint.
+    return all(
+        seg.strip() != "" and _RE_DECISION_HINT_SEGMENT.match(seg.strip())
+        for seg in stripped.split("·")
+    )
 
 
 def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
@@ -2383,9 +2450,14 @@ def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
     Permission / Workflow — declined first-match-wins). All requirements
     fail-closed → ``None``:
 
-      1. a bottom-most footer carrying a live ``Enter to (confirm|continue)``
-         component (the affirmative-commit half of a confirmation dialog —
-         verified on both real targets: ``Enter to confirm · Esc to cancel``).
+      1. a bottom-most FOOTER-SHAPED line (``_is_decision_footer_line``) that
+         carries a live ``Enter to (confirm|continue)`` component (the
+         affirmative-commit half of a confirmation dialog — verified on both
+         real targets: ``Enter to confirm · Esc to cancel``). §4 / P3-1: the
+         candidate must decompose ENTIRELY into ``·``-separated key hints and
+         must NOT be a numbered option / ``❯``-cursored row, so a mid-redraw AUQ
+         option whose LABEL embeds the footer phrase (``3. Enter to confirm ·
+         Esc to cancel``) is rejected instead of folded into the option block.
          REQUIRING ``Enter to (confirm|continue)`` — rather than accepting a
          bare ``Esc to cancel`` / ``Esc to exit`` — STRUCTURALLY closes the
          verb-drift veto bypass (Codex P2): the Permission / EPM footer family
@@ -2429,10 +2501,12 @@ def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
     lines = pane_text.split("\n")
 
     # (1) Bottom-most confirmation footer (live footer beats a stale scrollback
-    # one).
+    # one). §4 / P3-1: the candidate must be footer-SHAPED — not a numbered
+    # option / not ``❯``-cursored / all ``·``-separated key hints — so a
+    # mid-redraw option row whose LABEL embeds the footer phrase is rejected.
     footer_idx: int | None = None
     for i in range(len(lines) - 1, -1, -1):
-        if _RE_DECISION_FOOTER.search(lines[i]):
+        if _is_decision_footer_line(lines[i]):
             footer_idx = i
             break
     if footer_idx is None:
