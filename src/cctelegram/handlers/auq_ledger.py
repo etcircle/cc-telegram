@@ -469,6 +469,40 @@ def release_window(window_id: str) -> int:
     return released
 
 
+def release_key(key: str) -> bool:
+    """Append a ``released`` tombstone for a SINGLE ledger key; return whether a
+    row was released.
+
+    The Stage-B2 Decision lane's per-key release seam (additive to
+    ``release_window``, which the AUQ lane keys on the ``window_id`` FIELD). A
+    Decision resolves as a whole on its own commit, so the executor releases
+    ITS ledger key by the exact ``(route_hash, fp8, opt)`` triplet — mirroring
+    ``release_window``'s ``released``-tombstone semantics without touching the
+    window-scoped sweep. Composes with the existing state machine verbatim:
+    ``record(key, state="released")`` inherits the identifying fields from the
+    live entry and the ``released``-is-terminal guard makes a re-release
+    idempotent, so ``lookup`` treats the key as ``None`` and a later
+    byte-identical Decision reconstructing the same content-derived key is
+    dispatchable again.
+
+    Returns ``False`` — never raising — for an ABSENT key (``record``'s
+    first-write identity requirement means we never fabricate a key here), an
+    already-``released`` key, or a key aged past ``RETENTION_SECONDS`` (already
+    dead to ``lookup``). A pure leaf persistence write: no RouteRuntime /
+    status_polling wiring, no observer (c313657 forbidden).
+    """
+    _ensure_loaded()
+    entry = _entries.get(key)
+    if entry is None:
+        return False
+    if entry.state == "released":
+        return False
+    if entry.accepted_at < _now() - RETENTION_SECONDS:
+        return False
+    record(key, state="released")
+    return True
+
+
 def _append_line(entry: LedgerEntry) -> None:
     """Append one JSONL line via a single O_APPEND write.
 
