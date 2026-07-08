@@ -1354,8 +1354,18 @@ async def assert_nav_dispatchable(
     #     card rendered, or a bot restart that wiped the registry) → refuse.
     #   * gen ABSENT but the window carries a live gate generation → refuse (a
     #     pre-B2 un-suffixed gate card surviving a rollout must never raw-dispatch).
-    #   * gen ABSENT + no gate generation → the legacy AUQ / EPM path, byte-neutral.
+    #   * gen ABSENT + no gate generation → AMBIGUOUS, not automatically legacy:
+    #     after a restart/deploy the registry is ALWAYS empty, so a gate card
+    #     published pre-B2.3 (old raw ``aq:enter:@N`` callbacks) tapped before
+    #     the poller re-renders it would otherwise send a RAW un-generation-
+    #     validated keystroke into a live gate pane — exactly the §5b(c) hole
+    #     (review r1 P1, BOTH engines). No in-memory/persisted authority records
+    #     the surface's UI KIND, so this shape is discriminated on the LIVE pane
+    #     below (the ``_gate_pane_recheck_needed`` flag) — reusing the existing
+    #     guard-4 visible capture, so the suffixed / gen-registered paths gain NO
+    #     pane capture.
     cur_gen = decision_token.current_nav_generation(window_id)
+    _gate_pane_recheck_needed = False
     if gen is not None:
         if cur_gen is None or cur_gen != gen:
             await safe_answer(query, "Card refreshed — use the current card")
@@ -1363,6 +1373,8 @@ async def assert_nav_dispatchable(
     elif cur_gen is not None:
         await safe_answer(query, "Card refreshed — use the current card")
         return None
+    else:
+        _gate_pane_recheck_needed = True
     if not has_interactive_surface(user_id, thread_id):
         if is_esc:
             # Cleanup is idempotent and what ESC wants.
@@ -1387,6 +1399,21 @@ async def assert_nav_dispatchable(
             return NAV_ESC_CLEAR
         await safe_answer(query, "Picker closed, refreshing")
         return None
+    # §5b(c) P1 fold (review r1, BOTH engines — the un-suffixed pre-deploy gate
+    # hole): gen ABSENT + registry EMPTY is ambiguous between (a) a legacy AUQ /
+    # EPM card (must stay byte-neutral) and (b) a PRE-B2.3 gate card whose raw
+    # un-suffixed callbacks survived a restart/deploy (the registry is wiped on
+    # every restart, so ``cur_gen is None`` proves nothing). Discriminate on the
+    # LIVE pane — reusing THIS branch's existing visible capture (no new capture
+    # on the suffixed / gen-registered paths): a gate (Decision / Permission /
+    # Workflow) pane REFUSES fail-closed before any key (the poller re-renders
+    # the card with a fresh suffixed keyboard within ~1s); an AUQ / EPM / other
+    # pane proceeds down the legacy path unchanged.
+    if _gate_pane_recheck_needed and visible:
+        gate_content = extract_interactive_content(visible)
+        if gate_content is not None and gate_content.name in _GATE_RENDER_NAMES:
+            await safe_answer(query, "Card refreshed — use the current card")
+            return None
     # PRESENT or UNKNOWN: proceed. UNKNOWN explicitly continues per CB1.
     return w
 

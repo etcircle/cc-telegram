@@ -123,6 +123,42 @@ class _StuckEnterPicker(_DecisionPicker):
         return True
 
 
+class _EnterIntoNamedUiPicker(_DecisionPicker):
+    """Enter lands the pane on a NAMED interactive UI (the Settings warning)
+    that ALSO decision-parses — the review-r1 P2-B confirm-parity case: the
+    bare ``parse_generic_decision`` would fp-compare it as a "different
+    Decision" and wrongly confirm; the FULL extractor names it Settings."""
+
+    def __init__(self, *args: Any, landing_pane: str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._landing_pane = landing_pane
+        self._landed = False
+
+    async def send_keys(
+        self, window_id: str, keys: str, enter: bool = True, literal: bool = True
+    ) -> bool:
+        self.sent.append((window_id, keys, enter, literal))
+        if window_id != self.window_id or self._landed:
+            return True
+        scr = self.screens[self.idx]
+        if keys == "Down":
+            self.cursor = self.cursor + 1 if self.cursor < scr.n_nav else 1
+        elif keys == "Up":
+            self.cursor = self.cursor - 1 if self.cursor > 1 else scr.n_nav
+        elif keys == "Enter":
+            self._landed = True
+        return True
+
+    async def capture_pane(
+        self, window_id: str, with_ansi: bool = False, scrollback_lines: int = 0
+    ) -> str:
+        if self._landed and window_id == self.window_id:
+            return self._landing_pane
+        return await super().capture_pane(
+            window_id, with_ansi=with_ansi, scrollback_lines=scrollback_lines
+        )
+
+
 class _Query:
     def __init__(self) -> None:
         self.answers: list[tuple[str | None, bool | None]] = []
@@ -239,6 +275,80 @@ def test_parse_nav_payload_suffixed_and_legacy() -> None:
     assert cbi._parse_nav_payload("@12") == ("@12", None)
     assert cbi._parse_nav_payload("@12:gx") == ("@12:gx", None)
     assert cbi._parse_nav_payload("@12:g") == ("@12:g", None)
+
+
+@pytest.mark.asyncio
+async def test_dispatched_finalizes_before_callback_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review r1 P2-C named pin — §5b(b) ordering per the plan: on a CONFIRMED
+    dispatch the terminal teardown (pop the persisted surface → the inert
+    "✅ … sent" edit) runs FIRST, THEN the callback answer — answering first left
+    a crash/network window where the callback was acked but the persisted
+    surface was not yet terminal."""
+    picker = _DecisionPicker(_WINDOW_ID, [_Screen(_TRUST, 2, 2)])
+    key = _seed_accepted(2, "No, exit")
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    order: list[str] = []
+
+    async def _finalize(*args: Any, **kwargs: Any) -> None:
+        order.append("finalize")
+
+    monkeypatch.setattr(cbi.interactive_ui, "finalize_decision_dispatch", _finalize)
+    monkeypatch.setattr(cbi, "handle_interactive_ui", AsyncMock(return_value=True))
+
+    class _OrderQuery(_Query):
+        async def answer(
+            self, text: str | None = None, show_alert: bool | None = None
+        ) -> None:
+            order.append("answer")
+            await super().answer(text, show_alert)
+
+    q = _OrderQuery()
+    await cbi._dispatch_decision(
+        query=q,
+        context=SimpleNamespace(bot=SimpleNamespace()),
+        user=SimpleNamespace(id=_OWNER_ID),
+        tmux_manager=picker,
+        adapters=SimpleNamespace(session_manager=SimpleNamespace()),
+        w=SimpleNamespace(window_id=_WINDOW_ID),
+        window_id=_WINDOW_ID,
+        thread_id=_THREAD_ID,
+        minted_fingerprint=_fingerprint(),
+        option_number=2,
+        option_label="No, exit",
+        ledger_key=key,
+    )
+    assert order == ["finalize", "answer"], order
+
+
+@pytest.mark.asyncio
+async def test_commit_into_named_ui_pane_records_commit_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review r1 P2-B named pin — confirm-side extractor parity: the post-Enter
+    pane parses as a NAMED interactive UI (the Settings warning, which ALSO
+    decision-parses with a different fingerprint) while decision footer markers
+    are still present ⇒ ``commit_unconfirmed``, NEVER ``dispatched`` (the bare
+    ``parse_generic_decision`` recognizer would have fp-compared it as a
+    "different Decision" and wrongly confirmed + released)."""
+    # Premise guard: the fixture must decision-parse under the WEAK recognizer
+    # yet be named Settings by the FULL extractor (first-match-wins).
+    weak = tp.parse_generic_decision(_SETTINGS)
+    assert weak is not None
+    assert tp.decision_prompt_fingerprint(weak) != _fingerprint()
+    named = tp.extract_interactive_content(_SETTINGS)
+    assert named is not None and named.name == "Settings"
+
+    picker = _EnterIntoNamedUiPicker(
+        _WINDOW_ID, [_Screen(_TRUST, 2, 2)], landing_pane=_SETTINGS
+    )
+    q, finalize = await _run_dispatch(picker, 2, "No, exit", monkeypatch)
+    entry = auq_ledger.lookup(_ledger_key(2))
+    assert entry is not None and entry.state == "commit_unconfirmed"
+    assert "Enter" in [k for _w, k, _e, _l in picker.sent]
+    assert q.answers == [("Action sent; refreshing card.", False)]
+    finalize.assert_not_awaited()  # unreleased + no terminal teardown
 
 
 @pytest.mark.asyncio

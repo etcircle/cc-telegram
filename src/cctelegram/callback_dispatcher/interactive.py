@@ -744,20 +744,34 @@ def _decision_stable_key(entry: decision_token.DecisionTokenEntry) -> str:
 
 
 def _classify_decision_advance(pane2: str, minted_fingerprint: str) -> bool:
-    """True iff the committed Decision fingerprint is GONE from the post-Enter pane.
+    """True iff the committed Decision fingerprint is GONE from the post-Enter pane
+    — under the SAME extractor semantics the render mint and the pre-commit gate
+    use (review r1 P2-B: first-match-wins parity on the CONFIRM side too).
 
     Sound ONLY under §2b-proven families (Enter was the only commit-capable key
-    sent). ``dispatched`` fires ONLY on this proof; every ambiguity fails CLOSED
-    to ``commit_unconfirmed`` (refresh-only). A LIVE Decision still on the pane
-    with the SAME fingerprint is the round-3 zero-absence variant (a byte-identical
-    prompt re-raised before the committed one's absence was ever observed) →
-    unconfirmed. A DIFFERENT live Decision (committed one resolved, a new one
-    raised within the settle) → resolved (§11-5). No Decision parse AND no
-    Decision footer left on the pane → positively resolved; a footer still present
-    with no parse is an AMBIGUOUS parse-fail → unconfirmed.
+    sent). ``dispatched`` fires ONLY on the confirmed-absence proof; every
+    ambiguity fails CLOSED to ``commit_unconfirmed`` (refresh-only). Runs the
+    FULL ``extract_interactive_content`` (never the bare ``parse_generic_decision``
+    — a WEAKER recognizer: a Settings/AUQ pane that merely decision-parses would
+    fp-compare as a "different Decision" and wrongly confirm):
+
+      * extractor → ``Decision``: compare ``decision_prompt_fingerprint``. Same
+        fp = the round-3 zero-absence variant (a byte-identical prompt re-raised
+        before the committed one's absence was ever observed) → unconfirmed;
+        different fp = the committed prompt resolved and a NEW one raised within
+        the settle → resolved (§11-5).
+      * extractor → ANOTHER named interactive UI, or None: ``dispatched`` ONLY
+        when no Decision footer/marker line remains on the pane (the committed
+        fingerprint is positively absent); a still-present footer — under a
+        named UI that stole first-match, or an unparseable frame — is AMBIGUOUS
+        → unconfirmed, never dispatched.
     """
-    aform = parse_generic_decision(pane2)
-    if aform is not None:
+    content = extract_interactive_content(pane2)
+    if content is not None and content.name == "Decision":
+        aform = parse_generic_decision(pane2)
+        if aform is None:
+            # Extractor/validator disagreement — ambiguous, fail closed.
+            return False
         return decision_prompt_fingerprint(aform) != minted_fingerprint
     return not any(_is_decision_footer_line(line) for line in pane2.split("\n"))
 
@@ -1015,11 +1029,15 @@ async def _dispatch_decision(
         )
     # ── Unlocked response: Telegram I/O only after lock release. ──
     if outcome.kind == "dispatched":
-        await safe_answer(query, f"✅ {option_label[:32]}")
-        # §5b(b) dispatch-terminal teardown: pop the persisted interactive surface
-        # (a stale raw-nav tap then fails ``has_interactive_surface``, restart-safe)
-        # and edit the card into the inert "✅ … sent" final state. The nav
-        # generation was already invalidated IN-LOCK (§3).
+        # §5b(b)/§3 ORDERING (review r1 P2-C — the plan text is normative):
+        # FIRST the dispatch-terminal teardown — pop the persisted interactive
+        # surface (a stale raw-nav tap then fails ``has_interactive_surface``,
+        # restart-safe) and edit the card into the inert "✅ … sent" final state —
+        # THEN answer the callback. Answering first left a crash/network window
+        # where the callback was acked but the persisted surface was not yet
+        # terminal (a restart inside it would rehydrate a live-looking card for
+        # a committed dispatch). The nav generation was already invalidated
+        # IN-LOCK (§3), covering the lock-release→teardown gap either way.
         await interactive_ui.finalize_decision_dispatch(
             context.bot,
             user.id,
@@ -1028,6 +1046,7 @@ async def _dispatch_decision(
             option_label,
             session_mgr=adapters.session_manager,
         )
+        await safe_answer(query, f"✅ {option_label[:32]}")
         return
     if outcome.kind == "not_advanced":
         await safe_answer(query, "Action not registered; refreshing card.")

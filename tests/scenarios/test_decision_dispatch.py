@@ -316,3 +316,88 @@ async def test_ledger_dispatched_row_answers_already_received_after_restart(
         c.args[0] for c in update.callback_query.answer.await_args_list if c.args
     ]
     assert any("already received" in str(a) for a in answered), answered
+
+
+@pytest.mark.asyncio
+async def test_pre_deploy_unsuffixed_gate_nav_refuses_after_restart(
+    scenario: ScenarioHarness,
+) -> None:
+    """Review r1 P1 (BOTH engines), the Hermes scenario pin: a PRE-B2.3 gate card
+    (raw un-suffixed ``aq:enter:@N`` callbacks) whose persisted interactive
+    surface survived a restart — while the nav-generation registry (in-memory)
+    is ALWAYS wiped — must refuse BEFORE any key, never raw-dispatch into the
+    live Decision pane."""
+    wid = _bind(scenario)
+    assert await _render(scenario, wid)
+    assert decision_token.current_nav_generation(wid) is not None
+
+    # Simulate the restart/deploy: the in-memory registry (and tokens) are wiped;
+    # the persisted interactive surface (interactive_state.json) survives; the
+    # published PRE-B2.3 card still carries its raw un-suffixed callbacks.
+    decision_token.reset_for_tests()
+    decision_token.set_decision_dispatch_enabled(True)
+    assert decision_token.current_nav_generation(wid) is None
+    assert interactive_ui.has_interactive_surface(scenario.user_id, 42)
+
+    scenario.tmux.sent_keys.clear()
+    update = make_update_callback(
+        f"{CB_ASK_ENTER}{wid}",  # the pre-deploy un-suffixed shape
+        thread_id=42,
+        user_id=scenario.user_id,
+        chat_id=scenario.chat_id,
+    )
+    await dispatch_callback(
+        update,
+        scenario.context,
+        _adapters(scenario),
+        is_user_allowed_func=lambda _uid: True,
+    )
+    assert scenario.tmux.sent_keys == [], "no raw key into a live gate pane"
+    answered = [
+        c.args[0] for c in update.callback_query.answer.await_args_list if c.args
+    ]
+    assert any("Card refreshed" in str(a) for a in answered), answered
+
+
+@pytest.mark.asyncio
+async def test_clear_invalidates_decision_tokens_same_fp_reraise_refuses(
+    scenario: ScenarioHarness,
+) -> None:
+    """Review r1 P2-A (Hermes lifecycle scenario): /clear tears down the route's
+    Decision tokens + nav generation, so a stale ``dcp:`` tap on a SAME-fingerprint
+    re-raised prompt (same-cwd folder-trust after /clear, within the 300s token
+    TTL) REFUSES — extractor parity + fingerprint + license would all pass, so
+    only the teardown stops real keys reaching the NEW session."""
+    from cctelegram import bot as bot_module
+    from tests.conftest import make_update_command
+
+    wid = _bind(scenario)
+    assert await _render(scenario, wid)
+    dcp = _dcp_buttons(_latest_keyboard(scenario))
+    assert len(dcp) == 2
+    stale_tap = dcp[0]
+    assert decision_token.current_nav_generation(wid) is not None
+
+    # Drive /clear through the public command seam (bot.forward_command_handler).
+    update = make_update_command("clear", thread_id=42)
+    await bot_module.forward_command_handler(update, scenario.context)
+
+    # The /clear seam invalidated the Decision tokens + nav generation.
+    token = stale_tap.removeprefix(CB_DECISION_PICK).split(":")[-1]
+    assert decision_token.peek(token) is None, "/clear must kill the dcp tokens"
+    assert decision_token.current_nav_generation(wid) is None
+
+    # The NEW session re-raises the byte-identical (same-fingerprint) prompt.
+    scenario.tmux.set_pane(wid, _TRUST)
+    scenario.tmux.sent_keys.clear()
+    tap_update = make_update_callback(
+        stale_tap, thread_id=42, user_id=scenario.user_id, chat_id=scenario.chat_id
+    )
+    await dispatch_callback(
+        tap_update,
+        scenario.context,
+        _adapters(scenario),
+        is_user_allowed_func=lambda _uid: True,
+    )
+    # No nav / Enter / digit keystroke reached the new session's pane.
+    assert scenario.tmux.sent_keys == [], scenario.tmux.sent_keys

@@ -1,5 +1,5 @@
 """Stage B2.3 §5b(c)/O-6 — the generation-suffixed nav gate in
-``assert_nav_dispatchable`` (round-4 guardrail 2).
+``assert_nav_dispatchable`` (round-4 guardrail 2 + the review-r1 P1 fold).
 
 The presence of a window nav generation in ``decision_token`` is the "this window
 owns a live GATE card" bit. Rules, all fail-closed BEFORE any key:
@@ -7,7 +7,10 @@ owns a live GATE card" bit. Rules, all fail-closed BEFORE any key:
     a NEW card rendered, or a restart-wiped registry, refuses);
   * gen ABSENT but a live gate generation present → refuse (a pre-B2 un-suffixed
     gate card must never raw-dispatch);
-  * gen ABSENT + no gate generation → the legacy AUQ / EPM path (byte-neutral).
+  * gen ABSENT + no gate generation (the AMBIGUOUS post-restart shape — the
+    registry is ALWAYS empty after a deploy) → the LIVE pane discriminates
+    (review r1 P1, BOTH engines): a gate pane refuses; an AUQ / EPM pane
+    proceeds down the legacy path unchanged (byte-neutral).
 """
 
 from __future__ import annotations
@@ -22,9 +25,9 @@ from cctelegram import terminal_parser as tp
 from cctelegram.handlers import decision_token as dt
 from cctelegram.handlers import interactive_ui
 
-_TRUST = (
-    Path(__file__).parents[1] / "fixtures" / "decision_trust_folder_v2.1.204.txt"
-).read_text()
+_FIXTURES = Path(__file__).parents[1] / "fixtures"
+_TRUST = (_FIXTURES / "decision_trust_folder_v2.1.204.txt").read_text()
+_AUQ_PANE = (_FIXTURES / "auq_single_select_with_affordances_pane.txt").read_text()
 _USER = 1
 _THREAD = 7
 _WID = "@3"
@@ -70,10 +73,10 @@ def _seed_surface() -> None:
     interactive_ui._interactive_mode[(_USER, _THREAD)] = _WID
 
 
-async def _call(gen: int | None) -> tuple[Any, _Query]:
+async def _call(gen: int | None, pane: str = _TRUST) -> tuple[Any, _Query]:
     q = _Query()
     w = await interactive_ui.assert_nav_dispatchable(
-        q, _USER, _THREAD, _WID, tmux_mgr=_Tmux(_TRUST), gen=gen
+        q, _USER, _THREAD, _WID, tmux_mgr=_Tmux(pane), gen=gen
     )
     return w, q
 
@@ -119,12 +122,26 @@ async def test_restart_wiped_registry_suffixed_tap_refuses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_deploy_unsuffixed_gate_card_empty_registry_refuses() -> None:
+    """Review r1 P1 (BOTH engines), the named unit pin — NO rotate_nav_generation
+    call anywhere: a persisted gate surface + an EMPTY registry (the post-
+    restart/deploy shape, where ``current_nav_generation`` is ALWAYS None) + an
+    un-suffixed payload (a pre-B2.3 gate card's raw ``aq:enter:@N``) must REFUSE
+    on the live gate pane — never fall to the legacy raw-dispatch path."""
+    _seed_surface()
+    assert dt.current_nav_generation(_WID) is None  # registry empty — no rotate
+    w, q = await _call(None, pane=_TRUST)  # live Decision (gate) pane
+    assert w is None  # no window returned ⇒ the caller sends NO key
+    assert q.answers == [("Card refreshed — use the current card", False)]
+
+
+@pytest.mark.asyncio
 async def test_legacy_unsuffixed_auq_nav_byte_neutral() -> None:
-    # No gate generation for this window (AUQ / EPM surface) + an un-suffixed
-    # legacy callback → the AUQ nav contract is untouched (dispatches).
+    """The non-regression companion (review r1 P1 test (c)): gen=None + no gate
+    generation + an AUQ pane → the legacy nav path still dispatches unchanged."""
     _seed_surface()
     assert dt.current_nav_generation(_WID) is None
-    w, q = await _call(None)
+    w, q = await _call(None, pane=_AUQ_PANE)
     assert w is not None and w.window_id == _WID
     assert q.answers == []
 
