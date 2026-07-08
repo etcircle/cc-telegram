@@ -306,31 +306,63 @@ resurrection preserved verbatim; a NEW key on a stored-idle route records
 ONLY when `event_ts > last_assistant_turn_ended_at`, both non-None, strict —
 a buffered pre-end-of-turn flush fails closed; active/WAITING recording is
 unconditional but foreground-presumed); `mark_background_agent_launched`
-registers `is_background=True` from the parent's async-launch tool_result
-(the structured `agentId:` line is the anchor; the prose sentence is
-diagnostic-only) so the key survives the parent's end-of-turn regardless of
-sidechain batching. **Clears**: `mark_background_agent_done` on the agent's
+registers `is_background=True` from the parent's async-launch tool_result so
+the key survives the parent's end-of-turn regardless of sidechain batching.
+It is fed by THREE structured launch sources the monitor collects on the
+parent parse path — a plain Agent/Task `agentId`, a Workflow
+`wf-task:<taskId>` bracket key, and (**typing-unification T1.2, 2026-07-08**)
+a **background Bash `backgroundTaskId`** (`response_builder.background_bash_task_id_from_meta`
+over the tool_result's entry-level `toolUseResult`; keyed on
+`backgroundTaskId` PRESENCE only — the three async-launch meta shapes are
+disjoint, so an Agent/Workflow meta returns None and a Bash meta returns None
+from the other two parsers). The background Bash key is the **bare** task id
+(no `wf-task:` prefix), so it EQUALS the completion `<task-notification>`
+`<task-id>` — the launch/close key parity, with NO bracket (a background Bash
+has no sidechain dir to heartbeat; it ages by the background TTL and closes on
+its `<task-notification>`). A prose-only launch (structured meta absent) NEVER
+lifts — the Bash-scoped, rate-limited (once per tool_use_id) T1.6 drift
+WARNING fires instead. **Clears**: `mark_background_agent_done` on the agent's
 own sidechain end-of-turn (lifecycle-only markers included) and on the
 parent's `<task-notification>` task-id (extracted monitor-side, applied
-after lifecycle dispatch); the `BG_AGENT_TTL_SECONDS` (30 min) wall-clock
-heartbeat TTL (`_wall_now()` injectable; expire-before-classify deletes a
-stale record before NEW/EXISTING classification so a late None-ts batch can
-never relift); the provenance-only foreground prune at the authoritative
-end-of-turn (synchronous agents always finish before their parent's turn
-ends — `is_background` keys are NEVER pruned); and route teardown. Done keys
-are TOMBSTONED — reset only on a GENUINE user turn. A task-notification user
-event (`TranscriptLifecycleEvent.is_task_notification`, stamped by the
-adapter via the public `response_builder.is_task_notification`) is
-machine-initiated: it counts as activity but preserves the pane bit, the
+after lifecycle dispatch); the wall-clock heartbeat TTL (`_wall_now()`
+injectable; expire-before-classify deletes a stale record before NEW/EXISTING
+classification so a late None-ts batch can never relift) — **PER-KEY since the
+typing-unification T2 split (2026-07-08): a foreground-presumed key
+(`is_background=False`) ages by `BG_AGENT_TTL_SECONDS` (30 min, the original
+heartbeat-staleness bound); a launched / post-turn background key
+(`is_background=True`) is positive structured proof of a known-async task and
+ages by the longer `BG_BACKGROUND_TTL_SECONDS` (2 h)** — applied at BOTH TTL
+seams (`_live_background_keys` filter + `_expire_background_agents_in_place`)
+via the shared `_bg_ttl_for(rec)` selector; the provenance-only foreground
+prune at the authoritative end-of-turn (synchronous agents always finish
+before their parent's turn ends — `is_background` keys are NEVER pruned); and
+route teardown. Done keys are TOMBSTONED — reset only on a GENUINE user turn.
+A task-notification user event (`TranscriptLifecycleEvent.is_task_notification`,
+stamped by the adapter via the public `response_builder.is_task_notification`)
+is machine-initiated: it counts as activity but preserves the pane bit, the
 stash, and the tombstones, clears the notification bit timestamp-qualified
 only, and RE-DERIVES with the preserved gates (never a forced RUNNING — the
-`interactive_pending ⟺ pane-set WAITING` invariant holds). The status CARD
+`interactive_pending ⟺ pane-set WAITING` invariant holds). **typing-unification
+T1.3 (2026-07-08):** on a STORED-idle route with empty `open_tools` and NO
+preserved gate (no surviving notification bit, no pane bit, no suspended
+stash), the task-notification branch now PRESERVES the stored idle instead of
+re-deriving RUNNING — for a completing background bash/agent whose paired
+`mark_background_agent_done` tombstone lands via the LATER bot fan-out, a
+forced RUNNING would have no live key left to project idle again and would
+strand typing until the parent's next end-of-turn; the preserve leaves a clean
+idle snapshot so typing drops at close (the parent's own lifecycle events
+re-light RUNNING if it actually wakes). A preserved gate still derives WAITING;
+the branch is shared with Agent/Workflow task-notifications. The status CARD
 stays pane-driven and may clear on the idle pane while the lift holds —
 typing + digest/dashboard Busy are the contracted surfaces (recorded product
 decision). Restart degradation: all in-memory; the stamp-None guard keeps
 post-restart sidechain batches from lifting (no false Busy), so the route
-renders idle until fresh parent activity. Pull-only throughout (no observer;
-c313657 stays forbidden).
+renders idle until fresh parent activity. A background BASH specifically is
+**not restart-relit** (typing-unification T1.4b): unlike the Workflow/Agent
+startup reconciler there is no sidechain file to stat, so after a restart a
+still-running background bash stays typing-dark until fresh parent activity —
+the recorded GH #44 degradation shape, and the T2 window widening does NOT
+change it. Pull-only throughout (no observer; c313657 stays forbidden).
 
 **Workflow-tool bracket (ISSUE-6 — extends GH #44 to the `Workflow` tool).**
 GH #44 only detected the `Agent` tool's `run_in_background` (`agentId:` launch +
@@ -374,9 +406,11 @@ channel):** each poll, `_emit_workflow_bracket_heartbeats` stats the bracket's
 into `ParentSidechainActivity.bracket_heartbeats` (→ `mark_background_agent_activity`)
 ONLY on an mtime ADVANCE (real new sidechain writes) — never by parsing
 sidechain ENTRIES (run-state consumes only the bracket + a dir stat); no new
-writes → the key ages out via the 30-min `BG_AGENT_TTL_SECONDS` (the dead/
-never-completed backstop); a `wf_dir`-less bracket never heartbeats (ages out
-one TTL from `launch_wall`). **Close = GATE-ON-BRACKET ONLY:** the
+writes → the key ages out via the background heartbeat TTL
+`BG_BACKGROUND_TTL_SECONDS` (2 h post the T2 split — a launched `wf-task:` key
+is `is_background=True`; the dead/never-completed backstop); a `wf_dir`-less
+bracket never heartbeats (ages out one TTL from `launch_wall`). **Close =
+GATE-ON-BRACKET ONLY:** the
 `<task-notification>` emits the `wf-task:<id>` close key (→
 `mark_background_agent_done` tombstone) IFF a live open bracket exists — never
 guessing a Workflow id from its character set; an isolated close with no
@@ -399,8 +433,10 @@ poll loop): for each tracked parent with NO live open bracket (idempotency —
 skip a parent that already has one), STAT-glob
 `<project>/<parent_sid>/subagents/workflows/wf_*` (anchored, never `rglob`) and,
 for any `wf_*` dir whose freshest `*.jsonl` mtime is within
-`_RECONCILE_FRESH_WINDOW_S` (1800s, mirrors `BG_AGENT_TTL_SECONDS` without
-importing route_runtime), recover its Task ID + close-state from ONE bounded
+`_RECONCILE_FRESH_WINDOW_S` (7200s post the T2 split — it mirrors
+`BG_BACKGROUND_TTL_SECONDS`, the `is_background` TTL the reconciler's launched
+Workflow/Agent keys age by, WITHOUT importing route_runtime), recover its Task
+ID + close-state from ONE bounded
 parent-JSONL scan (`_scan_workflow_launches_and_closes` — the
 `_auq_tool_result_present` byte-prefilter pattern, matching the launch's Run ID /
 Transcript-dir basename to `wf_dir.name`; fail-closed `({}, set())` on any read

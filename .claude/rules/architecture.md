@@ -165,9 +165,16 @@ Additional modules:
                                 pane-false-idle resurrection unqualified; idle
                                 key SET strictly ts-qualified vs
                                 last_assistant_turn_ended_at, fail-closed),
-                                mark_background_agent_launched (agentId: line
-                                in the async-launch tool_result ⇒
-                                is_background, never pruned),
+                                mark_background_agent_launched (⇒
+                                is_background, never pruned; fed by THREE
+                                structured launch sources — Agent agentId,
+                                Workflow wf-task:<taskId>, and the T1.2 bare
+                                background Bash backgroundTaskId
+                                [response_builder.background_bash_task_id_from_meta,
+                                keyed on backgroundTaskId PRESENCE — the three
+                                async-launch meta shapes are disjoint]; the bash
+                                key is BARE so it == its <task-notification>
+                                close key, no bracket),
                                 seed_idle_and_mark_background_agent_launched
                                 (PR-1 Half B: the launched mark but SEEDS an
                                 IDLE_CLEARED+seen _RouteState if the route is
@@ -177,20 +184,31 @@ Additional modules:
                                 otherwise-stateless post-kickstart parent; a
                                 no-op seed on an already-seeded route),
                                 mark_background_agent_done (tombstones).
-                                Clears: done / BG_AGENT_TTL_SECONDS 30-min
-                                wall-clock heartbeat TTL (_wall_now(),
-                                expire-before-classify) / provenance-only
-                                foreground prune at end-of-turn / teardown.
+                                Clears: done / a PER-KEY wall-clock heartbeat
+                                TTL (_wall_now(), expire-before-classify) —
+                                T2 split: foreground-presumed keys age by
+                                BG_AGENT_TTL_SECONDS (30 min), launched /
+                                post-turn background keys by
+                                BG_BACKGROUND_TTL_SECONDS (2 h), via
+                                _bg_ttl_for(rec) at BOTH TTL seams /
+                                provenance-only foreground prune at
+                                end-of-turn / teardown.
                                 mark_notification_pending commits on
                                 stored-idle + live bg key (🔔 outranks the
                                 lift). Task-notification user events
                                 (is_task_notification, adapter-stamped)
                                 preserve tombstones/pane-bit/stash, clear the
                                 notification bit ts-qualified, and re-derive
-                                with preserved gates. mark_subagent_activity
-                                is RETIRED into the keyed mark. In-memory;
-                                restart ⇒ stamp-None fail-closed (no lift
-                                until fresh parent activity).
+                                with preserved gates — and (T1.3) PRESERVE the
+                                stored idle on a no-gates stored-idle route
+                                instead of forcing RUNNING, so a completing
+                                background bash/agent's later done tombstone
+                                drops typing cleanly at close instead of
+                                stranding it. mark_subagent_activity is RETIRED
+                                into the keyed mark. In-memory; restart ⇒
+                                stamp-None fail-closed (no lift until fresh
+                                parent activity; bash is NOT restart-relit — no
+                                sidechain to stat).
   transcript_event_adapter.py ─ Translates session_monitor.TranscriptEvent →
                                 route_runtime.TranscriptLifecycleEvent and fans out
                                 per-route. 150-250 LoC budget (kill signal at 250 —
