@@ -58,7 +58,14 @@ from ..terminal_parser import (
 )
 from ..transcript_parser import read_latest_usage
 from ..tmux_manager import TmuxWindow, tmux_manager
-from . import attention, auq_source, notify_source, pane_signals, pick_token
+from . import (
+    attention,
+    auq_source,
+    decision_token,
+    notify_source,
+    pane_signals,
+    pick_token,
+)
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -555,6 +562,14 @@ def _on_interactive_clear(
     # CLEARED interactive-owner window. Drop the EPM emission anchor so the NEXT
     # EPM in the topic anchors to its own instant (not this resolved one).
     _epm_surface_first_seen_at.pop((user_id, thread_id_or_0, window_id), None)
+    # Stage B2.3 §5b(b): drop the published-UI hash too, so a fast byte-identical
+    # re-raise (a Decision B appearing right after a CONFIRMED dispatch of A tore
+    # the surface down here) re-renders a FRESH card with fresh tokens + a fresh
+    # nav generation instead of the poller's same-hash branch preserving nothing.
+    # Neither the pane bit nor ``_prev_run_state`` is touched (that would mask the
+    # post-clear repaint); the update-loop clear paths already drop this hash, so
+    # this is redundant-but-safe for AUQ/EPM and load-bearing only for Decision.
+    _last_published_ui_hash.pop((user_id, thread_id_or_0, window_id), None)
 
 
 register_clear_callback(_on_interactive_clear)
@@ -910,6 +925,19 @@ async def update_status_message(
                     window_id,
                     min_remaining_s=_DEADLINE_REFRESH_MARGIN_S,
                 )
+                # Stage B2.3 (§8 long-lived cards): the D3-β analogue for a licensed
+                # Decision card — re-stamp its ``dcp:`` token deadlines so a
+                # long-open (``/update`` AFK) card never finds a TTL-pruned token
+                # under it. A no-op for non-Decision surfaces (no decision tokens
+                # on the route). The §2b tap gate still re-runs fresh, so a
+                # mid-card CC upgrade degrades honestly.
+                if ui_content.name == "Decision":
+                    await decision_token.refresh_route_deadlines(
+                        user_id,
+                        thread_id,
+                        window_id,
+                        min_remaining_s=_DEADLINE_REFRESH_MARGIN_S,
+                    )
                 return
             # New UI content. Store the new hash BEFORE the await so a
             # concurrent tick on the same route doesn't fire a duplicate

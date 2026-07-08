@@ -133,6 +133,15 @@ _generation_counter: int = _INITIAL_GENERATION
 # Injection seam for tests (mirrors pick_token / auq_ledger).
 _now: Callable[[], float] = time.monotonic
 
+# §7 dispatch flag (``CC_TELEGRAM_DECISION_DISPATCH``). A MODULE-LOCAL bool so
+# this leaf never imports ``config`` (which raises without a bot token — the
+# same reason the two ``terminal_parser`` parser flags are local). ``config``
+# owns the canonical env declaration; ``main._run_bot`` SEEDS this from it at
+# startup (the import-order-race dodge). Checked at BOTH the render mint site and
+# the ``dcp:`` callback entry so a flag-OFF deploy is provably inert (the render
+# never mints buttons, the callback declines). Reset by ``reset_for_tests``.
+_DISPATCH_ENABLED: bool = False
+
 # Serialises token-store mutations so ``consume`` reserves EXCLUSIVELY (the
 # critical section never awaits, so concurrent consumes have exactly one winner).
 _store_lock = asyncio.Lock()
@@ -420,15 +429,30 @@ def lookup(family: str, version: str) -> bool:
     return version in _DECISION_DISPATCH_TABLE.get(family, frozenset())
 
 
+def set_decision_dispatch_enabled(enabled: bool) -> None:
+    """Seed the §7 dispatch flag from config (``main._run_bot`` at startup).
+
+    A module-local write so this leaf stays config-free. The render mint site and
+    the ``dcp:`` callback entry consult ``decision_dispatch_enabled()``."""
+    global _DISPATCH_ENABLED
+    _DISPATCH_ENABLED = enabled
+
+
+def decision_dispatch_enabled() -> bool:
+    """True iff the §7 tappable-Decision-dispatch flag is ON (default OFF)."""
+    return _DISPATCH_ENABLED
+
+
 def reset_for_tests(*, now: Callable[[], float] | None = None) -> None:
     """Clear all in-memory state; optionally inject a monotonic clock.
 
-    Resets tokens, rows, the nav-generation registry, and the module-global
+    Resets tokens, rows, the nav-generation registry, the module-global
     generation counter (so a test that minted into a tombstone cannot leak a
-    generation into the next test)."""
-    global _generation_counter, _now
+    generation into the next test), AND the §7 dispatch flag back to OFF."""
+    global _generation_counter, _now, _DISPATCH_ENABLED
     _tokens.clear()
     _rows.clear()
     _nav_generations.clear()
     _generation_counter = _INITIAL_GENERATION
     _now = now if now is not None else time.monotonic
+    _DISPATCH_ENABLED = False

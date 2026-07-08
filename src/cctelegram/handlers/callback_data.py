@@ -55,6 +55,15 @@ CB_ASK_TOGGLE = "aqt:"  # aqt:<route_hash>:<fp8>:<opt>:<token>
 # the choice as a NORMAL user text message (never a picker keystroke). One
 # token per CARD, resolved via the in-memory handlers/late_answer registry.
 CB_ASK_LATE = "aql:"  # aql:<window_id>:<opt>:<token>
+# Stage B2 tappable Decision dispatch. A licensed generic ``Decision`` card
+# (folder-trust family et al.) mints one-tap option buttons on a PARALLEL,
+# Decision-specific lane (never the AUQ ``aqp:`` source/form machinery). The
+# leading ``(route_hash, fp8, opt)`` triplet feeds the shared
+# ``auq_action_ledger.jsonl`` (the ``fp8`` derives from the body-inclusive
+# ``decision_prompt_fingerprint`` with a ``decision:`` domain prefix → no
+# cross-lane collision). Resolved server-side via the in-memory
+# handlers/decision_token store; dispatch navigates→verifies→Enter the live pane.
+CB_DECISION_PICK = "dcp:"  # dcp:<route_hash>:<fp8>:<opt>:<token>
 
 # Session picker (resume existing session)
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>

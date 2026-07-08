@@ -26,6 +26,7 @@ from cctelegram.handlers.callback_data import (
     CB_ASK_TAB,
     CB_ASK_TOGGLE,
     CB_ASK_UP,
+    CB_DECISION_PICK,
     CB_DIR_BIND_EXISTING,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
@@ -259,6 +260,14 @@ CALLBACK_REGISTRY: tuple[CallbackRegistryEntry, ...] = (
         "cctelegram.callback_dispatcher.late_answer",
         "tests/scenarios/test_auq_late_answer.py",
         "execute_late_answer_callback",
+    ),
+    CallbackRegistryEntry(
+        CB_DECISION_PICK,
+        "DecisionPickCommand",
+        "cctelegram.handlers.interactive_ui",
+        "cctelegram.callback_dispatcher.interactive",
+        "tests/scenarios/test_decision_dispatch.py",
+        "execute_interactive_callback",
     ),
     CallbackRegistryEntry(
         CB_SESSION_SELECT,
