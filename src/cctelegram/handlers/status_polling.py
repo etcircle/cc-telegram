@@ -112,6 +112,24 @@ WATCHDOG_INTERVAL = 10.0
 # so cadence stays tight regardless of binding count.
 TYPING_ACTION_INTERVAL = 3.0
 
+# Fix A (2026-07-08): the Notification-hook ``kind`` (== CC's ``notification_type``,
+# stored VERBATIM by hook.py) that means "the turn ended and Claude is at the
+# input box" — the ~60s post-turn idle nudge (CC 2.1.204: exactly two observed
+# kinds, ``idle_prompt`` and ``permission_prompt``). It is DROPPED at the
+# notification trust boundary: the transcript end-of-turn already renders that
+# state, and the notification bit exists only for approval gates. Everything
+# else fails open (commits as today).
+_NOTIFY_IDLE_PROMPT_KIND = "idle_prompt"
+
+# Fix B (2026-07-08): a small floor on the elapsed-compensated post-tick sleep so
+# a chronically over-interval typing tick never hot-loops (Hermes r1 P3).
+TYPING_TICK_FLOOR_S = 0.1
+# Rate-limit window for the over-interval WARNING (the future-regression
+# observability hook — never floods the log on a persistently slow sweep).
+_TYPING_OVERRUN_WARN_INTERVAL_S = 60.0
+# Monotonic wall of the last over-interval WARNING (0.0 = never warned).
+_last_typing_overrun_warn_at: float = 0.0
+
 # Per-route last-capture timestamp, keyed by ``(user_id, thread_id_or_0,
 # window_id)``. Drives the WATCHDOG_INTERVAL gate in ``update_status_message``
 # — entries are written each time we successfully scrape a pane and read each
@@ -439,15 +457,38 @@ async def _consume_notification_signal(
     if rec is None:
         await _reconcile_decision_card(bot, user_id, thread_id, route)
         return
-    if snap.notification_pending and snap.notification_generation == rec.generation:
-        await _reconcile_decision_card(bot, user_id, thread_id, route)
-        return  # already reflected — nothing to do this tick
     if now - rec.ts > route_runtime.NOTIFY_TTL_SECONDS:
         # Expired on disk (e.g. written while the bot was down) — treated
         # absent; unlink so it doesn't re-surface every tick.
         notify_source.unlink_if_generation_matches(rec.session_id, rec.generation)
         await _reconcile_decision_card(bot, user_id, thread_id, route)
         return
+    if rec.kind == _NOTIFY_IDLE_PROMPT_KIND:
+        # Fix A (2026-07-08): DROP the ~60s ``idle_prompt`` nudge. CC 2.1.204
+        # fires a matcher-less Notification ("Claude is waiting for your input")
+        # ~60s after EVERY turn end; on a stored-idle route with live background
+        # keys the §3.6 commit turned it into a false "🔔 Waiting on you" +
+        # typing-dark + a spurious decision card (Defect A). ``idle_prompt``
+        # means "the turn ended and Claude is at the input box" — the transcript
+        # end-of-turn already renders exactly that; the notification BIT exists
+        # for APPROVAL gates (Wave B intent). Generation-guarded unlink (as the
+        # stale/on-disk-TTL paths), INFO log, NO ``mark_notification_pending``,
+        # NO card. Placed AFTER the on-disk TTL and BEFORE the same-generation
+        # reflected early-return (Hermes r1 P2) so a reflected same-generation
+        # idle record cannot bypass the drop. Everything ELSE
+        # (``permission_prompt``, empty, any FUTURE unknown kind) FAILS OPEN to
+        # today's commit-or-stale path below — only the provably-idle kind drops.
+        logger.info(
+            "notification_pending SKIPPED kind=idle_prompt route=%s generation=%s",
+            route,
+            rec.generation,
+        )
+        notify_source.unlink_if_generation_matches(rec.session_id, rec.generation)
+        await _reconcile_decision_card(bot, user_id, thread_id, route)
+        return
+    if snap.notification_pending and snap.notification_generation == rec.generation:
+        await _reconcile_decision_card(bot, user_id, thread_id, route)
+        return  # already reflected — nothing to do this tick
     result = await route_runtime.mark_notification_pending(
         route, set_at=rec.ts, generation=rec.generation
     )
@@ -1458,35 +1499,87 @@ async def _poll_one_binding(bot: Bot, user_id: int, thread_id: int, wid: str) ->
         )
 
 
+async def _typing_action_tick(bot: Bot) -> None:
+    """One typing-action sweep: fan out a concurrent typing send to every
+    typing-eligible route (Fix B — extracted for direct-drive tests; the loop
+    wrapper stays trivial).
+
+    Reads ``route_runtime.snapshot(route).typing_eligible`` directly (no tmux
+    I/O). The sends are gathered CONCURRENTLY (``return_exceptions=True``), so
+    one route's failure never aborts the others and the sweep's wall time is
+    ~max-latency, not the sum — the property the true-cadence loop depends on."""
+    bindings = list(session_manager.iter_thread_bindings())
+    sends: list = []
+    for user_id, thread_id, wid in bindings:
+        route = (user_id, thread_id or 0, wid)
+        # ``typing_eligible`` already covers the RUNNING / RUNNING_TOOL
+        # discrimination (incl. the background-agent projection lift).
+        if not route_runtime.snapshot(route).typing_eligible:
+            continue
+        sends.append(_send_typing_action(bot, user_id, thread_id, wid))
+    if sends:
+        await asyncio.gather(*sends, return_exceptions=True)
+
+
+def _typing_sleep_delay(elapsed: float) -> float:
+    """Elapsed-compensated post-tick sleep (Fix B): keep start-to-start cadence
+    at ``TYPING_ACTION_INTERVAL`` instead of ``elapsed + INTERVAL``. Floored at
+    ``TYPING_TICK_FLOOR_S`` so a chronically over-interval tick never hot-loops
+    (Hermes r1 P3)."""
+    return max(TYPING_TICK_FLOOR_S, TYPING_ACTION_INTERVAL - elapsed)
+
+
+def _maybe_warn_typing_overrun(elapsed: float, *, now: float | None = None) -> bool:
+    """Rate-limited WARNING when a typing tick exceeds the interval (Fix B — the
+    future-regression observability hook). Returns True iff it warned. Warns at
+    most once per ``_TYPING_OVERRUN_WARN_INTERVAL_S`` so a persistently slow
+    sweep (many bindings / slow Telegram) never floods the log."""
+    global _last_typing_overrun_warn_at
+    if elapsed <= TYPING_ACTION_INTERVAL:
+        return False
+    mono = time.monotonic() if now is None else now
+    if mono - _last_typing_overrun_warn_at < _TYPING_OVERRUN_WARN_INTERVAL_S:
+        return False
+    _last_typing_overrun_warn_at = mono
+    logger.warning(
+        "typing-action tick exceeded the interval: elapsed=%.2fs > interval=%.2fs "
+        "— the typing cadence may lag Telegram's ~5s TTL (binding count / send "
+        "latency growing?)",
+        elapsed,
+        TYPING_ACTION_INTERVAL,
+    )
+    return True
+
+
 async def typing_action_loop(bot: Bot) -> None:
     """Re-emit Telegram's native typing indicator for every actively-running
-    route on a fixed cadence, independent of pane polling.
+    route on a TRUE ``TYPING_ACTION_INTERVAL`` start-to-start cadence,
+    independent of pane polling.
 
     Reads ``route_runtime.snapshot(route).typing_eligible`` directly: no tmux
-    subprocess fan-out, no per-binding capture_pane. With ~14 bindings the
-    status poller's full cycle empirically lands at 6-8s on macOS, longer than
-    Telegram's ~5s typing-action TTL, so the indicator was flashing rather
-    than holding steady. This loop fires every ``TYPING_ACTION_INTERVAL``
-    seconds so the cadence stays well under the TTL regardless of binding
-    count. ``update_status_message`` never fires the typing indicator itself.
-    """
+    subprocess fan-out, no per-binding capture_pane. Telegram drops the native
+    typing indicator after ~5s, so the sweep must re-emit faster than that.
+
+    True-cadence contract (Fix B, 2026-07-08): the per-tick sends already fan
+    out CONCURRENTLY (``_typing_action_tick`` → ``asyncio.gather``), but the old
+    loop slept a FULL interval AFTER the tick, so start-to-start cadence was
+    ``tick-elapsed + INTERVAL`` (measured 6-12s live → the indicator blinked).
+    The loop now MEASURES each tick and sleeps ``max(TYPING_TICK_FLOOR_S,
+    INTERVAL - elapsed)`` (``_typing_sleep_delay``), so the cadence holds at
+    ``INTERVAL`` regardless of sweep cost; a tick that overruns the interval
+    triggers a rate-limited WARNING (``_maybe_warn_typing_overrun``) and falls
+    to the floor sleep. ``update_status_message`` never fires the typing
+    indicator itself."""
     logger.info("Typing-action loop started (interval: %ss)", TYPING_ACTION_INTERVAL)
     while True:
+        start = time.monotonic()
         try:
-            bindings = list(session_manager.iter_thread_bindings())
-            sends: list = []
-            for user_id, thread_id, wid in bindings:
-                route = (user_id, thread_id or 0, wid)
-                # ``typing_eligible`` already covers the
-                # RUNNING / RUNNING_TOOL discrimination.
-                if not route_runtime.snapshot(route).typing_eligible:
-                    continue
-                sends.append(_send_typing_action(bot, user_id, thread_id, wid))
-            if sends:
-                await asyncio.gather(*sends, return_exceptions=True)
+            await _typing_action_tick(bot)
         except Exception as e:
             logger.error("Typing-action loop error: %s", e)
-        await asyncio.sleep(TYPING_ACTION_INTERVAL)
+        elapsed = time.monotonic() - start
+        _maybe_warn_typing_overrun(elapsed)
+        await asyncio.sleep(_typing_sleep_delay(elapsed))
 
 
 async def _send_typing_action(bot: Bot, user_id: int, thread_id: int, wid: str) -> None:
