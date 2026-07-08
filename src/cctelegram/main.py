@@ -86,6 +86,16 @@ def _run_bot() -> None:
         "Generic decision cards: %s",
         "ON" if config.decision_cards_enabled else "OFF",
     )
+    # Stage B2: seed the tappable-Decision-dispatch flag onto the decision_token
+    # leaf (a pure stdlib store that must not import config). Same import-order
+    # dodge as the parser flags above; config is the env authority.
+    from .handlers import decision_token
+
+    decision_token.set_decision_dispatch_enabled(config.decision_dispatch_enabled)
+    logger.info(
+        "Tappable Decision dispatch: %s",
+        "ON" if config.decision_dispatch_enabled else "OFF",
+    )
 
     session = tmux_manager.get_or_create_session()
     logger.info("Tmux session '%s' ready", session.session_name)
