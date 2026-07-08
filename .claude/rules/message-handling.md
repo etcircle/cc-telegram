@@ -241,9 +241,40 @@ projection (rule 3, live bg key) lifts the next freeze to RUNNING → typing on.
 agent resumed) exactly like `PANE_RUNNING`. **Accepted residual (safety-bounded):
 a 🔔 on a route with >1 live background agent (multiple plain Agents, or any
 Workflow) is held to the 30-min TTL** — the runtime can't bind the route-level
-🔔 to a specific agent (no per-agent linkage; the `kind` field is unreliable), so
-it conservatively never auto-clears when the live set is ambiguous (the prompt
-stays discoverable on the pane). Pull-only; no observer (c313657 stays
+🔔 to a specific agent (no per-agent linkage; the `kind` field does not carry an
+agent id — a per-agent-binding limitation, NOT the type-space concern the Fix A
+kind-gate below characterizes), so it conservatively never auto-clears when the
+live set is ambiguous (the prompt stays discoverable on the pane). Pull-only; no
+observer (c313657 stays forbidden).
+
+**Fix A — the `idle_prompt` kind-gate at the notification trust boundary
+(2026-07-08).** CC 2.1.204 fires a matcher-less `Notification` ~60s after EVERY
+turn end (`notification_type: "idle_prompt"`, "Claude is waiting for your
+input"). On a stored-idle route with live background keys the §3.6 commit turned
+that nudge into a false "🔔 Waiting on you" + typing-dark + a spurious decision
+card (the multi-leg orchestration failure). **2.1.204 characterization (rig,
+supersedes the Fix-#1-era "kind field is unreliable" caveat for the type-space):
+exactly TWO observed `notification_type` values — `idle_prompt` (the 60s idle
+nudge) and `permission_prompt` (approval gates, tool-agnostic across
+Bash/Write) — and `hook.py` stores it VERBATIM as the side-file `kind` (Wave B
+schema; no hook change).** The gate lives at the POLLER consume seam
+(`status_polling._consume_notification_signal`; `route_runtime` stays
+kind-agnostic): a record with `kind == "idle_prompt"` is DROPPED —
+generation-guarded unlink (as the stale/on-disk-TTL paths), INFO log, NO
+`mark_notification_pending`, NO card. **Exact consume order (Hermes r1 P2):**
+rec-None → runtime-TTL → on-disk-TTL unlink/return → **the idle_prompt drop** →
+the same-generation reflected early-return → `mark_notification_pending`; the
+drop sits BEFORE the same-gen return so a reflected same-generation idle record
+cannot bypass it. **Fail-open for everything else:** `permission_prompt`, empty
+`""`, and any FUTURE unknown kind keep today's full commit-or-stale path (the rig
+could not exhaustively enumerate CC's type space; unknown-kind-commits preserves
+approval-gate safety). Rationale: `idle_prompt` means "the turn ended and Claude
+is at the input box" — the transcript end-of-turn already renders exactly that;
+the notification BIT exists only for approval gates (Wave B design intent).
+Disclosed residual: the reverse overwrite (an idle_prompt burying an unconsumed
+permission_prompt in the latest-event-wins side file) would drop a real 🔔,
+bounded to <1 poll tick and implausible ordering; the pane/TTL paths and the
+pane-discoverable prompt remain. Pull-only; no observer (c313657 stays
 forbidden).
 
 **Notification clear-reason channel + durable decision card (ISSUE-5 Fix
@@ -374,6 +405,71 @@ startup reconciler there is no sidechain file to stat, so after a restart a
 still-running background bash stays typing-dark until fresh parent activity —
 the recorded GH #44 degradation shape, and the T2 window widening does NOT
 change it. Pull-only throughout (no observer; c313657 stays forbidden).
+
+**Fix C (2026-07-08) — resume as the FOURTH launch source (relight a nudged
+agent).** A `SendMessage` to an already-EXISTING background agent (the standing
+multi-leg "nudge" pattern) resumes it, but its prior stop tombstoned the key AND
+tombstones reset only on a GENUINE user turn (the machine-initiated parent wake
+preserves them), so neither the launched key nor the sidechain-activity fallback
+fired and the resumed agent ran fully dark. The FOURTH launch source closes it,
+sharing the GH #44 `background_agents` machinery. **Discriminator
+(structured-ONLY):** `response_builder.resumed_agent_id_from_meta(meta)` reads
+the resume tool_result's entry-level `toolUseResult` (`{success, message,
+resumedAgentId}`, verified real JSONL 2.1.204) — keyed on non-empty-str
+`resumedAgentId` PRESENCE only, FOUR-WAY DISJOINT with the Agent/Workflow/Bash
+meta shapes. The monitor's SendMessage-scoped tool_result branch records the id
+into `ParentSidechainActivity.resumed`, a MAP `key -> resume_ts` (NEVER a bare
+set — Hermes r3; the value is the resume tool_result's EVENT timestamp, never
+wall time / a tick max). **`mark_background_agent_resumed(route, key,
+resume_ts)`** (+ the seed-idle twin for an unseeded post-restart parent) POPS the
+per-key done tombstone — the SECOND, KEYED exception to "tombstones reset only on
+a genuine user turn" (a structured resume is positive per-key proof of new work
+for exactly that agent; all OTHER keys' tombstones untouched) — then applies
+`mark_background_agent_launched` semantics (`is_background=True`, survives the
+EOT prune, 2 h TTL) and stamps `resumed_event_ts` on the record (max-monotonic
+preferring parseable; an unparseable later ts never erases an older parseable
+one). **The cross-file resume-vs-done resolution (Codex r3 cross-batch fold):** a
+resume and a done for the same key can occur in EITHER order, and "done" has TWO
+sources with DIFFERENT ordering guarantees, so `mark_background_agent_done`
+carries a `BgDoneSource`: a **PARENT** `<task-notification>` done (same file as
+the resume — the monitor already net-resolves a same-batch resume/done pair by
+transcript order, dropping the loser from `.resumed`/`.completed`) tombstones
+UNCONDITIONALLY; a **SIDECHAIN** end-of-turn done (a DIFFERENT file, no shared
+order) is timestamp-gated on the RECORD's `resumed_event_ts` — it keeps the key
+LIVE iff the record has a `resumed_event_ts` AND the end_turn ts (`SidechainTick.
+max_end_turn_ts`, the max PARSEABLE end-turn ts, kept STRICTLY separate from
+`max_event_ts` activity) is NOT strictly newer (a stale prior-leg end_turn, this
+batch or ANY later one, ≤ resume → LIVE); it tombstones on a strictly-newer
+end_turn (genuine fast-finish), on a MISSING record / no `resumed_event_ts`
+(plain-launch, byte-identical to today), or on any unparseable end_turn ts
+(`SidechainTick.end_turn_ts_unparseable`, fail-closed to DONE — false dark is
+annoying, false typing after completion is the historical bug class here). The
+bot fan-out applies launched → **resumed(map)** → activity → done (sidechain,
+then parent) so a same-tick resume is never blocked by the tombstone its own
+batch is popping. Close parity holds with ZERO new close code: the resumed
+agent's next stop emits a `<task-notification>` whose task-id == agentId == the
+key → the existing parent done re-tombstones; multi-leg agents cycle
+launch→done→resume→done… correctly. TTL edge (must-have 5): resume → record
+TTL-expires → a stale sidechain done tombstones (accepted — the runtime already
+judged the agent too silent) → a LATER resume pops the tombstone and relights
+(expiry never permanently poisons future legs). Workflow resumes are out of
+scope (one-shot). Restart: a mid-leg resumed agent is not restart-relit beyond
+the existing Fix-#5 reconciler's original-launch scan. Pull-only; no observer
+(c313657 stays forbidden).
+
+**Fix B (2026-07-08) — true typing cadence.** `status_polling.typing_action_loop`
+already fans out its per-route typing sends CONCURRENTLY (`_typing_action_tick` →
+`asyncio.gather(return_exceptions=True)`), but the old loop slept a FULL
+`TYPING_ACTION_INTERVAL` (3.0s) AFTER the tick, so start-to-start cadence was
+`tick-elapsed + INTERVAL` (measured 6-12s live vs Telegram's ~5s typing TTL → the
+indicator blinked). The loop now MEASURES each tick and sleeps
+`max(TYPING_TICK_FLOOR_S, INTERVAL - elapsed)` (`_typing_sleep_delay`; the 0.1s
+floor keeps a chronically over-interval tick from hot-looping — Hermes r1 P3), so
+the cadence holds at `INTERVAL` regardless of sweep cost; a tick that overruns the
+interval triggers a rate-limited WARNING (`_maybe_warn_typing_overrun`, once per
+60s — the future-regression observability hook). The per-iteration body is
+extracted (`_typing_action_tick`) for direct-drive tests; the concurrency is a
+PRESERVATION pin. Send-layer only; no run-state / route_runtime interaction.
 
 **Workflow-tool bracket (ISSUE-6 — extends GH #44 to the `Workflow` tool).**
 GH #44 only detected the `Agent` tool's `run_in_background` (`agentId:` launch +
