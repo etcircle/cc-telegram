@@ -59,8 +59,11 @@ def _parse_event_timestamp(raw: str | None) -> float | None:
 def _is_task_notification_user_event(event: TranscriptEvent) -> bool:
     """GH #44 §3.7: stamp machine-initiated ``<task-notification>`` user
     events so ``route_runtime`` can suppress the genuine-user-turn side
-    effects. Deferred import: the predicate lives in
-    ``handlers.response_builder`` (the single envelope-regex owner)."""
+    effects. Deferred import: the envelope predicate lives in ``utils`` (the
+    single envelope-regex owner since Codex r2 P1), re-exported by
+    ``handlers.response_builder`` as the SAME object ``transcript_parser``
+    synthesizes the CC 2.1.198 queue-shaped close with — so this stamp and
+    that synthesis can never fork."""
     if event.role != "user" or event.block_type != "text":
         return False
     from .handlers.response_builder import is_task_notification

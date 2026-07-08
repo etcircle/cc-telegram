@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .config import config
+from .utils import is_task_notification
 
 logger = logging.getLogger(__name__)
 
@@ -576,6 +577,37 @@ class TranscriptParser:
                 seen_user_prompt = False
                 assistant_emitted_after_prompt = False
                 continue
+            # CC 2.1.198 queue-shaped ``<task-notification>`` close. When a
+            # background task completes while the PARENT is BUSY, CC writes the
+            # close as a ``queue-operation`` / ``enqueue`` entry (payload in
+            # top-level ``content``) — never a ``type:"user"`` entry — so the
+            # hard type gate below drops it and the GH #44 ``background_agents``
+            # key never tombstones (typing strands to the 2 h TTL). Synthesize a
+            # lifecycle-only user-text entry so the extraction / lifecycle lanes
+            # see the close EXACTLY like the parent-idle user-entry shape; it is
+            # skipped in the display fan-out (``lifecycle_only``), matching
+            # today's "nothing visible" for this line. The predicate IS the
+            # adapter's stamp predicate (``utils.is_task_notification``, the SAME
+            # object): a malformed / truncated / suffixed envelope the stamp
+            # would reject synthesizes NOTHING, so a synthesized entry can never
+            # take route_runtime's genuine-user branch (which unconditionally
+            # POPS done tombstones — strictly worse than the missed close).
+            # Empty-turn tracking is deliberately untouched: a queued completion
+            # is not a model wake.
+            if msg_type == "queue-operation" and data.get("operation") == "enqueue":
+                q_content = data.get("content")
+                if isinstance(q_content, str) and is_task_notification(q_content):
+                    result.append(
+                        ParsedEntry(
+                            role="user",
+                            text=q_content,
+                            content_type="text",
+                            timestamp=cls.get_timestamp(data),
+                            uuid=None,
+                            lifecycle_only=True,
+                        )
+                    )
+                    continue
             if msg_type not in ("user", "assistant"):
                 continue
 
