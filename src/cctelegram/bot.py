@@ -43,7 +43,6 @@ from telegram import (
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, Conflict, Forbidden, NetworkError
 from telegram.ext import (
-    AIORateLimiter,
     Application,
     CallbackQueryHandler,
     CommandHandler,
@@ -53,6 +52,7 @@ from telegram.ext import (
 )
 
 from .config import config
+from .rate_limiter import TypingAwareRateLimiter
 from .callback_dispatcher import DispatcherAdapters, dispatch_callback
 from .callback_dispatcher.effort import build_effort_keyboard as _build_effort_keyboard
 from .callback_dispatcher.interactive import _lock_busy
@@ -1672,7 +1672,7 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        .rate_limiter(AIORateLimiter(max_retries=5))
+        .rate_limiter(TypingAwareRateLimiter(max_retries=5))
         .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
