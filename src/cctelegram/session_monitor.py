@@ -2162,7 +2162,7 @@ class SessionMonitor:
             from .session import session_manager
             from .handlers.interactive_ui import forget_ask_tool_input
             from . import route_runtime
-            from .handlers import pane_signals
+            from .handlers import decision_token, pane_signals
 
             for user_id, thread_id, wid in session_manager.iter_thread_bindings():
                 if wid in changed_window_ids:
@@ -2170,6 +2170,11 @@ class SessionMonitor:
                         (user_id, thread_id or 0, wid)
                     )
                     pane_signals.clear_route((user_id, thread_id or 0, wid))
+                    # B2.3 review fold P2-A: the /clear-rotated window keeps
+                    # its id — drop its Decision tokens + nav generation so a
+                    # stale dcp: tap can't dispatch into the NEW session's
+                    # same-fingerprint re-raised prompt within the token TTL.
+                    decision_token.teardown_route(user_id, thread_id, wid)
                     logger.info(
                         "Reset route_runtime route after session change: "
                         "user=%d thread=%s window=%s",

@@ -987,6 +987,122 @@ escape if a future variant defeats the auto-dispatch. **Scoped to single-select
 bare digit — a filed fast-follow (AUQ is NOT globally fixed).** Validated against
 Claude Code v2.1.168 terminal behavior.
 
+## Tappable Decision dispatch (`dcp:` lane — Stage B2.3, flag `CC_TELEGRAM_DECISION_DISPATCH`)
+
+A PARALLEL, Decision-specific dispatch lane that gives the B1 `Decision` cards
+verified one-tap option buttons. It reuses the AUQ dispatch DISCIPLINE — per-window
+send lock + `_lock_busy` reject-if-held, monotonic arrow nav,
+settle→re-parse→verify, `Enter` as the ONLY commit key, fail-closed advance
+classification, `auq_action_ledger.jsonl` idempotency — but NEVER the AUQ
+`resolve_auq_source` / `resolve_ask_form` machinery (a Decision pane returns None
+there — the P1-C dead-tap). Default OFF; a flag-OFF deploy mints no buttons and the
+`dcp:` callback declines ("Dispatch disabled — use the nav keys."). Requires
+`CC_TELEGRAM_DECISION_CARDS` ON to matter.
+
+**Render mint** (`interactive_ui._build_decision_pick_rows`, in the
+`content.name == "Decision"` gate branch): mints `dcp:<route_hash>:<fp8>:<opt>:<token>`
+buttons ONLY when the flag is ON, the strict `parse_generic_decision` form matches a
+`decision_token.identify_family` (which requires a non-None title — the §5a mint
+gate), `decision_token.lookup(family, w.pane_current_command)` licenses the family ×
+the CACHED CC-version, and the geometry is a clean single-select numbered picker
+(exactly one `❯`, no checkbox markers, contiguous 1..N); else display-only,
+byte-identical to B1. `fp8` = `terminal_parser.decision_prompt_fingerprint[:8]` — a
+body-inclusive canonical with a `decision:` DOMAIN PREFIX, so the shared ledger key
+can NEVER collide with the AUQ lane's bare-`_canonical_repr` fp8 (§8). The row is
+minted through `decision_token.mint_row` (§3(3) sibling-burn: a winning consume
+tombstones the whole route row).
+
+**Dispatch transaction** (`callback_dispatcher/interactive._dispatch_decision` →
+`_dispatch_decision_pane_locked`): tap → dispatch-flag check → ledger lookup FIRST
+(the AUQ collision matrix copied: owner-mismatch → live-token-peek collision test →
+else `WRONG_USER_PICK_TEXT`; per-state matrix — `dispatched` "already received" /
+`accepted` "in progress" / `unknown`+`commit_unconfirmed` refresh-only /
+`not_advanced` falls through) → token peek → owner → stale-window lease → consume by
+exclusive reservation → `accepted` ledger claim → under `window_send_lock` (reject
+if held): (a) extractor parity (`extract_interactive_content(pane).name ==
+"Decision"` — a Settings/AUQ pane that merely decision-parses bails, the named
+`settings_warning_v2170.txt` decline) → (b) `decision_prompt_fingerprint` identity +
+geometry/family gates → (c) the **FRESH** `pane_current_command` version-license
+re-read (`pane_command_is_claude` + `lookup`, INSIDE the lock, immediately before the
+first key — a /update-swapped TUI inside the 1s list-cache TTL can never be
+arrow-keyed; the AUQ round-2 P1-1 fix) → (d) nav→settle→verify with a MOTION proof
+(delta≠0: cursor moved to target AND ≠ pre-nav; delta==0: the WIGGLE — one arrow away
+then back, requiring the `❯` to move — a quoted block can't) → (e) loose landing-label
+match → (f) `Enter` → `_classify_decision_advance` — **confirm-side extractor parity
+(review r1 P2-B):** the confirm runs the FULL `extract_interactive_content(pane2)`
+(the SAME first-match-wins semantics as render + pre-commit; never the bare
+`parse_generic_decision`, a WEAKER recognizer — a Settings/AUQ pane that merely
+decision-parses would fp-compare as a "different Decision" and wrongly confirm):
+extractor→Decision ⇒ fingerprint compare (`dispatched` ONLY when the committed
+fingerprint is proven GONE; a live same-fp form is the round-3 zero-absence variant →
+`commit_unconfirmed`); extractor→ANOTHER named UI or None ⇒ `dispatched` only when NO
+decision footer/marker line remains (a still-present footer under a named UI /
+unparseable frame is AMBIGUOUS → `commit_unconfirmed`, never dispatched — pinned by
+`test_commit_into_named_ui_pane_records_commit_unconfirmed` on the settings_warning
+fixture). **Ledger discipline:** `accepted → dispatched` +
+`auq_ledger.release_key(key)` on the confirmed-gone proof; a **pre-commit bail**
+records `not_advanced` (Enter provably never sent → falls through / re-renders fresh
+tokens); once Enter is sent, an unconfirmed advance records `commit_unconfirmed`
+(refresh-only, UNRELEASED). A **busy send lock at dispatch downgrades the
+already-written `accepted` to `not_advanced`** (fall through, never a
+crash-ambiguous `accepted`).
+
+**§5b(b) dispatch-terminal teardown** (`interactive_ui.finalize_decision_dispatch`,
+NOT `clear_interactive_msg` — that deletes/tombstones): pops the PERSISTED
+interactive surface (a stale raw-nav tap then fails `has_interactive_surface` —
+restart-safe) + `decision_token.teardown_route`, fires the lifecycle hooks (the
+poller's `_on_interactive_clear` drops `_absent_streak` + `_last_published_ui_hash`
+→ a fast byte-identical re-raise renders FRESH), then edits the card to the inert
+"✅ … sent" final state. **Ordering (review r1 P2-C, the plan §3 text is normative):
+on `dispatched` the finalize runs FIRST, THEN the callback answer** — answering
+first left a crash/network window where the callback was acked but the persisted
+surface was not yet terminal (pinned by
+`test_dispatched_finalizes_before_callback_answer`). **§5b(c)/O-6
+generation-suffixed nav** (closes the
+pre-existing window-keyed raw-nav replay hole): every GATE card render (Decision AND
+Permission/Workflow per O-6) rotates `decision_token`'s per-window nav generation and
+suffixes its ↑/↓/⏎/Esc callbacks `aq:*:<window>:g<gen>`; non-gate (AUQ/EPM/
+RestoreCheckpoint) renders CLEAR the generation and stay un-suffixed (byte-neutral,
+the non-regressive constraint). `assert_nav_dispatchable` parses `(window_id, gen)`
+BEFORE `reject_stale_window` (guardrail 1) and validates (guardrail 2): gen present
+must equal the window's current gen; gen absent + a live gate generation → refuse (a
+pre-B2 un-suffixed gate card). **gen absent + no gate generation is AMBIGUOUS, not
+automatically legacy (review r1 P1, BOTH engines):** the registry is in-memory, so
+after EVERY restart/deploy it is empty — a gate card published pre-B2.3 (raw
+un-suffixed `aq:enter:@N` callbacks) tapped before the poller re-renders it would
+otherwise raw-dispatch into a live gate pane. No in-memory/persisted authority
+records the surface's UI KIND, so that shape is discriminated on the LIVE pane —
+reusing guard 4's EXISTING visible capture (the suffixed / gen-registered paths gain
+NO pane capture): `extract_interactive_content(visible).name in {Decision,
+Permission, Workflow}` → refuse fail-closed before any key (the poller re-renders a
+fresh suffixed card within ~1s); an AUQ/EPM/other pane proceeds down the legacy path
+unchanged (byte-neutral, pinned by the AUQ-pane companion test). The generation is
+invalidated IN-LOCK at `dispatched` (covering the lock-release→teardown gap) and
+wiped on restart → a suffixed tap fails closed ("Card refreshed — use the current
+card").
+
+**§8 restart + long-lived cards:** in-memory tokens + nav generations die; the
+ledger-first gate answers a `dispatched` duplicate; NO durable `pick_intent`-style
+recovery (Decision re-mints from the live pane trivially — the poller's Decision
+same-hash branch calls `decision_token.refresh_route_deadlines`, the D3-β analogue,
+so a long-open `/update`-AFK card's tokens never TTL-prune). **Teardown seams
+(review r1 P2-A):** `decision_token.teardown_route` is wired beside the existing
+pane_signals/route_runtime teardown calls at `clear_interactive_msg` /
+`finalize_decision_dispatch` (surface end), the **`/clear` `mark_session_reset`
+seams** (`bot.forward_command_handler`'s /clear branch AND the monitor's
+session-rotation sweep), and the `inbound_telegram` stale-window unbind
+`clear_route` sites — a /clear-rotated window keeps its id, so a same-fingerprint
+Decision (same-cwd folder-trust) re-raised by the NEW session within the 300s token
+TTL would otherwise validate a STALE `dcp:` tap end-to-end (extractor parity +
+fingerprint + license all pass); only the teardown stops it (pinned by
+`test_clear_invalidates_decision_tokens_same_fp_reraise_refuses`). **Top residual
+(disclosed):** the `decision_token._DECISION_DISPATCH_TABLE` allowlist is per
+`(family × CC-version)` — every CC upgrade empties the effective allowlist → buttons
+revert to display-only until re-characterized (honest degradation, INFO logs at mint
++ tap; never a wrong keystroke). Verify→Enter TOCTOU is disclosed + minimized (same
+class as AUQ's), bounded by the `commit_unconfirmed` fail-closed. Pull-only
+throughout; no observer (c313657 stays forbidden).
+
 ## AFK auto-resolve conversion + late answer (aql:) — Wave A
 
 On Claude Code ≥2.1.198 an unanswered AskUserQuestion **self-resolves at ~60s**

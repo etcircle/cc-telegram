@@ -145,7 +145,7 @@ from .handlers.message_sender import (
 from .handlers.response_builder import build_response_parts, is_task_notification
 from .handlers.status_polling import status_poll_loop, typing_action_loop
 from . import route_runtime, terminal_parser, transcript_event_adapter
-from .handlers import pane_signals
+from .handlers import decision_token, pane_signals
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import (
@@ -783,6 +783,13 @@ async def forward_command_handler(
             # rendering the dead session's 1M latch.
             await route_runtime.mark_session_reset(route)
             pane_signals.clear_route(route)  # GH #43: dead session's count
+            # B2.3 review fold P2-A: /clear rotates the session but the SAME
+            # window id stays bound — a same-fingerprint Decision (e.g. the
+            # folder-trust prompt for the same cwd) re-raised by the NEW
+            # session within the 300s token TTL would otherwise validate a
+            # STALE dcp: tap end-to-end (extractor parity + fingerprint +
+            # license all pass) and send real keys into the new session.
+            decision_token.teardown_route(user.id, thread_id, wid)
 
         # Interactive commands (e.g. /model) render a terminal-based UI
         # with no JSONL tool_use entry.  The status poller already detects

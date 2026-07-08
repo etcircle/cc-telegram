@@ -190,6 +190,25 @@ class Config:
             "CC_TELEGRAM_DECISION_CARDS", ""
         ).strip().lower() in ("1", "true", "yes", "on")
 
+        # Tappable Decision dispatch (Stage B2). Default OFF. When ON — AND the
+        # Decision-card detector above is ON, AND the prompt matches a known-good
+        # (family × running-CC-version) pair in the ``decision_token`` dispatch
+        # table — a licensed ``Decision`` card also mints one-tap option buttons
+        # that navigate→verify→Enter the live pane (mirroring the AUQ v2.1.168
+        # dispatch discipline through a PARALLEL, Decision-specific lane). Flag
+        # OFF (default) ⇒ the Decision card stays display-only, byte-identical to
+        # Stage B1. Independent of ``CC_TELEGRAM_DECISION_CARDS`` (which gates
+        # DETECTION) and ``CC_TELEGRAM_PERMISSION_PROMPTS``. config OWNS this
+        # canonical declaration for documentation + the README sync rule; the
+        # dispatch flag lives on the ``handlers/decision_token`` leaf (a pure
+        # stdlib store that must not import config) and is SEEDED from THIS value
+        # at startup by ``main._run_bot`` (``decision_token.
+        # set_decision_dispatch_enabled``), the same import-order-race dodge the
+        # two parser flags above use.
+        self.decision_dispatch_enabled = os.getenv(
+            "CC_TELEGRAM_DECISION_DISPATCH", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+
         # Max length of the per-tool input string surfaced in tool_use summary
         # lines (e.g. "**Bash**(<command>)", "**Read**(<path>)"). Long inputs
         # are truncated with a "…" marker. Default 40 keeps the activity feed

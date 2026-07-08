@@ -45,15 +45,25 @@ from ..terminal_parser import (
     AskUserQuestionForm,
     InteractiveUIContent,
     build_form_from_tool_input,
+    decision_prompt_fingerprint,
     extract_epm_plan_file_path,
     extract_interactive_content,
     parse_ask_user_question,
+    parse_generic_decision,
     visible_pane_liveness,
 )
 from .. import md_capture
 from ..tmux_manager import tmux_manager
 from ..utils import atomic_write_json
-from . import attention, auq_ledger, auq_source, late_answer, pick_intent, pick_token
+from . import (
+    attention,
+    auq_ledger,
+    auq_source,
+    decision_token,
+    late_answer,
+    pick_intent,
+    pick_token,
+)
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -66,6 +76,7 @@ from .callback_data import (
     CB_ASK_TAB,
     CB_ASK_TOGGLE,
     CB_ASK_UP,
+    CB_DECISION_PICK,
     checked_callback_data,
 )
 from .message_sender import (
@@ -1274,6 +1285,7 @@ async def assert_nav_dispatchable(
     *,
     tmux_mgr=None,
     is_esc: Literal[False] = False,
+    gen: int | None = None,
 ) -> TmuxWindow | None: ...
 
 
@@ -1286,6 +1298,7 @@ async def assert_nav_dispatchable(
     *,
     tmux_mgr=None,
     is_esc: Literal[True],
+    gen: int | None = None,
 ) -> TmuxWindow | Literal["__esc_clear__"] | None: ...
 
 
@@ -1297,6 +1310,7 @@ async def assert_nav_dispatchable(
     *,
     tmux_mgr=None,
     is_esc: bool = False,
+    gen: int | None = None,
 ) -> TmuxWindow | Literal["__esc_clear__"] | None:
     """Guard a nav-keystroke callback before it dispatches keys to tmux.
 
@@ -1330,6 +1344,37 @@ async def assert_nav_dispatchable(
     """
     if tmux_mgr is None:
         tmux_mgr = tmux_manager
+    # §5b(c) + O-6 nav-generation gate (round-4 guardrail 2). The presence of a
+    # window nav generation in ``decision_token`` is the "this window owns a live
+    # GATE card (Decision / Permission / Workflow)" bit — a gate render rotates it,
+    # a non-gate (AUQ / EPM / RestoreCheckpoint) render clears it, so the two
+    # surfaces never share a generation. Rules, all FAIL-CLOSED before any key:
+    #   * gen PRESENT (a suffixed gate callback): must equal the window's current
+    #     generation. A mismatch/absent current gen (an OLD card's ⏎ after a NEW
+    #     card rendered, or a bot restart that wiped the registry) → refuse.
+    #   * gen ABSENT but the window carries a live gate generation → refuse (a
+    #     pre-B2 un-suffixed gate card surviving a rollout must never raw-dispatch).
+    #   * gen ABSENT + no gate generation → AMBIGUOUS, not automatically legacy:
+    #     after a restart/deploy the registry is ALWAYS empty, so a gate card
+    #     published pre-B2.3 (old raw ``aq:enter:@N`` callbacks) tapped before
+    #     the poller re-renders it would otherwise send a RAW un-generation-
+    #     validated keystroke into a live gate pane — exactly the §5b(c) hole
+    #     (review r1 P1, BOTH engines). No in-memory/persisted authority records
+    #     the surface's UI KIND, so this shape is discriminated on the LIVE pane
+    #     below (the ``_gate_pane_recheck_needed`` flag) — reusing the existing
+    #     guard-4 visible capture, so the suffixed / gen-registered paths gain NO
+    #     pane capture.
+    cur_gen = decision_token.current_nav_generation(window_id)
+    _gate_pane_recheck_needed = False
+    if gen is not None:
+        if cur_gen is None or cur_gen != gen:
+            await safe_answer(query, "Card refreshed — use the current card")
+            return None
+    elif cur_gen is not None:
+        await safe_answer(query, "Card refreshed — use the current card")
+        return None
+    else:
+        _gate_pane_recheck_needed = True
     if not has_interactive_surface(user_id, thread_id):
         if is_esc:
             # Cleanup is idempotent and what ESC wants.
@@ -1354,6 +1399,31 @@ async def assert_nav_dispatchable(
             return NAV_ESC_CLEAR
         await safe_answer(query, "Picker closed, refreshing")
         return None
+    # §5b(c) P1 fold (review r1, BOTH engines — the un-suffixed pre-deploy gate
+    # hole): gen ABSENT + registry EMPTY is ambiguous between (a) a legacy AUQ /
+    # EPM card (must stay byte-neutral) and (b) a PRE-B2.3 gate card whose raw
+    # un-suffixed callbacks survived a restart/deploy (the registry is wiped on
+    # every restart, so ``cur_gen is None`` proves nothing). Discriminate on the
+    # LIVE pane — reusing THIS branch's existing visible capture (no new capture
+    # on the suffixed / gen-registered paths): a gate (Decision / Permission /
+    # Workflow) pane REFUSES fail-closed before any key (the poller re-renders
+    # the card with a fresh suffixed keyboard within ~1s); an AUQ / EPM / other
+    # pane proceeds down the legacy path unchanged.
+    if _gate_pane_recheck_needed:
+        if not visible or not visible.strip():
+            # r2 dual P1: an EMPTY/mid-redraw capture in the AMBIGUOUS shape
+            # (un-suffixed payload + empty registry) is NOT legacy proof — with
+            # no persisted surface-kind authority and no pane bytes, the card
+            # may be a pre-B2.3 gate whose raw key would land on a live gate.
+            # Fail CLOSED (a legacy AUQ tap merely re-taps once the pane
+            # settles; the CB1 UNKNOWN-proceeds rule stays for the UNambiguous
+            # legacy paths below, not this branch).
+            await safe_answer(query, "Card refreshed — use the current card")
+            return None
+        gate_content = extract_interactive_content(visible)
+        if gate_content is not None and gate_content.name in _GATE_RENDER_NAMES:
+            await safe_answer(query, "Card refreshed — use the current card")
+            return None
     # PRESENT or UNKNOWN: proceed. UNKNOWN explicitly continues per CB1.
     return w
 
@@ -2622,21 +2692,119 @@ def _build_multi_toggle_rows(
     return rows
 
 
+def _build_decision_pick_rows(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    pane_text: str,
+    cached_command: str,
+) -> list[list[InlineKeyboardButton]] | None:
+    """Stage B2.3 — mint one-tap ``dcp:`` option buttons for a LICENSED Decision.
+
+    Returns None (→ display-only, byte-identical to Stage B1) unless ALL hold:
+    the §7 dispatch flag is ON, the live pane strictly ``parse_generic_decision``s,
+    the form matches a known family (``identify_family`` — which also requires a
+    non-None title, the §5a mint gate), the family × the CACHED CC-version is
+    licensed (``lookup``; the FRESH re-check at tap is the load-bearing gate — a
+    mint on a stale version just renders buttons the tap then declines), and the
+    geometry is a clean single-select numbered picker (exactly one ❯, no checkbox
+    markers, contiguous 1..N). Mints a FRESH ``decision_token`` sibling row and
+    ``dcp:<route_hash>:<fp8>:<opt>:<token>`` buttons (the ``fp8`` from the
+    body-inclusive ``decision_prompt_fingerprint`` — domain-prefixed, so no shared
+    ledger collision with the AUQ lane, §8)."""
+    if not decision_token.decision_dispatch_enabled():
+        return None
+    form = parse_generic_decision(pane_text)
+    if form is None:
+        return None
+    family = decision_token.identify_family(form)
+    if family is None:
+        return None
+    if not decision_token.lookup(family, cached_command or ""):
+        logger.info(
+            "DECISION mint declined: cached pane command %r not licensed for "
+            "family %s window=%s",
+            cached_command,
+            family,
+            window_id,
+        )
+        return None
+    opts = form.options
+    if sum(1 for o in opts if o.cursor) != 1:
+        return None
+    if any(o.selected is not None for o in opts):
+        return None
+    if not form.options_contiguous_from_one():
+        return None
+    pickable = [o for o in opts if o.number is not None and 1 <= o.number <= 9]
+    if not pickable:
+        return None
+
+    fingerprint = decision_prompt_fingerprint(form)
+    tokens = decision_token.mint_row(
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        fingerprint=fingerprint,
+        specs=[
+            decision_token.DecisionMintSpec(
+                option_number=o.number or 0, option_label=o.label
+            )
+            for o in pickable
+        ],
+    )
+
+    route_hash = auq_ledger.make_route_hash(user_id, thread_id, window_id)
+    fp8 = fingerprint[:8]
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for opt, token in zip(pickable, tokens):
+        assert opt.number is not None
+        truncated = opt.label if len(opt.label) <= 24 else opt.label[:24] + "…"
+        text = f"{opt.number}. {truncated}"
+        payload = f"{CB_DECISION_PICK}{route_hash}:{fp8}:{opt.number}:{token}"
+        row.append(
+            InlineKeyboardButton(text, callback_data=checked_callback_data(payload))
+        )
+        if len(row) >= 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return rows
+
+
+def _nav_cb(prefix: str, window_id: str, nav_generation: int | None) -> str:
+    """Compose a nav callback payload, generation-suffixed for gate cards.
+
+    Gate cards (Decision / Permission / Workflow — §5b(c) + O-6) pass a non-None
+    ``nav_generation`` → ``<prefix><window>:g<gen>`` so a stale card's raw ⏎/Esc
+    can never act on a NEW card's prompt (validated in ``assert_nav_dispatchable``).
+    AUQ / EPM / RestoreCheckpoint pass ``None`` → the legacy un-suffixed shape,
+    byte-neutral (the non-regressive constraint)."""
+    suffix = f":g{nav_generation}" if nav_generation is not None else ""
+    return checked_callback_data(f"{prefix}{window_id}{suffix}")
+
+
 def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
     pick_rows: list[list[InlineKeyboardButton]] | None = None,
+    nav_generation: int | None = None,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
     ``ui_name`` controls the layout: ``RestoreCheckpoint`` omits ←/→ keys
     since only vertical selection is needed.
 
-    ``pick_rows`` is the optional output of ``_build_pick_button_rows`` —
-    when present, the structured pick row(s) are placed at the top of the
-    keyboard, above the keystroke navigation. The keystroke row stays even
-    when pick buttons are available so the user can still pick a free-text
-    "Type something" option, dismiss with Esc, or refresh.
+    ``pick_rows`` is the optional output of ``_build_pick_button_rows`` /
+    ``_build_decision_pick_rows`` — when present, the structured pick row(s) are
+    placed at the top of the keyboard, above the keystroke navigation. The
+    keystroke row stays even when pick buttons are available so the user can still
+    pick a free-text "Type something" option, dismiss with Esc, or refresh.
+
+    ``nav_generation`` (non-None for gate cards) generation-suffixes the raw nav
+    callback_data (§5b(c) / O-6).
     """
     vertical_only = ui_name == "RestoreCheckpoint"
 
@@ -2648,13 +2816,13 @@ def _build_interactive_keyboard(
         [
             InlineKeyboardButton(
                 "␣ Space",
-                callback_data=checked_callback_data(f"{CB_ASK_SPACE}{window_id}"),
+                callback_data=_nav_cb(CB_ASK_SPACE, window_id, nav_generation),
             ),
             InlineKeyboardButton(
-                "↑", callback_data=checked_callback_data(f"{CB_ASK_UP}{window_id}")
+                "↑", callback_data=_nav_cb(CB_ASK_UP, window_id, nav_generation)
             ),
             InlineKeyboardButton(
-                "⇥ Tab", callback_data=checked_callback_data(f"{CB_ASK_TAB}{window_id}")
+                "⇥ Tab", callback_data=_nav_cb(CB_ASK_TAB, window_id, nav_generation)
             ),
         ]
     )
@@ -2663,7 +2831,7 @@ def _build_interactive_keyboard(
             [
                 InlineKeyboardButton(
                     "↓",
-                    callback_data=checked_callback_data(f"{CB_ASK_DOWN}{window_id}"),
+                    callback_data=_nav_cb(CB_ASK_DOWN, window_id, nav_generation),
                 ),
             ]
         )
@@ -2672,15 +2840,15 @@ def _build_interactive_keyboard(
             [
                 InlineKeyboardButton(
                     "←",
-                    callback_data=checked_callback_data(f"{CB_ASK_LEFT}{window_id}"),
+                    callback_data=_nav_cb(CB_ASK_LEFT, window_id, nav_generation),
                 ),
                 InlineKeyboardButton(
                     "↓",
-                    callback_data=checked_callback_data(f"{CB_ASK_DOWN}{window_id}"),
+                    callback_data=_nav_cb(CB_ASK_DOWN, window_id, nav_generation),
                 ),
                 InlineKeyboardButton(
                     "→",
-                    callback_data=checked_callback_data(f"{CB_ASK_RIGHT}{window_id}"),
+                    callback_data=_nav_cb(CB_ASK_RIGHT, window_id, nav_generation),
                 ),
             ]
         )
@@ -2688,15 +2856,15 @@ def _build_interactive_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
-                "⎋ Esc", callback_data=checked_callback_data(f"{CB_ASK_ESC}{window_id}")
+                "⎋ Esc", callback_data=_nav_cb(CB_ASK_ESC, window_id, nav_generation)
             ),
             InlineKeyboardButton(
                 "🔄",
-                callback_data=checked_callback_data(f"{CB_ASK_REFRESH}{window_id}"),
+                callback_data=_nav_cb(CB_ASK_REFRESH, window_id, nav_generation),
             ),
             InlineKeyboardButton(
                 "⏎ Enter",
-                callback_data=checked_callback_data(f"{CB_ASK_ENTER}{window_id}"),
+                callback_data=_nav_cb(CB_ASK_ENTER, window_id, nav_generation),
             ),
         ]
     )
@@ -3184,7 +3352,13 @@ async def handle_interactive_ui(
     # narrows on declarations, not control flow across blocks).
     form: AskUserQuestionForm | None = None
     render_source: auq_source.RenderAuqSource | None = None
+    # §5b(c)/O-6 nav generation: rotated for gate cards (Decision / Permission /
+    # Workflow), None (and CLEARED) for every non-gate surface so a gate→AUQ
+    # transition never strands a stale generation that would fail the byte-neutral
+    # AUQ nav (``assert_nav_dispatchable``'s "gen absent + gate generation" rule).
+    nav_generation: int | None = None
     if content.name == "AskUserQuestion":
+        decision_token.invalidate_on_dispatch(window_id)  # not a gate surface
         # Unified resolver feeds both render and validate paths the same
         # form. Combines JSONL tool_input (full option list with
         # descriptions, plus the multi-question matrix) with pane state
@@ -3375,18 +3549,38 @@ async def handle_interactive_ui(
                 if built:
                     pick_rows = built
     elif content.name in _GATE_RENDER_NAMES:
-        # PR-1 interactive approval gate (Permission / Workflow), DISPLAY-ONLY.
-        # No pick buttons (pick_rows stays None) — the user answers via the
-        # window-keyed manual ↑/↓/⏎/Esc nav keyboard below. The card body is
-        # the extracted pane region + the honest un-verified-keystroke notice
-        # (P2-1). PR-2 will add a verified one-tap "Yes" through a gate-aware
-        # validator; until then there is NO semantic option-button dispatch.
+        # Interactive approval / decision gate (Permission / Workflow / Decision).
+        # The card body is the extracted pane region + the honest
+        # un-verified-keystroke notice (P2-1). Every gate card rotates its nav
+        # generation so its raw ↑/↓/⏎/Esc keyboard carries ``:g<gen>`` (§5b(c)/O-6).
+        # Permission / Workflow stay DISPLAY-ONLY (pick_rows None). Stage B2.3: a
+        # LICENSED Decision (flag ON + known family × licensed CC-version) ALSO
+        # mints one-tap ``dcp:`` option buttons; anything unlicensed stays
+        # display-only, byte-identical to Stage B1.
         text = _gate_card_text(content)
+        nav_generation = decision_token.rotate_nav_generation(window_id)
+        if content.name == "Decision":
+            decision_rows = _build_decision_pick_rows(
+                user_id,
+                thread_id,
+                window_id,
+                pane_text,
+                w.pane_current_command,
+            )
+            if decision_rows:
+                pick_rows = decision_rows
+    else:
+        # Every other interactive UI (ExitPlanMode / RestoreCheckpoint / Settings)
+        # is NOT a gate surface → drop any stale gate generation for this window.
+        decision_token.invalidate_on_dispatch(window_id)
 
     # Build message with navigation keyboard (structured rows on top when
     # available, keystroke nav row below for free-text / manual paths).
     keyboard = _build_interactive_keyboard(
-        window_id, ui_name=content.name, pick_rows=pick_rows
+        window_id,
+        ui_name=content.name,
+        pick_rows=pick_rows,
+        nav_generation=nav_generation,
     )
 
     chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
@@ -3836,6 +4030,11 @@ async def clear_interactive_msg(
         # the cache rows AND their sibling tokens for this route's window.
         if cleared_window_id is not None:
             pick_token.prune_for_route(user_id, thread_id, cleared_window_id)
+            # Stage B2.3: drop this route's Decision tokens + nav generation
+            # beside the AUQ token prune — covers the poller pane-absent tombstone,
+            # a window switch, AUQ/EPM/gate resolution, and topic close (which
+            # routes through here via ``clear_topic_state``).
+            decision_token.teardown_route(user_id, thread_id, cleared_window_id)
 
     logger.debug(
         "Clear interactive: user=%d thread=%s single=%s",
@@ -3890,6 +4089,60 @@ async def clear_interactive_msg(
     # Fix 3c: this fires at the end of EVERY interactive-card clear (tombstone
     # or delete, any reason) — kind-aware so it tears down only the
     # interactive_ui card and never doubles as a notification_decision ack.
+    await attention.dismiss_if_kind(
+        bot, user_id=user_id, thread_id=thread_id, kind="interactive_ui"
+    )
+
+
+async def finalize_decision_dispatch(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    option_label: str,
+    *,
+    session_mgr=None,
+) -> None:
+    """§5b(b) dispatch-terminal teardown for a CONFIRMED Decision dispatch.
+
+    NOT ``clear_interactive_msg`` (round-4 guardrail 3: that deletes/tombstones):
+    this PRESERVES the card as an inert "✅ … sent" final-state edit. Under the
+    route lock it pops the PERSISTED interactive surface (so a stale raw-nav tap
+    fails ``has_interactive_surface`` — the restart-safe guard (b)) and tears down
+    the Decision tokens + nav generation, then fires the lifecycle-end hooks — the
+    poller drops ``_absent_streak`` AND ``_last_published_ui_hash`` so a fast
+    byte-identical re-raise renders a FRESH card (fresh tokens + fresh generation).
+    The Telegram edit runs best-effort AFTER the lock (a failed edit leaves the
+    popped surface — no delete-fallback; the nav generation was already
+    invalidated in-lock at ``dispatched``)."""
+    if session_mgr is None:
+        session_mgr = session_manager
+    ikey = (user_id, thread_id or 0)
+    lock = _get_route_lock(user_id, thread_id)
+    async with lock:
+        single_msg_id = _clear_interactive_msg(ikey)
+        cleared_window_id = _interactive_mode.pop(ikey, None)
+        decision_token.teardown_route(
+            user_id, thread_id, cleared_window_id or window_id
+        )
+    _fire_clear(user_id, thread_id or 0, cleared_window_id)
+    if bot is None:
+        return
+    chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
+    if single_msg_id is not None:
+        clipped = option_label if len(option_label) <= 80 else option_label[:79] + "…"
+        await topic_edit(
+            bot,
+            op="interactive",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=cleared_window_id or window_id,
+            message_id=single_msg_id,
+            text=f"✅ {clipped} sent",
+            plain=True,
+            reply_markup=None,
+        )
     await attention.dismiss_if_kind(
         bot, user_id=user_id, thread_id=thread_id, kind="interactive_ui"
     )

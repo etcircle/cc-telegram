@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from cctelegram.handlers import (
     auq_ledger,
     auq_source,
+    decision_token,
     interactive_ui,
     pick_intent,
     pick_token,
@@ -37,6 +38,7 @@ from cctelegram.handlers.callback_data import (
     CB_ASK_TAB,
     CB_ASK_TOGGLE,
     CB_ASK_UP,
+    CB_DECISION_PICK,
 )
 from cctelegram.handlers.inbound_telegram import _get_thread_id
 from cctelegram.handlers.interactive_ui import (
@@ -48,10 +50,15 @@ from cctelegram.handlers.interactive_ui import (
 )
 from cctelegram.terminal_parser import (
     AskUserQuestionForm,
+    _is_decision_footer_line,
     _loose_label_match,
     _pane_looks_like_picker,
+    decision_prompt_fingerprint,
+    extract_interactive_content,
+    parse_generic_decision,
     resolve_ask_form,
 )
+from cctelegram.tmux_manager import pane_command_is_claude
 from cctelegram.tmux_manager import tmux_manager as _tmux_singleton
 
 from . import (
@@ -705,6 +712,374 @@ async def _attempt_pick_recovery(
     return True
 
 
+# ── Stage B2.3: the tappable Decision dispatch lane ──────────────────────────
+#
+# A PARALLEL, Decision-specific dispatch that reuses the AUQ dispatch DISCIPLINE
+# (per-window send lock + ``_lock_busy`` reject, monotonic arrow nav,
+# settle→re-parse→verify, Enter as the ONLY commit key, fail-closed advance
+# classification, ``auq_ledger`` idempotency) but NEVER the AUQ source/form
+# machinery — a Decision pane returns None from ``resolve_auq_source`` /
+# ``resolve_ask_form`` (the P1-C dead-tap the lane exists to avoid). Because the
+# first keystroke of any nav is an ARROW, dispatch is additionally gated on a
+# known-good (family × CC-version) license read FRESH at tap time (§2b).
+
+
+def _decision_cursor(form: AskUserQuestionForm) -> Any:
+    """The single live ``❯`` option in a parsed Decision form, or None."""
+    return next((o for o in form.options if o.cursor), None)
+
+
+def _decision_stable_key(entry: decision_token.DecisionTokenEntry) -> str:
+    """The shared-ledger key a live Decision token reconstructs (collision test).
+
+    Mirrors the render mint: ``make_ledger_key(make_route_hash(...),
+    decision_fingerprint[:8], opt)``. The ``fp8`` derives from the body-inclusive
+    ``decision_prompt_fingerprint`` (domain-prefixed ``decision:``) so it can
+    never collide with the AUQ lane's bare-``_canonical_repr`` fp8 (§8)."""
+    return auq_ledger.make_ledger_key(
+        auq_ledger.make_route_hash(entry.user_id, entry.thread_id, entry.window_id),
+        entry.fingerprint[:8],
+        entry.option_number,
+    )
+
+
+def _classify_decision_advance(pane2: str, minted_fingerprint: str) -> bool:
+    """True iff the committed Decision fingerprint is GONE from the post-Enter pane
+    — under the SAME extractor semantics the render mint and the pre-commit gate
+    use (review r1 P2-B: first-match-wins parity on the CONFIRM side too).
+
+    Sound ONLY under §2b-proven families (Enter was the only commit-capable key
+    sent). ``dispatched`` fires ONLY on the confirmed-absence proof; every
+    ambiguity fails CLOSED to ``commit_unconfirmed`` (refresh-only). Runs the
+    FULL ``extract_interactive_content`` (never the bare ``parse_generic_decision``
+    — a WEAKER recognizer: a Settings/AUQ pane that merely decision-parses would
+    fp-compare as a "different Decision" and wrongly confirm):
+
+      * extractor → ``Decision``: compare ``decision_prompt_fingerprint``. Same
+        fp = the round-3 zero-absence variant (a byte-identical prompt re-raised
+        before the committed one's absence was ever observed) → unconfirmed;
+        different fp = the committed prompt resolved and a NEW one raised within
+        the settle → resolved (§11-5).
+      * extractor → ANOTHER named interactive UI, or None: ``dispatched`` ONLY
+        when the capture is NON-EMPTY and no Decision footer/marker line remains
+        on it (the committed fingerprint is positively absent from an actually
+        observed frame); a still-present footer — under a named UI that stole
+        first-match, or an unparseable frame — is AMBIGUOUS → unconfirmed, never
+        dispatched. An EMPTY/blank capture is NOT absence proof ("we didn't see
+        the thing" — r2 Hermes P2): it fails closed to unconfirmed rather than
+        falsely finalizing + releasing the single-use key.
+    """
+    content = extract_interactive_content(pane2)
+    if content is not None and content.name == "Decision":
+        aform = parse_generic_decision(pane2)
+        if aform is None:
+            # Extractor/validator disagreement — ambiguous, fail closed.
+            return False
+        return decision_prompt_fingerprint(aform) != minted_fingerprint
+    if not pane2 or not pane2.strip():
+        return False  # empty capture ≠ positive absence proof (r2 Hermes P2)
+    return not any(_is_decision_footer_line(line) for line in pane2.split("\n"))
+
+
+@dataclass(frozen=True)
+class _DecisionPaneOutcome:
+    """Structured outcome of the locked Decision-dispatch pane-critical section.
+
+    ``kind`` is the terminal ledger state already recorded inside the lock;
+    ``reason`` carries the bail sub-reason (None on a confirmed dispatch).
+    """
+
+    kind: Literal["dispatched", "not_advanced", "commit_unconfirmed"]
+    reason: str | None = None
+
+
+async def _dispatch_decision_pane_locked(
+    *,
+    user: Any,
+    tmux_manager: Any,
+    w: Any,
+    window_id: str,
+    minted_fingerprint: str,
+    option_number: int,
+    option_label: str,
+    ledger_key: str | None,
+) -> _DecisionPaneOutcome:
+    """§3 dispatch transaction — the caller holds the window send lock.
+
+    Extractor parity → body-inclusive fingerprint identity → geometry/family
+    gates → FRESH (family × CC-version) license → nav→settle→verify (motion
+    proof) → Enter → confirm → terminal ledger write. NO Telegram I/O. Every gate
+    runs BEFORE any keystroke, so a keystroke is NEVER sent to an unlicensed /
+    non-matching shape.
+    """
+
+    def _bail_not_advanced(reason: str) -> _DecisionPaneOutcome:
+        if ledger_key is not None:
+            auq_ledger.record(ledger_key, state="not_advanced", failed_reason=reason)
+        return _DecisionPaneOutcome("not_advanced", reason)
+
+    def _bail_commit_unconfirmed(reason: str) -> _DecisionPaneOutcome:
+        if ledger_key is not None:
+            auq_ledger.record(
+                ledger_key, state="commit_unconfirmed", failed_reason=reason
+            )
+        return _DecisionPaneOutcome("commit_unconfirmed", reason)
+
+    # (b) Extractor parity — the FULL detector must return a Decision (a
+    # Settings / AUQ pane that merely decision-parses is caught here, since
+    # first-match-wins gives it its OWN name). Same 500-line scrollback as render.
+    pane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+    if not pane:
+        return _bail_not_advanced("capture_failed")
+    content = extract_interactive_content(pane)
+    if content is None or content.name != "Decision":
+        logger.info(
+            "DECISION dispatch decline extractor_parity user=%d window=%s name=%s",
+            user.id,
+            window_id,
+            None if content is None else content.name,
+        )
+        return _bail_not_advanced("extractor_parity")
+    live_form = parse_generic_decision(pane)
+    if live_form is None:
+        return _bail_not_advanced("parse_failed")
+
+    # (c) Identity — the body-inclusive fingerprint (two folder-trust prompts for
+    # DIFFERENT dirs differ) + geometry/family gates.
+    if decision_prompt_fingerprint(live_form) != minted_fingerprint:
+        return _bail_not_advanced("fingerprint_mismatch")
+    opts = live_form.options
+    if sum(1 for o in opts if o.cursor) != 1:
+        return _bail_not_advanced("cursor_geometry")
+    if any(o.selected is not None for o in opts):
+        # This lane never dispatches a multi-select / checkbox shape.
+        return _bail_not_advanced("multi_select_marker")
+    if not live_form.options_contiguous_from_one():
+        return _bail_not_advanced("options_noncontiguous")
+    if live_form.select_mode != "single":
+        return _bail_not_advanced("not_single_select")
+    family = decision_token.identify_family(live_form)
+    if family is None:
+        return _bail_not_advanced("family_unknown")
+
+    # (a) FRESH (family × CC-version) license — a direct stderr-checked
+    # ``display-message`` read (NOT the 1s list cache), INSIDE the lock,
+    # immediately before the first keystroke, so a /update-swapped TUI inside the
+    # cache TTL can never be arrow-keyed. Non-version-shaped / unlicensed →
+    # decline before ANY key + an INFO log (post-/update dead taps stay
+    # observable).
+    live_cmd = await tmux_manager.pane_current_command(window_id)
+    if not pane_command_is_claude(live_cmd) or not decision_token.lookup(
+        family, live_cmd or ""
+    ):
+        logger.info(
+            "DECISION dispatch declined: live pane command %r not licensed for "
+            "family %s (user=%d window=%s)",
+            live_cmd,
+            family,
+            user.id,
+            window_id,
+        )
+        return _bail_not_advanced("version_unlicensed")
+
+    # (d) Nav + liveness (motion proof normative). ``delta`` is computed from the
+    # PRE-nav live cursor (never a minted form); the wiggle proves the ❯ can move
+    # (a quoted block cannot).
+    target = option_number
+    cur = _decision_cursor(live_form)
+    if cur is None or cur.number is None:
+        return _bail_not_advanced("cursor_unknown")
+    pre_nav_pos = cur.number
+
+    async def _reparse_decision() -> AskUserQuestionForm | None:
+        p = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+        return parse_generic_decision(p) if p else None
+
+    delta = target - pre_nav_pos
+    if delta != 0:
+        nav_key = "Down" if delta > 0 else "Up"
+        for _ in range(abs(delta)):
+            if not await tmux_manager.send_keys(
+                w.window_id, nav_key, enter=False, literal=False
+            ):
+                return _bail_not_advanced("nav_send_failed")
+        await asyncio.sleep(NAV_SETTLE)
+        vform = await _reparse_decision()
+        vc = _decision_cursor(vform) if vform else None
+        if (
+            vform is None
+            or decision_prompt_fingerprint(vform) != minted_fingerprint
+            or vc is None
+            or vc.number != target
+            or vc.number == pre_nav_pos  # MOTION observed (delta != 0)
+        ):
+            return _bail_not_advanced("verify_failed")
+        landed_label = vc.label
+    else:
+        # Wiggle: delta == 0 → nudge one row away (direction by bounds) and back,
+        # requiring the cursor to MOVE then RETURN — a strong live-cursor proof
+        # (a quoted block can't move its ❯). Not a structural close (a verify→Enter
+        # TOCTOU window remains, same class as AUQ's).
+        away, back = ("Down", "Up") if target <= 1 else ("Up", "Down")
+        if not await tmux_manager.send_keys(
+            w.window_id, away, enter=False, literal=False
+        ):
+            return _bail_not_advanced("nav_send_failed")
+        await asyncio.sleep(NAV_SETTLE)
+        wform = await _reparse_decision()
+        wc = _decision_cursor(wform) if wform else None
+        if (
+            wform is None
+            or decision_prompt_fingerprint(wform) != minted_fingerprint
+            or wc is None
+            or wc.number == target  # cursor did NOT move → not a live picker
+        ):
+            return _bail_not_advanced("wiggle_no_motion")
+        if not await tmux_manager.send_keys(
+            w.window_id, back, enter=False, literal=False
+        ):
+            return _bail_not_advanced("nav_send_failed")
+        await asyncio.sleep(NAV_SETTLE)
+        vform = await _reparse_decision()
+        vc = _decision_cursor(vform) if vform else None
+        if (
+            vform is None
+            or decision_prompt_fingerprint(vform) != minted_fingerprint
+            or vc is None
+            or vc.number != target
+        ):
+            return _bail_not_advanced("verify_failed")
+        landed_label = vc.label
+
+    # (e) Verify (all shapes): the loose landing-label match (post-nav only).
+    if not _loose_label_match(landed_label, option_label):
+        return _bail_not_advanced("verify_failed")
+
+    # (f) Commit — the version-stable Enter (a False return means it never reached
+    # tmux → still a PRE-COMMIT bail).
+    if not await tmux_manager.send_keys(
+        w.window_id, "Enter", enter=False, literal=False
+    ):
+        return _bail_not_advanced("commit_send_failed")
+    await asyncio.sleep(COMMIT_SETTLE)
+    pane2 = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+    if not pane2:
+        return _bail_commit_unconfirmed("confirm_capture_failed")
+    if not _classify_decision_advance(pane2, minted_fingerprint):
+        return _bail_commit_unconfirmed("commit_unconfirmed")
+
+    # CONFIRMED — record ``dispatched`` (idempotency lock), invalidate the nav
+    # GENERATION in-lock (§3: a raw-nav tap landing in the lock-release→teardown
+    # gap already fails ``current_nav_generation``), and release the ledger key
+    # (§8: ``released`` fires ONLY on the confirmed-gone proof).
+    if ledger_key is not None:
+        auq_ledger.record(ledger_key, state="dispatched")
+    decision_token.invalidate_on_dispatch(window_id)
+    if ledger_key is not None:
+        auq_ledger.release_key(ledger_key)
+    logger.info(
+        "DECISION dispatch_ok user=%d window=%s opt=%d label=%s",
+        user.id,
+        window_id,
+        option_number,
+        option_label[:24],
+    )
+    return _DecisionPaneOutcome("dispatched")
+
+
+async def _dispatch_decision(
+    *,
+    query: Any,
+    context: Any,
+    user: Any,
+    tmux_manager: Any,
+    adapters: Any,
+    w: Any,
+    window_id: str,
+    thread_id: int | None,
+    minted_fingerprint: str,
+    option_number: int,
+    option_label: str,
+    ledger_key: str | None,
+) -> None:
+    """Lock-acquire (reject-if-held) → pane-locked transaction → unlocked response.
+
+    Reject-if-held (NOT queue): a message already queued on the send lock would
+    otherwise flush a keystroke mid-transaction. On a busy lock the already-written
+    ``accepted`` row is DOWNGRADED to ``not_advanced`` (Enter provably never sent)
+    and the callback falls through to a fresh-mint re-render — never stranding a
+    crash-ambiguous ``accepted``.
+    """
+    lock = _window_send_lock(tmux_manager, w.window_id)
+    if _lock_busy(lock):
+        if ledger_key is not None:
+            auq_ledger.record(
+                ledger_key, state="not_advanced", failed_reason="lock_busy"
+            )
+        await safe_answer(query, WINDOW_BUSY_TEXT)
+        await _rerender_picker(
+            context, user, tmux_manager, adapters, window_id, thread_id
+        )
+        return
+    async with lock:
+        outcome = await _dispatch_decision_pane_locked(
+            user=user,
+            tmux_manager=tmux_manager,
+            w=w,
+            window_id=window_id,
+            minted_fingerprint=minted_fingerprint,
+            option_number=option_number,
+            option_label=option_label,
+            ledger_key=ledger_key,
+        )
+    # ── Unlocked response: Telegram I/O only after lock release. ──
+    if outcome.kind == "dispatched":
+        # §5b(b)/§3 ORDERING (review r1 P2-C — the plan text is normative):
+        # FIRST the dispatch-terminal teardown — pop the persisted interactive
+        # surface (a stale raw-nav tap then fails ``has_interactive_surface``,
+        # restart-safe) and edit the card into the inert "✅ … sent" final state —
+        # THEN answer the callback. Answering first left a crash/network window
+        # where the callback was acked but the persisted surface was not yet
+        # terminal (a restart inside it would rehydrate a live-looking card for
+        # a committed dispatch). The nav generation was already invalidated
+        # IN-LOCK (§3), covering the lock-release→teardown gap either way.
+        await interactive_ui.finalize_decision_dispatch(
+            context.bot,
+            user.id,
+            thread_id,
+            window_id,
+            option_label,
+            session_mgr=adapters.session_manager,
+        )
+        await safe_answer(query, f"✅ {option_label[:32]}")
+        return
+    if outcome.kind == "not_advanced":
+        await safe_answer(query, "Action not registered; refreshing card.")
+    else:  # commit_unconfirmed
+        await safe_answer(query, "Action sent; refreshing card.")
+    await _rerender_picker(context, user, tmux_manager, adapters, window_id, thread_id)
+
+
+def _parse_nav_payload(raw: str) -> tuple[str, int | None]:
+    """Split an ``aq:*`` nav callback payload into ``(window_id, generation)``.
+
+    Gate cards (Decision / Permission / Workflow — §5b(c) + owner decision O-6)
+    carry a generation-suffixed shape ``@N:g<gen>``; AUQ / EPM keep the legacy
+    un-suffixed ``@N`` (byte-neutral, the non-regressive constraint). Window ids
+    are ``@N`` (colon-free), so the trailing ``:g<digits>`` is unambiguous. Parsed
+    BEFORE ``reject_stale_window_callback`` (round-4 guardrail 1: slicing the
+    whole payload as a window id would treat ``@12:g7`` as a window and dead-tap).
+    A malformed / absent suffix → ``None``; ``assert_nav_dispatchable`` still fails
+    a live GATE surface closed on a missing generation.
+    """
+    idx = raw.rfind(":g")
+    if idx != -1:
+        tail = raw[idx + 2 :]
+        if tail.isdigit():
+            return raw[:idx], int(tail)
+    return raw, None
+
+
 async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
     update = authorized.ctx.update
     context = authorized.ctx.context
@@ -734,12 +1109,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
     # Interactive UI: Up arrow
     if data.startswith(CB_ASK_UP):
-        window_id = data[len(CB_ASK_UP) :]
+        window_id, nav_gen = _parse_nav_payload(data[len(CB_ASK_UP) :])
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
         w = await assert_nav_dispatchable(
-            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager
+            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager, gen=nav_gen
         )
         if w is None:
             return
@@ -766,12 +1141,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
     # Interactive UI: Down arrow
     elif data.startswith(CB_ASK_DOWN):
-        window_id = data[len(CB_ASK_DOWN) :]
+        window_id, nav_gen = _parse_nav_payload(data[len(CB_ASK_DOWN) :])
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
         w = await assert_nav_dispatchable(
-            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager
+            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager, gen=nav_gen
         )
         if w is None:
             return
@@ -798,12 +1173,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
     # Interactive UI: Left arrow
     elif data.startswith(CB_ASK_LEFT):
-        window_id = data[len(CB_ASK_LEFT) :]
+        window_id, nav_gen = _parse_nav_payload(data[len(CB_ASK_LEFT) :])
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
         w = await assert_nav_dispatchable(
-            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager
+            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager, gen=nav_gen
         )
         if w is None:
             return
@@ -830,12 +1205,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
     # Interactive UI: Right arrow
     elif data.startswith(CB_ASK_RIGHT):
-        window_id = data[len(CB_ASK_RIGHT) :]
+        window_id, nav_gen = _parse_nav_payload(data[len(CB_ASK_RIGHT) :])
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
         w = await assert_nav_dispatchable(
-            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager
+            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager, gen=nav_gen
         )
         if w is None:
             return
@@ -862,13 +1237,19 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
     # Interactive UI: Escape
     elif data.startswith(CB_ASK_ESC):
-        window_id = data[len(CB_ASK_ESC) :]
+        window_id, nav_gen = _parse_nav_payload(data[len(CB_ASK_ESC) :])
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
         # F2: ESC carve-out. On a stale picker, still reap the Telegram card.
         w = await assert_nav_dispatchable(
-            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager, is_esc=True
+            query,
+            user.id,
+            thread_id,
+            window_id,
+            tmux_mgr=tmux_manager,
+            is_esc=True,
+            gen=nav_gen,
         )
         if w == NAV_ESC_CLEAR:
             await clear_interactive_msg(
@@ -895,12 +1276,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
     # Interactive UI: Enter
     elif data.startswith(CB_ASK_ENTER):
-        window_id = data[len(CB_ASK_ENTER) :]
+        window_id, nav_gen = _parse_nav_payload(data[len(CB_ASK_ENTER) :])
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
         w = await assert_nav_dispatchable(
-            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager
+            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager, gen=nav_gen
         )
         if w is None:
             return
@@ -927,12 +1308,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
     # Interactive UI: Space
     elif data.startswith(CB_ASK_SPACE):
-        window_id = data[len(CB_ASK_SPACE) :]
+        window_id, nav_gen = _parse_nav_payload(data[len(CB_ASK_SPACE) :])
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
         w = await assert_nav_dispatchable(
-            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager
+            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager, gen=nav_gen
         )
         if w is None:
             return
@@ -959,12 +1340,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
     # Interactive UI: Tab
     elif data.startswith(CB_ASK_TAB):
-        window_id = data[len(CB_ASK_TAB) :]
+        window_id, nav_gen = _parse_nav_payload(data[len(CB_ASK_TAB) :])
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
         w = await assert_nav_dispatchable(
-            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager
+            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager, gen=nav_gen
         )
         if w is None:
             return
@@ -991,12 +1372,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
     # Interactive UI: refresh display (F1: included in the nav-guard family)
     elif data.startswith(CB_ASK_REFRESH):
-        window_id = data[len(CB_ASK_REFRESH) :]
+        window_id, nav_gen = _parse_nav_payload(data[len(CB_ASK_REFRESH) :])
         thread_id = _get_thread_id(update)
         if await reject_stale_window_callback(window_id):
             return
         w = await assert_nav_dispatchable(
-            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager
+            query, user.id, thread_id, window_id, tmux_mgr=tmux_manager, gen=nav_gen
         )
         if w is None:
             return
@@ -1617,4 +1998,216 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             is_review_submit=entry.is_review_submit,
             current_form=current_form,
             ledger_key=ledger_key,
+        )
+
+    # Interactive UI: Stage B2 tappable Decision option pick (dcp: lane)
+    elif data.startswith(CB_DECISION_PICK):
+        # (0) dispatch-flag check — a stale flag-ON-epoch button after a config
+        # flip declines cleanly (the nav keys still work).
+        if not decision_token.decision_dispatch_enabled():
+            await safe_answer(query, "Dispatch disabled — use the nav keys.")
+            return
+        payload = data[len(CB_DECISION_PICK) :]
+        parts = payload.split(":")
+        if len(parts) != 4:
+            logger.info("DECISION_PICK malformed user=%d", user.id)
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="Card expired, refreshing.",
+            )
+            return
+        d_route_hash, d_fp8, d_opt_str, d_token = parts
+        try:
+            d_opt_num = int(d_opt_str)
+        except ValueError:
+            logger.info("DECISION_PICK malformed user=%d", user.id)
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="Card expired, refreshing.",
+            )
+            return
+        d_ledger_key: str | None = auq_ledger.make_ledger_key(
+            d_route_hash, d_fp8, d_opt_num
+        )
+
+        # (1) Ledger lookup FIRST (§8 restart-safe duplicate idempotency), then
+        # the AUQ collision matrix (copied): owner-mismatch → live-token-peek
+        # collision test → else WRONG_USER BEFORE any state text leaks.
+        d_existing = auq_ledger.lookup(d_ledger_key)
+        if d_existing is not None and d_existing.user_id != user.id:
+            live = decision_token.peek(d_token)
+            is_collision = (
+                live is not None
+                and live.user_id == user.id
+                and _decision_stable_key(live) == d_ledger_key
+            )
+            if not is_collision:
+                logger.info("DECISION_PICK wrong_user user=%d", user.id)
+                await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+                return
+            d_existing = None
+            d_ledger_key = None
+        # Same-user window-drift: the route_hash collided but the bound window
+        # differs — drop the row + key so this dispatch never clobbers it.
+        if d_existing is not None:
+            d_bound = get_interactive_window(user.id, _get_thread_id(update))
+            if d_bound and d_existing.window_id != d_bound:
+                d_existing = None
+                d_ledger_key = None
+
+        # Per-state matrix (mirrors aqp:, minus the legacy digit states).
+        if d_existing is not None:
+            d_proj = d_existing.state
+            if (
+                d_existing.state == "accepted"
+                and d_existing.accepted_at < auq_ledger.process_start_time()
+            ):
+                d_proj = "unknown"
+            logger.info(
+                "DECISION_PICK ledger_hit user=%d window=%s opt=%d proj=%s raw=%s",
+                user.id,
+                d_existing.window_id,
+                d_existing.option_number,
+                d_proj,
+                d_existing.state,
+            )
+            if d_proj == "dispatched":
+                await safe_answer(
+                    query,
+                    f"Action already received: {d_existing.option_label[:32]}",
+                )
+                return
+            if d_proj == "accepted":
+                await safe_answer(query, "Action in progress")
+                return
+            if d_proj in ("unknown", "commit_unconfirmed"):
+                # ``unknown`` = a pre-restart in-flight claim; ``commit_unconfirmed``
+                # = Enter WAS sent but unconfirmed → never auto-redispatch. Both
+                # REFRESH ONLY.
+                await _refresh_pick_card(
+                    query,
+                    context,
+                    update,
+                    user,
+                    tmux_manager,
+                    adapters,
+                    text=(
+                        "Action interrupted; please re-tap."
+                        if d_proj == "unknown"
+                        else "Action sent; refreshing card."
+                    ),
+                    fallback_window_id=d_existing.window_id,
+                )
+                return
+            # ``not_advanced`` → FALL THROUGH (a fresh-token re-tap re-validates;
+            # Enter provably never sent).
+
+        # (2) token peek → owner → stale-window lease.
+        d_peeked = decision_token.peek(d_token)
+        if d_peeked is None:
+            # No durable D2 recovery for Decision — it re-mints from the live pane
+            # trivially (§8). Refresh so the user taps a fresh button.
+            logger.info(
+                "DECISION_PICK peek_none user=%d token=%s", user.id, d_token[:6]
+            )
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="↻ Refreshed — tap your choice again.",
+                show_alert=True,
+            )
+            return
+        d_thread_id = d_peeked.thread_id
+        d_window_id = d_peeked.window_id
+        if not owner_matches(d_peeked, user.id):
+            logger.info(
+                "DECISION_PICK wrong_user user=%d window=%s", user.id, d_window_id
+            )
+            await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+            return
+        if await reject_stale_window_callback(d_window_id):
+            logger.info(
+                "DECISION_PICK stale_window user=%d window=%s", user.id, d_window_id
+            )
+            return
+
+        # (3) Consume by EXCLUSIVE RESERVATION (§3(3) sibling-burn — the winning
+        # consume tombstones the whole route row, so a losing/late sibling or a
+        # Telegram replay finds only a tomb).
+        d_consume = await decision_token.consume(d_token, user.id)
+        logger.info(
+            "DECISION_PICK consume user=%d window=%s opt=%d outcome=%s",
+            user.id,
+            d_window_id,
+            d_peeked.option_number,
+            d_consume.outcome,
+        )
+        if d_consume.outcome == "wrong_user":
+            await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+            return
+        if d_consume.outcome == "already_consumed":
+            await safe_answer(query, "Action already received.")
+            return
+        if d_consume.outcome == "expired":
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="↻ Refreshed — tap your choice again.",
+                show_alert=True,
+                fallback_window_id=d_window_id,
+            )
+            return
+        d_entry = d_consume.entry
+        assert d_entry is not None
+        d_w = await tmux_manager.find_window_by_id(d_window_id)
+        if not d_w:
+            await safe_answer(query, "Window not found", show_alert=True)
+            return
+
+        # (4) Write-ahead ledger ``accepted`` BEFORE dispatch (None only on a
+        # collision-suppression fall-through above — the guards keep the writes
+        # off another route's row).
+        if d_ledger_key is not None:
+            auq_ledger.record(
+                d_ledger_key,
+                state="accepted",
+                user_id=user.id,
+                window_id=d_window_id,
+                full_fingerprint=d_entry.fingerprint,
+                option_number=d_entry.option_number,
+                option_label=d_entry.option_label,
+            )
+
+        # (5) Navigate → verify → Enter → confirm (§3), the reject-if-held lock.
+        await _dispatch_decision(
+            query=query,
+            context=context,
+            user=user,
+            tmux_manager=tmux_manager,
+            adapters=adapters,
+            w=d_w,
+            window_id=d_window_id,
+            thread_id=d_thread_id,
+            minted_fingerprint=d_entry.fingerprint,
+            option_number=d_entry.option_number,
+            option_label=d_entry.option_label,
+            ledger_key=d_ledger_key,
         )

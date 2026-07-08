@@ -54,7 +54,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from .. import route_runtime
-from . import pane_signals
+from . import decision_token, pane_signals
 from ..config import config
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
@@ -547,6 +547,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # B2.3 review fold P2-A: the unbound route's Decision tokens + nav
+        # generation die with the binding — a stale dcp:/gate-nav tap must
+        # never survive into a window id a later binding may reuse.
+        decision_token.teardown_route(user.id, thread_id, wid)
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
@@ -636,6 +640,10 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # B2.3 review fold P2-A: the unbound route's Decision tokens + nav
+        # generation die with the binding — a stale dcp:/gate-nav tap must
+        # never survive into a window id a later binding may reuse.
+        decision_token.teardown_route(user.id, thread_id, wid)
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
@@ -813,6 +821,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # B2.3 review fold P2-A: the unbound route's Decision tokens + nav
+        # generation die with the binding — a stale dcp:/gate-nav tap must
+        # never survive into a window id a later binding may reuse.
+        decision_token.teardown_route(user.id, thread_id, wid)
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
@@ -1088,6 +1100,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # B2.3 review fold P2-A: the unbound route's Decision tokens + nav
+        # generation die with the binding — a stale dcp:/gate-nav tap must
+        # never survive into a window id a later binding may reuse.
+        decision_token.teardown_route(user.id, thread_id, wid)
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
