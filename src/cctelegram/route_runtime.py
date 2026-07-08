@@ -232,11 +232,20 @@ class _BgAgent:
     a timestamp-qualified idle-path SET (post-turn writes are background by
     definition); False for keys first seen while the parent was active
     (foreground-presumed → pruned at the parent's end-of-turn).
+    ``resumed_event_ts`` — Fix C (2026-07-08): the max parseable
+    ``SendMessage`` resume tool_result EVENT timestamp seen for this key (epoch;
+    ``None`` = never resumed / a plain launch). It is the CROSS-FILE
+    resume-vs-sidechain-done authority: a sidechain end-of-turn (a DIFFERENT
+    file, no shared order with the parent's resume) tombstones only when its
+    JSONL ts is STRICTLY NEWER than this — so a stale prior-leg end_turn observed
+    in ANY later batch never kills a live resumed key. Max-monotonic across
+    resumes; an unparseable later resume ts never erases an older parseable one.
     """
 
     last_seen_wall: float
     last_event_ts: float | None
     is_background: bool
+    resumed_event_ts: float | None = None
 
 
 # Cap on the per-route buffer of tool_result ids that arrived BEFORE their
@@ -324,6 +333,35 @@ class NotificationClearReason(Enum):
     BG_RUNNING = "bg_running"
     TTL = "ttl"
     TEARDOWN = "teardown"
+
+
+class BgDoneSource(Enum):
+    """Provenance of a background-agent done signal (Fix C, 2026-07-08).
+
+    A done for a background key has two structurally-distinct sources with
+    DIFFERENT causal-ordering guarantees vs a ``SendMessage`` resume, so
+    ``mark_background_agent_done`` treats them differently:
+
+      - ``PARENT`` — a ``<task-notification>`` in the PARENT transcript (the
+        same file as the resume). Single-file byte-offset reads are never out
+        of order, so the monitor already net-resolved a same-batch resume/done
+        pair by transcript order → the done is authoritative and tombstones
+        UNCONDITIONALLY (even when the record carries a ``resumed_event_ts``).
+      - ``SIDECHAIN`` — the agent's own sidechain end-of-turn (a DIFFERENT file;
+        no shared order with the parent resume). Resolved by the runtime
+        record's ``resumed_event_ts``: tombstone iff the record has NO
+        ``resumed_event_ts`` (plain-launch — today's behavior) OR the end_turn
+        ts is STRICTLY NEWER than the resume ts (a genuine fast-finish); a stale
+        prior-leg end_turn (ts ≤ resume) keeps the key LIVE. Any timestamp
+        missing/unparseable ⇒ fail-closed to DONE (false dark is annoying; false
+        typing after completion is the historical bug class here).
+
+    The existing positional callers pass no ``source`` → the ``PARENT`` default
+    keeps them byte-identical (unconditional tombstone, the pre-Fix-C behavior).
+    """
+
+    PARENT = "parent"
+    SIDECHAIN = "sidechain"
 
 
 # A route observed strictly above this token count must be on the 1M variant.
@@ -1754,30 +1792,180 @@ async def seed_idle_and_mark_background_agent_launched(
     return snap
 
 
-async def mark_background_agent_done(
-    route: Route, agent_key: str
-) -> RouteRuntimeSnapshot:
-    """Positive completion for ``agent_key`` (GH #44 §3.3 paths 1-2).
+def _apply_resume_in_place(st: _RouteState, key: str, resume_ts: float | None) -> None:
+    """Apply resume semantics for ``key`` on ``st`` (caller holds the lock).
 
-    Fired on the agent's own sidechain end-of-turn and on the parent's
-    ``<task-notification>`` for the key (belt and suspenders — either alone
-    clears). Removes the key and TOMBSTONES it so a trailing sidechain flush
-    cannot re-record and strand a false lift until the TTL. The stored
-    run_state is untouched — with the last live key gone the projection
-    simply stops lifting and the snapshot reports the stored idle (no
-    fall-back reconstruction). Tombstones even a never-recorded key (covers
-    a completion whose activity the monitor never saw). Never seeds.
-    """
+    (1) POP the done tombstone — the SECOND, KEYED exception to "tombstones
+        reset only on a genuine user turn" (a structured resume is positive
+        per-key proof of new work for exactly that agent; the global invariant
+        for all OTHER keys is untouched). (2) apply
+        ``mark_background_agent_launched`` semantics (``is_background=True``,
+        never pruned at EOT, 2h TTL). (3) store ``resumed_event_ts``
+        max-monotonic preferring parseable — an unparseable later resume ts
+        never erases an older parseable one (r4 must-have 6). Expire runs first
+        (so a TTL-expired corpse is a fresh record, not a refresh)."""
+    _expire_background_agents_in_place(st)
+    st.background_agents_done.discard(key)
+    rec = st.background_agents.get(key)
+    if rec is not None:
+        rec.is_background = True
+        rec.last_seen_wall = _wall_now()
+        if resume_ts is not None and (
+            rec.resumed_event_ts is None or resume_ts > rec.resumed_event_ts
+        ):
+            rec.resumed_event_ts = resume_ts
+    else:
+        st.background_agents[key] = _BgAgent(
+            last_seen_wall=_wall_now(),
+            last_event_ts=None,
+            is_background=True,
+            resumed_event_ts=resume_ts,
+        )
+
+
+async def mark_background_agent_resumed(
+    route: Route, agent_key: str, resume_ts: float | None
+) -> RouteRuntimeSnapshot:
+    """Resume evidence for ``agent_key`` on this route (Fix C, 2026-07-08).
+
+    The FOURTH background-launch source: a ``SendMessage`` to an already-existing
+    agent (the multi-leg "nudge" pattern) whose tool_result carries a
+    ``resumedAgentId``. Its prior stop tombstoned the key AND tombstones reset
+    only on a GENUINE user turn (a machine-initiated parent wake preserves them),
+    so both the launched and the sidechain-activity fallbacks were blocked and
+    the resumed agent ran fully dark. This mark POPS the per-key tombstone and
+    records the key ``is_background=True`` (survives the parent's end-of-turn
+    prune → typing + 🟡 + dashboard busy), stamping ``resumed_event_ts`` (the
+    parent SendMessage tool_result's EVENT timestamp — never wall time, never a
+    tick max) so the cross-file resume-vs-sidechain-done race is resolved on the
+    RECORD, outliving any single poll batch. Never seeds an unseen route
+    (mirrors ``mark_background_agent_launched``; the seed twin is
+    ``seed_idle_and_mark_background_agent_resumed``). Close parity holds with
+    ZERO new close code: the resumed agent's next stop emits a
+    ``<task-notification>`` whose task-id == agentId == this key → the existing
+    parent done path re-tombstones."""
     key = normalize_background_agent_key(agent_key)
     lock = _lock_for_route(route)
     async with lock:
         st = _state.get(route)
         if st is None:
             return _default_snapshot(route)
+        _apply_resume_in_place(st, key, resume_ts)
+        logger.info(
+            "background_agent resumed route=%s key=%s resume_ts=%s",
+            route,
+            key,
+            resume_ts,
+        )
+        snap = _freeze(route, st)
+    return snap
+
+
+async def seed_idle_and_mark_background_agent_resumed(
+    route: Route, agent_key: str, resume_ts: float | None
+) -> RouteRuntimeSnapshot:
+    """Like :func:`mark_background_agent_resumed`, but SEEDS a stored-IDLE
+    ``_RouteState`` for an UNSEEN route in the SAME critical section (the resume
+    twin of ``seed_idle_and_mark_background_agent_launched``).
+
+    A resumed agent's parent may have NO ``_RouteState`` at fan-out time (the
+    turn that nudged the agent already ended, or the bot restarted mid-leg), so a
+    bare ``mark_background_agent_resumed`` would hit ``st is None →
+    _default_snapshot`` and record nothing. This seam creates an
+    ``IDLE_CLEARED``+``seen`` state THEN applies the resume, so the projection
+    lifts the otherwise-stateless parent to RUNNING. On a route that already has
+    state (the normal live nudge path) the seed is a no-op — byte-identical to
+    ``mark_background_agent_resumed``, so the bot fan-out can call this seam
+    unconditionally."""
+    key = normalize_background_agent_key(agent_key)
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state.get(route)
+        if st is None:
+            st = _RouteState()  # defaults to RunState.IDLE_CLEARED
+            st.seen = True
+            _state[route] = st
+        _apply_resume_in_place(st, key, resume_ts)
+        logger.info(
+            "background_agent resumed (seeded) route=%s key=%s resume_ts=%s",
+            route,
+            key,
+            resume_ts,
+        )
+        snap = _freeze(route, st)
+    return snap
+
+
+async def mark_background_agent_done(
+    route: Route,
+    agent_key: str,
+    *,
+    source: BgDoneSource = BgDoneSource.PARENT,
+    end_turn_ts: float | None = None,
+    end_turn_ts_unparseable: bool = False,
+) -> RouteRuntimeSnapshot:
+    """Positive completion for ``agent_key`` (GH #44 §3.3 paths 1-2).
+
+    Fired on the agent's own sidechain end-of-turn (``source=SIDECHAIN``) and on
+    the parent's ``<task-notification>`` (``source=PARENT``, the default —
+    positional callers stay byte-identical). Removes the key and TOMBSTONES it so
+    a trailing sidechain flush cannot re-record and strand a false lift until the
+    TTL. The stored run_state is untouched — with the last live key gone the
+    projection simply stops lifting and the snapshot reports the stored idle.
+    Tombstones even a never-recorded key (covers a completion whose activity the
+    monitor never saw). Never seeds.
+
+    Fix C (2026-07-08) — the cross-file resume/done guard: a ``SIDECHAIN`` done
+    on a record carrying a ``resumed_event_ts`` (a live resumed agent) keeps the
+    key LIVE when the end_turn's ts is NOT strictly newer than the resume ts —
+    i.e. a stale prior-leg end_turn (observed in the same OR any later batch)
+    never kills the relit key. It falls through to the tombstone when the record
+    has no ``resumed_event_ts`` (plain-launch — today's behavior; a MISSING
+    record is treated the same, fail-closed — r4 must-have 3), when the end_turn
+    is strictly newer (a genuine fast-finish), or when any timestamp is
+    missing/unparseable (fail-closed to DONE). ``PARENT`` dones are always
+    unconditional (transcript order is authoritative)."""
+    key = normalize_background_agent_key(agent_key)
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state.get(route)
+        if st is None:
+            return _default_snapshot(route)
+        # Step 0 (expire-before-classify, as the other marks do): a TTL-expired
+        # resumed record must be treated as MISSING here, so a stale prior-leg
+        # sidechain done that lands AFTER the record aged out tombstones
+        # (fail-closed — the runtime already judged the agent too silent; a later
+        # resume relights it — r4 must-have 5).
+        _expire_background_agents_in_place(st)
+        rec = st.background_agents.get(key)
+        if (
+            source is BgDoneSource.SIDECHAIN
+            and rec is not None
+            and rec.resumed_event_ts is not None
+            and not end_turn_ts_unparseable
+            and end_turn_ts is not None
+            and end_turn_ts <= rec.resumed_event_ts
+        ):
+            # Stale prior-leg sidechain end_turn (ts ≤ resume) — NOT causal proof
+            # of a post-resume completion. Keep the resumed key LIVE.
+            logger.info(
+                "background_agent sidechain-done SUPPRESSED (stale prior-leg) "
+                "route=%s key=%s end_turn_ts=%s resume_ts=%s",
+                route,
+                key,
+                end_turn_ts,
+                rec.resumed_event_ts,
+            )
+            return _freeze(route, st)
         existed = st.background_agents.pop(key, None) is not None
         st.background_agents_done.add(key)
         if existed:
-            logger.info("background_agent done route=%s key=%s", route, key)
+            logger.info(
+                "background_agent done route=%s key=%s source=%s",
+                route,
+                key,
+                source.value,
+            )
         snap = _freeze(route, st)
     return snap
 
@@ -2233,6 +2421,7 @@ def reset_for_tests() -> None:
 __all__ = [
     "ContextUsage",
     "NOTIFY_TTL_SECONDS",
+    "BgDoneSource",
     "NotificationClearReason",
     "NotificationMarkResult",
     "Route",
@@ -2260,7 +2449,9 @@ __all__ = [
     "mark_background_agent_activity",
     "mark_background_agent_done",
     "mark_background_agent_launched",
+    "mark_background_agent_resumed",
     "seed_idle_and_mark_background_agent_launched",
+    "seed_idle_and_mark_background_agent_resumed",
     "pane_idle_clear_due",
     "parse_pending_tools_from_jsonl",
     "reset_for_tests",

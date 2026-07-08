@@ -76,13 +76,24 @@ class SidechainTick:
 
     ``max_event_ts`` — max JSONL timestamp over the batch's parsed entries
     (epoch via the shared ``utils.parse_iso_timestamp``; ``None`` when no
-    entry carried a parseable stamp). ``saw_end_of_turn`` — any entry
-    (INCLUDING lifecycle-only markers with no visible text) ended the
-    agent's turn.
+    entry carried a parseable stamp) — the ACTIVITY signal (keep-alive /
+    heartbeat). ``saw_end_of_turn`` — any entry (INCLUDING lifecycle-only
+    markers with no visible text) ended the agent's turn.
+
+    Fix C (2026-07-08) — the DONE-causality inputs, kept STRICTLY SEPARATE from
+    ``max_event_ts`` (never compare a done against the activity max): the
+    sidechain-done timestamp guard needs the newest END-TURN timestamp, not the
+    newest activity timestamp. ``max_end_turn_ts`` — max PARSEABLE timestamp over
+    the batch's END-TURN entries only; ``end_turn_ts_unparseable`` — True if ANY
+    observed end-turn entry had no parseable timestamp (the fail-closed rule
+    wins: an unparseable end-turn tombstones a resumed key even if another
+    end-turn in the same tick parsed).
     """
 
     max_event_ts: float | None = None
     saw_end_of_turn: bool = False
+    max_end_turn_ts: float | None = None
+    end_turn_ts_unparseable: bool = False
 
 
 @dataclass
@@ -108,6 +119,15 @@ class ParentSidechainActivity:
     completed: set[str] = field(default_factory=set)
     ticks: dict[str, SidechainTick] = field(default_factory=dict)
     bracket_heartbeats: dict[str, float] = field(default_factory=dict)
+    # Fix C (2026-07-08): resumed background agents (``SendMessage`` with a
+    # ``resumedAgentId``) → the resume tool_result's EVENT timestamp
+    # (``parse_iso_timestamp`` epoch, or ``None`` when unparseable). A MAP, never
+    # a bare set (Hermes r3): the bot fan-out passes the ts to
+    # ``mark_background_agent_resumed`` so the cross-file resume-vs-sidechain-done
+    # race is resolved on the runtime record. Net-resolved with ``completed`` in
+    # transcript order (the parent-lane same-batch pair: ``.resumed`` XOR
+    # ``.completed``).
+    resumed: dict[str, float | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -134,6 +154,25 @@ class _WorkflowBracket:
     # bracket is removed. ``_emit_workflow_bracket_heartbeats`` skips closing
     # brackets (the run-state done already fired via ``rec.completed``).
     closing: bool = False
+
+
+def _record_resume_ts(
+    resumed: dict[str, float | None], key: str, ts: float | None
+) -> None:
+    """Merge a resume ts into the ``.resumed`` map, MAX-preferring-parseable
+    (Fix C, r4 must-have 6): within one batch two resumes for the same key
+    collapse to the newest PARSEABLE ts, and an unparseable ts never erases an
+    already-recorded parseable one. Records the resume intent even when the ts is
+    unparseable (``None``) — the route_runtime record then falls to the
+    fail-closed sidechain-done rule."""
+    if key not in resumed:
+        resumed[key] = ts
+        return
+    existing = resumed[key]
+    if ts is None:
+        return  # keep the existing value (parseable or None)
+    if existing is None or ts > existing:
+        resumed[key] = ts
 
 
 def _is_window_id(key: str) -> bool:
@@ -1469,6 +1508,33 @@ class SessionMonitor:
                                     tuid or "?",
                                 )
                     elif (
+                        entry.content_type == "tool_result"
+                        and entry.tool_name == "SendMessage"
+                    ):
+                        # Fix C (2026-07-08): a ``SendMessage`` to an
+                        # already-existing agent (the multi-leg "nudge" pattern)
+                        # resumes it; the tool_result's structured entry-level
+                        # ``toolUseResult`` carries a non-empty ``resumedAgentId``
+                        # (STRUCTURED-ONLY, mirroring the other three launch
+                        # discriminators — never prose). The resumed id == the
+                        # agentId == the ``<task-notification>`` close key.
+                        from .handlers.response_builder import (
+                            resumed_agent_id_from_meta,
+                        )
+
+                        resumed_id = resumed_agent_id_from_meta(entry.tool_result_meta)
+                        if resumed_id:
+                            key = normalize_background_agent_key(resumed_id)
+                            rec = self._parent_activity(session_info.session_id)
+                            resume_ts = parse_iso_timestamp(entry.timestamp)
+                            # Parent-lane NET (transcript order): a resume observed
+                            # AFTER a <task-notification> for the SAME key in this
+                            # batch supersedes it (done→resume = nudge-after-stop →
+                            # LIVE). Drop any same-batch completion for this key,
+                            # then record the resume ts (max-preferring-parseable).
+                            rec.completed.discard(key)
+                            _record_resume_ts(rec.resumed, key, resume_ts)
+                    elif (
                         entry.role == "user"
                         and entry.content_type == "text"
                         and entry.text
@@ -1481,7 +1547,14 @@ class SessionMonitor:
                         task_id = extract_task_notification_task_id(entry.text)
                         if task_id:
                             rec = self._parent_activity(session_info.session_id)
-                            rec.completed.add(normalize_background_agent_key(task_id))
+                            close_key = normalize_background_agent_key(task_id)
+                            rec.completed.add(close_key)
+                            # Parent-lane NET (transcript order): a done observed
+                            # AFTER a resume for the SAME key in this batch
+                            # supersedes the resume (resume→done = fast finish →
+                            # TOMBSTONED). Drop any same-batch resume intent for
+                            # this key.
+                            rec.resumed.pop(close_key, None)
                             # ISSUE-6 / Fix 2d: for a WORKFLOW task-id, ALSO emit
                             # the wf-task: close key (== the wf-task launch key)
                             # so the bracket tombstones, and drop the open
@@ -1828,6 +1901,14 @@ class SessionMonitor:
                     tick.max_event_ts = ts
                 if entry.stop_reason in _TURN_END_REASONS:
                     tick.saw_end_of_turn = True
+                    # Fix C: DONE-causality inputs, separate from the activity
+                    # max. An unparseable end-turn ts forces fail-closed at the
+                    # sidechain done seam; otherwise track the max parseable
+                    # end-turn ts to compare against a resumed key's resume ts.
+                    if ts is None:
+                        tick.end_turn_ts_unparseable = True
+                    elif tick.max_end_turn_ts is None or ts > tick.max_end_turn_ts:
+                        tick.max_end_turn_ts = ts
 
         # Sidechain blocks are always emitted (keep-alive above is
         # already unconditional); display gating is PER-RECIPIENT via

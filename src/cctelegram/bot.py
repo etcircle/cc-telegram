@@ -910,6 +910,18 @@ async def apply_sidechain_activity(
                 await route_runtime.seed_idle_and_mark_background_agent_launched(
                     route, key
                 )
+            # Fix C (2026-07-08): resumed background agents (SendMessage with a
+            # resumedAgentId) — applied AFTER launched and BEFORE activity/done
+            # (Codex r1 P3: a same-tick resume must not stay blocked by the
+            # tombstone its own batch is popping). The resume ts (the parent
+            # tool_result event ts) is stored on the runtime record so a stale
+            # prior-leg sidechain end_turn — this batch OR any later one — never
+            # tombstones the relit key. The seed twin lifts an unseeded
+            # post-restart parent.
+            for key, resume_ts in rec.resumed.items():
+                await route_runtime.seed_idle_and_mark_background_agent_resumed(
+                    route, key, resume_ts
+                )
             # ISSUE-6 / Fix 2c (DESIGN B): the Workflow bracket's mtime-advance
             # heartbeat — a SEPARATE channel from rec.ticks (run-state never
             # consumes a Workflow's sidechain entries). Placed after the launch
@@ -924,9 +936,25 @@ async def apply_sidechain_activity(
                 )
             for key, tick in rec.ticks.items():
                 if tick.saw_end_of_turn:
-                    await route_runtime.mark_background_agent_done(route, key)
+                    # Fix C: SIDECHAIN-source done — a DIFFERENT file from the
+                    # parent resume, so timestamp-gated at the route_runtime seam
+                    # against the record's resumed_event_ts (a stale prior-leg
+                    # end_turn keeps a resumed key LIVE; a genuine fast-finish or
+                    # an unparseable ts tombstones fail-closed).
+                    await route_runtime.mark_background_agent_done(
+                        route,
+                        key,
+                        source=route_runtime.BgDoneSource.SIDECHAIN,
+                        end_turn_ts=tick.max_end_turn_ts,
+                        end_turn_ts_unparseable=tick.end_turn_ts_unparseable,
+                    )
             for key in rec.completed:
-                await route_runtime.mark_background_agent_done(route, key)
+                # Fix C: PARENT-source done (<task-notification>) — same file as
+                # the resume, so the monitor already net-resolved a same-batch
+                # pair by transcript order; UNCONDITIONAL tombstone.
+                await route_runtime.mark_background_agent_done(
+                    route, key, source=route_runtime.BgDoneSource.PARENT
+                )
 
 
 async def handle_new_message(msg: NewMessage, bot: Bot) -> None:

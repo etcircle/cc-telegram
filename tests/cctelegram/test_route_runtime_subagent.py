@@ -426,7 +426,9 @@ async def test_bot_fanout_applies_per_route_per_key_marks(monkeypatch):
         calls.append(("launched", route, key, None))
         return route_runtime.snapshot(route)
 
-    async def fake_done(route, key):
+    async def fake_done(
+        route, key, *, source=None, end_turn_ts=None, end_turn_ts_unparseable=False
+    ):
         calls.append(("done", route, key, None))
         return route_runtime.snapshot(route)
 
@@ -491,7 +493,9 @@ async def test_bot_fanout_same_key_launch_activity_done_in_one_tick(monkeypatch)
         calls.append(("launched", key))
         return route_runtime.snapshot(route)
 
-    async def fake_done(route, key):
+    async def fake_done(
+        route, key, *, source=None, end_turn_ts=None, end_turn_ts_unparseable=False
+    ):
         calls.append(("done", key))
         return route_runtime.snapshot(route)
 
