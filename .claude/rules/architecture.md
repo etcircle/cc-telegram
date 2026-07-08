@@ -84,6 +84,15 @@ Additional modules:
   transcribe.py               ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
   main.py                     ─ CLI entry point
   utils.py                    ─ Shared utilities (app_dir, atomic_write_json)
+  rate_limiter.py             ─ TypingAwareRateLimiter (AIORateLimiter subclass,
+                                transport-plumbing leaf) wired at the Application
+                                construction site. Overrides only process_request
+                                to exempt sendChatAction from the per-GROUP 20/60s
+                                bucket (positive dummy chat_id to the classifier)
+                                while keeping the overall 30/s limiter + RetryAfter
+                                — so multi-topic typing cadence isn't paced by the
+                                message budget. data is classification-only; the
+                                real request body (args) is untouched.
   route_runtime.py            ─ The sole per-route run-state / context-usage /
                                 idle-clear authority. A lock-protected
                                 RouteRuntimeSnapshot interface; owns RunState,

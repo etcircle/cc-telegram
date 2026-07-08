@@ -469,7 +469,10 @@ the cadence holds at `INTERVAL` regardless of sweep cost; a tick that overruns t
 interval triggers a rate-limited WARNING (`_maybe_warn_typing_overrun`, once per
 60s — the future-regression observability hook). The per-iteration body is
 extracted (`_typing_action_tick`) for direct-drive tests; the concurrency is a
-PRESERVATION pin. Send-layer only; no run-state / route_runtime interaction.
+PRESERVATION pin. Send-layer only; no run-state / route_runtime interaction. The
+send-layer group-bucket exemption (`TypingAwareRateLimiter`, see § Rate Limiting)
+completes this true-cadence contract for multi-busy-topic forums — without it the
+concurrent per-route typing sends re-serialize behind the 20/60s group bucket.
 
 **Workflow-tool bracket (ISSUE-6 — extends GH #44 to the `Workflow` tool).**
 GH #44 only detected the `Agent` tool's `run_in_background` (`agentId:` launch +
@@ -1375,9 +1378,10 @@ honest: owner-filtered, NOT private — any forum member can read the message.
 
 ## Rate Limiting
 
-- `AIORateLimiter(max_retries=5)` on the Application (30/s global)
+- `TypingAwareRateLimiter(max_retries=5)` (an `AIORateLimiter` subclass in `rate_limiter.py`) on the Application (30/s global)
 - On 429, AIORateLimiter pauses all concurrent requests (`_retry_after_event`) and retries after the ban
 - On restart, the global bucket is pre-filled (`_level=max_rate`) to avoid burst against Telegram's persisted server-side counter
+- **sendChatAction exemption (2026-07-08):** `TypingAwareRateLimiter.process_request` presents a positive dummy `chat_id` to the classifier for `sendChatAction` only, so typing actions SKIP the per-GROUP bucket (20/60s) while KEEPING the overall 30/s limiter + the RetryAfter machinery. PTB classifies buckets purely on `data["chat_id"]` and ignores `endpoint`; a forum's negative chat_id otherwise routes each typing action through the same message budget as content — which paced multi-topic typing past its ~5s TTL (the indicator blinked with ≥2 busy topics) and starved content sends. Typing sends no message, so group-bucketing it is a classification artifact, not a Telegram limit. The real request body (in `args`) is untouched — `data` is classification metadata only (pinned by `test_rate_limiter.py` against a PTB upgrade). This completes the Fix-B true-cadence contract for multi-busy-topic forums.
 - Status polling interval: 1 second (skips enqueue when queue is non-empty)
 
 ## Performance Optimizations

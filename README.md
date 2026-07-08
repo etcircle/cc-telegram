@@ -381,6 +381,7 @@ src/cctelegram/route_runtime.py           per-route run-state / context-usage / 
 src/cctelegram/transcript_event_adapter.py  TranscriptEvent → route_runtime adapter
 src/cctelegram/md_capture.py              MessageDisplay live-prose reader/accumulator + capture-settings/teardown
 src/cctelegram/_md_display_appender.py    tiny stdlib MessageDisplay hook (appends deltas; never imports the package)
+src/cctelegram/rate_limiter.py            TypingAwareRateLimiter (exempts sendChatAction from the per-group bucket)
 tests/                              pytest suite
 tests/scenarios/                    black-box behavior floor (@pytest.mark.scenario)
 bin/post-wave-check.sh              repo-health diff for the architecture campaign
