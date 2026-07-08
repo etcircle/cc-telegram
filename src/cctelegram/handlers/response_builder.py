@@ -249,6 +249,43 @@ def background_bash_task_id_from_meta(meta: object) -> str | None:
     return task_id if isinstance(task_id, str) and task_id else None
 
 
+def resumed_agent_id_from_meta(meta: object) -> str | None:
+    """Extract a RESUMED background agent's id from a ``SendMessage`` resume
+    tool_result's STRUCTURED entry-level ``toolUseResult`` (Fix C, 2026-07-08).
+
+    A ``SendMessage`` to an already-existing agent (the multi-leg orchestration
+    "nudge" pattern) writes a tool_result whose entry-level ``toolUseResult``
+    carries a non-empty ``resumedAgentId`` (verified real JSONL, Claude Code
+    2.1.204: ``{"success": true, "message": "Agent \\"<id>\\" had no active
+    task; resumed from transcript in the background …", "resumedAgentId":
+    "<id>"}``). That id EQUALS the agent's ``agentId`` and the
+    ``<task-notification>`` close key, so the resume/launch/close keys are the
+    SAME bare id (no namespace prefix) — the resumed agent's next stop
+    re-tombstones via the existing done path with ZERO new close code.
+
+    ``meta`` is the raw ``ParsedEntry.tool_result_meta`` (the JSONL
+    ``toolUseResult`` dict, or ``None`` / a non-dict). Returns the raw agent id
+    (normalize with ``route_runtime.normalize_background_agent_key`` before
+    keying) or ``None``. Keys on ``resumedAgentId`` PRESENCE ONLY — never
+    ``status`` / ``success`` / prose. Non-str / empty / whitespace-only reject.
+
+    FOUR-WAY DISJOINT with the other three launch shapes (verified): a plain
+    Agent carries ``agentId`` + ``status``; a Workflow carries ``taskId`` +
+    ``status``; a background Bash carries ``backgroundTaskId``; a resume carries
+    NONE of those (only ``resumedAgentId``) — so this returns ``None`` for the
+    other three metas, and ``async_agent_launch_id_from_meta`` /
+    ``workflow_launch_info_from_meta`` / ``background_bash_task_id_from_meta``
+    return ``None`` for a resume meta. The caller scopes it to
+    ``tool_name == "SendMessage"`` tool_results.
+    """
+    if not isinstance(meta, dict):
+        return None
+    rid = meta.get("resumedAgentId")
+    if not isinstance(rid, str) or not rid.strip():
+        return None
+    return rid
+
+
 def _render_task_notification(text: str) -> str | None:
     """Render an external `<task-notification>` envelope as a clean card.
 
