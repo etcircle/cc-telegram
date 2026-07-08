@@ -2572,6 +2572,71 @@ def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
     )
 
 
+def decision_prompt_fingerprint(form: AskUserQuestionForm) -> str:
+    """Body-inclusive identity for a Stage-B2 ``Decision`` prompt (§3b).
+
+    The AUQ ``fingerprint`` (``_canonical_repr``) cannot tell two folder-trust
+    prompts for DIFFERENT directories apart — their title + option labels are
+    identical and only the body path differs — so a stale ``dcp:`` tap on
+    prompt A could dispatch into a byte-identical prompt B for another
+    directory. This canonical folds the prompt BODY in.
+
+    Assembled ONLY from STRUCTURED parse fields — never regex-stripped raw text:
+
+      - a literal ``"decision:"`` DOMAIN PREFIX — so the hashed input, and hence
+        the 8-char ``fp8`` slice used for the shared ``auq_action_ledger.jsonl``
+        key, can NEVER collide with the AUQ lane's bare ``_canonical_repr``
+        (cross-lane fp8 collision is impossible BY CONSTRUCTION — §8);
+      - the title VERBATIM (``current_question_title``; ``None`` → empty — NO
+        regex mutation);
+      - the excerpt BODY lines between the prompt-block top and the option-block
+        top, VERBATIM (only per-line trailing-whitespace trim + blank-line drop
+        — leading bytes preserved);
+      - per-option ``number:label`` pairs exactly as ``_parse_numbered_options``
+        emitted them (the parser isolates the leading ``❯`` cursor STRUCTURALLY,
+        so a label never carried the glyph).
+
+    NO glyph stripping of title / body bytes, EVER: a directory path carrying a
+    literal ``❯`` / ``☑`` / ``[x]`` keeps its bytes, so it can never collide with
+    its stripped twin (round-2 P1-2). Cursor-blindness comes from EXCLUDING the
+    per-option cursor METADATA, not from mutating text — moving the ``❯`` cursor
+    across option rows does NOT rotate the identity (the ``dcp:`` dispatch
+    NAVIGATES the cursor before committing, so the identity must stay
+    cursor-stable, mirroring ``_canonical_repr``).
+
+    Returns a stable 16-char hex digest (``sha1[:16]`` — the repo fingerprint
+    convention, matching ``AskUserQuestionForm.fingerprint``).
+    """
+    title = form.current_question_title or ""
+    body_lines: list[str] = []
+    excerpt_lines = form.pane_excerpt.split("\n") if form.pane_excerpt else []
+    if excerpt_lines:
+        footer_idx: int | None = None
+        for i in range(len(excerpt_lines) - 1, -1, -1):
+            if _RE_DECISION_FOOTER.search(excerpt_lines[i]):
+                footer_idx = i
+                break
+        option_top = (
+            _decision_option_block_top(excerpt_lines, footer_idx)
+            if footer_idx is not None
+            else None
+        )
+        # ``parse_generic_decision`` sets ``excerpt_start = prompt_top_idx`` when a
+        # title was resolved, so the title occupies excerpt line 0; with no title
+        # the excerpt begins at the option block and there is no body to walk.
+        body_start = 1 if form.current_question_title is not None else 0
+        body_end = option_top if option_top is not None else len(excerpt_lines)
+        for line in excerpt_lines[body_start:body_end]:
+            trimmed = line.rstrip()
+            if trimmed:
+                body_lines.append(trimmed)
+    parts = ["decision:", f"T:{title}"]
+    parts.extend(f"B:{b}" for b in body_lines)
+    parts.extend(f"O:{o.number}:{o.label}" for o in form.options)
+    canonical = "\n".join(parts)
+    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 # Wire the strict variant parsers as the gate patterns' S-8 post-validators
 # (the parsers are defined here, far below ``UI_PATTERNS``; ``UIPattern`` is
 # frozen, so rebuild the validated entries in place via ``replace``). After
