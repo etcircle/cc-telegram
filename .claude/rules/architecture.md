@@ -167,14 +167,27 @@ Additional modules:
                                 last_assistant_turn_ended_at, fail-closed),
                                 mark_background_agent_launched (⇒
                                 is_background, never pruned; fed by THREE
-                                structured launch sources — Agent agentId,
-                                Workflow wf-task:<taskId>, and the T1.2 bare
-                                background Bash backgroundTaskId
-                                [response_builder.background_bash_task_id_from_meta,
-                                keyed on backgroundTaskId PRESENCE — the three
-                                async-launch meta shapes are disjoint]; the bash
-                                key is BARE so it == its <task-notification>
-                                close key, no bracket),
+                                live launch sources, EACH WITH ITS OWN
+                                ANCHORING — they are NOT uniformly structured:
+                                (1) Agent/Task agentId — at the LIVE monitor
+                                seam PROSE-anchored ONLY
+                                (extract_async_agent_launch_id on the
+                                `agentId:` tool_result line; the structured
+                                async_agent_launch_id_from_meta runs ONLY in
+                                the startup reconciler, so LIVE Agent launch
+                                recording is NOT meta-drift-proof — a prose
+                                drift silently stops it; disclosed);
+                                (2) Workflow wf-task:<taskId> —
+                                structured-PRIMARY
+                                (workflow_launch_info_from_meta) with a
+                                WARNING-logged prose fallback;
+                                (3) T1.2 background Bash backgroundTaskId —
+                                structured-ONLY
+                                (background_bash_task_id_from_meta, keyed on
+                                backgroundTaskId PRESENCE; prose NEVER lifts —
+                                the three async-launch META shapes are
+                                disjoint). The bash key is BARE so it == its
+                                <task-notification> close key, no bracket),
                                 seed_idle_and_mark_background_agent_launched
                                 (PR-1 Half B: the launched mark but SEEDS an
                                 IDLE_CLEARED+seen _RouteState if the route is

@@ -308,20 +308,31 @@ a buffered pre-end-of-turn flush fails closed; active/WAITING recording is
 unconditional but foreground-presumed); `mark_background_agent_launched`
 registers `is_background=True` from the parent's async-launch tool_result so
 the key survives the parent's end-of-turn regardless of sidechain batching.
-It is fed by THREE structured launch sources the monitor collects on the
-parent parse path — a plain Agent/Task `agentId`, a Workflow
-`wf-task:<taskId>` bracket key, and (**typing-unification T1.2, 2026-07-08**)
-a **background Bash `backgroundTaskId`** (`response_builder.background_bash_task_id_from_meta`
-over the tool_result's entry-level `toolUseResult`; keyed on
-`backgroundTaskId` PRESENCE only — the three async-launch meta shapes are
-disjoint, so an Agent/Workflow meta returns None and a Bash meta returns None
-from the other two parsers). The background Bash key is the **bare** task id
+It is fed by THREE launch sources the monitor collects on the parent parse
+path, **each with its OWN anchoring — they are NOT uniformly structured** (the
+round-1 fold-log correction): **(1) the plain Agent/Task `agentId`** — at the
+LIVE monitor seam this branch is **PROSE-anchored ONLY**
+(`extract_async_agent_launch_id` on the `agentId:` tool_result line); its
+structured discriminator `async_agent_launch_id_from_meta` runs ONLY in the
+startup reconciler, so LIVE Agent launch recording is NOT meta-drift-proof — a
+CC version that drops/renames the prose line while keeping the structured
+`agentId` silently stops live Agent launches from recording (a known,
+disclosed drift surface). **(2) the Workflow `wf-task:<taskId>` bracket key**
+— structured-PRIMARY (`workflow_launch_info_from_meta` over the entry-level
+`toolUseResult`) with a WARNING-logged prose fallback. **(3)
+(typing-unification T1.2, 2026-07-08) the background Bash
+`backgroundTaskId`** — structured-ONLY
+(`response_builder.background_bash_task_id_from_meta` over the tool_result's
+entry-level `toolUseResult`; keyed on `backgroundTaskId` PRESENCE only — the
+three async-launch META shapes are disjoint, so an Agent/Workflow meta returns
+None here and a Bash meta returns None from the other two meta parsers; prose
+NEVER lifts). The background Bash key is the **bare** task id
 (no `wf-task:` prefix), so it EQUALS the completion `<task-notification>`
 `<task-id>` — the launch/close key parity, with NO bracket (a background Bash
 has no sidechain dir to heartbeat; it ages by the background TTL and closes on
-its `<task-notification>`). A prose-only launch (structured meta absent) NEVER
-lifts — the Bash-scoped, rate-limited (once per tool_use_id) T1.6 drift
-WARNING fires instead. **Clears**: `mark_background_agent_done` on the agent's
+its `<task-notification>`). A prose-only BASH launch announcement (structured
+meta absent) NEVER lifts — the Bash-scoped, rate-limited (once per
+tool_use_id) T1.6 drift WARNING fires instead. **Clears**: `mark_background_agent_done` on the agent's
 own sidechain end-of-turn (lifecycle-only markers included) and on the
 parent's `<task-notification>` task-id (extracted monitor-side, applied
 after lifecycle dispatch); the wall-clock heartbeat TTL (`_wall_now()`

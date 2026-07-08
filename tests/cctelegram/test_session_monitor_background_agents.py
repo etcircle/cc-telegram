@@ -1529,36 +1529,70 @@ async def test_bg_bash_drift_warning_is_rate_limited_per_tool_use_id(
     make_tool_result_block,
     caplog,
 ):
-    """T1.6 rate-limit: the same drift tool_result re-observed across polls warns
-    ONCE (keyed by tool_use_id)."""
+    """T1.6 rate-limit: a re-observed drift launch with the SAME tool_use_id warns
+    ONCE — and the test PROVES the Bash branch was genuinely reached on the
+    re-observation (hermes fold 2026-07-08: the earlier shape re-appended only the
+    lone tool_result, whose tool_use pairing was already consumed on poll 1, so
+    ``tool_name`` was no longer ``"Bash"`` and the branch was never REACHED — the
+    assertion passed vacuously, guard or no guard; empirically reproduced).
+
+    Poll 2 re-appends the FULL tool_use+tool_result pair (same tool_use_id
+    ``tb``), so the same-batch pairing re-yields ``tool_name == "Bash"`` and the
+    branch runs — only ``_bg_bash_drift_warned`` suppresses the second warning.
+    Poll 3 is the reachability proof AND the guard-deletion simulation: clearing
+    the guard set and appending the identical pair fires the warning AGAIN, so
+    (a) poll 2's identical construction provably reached the branch, and (b) if
+    someone deletes the rate-limit guard, poll 2 itself re-warns and the
+    ``== 1`` assertion fails."""
     parent_jsonl, _ = _setup_parent(monitor, tmp_path)
-    entries = [
-        make_jsonl_entry(
-            "assistant",
-            [make_tool_use_block("tb", "Bash", {"command": "sleep 999"})],
-            session_id=PARENT,
-        ),
-        make_jsonl_entry(
-            "user",
+
+    def _launch_pair() -> list[dict]:
+        # Same tool_use_id every time — the rate-limit key under test.
+        return [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("tb", "Bash", {"command": "sleep 999"})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [
+                    make_tool_result_block(
+                        "tb", "Command running in background with ID: byziqxhyh."
+                    )
+                ],
+                session_id=PARENT,
+            ),
+        ]
+
+    def _drift_count() -> int:
+        return len(
             [
-                make_tool_result_block(
-                    "tb", "Command running in background with ID: byziqxhyh."
-                )
-            ],
-            session_id=PARENT,
-        ),
-    ]
+                r
+                for r in caplog.records
+                if "backgroundTaskId is absent/malformed" in r.message
+            ]
+        )
+
     with caplog.at_level("WARNING"):
-        _append(parent_jsonl, entries)
+        _append(parent_jsonl, _launch_pair())
         await monitor.check_for_updates({PARENT})
-        # Re-append the SAME launch tool_result (same tool_use_id) — a second
-        # observation must not re-warn.
-        _append(parent_jsonl, [entries[1]])
+        assert _drift_count() == 1
+        assert "tb" in monitor._bg_bash_drift_warned  # the guard state under test
+
+        # Poll 2: the FULL pair again (same tool_use_id) — pairing re-yields
+        # tool_name=="Bash", the branch RUNS, the guard suppresses the re-warn.
+        _append(parent_jsonl, _launch_pair())
         await monitor.check_for_updates({PARENT})
-    drift = [
-        r for r in caplog.records if "backgroundTaskId is absent/malformed" in r.message
-    ]
-    assert len(drift) == 1
+        assert _drift_count() == 1  # rate-limited (fails if the guard is deleted)
+
+        # Poll 3 (reachability proof): with the guard state cleared, the SAME
+        # construction warns again — so poll 2 provably reached the branch and
+        # the guard was the only suppressor.
+        monitor._bg_bash_drift_warned.clear()
+        _append(parent_jsonl, _launch_pair())
+        await monitor.check_for_updates({PARENT})
+        assert _drift_count() == 2
 
 
 @pytest.mark.asyncio
