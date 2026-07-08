@@ -279,3 +279,157 @@ async def test_sidechain_tick_flags_unparseable_end_turn_ts(
     assert tick.saw_end_of_turn is True
     assert tick.end_turn_ts_unparseable is True
     assert tick.max_end_turn_ts is None
+
+
+def _end_turn_entry(ts: str | None) -> dict:
+    """A raw sidechain assistant entry whose stop_reason ends the turn."""
+    entry: dict = {
+        "type": "assistant",
+        "message": {
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+        },
+        "sessionId": PARENT,
+    }
+    if ts is not None:
+        entry["timestamp"] = ts
+    return entry
+
+
+@pytest.mark.asyncio
+async def test_sidechain_tick_two_end_turns_max_parseable_wins(monitor, tmp_path):
+    """Adversarial pin (Codex+Hermes r1 review fold): the per-tick reduction
+    takes the MAX over the batch's parseable END-TURN timestamps — the EARLIER
+    end-turn appears LATER in the file, so file ordering isn't doing the work.
+    A genuine post-resume end-turn can therefore never be shadowed by a stale
+    one in the same tick (a last-wins or first-wins reduction would report the
+    stale 08:01:30 here and let a resumed key survive a real fast-finish)."""
+    _, sub_dir = _setup_parent(monitor, tmp_path)
+    sc = sub_dir / f"agent-{RID}.jsonl"
+    sc.write_text("")
+    await monitor.check_sidechain_updates({PARENT})  # register at EOF
+    _append(
+        sc,
+        [
+            # The LATER timestamp appears FIRST in the file...
+            _end_turn_entry("2026-06-12T08:06:00.000Z"),
+            # ...and the EARLIER timestamp appears LAST.
+            _end_turn_entry("2026-06-12T08:01:30.000Z"),
+        ],
+    )
+    await monitor.check_sidechain_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    tick = activity[PARENT].ticks[RID]
+    assert tick.saw_end_of_turn is True
+    assert tick.max_end_turn_ts == parse_iso_timestamp("2026-06-12T08:06:00.000Z")
+    assert tick.end_turn_ts_unparseable is False
+
+
+@pytest.mark.asyncio
+async def test_combined_batch_done_resume_and_stale_sidechain_end_turn_stays_live(
+    monitor,
+    tmp_path,
+    monkeypatch,
+    make_jsonl_entry,
+    make_tool_use_block,
+    make_tool_result_block,
+):
+    """END-TO-END composition (Codex+Hermes r1 review fold — real JSONL bytes
+    through the monitor): in ONE poll batch the PARENT transcript gains, in
+    transcript order, a ``<task-notification>`` done for the key THEN a
+    ``SendMessage`` resume tool_result for the SAME key (resume ts strictly
+    later than the sidechain end-turn ts), AND the agent's own sidechain file
+    gains a STALE end_turn entry (ts strictly older than the resume ts).
+
+    Composes the monitor's transcript-order parent-lane net (done→resume ⇒
+    ``.resumed`` XOR ``.completed``) with the runtime-record timestamp gate,
+    through the REAL ``bot.apply_sidechain_activity`` fan-out onto a seeded
+    idle route — the final state must be LIVE (typing lifted, key live)."""
+    from cctelegram import bot as bot_module
+    from cctelegram import route_runtime
+    from cctelegram.route_runtime import RunState, TranscriptLifecycleEvent
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    sc = sub_dir / f"agent-{RID}.jsonl"
+    sc.write_text("")
+    await monitor.check_sidechain_updates({PARENT})  # register at EOF
+    monitor.pop_sidechain_activity()
+
+    stale_end_turn_ts = "2026-07-08T08:00:00.000Z"
+    resume_ts = "2026-07-08T08:06:46.302Z"
+    assert parse_iso_timestamp(stale_end_turn_ts) < parse_iso_timestamp(resume_ts)  # type: ignore[operator]
+
+    # Parent transcript order: <task-notification> done FIRST, resume SECOND
+    # (the nudge-after-stop shape — must net to .resumed).
+    _append(
+        parent_jsonl,
+        [
+            _task_notification_entry(make_jsonl_entry),
+            *_resume_entries(
+                make_jsonl_entry,
+                make_tool_use_block,
+                make_tool_result_block,
+                ts=resume_ts,
+            ),
+        ],
+    )
+    # The agent's sidechain: a STALE prior-leg end_turn (older than the resume).
+    _append(sc, [_end_turn_entry(stale_end_turn_ts)])
+
+    # ONE poll batch over the real files.
+    await monitor.check_for_updates({PARENT})
+    await monitor.check_sidechain_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+
+    # Parent-lane net: the resume superseded the earlier done.
+    assert activity[PARENT].resumed == {RID: parse_iso_timestamp(resume_ts)}
+    assert RID not in activity[PARENT].completed
+    tick = activity[PARENT].ticks[RID]
+    assert tick.saw_end_of_turn is True
+    assert tick.max_end_turn_ts == parse_iso_timestamp(stale_end_turn_ts)
+
+    # Apply through the REAL fan-out onto a seeded idle route.
+    route: route_runtime.Route = (1, 42, "@7")
+    route_runtime.reset_for_tests()
+    try:
+        await route_runtime.ingest_transcript_event(
+            route,
+            TranscriptLifecycleEvent(
+                role="user",
+                block_type="text",
+                tool_use_id=None,
+                tool_name=None,
+                stop_reason=None,
+                timestamp=None,
+            ),
+        )
+        await route_runtime.ingest_transcript_event(
+            route,
+            TranscriptLifecycleEvent(
+                role="assistant",
+                block_type="text",
+                tool_use_id=None,
+                tool_name=None,
+                stop_reason="end_turn",
+                timestamp=100.0,
+            ),
+        )
+        assert route_runtime.snapshot(route).run_state in (
+            RunState.IDLE_RECENT,
+            RunState.IDLE_CLEARED,
+        )
+
+        async def fake_find(session_id: str):
+            return [(1, "@7", 42)]
+
+        monkeypatch.setattr(
+            bot_module.session_manager, "find_users_for_session", fake_find
+        )
+        await bot_module.apply_sidechain_activity(activity)
+
+        snap = route_runtime.snapshot(route)
+        assert snap.typing_eligible is True  # LIVE — the stale done never won
+        assert snap.background_agents == (RID,)
+        assert RID not in route_runtime._state[route].background_agents_done
+    finally:
+        route_runtime.reset_for_tests()

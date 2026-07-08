@@ -282,6 +282,29 @@ async def test_sidechain_done_missing_record_tombstones_fail_closed():
     assert KEY in _st().background_agents_done
 
 
+async def test_resume_with_unparseable_ts_then_sidechain_done_tombstones_fail_closed():
+    """Adversarial pin (Codex+Hermes r1 review fold): a resume HAPPENED but its
+    ts was UNPARSEABLE (``resume_ts=None``) — distinct from the no-resume test
+    above. The record's ``resumed_event_ts`` stays None, so a later sidechain
+    done (with a perfectly parseable end_turn ts) finds no resume-ts authority
+    to compare against and the keep-LIVE gate falls through → TOMBSTONED, the
+    fail-closed direction (with no parseable resume authority the runtime can
+    never prove the end_turn is stale)."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_launched(ROUTE, KEY)  # live key
+    assert KEY in _st().background_agents
+    await route_runtime.mark_background_agent_resumed(ROUTE, KEY, None)
+    assert _st().background_agents[KEY].resumed_event_ts is None  # unparseable
+    await route_runtime.mark_background_agent_done(
+        ROUTE,
+        KEY,
+        source=BgDoneSource.SIDECHAIN,
+        end_turn_ts=200.0,
+        end_turn_ts_unparseable=False,
+    )
+    assert KEY in _st().background_agents_done  # fail-closed to DONE
+
+
 # ── must-have 2: parent done UNCONDITIONAL ───────────────────────────────
 
 

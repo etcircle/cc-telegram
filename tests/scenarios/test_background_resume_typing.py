@@ -181,6 +181,43 @@ async def test_same_batch_stale_end_turn_and_resume_stays_live(
 
 
 @pytest.mark.asyncio
+async def test_same_batch_stale_end_turn_with_newer_activity_stays_live(
+    scenario: ScenarioHarness,
+) -> None:
+    """Adversarial pin (Codex+Hermes r1 review fold): the fan-out must feed
+    ``max_end_turn_ts`` (the DONE-causality field) to the sidechain done seam,
+    NEVER ``max_event_ts`` (the activity max).
+
+    THE POINT: every other test in this file uses
+    ``max_event_ts == max_end_turn_ts``, so a future fan-out edit that
+    accidentally passed ``tick.max_event_ts`` as ``end_turn_ts`` would slip
+    through them all. Here the two fields DIVERGE: resume ts=100.0, activity
+    ``max_event_ts=150.0`` (a NEWER post-resume non-end-turn write, > resume),
+    end-turn ``max_end_turn_ts=90.0`` (a stale prior-leg end_turn, ≤ resume).
+    The correct comparison (end_turn_ts=90 ≤ resume 100) keeps the key LIVE;
+    the buggy comparison (max_event_ts=150 > resume 100) would tombstone it —
+    so this test fails exactly when the fan-out feeds the wrong field."""
+    route = await _bind_idle_route(scenario)
+    await bot_module.apply_sidechain_activity(
+        {
+            _SID: ParentSidechainActivity(
+                resumed={_KEY: 100.0},
+                ticks={
+                    _KEY: SidechainTick(
+                        max_event_ts=150.0,
+                        saw_end_of_turn=True,
+                        max_end_turn_ts=90.0,
+                    )
+                },
+            )
+        }
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True  # NOT tombstoned by the activity max
+    assert snap.background_agents == (_KEY,)
+
+
+@pytest.mark.asyncio
 async def test_same_batch_fast_finish_end_turn_tombstones(
     scenario: ScenarioHarness,
 ) -> None:
