@@ -33,6 +33,7 @@ from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
 from .transcript_parser import BLOCK_ORIGIN_EXIT_PLAN, TranscriptParser
 from .utils import (
+    is_task_notification,
     normalize_background_agent_key,
     parse_iso_timestamp,
     read_cwd_from_jsonl,
@@ -662,6 +663,20 @@ class SessionMonitor:
             content = msg.get("content") if isinstance(msg, dict) else None
             tr: list[str] = []
             tx: list[str] = []
+            # CC 2.1.198 queue-shaped ``<task-notification>`` close (busy
+            # parent): the payload is in top-level ``content``, not
+            # ``message.content``. Mirror the LIVE-parser predicate EXACTLY
+            # (Hermes r2 P2-1: ``operation == "enqueue"`` + full-envelope
+            # ``is_task_notification``) and feed ONLY the plain-text (tx) lane —
+            # close detection reads tx, launch recovery reads ONLY tr, so a
+            # queue-op can never mint a launch, only a close.
+            if (
+                entry.get("type") == "queue-operation"
+                and entry.get("operation") == "enqueue"
+            ):
+                qc = entry.get("content")
+                if isinstance(qc, str) and is_task_notification(qc):
+                    tx.append(qc)
             # A string ``message.content`` is plain assistant text, never a
             # tool_result wrapper → plain lane only.
             if isinstance(content, str):
@@ -766,6 +781,18 @@ class SessionMonitor:
             content = msg.get("content") if isinstance(msg, dict) else None
             tr: list[str] = []
             tx: list[str] = []
+            # CC 2.1.198 queue-shaped ``<task-notification>`` close (busy
+            # parent): the payload is in top-level ``content`` — mirror the
+            # LIVE-parser predicate EXACTLY (Hermes r2 P2-1) and feed ONLY the
+            # plain-text (tx) lane. Close detection reads tx; launch recovery
+            # reads ONLY tr, so a queue-op can never mint an async agent key.
+            if (
+                entry.get("type") == "queue-operation"
+                and entry.get("operation") == "enqueue"
+            ):
+                qc = entry.get("content")
+                if isinstance(qc, str) and is_task_notification(qc):
+                    tx.append(qc)
             if isinstance(content, str):
                 tx.append(content)
             elif isinstance(content, list):
@@ -1400,8 +1427,11 @@ class SessionMonitor:
                     # PARENT transcript — applied by the bot fan-out AFTER
                     # this tick's lifecycle dispatch (which already happened
                     # above), preserving the §4.2 ordering. Deferred import:
-                    # the envelope/agentId extractors live in
-                    # handlers.response_builder (single regex owner).
+                    # the agentId/Workflow launch extractors live in
+                    # handlers.response_builder; the ``<task-notification>``
+                    # envelope helpers moved to ``utils`` (response_builder
+                    # re-exports them) — each predicate has a SINGLE owner so
+                    # the live and restart-scan paths never fork.
                     if entry.content_type == "tool_result" and entry.tool_name in (
                         "Agent",
                         "Task",

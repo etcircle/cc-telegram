@@ -1179,6 +1179,13 @@ class SessionManager:
             return [], 0
 
         parsed_entries, _ = TranscriptParser.parse_entries(entries)
+        # Skip lifecycle-only entries: they exist solely to drive run-state
+        # transitions and have no visible content, so they must not fan out
+        # into /history. The CC 2.1.198 queue-shaped ``<task-notification>``
+        # close synthesizes a lifecycle-only user-text entry with REAL text
+        # (the envelope) — without this filter it would leak into /history;
+        # the pre-existing empty-text lifecycle markers were invisible only by
+        # luck (empty string).
         all_messages = [
             {
                 "role": e.role,
@@ -1187,6 +1194,7 @@ class SessionManager:
                 "timestamp": e.timestamp,
             }
             for e in parsed_entries
+            if not e.lifecycle_only
         ]
 
         return all_messages, len(all_messages)

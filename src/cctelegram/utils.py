@@ -8,16 +8,70 @@ Provides:
     failure) — the SINGLE parse shared by transcript_event_adapter and
     session_monitor so both sides of a timestamp comparison use one clock
     semantics (GH #44).
+  - normalize_background_agent_key(): the GH #44 key-normalization contract.
+  - is_task_notification() / extract_task_notification_task_id(): the SINGLE
+    owner of the ``<task-notification>`` envelope regexes (Codex r2 P1 — moved
+    here from handlers.response_builder, the true leaf, so transcript_parser can
+    synthesize a queue-shaped close with the SAME predicate object the adapter
+    stamps with, without a response_builder→TranscriptParser import cycle;
+    response_builder re-exports both as alias-only for its existing callers).
 """
 
 import json
 import os
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 CC_TELEGRAM_DIR_ENV = "CC_TELEGRAM_DIR"
+
+# The single owner of the external ``<task-notification>`` envelope regexes
+# (Codex r2 P1). ``handlers.response_builder`` re-exports the two public
+# helpers below as alias-only so bot.py / the adapter / session_monitor keep
+# their existing import path; ``transcript_parser`` imports them straight from
+# here (response_builder imports TranscriptParser, so the reverse import would
+# cycle). Byte-0 anchored + full-envelope so the synthesis predicate is exactly
+# the adapter's stamp predicate — a malformed / truncated / suffixed envelope
+# is rejected identically at both ends (mint/validate parity).
+_TASK_NOTIF_RE = re.compile(
+    r"\A<task-notification>(.*?)</task-notification>\s*\Z", re.DOTALL
+)
+_TASK_NOTIF_TAG_RE = re.compile(
+    r"<(?P<tag>task-id|summary|event)>(?P<body>.*?)</(?P=tag)>", re.DOTALL
+)
+
+
+def is_task_notification(text: str) -> bool:
+    """True when the text is an external ``<task-notification>`` envelope.
+
+    Public predicate (plan v4 / codex r2 P3-5): the per-user echo gate in
+    ``bot.handle_new_message`` must EXEMPT these system events from user-echo
+    suppression without duplicating the envelope regexes. Also the CC 2.1.198
+    queue-shaped-close synthesis gate in ``transcript_parser.parse_entries`` —
+    the SAME object the adapter stamps ``is_task_notification`` with.
+    """
+    return _TASK_NOTIF_RE.match(text or "") is not None
+
+
+def extract_task_notification_task_id(text: str) -> str | None:
+    """Extract ``<task-id>`` from a ``<task-notification>`` envelope.
+
+    Public extractor beside the predicate (GH #44, codex r3 P3-1 — the
+    predicate alone returns bool). For a background async agent the task-id
+    IS the agent key (== the sidechain ``agent-<id>.jsonl`` stem minus the
+    prefix; fixture-verified). ``None`` when the text is not a recognizable
+    envelope or carries no task-id.
+    """
+    m = _TASK_NOTIF_RE.match(text or "")
+    if not m:
+        return None
+    for tm in _TASK_NOTIF_TAG_RE.finditer(m.group(1)):
+        if tm.group("tag") == "task-id":
+            body = tm.group("body").strip()
+            return body or None
+    return None
 
 
 def normalize_background_agent_key(raw: str) -> str:

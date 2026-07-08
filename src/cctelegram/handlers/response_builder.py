@@ -20,41 +20,22 @@ from ..markdown_v2 import convert_markdown_tables
 from ..telegram_sender import split_message
 from ..transcript_parser import TranscriptParser
 
-_TASK_NOTIF_RE = re.compile(
-    r"\A<task-notification>(.*?)</task-notification>\s*\Z", re.DOTALL
+# The ``<task-notification>`` envelope helpers moved to ``utils`` (the true leaf
+# — this module imports ``TranscriptParser``, so ``utils.py`` must own them to
+# avoid an import cycle when ``transcript_parser`` needs the SAME predicate
+# object it synthesizes the CC 2.1.198 queue-shaped close with; Codex r2 P1).
+# Re-exported here ALIAS-ONLY (identical objects, never wrappers — the redundant
+# ``as`` marks the intentional re-export) so bot.py / transcript_event_adapter /
+# session_monitor keep their existing ``handlers.response_builder`` import path,
+# and ``route_runtime``'s genuine-user vs task-notification branch keys on the
+# SAME predicate the parser synthesizes with. ``_render_task_notification``
+# below uses the two regexes directly.
+from ..utils import _TASK_NOTIF_RE as _TASK_NOTIF_RE
+from ..utils import _TASK_NOTIF_TAG_RE as _TASK_NOTIF_TAG_RE
+from ..utils import (
+    extract_task_notification_task_id as extract_task_notification_task_id,
 )
-_TASK_NOTIF_TAG_RE = re.compile(
-    r"<(?P<tag>task-id|summary|event)>(?P<body>.*?)</(?P=tag)>", re.DOTALL
-)
-
-
-def is_task_notification(text: str) -> bool:
-    """True when the text is an external ``<task-notification>`` envelope.
-
-    Public predicate (plan v4 / codex r2 P3-5): the per-user echo gate in
-    ``bot.handle_new_message`` must EXEMPT these system events from user-echo
-    suppression without duplicating the envelope regexes.
-    """
-    return _TASK_NOTIF_RE.match(text or "") is not None
-
-
-def extract_task_notification_task_id(text: str) -> str | None:
-    """Extract ``<task-id>`` from a ``<task-notification>`` envelope.
-
-    Public extractor beside the predicate (GH #44, codex r3 P3-1 — the
-    predicate alone returns bool). For a background async agent the task-id
-    IS the agent key (== the sidechain ``agent-<id>.jsonl`` stem minus the
-    prefix; fixture-verified). ``None`` when the text is not a recognizable
-    envelope or carries no task-id.
-    """
-    m = _TASK_NOTIF_RE.match(text or "")
-    if not m:
-        return None
-    for tm in _TASK_NOTIF_TAG_RE.finditer(m.group(1)):
-        if tm.group("tag") == "task-id":
-            body = tm.group("body").strip()
-            return body or None
-    return None
+from ..utils import is_task_notification as is_task_notification
 
 
 # The async-launch background discriminator (GH #44 §3.2a). Anchored on the

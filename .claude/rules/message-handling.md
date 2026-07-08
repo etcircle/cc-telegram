@@ -366,7 +366,28 @@ meta absent) NEVER lifts — the Bash-scoped, rate-limited (once per
 tool_use_id) T1.6 drift WARNING fires instead. **Clears**: `mark_background_agent_done` on the agent's
 own sidechain end-of-turn (lifecycle-only markers included) and on the
 parent's `<task-notification>` task-id (extracted monitor-side, applied
-after lifecycle dispatch); the wall-clock heartbeat TTL (`_wall_now()`
+after lifecycle dispatch). **Queue-shaped close lane (CC 2.1.198 OBSERVED
+invariant, 2026-07-08):** when a background task completes while the PARENT is
+BUSY, CC does NOT write a `type:"user"` delivery entry — it writes the
+`<task-notification>` as a `{"type":"queue-operation","operation":"enqueue",
+"content":<envelope>}` entry (the COMPLETION timestamp), then an
+`attachment`/`queued_command` entry (same COMPLETION timestamp) which never
+becomes a user entry. `transcript_parser.parse_entries` dropped both, so the
+close never tombstoned and typing stranded to the 2 h `is_background` TTL. Fix:
+the parser SYNTHESIZES a `lifecycle_only` user-text entry from the enqueue line
+(top-level `content`, `utils.is_task_notification` gated — the SAME predicate
+the adapter stamps with), so it rides the EXISTING extraction branch
+(`rec.completed` → `mark_background_agent_done` + the Fix C resume-vs-done NET
+in true transcript order + the `wf-task:` bracket close) identically to the
+parent-idle user-entry shape; the `attachment` lane stays intentionally unparsed
+(strictly redundant with the enqueue line — attachment-only delivery is a
+documented UNSUPPORTED shape). The `queue-operation` line carries a **COMPLETION**
+timestamp; the parent-idle `type:"user"` delivery a **DELIVERY** timestamp
+(~74 ms later) — ts-qualified notification clears compare against whichever
+event carries the clear. The startup reconciler scans read the SAME queue-op
+lane (tx/plain-text only, so it can never mint a launch — the restart
+false-relight fix). Older CC without queue-op lines degrades to the user-entry
+path (no regression). The wall-clock heartbeat TTL (`_wall_now()`
 injectable; expire-before-classify deletes a stale record before NEW/EXISTING
 classification so a late None-ts batch can never relift) — **PER-KEY since the
 typing-unification T2 split (2026-07-08): a foreground-presumed key
@@ -524,7 +545,14 @@ GATE-ON-BRACKET ONLY:** the
 `<task-notification>` emits the `wf-task:<id>` close key (→
 `mark_background_agent_done` tombstone) IFF a live open bracket exists — never
 guessing a Workflow id from its character set; an isolated close with no
-bracket has no route_runtime key to tombstone, so the bare key suffices.
+bracket has no route_runtime key to tombstone, so the bare key suffices. The
+close is caught in BOTH observed CC 2.1.198 shapes: a parent-idle
+`type:"user"` delivery (DELIVERY timestamp) AND — new (2026-07-08) — a
+busy-parent `queue-operation`/`enqueue` entry (COMPLETION timestamp) that the
+parser now synthesizes into the same `<task-notification>` user-text entry, so
+the `wf-task:` bracket closes even when the parent was busy at completion (the
+same extraction branch fires for both; the startup scan reads the queue-op lane
+tx-only too).
 Out-of-order done-before-launch fail-closes (the done tombstone no-ops the
 later launch). The bracket is now MARKED `closing` (not popped immediately) so
 the Fix 5 display path tails its `wf_dir` one final time before teardown (see
