@@ -1624,10 +1624,17 @@ class TestAssertNavDispatchable:
         q.answer.assert_awaited_once_with("Picker closed, refreshing", show_alert=False)
 
     @pytest.mark.asyncio
-    async def test_visible_pane_unknown_proceeds(self):
-        # CB1: empty visible capture (alt-screen / redraw race) is UNKNOWN.
-        # MUST NOT short-circuit — that would destroy a live picker the
-        # very next frame brings back.
+    async def test_visible_pane_empty_ambiguous_shape_refuses(self):
+        # SUPERSEDES the original CB1 "empty visible proceeds" pin (B2.3 review
+        # r2, dual P1): an un-suffixed payload + an EMPTY nav-generation
+        # registry is the AMBIGUOUS shape — the card may be a pre-B2.3 gate —
+        # and an empty/mid-redraw capture is NOT legacy proof, so it fails
+        # CLOSED with the refresh answer. A legacy AUQ tap merely re-taps once
+        # the pane settles; nothing is destroyed — the refuse never clears the
+        # card (unlike the absent-branch cleanup CB1 originally feared).
+        # CB1's UNKNOWN-proceeds rule still governs a CONTENTFUL unknown pane
+        # (pinned by test_legacy_unsuffixed_auq_nav_byte_neutral in
+        # test_decision_nav_generation.py).
         from cctelegram.handlers import interactive_ui as iui
 
         iui._interactive_msgs[(42, 7)] = 999
@@ -1650,9 +1657,10 @@ class TestAssertNavDispatchable:
             ),
         ):
             result = await iui.assert_nav_dispatchable(q, 42, 7, "@0")
-        # Proceed: returns the live window object, no short-circuit answer.
-        assert result is fake_window
-        q.answer.assert_not_called()
+        assert result is None
+        q.answer.assert_awaited_once_with(
+            "Card refreshed — use the current card", show_alert=False
+        )
 
     @pytest.mark.asyncio
     async def test_picker_present_returns_window(self):

@@ -1409,7 +1409,17 @@ async def assert_nav_dispatchable(
     # Workflow) pane REFUSES fail-closed before any key (the poller re-renders
     # the card with a fresh suffixed keyboard within ~1s); an AUQ / EPM / other
     # pane proceeds down the legacy path unchanged.
-    if _gate_pane_recheck_needed and visible:
+    if _gate_pane_recheck_needed:
+        if not visible or not visible.strip():
+            # r2 dual P1: an EMPTY/mid-redraw capture in the AMBIGUOUS shape
+            # (un-suffixed payload + empty registry) is NOT legacy proof — with
+            # no persisted surface-kind authority and no pane bytes, the card
+            # may be a pre-B2.3 gate whose raw key would land on a live gate.
+            # Fail CLOSED (a legacy AUQ tap merely re-taps once the pane
+            # settles; the CB1 UNKNOWN-proceeds rule stays for the UNambiguous
+            # legacy paths below, not this branch).
+            await safe_answer(query, "Card refreshed — use the current card")
+            return None
         gate_content = extract_interactive_content(visible)
         if gate_content is not None and gate_content.name in _GATE_RENDER_NAMES:
             await safe_answer(query, "Card refreshed — use the current card")

@@ -264,6 +264,15 @@ async def test_commit_no_resolve_records_commit_unconfirmed_unreleased(
     finalize.assert_not_awaited()  # never terminal-teardown on an unconfirmed
 
 
+def test_classify_advance_empty_capture_fails_closed() -> None:
+    """r2 Hermes P2: an EMPTY/blank post-Enter capture is NOT positive absence
+    proof of the committed prompt ("we didn't see the thing") — it must classify
+    False (⇒ commit_unconfirmed, unreleased), never a false ``dispatched`` that
+    would finalize the card and release the single-use ledger key."""
+    assert cbi._classify_decision_advance("", "decision:abc") is False
+    assert cbi._classify_decision_advance("   \n\n  ", "decision:abc") is False
+
+
 def test_parse_nav_payload_suffixed_and_legacy() -> None:
     """Round-4 guardrail 1: ``(window_id, gen)`` parses BEFORE the window is used.
 

@@ -761,10 +761,13 @@ def _classify_decision_advance(pane2: str, minted_fingerprint: str) -> bool:
         different fp = the committed prompt resolved and a NEW one raised within
         the settle → resolved (§11-5).
       * extractor → ANOTHER named interactive UI, or None: ``dispatched`` ONLY
-        when no Decision footer/marker line remains on the pane (the committed
-        fingerprint is positively absent); a still-present footer — under a
-        named UI that stole first-match, or an unparseable frame — is AMBIGUOUS
-        → unconfirmed, never dispatched.
+        when the capture is NON-EMPTY and no Decision footer/marker line remains
+        on it (the committed fingerprint is positively absent from an actually
+        observed frame); a still-present footer — under a named UI that stole
+        first-match, or an unparseable frame — is AMBIGUOUS → unconfirmed, never
+        dispatched. An EMPTY/blank capture is NOT absence proof ("we didn't see
+        the thing" — r2 Hermes P2): it fails closed to unconfirmed rather than
+        falsely finalizing + releasing the single-use key.
     """
     content = extract_interactive_content(pane2)
     if content is not None and content.name == "Decision":
@@ -773,6 +776,8 @@ def _classify_decision_advance(pane2: str, minted_fingerprint: str) -> bool:
             # Extractor/validator disagreement — ambiguous, fail closed.
             return False
         return decision_prompt_fingerprint(aform) != minted_fingerprint
+    if not pane2 or not pane2.strip():
+        return False  # empty capture ≠ positive absence proof (r2 Hermes P2)
     return not any(_is_decision_footer_line(line) for line in pane2.split("\n"))
 
 

@@ -136,6 +136,23 @@ async def test_pre_deploy_unsuffixed_gate_card_empty_registry_refuses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_deploy_unsuffixed_empty_pane_capture_refuses() -> None:
+    """r2 dual P1: in the AMBIGUOUS shape (un-suffixed payload + empty registry)
+    an EMPTY/mid-redraw capture is NOT legacy proof — with no persisted
+    surface-kind authority and no pane bytes, the card may be a pre-B2.3 gate
+    whose raw key would land on a live gate. Fail closed. (Empty/whitespace
+    captures classify liveness "unknown", so they REACH the recheck branch —
+    verified against visible_pane_liveness; the earlier absent-branch does not
+    swallow this shape.)"""
+    _seed_surface()
+    assert dt.current_nav_generation(_WID) is None
+    for blank in ("", "   \n\n  "):
+        w, q = await _call(None, pane=blank)
+        assert w is None
+        assert q.answers[-1] == ("Card refreshed — use the current card", False)
+
+
+@pytest.mark.asyncio
 async def test_legacy_unsuffixed_auq_nav_byte_neutral() -> None:
     """The non-regression companion (review r1 P1 test (c)): gen=None + no gate
     generation + an AUQ pane → the legacy nav path still dispatches unchanged."""
