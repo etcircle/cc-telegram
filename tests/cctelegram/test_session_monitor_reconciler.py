@@ -22,8 +22,13 @@ import time
 
 import pytest
 
-from cctelegram.route_runtime import BG_AGENT_TTL_SECONDS
 from cctelegram.session_monitor import SessionInfo, SessionMonitor, TrackedSession
+
+# typing-unification T2.3: the "stale" threshold is the reconciler's fresh
+# window (``_RECONCILE_FRESH_WINDOW_S`` = 7200s post-split), NOT
+# ``route_runtime.BG_AGENT_TTL_SECONDS`` (the FOREGROUND 1800s constant, which
+# would now fall INSIDE the widened window and mis-mark a stale dir as fresh).
+_STALE_WINDOW_S = SessionMonitor._RECONCILE_FRESH_WINDOW_S
 
 PARENT = "parent-sid"
 RUNID = "wf_54f46aea-ba6"
@@ -174,7 +179,7 @@ async def test_staleness_old_mtime_no_lift_and_no_scan(monitor, tmp_path):
     parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
     wf = _wf_dir(proj_dir)
     _make_fresh_agent_file(wf)
-    stale = time.time() - (BG_AGENT_TTL_SECONDS + 600)
+    stale = time.time() - (_STALE_WINDOW_S + 600)
     os.utime(wf / "agent-aaa.jsonl", (stale, stale))
     _append(parent_jsonl, [_launch_entry(_launch_text(proj_dir))])
 
@@ -311,7 +316,7 @@ async def test_fresh_dir_not_starved_by_many_stale_dirs(monitor, tmp_path):
     fresh dir out of the per-tick cap — the cap bounds FRESH candidates, the stale
     dirs are filtered out first."""
     parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
-    stale_ts = time.time() - (BG_AGENT_TTL_SECONDS + 600)
+    stale_ts = time.time() - (_STALE_WINDOW_S + 600)
     for i in range(monitor._RECONCILE_MAX_WF_DIRS + 5):
         d = _wf_dir(proj_dir, runid=f"wf_stale{i:03d}")
         _make_fresh_agent_file(d)
@@ -478,7 +483,7 @@ async def test_agent_stale_mtime_no_lift(monitor, tmp_path):
     parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
     p = _agent_file(proj_dir)
     _append(parent_jsonl, [_agent_launch_entry()])
-    old = time.time() - (BG_AGENT_TTL_SECONDS + 60)
+    old = time.time() - (_STALE_WINDOW_S + 60)
     os.utime(p, (old, old))
     await monitor._reconcile_workflow_brackets_on_startup(_current_map())
     assert monitor.pop_sidechain_activity() == {}

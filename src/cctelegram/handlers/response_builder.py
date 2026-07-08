@@ -217,6 +217,38 @@ def extract_workflow_launch_task_id(text: str) -> str | None:
     return info.task_id if info else None
 
 
+def background_bash_task_id_from_meta(meta: object) -> str | None:
+    """Extract a ``run_in_background`` Bash task id from the STRUCTURED
+    entry-level ``toolUseResult`` (typing-unification T1.1, 2026-07-08).
+
+    A ``Bash`` tool call with ``run_in_background=true`` writes a tool_result
+    whose entry-level ``toolUseResult`` carries a non-empty ``backgroundTaskId``
+    (verified real JSONL, Claude Code 2.1.197:
+    ``{"stdout":"","stderr":"", ..., "backgroundTaskId":"byziqxhyh"}``). That id
+    EQUALS the ``<task-notification>`` ``<task-id>`` fired on completion, so the
+    launch and close keys are the SAME bare id — no namespace prefix (unlike
+    ``wf-task:``).
+
+    ``meta`` is the raw ``ParsedEntry.tool_result_meta`` (the JSONL
+    ``toolUseResult`` dict, or ``None`` / a non-dict). Returns the raw task id
+    (normalize with ``route_runtime.normalize_background_agent_key`` before
+    keying) or ``None`` when ``meta`` is not a background-Bash launch result.
+
+    Keys on ``backgroundTaskId`` PRESENCE ONLY — never ``status`` or prose. The
+    three async-launch shapes are DISJOINT: a plain Agent carries ``agentId`` +
+    ``status=="async_launched"``; a Workflow carries ``taskId`` +
+    ``status=="async_launched"``; a background Bash carries NEITHER ``status``
+    NOR ``agentId``/``taskId`` — so this returns ``None`` for the other two, and
+    ``async_agent_launch_id_from_meta`` / ``workflow_launch_info_from_meta``
+    return ``None`` for a Bash meta. The caller scopes it to
+    ``tool_name == "Bash"`` tool_results.
+    """
+    if not isinstance(meta, dict):
+        return None
+    task_id = meta.get("backgroundTaskId")
+    return task_id if isinstance(task_id, str) and task_id else None
+
+
 def _render_task_notification(text: str) -> str | None:
     """Render an external `<task-notification>` envelope as a clean card.
 
