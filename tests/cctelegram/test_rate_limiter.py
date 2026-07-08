@@ -121,8 +121,13 @@ async def test_real_request_body_carries_negative_chat_id():
     # group chat id — the classification dummy never leaked into the request.
     assert recorded["args"][1] is data
     assert recorded["args"][1]["chat_id"] == _GROUP_CHAT_ID
-    # The original data object was NOT mutated by the classification copy.
-    assert data["chat_id"] == _GROUP_CHAT_ID
+    # The original data object was NOT mutated by the classification copy —
+    # the WHOLE dict, not just the chat_id key (hermes diff-review P2 fold).
+    assert data == {
+        "chat_id": _GROUP_CHAT_ID,
+        "message_thread_id": 42,
+        "action": "typing",
+    }
 
 
 async def test_overall_limiter_still_applies_to_typing():

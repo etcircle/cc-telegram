@@ -1,5 +1,4 @@
-"""Transport-plumbing leaf: an AIORateLimiter that exempts sendChatAction from
-the per-GROUP bucket.
+"""AIORateLimiter subclass exempting sendChatAction from the per-group bucket.
 
 Purpose: typing indicators (``sendChatAction``) are not messages, but
 python-telegram-bot's rate limiter classifies every request purely on
