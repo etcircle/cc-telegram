@@ -306,6 +306,8 @@ class NotificationClearReason(Enum):
       - ``END_OF_TURN`` — a strictly-newer authoritative end-of-turn.
       - ``TASK_NOTIFICATION`` — a strictly-newer ``<task-notification>`` user
         event (machine-initiated completion).
+      - ``TEAMMATE_NOTIFICATION`` — a strictly-newer agent-teams teammate
+        user event (GH #46; machine-initiated, the teammate parked/reported).
       - ``INVARIANT`` — pending-without-set_at corruption cleared as expired
         (also the narration text/thinking invariant-only clear, Fix 1).
       - ``PANE_RUNNING`` — the poller observed the pane RUNNING sufficiently
@@ -328,6 +330,7 @@ class NotificationClearReason(Enum):
     TOOL_RESULT = "tool_result"
     END_OF_TURN = "end_of_turn"
     TASK_NOTIFICATION = "task_notification"
+    TEAMMATE_NOTIFICATION = "teammate_notification"
     INVARIANT = "invariant"
     PANE_RUNNING = "pane_running"
     BG_RUNNING = "bg_running"
@@ -356,12 +359,22 @@ class BgDoneSource(Enum):
         missing/unparseable ⇒ fail-closed to DONE (false dark is annoying; false
         typing after completion is the historical bug class here).
 
+      - ``TEAMMATE`` — an agent-teams teammate's park (idle_notification) close
+        (GH #46). A teammate leg ends in plain text (``stop_reason=None``), so
+        the sidechain end-of-turn done never fires and the teammate emits no
+        ``<task-notification>`` — the parent-transcript park report is the ONLY
+        close signal. Shares the ``SIDECHAIN`` ts-gate (the park ts vs the
+        record's ``resumed_event_ts``): a stale prior-leg park keeps a resumed
+        key LIVE, a genuine newer park (or a None/unparseable park ts, or a
+        record with no ``resumed_event_ts``) tombstones — fail-closed to DONE.
+
     The existing positional callers pass no ``source`` → the ``PARENT`` default
     keeps them byte-identical (unconditional tombstone, the pre-Fix-C behavior).
     """
 
     PARENT = "parent"
     SIDECHAIN = "sidechain"
+    TEAMMATE = "teammate"
 
 
 # A route observed strictly above this token count must be on the 1M variant.
@@ -395,6 +408,15 @@ class TranscriptLifecycleEvent:
     # preserved gates instead of running the genuine-user-turn unconditional
     # clears — and never reset background-agent tombstones.
     is_task_notification: bool = False
+    # GH #46 §PR-1: True when this ``user`` event is a machine-initiated
+    # agent-teams teammate message (stamped by the adapter via the public
+    # ``response_builder.is_teammate_message``). Handled identically to a
+    # task-notification in the machine-initiated branch (preserved
+    # tombstones/stash/pane-bit; the notification clear stamps
+    # ``TEAMMATE_NOTIFICATION``) — a teammate's idle report is NOT a human turn,
+    # so it must not reset the background-agent tombstones (the re-record
+    # amplifier).
+    is_teammate_notification: bool = False
 
 
 @dataclass(frozen=True)
@@ -1176,10 +1198,21 @@ def _apply_lifecycle_event(
     # intact — never a forced RUNNING (hermes r3 P2: forcing RUNNING while
     # preserving the pane bit would break the invariant
     # ``interactive_pending ⟺ pane-set WAITING_ON_USER``).
-    if role == "user" and block != "tool_result" and event.is_task_notification:
-        _maybe_clear_notification_by_ts(
-            st, event.timestamp, reason=NotificationClearReason.TASK_NOTIFICATION
+    # GH #46: an agent-teams teammate user event is machine-initiated too (the
+    # teammate parked/reported, not the human) — it rides this SAME branch so its
+    # tombstone/stash/pane-bit preservation + stored-idle preserve are
+    # byte-identical; only the notification-clear reason differs.
+    if (
+        role == "user"
+        and block != "tool_result"
+        and (event.is_task_notification or event.is_teammate_notification)
+    ):
+        clear_reason = (
+            NotificationClearReason.TEAMMATE_NOTIFICATION
+            if event.is_teammate_notification and not event.is_task_notification
+            else NotificationClearReason.TASK_NOTIFICATION
         )
+        _maybe_clear_notification_by_ts(st, event.timestamp, reason=clear_reason)
         # typing-unification T1.3 (2026-07-08,
         # temp/2026-07-08-typing-unification-plan.md): a task-notification is
         # machine-initiated (a background task completed) — NOT the human
@@ -1960,7 +1993,10 @@ async def mark_background_agent_done(
         _expire_background_agents_in_place(st)
         rec = st.background_agents.get(key)
         if (
-            source is BgDoneSource.SIDECHAIN
+            # GH #46: TEAMMATE shares the SIDECHAIN cross-file ts-gate (the park
+            # ts vs the record's resume ts) — both are close signals from a file
+            # with no shared transcript order vs the parent SendMessage resume.
+            source in (BgDoneSource.SIDECHAIN, BgDoneSource.TEAMMATE)
             and rec is not None
             and rec.resumed_event_ts is not None
             and not end_turn_ts_unparseable
