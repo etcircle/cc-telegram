@@ -517,31 +517,59 @@ by the adapter as `TranscriptLifecycleEvent.is_teammate_notification`;
 `route_runtime`'s machine-initiated branch handles it identically to a
 `<task-notification>` (preserved tombstones/stash/pane-bit + stored-idle
 preserve; the notification clear stamps `TEAMMATE_NOTIFICATION`, ts-qualified).
-**The shared bounded envelope scanner (review P2):** predicate AND parser both
-consume `utils.teammate_envelope_payload_regions` — byte-0 anchored `Another
-Claude session sent a message:`, then EVERY structurally-valid
+**The shared bounded envelope scanner (review P2, r2-hardened):** predicate AND
+parser both consume `utils.teammate_envelope_payloads` — byte-0 anchored
+`Another Claude session sent a message:`, then EVERY structurally-valid
 `<teammate-message>` envelope within the first 64 KiB of UTF-8 BYTES (never a
-character count — a multi-byte payload must not stretch the bound); per
-envelope the opening tag must COMPLETE (its `>`) within the bound and the close
-must occur strictly AFTER that completion (a close token inside the opening
-tag's quoted attributes never counts). Fail-closed to genuine-user on any
-structural drift, and the two callers can never diverge on structure. **Fix (B)
+character count — a multi-byte payload must not stretch the bound). Per
+envelope (r2, BOTH engines converged): the tag name must be followed by an
+EXPLICIT whitespace/`>` delimiter (`\b` accepted `<teammate-message!broken>`);
+the opening tag must COMPLETE via a QUOTE-AWARE `>` scan (a quoted `>` — or a
+close token embedded in a quoted attribute — never completes it; the old
+quote-blind `find(b">")` accepted a never-completed tag and produced a park);
+the payload is decoded with `json.JSONDecoder().raw_decode` from the first `{`
+after tag completion (raw_decode stops at the JSON value's TRUE end, so a
+literal `</teammate-message>` INSIDE a JSON string no longer terminates the
+envelope — a teammate summary quoting the tag now parses correctly); and the
+structural close tag must follow the decoded JSON end (+ optional whitespace)
+within the bound. Predicate-True now IMPLIES a decodable payload + structural
+close — predicate/parser divergence is dead by construction. ACCEPTED
+consequence (disclosed): an envelope whose body is not a decodable JSON object
+(e.g. a markdown teammate report) classifies as genuine-user (unknown shape =
+human — the pre-GH#46 behavior); enumeration STOPS at the first
+structurally-invalid envelope (earlier valid payloads kept). **Fix (B)
 — the park-close lane:** `response_builder.parse_teammate_idle_notifications`
 (PLURAL — one parent entry can carry MULTIPLE envelopes, real-data verified;
 the second envelope of the live 15:56:55Z entry names the teammate whose park
-is its ONLY close signal, review P1) extracts EVERY envelope's inner `{…}`
-payload (`name` = `from`, `park_ts`); the monitor's parent user-text arm
+is its ONLY close signal, review P1) filters the scanner's payloads to idle
+notifications (`name` = `from`, `park_ts`); the monitor's parent user-text arm
 resolves each name → this parent's currently-tracked TOP-LEVEL sidechain stem
 key(s) (`sub:<parent>:agent-a<name>-<hex>`, hex 8-32 chars, read from
 `tracked_sessions` — NO disk glob; a nested Fix-5 Workflow display key
 `sub:<parent>:<runid>:agent-…` NEVER matches, hermes P3 — its close is the
 `wf-task:` bracket; PR-1 closes ALL same-name top-level stems, documented safe
-degradation) and records `teammate_parks[key] = (park_ts, unparseable)`;
-the bot fan-out applies each as `mark_background_agent_done(...,
-source=BgDoneSource.TEAMMATE, end_turn_ts=park_ts, ...)`. `TEAMMATE` shares the
-`SIDECHAIN` cross-file ts-gate (a stale prior-leg park keeps a resumed key LIVE;
-a genuine newer park, a None/unparseable park ts, or a record with no
-`resumed_event_ts` tombstones — fail-closed to DONE). Deferred to PR-2: a
+degradation) and records parks via `ParentSidechainActivity.merge_teammate_park`
+— a CAUSAL REDUCTION, never last-write-wins (r2, BOTH engines: an unparseable
+park DOMINATES the key permanently within the tick record — its
+unconditional-tombstone evidence survives a later parseable park — else
+max(park_ts) wins, so an older redelivered park can never bury the newer one
+the downstream strict-newer gates need); the bot fan-out applies each as
+`mark_background_agent_done(..., source=BgDoneSource.TEAMMATE,
+end_turn_ts=park_ts, ...)`. `TEAMMATE` shares the `SIDECHAIN` cross-file
+ts-gate (a stale prior-leg park keeps a resumed key LIVE) **PLUS the
+stale-vs-activity gate — a deliberate PLAN AMENDMENT (r2, Codex P1; the v8
+plan gated only on `resumed_event_ts`):** a PARSEABLE park strictly OLDER than
+the record's own `last_event_ts` is SUPPRESSED (real-data verified: the
+multi-envelope entry redelivers park #1 15:56:45.564Z after the key's
+sidechain wrote 15:58:10.097Z — tombstoning there darkens a
+demonstrably-working teammate mid-leg AND empties the key so the
+genuinely-final park #2 15:58:10.253Z has nothing to close); a TIE
+(park_ts == last_event_ts) TOMBSTONES (dark-safe — false-dark over
+false-typing; the genuine final park is stamped ms after the final write, so
+ties are overwhelmingly the genuine shape); an UNPARSEABLE park tombstones
+unconditionally, a missing record / `last_event_ts=None` tombstones —
+fail-closed to DONE. The stale-vs-activity gate is TEAMMATE-only; `SIDECHAIN`
+semantics are byte-untouched. Deferred to PR-2: a
 teammate registry, a wake lane, launched emission, binding logic. Pull-only; no
 observer (c313657 stays forbidden).
 

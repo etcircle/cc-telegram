@@ -241,7 +241,15 @@ Additional modules:
                                 close signal for a teammate leg that ends in
                                 plain text, no sidechain end-of-turn + no
                                 <task-notification>) SHARES the SIDECHAIN
-                                ts-gate).
+                                resume ts-gate PLUS (r2, a documented plan
+                                amendment) a TEAMMATE-only stale-vs-activity
+                                gate: a PARSEABLE park strictly older than the
+                                record's own last_event_ts is SUPPRESSED (a
+                                redelivered old park must not tombstone a
+                                working teammate mid-leg / strand the
+                                genuinely-final park); a tie tombstones
+                                (dark-safe), unparseable/missing-record
+                                tombstones — SIDECHAIN byte-untouched).
                                 Clears: done / a PER-KEY wall-clock heartbeat
                                 TTL (_wall_now(), expire-before-classify) —
                                 T2 split: foreground-presumed keys age by
