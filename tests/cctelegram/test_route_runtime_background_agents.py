@@ -39,6 +39,7 @@ from cctelegram.route_runtime import (
     RunState,
     TranscriptLifecycleEvent,
 )
+from cctelegram.utils import parse_iso_timestamp
 
 WF_KEY = "wf-task:wrnmrbn3s"
 
@@ -1155,21 +1156,44 @@ async def test_teammate_done_suppression_parity_with_sidechain():
     assert snap.background_agents == ()
 
 
+# The REAL causal timeline (live capture, Claude Code 2.1.197): the teammate's
+# sidechain last wrote at 15:58:10.097 (the final report leg); park #1
+# (15:56:45.564, redelivered in the multi-envelope entry) is STALE vs that
+# activity; park #2 (15:58:10.253 > the last write) is the causally-final
+# close. These constants keep the tests pinned to the observed ordering.
+
+
+def _iso(ts: str) -> float:
+    val = parse_iso_timestamp(ts)
+    assert val is not None
+    return val
+
+
+T_PARK1 = _iso("2026-07-09T15:56:45.564Z")
+T_ACT_LAST = _iso("2026-07-09T15:58:10.097Z")
+T_PARK2 = _iso("2026-07-09T15:58:10.253Z")
+assert T_PARK1 < T_ACT_LAST < T_PARK2
+
+
 async def test_observed_strand_replay_no_re_record_after_teammate_event():
-    """The end-to-end regression: recorded → sidechain done (tombstone) →
-    teammate user event → trailing-batch activity ⇒ NO re-record, not lifted,
-    background_only False. Old code cleared the tombstone on the teammate
-    event and the trailing activity relit the route for the 2 h TTL."""
+    """The end-to-end regression on the real causal timeline (r2): the
+    causally-final park #2 (> the key's last write) tombstones; the
+    machine-initiated teammate user event preserves the tombstone; a
+    trailing-batch activity flush does NOT re-record ⇒ not lifted,
+    background_only False, typing off. Old code (defect A) reset the tombstone
+    on the teammate event and the trailing activity relit for the 2 h TTL."""
     await _idle_transcript(end_ts=100.0)
-    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, T_ACT_LAST)
     await route_runtime.mark_background_agent_done(
-        ROUTE, KEY, source=BgDoneSource.SIDECHAIN, end_turn_ts=160.0
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=T_PARK2
     )
+    assert KEY in _st().background_agents_done  # causal close (park#2 > last write)
     await route_runtime.ingest_transcript_event(
-        ROUTE, _evt("user", "text", timestamp=170.0, is_teammate_notification=True)
+        ROUTE,
+        _evt("user", "text", timestamp=T_PARK2 + 1.0, is_teammate_notification=True),
     )
     assert KEY in _st().background_agents_done  # tombstone HELD
-    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, 180.0)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, T_PARK2 + 2.0)
     assert snap.background_agents == ()
     assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
     assert snap.background_only is False
@@ -1178,14 +1202,91 @@ async def test_observed_strand_replay_no_re_record_after_teammate_event():
 
 async def test_never_tombstoned_shape_teammate_park_drops_typing_without_ttl():
     """The teammate leg ends in plain text (stop_reason=None) so no sidechain
-    done ever fires; the teammate park (BgDoneSource.TEAMMATE) tombstones the
-    launched key so typing drops promptly instead of waiting out the 2 h TTL."""
+    done ever fires; the CAUSALLY-FINAL teammate park (park #2, ts strictly >
+    the leg's last write — r2: proves causal close, not accidental close)
+    tombstones the launched key so typing drops promptly instead of waiting
+    out the 2 h TTL."""
     await _idle_transcript(end_ts=100.0)
     await route_runtime.mark_background_agent_launched(ROUTE, KEY)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, T_ACT_LAST)
     assert route_runtime.snapshot(ROUTE).typing_eligible is True
     snap = await route_runtime.mark_background_agent_done(
-        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=200.0
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=T_PARK2
     )
     assert KEY in _st().background_agents_done
     assert snap.typing_eligible is False
     assert snap.background_agents == ()
+
+
+# ── GH #46 r2 (Codex P1, plan amendment): the TEAMMATE stale-park gate ──────
+
+
+async def test_teammate_stale_park_older_than_activity_suppressed_then_final_closes():
+    """The Codex r2 repro (real-data verified): park #1 (15:56:45.564) is
+    OLDER than the key's own later sidechain writes (15:58:10.097) — applying
+    it would tombstone a demonstrably-working teammate mid-leg AND leave the
+    genuinely-final park #2 nothing to close. The stale park is SUPPRESSED
+    (key stays live); park #2 (15:58:10.253 > last write) then closes."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, T_ACT_LAST)
+    snap = await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=T_PARK1
+    )
+    assert KEY not in _st().background_agents_done  # suppressed — key LIVE
+    assert snap.background_agents == (KEY,)
+    assert snap.run_state is RunState.RUNNING  # still projected busy
+    snap = await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=T_PARK2
+    )
+    assert KEY in _st().background_agents_done  # the causally-final park closes
+    assert snap.background_agents == ()
+
+
+async def test_teammate_park_tie_with_activity_tombstones():
+    """park_ts == last_event_ts TOMBSTONES (dark-safe per the repo doctrine —
+    false-dark over false-typing; the genuine final park is stamped ms after
+    the final write, so ties are overwhelmingly the genuine shape)."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
+    snap = await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=150.0
+    )
+    assert KEY in _st().background_agents_done
+    assert snap.background_agents == ()
+
+
+async def test_teammate_unparseable_park_tombstones_despite_newer_activity():
+    """An UNPARSEABLE park still tombstones unconditionally (unchanged —
+    fail-closed to DONE), even when the record carries newer activity."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
+    await route_runtime.mark_background_agent_done(
+        ROUTE,
+        KEY,
+        source=BgDoneSource.TEAMMATE,
+        end_turn_ts=None,
+        end_turn_ts_unparseable=True,
+    )
+    assert KEY in _st().background_agents_done
+
+
+async def test_teammate_park_on_missing_record_still_tombstones():
+    """A park for a never-recorded key still tombstones-noop (unchanged)."""
+    await _idle_transcript(end_ts=100.0)
+    snap = await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=50.0
+    )
+    assert KEY in _st().background_agents_done
+    assert snap.background_agents == ()
+
+
+async def test_sidechain_done_older_than_activity_still_tombstones():
+    """r2 scope pin: the stale-vs-activity gate is TEAMMATE-ONLY. A SIDECHAIN
+    end-of-turn older than the key's last_event_ts (no resume stamp) keeps
+    today's unconditional tombstone byte-identical."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
+    await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.SIDECHAIN, end_turn_ts=90.0
+    )
+    assert KEY in _st().background_agents_done

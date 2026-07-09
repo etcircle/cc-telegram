@@ -13,7 +13,6 @@ Key function:
   - build_response_parts: Build paginated response messages
 """
 
-import json
 import re
 from dataclasses import dataclass
 
@@ -42,9 +41,7 @@ from ..utils import (
 from ..utils import is_task_notification as is_task_notification
 from ..utils import is_teammate_message as is_teammate_message
 from ..utils import parse_iso_timestamp as parse_iso_timestamp
-from ..utils import (
-    teammate_envelope_payload_regions as teammate_envelope_payload_regions,
-)
+from ..utils import teammate_envelope_payloads as teammate_envelope_payloads
 
 
 # The async-launch background discriminator (GH #44 §3.2a). Anchored on the
@@ -299,30 +296,21 @@ def parse_teammate_idle_notifications(text: str) -> list[TeammateIdle]:
     One parent user entry can carry MULTIPLE ``<teammate-message>`` envelopes
     (real-data verified — the 2026-07-09T15:56:55.336Z entry carries two, and
     the SECOND names the teammate whose leg has no other close signal; review
-    P1), so this enumerates every structurally-valid envelope via the shared
-    ``utils.teammate_envelope_payload_regions`` scanner (the SAME structural
-    judgment as ``is_teammate_message`` — review P2) and returns one
-    ``TeammateIdle`` per envelope whose inner payload parses as an idle
-    notification, in envelope order. Per envelope: take the substring from the
-    first ``{`` to the last ``}`` inside the payload region, ``json.loads`` it
-    (any failure ⇒ skip), require ``type == "idle_notification"`` and a
-    non-empty str ``from`` (⇒ ``name``). ``park_ts`` is the parsed
-    ``timestamp`` (``None`` when missing/unparseable); ``park_ts_unparseable``
-    mirrors ``park_ts is None`` so a None stamp fails closed to an
-    unconditional done downstream. Non-idle teammate envelopes (reports etc.)
-    contribute nothing — the predicate still classifies the ENTRY
-    machine-initiated; only parks come from here.
+    P1), so this consumes the decoded payload of every structurally-valid
+    envelope from the shared ``utils.teammate_envelope_payloads`` scanner (the
+    SAME structural + raw_decode judgment as ``is_teammate_message`` — review
+    P2/r2, so the two can never diverge) and returns one ``TeammateIdle`` per
+    payload that is an idle notification, in envelope order. Requires
+    ``type == "idle_notification"`` and a non-empty str ``from`` (⇒ ``name``);
+    other payload shapes (teammate reports etc.) contribute nothing — the
+    predicate still classifies the ENTRY machine-initiated when at least one
+    envelope carries a decodable JSON payload; only parks come from here.
+    ``park_ts`` is the parsed ``timestamp`` (``None`` when missing/
+    unparseable); ``park_ts_unparseable`` mirrors ``park_ts is None`` so a
+    None stamp fails closed to an unconditional done downstream.
     """
     out: list[TeammateIdle] = []
-    for region in teammate_envelope_payload_regions(text):
-        j0 = region.find(b"{")
-        j1 = region.rfind(b"}")
-        if j0 < 0 or j1 <= j0:
-            continue
-        try:
-            payload = json.loads(region[j0 : j1 + 1])
-        except (ValueError, TypeError, UnicodeDecodeError):
-            continue
+    for payload in teammate_envelope_payloads(text):
         if not isinstance(payload, dict):
             continue
         if payload.get("type") != "idle_notification":

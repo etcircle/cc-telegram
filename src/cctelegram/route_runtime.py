@@ -365,8 +365,15 @@ class BgDoneSource(Enum):
         ``<task-notification>`` — the parent-transcript park report is the ONLY
         close signal. Shares the ``SIDECHAIN`` ts-gate (the park ts vs the
         record's ``resumed_event_ts``): a stale prior-leg park keeps a resumed
-        key LIVE, a genuine newer park (or a None/unparseable park ts, or a
-        record with no ``resumed_event_ts``) tombstones — fail-closed to DONE.
+        key LIVE. PLUS (r2, Codex P1 — a deliberate plan amendment) a park
+        whose PARSEABLE ts is strictly OLDER than the record's own
+        ``last_event_ts`` is SUPPRESSED (a multi-envelope entry can redeliver
+        an old park after the key wrote newer activity — tombstoning there
+        darkens a working teammate mid-leg and strands the genuinely-final
+        park with nothing to close); a TIE tombstones (dark-safe), an
+        UNPARSEABLE park tombstones unconditionally, a missing record /
+        ``last_event_ts=None`` tombstones — fail-closed to DONE. The
+        stale-vs-activity gate is TEAMMATE-only; ``SIDECHAIN`` is untouched.
 
     The existing positional callers pass no ``source`` → the ``PARENT`` default
     keeps them byte-identical (unconditional tombstone, the pre-Fix-C behavior).
@@ -1978,7 +1985,21 @@ async def mark_background_agent_done(
     record is treated the same, fail-closed — r4 must-have 3), when the end_turn
     is strictly newer (a genuine fast-finish), or when any timestamp is
     missing/unparseable (fail-closed to DONE). ``PARENT`` dones are always
-    unconditional (transcript order is authoritative)."""
+    unconditional (transcript order is authoritative).
+
+    GH #46 r2 (Codex P1 — a deliberate PLAN AMENDMENT; the v8 plan gated only
+    on ``resumed_event_ts``): a ``TEAMMATE`` park ADDITIONALLY suppresses when
+    its PARSEABLE ts is strictly OLDER than the record's own ``last_event_ts``
+    — real-data verified: a multi-envelope entry can redeliver an old park
+    (15:56:45.564Z) AFTER the key's sidechain wrote newer activity
+    (15:58:10.097Z); tombstoning there darkens a demonstrably-working teammate
+    mid-leg AND empties the key so the genuinely-final park has nothing to
+    close. A TIE (park_ts == last_event_ts) TOMBSTONES (dark-safe per the repo
+    doctrine — false-dark over false-typing; the genuine final park is stamped
+    ms after the final write, so ties are overwhelmingly the genuine shape);
+    an UNPARSEABLE park still tombstones unconditionally; a missing record /
+    ``last_event_ts=None`` still tombstones. Scoped to ``TEAMMATE`` ONLY —
+    ``SIDECHAIN`` semantics are byte-untouched."""
     key = normalize_background_agent_key(agent_key)
     lock = _lock_for_route(route)
     async with lock:
@@ -2012,6 +2033,29 @@ async def mark_background_agent_done(
                 key,
                 end_turn_ts,
                 rec.resumed_event_ts,
+            )
+            return _freeze(route, st)
+        if (
+            # GH #46 r2 (Codex P1, plan amendment): a TEAMMATE park strictly
+            # OLDER than the key's own latest observed activity is a stale
+            # redelivery, not causal proof the teammate parked AFTER its work —
+            # keep the key LIVE so the genuinely-final park can close it.
+            # Strict `<`: a tie tombstones (dark-safe); unparseable/None park
+            # ts or a None last_event_ts fall through to the tombstone.
+            source is BgDoneSource.TEAMMATE
+            and rec is not None
+            and not end_turn_ts_unparseable
+            and end_turn_ts is not None
+            and rec.last_event_ts is not None
+            and end_turn_ts < rec.last_event_ts
+        ):
+            logger.info(
+                "background_agent teammate-park SUPPRESSED (stale vs activity) "
+                "route=%s key=%s park_ts=%s last_event_ts=%s",
+                route,
+                key,
+                end_turn_ts,
+                rec.last_event_ts,
             )
             return _freeze(route, st)
         existed = st.background_agents.pop(key, None) is not None

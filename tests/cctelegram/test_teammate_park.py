@@ -5,7 +5,7 @@ teammate's background key when the teammate parks (reports idle) instead of
 stranding typing/Busy for up to 2 h:
 
   - ``utils.is_teammate_message`` — the byte-0-anchored envelope predicate,
-    backed by the SHARED bounded scanner ``teammate_envelope_payload_regions``
+    backed by the SHARED bounded scanner ``teammate_envelope_payloads``
     (review P2: predicate/parser structural parity; the 64 KiB bound is UTF-8
     BYTES, and a close token inside the opening tag's quoted attributes never
     counts). Fail-closed to genuine-user on any drift.
@@ -136,36 +136,40 @@ def test_crlf_line_endings_accepted():
 
 
 def test_envelope_closing_beyond_scan_bound_rejects():
-    filler = "x" * (TEAMMATE_ENVELOPE_SCAN_BYTES + 10)
+    """An envelope whose payload+close only complete BEYOND the 64 KiB bound
+    rejects (the truncated payload never raw_decodes)."""
+    pad = "x" * (TEAMMATE_ENVELOPE_SCAN_BYTES + 10)
     text = (
         "Another Claude session sent a message:\n"
         '<teammate-message teammate_id="x" color="red">\n'
-        + filler
-        + "\n</teammate-message>"
+        '{"type":"idle_notification","from":"x","pad":"' + pad + '"}\n'
+        "</teammate-message>"
     )
     assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
 
 
 def test_multibyte_utf8_close_beyond_byte_bound_rejects():
-    """Review P2a (Hermes repro): the bound is UTF-8 BYTES, not characters.
+    """Review r2 P2a (Hermes repro): the bound is UTF-8 BYTES, not characters.
     43,650 '€' (3 bytes each) = 130,950 bytes but only ~43.7k chars — a
-    CHARACTER-sliced bound would keep the closing tag in view and accept."""
-    filler = "€" * 43_650
+    CHARACTER-sliced bound would keep the whole envelope in view and accept."""
+    pad = "€" * 43_650
     text = (
         "Another Claude session sent a message:\n"
         '<teammate-message teammate_id="x" color="red">\n'
-        + filler
-        + "\n</teammate-message>"
+        '{"type":"idle_notification","from":"x","pad":"' + pad + '"}\n'
+        "</teammate-message>"
     )
     assert len(text.encode("utf-8")) > TEAMMATE_ENVELOPE_SCAN_BYTES
     assert len(text) < TEAMMATE_ENVELOPE_SCAN_BYTES  # the char-slice trap
     assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
 
 
 def test_close_tag_only_inside_opening_tag_quoted_attribute_rejects():
     """Review P2b: a close token inside the opening tag's quoted attribute text
-    precedes the tag's completing '>' and must NOT satisfy the close — the old
-    ``close in prefix`` check accepted this where the parser returned None."""
+    must NOT satisfy the close — the old ``close in prefix`` check accepted
+    this where the parser returned None (the verified divergence)."""
     text = (
         "Another Claude session sent a message:\n"
         '<teammate-message teammate_id="x" note="</teammate-message>">\n'
@@ -176,14 +180,77 @@ def test_close_tag_only_inside_opening_tag_quoted_attribute_rejects():
 
 
 def test_opening_tag_never_completes_rejects():
-    """The opening tag's only '>' belongs to an embedded close token — the tag
-    never completes, so no structurally-valid envelope exists."""
+    """A tag whose only unquoted '>' belongs to an embedded close token leaves
+    no payload after 'completion' — no structurally-valid envelope exists."""
     text = (
         "Another Claude session sent a message:\n"
         '<teammate-message teammate_id="x" broken </teammate-message>'
     )
     assert is_teammate_message(text) is False
     assert parse_teammate_idle_notifications(text) == []
+
+
+def test_quoted_gt_in_never_completed_tag_rejects_and_no_park():
+    """Review r2 P2(i) (Hermes repro): the old quote-blind ``find('>')`` took a
+    ``>`` INSIDE a quoted attribute as the tag completion — accepting a
+    never-completed opening tag AND producing a park. The quote-aware scan
+    skips it; the tag never genuinely completes → False, no park."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x" note="a > b"\n'
+        '{"type":"idle_notification","from":"x","timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
+
+
+def test_attribute_with_gt_and_close_token_rejects():
+    """Review r2 P2 (Codex repro): an attribute value carrying
+    ``"> x </teammate-message>"`` made the old predicate True while the parser
+    returned [] (divergence). Quote-aware: both the ``>`` and the close token
+    inside the quotes are skipped; with no genuine close after the payload →
+    False on BOTH."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x" note="> x </teammate-message>">\n'
+        '{"type":"idle_notification","from":"x"}\n'
+    )
+    assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
+
+
+def test_malformed_tag_name_delimiter_rejects():
+    """Review r2 P2(ii): the char after ``<teammate-message`` must be
+    whitespace or ``>`` — ``\\b`` accepted ``<teammate-message!broken>``."""
+    text = (
+        "Another Claude session sent a message:\n"
+        "<teammate-message!broken>\n"
+        '{"type":"idle_notification","from":"x"}\n'
+        "</teammate-message>"
+    )
+    assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
+
+
+def test_json_string_quoting_close_tag_parses_correctly():
+    """Review r2 P2(iii) — the raw_decode robustness win: a literal
+    ``</teammate-message>`` INSIDE a JSON string no longer terminates the
+    envelope; the summary-quoting park parses with the correct name/ts."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="quoter" color="red">\n'
+        '{"type":"idle_notification","from":"quoter",'
+        '"timestamp":"2026-07-09T00:00:00Z",'
+        '"summary":"note: </teammate-message> is the close tag"}\n'
+        "</teammate-message>\n\ntrailing prose"
+    )
+    assert is_teammate_message(text) is True
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "quoter"
+    assert parsed[0].park_ts == parse_iso_timestamp("2026-07-09T00:00:00Z")
+    assert parsed[0].park_ts_unparseable is False
 
 
 def test_attribute_embedded_close_with_genuine_close_still_accepts():
@@ -275,8 +342,9 @@ def test_parse_present_but_unparseable_timestamp():
 
 
 def test_parse_mixed_valid_and_invalid_envelopes():
-    """An invalid-payload envelope is SKIPPED, not fatal — later valid
-    envelopes still parse (the plural-enumeration contract)."""
+    """A brace-less non-JSON body is crossed to the first decodable payload —
+    the later valid envelope still parses (the plural-enumeration contract
+    keeps parks from being lost to leading junk)."""
     text = (
         "Another Claude session sent a message:\n"
         '<teammate-message teammate_id="x">\nnot json at all\n</teammate-message>\n'
@@ -289,6 +357,24 @@ def test_parse_mixed_valid_and_invalid_envelopes():
     parsed = parse_teammate_idle_notifications(text)
     assert len(parsed) == 1
     assert parsed[0].name == "peer-two"
+
+
+def test_parse_undecodable_first_envelope_stops_enumeration():
+    """r2 documented degradation: an UNDECODABLE JSON payload (raw_decode
+    raises) has no reliable envelope end, so enumeration STOPS — a later valid
+    envelope in the same entry is not reached (fail-closed; real envelopes are
+    machine-generated JSON, so this shape requires corruption)."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x">\n{broken json,,,\n</teammate-message>\n'
+        "\n"
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-two",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>\n\ntrailing prose"
+    )
+    assert parse_teammate_idle_notifications(text) == []
+    assert is_teammate_message(text) is False
 
 
 # ── the never-tombstoned shape (defect B premise, real data) ─────────────

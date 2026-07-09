@@ -132,12 +132,40 @@ class ParentSidechainActivity:
     # GH #46 PR-1: agent-teams teammate parks. A teammate ``idle_notification``
     # user entry on the PARENT transcript names a teammate; the arm resolves the
     # name → this parent's currently-tracked sidechain stem key(s)
-    # (``a<name>-<hex>``) and records ``key -> (park_ts, park_ts_unparseable)``.
-    # The bot fan-out applies each as ``mark_background_agent_done(...,
+    # (``a<name>-<hex>``) and records ``key -> (park_ts, park_ts_unparseable)``
+    # via ``merge_teammate_park`` (NEVER a bare assignment — review r2 P2: the
+    # per-key merge is a CAUSAL REDUCTION, not last-write-wins). The bot fan-out
+    # applies each as ``mark_background_agent_done(...,
     # source=BgDoneSource.TEAMMATE, end_turn_ts=park_ts, ...)`` — the ONLY close
     # signal for a teammate leg that ends in plain text (no sidechain
     # end-of-turn, no ``<task-notification>``).
     teammate_parks: dict[str, tuple[float | None, bool]] = field(default_factory=dict)
+
+    def merge_teammate_park(
+        self, key: str, park_ts: float | None, unparseable: bool
+    ) -> None:
+        """Causal per-key park merge (review r2 P2, BOTH engines).
+
+        A bare ``teammate_parks[key] = …`` would be last-write-wins: an
+        unparseable park's unconditional-tombstone evidence could be discarded
+        by a later parseable one (Hermes repro), and an OLDER park could bury a
+        NEWER one whose ts is the only one that clears the route_runtime
+        stale/resume gates (Codex repro: ts 200 then 100 vs resume 150 → only
+        100 retained → suppressed as stale → key wrongly left live). Rules:
+        UNPARSEABLE DOMINATES the key permanently within the tick record
+        (fail-closed to the unconditional done); otherwise keep the MAX
+        park_ts (the causally-latest park is the one that must win the
+        strict-newer gates downstream).
+        """
+        existing = self.teammate_parks.get(key)
+        if existing is not None:
+            ex_ts, ex_unparseable = existing
+            if ex_unparseable:
+                return  # unparseable dominates — never demoted by a later park
+            if not unparseable and ex_ts is not None:
+                if park_ts is None or park_ts <= ex_ts:
+                    return  # keep the causally-later (max) parseable park
+        self.teammate_parks[key] = (park_ts, unparseable)
 
 
 @dataclass
@@ -575,7 +603,9 @@ class SessionMonitor:
             return
         rec = self._parent_activity(parent_session_id)
         for key in matched:
-            rec.teammate_parks[key] = (parked.park_ts, parked.park_ts_unparseable)
+            # Causal merge, never last-write-wins (review r2 P2): unparseable
+            # dominates, else max park_ts — see merge_teammate_park.
+            rec.merge_teammate_park(key, parked.park_ts, parked.park_ts_unparseable)
 
     def _open_workflow_bracket(self, parent_session_id: str, info: Any) -> None:
         """Open a persistent Workflow bracket (ISSUE-6 / Fix 2c).
