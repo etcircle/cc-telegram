@@ -1,90 +1,127 @@
 # cc-telegram
 
-A Telegram ↔ Claude Code bridge for running Claude sessions from Telegram forum topics.
+**Your real Claude Code, on your own machine, driven from Telegram.**
 
-Each Telegram topic maps to one tmux window running one Claude Code process. The terminal remains the source of truth, and Telegram becomes the remote control / notification layer.
+cc-telegram is not a hosted chatbot and not an API wrapper. It's a bridge to the actual `claude` CLI running in tmux on your computer — with your files, your tools, your skills, your MCP servers, your logged-in account. You talk to it from a Telegram forum. Each topic is one live Claude Code session in its own tmux window. The terminal stays the source of truth; Telegram is the remote control. Open a new topic to start a session. The forum *is* your session list — no web UI, no extra app, just topics.
 
-## What it does
+Why it's worth running:
 
-- **Topic-based sessions** — one Telegram topic = one tmux window = one Claude session.
-- **Hook-based session tracking** — Claude Code `SessionStart` writes `session_map.json`, so `/clear` and resumed sessions stay attached to the right topic.
-- **AskUserQuestion descriptions and multi-select toggles** — a `PreToolUse` hook captures the structured `AskUserQuestion` payload before Claude renders the picker, so each option's full description shows in Telegram right away. Single-select options submit through the restart-safe `aqp:` pick flow; multi-select options toggle with non-ledgered `aqt:` bare-digit callbacks, then final Submit/Cancel reuses the review-screen `aqp:` flow. A single-select pick / review Submit **navigates the live cursor to the tapped option with arrow keys, then presses Enter**, and only records the dispatch once the pane confirms the expected advance — version-stable on Claude Code v2.1.168, where a bare digit no longer reliably selects. (The `aqt:` multi-select toggle still uses a bare digit.)
-- **Live prose before interactive prompts** — when Claude writes explanatory prose in the same turn as an `AskUserQuestion` / `ExitPlanMode`, Claude Code buffers the whole turn in the session JSONL until the prompt resolves, so without help the Telegram user would see only the picker and choose blind. A lightweight `MessageDisplay` hook captures that prose live (before the picker blocks) so the bot can deliver it ahead of the picker card.
-- **Late answers after the ~60s AFK auto-resolve** — on Claude Code ≥2.1.198 an unanswered `AskUserQuestion` self-resolves after ~60 seconds and Claude proceeds on its own judgment. Instead of silently losing the question, the picker card converts to an honest "⏰ Claude proceeded after ~60s (no response)." card whose buttons send your choice as a normal correction message ("Re your earlier question … my answer is … Please course-correct"), so you can still steer Claude after the fact.
-- **Waiting-on-you detection** — a `Notification` hook writes a window-keyed marker when Claude blocks on a permission / approval prompt (including the Workflow tool's Bash-approval gate, which leaves no JSONL trace), so the topic shows "🔔 Waiting on you" instead of an eternal "🟡 Busy".
-- **Interactive approval-gate cards (opt-in)** — with `CC_TELEGRAM_PERMISSION_PROMPTS=true`, tool-permission prompts (bridged user-launched / resumed, non-bypass sessions) and the Workflow tool's dynamic-workflow-launch approval surface as a card you can answer from Telegram via the manual ↑/↓/⏎/Esc keyboard (the Workflow card also shows the phases + token-cost warning). This release is **display-only** — the card honestly labels the nav controls as raw, un-cursor-verified live-terminal keystrokes; there is no one-tap option button yet. Default OFF; a flag-OFF deploy detects and changes nothing.
-- **Generic decision cards (opt-in)** — with `CC_TELEGRAM_DECISION_CARDS=true`, titled numbered-option confirmation prompts that no built-in interactive pattern covers (the "Switch model?" confirmation, the folder-trust prompt, and peers) surface as a display-only card with the same manual nav keyboard. Last-priority + strict-or-None, so it never shadows a built-in prompt type and never re-exposes a permission/workflow gate its own flag left off. Independent of the approval-gate flag; default OFF; a flag-OFF deploy detects and changes nothing.
-- **Tappable Decision dispatch (opt-in, canary)** — with `CC_TELEGRAM_DECISION_DISPATCH=true` **and** the decision cards flag ON, a decision prompt from a *known-good family on a characterized Claude Code version* (currently the folder-trust prompt on the versions in `handlers/decision_token.py`'s dispatch table) also gets one-tap option buttons: a tap arrow-navigates the live cursor to the choice, verifies it landed, and presses Enter — the AUQ v2.1.168 navigate→verify→Enter discipline through a parallel, Decision-specific lane. Anything else (unknown family, an un-characterized CC version, a busy/quoted pane) stays display-only. Default OFF; a flag-OFF deploy mints no buttons and the callback declines.
-- **📎 Tap-to-download file cards** — when Claude's prose mentions a deliverable local file (`report.md`, `chart.png`, `export.pdf`, and other document/data/image formats), the bot posts a compact 📎 card with one button per file; a tap uploads that file to the topic as a Telegram document. Detection is parent-prose only (never tool output, sub-agent narration, or web URLs) and every file is fully validated before upload — it must resolve (through symlinks) to a real regular file under the session's working directory (or an extra root in `CC_TELEGRAM_ARTIFACT_ROOTS`) and be within the size cap (worktree sessions also resolve a relative path against their main repo root, so a handoff written up a level still uploads); the upload itself goes through a re-validated file descriptor (`O_NOFOLLOW` + `fstat`), never a re-opened pathname. A tap is owner-only. `/file <path>` is the always-available manual escape hatch (it accepts any file type, not just the auto-offered formats, and paths with spaces). Governed by the `/settings` **📎 Files** toggle (on for every preset except `quiet`). **Note:** because detection is prose-driven, files with secrets-adjacent extensions (`.json`, `.log`, `.txt`) can be offered when Claude names them — a tap still uploads the file to the topic, so treat the card as you would any file share.
-- **Machine-surface terminal geometry** — bot-created tmux windows default to `160x50` (`CC_TELEGRAM_WINDOW_GEOMETRY`), and existing windows are resized once at startup. Nobody looks at the terminals directly — Telegram is the UI — so the geometry serves the parser: 50 rows keep a tall `AskUserQuestion` picker fully on-screen (real cursor visible from the first frame), 160 columns keep long option labels from overflowing.
-- **`/update` — update the CLI + restart idle sessions in place (owner-only)** — updates the Claude Code CLI binary, then restarts each **idle** bound session inside its existing tmux window (via `claude --resume`, so it adopts the new version and the topic keeps its window id / routing). Busy or waiting sessions are **deferred**, never interrupted — as are sessions with live background shells (the `· N shell` status-bar token: a restart would kill those jobs): it is fail-closed and idle-only (a session that won't cleanly exit within the bounded ~15s wait is skipped, not force-killed — the summary then warns the session may be dead and to check the window before sending messages, since `/exit` was already sent). A skipped window is additionally **quarantined**: the bot refuses to type new messages into it until it observes Claude running there again (a message typed into a dead session's bare shell would be *executed* by the shell), replying with an explicit "Message NOT delivered" error in the topic instead. "Claude running" is strict: the pane must report Claude's own version-string process — any other foreground command, including one you started yourself while checking the window (vim, python, ssh), keeps sends blocked. A relaunch counts as successful only once Claude is actually *observed* running in the pane (a bounded ~10s check after the relaunch keystroke, since a broken `CLAUDE_COMMAND` or auth failure can drop straight back to the shell); an unconfirmed relaunch is reported in the summary and keeps the quarantine. The quarantine clears automatically once Claude is seen alive, on a later confirmed restart, or when the window/topic is torn down; it is in-memory — a bot restart clears it. (Residuals: a Claude that crashes *after* being confirmed is out of scope, and if a future Claude Code changes how the pane reports its process, quarantined sends keep refusing — fail-closed — until a `/update` rerun, window recreate, or bot restart.) Restarts run one at a time; a second `/update` while one is running is rejected. It reports a progressive summary (`♻️ Restarted N idle · deferred M busy · skipped K`). No scheduler — run it when you want the running sessions on a freshly-updated CLI. Note: `CLAUDE_COMMAND` must exec the claude binary directly (or via an exec-ing wrapper) — a non-exec shell wrapper makes the pane report the wrapper shell while Claude is still alive, defeating `/update`'s shell-detection safety gate in the dangerous direction.
-- **Streaming output** — assistant text, thinking, tool use/result summaries, interactive prompts, and local command output flow into Telegram.
-- **Per-route queues** — each `(user_id, thread_id, window_id)` has its own worker, so one noisy topic does not stall another.
-- **Run-state digest** — compact activity digests show tool activity, context-window percentage, and busy/waiting state. When the turn finishes, the digest **collapses to a one-line summary** (`✅ Done — repo · 14 tools · 2 sub-agents · 3m 41s`) by default — the play-by-play is valuable live, scrollback noise afterwards; `/history` keeps the full log. Per-sub-agent cards collapse the same way when the sub-agent finishes (its 🤖✅ report message stays, full and expandable) — including the `Workflow` tool's background sub-agents, which now also surface as `↳` cards and collapse at the workflow's close.
-- **Per-user output verbosity** — `/settings` (any topic or DM) opens a personal panel with presets (`verbose` / `standard` / `compact` / `quiet`) plus quick knobs (tool-line length, done-card policy keep/collapse/delete, sub-agent cards keep/collapse/off, 👤 echo, 📊 footer, 📎 file cards). Choices persist in `state.json` and apply to everything the bot sends *to you*, in every topic; another allowed user tapping your panel changes nothing. Default preset is `standard`; `verbose` restores the pre-settings behavior exactly. Errors, interactive prompts, and the 🤖✅ sub-agent report stay visible at every preset.
-- **Cross-topic dashboard** — `/dashboard` run inside any forum topic claims that topic as your dashboard host: one passive message listing every topic you have bound **in that forum** (per-chat scoped — a dashboard never lists another chat's topics, and a topic whose chat can't be resolved is excluded, fail-closed), grouped needs-attention-first (🔔 waiting on you · 🟡 running · ⚪ idle), repainted by the status poller when content changes. Re-running `/dashboard` in another topic moves it; `/dashboard pin` pins the message (opt-in only — never automatic). 🔔 also covers an idle topic whose last assistant turn ended after your last message (the "unanswered turn"); after a bot restart those in-memory wall-clock stamps are gone, so the dashboard renders state-only until fresh turns repopulate them. **Visibility note:** the dashboard is owner-*filtered*, not private — any member of the shared forum can read it.
-- **Reply context** — Telegram replies/quotes are injected into Claude with fenced, role-aware context for text, voice, photo, and document messages.
-- **Photos and voice** — photos are forwarded as base64 image blocks; voice notes are transcribed through OpenAI-compatible transcription.
-- **Attention cards** — when Claude is waiting on you and the structured picker can't be delivered to the topic, a single bold "Claude is waiting for you" card is pushed (notified once per episode, then silently kept current).
-- **SQLite provenance** — outgoing Telegram messages are indexed for safer reply-context resolution.
-- **Reactive broken-topic fallback** — if Telegram says a topic is gone/closed/forbidden, the bot falls back to DM rather than silently dropping Claude output.
+**Buttons that don't lie.** When Claude asks a question, proposes a plan, or hits a permission gate, you get real tappable buttons — not a screenshot you squint at. And a tap doesn't fire blind. The bot navigates the live terminal cursor to your choice, re-reads the pane to confirm it landed, *then* presses Enter. If the screen changed under you, the tap bails instead of pressing the wrong thing.
 
-## Quick start
+**Honest presence.** The "typing…" indicator means the machine is actually working — foreground turns, background agents, workflows, and shells all count. When only background work is running and the foreground is quiet, a **⏳ Background work running** line explains the silence instead of leaving you to guess. When Claude is blocked waiting on *you*, a **🔔** card says so — once, out loud.
 
-Zero to working bot in a handful of commands:
+**Files come to you.** Mention a file in prose — `report.md`, `chart.png` — and it turns into a 📎 tap-to-download button. `/file <path>` fetches any file type, scoped to the session's folders and a size cap. Images a tool produces arrive as real photos, and `/screenshot` grabs the terminal itself as an image whenever you want the raw pane.
 
-```bash
-git clone https://github.com/etcircle/cc-telegram.git && cd cc-telegram
-uv tool install --force --no-cache .   # --no-cache REQUIRED — see note below
-mkdir -p ~/.cc-telegram && $EDITOR ~/.cc-telegram/.env  # TELEGRAM_BOT_TOKEN + ALLOWED_USERS (the only two required)
-cc-telegram hook --install
-cc-telegram doctor       # checks token/users/tmux/claude/SessionStart-hook/config-dir
-cc-telegram              # foreground, or daemonize on macOS with: bash bin/install-service.sh
-```
+**Talk to it like a person.** Send a voice note and it's transcribed into a prompt. Send a photo or a document and it's downloaded and handed to Claude. Reply to a message to quote it back with role-aware context.
 
-> **`--no-cache` is mandatory.** uv's wheel cache is keyed on the package version, and the version is not bumped on every deploy — so `uv tool install --force .` *alone* silently reinstalls a stale cached wheel (exits 0, your code never ships). See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** for the full end-to-end guide: launchd setup, the upgrade recipe and why, Claude Code auth, verification, and troubleshooting. New code agent? Start at **[AGENTS.md](AGENTS.md)**.
+**The rest just works.** Unknown slash commands forward straight into Claude Code, so `/clear`, `/compact`, `/model`, and `/cost` all work from your phone. `/dashboard` puts a live overview of every session in one pinned message. `/update` upgrades the CLI and restarts your idle sessions in place — without dropping a single topic binding.
 
-## Requirements
+**It survives things.** Bot restart, tmux restart, phone in a tunnel — sessions live in tmux, state lives on disk, and the bridge reconciles on startup. Duplicate taps are caught by an append-only action ledger, so a double-press after a restart answers "already received" instead of doing the thing twice. 2,800+ tests keep it honest.
 
-- Python 3.12+
-- `uv`
-- `tmux`
-- Claude Code CLI (`claude`) in `PATH`, **independently authenticated** — run `claude` once interactively to log in (cc-telegram manages no Anthropic credentials; it only drives the `claude` binary, so an unauthenticated CLI shows opaque failures inside the topic)
-- Telegram bot token from [@BotFather](https://t.me/BotFather)
-- A Telegram supergroup with forum topics enabled
+One caveat up front: this is a single-operator tool. You lock it to your own Telegram user id and point it at your own machine. It is not multi-tenant and doesn't pretend to be.
 
-> **Windows:** the bot requires tmux and therefore runs under WSL2 — the bot, tmux, and the Claude Code sessions it drives all live inside WSL. See **[docs/windows-wsl.md](docs/windows-wsl.md)** for setup and for sharing Claude Code skills/settings between WSL and a native Windows install.
+## Features
+
+The pitch above covers the headline behavior. Also in the box:
+
+- **One topic = one window = one session.** All routing is keyed by tmux window id, so `/clear` and resumed sessions stay attached to the right topic. The same directory can back several topics.
+- **Streaming output.** Assistant text, thinking, tool use/result summaries, interactive prompts, and local command output all flow into the topic as they happen.
+- **Per-route queues.** Every `(user, topic, window)` has its own worker, so one noisy topic never stalls another.
+- **Collapsing activity digest.** A compact digest shows tool activity, context-window %, and busy/waiting state while a turn runs, then collapses to a one-line summary (`✅ Done — repo · 14 tools · 2 sub-agents · 3m 41s`) when it finishes. `/history` keeps the full log.
+- **Live prose before prompts.** When Claude writes an explanation in the same turn as a question, Claude Code buffers the whole turn until you answer — so you'd normally choose blind. A lightweight `MessageDisplay` hook captures that prose live and the bot delivers it *ahead* of the picker.
+- **Late answers after the 60s AFK auto-resolve.** On Claude Code ≥2.1.198 an unanswered question self-resolves after ~60s. Instead of losing it, the card converts to "⏰ Claude proceeded after ~60s (no response)." whose buttons send your pick as a plain course-correction message.
+- **Per-user output verbosity.** `/settings` gives you presets (`verbose` / `standard` / `compact` / `quiet`) plus knobs, stored per user and applied to everything the bot sends *to you*. Another allowed user tapping your panel changes nothing.
+- **📎 downloads have a strict trust boundary.** Auto-offers come from Claude's own prose only — never tool output, sub-agent narration, or web URLs. A file is only offered if it actually resolves under the session's working directory (or `CC_TELEGRAM_ARTIFACT_ROOTS`) within the size cap, buttons answer only to you (owner-checked taps), and `/settings` has a 📎 Files toggle to turn the cards off. `/file` applies the same folder/size validation to any file type.
+- **Reply context, voice, photos, documents.** Telegram replies inject fenced, role-aware quote context. Voice notes are transcribed (OpenAI-compatible). Photos go in as image blocks; documents up to 20 MB are downloaded and forwarded.
+- **Reactive broken-topic fallback.** If Telegram says a topic is gone/closed/forbidden, output falls back to DM rather than vanishing.
+- **Opt-in approval-gate and decision cards.** Behind `CC_TELEGRAM_PERMISSION_PROMPTS` / `CC_TELEGRAM_DECISION_CARDS`, permission prompts and generic confirmation prompts surface as cards (display-only by default; `CC_TELEGRAM_DECISION_DISPATCH` adds verified one-tap buttons for known-good prompt families on characterized CC versions). Off by default; a flag-off deploy changes nothing.
+
+## Commands
+
+Bot-owned commands (handled by cc-telegram, never forwarded):
+
+| Command | What it does |
+|---|---|
+| `/start` | Greeting and how to begin — open a topic to start a session. |
+| `/history` | Paginated message history for this topic's session. |
+| `/screenshot` | Capture the tmux pane as a PNG. |
+| `/esc` | Send Escape to interrupt Claude. |
+| `/usage` | Pull Claude Code's usage/limits from the TUI. |
+| `/update` | Update the CLI, then restart idle sessions in place (owner-only). |
+| `/dashboard` | Claim this topic as a cross-session overview; `/dashboard pin` pins it. |
+| `/settings` | Your personal output-verbosity preferences (presets + knobs). |
+| `/file <path>` | Upload a file from the session's directory to the topic (any type, spaces OK). |
+| `/unbind` | Detach the topic from its session; the tmux window keeps running. |
+| `/kill` | Kill the topic's tmux window; the topic stays open for a new session. |
+
+Any other slash command is forwarded straight into Claude Code — so `/clear`, `/compact`, `/model`, `/cost`, and `/effort` work from Telegram. (`/help` and `/memory` open interactive panels inside Claude Code that never reach the transcript, so they aren't useful over the bridge.)
 
 ## Install
 
-Two modes — pick one.
+### The easy way: let Claude set it up
 
-**Install as a tool (production / the deploy path):**
+Already have Claude Code? Clone the repo, open it in Claude Code, and say:
+
+> read the README and set cc-telegram up for me
+
+It walks you through the BotFather token, writes your `.env`, installs the hooks, and offers to run it as a background service — asking you only for the parts nobody else can supply (your token, your Telegram user id). The manual steps are right below if you'd rather do it yourself.
+
+### The manual way
+
+**You'll need:**
+
+- macOS or Linux. On Windows the bot runs under WSL2 — see **[docs/windows-wsl.md](docs/windows-wsl.md)**.
+- Python 3.12+, [`uv`](https://docs.astral.sh/uv/), and `tmux`.
+- The Claude Code CLI (`claude`) on `PATH` and **already logged in** — run `claude` once interactively. cc-telegram manages no Anthropic credentials; it only drives the binary, so an unauthenticated CLI just fails opaquely inside the topic.
+- A Telegram bot token from [@BotFather](https://t.me/BotFather).
+- A Telegram supergroup with **Topics** turned on, with your bot added.
+
+**Steps:**
 
 ```bash
 git clone https://github.com/etcircle/cc-telegram.git && cd cc-telegram
 uv tool install --force --no-cache .   # puts `cc-telegram` on PATH at ~/.local/bin
 ```
 
-Then use bare `cc-telegram …`. `--no-cache` is required because the version is not bumped on every deploy (see the Quick start note).
+`--no-cache` is not optional. uv's wheel cache is keyed on the package version, and the version isn't bumped on every deploy — so `uv tool install --force .` alone silently reinstalls a stale cached wheel (exits 0, your code never ships).
 
-**Run from source (development):**
-
-```bash
-git clone https://github.com/etcircle/cc-telegram.git && cd cc-telegram
-uv sync --all-extras          # creates the dev .venv; does NOT put `cc-telegram` on PATH
-```
-
-Then always prefix commands with `uv run` (e.g. `uv run cc-telegram doctor`, `uv run cc-telegram`).
-
-## Configure
-
-Create `~/.cc-telegram/.env`:
+Write `~/.cc-telegram/.env` with the two required values:
 
 ```ini
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 ALLOWED_USERS=your_telegram_user_id
 ```
+
+Install the Claude Code hooks, sanity-check, and run:
+
+```bash
+cc-telegram hook --install    # SessionStart / PreToolUse / Notification hooks
+cc-telegram doctor            # checks token/users/tmux/claude/SessionStart hook/config-dir
+cc-telegram                   # foreground
+```
+
+Then message your bot in a topic — the first message opens a directory picker to bind the topic to a session.
+
+For day-to-day use run it under launchd on macOS with `bash bin/install-service.sh` (below). The full end-to-end deploy, upgrade, and troubleshooting guide is in **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**. New code agent? Start at **[AGENTS.md](AGENTS.md)**.
+
+**Run from source instead (development):**
+
+```bash
+git clone https://github.com/etcircle/cc-telegram.git && cd cc-telegram
+uv sync --all-extras          # dev .venv; does NOT put `cc-telegram` on PATH
+```
+
+Then prefix everything with `uv run` (e.g. `uv run cc-telegram doctor`, `uv run cc-telegram`).
+
+---
+
+# Reference
+
+Everything below is operator detail: every environment variable, hook, and state file the bot reads or writes.
+
+## Configure
+
+The two required values live in `~/.cc-telegram/.env` (see Install). Everything else has a default.
 
 Core variables:
 
@@ -92,31 +129,18 @@ Core variables:
 - `ALLOWED_USERS` — required; comma-separated Telegram user IDs.
 - `CC_TELEGRAM_DIR` — config/state directory; default `~/.cc-telegram`.
 - `TMUX_SESSION_NAME` — tmux session driven by the bot; default `cc-telegram`.
-- `CLAUDE_COMMAND` — command used for new windows; default `claude`. Must exec the claude binary directly (or via an exec-ing wrapper); a non-exec shell wrapper defeats `/update`'s shell-detection gate (see the `/update` bullet above).
+- `CLAUDE_COMMAND` — command used for new windows; default `claude`. Must exec the claude binary directly (or via an exec-ing wrapper); a non-exec shell wrapper defeats `/update`'s shell-detection gate (see the `/update` notes below).
 - `CLAUDE_CONFIG_DIR` — Claude config root; projects default to `$CLAUDE_CONFIG_DIR/projects`.
 - `CC_TELEGRAM_CLAUDE_PROJECTS_PATH` — explicit Claude projects directory override. Precedence: `CC_TELEGRAM_CLAUDE_PROJECTS_PATH` > `CLAUDE_CONFIG_DIR/projects` > `~/.claude/projects`.
 - `MONITOR_POLL_INTERVAL` — JSONL poll interval; default `2.0`.
 - `CC_TELEGRAM_BROWSE_ROOT` — directory picker root; default `~`.
 - `OPENAI_API_KEY` / `OPENAI_BASE_URL` — optional voice transcription provider.
 
-Useful behavior knobs:
+Behavior knobs:
 
-- `CC_TELEGRAM_VERBOSITY` — default output preset (`verbose` / `standard` /
-  `compact` / `quiet`) for users who have not picked one via `/settings`;
-  default `standard` (collapsed post-turn digests, 160-char tool lines, user
-  echo off — `verbose` restores the pre-settings firehose). Per-user
-  `/settings` choices always win over env defaults — the env vars below are
-  knob-precise **defaults, not ceilings**.
-- `CC_TELEGRAM_SHOW_USER_MESSAGES` — echo user messages from tmux; default `true`.
-  When set explicitly it becomes the default for the per-user 👤-echo
-  preference; a user's stored `/settings` choice overrides it.
-- `CC_TELEGRAM_SHOW_TOOL_CALLS` — show tool use/result stream; default `true`.
-  Setting it to `false` suppresses **display only** (the faithful legacy
-  mapping: all tool surfaces including the 🤖 sub-agent dispatch/report and
-  the per-sub-agent cards): sidechain transcripts are still tailed and their
-  activity still feeds the run-state truth (busy indicator / typing), so a
-  long subagent run doesn't read as idle. A user's stored `/settings` choice
-  overrides it.
+- `CC_TELEGRAM_VERBOSITY` — default output preset (`verbose` / `standard` / `compact` / `quiet`) for users who haven't picked one via `/settings`; default `standard` (collapsed post-turn digests, 160-char tool lines, user echo off — `verbose` restores the pre-settings firehose). Per-user `/settings` choices always win over env defaults — the env vars below are knob-precise **defaults, not ceilings**.
+- `CC_TELEGRAM_SHOW_USER_MESSAGES` — echo user messages from tmux; default `true`. When set explicitly it becomes the default for the per-user 👤-echo preference; a user's stored `/settings` choice overrides it.
+- `CC_TELEGRAM_SHOW_TOOL_CALLS` — show tool use/result stream; default `true`. Setting it to `false` suppresses **display only** (all tool surfaces including the 🤖 sub-agent dispatch/report and the per-sub-agent cards): sidechain transcripts are still tailed and still feed the run-state truth (busy indicator / typing), so a long subagent run doesn't read as idle. A user's stored `/settings` choice overrides it.
 - `CC_TELEGRAM_SHOW_HIDDEN_DIRS` — show dot-directories in picker; default `false`.
 - `CC_TELEGRAM_HOOK_TIMEOUT` — seconds to wait for Claude Code's `SessionStart` hook to register a newly-bound window before giving up; overrides **both** built-in defaults (5s fresh / 15s resume) when set. Raise it when Claude starts slowly — a WSL `/mnt/c` DrvFs mount, or several MCP servers, can push `SessionStart` out to ~15-20s, past which the first message is silently dropped on every bind. Unset preserves the stock 5s/15s; an invalid value (non-numeric / non-finite / `<= 0`) falls back to the defaults with a warning.
 - `CC_TELEGRAM_WINDOW_GEOMETRY` — `<width>x<height>` geometry for bot-created tmux windows (applied at window creation, before Claude launches, and to every existing window once at startup); default `160x50`. The terminals are a machine surface — nobody attaches to them — so the geometry serves the parser: 50 rows keep tall `AskUserQuestion` pickers fully on-screen, 160 columns keep long option labels from overflowing. Sanity bounds `20–500` × `5–300`; an invalid value falls back to the default with a warning.
@@ -139,7 +163,43 @@ Useful behavior knobs:
 - `CC_TELEGRAM_MESSAGE_REFS_DB_PATH` — SQLite path; default `$CC_TELEGRAM_DIR/message_refs.db`.
 - `CC_TELEGRAM_MESSAGE_REF_TEXT_MAX_CHARS` — stored body cap; default `4000`.
 
-### State files
+### Recommended daily-driver `.env`
+
+Only use this if the bot runs on a machine you trust and `ALLOWED_USERS` is locked to you. `--dangerously-skip-permissions` lets Claude act without local confirmation.
+
+```ini
+TELEGRAM_BOT_TOKEN=...
+ALLOWED_USERS=<your_id>
+CLAUDE_COMMAND=IS_SANDBOX=1 claude --dangerously-skip-permissions
+MONITOR_POLL_INTERVAL=1.0
+OPENAI_API_KEY=sk-...
+CC_TELEGRAM_BROWSE_ROOT=~/dev
+# CC_TELEGRAM_SHOW_TOOL_CALLS=false
+# CC_TELEGRAM_SHOW_USER_MESSAGES=false
+```
+
+### Config directory override
+
+Default config dir is `~/.cc-telegram`. Override it with `CC_TELEGRAM_DIR`:
+
+```bash
+CC_TELEGRAM_DIR=/path/to/state cc-telegram
+```
+
+Useful for testing or running multiple profiles against one install.
+
+## The `/update` command in detail
+
+`/update` updates the Claude Code CLI binary, then restarts each **idle** bound session inside its existing tmux window (via `claude --resume`, so it adopts the new version and the topic keeps its window id / routing). It is owner-only, fail-closed, and idle-only:
+
+- Busy, waiting, or background-agent sessions are **deferred**, never interrupted — as are sessions with live background shells (a `· N shell` status-bar token; a restart would kill those jobs).
+- A session that won't cleanly exit within a bounded ~15s wait is **skipped**, not force-killed. The summary then warns that the session may be dead and to check the window before sending messages, since `/exit` was already sent.
+- A skipped window is **quarantined**: the bot refuses to type new messages into it until it observes Claude running there again (a message typed into a dead session's bare shell would be *executed* by the shell), replying with an explicit "Message NOT delivered" error in the topic instead. "Claude running" is strict — the pane must report Claude's own version-string process; any other foreground command, including vim/python/ssh you started while checking the window, keeps sends blocked. The quarantine clears once Claude is seen alive, on a later confirmed restart, or when the window/topic is torn down; it is in-memory, so a bot restart clears it.
+- Restarts run one at a time; a second `/update` while one is running is rejected. There's no scheduler — run it when you want the running sessions on a freshly-updated CLI. It reports a progressive summary (`♻️ Restarted N idle · deferred M busy · skipped K`).
+
+Note: `CLAUDE_COMMAND` must exec the claude binary directly (or via an exec-ing wrapper). A non-exec shell wrapper makes the pane report the wrapper shell while Claude is still alive, which defeats `/update`'s shell-detection safety gate in the dangerous direction.
+
+## State files
 
 Under `$CC_TELEGRAM_DIR` (default `~/.cc-telegram/`):
 
@@ -157,22 +217,12 @@ Under `$CC_TELEGRAM_DIR` (default `~/.cc-telegram/`):
 - `message_refs.db` — SQLite provenance index for safer reply-context resolution (path overridable via `CC_TELEGRAM_MESSAGE_REFS_DB_PATH`).
 - `log-archive/` — gzipped log rotations (only present if the rotation LaunchAgent is installed; see "Log rotation").
 
-All state files are safe to delete — the bot re-creates what it needs on next start (you will lose interactive picker continuity and bound topic mappings).
+All state files are safe to delete — the bot re-creates what it needs on next start (you'll lose interactive picker continuity and bound topic mappings).
 
-## Voice transcription
-
-Voice notes are transcribed via a standard OpenAI `POST $OPENAI_BASE_URL/audio/transcriptions` call with `Authorization: Bearer $OPENAI_API_KEY`. The transcription model is **hardcoded to `gpt-4o-transcribe`** (`transcribe.py`; no override env var), so the backend must expose that exact model name. `OPENAI_API_KEY` is required **for voice only** — without it, voice notes fail with a raw 401. Point `OPENAI_BASE_URL` at anything that speaks that shape:
-
-- `https://api.openai.com/v1` — the default.
-- A local LiteLLM, vLLM, or other OpenAI-compatible gateway that serves `gpt-4o-transcribe`.
-- A backend exposing only a different STT model (e.g. OpenRouter's `whisper-1`) will return a model-not-found error unless fronted by a model-name-translating proxy.
-
-If your backend doesn't natively speak OpenAI's STT shape (e.g., a local `whisper.cpp` server with its `/inference` endpoint), or serves a different model name, front it with a small shape-translating proxy and point `OPENAI_BASE_URL` at that. (An external `whisper-openai-proxy` example — a ~130-line stdlib-only shim — is an optional companion; it is not part of this repo.)
-
-## Install the Claude Code hook
+## The Claude Code hooks
 
 ```bash
-uv run cc-telegram hook --install
+cc-telegram hook --install
 ```
 
 This writes/updates `~/.claude/settings.json` with three managed hook entries:
@@ -206,7 +256,7 @@ This writes/updates `~/.claude/settings.json` with three managed hook entries:
 }
 ```
 
-The `SessionStart` hook writes `session_map.json` so the bot can route messages back to the right tmux window. The `PreToolUse` hook (matcher `AskUserQuestion`) captures the structured question payload before Claude renders the picker — see the next section. The `Notification` hook (matcher-less) writes a window-keyed `notify_pending/<session_id>.json` marker when Claude blocks on a permission / approval prompt, so the bot can flip the topic to "🔔 Waiting on you" — the only detection path for approval gates that never reach the session JSONL. No notification text is stored in the marker. If either the `PreToolUse` or the `Notification` entry is missing, the bot logs a one-time startup warning; re-run `cc-telegram hook --install` to repair.
+The `SessionStart` hook writes `session_map.json` so the bot can route messages back to the right tmux window. The `PreToolUse` hook (matcher `AskUserQuestion`) captures the structured question payload before Claude renders the picker — see below. The `Notification` hook (matcher-less) writes a window-keyed `notify_pending/<session_id>.json` marker when Claude blocks on a permission / approval prompt, so the bot can flip the topic to "🔔 Waiting on you" — the only detection path for approval gates that never reach the session JSONL. No notification text is stored in the marker. If either the `PreToolUse` or the `Notification` entry is missing, the bot logs a one-time startup warning; re-run `cc-telegram hook --install` to repair.
 
 > **`cc-telegram doctor` only verifies the `SessionStart` hook.** Confirm all three managed entries installed with `grep -c 'cc-telegram hook' ~/.claude/settings.json` (expect `3`); a missing `PreToolUse`/`Notification` also surfaces as the one-time startup-log warning above.
 
@@ -250,19 +300,15 @@ When Claude writes prose in the same turn as an `AskUserQuestion` / `ExitPlanMod
 
 If the bot cannot write the settings file (e.g. an unwritable config dir), it logs a one-time startup warning and live prose silently falls back to post-resolution delivery — no crash, the picker still works.
 
-## Run
+## Voice transcription
 
-```bash
-uv run cc-telegram
-```
+Voice notes are transcribed via a standard OpenAI `POST $OPENAI_BASE_URL/audio/transcriptions` call with `Authorization: Bearer $OPENAI_API_KEY`. The transcription model is **hardcoded to `gpt-4o-transcribe`** (`transcribe.py`; no override env var), so the backend must expose that exact model name. `OPENAI_API_KEY` is required **for voice only** — without it, a voice note gets a polite "transcription needs an OpenAI API key" reply and no HTTP call is made. Point `OPENAI_BASE_URL` at anything that speaks that shape:
 
-If installed as a tool:
+- `https://api.openai.com/v1` — the default.
+- A local LiteLLM, vLLM, or other OpenAI-compatible gateway that serves `gpt-4o-transcribe`.
+- A backend exposing only a different STT model (e.g. OpenRouter's `whisper-1`) will return a model-not-found error unless fronted by a model-name-translating proxy.
 
-```bash
-cc-telegram
-```
-
-For day-to-day use, run it under launchd (below) or a process supervisor.
+If your backend doesn't natively speak OpenAI's STT shape (e.g., a local `whisper.cpp` server with its `/inference` endpoint), or serves a different model name, front it with a small shape-translating proxy and point `OPENAI_BASE_URL` at that. (An external `whisper-openai-proxy` example — a ~130-line stdlib-only shim — is an optional companion; it is not part of this repo.)
 
 ## Run under launchd (macOS)
 
@@ -275,8 +321,6 @@ bash bin/install-service.sh --print  # dry-run: print the plist it would write (
 
 `cc-telegram` must already be on PATH (install as a tool, above). The script sets an explicit `PATH` in the plist so launchd can find `cc-telegram`/`tmux`/`claude`, enables `KeepAlive`+`RunAtLoad`, and redirects stdout/stderr to `$CC_TELEGRAM_DIR/launchd.{out,err}.log`. Hand-written-plist instructions and the full rationale are in **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** section 7.
 
-## Restart the service
-
 Once the LaunchAgent exists, restart (kill + relaunch) the bot with:
 
 ```bash
@@ -285,22 +329,13 @@ launchctl kickstart -k gui/$(id -u)/com.cc-telegram
 
 ## Log rotation
 
-`launchd.err.log` and `launchd.out.log` are written by launchd's
-stderr/stdout redirect, not by Python's logging — so the bot can't
-rotate them itself. A small LaunchAgent handles rotation: every 30
-minutes it checks both files, gzips a dated copy into
-`~/.cc-telegram/log-archive/` if either exceeds 50MB, and truncates
-the original in place (safe under the bot's `O_APPEND` write).
-Archives older than 14 days are deleted automatically. Install with:
+`launchd.err.log` and `launchd.out.log` are written by launchd's stderr/stdout redirect, not by Python's logging — so the bot can't rotate them itself. A small LaunchAgent handles rotation: every 30 minutes it checks both files, gzips a dated copy into `~/.cc-telegram/log-archive/` if either exceeds 50MB, and truncates the original in place (safe under the bot's `O_APPEND` write). Archives older than 14 days are deleted automatically. Install with:
 
 ```bash
 bash bin/install-log-rotate.sh
 ```
 
-The script is idempotent — re-running replaces the existing agent.
-Override thresholds via env in the plist `EnvironmentVariables` block
-(`CC_TELEGRAM_LOG_ROTATE_THRESHOLD_MB`,
-`CC_TELEGRAM_LOG_ROTATE_MAX_AGE_DAYS`).
+The script is idempotent — re-running replaces the existing agent. Override thresholds via env in the plist `EnvironmentVariables` block (`CC_TELEGRAM_LOG_ROTATE_THRESHOLD_MB`, `CC_TELEGRAM_LOG_ROTATE_MAX_AGE_DAYS`).
 
 Force a rotation pass now:
 
@@ -315,37 +350,7 @@ launchctl bootout gui/$(id -u)/com.cc-telegram.log-rotate
 rm ~/Library/LaunchAgents/com.cc-telegram.log-rotate.plist
 ```
 
-Without this, a crash-loop (e.g. a startup AttributeError under
-`KeepAlive=true`) can balloon `launchd.err.log` to hundreds of
-megabytes and trigger Telegram `getUpdates` rate-limiting via the
-restart spam. The rotation cap also caps the blast radius.
-
-## Config directory override
-
-Default config dir: `~/.cc-telegram`.
-
-Override with the `CC_TELEGRAM_DIR` env var:
-
-```bash
-CC_TELEGRAM_DIR=/path/to/state cc-telegram
-```
-
-Useful for testing or running multiple profiles against the same install.
-
-## Recommended daily-driver `.env`
-
-Only use this if the bot runs on a machine you trust and `ALLOWED_USERS` is locked to you. `--dangerously-skip-permissions` means Claude can act without local confirmation.
-
-```ini
-TELEGRAM_BOT_TOKEN=...
-ALLOWED_USERS=<your_id>
-CLAUDE_COMMAND=IS_SANDBOX=1 claude --dangerously-skip-permissions
-MONITOR_POLL_INTERVAL=1.0
-OPENAI_API_KEY=sk-...
-CC_TELEGRAM_BROWSE_ROOT=~/dev
-# CC_TELEGRAM_SHOW_TOOL_CALLS=false
-# CC_TELEGRAM_SHOW_USER_MESSAGES=false
-```
+Without this, a crash-loop (e.g. a startup AttributeError under `KeepAlive=true`) can balloon `launchd.err.log` to hundreds of megabytes and trigger Telegram `getUpdates` rate-limiting via the restart spam. The rotation cap also caps the blast radius.
 
 ## Test
 
@@ -358,10 +363,7 @@ uv run pytest -m scenario -q          # behavior floor (tests/scenarios/)
 bin/post-wave-check.sh                # repo health diff (LoC + brittleness signals)
 ```
 
-`tests/scenarios/` holds the black-box behavior floor: each file drives a
-single user-visible scenario through the real handler stack (no
-monkeypatch of handler internals in test bodies). See
-`tests/scenarios/README.md` for the scenario → behavior map.
+`tests/scenarios/` holds the black-box behavior floor: each file drives a single user-visible scenario through the real handler stack (no monkeypatch of handler internals in test bodies). See `tests/scenarios/README.md` for the scenario → behavior map.
 
 ## Repository layout
 
