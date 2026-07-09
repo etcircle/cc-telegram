@@ -37,6 +37,7 @@ from cctelegram.session import session_manager as _real_sm
 from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
 from cctelegram.utils import app_dir
 from cctelegram.handlers import (
+    artifacts,
     attention,
     auq_ledger,
     auq_source,
@@ -787,6 +788,8 @@ def _reset_all_handler_state() -> None:
     # Wave A: the in-memory aql: late-answer card registry (R3 reset-seam
     # protocol — co-located reset called by direct module reference).
     late_answer.reset_for_tests()
+    # Artifact delivery lane: the in-memory 📎 download-card registry + offer-dedup.
+    artifacts.reset_for_tests()
     pick_token.reset_for_tests()
     pick_intent.reset_for_tests()
     auq_source.reset_for_tests()

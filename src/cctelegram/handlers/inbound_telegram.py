@@ -54,7 +54,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from .. import route_runtime
-from . import decision_token, pane_signals
+from . import artifacts, decision_token, pane_signals
 from ..config import config
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
@@ -551,6 +551,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # generation die with the binding — a stale dcp:/gate-nav tap must
         # never survive into a window id a later binding may reuse.
         decision_token.teardown_route(user.id, thread_id, wid)
+        # Artifact delivery lane: the unbound route's 📎 download cards die with
+        # the binding — a stale dlf: tap must never survive into a window id a
+        # later binding may reuse.
+        artifacts.invalidate_window(wid)
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
@@ -644,6 +648,10 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # generation die with the binding — a stale dcp:/gate-nav tap must
         # never survive into a window id a later binding may reuse.
         decision_token.teardown_route(user.id, thread_id, wid)
+        # Artifact delivery lane: the unbound route's 📎 download cards die with
+        # the binding — a stale dlf: tap must never survive into a window id a
+        # later binding may reuse.
+        artifacts.invalidate_window(wid)
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
@@ -825,6 +833,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # generation die with the binding — a stale dcp:/gate-nav tap must
         # never survive into a window id a later binding may reuse.
         decision_token.teardown_route(user.id, thread_id, wid)
+        # Artifact delivery lane: the unbound route's 📎 download cards die with
+        # the binding — a stale dlf: tap must never survive into a window id a
+        # later binding may reuse.
+        artifacts.invalidate_window(wid)
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
@@ -1104,6 +1116,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # generation die with the binding — a stale dcp:/gate-nav tap must
         # never survive into a window id a later binding may reuse.
         decision_token.teardown_route(user.id, thread_id, wid)
+        # Artifact delivery lane: the unbound route's 📎 download cards die with
+        # the binding — a stale dlf: tap must never survive into a window id a
+        # later binding may reuse.
+        artifacts.invalidate_window(wid)
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")

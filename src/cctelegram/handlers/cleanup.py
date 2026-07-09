@@ -18,6 +18,7 @@ from ..session import session_id_for_window, session_manager
 from ..tmux_manager import tmux_manager
 
 from . import (
+    artifacts,
     attention,
     auq_source,
     late_answer,
@@ -157,6 +158,11 @@ async def clear_topic_state(
     # routes loop above, so a queue-less route's card dies with the topic
     # too (the same _route_queues gap that gave route_runtime its own seam).
     late_answer.invalidate_topic(user_id, thread_id or 0)
+    # Artifact delivery lane: drop the topic's 📎 download cards (+ offer-dedup)
+    # here — the COVERING seam (topic close/delete + the status-poller
+    # window-gone path all route through clear_topic_state); topic-keyed for the
+    # same queue-less-route reason as late_answer above.
+    artifacts.invalidate_topic(user_id, thread_id or 0)
 
     # Pop the status poller's route-local caches for this topic (gate P3-1) —
     # a rebound topic reusing the same route key must not inherit a stale

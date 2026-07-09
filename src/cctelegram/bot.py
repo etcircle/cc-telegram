@@ -41,7 +41,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, Conflict, Forbidden, NetworkError
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -130,6 +130,7 @@ from .handlers.interactive_ui import (
 )
 from .handlers.late_answer import is_afk_auto_resolve
 from .handlers.message_queue import (
+    enqueue_artifact_card,
     enqueue_content_message,
     enqueue_subagent_collapse,
     get_content_queue,
@@ -145,7 +146,7 @@ from .handlers.message_sender import (
 from .handlers.response_builder import build_response_parts, is_task_notification
 from .handlers.status_polling import status_poll_loop, typing_action_loop
 from . import route_runtime, terminal_parser, transcript_event_adapter
-from .handlers import decision_token, pane_signals
+from .handlers import artifacts, decision_token, pane_signals
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import (
@@ -461,6 +462,72 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update.message, "❌ Failed to send — window may be gone")
         return
     await safe_reply(update.message, "⎋ Sent Escape")
+
+
+async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/file <path>`` — upload a local file from this session to the topic.
+
+    The durable escape hatch for the 📎 artifact card lane: an owner-only,
+    explicit request that fetches ANY file type under the session cwd + the
+    configured extra roots (NOT ext-gated — the allowlist governs only the
+    auto-offered card). Same resolve/validate/open pipeline (containment +
+    size cap + the validated-fd contract). Registered BEFORE the catch-all
+    ``filters.COMMAND`` forwarder so it never lands in tmux.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    # The RAW argument tail (codex r2 P3-1) so paths with spaces work — split off
+    # only the leading "/file" (or "/file@botname") token.
+    raw = update.message.text or ""
+    tail = raw.split(None, 1)
+    arg = tail[1].strip() if len(tail) > 1 else ""
+    if not arg:
+        await safe_reply(update.message, "Usage: /file <path>")
+        return
+
+    ws = session_manager.window_states.get(wid)
+    cwd = ws.cwd if ws else ""
+    if not cwd:
+        await safe_reply(update.message, "❌ This session has no working directory.")
+        return
+
+    art, reason = artifacts.resolve_single(
+        arg, cwd, config.artifact_roots, config.artifact_max_bytes
+    )
+    if art is None:
+        await safe_reply(update.message, f"❌ Can't send that file: {reason}.")
+        return
+
+    opened = artifacts.open_validated_artifact(
+        art.resolved_path, art.allowed_roots, config.artifact_max_bytes
+    )
+    if opened.file is None:
+        await safe_reply(update.message, f"❌ Upload failed: {opened.reason}.")
+        return
+    try:
+        await update.message.reply_document(
+            document=opened.file, filename=Path(art.resolved_path).name
+        )
+    except RetryAfter:
+        await safe_reply(update.message, "Rate-limited — try again shortly.")
+    except Exception as exc:
+        logger.warning("/file upload failed window=%s: %s", wid, exc)
+        await safe_reply(update.message, f"❌ Upload failed: {exc}")
+    finally:
+        try:
+            opened.file.close()
+        except Exception:  # pragma: no cover — defensive close
+            pass
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -964,6 +1031,38 @@ async def apply_sidechain_activity(
                 )
 
 
+async def _maybe_offer_artifacts(
+    bot: Bot, user_id: int, wid: str, thread_id: int | None, text: str
+) -> None:
+    """Detect deliverable local file paths in ``text`` and post a 📎 card.
+
+    Reads the config-owned size cap + extra roots and INJECTS them into the
+    config-free ``artifacts`` leaf (the leaf-purity contract). cwd comes from the
+    window state (empty ⇒ skip, fail-closed). The offer-dedup makes re-mentions
+    cheap; ``None`` means nothing fresh to offer. Pull-only; no observer.
+    """
+    ws = session_manager.window_states.get(wid)
+    cwd = ws.cwd if ws else ""
+    if not cwd:
+        return
+    candidates = artifacts.extract_artifact_candidates(text)
+    if not candidates:
+        return
+    resolved = artifacts.resolve_artifacts(
+        candidates, cwd, config.artifact_roots, config.artifact_max_bytes
+    )
+    if not resolved:
+        return
+    route = (user_id, thread_id or 0, wid)
+    card = artifacts.mint(route, resolved)
+    if card is None or not card.rows:
+        return
+    # The body lists the FULL display names (card.names) — the restart-safe
+    # /file fallback; only the BUTTON labels are clipped (fold item 2).
+    body = artifacts.card_text(card.names, overflow=card.overflow)
+    await enqueue_artifact_card(bot, route, body, card.rows)
+
+
 async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     """Handle a new assistant message — enqueue for sequential processing.
 
@@ -1246,6 +1345,20 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             stop_reason=msg.stop_reason,
         )
 
+        # Artifact delivery lane: scan this PARENT assistant prose block for
+        # deliverable local file paths and offer a 📎 tap-to-download card.
+        # Enqueued strictly AFTER the block's content task above (codex P1-2),
+        # so the route FIFO delivers prose → card. Gated on the per-recipient
+        # ``artifact_card`` pref (quiet ⇒ off). Sidechain blocks
+        # (``subagent_key`` non-None) never offer.
+        if (
+            prefs.artifact_card
+            and msg.role == "assistant"
+            and msg.content_type == "text"
+            and msg.subagent_key is None
+        ):
+            await _maybe_offer_artifacts(bot, user_id, wid, thread_id, msg.text)
+
         # Update user's read offset to current file position
         # This marks these messages as "read" for this user
         session = await session_manager.resolve_session_for_window(wid)
@@ -1395,6 +1508,7 @@ async def post_init(application: Application) -> None:
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
         BotCommand("update", "Update Claude Code CLI + restart idle sessions"),
+        BotCommand("file", "Upload a file from this session (/file <path>)"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -1695,6 +1809,9 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    # /file is bot-owned (upload a local file from the session to the topic) —
+    # register before the catch-all forwarder below so it never lands in tmux.
+    application.add_handler(CommandHandler("file", file_command))
     # /update is bot-owned (update the CLI + restart idle sessions in place) —
     # register before the catch-all forwarder below so it never lands in tmux.
     application.add_handler(CommandHandler("update", update_command))

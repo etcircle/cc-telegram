@@ -60,6 +60,10 @@ class OutputPrefs:
     # Agent prominence (the 🤖 dispatched / 🤖✅ done surface)
     agent_dispatch_msg: bool
     agent_prompt_preview_chars: int
+    # 📎 artifact tap-to-download cards (preset-only knob; no legacy env
+    # default). False ⇒ Claude's prose is never scanned for deliverable file
+    # paths and no 📎 card is posted (quiet's "no cards" contract).
+    artifact_card: bool
     # Other surfaces
     user_echo: bool
     todo_card: bool
@@ -83,6 +87,7 @@ PRESETS: dict[str, OutputPrefs] = {
         subagent_live_lines=12,
         agent_dispatch_msg=True,
         agent_prompt_preview_chars=400,
+        artifact_card=True,
         user_echo=True,
         todo_card=True,
         context_footer=True,
@@ -100,6 +105,7 @@ PRESETS: dict[str, OutputPrefs] = {
         subagent_live_lines=6,
         agent_dispatch_msg=True,
         agent_prompt_preview_chars=400,
+        artifact_card=True,
         user_echo=False,
         todo_card=True,
         context_footer=True,
@@ -117,6 +123,7 @@ PRESETS: dict[str, OutputPrefs] = {
         subagent_live_lines=0,
         agent_dispatch_msg=True,
         agent_prompt_preview_chars=120,
+        artifact_card=True,
         user_echo=False,
         todo_card=True,
         context_footer=True,
@@ -134,6 +141,7 @@ PRESETS: dict[str, OutputPrefs] = {
         subagent_live_lines=0,
         agent_dispatch_msg=False,
         agent_prompt_preview_chars=120,
+        artifact_card=False,
         user_echo=False,
         todo_card=False,
         context_footer=True,
@@ -152,6 +160,7 @@ KNOB_CHOICES: dict[str, dict[str, Any]] = {
     "lines": {"64": 64, "160": 160, "400": 400},  # digest_line_chars
     "echo": {"on": True, "off": False},  # user_echo
     "footer": {"on": True, "off": False},  # context_footer
+    "artifacts": {"on": True, "off": False},  # artifact_card (📎 download cards)
     # W1/W2 collapse policies (PR-2; deferred from PR-1 so the controls
     # never shipped before their mechanics — codex PR-1 review P2-1).
     "done": {
@@ -169,6 +178,7 @@ _KNOB_FIELDS: dict[str, str] = {
     "lines": "digest_line_chars",
     "echo": "user_echo",
     "footer": "context_footer",
+    "artifacts": "artifact_card",
     "done": "digest_on_done",
     "subcards": "subagent_cards",
 }

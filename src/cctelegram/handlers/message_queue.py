@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from collections.abc import Iterable
 from typing import Any, Literal
 
-from telegram import Bot, ReplyParameters
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 from telegram.error import RetryAfter
 
 from ..config import config
@@ -67,7 +67,13 @@ MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
 class MessageTask:
     """Message task for queue processing."""
 
-    task_type: Literal["content", "status_update", "status_clear", "subagent_collapse"]
+    task_type: Literal[
+        "content",
+        "status_update",
+        "status_clear",
+        "subagent_collapse",
+        "artifact_card",
+    ]
     text: str | None = None
     window_id: str | None = None
     # content type fields
@@ -119,6 +125,11 @@ class MessageTask:
     # ``↳`` cards this task collapses (summary-gated). Runs on the route FIFO
     # AFTER the run's content tasks so the cards exist when it fires.
     subagent_collapse_prefix: str | None = None
+    # Artifact delivery lane: for an ``artifact_card`` control task — the plain
+    # ``(button_label, callback_data)`` rows the processor wraps into an
+    # ``InlineKeyboardMarkup`` (the leaf never imports telegram). Enqueued
+    # strictly AFTER the block's content task so the 📎 card follows the prose.
+    artifact_rows: list[tuple[str, str]] | None = None
 
 
 @dataclass
@@ -656,7 +667,7 @@ CONTENT_RETRY_MAX_ATTEMPTS = 3
 # / a ``RetryAfter`` would strand an empty-final card live, voiding the
 # guarantee. It is idempotent (already-collapsed → flush; tombstoned → no-op),
 # so a retry re-run is safe. Status tasks stay ephemeral (dropped on flood).
-_RETRYABLE_TASK_TYPES = {"content", "subagent_collapse"}
+_RETRYABLE_TASK_TYPES = {"content", "subagent_collapse", "artifact_card"}
 
 
 def _retry_after_seconds(exc: RetryAfter) -> int:
@@ -759,6 +770,15 @@ async def _dispatch_task(
             bot, user_id, task.thread_id, task.subagent_collapse_prefix or ""
         )
         return task
+    if task.task_type == "artifact_card":
+        # Artifact delivery lane: enqueued AFTER the block's content task, so it
+        # rides the route FIFO and lands below the prose. Retryable like content
+        # (a RetryAfter re-runs via _dispatch_already_merged; a retry after an
+        # ambiguous send may duplicate the card — same class as content).
+        if merged_holder is not None:
+            merged_holder.append(task)
+        await _send_artifact_card(bot, user_id, task)
+        return task
     if task.task_type == "status_update":
         await _process_status_update_task(bot, user_id, task)
         return task
@@ -803,6 +823,9 @@ async def _dispatch_already_merged(
         await collapse_subagent_cards_with_prefix(
             bot, user_id, task.thread_id, task.subagent_collapse_prefix or ""
         )
+        return
+    if task.task_type == "artifact_card":
+        await _send_artifact_card(bot, user_id, task)
         return
     if task.task_type == "status_update":
         await _process_status_update_task(bot, user_id, task)
@@ -3530,6 +3553,63 @@ async def enqueue_subagent_collapse(
             thread_id=route[1],
             window_id=route[2],
             subagent_collapse_prefix=key_prefix,
+        )
+    )
+
+
+async def _send_artifact_card(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Send one 📎 artifact card — plain text + the tap-to-download keyboard.
+
+    ``plain=True`` avoids MarkdownV2 escaping of the listed paths; the rows are
+    wrapped into an ``InlineKeyboardMarkup`` here (the artifacts leaf never
+    imports telegram). Topic-broken outcomes ride topic_send's classification.
+    """
+    chat_id, effective_thread_id = _delivery_target(user_id, task.thread_id)
+    rows = task.artifact_rows or []
+    markup = (
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton(label, callback_data=cb)] for label, cb in rows]
+        )
+        if rows
+        else None
+    )
+    await topic_send(
+        bot,
+        op="artifact",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=effective_thread_id,
+        window_id=task.window_id,
+        text=task.text or "",
+        plain=True,
+        reply_markup=markup,
+    )
+
+
+async def enqueue_artifact_card(
+    bot: Bot,
+    route: Route,
+    text: str,
+    rows: list[tuple[str, str]],
+) -> None:
+    """Enqueue a 📎 artifact card as an ``artifact_card`` control task.
+
+    Lands in the SAME per-route FIFO as the block's content, so the per-route
+    worker sends the prose FIRST and the card SECOND (the card follows the
+    prose). Ordered + retryable like content (``_RETRYABLE_TASK_TYPES``).
+    """
+    if route in _route_tearing_down:
+        # Mirror enqueue_content_message: a teardown is in flight — dropping the
+        # card is correct (the route is going away anyway).
+        return
+    queue = _get_or_create_route(bot, route)
+    queue.put_nowait(
+        MessageTask(
+            task_type="artifact_card",
+            text=text,
+            thread_id=route[1],
+            window_id=route[2],
+            artifact_rows=list(rows),
         )
     )
 
