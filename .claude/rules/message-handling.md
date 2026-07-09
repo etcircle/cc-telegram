@@ -605,14 +605,23 @@ four OTHER lanes' ownership fields (`agentId` / `taskId` / `backgroundTaskId` /
 (`resumedAgentId`, verified 0-overlap). A prose `Spawned successfully.` line with
 NO structured meta fires the rate-limited T1.6-analogue drift WARNING, never a
 lift. **The registry (`session_monitor`, per-parent `dict[name -> _TeammateRec]`):**
-`_record_teammate_spawn` creates a gen-1 rec OR ROTATES it — a same-name RESPAWN
+`_record_teammate_spawn` (anchored to the spawn tool_result's JSONL EVENT ts,
+NOT the monitor's parse instant — the poll lags CC's write, so `time.time()`
+would set `spawned_ts` after the genuine new-gen file's first entry and the
+gen≥2 gate would reject it; an unparseable event ts falls back with a WARNING —
+adversarial-review P1) creates a gen-1 rec OR ROTATES it — a same-name RESPAWN
 (1) closes the old `current_key` unconditionally (an `end_turn_ts_unparseable=True`
 teammate done — bypasses the resume/stale gates by design, never peeks runtime
-liveness), (2) moves it to `retired_keys`, (3) QUARANTINES every matching stem
-tracked OR present on a single anchored `glob(glob.escape("agent-a<name>-") +
-"*.jsonl")` disk snapshot (the disk snapshot closes the untracked-stale-file
-hole), (4) resets `current_key`/pending + bumps `spawn_generation`, then (5) a
-PRE-SPAWN scan attempts binding on surviving tracked unbound stems. **Binding
+liveness), (2) moves it to `retired_keys` + bumps `spawn_generation` /
+`spawned_ts`, (3) QUARANTINES the genuinely-STALE matching stems tracked OR
+present on a single anchored `glob(glob.escape("agent-a<name>-") + "*.jsonl")`
+disk snapshot — GATED on the NEW generation's bind gate (adversarial-review P1
+over-quarantine fix): only a stem that FAILS the gate (first entry predates the
+new spawn ⇒ prior gen) is severed; a same-name file ALREADY on disk at rotation
+whose first entry is ≥ the new spawn is the GENUINE new-gen file the poll lagged
+and is LEFT for the normal binding path (a mid-write file too), (4) resets
+`current_key`/pending, then (5) a PRE-SPAWN scan attempts binding on surviving
+tracked unbound stems. **Binding
 (`_try_bind_or_quarantine_teammate_file`, called for EVERY top-level sidechain
 file in `check_sidechain_updates` BEFORE `_track_and_emit_sidechain_file`, so it
 fires at first-seen EOF):** a stem whose normalized key resolves to a registered
@@ -622,9 +631,14 @@ name (LONGEST-name-first, pure-hex residual disambiguates nested names) binds as
 5.0s) AND the **first-entry-timestamp generation gate** (`_read_first_entry_ts`:
 a bounded byte-capped read of the FIRST JSONL line — cap/no-newline/parse-fail/
 unparseable ⇒ NO bind this tick, RETRY while unbound, never consume-once; gen-1
-tolerates `>= spawned_ts - SKEW`, gen≥2 STRICT `>= spawned_ts`; multiple
-unretired candidates passing simultaneously in the pre-spawn scan → bind NONE +
-WARN, fail-DARK) all pass. On bind it emits the EXISTING `launched` key at
+tolerates the larger `>= spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S`,
+gen≥2 tolerates only the small cross-write-path
+`>= spawned_ts - TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S` (1.0s — the spawn
+tool_result and the teammate's first sidechain entry are different CC flushes, so
+the genuine new file's first entry can land a sub-second before the parent
+flush; far under the respawn interval so a stale prior-gen file still fails —
+adversarial-review P2); multiple unretired candidates passing simultaneously in
+the pre-spawn scan → bind NONE + WARN, fail-DARK) all pass. On bind it emits the EXISTING `launched` key at
 DISCOVERY (once-only; a bound file's later ticks feed run-state normally and
 never re-launch) then applies the buffered pending signals in CAUSAL order —
 `pending_wake` first (→ `resumed[key]`), `pending_park` second (→ the merge) —
