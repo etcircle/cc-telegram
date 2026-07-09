@@ -21,7 +21,8 @@ Leaf rules: stdlib + ``callback_data`` helpers only — NEVER imports ``config``
 (values are injected at callsites) or ``telegram`` (the executor wraps the
 plain ``(label, callback_data)`` rows into an ``InlineKeyboardMarkup``). The
 registry is in-memory only (restart wipes it — a dead button answers a graceful
-expired modal; the card text lists the paths so ``/file`` is the restart net),
+expired modal; the prose above the card names the file(s) so ``/file`` is the
+restart net — the card BODY is pathless, see ``card_text``),
 NOT a route_runtime field, registers no observers (c313657 stays forbidden).
 """
 
@@ -326,20 +327,31 @@ def open_validated_artifact(
 
 
 # ── Card text (§C body) ───────────────────────────────────────────────────
+#
+# Owner product decision (2026-07-09): the card body is PATHLESS — a single
+# static line, never the detected paths. Two reasons: (1) the triggering prose
+# message directly above the card ALWAYS names the file(s), so listing them
+# again in the body was pure repetition; (2) Telegram clients auto-linkify a
+# bare path whose extension collides with a TLD (``.md`` = Moldova, ``.zip``,
+# …) into a dead blue link that opens nothing. The (clipped) button labels
+# carry the names; ``/file <path>`` — using a path from that prose — is the
+# restart-safe fallback.
+_CARD_HEADER = "📎 Tap to download:"
 
-_CARD_HEADER = "📎 Files mentioned — tap to download:"
 
+def card_text(*, overflow: int = 0) -> str:
+    """Render the 📎 card body: the static header + an optional overflow note.
 
-def card_text(names: list[str], *, overflow: int = 0) -> str:
-    """Render the 📎 card body: header + buttoned paths + overflow note.
-
-    The listed paths double as the restart-safe ``/file`` fallback (the tokens
-    are in-memory; a restart drops the buttons but the paths stay visible).
+    PATHLESS by owner decision — no detected paths in the body (a plain-text
+    path gets TLD-auto-linkified into a dead link, and the prose above the card
+    already names the file(s)). Only the ``overflow`` count is dynamic.
     """
     lines = [_CARD_HEADER]
-    lines.extend(f"• {name}" for name in names)
     if overflow > 0:
-        lines.append(f"…and {overflow} more — use /file <path>")
+        lines.append(
+            f"…and {overflow} more — send /file <path> using a path from "
+            "the message above."
+        )
     return "\n".join(lines)
 
 
@@ -384,14 +396,15 @@ class ArtifactRow:
 
 @dataclass
 class MintedCard:
-    """The card render inputs: buttoned rows + body names + the no-button count."""
+    """The card render inputs: buttoned rows + the no-button overflow count.
+
+    The card BODY is pathless (owner decision — see ``card_text``), so the file
+    names live ONLY on the (clipped) button labels; there is no ``names`` body
+    list.
+    """
 
     # (button_label, callback_data) — the label is CLIPPED to ≤64 chars.
     rows: list[tuple[str, str]] = field(default_factory=list)
-    # FULL display names of the buttoned files, UNCLIPPED — the card BODY lists
-    # these (the restart-safe /file fallback needs the real path; only the
-    # button labels are clipped — fold item 2).
-    names: list[str] = field(default_factory=list)
     overflow: int = 0
 
 
@@ -432,7 +445,6 @@ def mint(
         return None
     head = fresh[:max_buttons]
     rows: list[tuple[str, str]] = []
-    names: list[str] = []
     for art in head:
         _offer_dedup[(route, art.resolved_path)] = now
         token = secrets.token_urlsafe(_TOKEN_BYTES)
@@ -451,8 +463,7 @@ def mint(
                 checked_callback_data(f"{CB_DOWNLOAD_FILE}{window_id}:{token}"),
             )
         )
-        names.append(art.display_name)
-    return MintedCard(rows=rows, names=names, overflow=len(fresh) - len(head))
+    return MintedCard(rows=rows, overflow=len(fresh) - len(head))
 
 
 def lookup(token: str) -> ArtifactRow | None:

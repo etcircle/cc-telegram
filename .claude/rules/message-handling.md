@@ -1257,7 +1257,14 @@ fail-closed); `max_bytes` + extra roots are read from `config` at the callsite
 and INJECTED into the config-free `artifacts` leaf. **Ordering:** the card is
 `enqueue_artifact_card`-ed STRICTLY AFTER the block's `enqueue_content_message`
 (codex P1-2), so the route FIFO delivers prose → card. Cap 6 buttons/card;
-overflow disclosed in the card text (`…and N more — use /file <path>`).
+overflow disclosed in the card text (`…and N more — send /file <path> using a
+path from the message above.`). **Card body is PATHLESS (owner decision
+2026-07-09 — TLD auto-linkification):** the body is a single static line
+`📎 Tap to download:`, never the detected paths — Telegram clients auto-linkify
+a bare path whose extension collides with a TLD (`.md` = Moldova, `.zip`, …)
+into a dead blue link, and the triggering prose directly above the card always
+names the file(s), so the body repetition added nothing. The (clipped) button
+labels carry the names.
 
 **Validation + validated-fd upload (`handlers/artifacts.py` leaf).**
 `resolve_artifacts` / `resolve_single`: expanduser → cwd-join a relative
@@ -1306,8 +1313,9 @@ four `inbound_telegram` stale-window unbinds (beside `decision_token.teardown_ro
 `forget_ask_tool_input` is deliberately NOT a seam (AUQ-specific); `/clear` and
 session rotation deliberately do NOT invalidate (tokens are path-anchored, cwd
 survives rotation, and SEND-TIME revalidation is the real guard). Restart wipes
-the registry (a dead button answers the expired modal; the card text + `/file`
-cover it). Pull-only throughout; no observer (c313657 stays forbidden).
+the registry (a dead button answers the expired modal; the prose above the card
+names the paths + `/file` cover it — the body itself is pathless). Pull-only
+throughout; no observer (c313657 stays forbidden).
 
 ## MessageDisplay live-prose capture (Bug 2)
 

@@ -75,7 +75,7 @@ def _card_records(scenario: ScenarioHarness) -> list:
         s
         for s in scenario.bot.sent
         if s.method == "send_message"
-        and "📎 Files mentioned" in (s.kwargs.get("text") or "")
+        and "📎 Tap to download:" in (s.kwargs.get("text") or "")
     ]
 
 
@@ -112,7 +112,11 @@ async def test_card_lands_after_prose(
     cards = _card_records(scenario)
     assert len(cards) == 1
     card = cards[0]
-    assert "• report.md" in card.kwargs["text"]
+    # Pathless body (owner decision): the static line only, NEVER the path —
+    # a plain-text path gets TLD-auto-linkified into a dead link; the prose
+    # above names the file. The button carries the (clipped) name.
+    assert "📎 Tap to download:" in card.kwargs["text"]
+    assert "report.md" not in card.kwargs["text"]
     cb = _card_callback(card)
     assert cb.startswith(f"{CB_DOWNLOAD_FILE}{wid}:")
     # The prose landed BEFORE the 📎 card (route FIFO order — codex P1-2).

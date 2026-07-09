@@ -1057,9 +1057,11 @@ async def _maybe_offer_artifacts(
     card = artifacts.mint(route, resolved)
     if card is None or not card.rows:
         return
-    # The body lists the FULL display names (card.names) — the restart-safe
-    # /file fallback; only the BUTTON labels are clipped (fold item 2).
-    body = artifacts.card_text(card.names, overflow=card.overflow)
+    # Pathless body (owner decision 2026-07-09): the prose above already names
+    # the file(s), and a plain-text path here gets TLD-auto-linkified into a
+    # dead link (.md = Moldova, .zip, …). The BUTTON labels carry the names;
+    # only the overflow count is dynamic.
+    body = artifacts.card_text(overflow=card.overflow)
     await enqueue_artifact_card(bot, route, body, card.rows)
 
 
