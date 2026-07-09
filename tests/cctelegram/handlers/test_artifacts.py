@@ -389,7 +389,8 @@ def test_callback_data_under_64_bytes() -> None:
 def test_mint_clips_long_button_labels_keeps_tail() -> None:
     """[fold item 2 — codex P2-2 / hermes P2-1] button labels are clipped to
     ≤64 chars, prefix-ellipsized (the FILENAME tail is the discriminating
-    part); the card BODY keeps the FULL path (the /file restart fallback)."""
+    part). The card body is pathless (owner decision), so the name lives ONLY
+    on the button label."""
     long_name = "very/deeply/nested/" * 4 + "final-quarterly-report-2026.pdf"
     assert len(long_name) > 64
     card = artifacts.mint((1, 2, "@3"), [_art("/repo/" + long_name, long_name)])
@@ -398,18 +399,19 @@ def test_mint_clips_long_button_labels_keeps_tail() -> None:
     assert len(label) <= 64
     assert label.startswith("…")
     assert label.endswith("final-quarterly-report-2026.pdf")
-    # The card body lists the FULL display name, unclipped.
-    assert card.names == [long_name]
     # A short label passes through untouched.
     card2 = artifacts.mint((1, 2, "@4"), [_art("/repo/a.png", "a.png")])
     assert card2 is not None and card2.rows[0][0] == "a.png"
 
 
 def test_card_text_shape() -> None:
-    text = artifacts.card_text(["a.png", "b.pdf"], overflow=3)
+    # Pathless body (owner decision): a single static line, NO paths — a plain-
+    # text path gets TLD-auto-linkified into a dead link, and the prose above
+    # the card names the file(s). Overflow points back at that message, keeping
+    # the count.
+    assert artifacts.card_text() == "📎 Tap to download:"
+    text = artifacts.card_text(overflow=3)
     assert text.splitlines() == [
-        "📎 Files mentioned — tap to download:",
-        "• a.png",
-        "• b.pdf",
-        "…and 3 more — use /file <path>",
+        "📎 Tap to download:",
+        "…and 3 more — send /file <path> using a path from the message above.",
     ]
