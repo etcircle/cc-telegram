@@ -616,7 +616,15 @@ monitor now RETAINS the teammate-shaped parsed signal keyed by `tool_use_id`
 drop-oldest cap, torn down with the parent) and applies it when the matching
 Agent/Task/SendMessage `tool_use` arrives — whose entry carries the `input` the
 wake cross-check needs, so the cross-check runs at retro-pair time; the spawn's
-`spawned_ts` still anchors to the RESULT's event ts. **The registry
+`spawned_ts` still anchors to the RESULT's event ts. The stash REPLACES an
+existing id in place and evicts the oldest only for a genuinely NEW id at cap
+(r2 P3 — evict-then-overwrite dropped an unrelated live signal); and the apply
+seam ALSO clears the persisted parser pending-tool carry for the retro-paired
+id (r2 P2 — the id's result was already consumed, so the `PendingToolInfo` the
+parser stores for the LATE tool_use would otherwise retain its full input until
+teardown, one leak per retro-paired spawn/wake; scoped strictly to the
+retro-paired id — the normal in-order display pairing never reaches the seam).
+**The registry
 (`session_monitor`, per-parent `dict[name -> _TeammateRec]`):**
 `_record_teammate_spawn` (anchored to the spawn tool_result's JSONL EVENT ts,
 NOT the monitor's parse instant — the poll lags CC's write, so `time.time()`
@@ -633,9 +641,28 @@ over-quarantine fix): only a stem that FAILS the gate (first entry predates the
 new spawn ⇒ prior gen) is severed; a same-name file ALREADY on disk at rotation
 whose first entry is ≥ the new spawn is the GENUINE new-gen file the poll lagged
 and is LEFT for the normal binding path (a mid-write file too), (4) resets
-`current_key`/pending + clears the STICKY ambiguity flag (a fresh spawn is new
-evidence — the ONLY clear), then (5) a PRE-SPAWN scan attempts binding on
-surviving tracked unbound stems. **Binding — SET-BASED arbitration (dual-review
+`current_key`/pending + clears the STICKY ambiguity flag + `done_retracted_keys`
+(a fresh spawn is new evidence — the ONLY clear), then (5) a PRE-SPAWN scan
+attempts binding on surviving tracked unbound stems, then (6) **pre-registration
+key RETRACTION (r2 P1, BOTH engines, probe-reproduced):** an already-tracked
+matching candidate may have fed run-state as a LEGACY agent BEFORE the spawn
+parsed (no registry rec existed → classification returned legacy-True) — if
+arbitration just left it UNRESOLVED or sticky-AMBIGUOUS, that already-recorded
+runtime key would stay live until the 2h TTL while all future writes are dark
+(the strand re-entry; with a post-turn pre-spawn tick this fully recreates
+GH #46). Registration therefore emits an UNCONDITIONAL teammate-done for every
+tracked matching candidate arbitration left unbound — WITHOUT retiring/severing
+it (item 2: it stays bind-eligible; an extra tombstone on a never-live key is a
+runtime no-op) — and records the key in `done_retracted_keys`. **The relight
+constraint:** the runtime tombstone NO-OPS a later `launched`
+(done-before-launch fail-closes), so when a retracted candidate later passes
+the gate, `_bind_teammate_key` emits through the RESUMED lane instead (the
+Fix-C tombstone-popping path — binding IS positive per-key proof of new work;
+ZERO new RouteRuntime mutators), with resume ts = the generation's `spawned_ts`
+(the leg-start instant — a genuine current-gen park, floored at `spawned_ts` by
+the item-4 drop and in practice strictly later, still closes through the
+strict-newer gate, and a pending wake max-merges over it).
+**Binding — SET-BASED arbitration (dual-review
 r1 item 2, BOTH engines converged; `_arbitrate_and_bind`, shared by the public
 `check_sidechain_updates` pre-pass `_arbitrate_teammate_bindings` AND the
 pre-spawn scan — never sequential first-wins, so filesystem enumeration order
