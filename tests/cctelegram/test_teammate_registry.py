@@ -1884,3 +1884,204 @@ def test_send_target_refuses_present_but_falsy_ownership_field(falsy):
         "resumedAgentId": falsy,
     }
     assert teammate_send_target_from_meta(meta) is None
+
+
+# ── pre-registration key retraction + resumed-lane relight (r2 P1) ───────
+
+
+@pytest.mark.asyncio
+async def test_registration_retracts_preexisting_unresolved_key(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """Dual-review r2 P1 (BOTH engines, probe-reproduced): an already-tracked
+    candidate emits run-state ticks as a LEGACY agent BEFORE the spawn tool_result
+    parses (the registry doesn't exist yet). If registration then leaves it
+    UNRESOLVED (indeterminate gate), the already-recorded key would stay live to
+    the 2h TTL while all future writes are dark. Registration must RETRACT it —
+    an unconditional teammate-done — WITHOUT retiring/severing (it stays
+    bind-eligible)."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    key = _key_for(_NAME)
+
+    # Pre-spawn: the candidate is tracked and TICKS as a legacy agent (the
+    # malformed first line keeps the gate indeterminate forever; later lines
+    # parse fine and fed run-state pre-registration).
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text("this is never json\n")
+    await monitor.check_sidechain_updates({PARENT})  # register at EOF
+    _append(
+        sc,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [{"type": "text", "text": "pre-spawn work"}],
+                timestamp=_iso(time.time()),
+            )
+        ],
+    )
+    await monitor.check_sidechain_updates({PARENT})
+    pre = monitor.pop_sidechain_activity()
+    assert key in pre[PARENT].ticks  # the legacy live key exists on the runtime
+
+    # The spawn registers the name; the candidate stays unresolved → RETRACT.
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
+    await monitor.check_for_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert act[PARENT].teammate_parks[key] == (None, True)  # unconditional done
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert key in rec.done_retracted_keys
+    assert key not in rec.retired_keys  # NOT retired — stays bind-eligible
+    assert f"sub:{PARENT}:agent-{key}" not in monitor._severed_teammate_stems.get(
+        PARENT, set()
+    )
+
+    # Future writes stay dark (classification), and no re-retraction spam.
+    _append(
+        sc,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [{"type": "text", "text": "post-spawn work"}],
+                timestamp=_iso(time.time() + 1),
+            )
+        ],
+    )
+    await monitor.check_sidechain_updates({PARENT})
+    act2 = monitor.pop_sidechain_activity()
+    assert act2.get(PARENT, ParentSidechainActivity()).ticks == {}
+
+
+@pytest.mark.asyncio
+async def test_registration_retracts_both_keys_on_ambiguity(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """r2 P1 ambiguity variant: TWO pre-tracked candidates both pass the gate at
+    registration → bind NONE + sticky-ambiguous → BOTH potentially pre-existing
+    keys are retracted (done'd), neither retired; rotation resolves later."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time()
+    k1 = _key_for(_NAME, "aaaa1111bbbb2222")
+    k2 = _key_for(_NAME, "cccc3333dddd4444")
+    for k in (k1, k2):
+        _write_sidechain(sub_dir, k, _iso(base))
+    await monitor.check_sidechain_updates({PARENT})  # track both (legacy)
+    monitor.pop_sidechain_activity()
+
+    # Spawn at base+1 — both first entries within the gen-1 skew → both pass →
+    # ambiguous → both unbound → both retracted.
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base + 1)
+    )
+    await monitor.check_for_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert rec.ambiguous is True and rec.current_key is None
+    assert act[PARENT].teammate_parks[k1] == (None, True)
+    assert act[PARENT].teammate_parks[k2] == (None, True)
+    assert rec.done_retracted_keys == {k1, k2}
+    assert k1 not in rec.retired_keys and k2 not in rec.retired_keys
+
+
+@pytest.mark.asyncio
+async def test_retracted_candidate_bind_relights_via_resumed_lane(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """r2 P1 relight: the registration done TOMBSTONES the key, and a runtime
+    tombstone no-ops a later ``launched`` (done-before-launch fail-closes) — so
+    when the retracted candidate later PASSES the gate and binds, the bind must
+    emit through the RESUMED lane (tombstone-popping; resume ts = the
+    generation's spawned_ts so a genuine later park still closes)."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    key = _key_for(_NAME)
+
+    # Tracked pre-spawn with a MID-WRITE first line (no newline → gate None).
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text('{"type":"assistant","timestamp":"' + _iso(time.time()))
+    await monitor.check_sidechain_updates({PARENT})  # register at EOF
+    monitor.pop_sidechain_activity()
+
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
+    await monitor.check_for_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert key in rec.done_retracted_keys  # unresolved at registration → retracted
+    assert act[PARENT].teammate_parks[key] == (None, True)
+
+    # The first line completes (valid, within the gen-1 skew) → the next sweep
+    # binds — via RESUMED (never launched), ts == the generation's spawned_ts.
+    with open(sc, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": []},
+                    "timestamp": _iso(time.time() + 0.2),
+                }
+            )
+            + "\n"
+        )
+    await monitor.check_sidechain_updates({PARENT})
+    act2 = monitor.pop_sidechain_activity()
+    assert act2[PARENT].launched == set()  # NOT the tombstone-blocked lane
+    assert act2[PARENT].resumed == {key: rec.spawned_ts}  # the popping lane
+    assert monitor._teammate_registry[PARENT][_NAME].current_key == key
+    assert key not in rec.done_retracted_keys  # consumed at bind
+
+    # Park/close still works after the relight (park strictly newer than the
+    # resume ts) — the monitor emits it; the runtime strict-newer gate closes.
+    _append_park(parent_jsonl, _NAME, make_jsonl_entry, _iso(rec.spawned_ts + 60))
+    await monitor.check_for_updates({PARENT})
+    act3 = monitor.pop_sidechain_activity()
+    park_ts, unparseable = act3[PARENT].teammate_parks[key]
+    assert unparseable is False and park_ts is not None
+    assert park_ts > rec.spawned_ts  # strictly newer → tombstones at the runtime
+
+
+# ── retro-pair parser-carry cleanup (r2 P2, Codex) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_retro_pair_clears_parser_pending_carry(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """r2 P2: the retro-paired id's tool_result was already consumed, so the
+    PendingToolInfo the parser stores for the LATE tool_use would be retained
+    (with its full input) until teardown — one leak per retro-paired spawn/wake.
+    The apply seam must clear the persisted parser carry for that id."""
+    parent_jsonl, _sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 30
+    _append_spawn_result_before_use(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    assert monitor._teammate_registry[PARENT][_NAME].spawn_generation == 1
+    # The retro-paired id must NOT be retained in the persisted parser carry.
+    assert "tu_ooo_spawn" not in monitor._pending_tools.get(PARENT, {})
+
+
+# ── stash duplicate-at-cap replacement (r2 P3, Hermes) ───────────────────
+
+
+def test_stash_duplicate_at_cap_replaces_in_place(monitor):
+    """r2 P3: a duplicate tool_use_id arriving at capacity must REPLACE its
+    existing slot — never evict an unrelated oldest signal first (which left the
+    stash one short and dropped a live spawn/wake)."""
+    from cctelegram.session_monitor import _EARLY_TEAMMATE_SIGNALS_MAX
+
+    meta = _spawn_meta_for(_NAME)
+    for i in range(_EARLY_TEAMMATE_SIGNALS_MAX):
+        monitor._stash_early_teammate_signal(PARENT, f"tu{i}", meta, _iso(1000.0 + i))
+    stash = monitor._early_teammate_signals[PARENT]
+    assert len(stash) == _EARLY_TEAMMATE_SIGNALS_MAX
+
+    # Duplicate at cap: replace in place — same size, nothing unrelated dropped.
+    monitor._stash_early_teammate_signal(PARENT, "tu5", meta, _iso(9999.0))
+    assert len(stash) == _EARLY_TEAMMATE_SIGNALS_MAX
+    assert set(stash) == {f"tu{i}" for i in range(_EARLY_TEAMMATE_SIGNALS_MAX)}
+    assert stash["tu5"][2] == _iso(9999.0)  # the replacement took
+
+    # A genuinely NEW id at cap evicts exactly the oldest.
+    monitor._stash_early_teammate_signal(PARENT, "tu_new", meta, _iso(10000.0))
+    assert len(stash) == _EARLY_TEAMMATE_SIGNALS_MAX
+    assert "tu0" not in stash and "tu_new" in stash

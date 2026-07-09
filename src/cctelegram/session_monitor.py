@@ -291,6 +291,18 @@ class _TeammateRec:
     run-state (item 3) and are NOT arbitrarily quarantined. It clears ONLY at
     the next rotation (a fresh spawn is new evidence).
 
+    ``done_retracted_keys`` (dual-review r2 P1, BOTH engines) — candidates whose
+    POTENTIALLY PRE-EXISTING runtime key was retracted with an unconditional
+    teammate-done at FIRST registration (an already-tracked matching sidechain
+    can feed run-state as a LEGACY agent before the spawn tool_result is parsed;
+    if arbitration then leaves it unresolved/ambiguous, that already-recorded
+    key would stay live until TTL — the 2h strand re-entry). The retraction
+    tombstones the runtime key WITHOUT retiring/severing the candidate, so it
+    stays bind-eligible; because a runtime tombstone no-ops a LATER ``launched``
+    (done-before-launch fail-closes), a retracted candidate that later BINDS
+    must relight through the RESUMED lane (the Fix-C tombstone-popping path —
+    binding IS positive per-key proof of new work). Reset at rotation.
+
     route_runtime gains ZERO new mutators — the registry drives the EXISTING
     launched / resumed / done marks through the bot fan-out.
     """
@@ -305,6 +317,7 @@ class _TeammateRec:
     pending_wake: float | None = None
     pending_park: _PendingPark | None = None
     ambiguous: bool = False
+    done_retracted_keys: set[str] = field(default_factory=set)
 
 
 def _record_resume_ts(
@@ -804,6 +817,7 @@ class SessionMonitor:
         rec.pending_wake = None
         rec.pending_park = None
         rec.ambiguous = False
+        rec.done_retracted_keys.clear()
         rec.spawn_generation += 1
         rec.spawned_ts = spawned_ts
         # (3) quarantine only the STALE matching stems (gate==False); leave a
@@ -912,6 +926,46 @@ class SessionMonitor:
             )
         # (5) pre-spawn scan: bind an already-tracked, unretired, gate-passing stem.
         self._try_bind_tracked_teammate_stems(parent_session_id, info.name)
+        # (6) dual-review r2 P1 (BOTH engines): a candidate tracked BEFORE this
+        # registration may have fed run-state as a LEGACY agent (the registry
+        # didn't exist yet) — if arbitration just left it UNRESOLVED or
+        # AMBIGUOUS, its already-recorded runtime key would stay live until TTL
+        # while all future writes are classification-dark (the 2h strand
+        # re-entry). Retract those keys with an unconditional teammate-done,
+        # WITHOUT retiring/severing (they stay bind-eligible); a later bind
+        # relights through the resumed lane (see _bind_teammate_key).
+        self._retract_unbound_preexisting_candidates(parent_session_id, recs[info.name])
+
+    def _retract_unbound_preexisting_candidates(
+        self, parent_session_id: str, rec: "_TeammateRec"
+    ) -> None:
+        """r2 P1: emit an UNCONDITIONAL teammate-done for every already-tracked
+        matching candidate that arbitration left UNBOUND (unresolved or
+        sticky-ambiguous) at registration/rotation time — its potentially
+        pre-existing (pre-registration legacy) runtime key must not survive to
+        TTL. Deliberately NOT retired/severed (item 2 — the candidate stays
+        eligible for retry and eventual binding); the key is recorded in
+        ``done_retracted_keys`` so a later bind knows to relight through the
+        tombstone-popping RESUMED lane instead of the tombstone-blocked
+        ``launched`` (an extra tombstone on a key that never existed is a
+        runtime no-op — we never peek route_runtime liveness)."""
+        for _tk, key in self._tracked_teammate_stems(parent_session_id, rec.name):
+            if key == rec.current_key or key in rec.retired_keys:
+                continue  # bound = legitimately live; retired = already done'd
+            if key in rec.done_retracted_keys:
+                continue  # already retracted this generation
+            rec.done_retracted_keys.add(key)
+            self._parent_activity(parent_session_id).merge_teammate_park(
+                key, park_ts=None, unparseable=True
+            )
+            logger.info(
+                "teammate registration: retracting potentially pre-existing "
+                "key %s for unbound candidate of name=%r parent=%s "
+                "(stays bind-eligible)",
+                key,
+                rec.name,
+                parent_session_id[:8],
+            )
 
     def _record_teammate_wake(
         self, parent_session_id: str, name: str, event_ts: float | None
@@ -983,8 +1037,12 @@ class SessionMonitor:
         if spawn is None and target is None:
             return
         stash = self._early_teammate_signals.setdefault(parent_session_id, {})
-        while len(stash) >= _EARLY_TEAMMATE_SIGNALS_MAX:
-            stash.pop(next(iter(stash)))  # drop-oldest (insertion order)
+        # r2 P3 (Hermes): REPLACE an existing id in place — evicting first would
+        # drop an unrelated oldest signal and then overwrite anyway, leaving the
+        # stash one short. Evict only when inserting a genuinely NEW id at cap.
+        if tool_use_id not in stash:
+            while len(stash) >= _EARLY_TEAMMATE_SIGNALS_MAX:
+                stash.pop(next(iter(stash)))  # drop-oldest (insertion order)
         stash[tool_use_id] = (spawn, target, ts)
 
     def _apply_early_teammate_signal(self, parent_session_id: str, entry: Any) -> None:
@@ -1000,6 +1058,19 @@ class SessionMonitor:
         sig = stash.pop(entry.tool_use_id, None)
         if sig is None:
             return
+        # r2 P2 (Codex): a retro-paired id's tool_result was ALREADY consumed
+        # (result-before-use), so the PendingToolInfo the parser just stored for
+        # this late tool_use will never be popped by a result — without this, its
+        # full (potentially large) input is retained until teardown, one leak per
+        # retro-paired spawn/wake. The persisted carry is the SAME dict object
+        # ``parse_entries`` returned (stored before the entry loop), so the pop
+        # persists. Scoped STRICTLY to the retro-paired id — the normal in-order
+        # tool_use↔tool_result display pairing never reaches here.
+        pending = self._pending_tools.get(parent_session_id)
+        if pending is not None:
+            pending.pop(entry.tool_use_id, None)
+            if not pending:
+                self._pending_tools.pop(parent_session_id, None)
         spawn, target, ts = sig
         if spawn is not None and entry.tool_name in ("Agent", "Task"):
             self._record_teammate_spawn(
@@ -1148,15 +1219,30 @@ class SessionMonitor:
     def _bind_teammate_key(
         self, parent_session_id: str, rec: "_TeammateRec", key: str
     ) -> None:
-        """Bind ``key`` as ``rec.current_key`` and emit its launched signal, then
+        """Bind ``key`` as ``rec.current_key`` and emit its launch signal, then
         apply the buffered pending signals in CAUSAL order (§2 binding).
 
         pending_wake FIRST (→ ``resumed[key]``), pending_park SECOND (→
         ``teammate_parks``) — so the runtime ts-gates arbitrate a wake-then-park
-        vs park-then-wake correctly; both pending slots are cleared."""
+        vs park-then-wake correctly; both pending slots are cleared.
+
+        RELIGHT LANE (r2 P1): a key retracted at registration
+        (``done_retracted_keys``) carries a runtime done TOMBSTONE, and a
+        tombstone no-ops a later ``launched`` (done-before-launch fail-closes) —
+        so the bind emits through the RESUMED lane instead (the Fix-C
+        tombstone-popping path; binding is positive per-key proof of new work).
+        The resume ts is the GENERATION's ``spawned_ts`` — the leg-start
+        instant — so any genuine current-generation park (floored at
+        ``spawned_ts`` by the item-4 generation drop, in practice strictly
+        later) still closes the key through the runtime's strict-newer gate,
+        and a pending wake (necessarily newer) max-merges over it."""
         rec.current_key = key
         activity = self._parent_activity(parent_session_id)
-        activity.launched.add(key)
+        if key in rec.done_retracted_keys:
+            rec.done_retracted_keys.discard(key)
+            _record_resume_ts(activity.resumed, key, rec.spawned_ts)
+        else:
+            activity.launched.add(key)
         if rec.pending_wake is not None:
             _record_resume_ts(activity.resumed, key, rec.pending_wake)
         if rec.pending_park is not None:

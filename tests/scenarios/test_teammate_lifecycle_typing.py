@@ -140,3 +140,65 @@ async def test_teammate_full_lifecycle_typing(scenario: ScenarioHarness) -> None
     snap = route_runtime.snapshot(route)
     assert snap.typing_eligible is False
     assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_preregistration_retract_then_bind_relights_via_resumed(
+    scenario: ScenarioHarness,
+) -> None:
+    """r2 P1 design-constraint pin: the registration retraction emits an
+    UNCONDITIONAL teammate-done for a pre-registration live key, and the runtime
+    tombstone then NO-OPS a later ``launched`` (done-before-launch fail-closes)
+    — so the bind-after-retraction relight MUST ride the RESUMED lane (the Fix-C
+    tombstone-popping path). Sequence: pre-registration legacy tick lifts typing
+    → the retraction done drops it → a plain ``launched`` cannot relight
+    (negative control) → the bind's ``resumed`` relights → a genuine later park
+    closes."""
+    from cctelegram.utils import parse_iso_timestamp
+
+    route = await _bind_idle_route(scenario)
+    eot = parse_iso_timestamp("2026-07-09T10:00:00.000Z")
+    assert eot is not None
+
+    # Pre-registration: the candidate ticks as a LEGACY agent (ts-qualified
+    # past the parent's end-of-turn) → live key, typing ON.
+    await bot_module.apply_sidechain_activity(
+        {
+            _SID: ParentSidechainActivity(
+                ticks={_KEY: SidechainTick(max_event_ts=eot + 10)}
+            )
+        }
+    )
+    assert route_runtime.snapshot(route).typing_eligible is True
+
+    # Registration retraction: the unconditional teammate-done → typing OFF.
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(teammate_parks={_KEY: (None, True)})}
+    )
+    assert route_runtime.snapshot(route).typing_eligible is False
+
+    # Negative control: a plain launched CANNOT relight the tombstoned key —
+    # exactly why the bind must use the resumed lane.
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(launched={_KEY})}
+    )
+    assert route_runtime.snapshot(route).typing_eligible is False
+
+    # The bind relight (resumed lane, ts = the generation's spawned_ts): pops
+    # the tombstone → typing back ON.
+    spawn_ts = eot + 20
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(resumed={_KEY: spawn_ts})}
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True
+    assert snap.background_agents == (_KEY,)
+
+    # A genuine current-generation park (strictly newer than the resume ts)
+    # closes it — the strict-newer gate passes.
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(teammate_parks={_KEY: (spawn_ts + 60, False)})}
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
