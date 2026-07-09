@@ -1298,16 +1298,22 @@ candidate → `Path.resolve()` (FOLLOWS symlinks — an in-cwd symlink pointing
 outside RESOLVES outside and fails containment) → MUST be `is_relative_to` a
 RESOLVED allowed root (cwd + `CC_TELEGRAM_ARTIFACT_ROOTS`; empty cwd contributes
 no root — fail-closed) → regular file + `st_size <= max_bytes`. **Worktree
-fallback (still fail-closed):** a RELATIVE candidate that misses under the
-session cwd (file-not-found / not-contained — NOT an oversize/type reject, which
-the cwd copy OWNS) retries the join against the derived main-repo root when the
-resolved cwd carries the harness `.claude/worktrees/<name>` shape
-(`_worktree_main_root`: the prefix before the `.claude`/`worktrees` segment pair,
-pure string logic — no git subprocess); the cwd hit ALWAYS wins (same-named file
-in both → the session's own copy), the main-root hit is pinned + displayed
-relative to the main root, and a `../`-escape / symlink-escape rejects under BOTH
-roots (containment + O_NOFOLLOW + fstat unchanged). Only the harness layout is
-covered — a general `git worktree add` elsewhere is NOT. The card path
+fallback (still fail-closed):** a RELATIVE candidate that is genuinely
+FILE-NOT-FOUND under the session cwd — the ONLY fallback reason; any
+existing-but-rejected cwd resolution (oversize / non-regular / an escaping
+symlink or `../` traversal's "outside" reject, hermes P3c — a fallthrough there
+would silently substitute a different main-root file for the entry the prose
+referred to) OWNS the name — retries the join against the derived main-repo
+root when the resolved cwd carries the harness `.claude/worktrees/<name>` shape
+(`_worktree_main_root`: the prefix before the `.claude`/`worktrees` segment
+pair, pure string logic — no git subprocess; the cwd must be INSIDE a worktree,
+at least one segment after `worktrees` — the bare `~/.claude/worktrees`
+container must never derive the home directory, codex P1); the cwd hit ALWAYS
+wins (same-named file in both → the session's own copy), the main-root hit is
+pinned + displayed relative to the main root, and a `../`-escape /
+symlink-escape rejects under BOTH roots (containment + O_NOFOLLOW + fstat
+unchanged). Only the harness layout is covered — a general `git worktree add`
+elsewhere is NOT. The card path
 drops rejections silently; `/file` surfaces the specific reason (not found /
 outside roots / too large [states the cap] / no working directory). The SEND
 closes the TOCTOU hole: `open_validated_artifact` re-checks containment against

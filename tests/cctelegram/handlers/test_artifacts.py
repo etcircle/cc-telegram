@@ -299,6 +299,70 @@ def test_worktree_fallback_symlink_in_main_root_rejected(tmp_path: Path) -> None
     assert got == []
 
 
+def test_bare_worktrees_container_cwd_no_fallback(tmp_path: Path) -> None:
+    """RED-first (codex P1): a cwd that IS the bare ``.claude/worktrees``
+    CONTAINER (no ``<name>`` segment after it — e.g. ``~/.claude/worktrees``)
+    must NOT derive a fallback root: deriving its parent would open the entire
+    home directory. A candidate that exists under the would-be derived parent
+    is skipped, fail-closed."""
+    main_root = tmp_path / "myrepo"
+    container = main_root / ".claude" / "worktrees"
+    container.mkdir(parents=True)
+    _write(main_root / "temp" / "sessions" / "x.md", b"handoff")
+    got = artifacts.resolve_artifacts(["temp/sessions/x.md"], str(container), [], 1024)
+    assert got == []
+
+
+def test_worktree_fallback_nested_subdir_cwd_derives_main(tmp_path: Path) -> None:
+    """A cwd DEEPER inside a worktree (``<main>/.claude/worktrees/<x>/subdir``)
+    still derives ``<main>`` correctly (the prefix before the segment pair)."""
+    main_root, worktree = _worktree(tmp_path)
+    subdir = worktree / "src" / "pkg"
+    subdir.mkdir(parents=True)
+    f = _write(main_root / "temp" / "sessions" / "x.md", b"handoff")
+    got = artifacts.resolve_artifacts(["temp/sessions/x.md"], str(subdir), [], 1024)
+    assert len(got) == 1
+    assert got[0].resolved_path == str(f.resolve())
+    assert got[0].allowed_roots == (str(main_root.resolve()),)
+
+
+def test_cwd_copy_oversize_owns_name_no_fallback(tmp_path: Path) -> None:
+    """[hermes P3a] an EXISTING-but-oversize cwd copy OWNS the name: no
+    main-root fallback even though a VALID same-named copy sits there —
+    substituting a different file for the one the prose referred to would lie."""
+    main_root, worktree = _worktree(tmp_path)
+    _write(main_root / "temp" / "x.md", b"ok")  # valid main-root copy
+    _write(worktree / "temp" / "x.md", b"z" * 5000)  # oversize cwd copy
+    got = artifacts.resolve_artifacts(["temp/x.md"], str(worktree), [], 1024)
+    assert got == []
+
+
+def test_cwd_copy_directory_owns_name_no_fallback(tmp_path: Path) -> None:
+    """[hermes P3b] a DIRECTORY at the name under cwd owns it — no fallback."""
+    main_root, worktree = _worktree(tmp_path)
+    _write(main_root / "temp" / "x.md", b"ok")  # valid main-root copy
+    (worktree / "temp" / "x.md").mkdir(parents=True)  # directory in cwd
+    got = artifacts.resolve_artifacts(["temp/x.md"], str(worktree), [], 1024)
+    assert got == []
+
+
+def test_cwd_escaping_symlink_owns_name_no_fallback(tmp_path: Path) -> None:
+    """RED-first [hermes P3c]: a cwd symlink at the name ESCAPING the roots
+    owns the name too — NO main-root fallback even though a valid same-named
+    copy sits there. Rationale (the narrowed `_FALLBACK_REASONS`): an existing
+    cwd entry at the name that is rejected (oversize / non-regular / escaping
+    symlink) must never be silently SUBSTITUTED with a different main-root
+    file — the tap would deliver a file other than the one the session's
+    prose referred to. The fallback fires ONLY on genuine file-not-found."""
+    main_root, worktree = _worktree(tmp_path)
+    _write(main_root / "temp" / "x.md", b"ok")  # valid main-root copy
+    outside = _write(tmp_path / "outside" / "secret.md", b"secret")
+    (worktree / "temp").mkdir(parents=True, exist_ok=True)
+    (worktree / "temp" / "x.md").symlink_to(outside)  # escaping cwd symlink
+    got = artifacts.resolve_artifacts(["temp/x.md"], str(worktree), [], 1024)
+    assert got == []
+
+
 def test_worktree_fallback_resolve_single_surfaces_hit(tmp_path: Path) -> None:
     """``/file`` (resolve_single) shares the pipeline → the same fallback."""
     main_root, worktree = _worktree(tmp_path)

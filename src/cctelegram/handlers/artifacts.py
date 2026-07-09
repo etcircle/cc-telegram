@@ -183,13 +183,19 @@ def _worktree_main_root(resolved_cwd: Path) -> Path | None:
     main root is the prefix BEFORE the first ``.claude``/``worktrees`` segment
     pair. Pure string/``Path`` logic on the ALREADY-RESOLVED cwd (a prefix of a
     resolved path is itself canonical — no symlinks / ``..`` to re-resolve, no
-    git subprocess). Returns None when the shape is absent or the prefix is not
-    a proper directory (just the filesystem anchor). Only this exact layout is
-    covered — a general ``git worktree add`` elsewhere has no such shape.
+    git subprocess). The cwd must be INSIDE a worktree — at least one path
+    segment AFTER the ``worktrees`` segment (codex P1: the BARE container,
+    e.g. ``~/.claude/worktrees`` itself, would otherwise derive the user's
+    entire home directory as the fallback root). Returns None when the shape
+    is absent or the prefix is not a proper directory (just the filesystem
+    anchor). Only this exact layout is covered — a general ``git worktree
+    add`` elsewhere has no such shape.
     """
     parts = resolved_cwd.parts
     for i in range(len(parts) - 1):
         if parts[i] == ".claude" and parts[i + 1] == "worktrees":
+            if i + 2 >= len(parts):  # the BARE container — not inside a worktree
+                return None
             prefix = parts[:i]
             if len(prefix) < 2:  # anchor only (e.g. "/") — never a repo root
                 return None
@@ -221,13 +227,18 @@ def _display_name(resolved: Path, roots: list[Path]) -> str:
     return best if best else resolved.name
 
 
-# A cwd-attempt rejection that means "no valid file resolvable at this
-# candidate under cwd" (as opposed to "the cwd file EXISTS but is oversize / not
-# a regular file" — which the cwd OWNS, so the worktree fallback must NOT serve
-# a DIFFERENT main-root file in its place). Only these two trigger the fallback.
-_FALLBACK_REASONS = frozenset(
-    {"file not found", "outside the session's allowed folders"}
-)
+# The ONLY cwd-attempt rejection that triggers the worktree fallback: genuine
+# file-not-found (nothing servable exists at the candidate's name under cwd).
+# Any EXISTING-but-rejected cwd resolution OWNS the name — oversize /
+# non-regular, AND an "outside the allowed folders" reject (hermes P3c): the
+# only producers of an "outside" cwd-attempt reject on a RELATIVE candidate
+# are a `../` traversal (which rejects under the main root too, so the
+# fallthrough never served anything) and a cwd-local symlink escaping the
+# roots (attacker-shaped — a fallthrough would silently SUBSTITUTE a different
+# main-root file for the entry the session's prose actually referred to). So
+# "outside" is deliberately NOT a fallback reason; narrowing to file-not-found
+# loses no legitimate hit.
+_FALLBACK_REASONS = frozenset({"file not found"})
 
 
 def _validate_resolved(
@@ -308,7 +319,7 @@ def _classify_one(
     art, reason = _validate_resolved(resolved, roots, max_bytes)
     if art is not None:
         return art, None
-    if reason not in _FALLBACK_REASONS:  # cwd file exists but was rejected — it owns it
+    if reason not in _FALLBACK_REASONS:  # an owned cwd rejection — never substitute
         return None, reason
 
     # Attempt 2 — the harness worktree's main repo root (pinned to it alone, so
