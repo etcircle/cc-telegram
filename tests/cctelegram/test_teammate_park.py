@@ -341,10 +341,13 @@ def test_parse_present_but_unparseable_timestamp():
     assert parsed[0].park_ts_unparseable is True
 
 
-def test_parse_mixed_valid_and_invalid_envelopes():
-    """A brace-less non-JSON body is crossed to the first decodable payload —
-    the later valid envelope still parses (the plural-enumeration contract
-    keeps parks from being lost to leading junk)."""
+def test_parse_non_json_body_stops_enumeration():
+    """Codex r3 P1 pinned semantics: the payload must start IMMEDIATELY after
+    the tag completion, so a brace-less non-JSON body is structurally invalid
+    and STOPS enumeration — the SAME stop-on-invalid rule as the
+    undecodable-payload case (consistent, conservative); a later valid
+    envelope in the same entry is not reached. The old free-ranging find
+    CROSSED the boundary and borrowed the second envelope's JSON."""
     text = (
         "Another Claude session sent a message:\n"
         '<teammate-message teammate_id="x">\nnot json at all\n</teammate-message>\n'
@@ -354,9 +357,60 @@ def test_parse_mixed_valid_and_invalid_envelopes():
         '"timestamp":"2026-07-09T00:00:00Z"}\n'
         "</teammate-message>\n\ntrailing prose"
     )
-    parsed = parse_teammate_idle_notifications(text)
-    assert len(parsed) == 1
-    assert parsed[0].name == "peer-two"
+    assert parse_teammate_idle_notifications(text) == []
+    assert is_teammate_message(text) is False
+
+
+def test_json_search_never_crosses_envelope_boundary():
+    """Codex r3 P1 (verified repro, verbatim): a non-JSON envelope body
+    followed by FOREIGN JSON outside the envelope must not be borrowed — the
+    old ``find("{")`` yielded predicate True + TeammateIdle(name="z",
+    unparseable=True): genuine-user text classified machine-initiated AND an
+    unconditional-tombstone park for a teammate the envelope never named."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x">\n'
+        "not json\n"
+        "</teammate-message>\n"
+        'random {"type":"idle_notification","from":"z"}\n'
+        "</teammate-message>"
+    )
+    assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
+
+
+def test_broken_opener_never_borrows_later_open_tags_gt():
+    """Hermes r3 P2 repro 1 (verbatim): a malformed FIRST opener (no '>')
+    followed by a VALID envelope — the completion scan must stop at the
+    unquoted '<' of the later tag instead of borrowing its '>' (which yielded
+    predicate True + a peer-two park from the foreign envelope)."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x"\n'
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-two",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
+
+
+def test_broken_opener_never_borrows_close_tags_gt():
+    """Hermes r3 P2 repro 2 (verbatim): a malformed opener followed by a close
+    tag, foreign JSON, and another close — the old scan borrowed the close
+    tag's '>' as the completion and decoded the foreign JSON into an
+    UNPARSEABLE 'z' park (an unconditional tombstone from human-shaped
+    text). The unquoted '<' now rejects the opener."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x"\n'
+        "</teammate-message>\n"
+        '{"type":"idle_notification","from":"z"}\n'
+        "</teammate-message>"
+    )
+    assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
 
 
 def test_parse_undecodable_first_envelope_stops_enumeration():

@@ -526,18 +526,28 @@ envelope (r2, BOTH engines converged): the tag name must be followed by an
 EXPLICIT whitespace/`>` delimiter (`\b` accepted `<teammate-message!broken>`);
 the opening tag must COMPLETE via a QUOTE-AWARE `>` scan (a quoted `>` — or a
 close token embedded in a quoted attribute — never completes it; the old
-quote-blind `find(b">")` accepted a never-completed tag and produced a park);
-the payload is decoded with `json.JSONDecoder().raw_decode` from the first `{`
-after tag completion (raw_decode stops at the JSON value's TRUE end, so a
+quote-blind `find(b">")` accepted a never-completed tag and produced a park;
+an UNQUOTED `<` before the completing `>` REJECTS the opener — Hermes r3 P2: a
+malformed opener must never borrow a LATER opening/closing tag's `>` and then
+decode foreign JSON as its payload);
+the payload is decoded with `json.JSONDecoder().raw_decode` from the `{` that
+must IMMEDIATELY follow tag completion (whitespace-only gap — Codex r3 P1: a
+free-ranging `find("{")` could cross the envelope boundary and borrow FOREIGN
+JSON from later text, stamping genuine-user text machine-initiated and minting
+a park for a teammate the envelope never named; the immediate rule means the
+payload start never crosses the current close tag or a following open tag).
+raw_decode stops at the JSON value's TRUE end, so a
 literal `</teammate-message>` INSIDE a JSON string no longer terminates the
-envelope — a teammate summary quoting the tag now parses correctly); and the
+envelope — a teammate summary quoting the tag now parses correctly; and the
 structural close tag must follow the decoded JSON end (+ optional whitespace)
 within the bound. Predicate-True now IMPLIES a decodable payload + structural
 close — predicate/parser divergence is dead by construction. ACCEPTED
-consequence (disclosed): an envelope whose body is not a decodable JSON object
-(e.g. a markdown teammate report) classifies as genuine-user (unknown shape =
-human — the pre-GH#46 behavior); enumeration STOPS at the first
-structurally-invalid envelope (earlier valid payloads kept). **Fix (B)
+consequence (disclosed): an envelope whose body is not IMMEDIATELY a decodable
+JSON object (e.g. a markdown teammate report) classifies as genuine-user
+(unknown shape = human — the pre-GH#46 behavior); enumeration STOPS at the
+first structurally-invalid envelope — including a non-JSON body (the r3 pinned
+stop-on-invalid rule, consistent with the undecodable case; earlier valid
+payloads kept). **Fix (B)
 — the park-close lane:** `response_builder.parse_teammate_idle_notifications`
 (PLURAL — one parent entry can carry MULTIPLE envelopes, real-data verified;
 the second envelope of the live 15:56:55Z entry names the teammate whose park

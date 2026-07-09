@@ -102,8 +102,12 @@ _TEAMMATE_OPEN_RE = re.compile(r"<teammate-message(?=[\s>])")
 def _teammate_tag_completion(s: str, start: int) -> int:
     """Quote-aware scan for the opening tag's completing ``>`` (review r2
     P2(i)): a ``>`` inside a single- or double-quoted attribute value never
-    completes the tag. Returns the index of the completing ``>`` or ``-1``
-    (never completed within the scanned text — fail closed)."""
+    completes the tag. An UNQUOTED ``<`` before the completing ``>`` rejects
+    the opener (Hermes r3 P2 — a malformed opener must never borrow a LATER
+    opening/closing tag's ``>`` and then decode foreign JSON as its payload;
+    the current tag's own ``<`` precedes ``start``, and a legitimate attribute
+    ``<`` is always quoted). Returns the index of the completing ``>`` or
+    ``-1`` (never completed / structurally invalid — fail closed)."""
     quote: str | None = None
     for i in range(start, len(s)):
         ch = s[i]
@@ -114,6 +118,8 @@ def _teammate_tag_completion(s: str, start: int) -> int:
             quote = ch
         elif ch == ">":
             return i
+        elif ch == "<":
+            return -1  # a new tag opened before this one completed
     return -1
 
 
@@ -129,16 +135,22 @@ def teammate_envelope_payloads(text: str) -> list[Any]:
     ``>`` scan (a quoted ``>`` — or a close token embedded in a quoted
     attribute — never completes it); (ii) the tag name must be followed by an
     explicit whitespace/``>`` delimiter; (iii) the payload is decoded with
-    ``json.JSONDecoder().raw_decode`` from the first ``{`` after tag
-    completion — raw_decode stops at the JSON value's TRUE end, so a literal
-    ``</teammate-message>`` INSIDE a JSON string never terminates the envelope
-    (a teammate summary quoting the tag parses correctly); (iv) the structural
-    close tag must follow the decoded JSON end (+ optional whitespace) within
-    the bound. Enumeration continues after each close (one entry can carry
-    MULTIPLE envelopes — review P1) and STOPS at the first structurally-invalid
-    envelope (no reliable resync point without re-introducing quote-blind close
-    matching; earlier valid payloads are kept). ACCEPTED consequence (r2,
-    disclosed): an envelope whose body is not a decodable JSON object — e.g. a
+    ``json.JSONDecoder().raw_decode`` from the ``{`` that must IMMEDIATELY
+    follow tag completion (optional whitespace only — Codex r3 P1: a
+    free-ranging ``find("{")`` could cross the envelope boundary and borrow
+    FOREIGN JSON from later text, stamping genuine-user text machine-initiated
+    and minting a park for a teammate the envelope never named; the immediate
+    rule means the payload start can never cross the current close tag or a
+    following open tag). raw_decode stops at the JSON value's TRUE end, so a
+    literal ``</teammate-message>`` INSIDE a JSON string never terminates the
+    envelope (a teammate summary quoting the tag parses correctly); (iv) the
+    structural close tag must follow the decoded JSON end (+ optional
+    whitespace) within the bound. Enumeration continues after each close (one
+    entry can carry MULTIPLE envelopes — review P1) and STOPS at the first
+    structurally-invalid envelope — including a non-JSON body (no reliable
+    resync point without re-introducing quote-blind close matching; earlier
+    valid payloads are kept). ACCEPTED consequence (r2/r3, disclosed): an
+    envelope whose body is not IMMEDIATELY a decodable JSON object — e.g. a
     markdown teammate report — classifies as genuine-user (unknown shape =
     human, the pre-GH#46 behavior; fail direction toward never suppressing a
     real human turn). Bound math is BYTES: the char pre-slice caps encode cost
@@ -164,9 +176,14 @@ def teammate_envelope_payloads(text: str) -> list[Any]:
         gt = _teammate_tag_completion(s, open_m.end())
         if gt < 0:
             break  # the opening tag never completes within the bound
-        j0 = s.find("{", gt + 1)
-        if j0 < 0:
-            break  # no JSON payload after tag completion — fail closed
+        # Codex r3 P1: the payload must start IMMEDIATELY after the tag
+        # completion (whitespace-only gap) — never a free-ranging find, which
+        # could cross the envelope boundary and borrow foreign JSON.
+        j0 = gt + 1
+        while j0 < len(s) and s[j0] in " \t\r\n":
+            j0 += 1
+        if j0 >= len(s) or s[j0] != "{":
+            break  # non-JSON body / nothing after the tag — fail closed
         try:
             payload, jend = decoder.raw_decode(s, j0)
         except ValueError:
