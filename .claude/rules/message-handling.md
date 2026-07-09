@@ -504,6 +504,35 @@ scope (one-shot). Restart: a mid-leg resumed agent is not restart-relit beyond
 the existing Fix-#5 reconciler's original-launch scan. Pull-only; no observer
 (c313657 stays forbidden).
 
+**GH #46 PR-1 (agent-teams teammate park-close).** A Claude Code agent-teams
+"teammate" session's background key stranded typing/Busy for up to 2 h. TWO
+coupled defects: **(A)** a teammate's `idle_notification` report lands on the
+PARENT transcript as a `type:"user"` text entry and USED to classify as a
+GENUINE user turn — resetting `background_agents_done` (the re-record amplifier)
+so the key relit and never dropped. **(B)** the teammate leg ends in plain text
+(`stop_reason=None`), so the sidechain-done detector never fires, AND teammates
+emit no `<task-notification>` — the key had NO close signal. **Fix (A):** the
+teammate user event is machine-initiated. `utils.is_teammate_message` (byte-0
+anchored `Another Claude session sent a message:` + a `<teammate-message>`
+envelope closed within a 64 KiB scan bound) is stamped by the adapter as
+`TranscriptLifecycleEvent.is_teammate_notification`; `route_runtime`'s
+machine-initiated branch handles it identically to a `<task-notification>`
+(preserved tombstones/stash/pane-bit + stored-idle preserve; the notification
+clear stamps `TEAMMATE_NOTIFICATION`, ts-qualified). **Fix (B) — the park-close
+lane:** `response_builder.parse_teammate_idle_notification` extracts the FIRST
+envelope's inner `{…}` payload (`name` = `from`, `park_ts`); the monitor's
+parent user-text arm resolves the name → this parent's currently-tracked
+sidechain stem key(s) (`a<name>-<hex>`, hex 8-32 chars, read from
+`tracked_sessions` — NO disk glob; PR-1 closes ALL same-name stems, documented
+safe degradation) and records `teammate_parks[key] = (park_ts, unparseable)`;
+the bot fan-out applies each as `mark_background_agent_done(...,
+source=BgDoneSource.TEAMMATE, end_turn_ts=park_ts, ...)`. `TEAMMATE` shares the
+`SIDECHAIN` cross-file ts-gate (a stale prior-leg park keeps a resumed key LIVE;
+a genuine newer park, a None/unparseable park ts, or a record with no
+`resumed_event_ts` tombstones — fail-closed to DONE). Deferred to PR-2: a
+teammate registry, a wake lane, launched emission, binding logic. Pull-only; no
+observer (c313657 stays forbidden).
+
 **Fix B (2026-07-08) — true typing cadence.** `status_polling.typing_action_loop`
 already fans out its per-route typing sends CONCURRENTLY (`_typing_action_tick` →
 `asyncio.gather(return_exceptions=True)`), but the old loop slept a FULL
