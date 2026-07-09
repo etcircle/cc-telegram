@@ -331,6 +331,33 @@ async def test_file_command_error_paths(
 
 
 @pytest.mark.asyncio
+async def test_file_command_worktree_falls_back_to_main_root(
+    scenario: ScenarioHarness, tmp_path: Path
+) -> None:
+    """A session whose cwd is a HARNESS WORKTREE
+    (``<main_repo>/.claude/worktrees/<name>``) can /file a handoff written to
+    the MAIN repo (``temp/sessions/x.md``) even though it does not exist under
+    the worktree cwd — the resolve falls back to the worktree's main root."""
+    main_root = tmp_path / "myrepo"
+    worktree = main_root / ".claude" / "worktrees" / "agent-x"
+    worktree.mkdir(parents=True)
+    (main_root / "temp" / "sessions").mkdir(parents=True)
+    (main_root / "temp" / "sessions" / "x.md").write_bytes(b"# handoff")
+    _bind(scenario, str(worktree))
+
+    update = make_update_command(
+        "file",
+        args="temp/sessions/x.md",
+        thread_id=_THREAD_ID,
+        user_id=scenario.user_id,
+    )
+    await bot_module.file_command(update, scenario.context)
+
+    assert update.message.reply_document.await_count == 1
+    assert update.message.reply_document.await_args.kwargs["filename"] == "x.md"
+
+
+@pytest.mark.asyncio
 async def test_file_command_unbound_topic(
     scenario: ScenarioHarness, tmp_path: Path
 ) -> None:
