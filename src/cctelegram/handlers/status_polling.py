@@ -30,6 +30,11 @@ Key components:
     ``is_running``.
   - clear_route_caches_for_topic: the topic-teardown seam for the
     poller-local route-keyed caches, called by cleanup.clear_topic_state.
+  - _maybe_post_bg_only_card: the edge-triggered "labeled silence" line —
+    when the GH #44 projection keeps a parent-idle route Busy purely on live
+    background keys (typing on, topic silent), post ONE silent note per
+    episode so the silence is explained (``snapshot.background_only``,
+    poller-local ``_bg_only_card_posted`` one-shot cache; pull-only).
 """
 
 import asyncio
@@ -46,7 +51,7 @@ from .. import route_runtime
 # tests that read ``status_polling.IDLE_CLEAR_DELAY_SECONDS`` keep resolving
 # to the single source of truth.
 from ..route_runtime import IDLE_CLEAR_DELAY_SECONDS as IDLE_CLEAR_DELAY_SECONDS
-from ..session import session_manager
+from ..session import session_id_for_window, session_manager
 from ..terminal_parser import (
     extract_interactive_content,
     has_pane_chrome,
@@ -63,9 +68,11 @@ from . import (
     auq_source,
     decision_token,
     notify_source,
+    output_prefs,
     pane_signals,
     pick_token,
 )
+from .message_sender import topic_send
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -191,6 +198,16 @@ _absent_streak: dict[tuple[int, int, str], int] = {}
 _UNSEEN = object()
 _prev_run_state: dict[tuple[int, int, str], object] = {}
 
+# Per-route one-shot "background-only episode card posted" flag, keyed by
+# ``(user_id, thread_id_or_0, window_id)`` — the exact ``_prev_run_state``
+# pattern (poller-local, self-healing; NO observer, c313657). Set True after a
+# labeled-silence card is posted for an episode; popped when the episode ends
+# (``snapshot.background_only`` goes False) so a LATER episode posts a fresh
+# card. A failed send leaves it UNSET so the next tick retries (idempotency is
+# the flag, never the send). Torn down in the window-gone path and
+# ``clear_route_caches_for_topic`` beside ``_prev_run_state``.
+_bg_only_card_posted: dict[tuple[int, int, str], bool] = {}
+
 # Codex P2 (the EOT-gap card-dismiss race): per-route monotonic dismiss-deadline
 # for the decision card, keyed by ``(user_id, thread_id_or_0, window_id)``. Set
 # when ``_reconcile_decision_card`` first observes an END_OF_TURN clear with no
@@ -275,6 +292,13 @@ NOTIFY_DECISION_PROMPT = (
 # no bg key (a genuine no-workflow end-of-turn).
 DECISION_CARD_EOT_GRACE_S = 5.0
 
+# The "labeled silence" line posted once per background-only episode (parent
+# idle, only a background task keeps the route Busy — typing on, topic silent).
+# ``{tasks}`` is singular/plural on the live-key count.
+_BG_ONLY_CARD_TEXT = (
+    "⏳ Background work running ({n} {tasks}) — the topic will resume when it finishes."
+)
+
 
 def clear_route_caches_for_topic(user_id: int, thread_id_or_0: int) -> None:
     """Pop every poller-local route-keyed cache entry for ``(user, thread)``.
@@ -297,12 +321,70 @@ def clear_route_caches_for_topic(user_id: int, thread_id_or_0: int) -> None:
         _last_published_ui_hash,
         _absent_streak,
         _prev_run_state,
+        _bg_only_card_posted,
         _decision_card_eot_grace,
         _epm_surface_first_seen_at,
     )
     for cache in caches:
         for key in [k for k in cache if k[0] == user_id and k[1] == thread_id_or_0]:
             cache.pop(key, None)
+
+
+async def _maybe_post_bg_only_card(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    route: route_runtime.Route,
+) -> None:
+    """Edge-triggered one-shot "labeled silence" card (pull-only; no observer).
+
+    When the GH #44 projection keeps a PARENT-idle route Busy purely on live
+    background keys (``snapshot.background_only``), the topic looks frozen —
+    typing is on but Claude writes nothing (a background Bash has no sidechain
+    to stream). Post ONE silent line so the silence is explained; the flag is
+    the idempotency, never the send.
+
+    Edge semantics (the ``_prev_run_state`` precedent): post + set the flag on
+    the False→True transition; clear the flag on True→False (the episode ended,
+    so a LATER episode posts a fresh card). The card itself stays in history
+    when the episode ends (v1 — no edit/delete). A committed 🔔 outranks the
+    lift (``background_only`` is False there), so this never double-signals the
+    decision card.
+    """
+    snap = route_runtime.snapshot(route)
+    posted = _bg_only_card_posted.get(route, False)
+    if not snap.background_only:
+        # Episode ended (or never started) — reset the one-shot flag.
+        if posted:
+            _bg_only_card_posted.pop(route, None)
+        return
+    if posted:
+        return  # already posted this episode — one card per episode
+    if not output_prefs.resolve(user_id).digest_card:
+        return  # quiet preset — no card ever
+    n = len(snap.background_agents)
+    text = _BG_ONLY_CARD_TEXT.format(n=n, tasks="task" if n == 1 else "tasks")
+    sent, _outcome = await topic_send(
+        bot,
+        op="bg_only",
+        user_id=user_id,
+        chat_id=session_manager.resolve_chat_id(user_id, thread_id or None),
+        thread_id=thread_id,
+        window_id=window_id,
+        text=text,
+        plain=True,
+        disable_notification=True,
+        role="activity",
+        content_type="activity",
+        session_id=session_id_for_window(window_id),
+    )
+    # A failed send (sent is None — covers the topic-shaped outcomes too) leaves
+    # the flag UNSET so the next tick retries. A dead topic retries each tick
+    # (matches the attention-card tolerance).
+    if sent is None:
+        return
+    _bg_only_card_posted[route] = True
 
 
 async def _reconcile_decision_card(
@@ -742,13 +824,22 @@ async def update_status_message(
         # message_queue, which would invert the status_polling → message_queue
         # edge). A re-bound window seeds fresh (first observation, no edit).
         _prev_run_state.pop((user_id, thread_id or 0, window_id), None)
+        # A gone window has no live background episode — drop its one-shot flag
+        # so a re-bind starts fresh.
+        _bg_only_card_posted.pop((user_id, thread_id or 0, window_id), None)
         return
+
+    route = (user_id, thread_id or 0, window_id)
+    # Labeled-silence card: post/clear off the run-state snapshot BEFORE the
+    # capture-gating early returns (a capture-skipped tick still posts/clears),
+    # once the window is confirmed live. Pull-only, edge-triggered off the
+    # poller-local one-shot flag (the ``_prev_run_state`` precedent).
+    await _maybe_post_bg_only_card(bot, user_id, thread_id, window_id, route)
 
     # Adaptive pane-capture gate. The 1Hz loop still runs (so cleanup,
     # idle-clear timing, and stale-binding sweeps remain responsive), but
     # we skip the ``capture_pane`` subprocess most ticks. See
     # WATCHDOG_INTERVAL above for the criteria.
-    route = (user_id, thread_id or 0, window_id)
     interactive_window = get_interactive_window(user_id, thread_id)
     if interactive_window != window_id:
         # ``_absent_streak`` is meaningful only while THIS route+window owns

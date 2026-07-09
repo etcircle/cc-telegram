@@ -88,7 +88,8 @@ fields: `run_state`, `open_tools`, `waiting_on_user_tools`,
 `context_usage`, `last_event_at`, `idle_clear_at`, `pane_idle_clear_at`,
 `typing_eligible`, `status_card_visible`, `status_card_msg_id`,
 `interactive_pending`, `notification_pending`, `notification_set_at`,
-`notification_generation`, `notification_clear_reason`, `background_agents`.
+`notification_generation`, `notification_clear_reason`, `background_agents`,
+`background_only`.
 The two
 idle deadlines are distinct:
 `idle_clear_at` is the run-state `IDLE_RECENT → IDLE_CLEARED` decay
@@ -426,6 +427,31 @@ startup reconciler there is no sidechain file to stat, so after a restart a
 still-running background bash stays typing-dark until fresh parent activity —
 the recorded GH #44 degradation shape, and the T2 window widening does NOT
 change it. Pull-only throughout (no observer; c313657 stays forbidden).
+
+**Background-only episode card ("labeled silence").** When the projection keeps
+a PARENT-idle route Busy purely on live background keys — typing on, topic
+silent (a background Bash has no sidechain to stream) — the topic looks frozen.
+The snapshot exposes a DERIVED read field `background_only` (computed ONLY in
+`_build_snapshot`: stored `run_state` idle AND the lift projected RUNNING on the
+TTL-filtered `background_agents`; False whenever a committed
+`notification_pending` outranks the lift to WAITING — the 🔔 decision card owns
+that state — so the two never double-signal). The poller
+(`status_polling._maybe_post_bg_only_card`, sited AFTER the window-gone return
+and BEFORE the capture-gating early returns, so a capture-skipped tick still
+posts/clears) posts ONE silent line per episode —
+`⏳ Background work running (N task[s]) — the topic will resume when it
+finishes.` (the count from `len(snapshot.background_agents)`) via
+`message_sender.topic_send(plain=True, disable_notification=True)` to
+`session_manager.resolve_chat_id(user, thread)`. Edge-triggered off the
+poller-local one-shot `_bg_only_card_posted` cache (the `_prev_run_state`
+precedent): post + set on False→True; clear the flag on True→False (a LATER
+episode posts a fresh card — the card itself STAYS in history, v1: no
+edit/delete). A failed send (`sent is None` / topic-shaped outcome) leaves the
+flag UNSET so the next tick retries (idempotency is the flag, never the send; a
+dead topic retries each tick — the attention-card tolerance). The `quiet` preset
+(`output_prefs.resolve(user).digest_card` False) gets no card. Torn down beside
+`_prev_run_state` at the window-gone pop and `clear_route_caches_for_topic`.
+Pull-only; no observer (c313657 stays forbidden).
 
 **Fix C (2026-07-08) — resume as the FOURTH launch source (relight a nudged
 agent).** A `SendMessage` to an already-EXISTING background agent (the standing
