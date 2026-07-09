@@ -874,6 +874,58 @@ async def test_respawn_with_live_old_key_no_residual_live_key(
 
 
 @pytest.mark.asyncio
+async def test_respawn_new_gen_file_already_on_disk_at_rotation_still_binds(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """Adversarial-review P1 (over-quarantine): under poll lag the GENUINE new-gen
+    sidechain file ALREADY exists at rotation-parse time. The rotation's
+    disk-snapshot quarantine must NOT retire it (its first entry is >= the new
+    spawn) — only genuinely STALE prior-gen files are quarantined; the new file
+    binds normally. Regression: an unconditional-by-name quarantine darkened the
+    respawn permanently."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 60  # spawn events in the past (poll lags CC's write)
+    key1 = _key_for(_NAME, "1111aaaa1111aaaa")
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    sc1 = _write_sidechain(sub_dir, key1, _iso(base + 0.1))
+    import os
+
+    os.utime(sc1, (base + 0.1, base + 0.1))
+    await monitor.check_sidechain_updates({PARENT})
+    assert monitor.pop_sidechain_activity()[PARENT].launched == {key1}
+
+    # The RESPAWN + the new-gen file BOTH land on disk BEFORE the monitor observes
+    # the respawn tool_result (the realistic lag). The new file's first entry is at
+    # ~the respawn event ts.
+    respawn_event = base + 10
+    key2 = _key_for(_NAME, "2222bbbb2222bbbb")
+    sc2 = _write_sidechain(sub_dir, key2, _iso(respawn_event + 0.1))
+    os.utime(sc2, (respawn_event + 0.1, respawn_event + 0.1))
+    # Only NOW does the monitor parse the respawn (rotation runs with the new file
+    # already present on disk).
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(respawn_event)
+    )
+    await monitor.check_for_updates({PARENT})
+    # The old key1 is tombstoned at rotation; the new key2 is NOT retired.
+    rot = monitor.pop_sidechain_activity()
+    assert key1 in rot[PARENT].teammate_parks
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert key1 in rec.retired_keys
+    assert key2 not in rec.retired_keys  # the genuine new-gen file survives
+
+    # The new-gen file binds on the next sidechain sweep.
+    await monitor.check_sidechain_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert act[PARENT].launched == {key2}
+    assert monitor._teammate_registry[PARENT][_NAME].current_key == key2
+
+
+@pytest.mark.asyncio
 async def test_respawn_quarantines_untracked_disk_stem_before_first_bind(
     monitor, tmp_path, make_jsonl_entry, make_tool_use_block
 ):

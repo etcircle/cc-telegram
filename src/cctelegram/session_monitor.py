@@ -79,6 +79,16 @@ _TURN_END_REASONS = frozenset({"end_turn", "stop_sequence"})
 # file (a same-name teammate from an earlier spawn) that must not bind.
 TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S = 5.0
 
+# GH #46 PR-2: the SMALL cross-write-path tolerance the STRICT gen>=2 first-entry
+# gate allows below the new spawn's event ts (adversarial-review P2). The spawn
+# tool_result (parent transcript) and the teammate's first sidechain entry are
+# stamped by CC through DIFFERENT flushes, so the teammate's first entry can land
+# a sub-second BEFORE the parent tool_result even for the genuine new-gen file. A
+# prior-generation file's first entry predates the new spawn by the whole RESPAWN
+# interval (seconds+), so this sub-second tolerance distinguishes the two without
+# admitting a stale prior-gen file. (Gen-1 uses the larger MTIME skew above.)
+TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S = 1.0
+
 # GH #46 PR-2: the byte cap for reading a candidate teammate sidechain's FIRST
 # JSONL line at the binding gate. One real entry is a few KiB; a line longer than
 # this (or with no newline yet) is a partial write ⇒ NO bind this tick (retry).
@@ -729,28 +739,53 @@ class SessionMonitor:
     def _rotate_teammate_generation(
         self, parent_session_id: str, rec: "_TeammateRec", spawned_ts: float
     ) -> None:
-        """A same-name RESPAWN: close the old leg's current_key, quarantine every
-        matching stem (tracked OR on disk), and bump the generation (§2 spawn).
+        """A same-name RESPAWN: close the old leg's current_key, quarantine the
+        genuinely-STALE matching stems (tracked OR on disk), and bump the
+        generation (§2 spawn).
 
         The quarantine snapshot is ONE anchored ``glob`` of this parent's
         ``subagents`` dir plus the in-memory tracked stems — so a stale prior-gen
         file that is present on disk but NOT yet tracked can never bind to the new
-        generation (the disk-snapshot pin)."""
-        # (1) close the old current_key unconditionally (its leg is superseded).
+        generation (the disk-snapshot pin). BUT the sever is GATED on the NEW
+        generation's bind gate (adversarial-review class-8): a same-name file that
+        ALREADY exists at rotation time and whose first entry is >= the new spawn
+        is the GENUINE new-gen file (a fast teammate the poll lagged), so it is
+        left UN-retired for the normal binding path; only a file that FAILS the
+        gate (first entry predates the new spawn ⇒ stale prior-gen) is quarantined.
+        An indeterminate file (mid-write) is left for the per-tick retry."""
+        # (1) close the old current_key unconditionally (its leg is superseded,
+        # regardless of its first-entry ts).
         if rec.current_key is not None:
             self._quarantine_teammate_stem(parent_session_id, rec, rec.current_key)
-        # (3) quarantine every matching stem tracked OR on disk.
-        for key in self._matching_stems_on_disk_and_tracked(
-            parent_session_id, rec.name
-        ):
-            if key not in rec.retired_keys:
-                self._quarantine_teammate_stem(parent_session_id, rec, key)
-        # (4) reset for the new generation.
+        # (2) bump the generation + set spawned_ts FIRST so the gate below is the
+        # NEW generation's strict gate.
+        old_current = rec.current_key
         rec.current_key = None
         rec.pending_wake = None
         rec.pending_park = None
         rec.spawn_generation += 1
         rec.spawned_ts = spawned_ts
+        # (3) quarantine only the STALE matching stems (gate==False); leave a
+        # genuine already-existing new-gen file (gate==True) + a mid-write file
+        # (gate==None) for the normal binding path.
+        tracked = self.state.get_session(parent_session_id)
+        sub_dir = (
+            Path(tracked.file_path).parent / parent_session_id / "subagents"
+            if tracked is not None and tracked.file_path
+            else None
+        )
+        for key in self._matching_stems_on_disk_and_tracked(
+            parent_session_id, rec.name
+        ):
+            if key in rec.retired_keys or key == old_current:
+                continue
+            if sub_dir is not None:
+                gate = self._teammate_bind_gate_passes(
+                    rec, sub_dir / f"agent-{key}.jsonl"
+                )
+                if gate is not False:
+                    continue  # genuine new-gen (True) or mid-write (None) → keep
+            self._quarantine_teammate_stem(parent_session_id, rec, key)
 
     def _matching_stems_on_disk_and_tracked(
         self, parent_session_id: str, name: str
@@ -950,9 +985,13 @@ class SessionMonitor:
 
         Returns True (bind), False (never — the file's first entry predates the
         spawn: a STALE prior-generation file), or None (INDETERMINATE — first line
-        not yet readable ⇒ NO bind this tick, RETRY). Gen-1 tolerates the skew
-        window (``spawned_ts - SKEW``); gen>=2 is STRICT (``>= spawned_ts``) so a
-        respawn never binds a file whose first entry predates the new spawn."""
+        not yet readable ⇒ NO bind this tick, RETRY). Gen-1 tolerates the larger
+        MTIME skew window (``spawned_ts - MTIME_SKEW``); gen>=2 tolerates only the
+        SMALL cross-write-path jitter (``spawned_ts - GEN2_FIRST_TS_TOLERANCE``,
+        adversarial-review P2) — far below the respawn interval, so a stale
+        prior-gen file (first entry seconds before the new spawn) still fails while
+        the genuine new-gen file (first entry a sub-second before the parent
+        tool_result flush) binds."""
         try:
             mtime = sc_file.stat().st_mtime
         except OSError:
@@ -963,7 +1002,7 @@ class SessionMonitor:
         if first_ts is None:
             return None  # unreadable/mid-write first line → retry
         if rec.spawn_generation >= 2:
-            return first_ts >= rec.spawned_ts
+            return first_ts >= rec.spawned_ts - TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S
         return first_ts >= rec.spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S
 
     def _bind_teammate_key(
