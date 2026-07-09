@@ -583,9 +583,79 @@ false-typing; the genuine final park is stamped ms after the final write, so
 ties are overwhelmingly the genuine shape); an UNPARSEABLE park tombstones
 unconditionally, a missing record / `last_event_ts=None` tombstones —
 fail-closed to DONE. The stale-vs-activity gate is TEAMMATE-only; `SIDECHAIN`
-semantics are byte-untouched. Deferred to PR-2: a
-teammate registry, a wake lane, launched emission, binding logic. Pull-only; no
-observer (c313657 stays forbidden).
+semantics are byte-untouched. Pull-only; no observer (c313657 stays forbidden).
+
+**GH #46 PR-2 (teammates as FIRST-CLASS background keys — the generational
+registry, launch-at-binding, wake lane, discovery-quarantine).** PR-1 closed a
+teammate's PARK; PR-2 makes the teammate a first-class background key so typing
+stays ON while it genuinely works ACROSS the parent's own turns, relights when
+re-woken, and drops promptly at park — WITHOUT ever stranding on a stale
+same-name sidechain file. **route_runtime gains ZERO new mutators** — the
+registry drives the EXISTING `launched` / `resumed` / `done`
+(`BgDoneSource.TEAMMATE`) marks through the bot fan-out. **The structured
+discriminators (`handlers/response_builder`, STRUCTURED-ONLY, five-way
+disjoint):** `teammate_spawn_info_from_meta` keys on
+`status=="teammate_spawned"` + a glob/regex-safe `name` (the id is snake
+`agent_id`, NO camelCase `agentId` — verified 2.1.197 — so it is disjoint from
+the plain-Agent async-launch lane; a metacharacter/over-long name fails DARK +
+WARNs because the name feeds a `glob.escape` + `re.escape`); refuses any of the
+four OTHER lanes' ownership fields (`agentId` / `taskId` / `backgroundTaskId` /
+`resumedAgentId`). `teammate_send_target_from_meta` keys on `success is True` +
+`routing.target == "@<name>"`, disjoint from the Fix-C resume lane
+(`resumedAgentId`, verified 0-overlap). A prose `Spawned successfully.` line with
+NO structured meta fires the rate-limited T1.6-analogue drift WARNING, never a
+lift. **The registry (`session_monitor`, per-parent `dict[name -> _TeammateRec]`):**
+`_record_teammate_spawn` creates a gen-1 rec OR ROTATES it — a same-name RESPAWN
+(1) closes the old `current_key` unconditionally (an `end_turn_ts_unparseable=True`
+teammate done — bypasses the resume/stale gates by design, never peeks runtime
+liveness), (2) moves it to `retired_keys`, (3) QUARANTINES every matching stem
+tracked OR present on a single anchored `glob(glob.escape("agent-a<name>-") +
+"*.jsonl")` disk snapshot (the disk snapshot closes the untracked-stale-file
+hole), (4) resets `current_key`/pending + bumps `spawn_generation`, then (5) a
+PRE-SPAWN scan attempts binding on surviving tracked unbound stems. **Binding
+(`_try_bind_or_quarantine_teammate_file`, called for EVERY top-level sidechain
+file in `check_sidechain_updates` BEFORE `_track_and_emit_sidechain_file`, so it
+fires at first-seen EOF):** a stem whose normalized key resolves to a registered
+name (LONGEST-name-first, pure-hex residual disambiguates nested names) binds as
+`current_key` IFF `current_key` is None AND the key is not retired AND the
+**mtime prefilter** (`st_mtime >= spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S`,
+5.0s) AND the **first-entry-timestamp generation gate** (`_read_first_entry_ts`:
+a bounded byte-capped read of the FIRST JSONL line — cap/no-newline/parse-fail/
+unparseable ⇒ NO bind this tick, RETRY while unbound, never consume-once; gen-1
+tolerates `>= spawned_ts - SKEW`, gen≥2 STRICT `>= spawned_ts`; multiple
+unretired candidates passing simultaneously in the pre-spawn scan → bind NONE +
+WARN, fail-DARK) all pass. On bind it emits the EXISTING `launched` key at
+DISCOVERY (once-only; a bound file's later ticks feed run-state normally and
+never re-launch) then applies the buffered pending signals in CAUSAL order —
+`pending_wake` first (→ `resumed[key]`), `pending_park` second (→ the merge) —
+so the runtime ts-gates arbitrate. **Wake (`_record_teammate_wake`, the
+`SendMessage` lane):** BOUND → `resumed[current_key] = event_ts`; UNBOUND →
+`pending_wake` (max on repeats); UNKNOWN name → no-op; the monitor cross-checks
+the paired `SendMessage input["to"] == <name>` (`transcript_parser` now carries
+`SendMessage` input onto its tool_result), a mismatch REFUSES + WARNs and an
+unavailable input FAILS CLOSED (no wake). **Park (`_record_teammate_park`):** name
+IN registry → close `current_key` only (bound) or buffer a TYPED `_PendingPark`
+slot (unbound; `_merge_pending_park` — UnknownDone dominates permanently, else
+max parseable ts, NEVER a bare tuple last-write-wins); name NOT in registry →
+PR-1's all-tracked-stems close verbatim (the documented no-registry degradation,
+e.g. a pre-restart spawn). **Discovery-quarantine severing
+(`_quarantine_teammate_stem`):** a same-name candidate that CANNOT bind
+(`current_key` occupied by a different key / gate-False stale-prior-gen / gen≥2
+ambiguity / retired) is retired + an UNCONDITIONAL teammate done + PERMANENTLY
+severed from run-state tick emission — its `tracking_key` joins
+`_severed_teammate_stems[parent]`, and the top-level loop passes
+`feed_run_state=False` for it forever (still tailed for DISPLAY, the Fix-5
+discipline). The sever is MONITOR-SIDE, so it is immune to a runtime tombstone
+reset (a genuine user turn clears `background_agents_done` but a severed stem can
+never re-record a tick) — the STRUCTURAL guarantee that NO non-current same-name
+key can ever be recorded live (the sequential-ambiguity strand pin). **Teardown:**
+the registry (incl. `retired_keys`) + the severed set die with the parent's
+tracking state in `_remove_sidechains_for_parent` (session replacement / `/clear`
+/ window gone); NOT restart-reconciled — a mid-leg teammate is not relit after
+kickstart (the disclosed degradation, same class as background-Bash T1.4b).
+Binding is a HEURISTIC and intentionally fail-DARK when ambiguous (prefer
+dark-until-next-signal over a wrong lift). Pull-only; no observer (c313657 stays
+forbidden).
 
 **Fix B (2026-07-08) — true typing cadence.** `status_polling.typing_action_loop`
 already fans out its per-route typing sends CONCURRENTLY (`_typing_action_tick` →

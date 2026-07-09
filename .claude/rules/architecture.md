@@ -250,6 +250,12 @@ Additional modules:
                                 genuinely-final park); a tie tombstones
                                 (dark-safe), unparseable/missing-record
                                 tombstones — SIDECHAIN byte-untouched).
+                                GH #46 PR-2 (teammates as first-class bg keys)
+                                adds ZERO new route_runtime mutators — the
+                                session_monitor generational teammate registry
+                                (_TeammateRec) drives the EXISTING launched (at
+                                bind) / resumed (wake) / TEAMMATE-done (park)
+                                marks; see message-handling.md.
                                 Clears: done / a PER-KEY wall-clock heartbeat
                                 TTL (_wall_now(), expire-before-classify) —
                                 T2 split: foreground-presumed keys age by
