@@ -600,11 +600,24 @@ disjoint):** `teammate_spawn_info_from_meta` keys on
 the plain-Agent async-launch lane; a metacharacter/over-long name fails DARK +
 WARNs because the name feeds a `glob.escape` + `re.escape`); refuses any of the
 four OTHER lanes' ownership fields (`agentId` / `taskId` / `backgroundTaskId` /
-`resumedAgentId`). `teammate_send_target_from_meta` keys on `success is True` +
+`resumedAgentId` — key-PRESENCE checks, never truthiness: a field present with
+an empty/None value is still another lane's shape, dual-review r1 item 6b).
+`teammate_send_target_from_meta` keys on `success is True` +
 `routing.target == "@<name>"`, disjoint from the Fix-C resume lane
 (`resumedAgentId`, verified 0-overlap). A prose `Spawned successfully.` line with
 NO structured meta fires the rate-limited T1.6-analogue drift WARNING, never a
-lift. **The registry (`session_monitor`, per-parent `dict[name -> _TeammateRec]`):**
+lift. **Result-before-use retro-pairing (dual-review r1 item 1, Hermes P1):**
+Claude Code flushes a tool_result BEFORE its tool_use in 27/40 real session
+files (the GH #42 ordering), and the parser hands such a result over with
+`tool_name=None` — so the tool_name-gated spawn/wake branches could silently
+drop the signal (registry never created / a parked teammate never relit). The
+monitor now RETAINS the teammate-shaped parsed signal keyed by `tool_use_id`
+(`_early_teammate_signals`, only spawn/wake-shaped metas — bounded, per-parent
+drop-oldest cap, torn down with the parent) and applies it when the matching
+Agent/Task/SendMessage `tool_use` arrives — whose entry carries the `input` the
+wake cross-check needs, so the cross-check runs at retro-pair time; the spawn's
+`spawned_ts` still anchors to the RESULT's event ts. **The registry
+(`session_monitor`, per-parent `dict[name -> _TeammateRec]`):**
 `_record_teammate_spawn` (anchored to the spawn tool_result's JSONL EVENT ts,
 NOT the monitor's parse instant — the poll lags CC's write, so `time.time()`
 would set `spawned_ts` after the genuine new-gen file's first entry and the
@@ -620,52 +633,79 @@ over-quarantine fix): only a stem that FAILS the gate (first entry predates the
 new spawn ⇒ prior gen) is severed; a same-name file ALREADY on disk at rotation
 whose first entry is ≥ the new spawn is the GENUINE new-gen file the poll lagged
 and is LEFT for the normal binding path (a mid-write file too), (4) resets
-`current_key`/pending, then (5) a PRE-SPAWN scan attempts binding on surviving
-tracked unbound stems. **Binding
-(`_try_bind_or_quarantine_teammate_file`, called for EVERY top-level sidechain
-file in `check_sidechain_updates` BEFORE `_track_and_emit_sidechain_file`, so it
-fires at first-seen EOF):** a stem whose normalized key resolves to a registered
-name (LONGEST-name-first, pure-hex residual disambiguates nested names) binds as
-`current_key` IFF `current_key` is None AND the key is not retired AND the
-**mtime prefilter** (`st_mtime >= spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S`,
-5.0s) AND the **first-entry-timestamp generation gate** (`_read_first_entry_ts`:
-a bounded byte-capped read of the FIRST JSONL line — cap/no-newline/parse-fail/
-unparseable ⇒ NO bind this tick, RETRY while unbound, never consume-once; gen-1
-tolerates the larger `>= spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S`,
-gen≥2 tolerates only the small cross-write-path
-`>= spawned_ts - TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S` (1.0s — the spawn
-tool_result and the teammate's first sidechain entry are different CC flushes, so
-the genuine new file's first entry can land a sub-second before the parent
-flush; far under the respawn interval so a stale prior-gen file still fails —
-adversarial-review P2); multiple unretired candidates passing simultaneously in
-the pre-spawn scan → bind NONE + WARN, fail-DARK) all pass. On bind it emits the EXISTING `launched` key at
-DISCOVERY (once-only; a bound file's later ticks feed run-state normally and
-never re-launch) then applies the buffered pending signals in CAUSAL order —
-`pending_wake` first (→ `resumed[key]`), `pending_park` second (→ the merge) —
-so the runtime ts-gates arbitrate. **Wake (`_record_teammate_wake`, the
-`SendMessage` lane):** BOUND → `resumed[current_key] = event_ts`; UNBOUND →
-`pending_wake` (max on repeats); UNKNOWN name → no-op; the monitor cross-checks
-the paired `SendMessage input["to"] == <name>` (`transcript_parser` now carries
-`SendMessage` input onto its tool_result), a mismatch REFUSES + WARNs and an
-unavailable input FAILS CLOSED (no wake). **Park (`_record_teammate_park`):** name
-IN registry → close `current_key` only (bound) or buffer a TYPED `_PendingPark`
-slot (unbound; `_merge_pending_park` — UnknownDone dominates permanently, else
-max parseable ts, NEVER a bare tuple last-write-wins); name NOT in registry →
-PR-1's all-tracked-stems close verbatim (the documented no-registry degradation,
-e.g. a pre-restart spawn). **Discovery-quarantine severing
-(`_quarantine_teammate_stem`):** a same-name candidate that CANNOT bind
-(`current_key` occupied by a different key / gate-False stale-prior-gen / gen≥2
-ambiguity / retired) is retired + an UNCONDITIONAL teammate done + PERMANENTLY
-severed from run-state tick emission — its `tracking_key` joins
-`_severed_teammate_stems[parent]`, and the top-level loop passes
+`current_key`/pending + clears the STICKY ambiguity flag (a fresh spawn is new
+evidence — the ONLY clear), then (5) a PRE-SPAWN scan attempts binding on
+surviving tracked unbound stems. **Binding — SET-BASED arbitration (dual-review
+r1 item 2, BOTH engines converged; `_arbitrate_and_bind`, shared by the public
+`check_sidechain_updates` pre-pass `_arbitrate_teammate_bindings` AND the
+pre-spawn scan — never sequential first-wins, so filesystem enumeration order
+can never pick the "genuine" key):** each pass groups this parent's same-name
+candidates (LONGEST-name-first stem resolution, pure-hex residual disambiguates
+nested names; retired keys excluded) and evaluates ALL gates BEFORE any
+`current_key` mutation. The gate = the **mtime prefilter**
+(`st_mtime >= spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S`, 5.0s) AND the
+**first-entry-timestamp generation gate** (`_read_first_entry_ts`: a bounded
+byte-capped read of the FIRST JSONL line — cap/no-newline/parse-fail/unparseable
+⇒ INDETERMINATE, no bind this pass, RETRY while unbound, never consume-once;
+gen-1 tolerates the larger `>= spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S`,
+gen≥2 tolerates only `>= spawned_ts - TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S` —
+**0.1s, FIXTURE-DERIVED (r1 item 5)**: across ALL 18 real 2.1.197 spawns the
+teammate's first sidechain entry lands 1–7 ms AFTER the spawn tool_result,
+never before, so 0.1s is 14× headroom over the max observed cross-flush gap and
+rejects a stale sibling written even 0.2s pre-respawn). Gate-False (stale prior
+gen) → quarantine + sever (deterministic); gate-None → unresolved (retry, NOT
+quarantined); EXACTLY ONE gate-True → BIND; **>1 gate-True → bind NONE + WARN +
+the rec goes STICKY-ambiguous** (the gate inputs are static, so the ambiguity
+never self-resolves — it clears ONLY at the next rotation; the passing
+candidates are NOT arbitrarily quarantined and stay out of run-state via item
+3). On bind it emits the EXISTING `launched` key at DISCOVERY (once-only; a
+bound file's later ticks feed run-state normally and never re-launch) then
+applies the buffered pending signals in CAUSAL order — `pending_wake` first (→
+`resumed[key]`), `pending_park` second (→ the merge) — so the runtime ts-gates
+arbitrate. **Run-state classification (`_teammate_feed_run_state`, r1 item 3,
+BOTH engines):** for a REGISTERED teammate name, ONLY the bound `current_key`
+ever feeds run-state ticks — a retired or occupied-newcomer candidate is
+quarantined + severed; an UNRESOLVED (permanently-indeterminate gate included)
+or sticky-AMBIGUOUS candidate is DARK without quarantine — so an unbound
+candidate can never mint a background key that a genuine-user tombstone reset
+could resurrect (pre-fix, an indeterminate gate fell through to
+`feed_run_state=True` and an unbound candidate emitted SidechainTicks — the
+strand re-entry). A name with no registry rec keeps legacy behavior. **Wake
+(`_record_teammate_wake`, the `SendMessage` lane):** BOUND →
+`resumed[current_key] = event_ts`; UNBOUND → `pending_wake` (max on repeats);
+UNKNOWN name → no-op; the monitor cross-checks the paired `SendMessage
+input["to"] == <name>` (`transcript_parser` now carries `SendMessage` input
+onto its tool_result; the shared `_apply_teammate_wake_crosschecked` also runs
+on the item-1 retro path), a mismatch REFUSES + WARNs and an unavailable input
+FAILS CLOSED (no wake). **Park (`_record_teammate_park`):** name IN registry →
+**generation scope first (r1 item 4, Codex P1): a PARSEABLE park whose
+`park_ts` predates the CURRENT generation's `spawned_ts` is DROPPED (INFO) — it
+reports the PRIOR leg going idle and cannot close a generation it predates
+(pre-fix, a delayed prior-gen park buffered into `pending_park` after a
+rotation tombstoned the FRESH key at bind, which had no activity/resume stamp
+yet to defend it); an UNPARSEABLE park keeps unconditional dominance (it cannot
+be generation-checked; fail-dark doctrine — disclosed residual: an unparseable
+post-rotation stale park darkens the new gen until a wake / the next genuine
+park)** — then close `current_key` only (bound) or buffer a TYPED
+`_PendingPark` slot (unbound; `_merge_pending_park` — UnknownDone dominates
+permanently, else max parseable ts, NEVER a bare tuple last-write-wins); name
+NOT in registry → PR-1's all-tracked-stems close verbatim (the documented
+no-registry degradation, e.g. a pre-restart spawn). **Discovery-quarantine
+severing (`_quarantine_teammate_stem`):** a same-name candidate that
+DETERMINISTICALLY cannot bind (`current_key` occupied by a different key /
+gate-False stale-prior-gen / retired) is retired + an UNCONDITIONAL teammate
+done + PERMANENTLY severed from run-state tick emission — its `tracking_key`
+joins `_severed_teammate_stems[parent]`, and the top-level loop passes
 `feed_run_state=False` for it forever (still tailed for DISPLAY, the Fix-5
 discipline). The sever is MONITOR-SIDE, so it is immune to a runtime tombstone
 reset (a genuine user turn clears `background_agents_done` but a severed stem can
-never re-record a tick) — the STRUCTURAL guarantee that NO non-current same-name
-key can ever be recorded live (the sequential-ambiguity strand pin). **Teardown:**
-the registry (incl. `retired_keys`) + the severed set die with the parent's
-tracking state in `_remove_sidechains_for_parent` (session replacement / `/clear`
-/ window gone); NOT restart-reconciled — a mid-leg teammate is not relit after
+never re-record a tick) — with the item-3 unresolved-never-feeds rule, the
+STRUCTURAL guarantee that NO non-current same-name key can ever be recorded
+live (the sequential-ambiguity strand pin). **Teardown:**
+the registry (incl. `retired_keys` + the sticky ambiguity flag) + the severed
+set + the item-1 result-before-use stash die with the parent's tracking state
+in `_remove_sidechains_for_parent` (session replacement / `/clear` / window
+gone); NOT restart-reconciled — a mid-leg teammate is not relit after
 kickstart (the disclosed degradation, same class as background-Bash T1.4b).
 Binding is a HEURISTIC and intentionally fail-DARK when ambiguous (prefer
 dark-until-next-signal over a wrong lift). Pull-only; no observer (c313657 stays
