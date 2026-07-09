@@ -1,0 +1,323 @@
+"""Unit tests for handlers/artifacts.py (the 📎 artifact delivery lane leaf).
+
+RED-first (plan §J): the extraction shapes + the validated-fd open contract are
+pinned before implementation. Also covers the resolve/validate rejections
+(traversal, symlink-escape, oversize, empty-cwd fail-closed), the registry
+single-FLIGHT state machine + offer-dedup + token TTL, and the ≤64-byte
+callback cap.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+from cctelegram.handlers import artifacts
+from cctelegram.handlers.callback_data import CB_DOWNLOAD_FILE
+
+
+@pytest.fixture(autouse=True)
+def _reset() -> None:
+    artifacts.reset_for_tests()
+    yield
+    artifacts.reset_for_tests()
+
+
+# ── Extraction shapes (§A.2) ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("See report.md for details", ["report.md"]),
+        ("Wrote the chart to `chart.png` now", ["chart.png"]),
+        ("Saved (export.pdf) in the folder", ["export.pdf"]),
+        ("[the report](docs/report.md) is ready", ["docs/report.md"]),
+        ("Output written to output.csv.", ["output.csv"]),
+        ("Your notes are in ~/notes/todo.txt", ["~/notes/todo.txt"]),
+        ("Open ./build/index.html to preview", ["./build/index.html"]),
+        ("Placed at temp/report.md today", ["temp/report.md"]),
+        ("Tailing /var/log/app.log now", ["/var/log/app.log"]),
+        ("A deep one: a/b/c/deck.pptx.", ["a/b/c/deck.pptx"]),
+    ],
+)
+def test_extract_shapes(text: str, expected: list[str]) -> None:
+    assert artifacts.extract_artifact_candidates(text) == expected
+
+
+def test_extract_rejects_non_allowlisted_and_mdx_guard() -> None:
+    # Source-code extensions are never offered; .mdx must not match .md.
+    assert artifacts.extract_artifact_candidates("run script.py then main.ts") == []
+    assert artifacts.extract_artifact_candidates("edit component.mdx here") == []
+    assert artifacts.extract_artifact_candidates("no paths here at all") == []
+
+
+def test_extract_dedups_preserving_order() -> None:
+    text = "a.png and a.png then b.pdf and a.png"
+    assert artifacts.extract_artifact_candidates(text) == ["a.png", "b.pdf"]
+
+
+def test_extract_multiple_mixed_shapes() -> None:
+    text = "Files: `reports/q1.csv`, /tmp/out.json, and ~/deck.pptx done."
+    assert artifacts.extract_artifact_candidates(text) == [
+        "reports/q1.csv",
+        "/tmp/out.json",
+        "~/deck.pptx",
+    ]
+
+
+# ── Validation (§A.3) ─────────────────────────────────────────────────────
+
+
+def _write(p: Path, data: bytes = b"hello") -> Path:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
+def test_resolve_absolute_inside_root(tmp_path: Path) -> None:
+    f = _write(tmp_path / "sub" / "report.md")
+    got = artifacts.resolve_artifacts([str(f)], str(tmp_path), [], 1024)
+    assert len(got) == 1
+    assert got[0].resolved_path == str(f.resolve())
+    assert got[0].display_name == "sub/report.md"
+    assert got[0].size == 5
+    assert got[0].allowed_roots == (str(tmp_path.resolve()),)
+
+
+def test_resolve_bare_relative_joined_to_cwd(tmp_path: Path) -> None:
+    _write(tmp_path / "temp" / "data.csv")
+    got = artifacts.resolve_artifacts(["temp/data.csv"], str(tmp_path), [], 1024)
+    assert len(got) == 1
+    assert got[0].display_name == "temp/data.csv"
+
+
+def test_resolve_extra_root(tmp_path: Path) -> None:
+    root_a = tmp_path / "a"
+    root_b = tmp_path / "b"
+    f = _write(root_b / "note.txt")
+    got = artifacts.resolve_artifacts([str(f)], str(root_a), [str(root_b)], 1024)
+    assert len(got) == 1 and got[0].display_name == "note.txt"
+
+
+def test_reject_nonexistent(tmp_path: Path) -> None:
+    got = artifacts.resolve_artifacts(["missing.pdf"], str(tmp_path), [], 1024)
+    assert got == []
+
+
+def test_reject_directory_not_file(tmp_path: Path) -> None:
+    (tmp_path / "adir.md").mkdir()
+    got = artifacts.resolve_artifacts(["adir.md"], str(tmp_path), [], 1024)
+    assert got == []
+
+
+def test_reject_oversize(tmp_path: Path) -> None:
+    _write(tmp_path / "big.zip", b"x" * 5000)
+    got = artifacts.resolve_artifacts(["big.zip"], str(tmp_path), [], 1024)
+    assert got == []
+
+
+def test_reject_empty_cwd_fail_closed(tmp_path: Path) -> None:
+    _write(tmp_path / "x.md")
+    # empty cwd AND no extra roots ⇒ no roots ⇒ nothing offerable.
+    assert artifacts.resolve_artifacts(["x.md"], "", [], 1024) == []
+
+
+def test_reject_traversal_escaping_cwd(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    _write(tmp_path / "secret.json")
+    got = artifacts.resolve_artifacts(["../secret.json"], str(root), [], 1024)
+    assert got == []
+
+
+def test_reject_absolute_outside_roots(tmp_path: Path) -> None:
+    outside = _write(tmp_path / "outside" / "x.pdf")
+    root = tmp_path / "root"
+    root.mkdir()
+    got = artifacts.resolve_artifacts([str(outside)], str(root), [], 1024)
+    assert got == []
+
+
+def test_reject_in_root_symlink_resolving_outside(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    target = _write(tmp_path / "outside" / "secret.log")
+    link = root / "link.log"
+    link.symlink_to(target)
+    # resolve() follows the symlink → outside root → rejected.
+    got = artifacts.resolve_artifacts(["link.log"], str(root), [], 1024)
+    assert got == []
+
+
+def test_resolve_single_reasons(tmp_path: Path) -> None:
+    _write(tmp_path / "ok.md")
+    art, reason = artifacts.resolve_single("ok.md", str(tmp_path), [], 1024)
+    assert art is not None and reason is None
+    _art, reason = artifacts.resolve_single("nope.md", str(tmp_path), [], 1024)
+    assert _art is None and reason and "not found" in reason.lower()
+    _art, reason = artifacts.resolve_single("../up.md", str(tmp_path / "r"), [], 1024)
+    assert _art is None and reason is not None
+    _write(tmp_path / "huge.pdf", b"z" * 4096)
+    _art, reason = artifacts.resolve_single("huge.pdf", str(tmp_path), [], 1024)
+    assert _art is None and reason and "large" in reason.lower()
+    _art, reason = artifacts.resolve_single("x.md", "", [], 1024)
+    assert _art is None and reason is not None
+
+
+# ── open_validated_artifact (§A.4) ────────────────────────────────────────
+
+
+def test_open_validated_happy_path(tmp_path: Path) -> None:
+    f = _write(tmp_path / "doc.pdf", b"PDFDATA")
+    res = artifacts.open_validated_artifact(
+        str(f.resolve()), (str(tmp_path.resolve()),), 1024
+    )
+    assert res.file is not None and res.reason is None
+    try:
+        assert res.size == 7
+        assert res.file.read() == b"PDFDATA"
+    finally:
+        res.file.close()
+
+
+def test_open_rejects_outside_pinned_roots(tmp_path: Path) -> None:
+    f = _write(tmp_path / "doc.pdf")
+    res = artifacts.open_validated_artifact(
+        str(f.resolve()), (str((tmp_path / "elsewhere").resolve()),), 1024
+    )
+    assert res.file is None and res.reason is not None
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW"), reason="O_NOFOLLOW unavailable on this platform"
+)
+def test_open_refuses_final_component_symlink(tmp_path: Path) -> None:
+    target = _write(tmp_path / "real.md", b"data")
+    link = tmp_path / "link.md"
+    link.symlink_to(target)
+    # A final-component symlink (swapped in after validation) → O_NOFOLLOW fails.
+    res = artifacts.open_validated_artifact(str(link), (str(tmp_path.resolve()),), 1024)
+    assert res.file is None and res.reason is not None
+
+
+def test_open_enforces_size_on_fd(tmp_path: Path) -> None:
+    f = _write(tmp_path / "big.zip", b"y" * 4096)
+    res = artifacts.open_validated_artifact(
+        str(f.resolve()), (str(tmp_path.resolve()),), 1024
+    )
+    assert res.file is None and res.reason is not None
+
+
+# ── Registry state machine + offer-dedup + TTL (§A.5) ─────────────────────
+
+
+def _art(path: str = "/repo/a.png", name: str = "a.png") -> artifacts.Artifact:
+    return artifacts.Artifact(
+        resolved_path=path, display_name=name, size=10, allowed_roots=("/repo",)
+    )
+
+
+def test_mint_and_lookup_roundtrip() -> None:
+    route = (12345, 42, "@7")
+    card = artifacts.mint(route, [_art()])
+    assert card is not None and len(card.rows) == 1
+    label, cb = card.rows[0]
+    assert label == "a.png" and cb.startswith(f"{CB_DOWNLOAD_FILE}@7:")
+    token = cb.split(":")[-1]
+    row = artifacts.lookup(token)
+    assert row is not None
+    assert (row.owner_id, row.thread_id, row.window_id) == (12345, 42, "@7")
+    assert row.resolved_path == "/repo/a.png"
+    assert row.pinned_roots == ("/repo",)
+    assert row.state == "live"
+
+
+def test_mint_offer_dedup_suppresses_repeat() -> None:
+    route = (1, 2, "@3")
+    assert artifacts.mint(route, [_art()]) is not None
+    # Same file on the same route within the TTL → nothing fresh → None.
+    assert artifacts.mint(route, [_art()]) is None
+
+
+def test_mint_button_cap_and_overflow() -> None:
+    route = (1, 2, "@3")
+    many = [_art(f"/repo/f{i}.png", f"f{i}.png") for i in range(8)]
+    card = artifacts.mint(route, many)
+    assert card is not None
+    assert len(card.rows) == 6
+    assert card.overflow == 2
+
+
+def test_begin_finish_send_single_flight_not_single_use() -> None:
+    route = (1, 2, "@3")
+    card = artifacts.mint(route, [_art()])
+    assert card is not None
+    token = card.rows[0][1].split(":")[-1]
+    assert artifacts.begin_send(token) is True
+    # Concurrent second tap blocked while in flight.
+    assert artifacts.begin_send(token) is False
+    # A completed upload returns to live (a re-tap re-uploads — single-FLIGHT).
+    artifacts.finish_send(token, True)
+    assert artifacts.lookup(token).state == "live"  # type: ignore[union-attr]
+    assert artifacts.begin_send(token) is True
+    artifacts.finish_send(token, False)
+    assert artifacts.begin_send(token) is True
+
+
+def test_token_ttl_expires_lookup() -> None:
+    route = (1, 2, "@3")
+    card = artifacts.mint(route, [_art()])
+    token = card.rows[0][1].split(":")[-1]  # type: ignore[union-attr]
+    row = artifacts._rows[token]
+    row.created = time.monotonic() - artifacts._TOKEN_TTL_S - 1
+    assert artifacts.lookup(token) is None
+
+
+def test_offer_dedup_ttl_allows_reoffer_after_expiry() -> None:
+    route = (1, 2, "@3")
+    assert artifacts.mint(route, [_art()]) is not None
+    # Age the dedup entry past its TTL → the file is offerable again.
+    for k in list(artifacts._offer_dedup):
+        artifacts._offer_dedup[k] = time.monotonic() - artifacts.OFFER_DEDUP_TTL_S - 1
+    assert artifacts.mint(route, [_art()]) is not None
+
+
+def test_invalidate_window_scoped() -> None:
+    card_a = artifacts.mint((1, 2, "@7"), [_art()])
+    card_b = artifacts.mint((1, 2, "@8"), [_art("/repo/b.png", "b.png")])
+    tok_a = card_a.rows[0][1].split(":")[-1]  # type: ignore[union-attr]
+    tok_b = card_b.rows[0][1].split(":")[-1]  # type: ignore[union-attr]
+    artifacts.invalidate_window("@7")
+    assert artifacts.lookup(tok_a) is None
+    assert artifacts.lookup(tok_b) is not None
+
+
+def test_invalidate_topic_scoped() -> None:
+    card_a = artifacts.mint((1, 2, "@7"), [_art()])
+    card_b = artifacts.mint((1, 3, "@7"), [_art("/repo/b.png", "b.png")])
+    tok_a = card_a.rows[0][1].split(":")[-1]  # type: ignore[union-attr]
+    tok_b = card_b.rows[0][1].split(":")[-1]  # type: ignore[union-attr]
+    artifacts.invalidate_topic(1, 2)
+    assert artifacts.lookup(tok_a) is None
+    assert artifacts.lookup(tok_b) is not None
+
+
+def test_callback_data_under_64_bytes() -> None:
+    card = artifacts.mint((1, 2, "@123456"), [_art()])
+    assert card is not None
+    for _label, cb in card.rows:
+        assert len(cb.encode("utf-8")) <= 64
+
+
+def test_card_text_shape() -> None:
+    text = artifacts.card_text(["a.png", "b.pdf"], overflow=3)
+    assert text.splitlines() == [
+        "📎 Files mentioned — tap to download:",
+        "• a.png",
+        "• b.pdf",
+        "…and 3 more — use /file <path>",
+    ]

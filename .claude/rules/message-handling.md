@@ -1239,6 +1239,76 @@ text-only; EPM 60s behavior is unobserved → ExitPlanMode is OUT of scope;
 labels are clipped to 64 chars on buttons AND in the correction message.
 Pull-only throughout; no observer (c313657 stays forbidden).
 
+## Artifact delivery lane (📎 tap-to-download + `/file`)
+
+Parent-route assistant PROSE that names a deliverable local file
+(`report.md` / `chart.png` / … in `artifacts.ARTIFACT_EXTS`) gets a compact
+`📎` follow-up card with one `dlf:<window_id>:<token>` button per file; a tap
+uploads that file to the topic as a Telegram document. `/file <path>` is the
+durable escape hatch.
+
+**Detection seam (`bot._maybe_offer_artifacts`).** Runs at the parent
+assistant-text block (`msg.role=="assistant" and msg.content_type=="text" and
+msg.subagent_key is None`), gated on the per-recipient `prefs.artifact_card`
+(preset-only knob; `quiet=off`). NO detection in tool_results / Bash output /
+thinking / sidechain narration / web URLs (the anti-spam core — tool output is
+full of incidental paths). cwd comes from the window state (empty ⇒ skip,
+fail-closed); `max_bytes` + extra roots are read from `config` at the callsite
+and INJECTED into the config-free `artifacts` leaf. **Ordering:** the card is
+`enqueue_artifact_card`-ed STRICTLY AFTER the block's `enqueue_content_message`
+(codex P1-2), so the route FIFO delivers prose → card. Cap 6 buttons/card;
+overflow disclosed in the card text (`…and N more — use /file <path>`).
+
+**Validation + validated-fd upload (`handlers/artifacts.py` leaf).**
+`resolve_artifacts` / `resolve_single`: expanduser → cwd-join a relative
+candidate → `Path.resolve()` (FOLLOWS symlinks — an in-cwd symlink pointing
+outside RESOLVES outside and fails containment) → MUST be `is_relative_to` a
+RESOLVED allowed root (cwd + `CC_TELEGRAM_ARTIFACT_ROOTS`; empty cwd contributes
+no root — fail-closed) → regular file + `st_size <= max_bytes`. The card path
+drops rejections silently; `/file` surfaces the specific reason (not found /
+outside roots / too large [states the cap] / no working directory). The SEND
+closes the TOCTOU hole: `open_validated_artifact` re-checks containment against
+the roots **PINNED in the registry row at mint time** (codex r2 P2-1 — never a
+recomputed, mutable `WindowState.cwd`), `os.open(path, O_RDONLY |
+getattr(os,"O_NOFOLLOW",0))` (a final-component symlink swapped in after
+validation → open FAILS), `os.fstat` → `S_ISREG` + size ON THE FD, and passes
+THAT open file object to `message_sender.send_document` — the pathname is NEVER
+re-opened. `send_document` returns `(ok, reason)` and RE-RAISES `RetryAfter`
+(the executor handles it). Disclosed residual: an intermediate-DIRECTORY symlink
+swap between resolve and open is not covered by `O_NOFOLLOW` — accepted on a
+single-owner box; the fstat still guarantees regular-file + size.
+
+**Token registry + card task.** In-memory `dlf:` tokens, single-FLIGHT not
+single-use (`begin_send` gates concurrent taps; `finish_send(ok)` returns the
+row to `live` either way — a re-tap re-uploads the current bytes, benign +
+serialized). A row PINS the resolved path + the resolved allowed roots. Offer-
+dedup keyed `(route, resolved_path)` (30 min) makes a mid-turn repeat cheap;
+24h lazy token TTL. The card rides a `message_queue` `artifact_card` control
+task (route-FIFO, `_RETRYABLE_TASK_TYPES`) sent `plain=True` (no MarkdownV2
+escaping of paths) with the rows wrapped into an `InlineKeyboardMarkup` in
+`message_queue` (the leaf never imports telegram).
+
+**Executor (`callback_dispatcher/artifacts.py`).** `aql:`-style guard order:
+lookup (None → graceful "expired — use /file" modal) → owner check → stale-
+window (payload/registry parity + lease + live-window existence) → single-
+FLIGHT `begin_send` → **ANSWER THE CALLBACK FIRST** ("Uploading <name>…", since
+an upload can exceed the callback-answer deadline) → `open_validated_artifact`
+→ `send_document(open fd)` → success `finish_send(True)` / failure
+`finish_send(False)` + in-topic `❌ Upload failed: <reason>` / RetryAfter
+`finish_send(False)` + "Rate-limited — tap again shortly."; the fd is closed in
+a `finally`.
+
+**Teardown.** `artifacts.invalidate_topic(owner, thread)` in
+`cleanup.clear_topic_state` (the COVERING seam — topic close/delete + the
+status-poller window-gone path all route through it), topic-keyed (mirrors
+`late_answer.invalidate_topic`); `artifacts.invalidate_window(window_id)` at the
+four `inbound_telegram` stale-window unbinds (beside `decision_token.teardown_route`).
+`forget_ask_tool_input` is deliberately NOT a seam (AUQ-specific); `/clear` and
+session rotation deliberately do NOT invalidate (tokens are path-anchored, cwd
+survives rotation, and SEND-TIME revalidation is the real guard). Restart wipes
+the registry (a dead button answers the expired modal; the card text + `/file`
+cover it). Pull-only throughout; no observer (c313657 stays forbidden).
+
 ## MessageDisplay live-prose capture (Bug 2)
 
 Assistant free-text prose written in the same turn as an `AskUserQuestion` /

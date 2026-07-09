@@ -209,6 +209,38 @@ class Config:
             "CC_TELEGRAM_DECISION_DISPATCH", ""
         ).strip().lower() in ("1", "true", "yes", "on")
 
+        # Artifact delivery lane (handlers/artifacts.py). When Claude's prose
+        # mentions a deliverable local file, the bot offers a 📎 tap-to-download
+        # card; ``/file <path>`` is the durable escape hatch. config OWNS these
+        # canonical declarations for the README sync rule; the values are
+        # INJECTED into the config-free ``artifacts`` leaf at the callsites.
+        #
+        # Upload size cap in MB (Telegram's bot upload hard cap is 50 MB);
+        # int-with-fallback parse.
+        try:
+            _artifact_max_mb = int(os.getenv("CC_TELEGRAM_ARTIFACT_MAX_MB", "45"))
+        except ValueError:
+            _artifact_max_mb = 45
+        self.artifact_max_bytes: int = _artifact_max_mb * 1024 * 1024
+        # Comma-separated EXTRA ABSOLUTE allowed roots beyond the session cwd
+        # (e.g. a scratchpad dir). RELATIVE entries are IGNORED with a WARNING —
+        # absolute paths only, never resolved against the bot's launch cwd.
+        self.artifact_roots: list[str] = []
+        for _entry in os.getenv("CC_TELEGRAM_ARTIFACT_ROOTS", "").split(","):
+            _entry = _entry.strip()
+            if not _entry:
+                continue
+            _expanded = os.path.expanduser(_entry)
+            if not os.path.isabs(_expanded):
+                logger.warning(
+                    "CC_TELEGRAM_ARTIFACT_ROOTS entry %r is not absolute — "
+                    "ignored (absolute paths only; never resolved against the "
+                    "bot's launch cwd)",
+                    _entry,
+                )
+                continue
+            self.artifact_roots.append(_expanded)
+
         # Max length of the per-tool input string surfaced in tool_use summary
         # lines (e.g. "**Bash**(<command>)", "**Read**(<path>)"). Long inputs
         # are truncated with a "…" marker. Default 40 keeps the activity feed

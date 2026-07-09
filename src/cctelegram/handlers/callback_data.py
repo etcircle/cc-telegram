@@ -64,6 +64,12 @@ CB_ASK_LATE = "aql:"  # aql:<window_id>:<opt>:<token>
 # cross-lane collision). Resolved server-side via the in-memory
 # handlers/decision_token store; dispatch navigates→verifies→Enter the live pane.
 CB_DECISION_PICK = "dcp:"  # dcp:<route_hash>:<fp8>:<opt>:<token>
+# Artifact delivery lane: a 📎 card's option buttons upload a deliverable local
+# file (report.md / chart.png / …) mentioned in Claude's prose to the topic as a
+# Telegram document. The token resolves server-side to the in-memory
+# handlers/artifacts registry row (PINNED resolved path + allowed roots);
+# ``dlf:<window_id>:<token>`` ≈ 22 bytes ≪ 64 (checked_callback_data enforces).
+CB_DOWNLOAD_FILE = "dlf:"  # dlf:<window_id>:<token>
 
 # Session picker (resume existing session)
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>

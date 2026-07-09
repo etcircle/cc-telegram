@@ -71,6 +71,7 @@ def build_settings_keyboard(prefs: OutputPrefs, owner_id: int) -> InlineKeyboard
 
     echo_flip = "off" if prefs.user_echo else "on"
     footer_flip = "off" if prefs.context_footer else "on"
+    artifacts_flip = "off" if prefs.artifact_card else "on"
     return InlineKeyboardMarkup(
         [
             [preset_btn("verbose"), preset_btn("standard")],
@@ -99,6 +100,12 @@ def build_settings_keyboard(prefs: OutputPrefs, owner_id: int) -> InlineKeyboard
                     footer_flip,
                     owner_id,
                 ),
+                _btn(
+                    f"📎 Files: {'on' if prefs.artifact_card else 'off'}",
+                    "artifacts",
+                    artifacts_flip,
+                    owner_id,
+                ),
             ],
         ]
     )
@@ -113,7 +120,8 @@ def render_settings_text(prefs: OutputPrefs) -> str:
         f"live lines: {prefs.digest_live_lines}",
         f"Done card: {prefs.digest_on_done} · sub-agent cards: {prefs.subagent_cards}",
         f"👤 Echo: {'on' if prefs.user_echo else 'off'} · "
-        f"📊 Footer: {'on' if prefs.context_footer else 'off'}",
+        f"📊 Footer: {'on' if prefs.context_footer else 'off'} · "
+        f"📎 Files: {'on' if prefs.artifact_card else 'off'}",
         "",
         "Applies to messages this bot sends *to you*, in every topic.",
     ]

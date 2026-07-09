@@ -27,6 +27,7 @@ from cctelegram.handlers.callback_data import (
     CB_ASK_TOGGLE,
     CB_ASK_UP,
     CB_DECISION_PICK,
+    CB_DOWNLOAD_FILE,
     CB_DIR_BIND_EXISTING,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
@@ -268,6 +269,14 @@ CALLBACK_REGISTRY: tuple[CallbackRegistryEntry, ...] = (
         "cctelegram.callback_dispatcher.interactive",
         "tests/scenarios/test_decision_dispatch.py",
         "execute_interactive_callback",
+    ),
+    CallbackRegistryEntry(
+        CB_DOWNLOAD_FILE,
+        "DownloadFileCommand",
+        "cctelegram.handlers.artifacts",
+        "cctelegram.callback_dispatcher.artifacts",
+        "tests/scenarios/test_artifact_card.py",
+        "execute_download_file_callback",
     ),
     CallbackRegistryEntry(
         CB_SESSION_SELECT,

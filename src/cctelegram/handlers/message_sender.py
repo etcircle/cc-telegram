@@ -202,6 +202,46 @@ async def send_photo(
         logger.error("Failed to send photo to %d: %s", chat_id, e)
 
 
+def _document_error_reason(exc: BaseException) -> str:
+    """A short, user-facing reason for a failed document upload."""
+    msg = str(exc).strip()
+    return msg[:200] if msg else "the upload was rejected"
+
+
+async def send_document(
+    bot: Bot,
+    chat_id: int,
+    document: Any,
+    *,
+    filename: str,
+    message_thread_id: int | None = None,
+    disable_notification: bool = True,
+    **kwargs: Any,
+) -> tuple[bool, str | None]:
+    """Upload an OPEN binary file object as a Telegram document.
+
+    Never takes a pathname — the caller opens the fd through
+    ``artifacts.open_validated_artifact`` and owns the ``finally: close`` (the
+    TOCTOU contract). Returns ``(ok, reason)``: ``RetryAfter`` is RE-RAISED (the
+    caller handles rate limiting), every OTHER Telegram failure is
+    classified/logged AND surfaced as ``(False, reason)`` so the caller can post
+    an in-topic failure notice (never ``send_photo``'s silent log-and-swallow).
+    """
+    if message_thread_id is not None:
+        kwargs.setdefault("message_thread_id", message_thread_id)
+    kwargs.setdefault("disable_notification", disable_notification)
+    try:
+        await bot.send_document(
+            chat_id=chat_id, document=document, filename=filename, **kwargs
+        )
+        return True, None
+    except RetryAfter:
+        raise
+    except Exception as exc:
+        logger.error("Failed to send document to %d: %s", chat_id, exc)
+        return False, _document_error_reason(exc)
+
+
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
     """Reply with formatting, falling back to plain text on failure."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
