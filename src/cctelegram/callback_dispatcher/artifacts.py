@@ -125,11 +125,23 @@ async def execute_download_file_callback(authorized: Any, adapters: Any) -> None
             )
         except RetryAfter:
             # send_document re-raises RetryAfter; the download lane handles it
-            # gracefully (a re-tap re-uploads — single-FLIGHT).
+            # gracefully (a re-tap re-uploads — single-FLIGHT). The in-topic
+            # notice is BEST-EFFORT: safe_send itself re-raises RetryAfter, and
+            # this lane must never depend on PTB's error handler (fold item 3 —
+            # codex P3-1).
             artifacts.finish_send(token, False)
-            await safe_send(
-                bot, chat_id, RATE_LIMITED_TEXT, message_thread_id=thread_id
-            )
+            try:
+                await safe_send(
+                    bot, chat_id, RATE_LIMITED_TEXT, message_thread_id=thread_id
+                )
+            except RetryAfter as notice_exc:
+                logger.warning(
+                    "artifact rate-limit notice itself rate-limited "
+                    "(chat=%s thread=%s): %s",
+                    chat_id,
+                    thread_id,
+                    notice_exc,
+                )
             return
     finally:
         try:

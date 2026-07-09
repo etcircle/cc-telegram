@@ -241,11 +241,21 @@ async def test_file_command_happy_path(
     )
     await bot_module.file_command(update, scenario.context)
 
-    # reply_document auto-targets the same topic (thread) as the command.
+    # [fold item 5 — codex P3-2] assert the ACTUAL reply target, not just the
+    # command update's thread id: delivery is the reply_document bound to the
+    # command's own Message (PTB reply_* auto-inherits chat + thread for topic
+    # messages), so the replied-to message's coordinates ARE the destination —
+    # and no stray bot-level send_document targets anything else.
     assert update.message.reply_document.await_count == 1
     kw = update.message.reply_document.await_args.kwargs
     assert kw["filename"] == "deck.pdf"
-    assert update.message.message_thread_id == _THREAD_ID
+    replied_to = update.message
+    assert replied_to.chat_id == scenario.chat_id
+    assert replied_to.message_thread_id == _THREAD_ID
+    assert replied_to.is_topic_message is True
+    assert [s for s in scenario.bot.sent if s.method == "send_document"] == [], (
+        "/file must deliver via the reply seam, never a raw bot send"
+    )
 
 
 @pytest.mark.asyncio

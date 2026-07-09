@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -42,10 +43,53 @@ def _reset() -> None:
         ("Placed at temp/report.md today", ["temp/report.md"]),
         ("Tailing /var/log/app.log now", ["/var/log/app.log"]),
         ("A deep one: a/b/c/deck.pptx.", ["a/b/c/deck.pptx"]),
+        # Legit trailing-punctuation pins — MUST survive the fold-item-1
+        # right-boundary tightening (sentence-final period is in the shapes
+        # above; comma / colon / quotes pinned here).
+        ("Check report.md, then continue", ["report.md"]),
+        ("Next file: report.md: all done", ["report.md"]),
+        ('Open "report.md" now', ["report.md"]),
     ],
 )
 def test_extract_shapes(text: str, expected: list[str]) -> None:
     assert artifacts.extract_artifact_candidates(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "backup at foo.pdf.bak here",
+        "old copy report.md.old kept",
+        "inside foo.pdf/assets today",
+        "versioned report.pdf-v2 saved",
+        "see foo.md#anchor now",
+        "get foo.md?download=1 there",
+    ],
+)
+def test_extract_rejects_continued_tokens(text: str) -> None:
+    """[fold item 1 — hermes P1 / codex P2-1, converged] a matched extension
+    must genuinely END the token: prose mentioning `secrets.json.bak` must
+    never mint a tappable card claiming `secrets.json` — the card would lie
+    about what was mentioned. Reject when the next characters CONTINUE the
+    token: any word char, `/`, `~`, or `.`/`-`/`?`/`#` immediately followed
+    by a word char."""
+    assert artifacts.extract_artifact_candidates(text) == []
+
+
+def test_extract_bare_domain_documented_behavior() -> None:
+    """[fold item 1] a BARE domain (`example.com/report.pdf`, no scheme) is
+    string-indistinguishable from a bare-relative path, so it IS extracted —
+    but always as the WHOLE token (never a truncated `report.pdf`); the
+    resolve-against-cwd step then fail-closes on nonexistence, so no card is
+    ever offered for it. Scheme-ful URLs (`https://…`) never match at all —
+    the left boundary rejects every mid-token start after `://`."""
+    assert artifacts.extract_artifact_candidates("see example.com/report.pdf now") == [
+        "example.com/report.pdf"
+    ]
+    assert (
+        artifacts.extract_artifact_candidates("at https://example.com/report.pdf now")
+        == []
+    )
 
 
 def test_extract_rejects_non_allowlisted_and_mdx_guard() -> None:
@@ -212,6 +256,35 @@ def test_open_enforces_size_on_fd(tmp_path: Path) -> None:
     assert res.file is None and res.reason is not None
 
 
+def test_open_fdopen_failure_closes_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[fold item 4 — hermes P3-1] a raise from ``os.fdopen`` must not leak the
+    validated fd — the helper closes it and returns the error shape."""
+    f = _write(tmp_path / "doc.pdf", b"x")
+    opened_fds: list[int] = []
+    real_open = os.open
+
+    def spy_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, flags, *args, **kwargs)
+        opened_fds.append(fd)
+        return fd
+
+    def fdopen_raises(*_args: Any, **_kwargs: Any) -> Any:
+        raise MemoryError("fdopen boom")
+
+    monkeypatch.setattr(artifacts.os, "open", spy_open)
+    monkeypatch.setattr(artifacts.os, "fdopen", fdopen_raises)
+    res = artifacts.open_validated_artifact(
+        str(f.resolve()), (str(tmp_path.resolve()),), 1024
+    )
+    assert res.file is None and res.reason is not None
+    assert opened_fds, "the spy must have observed the validated open"
+    # The fd must be CLOSED — fstat on a closed fd raises.
+    with pytest.raises(OSError):
+        os.fstat(opened_fds[-1])
+
+
 # ── Registry state machine + offer-dedup + TTL (§A.5) ─────────────────────
 
 
@@ -311,6 +384,25 @@ def test_callback_data_under_64_bytes() -> None:
     assert card is not None
     for _label, cb in card.rows:
         assert len(cb.encode("utf-8")) <= 64
+
+
+def test_mint_clips_long_button_labels_keeps_tail() -> None:
+    """[fold item 2 — codex P2-2 / hermes P2-1] button labels are clipped to
+    ≤64 chars, prefix-ellipsized (the FILENAME tail is the discriminating
+    part); the card BODY keeps the FULL path (the /file restart fallback)."""
+    long_name = "very/deeply/nested/" * 4 + "final-quarterly-report-2026.pdf"
+    assert len(long_name) > 64
+    card = artifacts.mint((1, 2, "@3"), [_art("/repo/" + long_name, long_name)])
+    assert card is not None
+    label, _cb = card.rows[0]
+    assert len(label) <= 64
+    assert label.startswith("…")
+    assert label.endswith("final-quarterly-report-2026.pdf")
+    # The card body lists the FULL display name, unclipped.
+    assert card.names == [long_name]
+    # A short label passes through untouched.
+    card2 = artifacts.mint((1, 2, "@4"), [_art("/repo/a.png", "a.png")])
+    assert card2 is not None and card2.rows[0][0] == "a.png"
 
 
 def test_card_text_shape() -> None:

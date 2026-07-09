@@ -39,10 +39,15 @@ class _FakeQuery:
 
 
 class _FakeBot:
-    def __init__(self, doc_exc: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        doc_exc: BaseException | None = None,
+        msg_exc: BaseException | None = None,
+    ) -> None:
         self.documents: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
         self.doc_exc = doc_exc
+        self.msg_exc = msg_exc
 
     async def send_document(
         self, *, chat_id: int, document: Any, filename: str, **kw: Any
@@ -60,6 +65,8 @@ class _FakeBot:
         return SimpleNamespace(message_id=1)
 
     async def send_message(self, *, chat_id: int, text: str, **kw: Any) -> Any:
+        if self.msg_exc is not None:
+            raise self.msg_exc
         self.messages.append({"chat_id": chat_id, "text": text, **kw})
         return SimpleNamespace(message_id=2)
 
@@ -254,6 +261,29 @@ async def test_retry_after_resets_row_and_notifies(tmp_path: Any) -> None:
     assert bot.documents == []
     assert any("rate" in m["text"].lower() for m in bot.messages)
     assert artifacts.lookup(token).state == "live"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_notice_itself_rate_limited_never_raises(
+    tmp_path: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """[fold item 3 — codex P3-1] the in-topic rate-limit notice can itself
+    raise RetryAfter (safe_send re-raises it); the executor swallows + logs it
+    best-effort — this lane never depends on PTB's error handler."""
+    import logging
+
+    token, _f = _seed_row(tmp_path)
+    query = _FakeQuery(f"{CB_DOWNLOAD_FILE}@5:{token}")
+    bot = _FakeBot(doc_exc=RetryAfter(3), msg_exc=RetryAfter(3))
+    with caplog.at_level(
+        logging.WARNING, logger="cctelegram.callback_dispatcher.artifacts"
+    ):
+        await artifacts_exec.execute_download_file_callback(
+            _authorized(query, 1, 10), _adapters(bot)
+        )
+    assert bot.documents == [] and bot.messages == []
+    assert artifacts.lookup(token).state == "live"  # type: ignore[union-attr]
+    assert any("rate-limit notice" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio

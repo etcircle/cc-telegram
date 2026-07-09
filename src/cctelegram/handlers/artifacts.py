@@ -76,11 +76,22 @@ ARTIFACT_EXTS: frozenset[str] = frozenset(
 # ``a/b.jsonl``) never matches. Backticks / parens / markdown-link ``(…)``
 # targets / trailing sentence punctuation all fall outside the char class, so
 # they are stripped naturally by the boundaries.
+#
+# RIGHT boundary (fold item 1 — hermes P1 / codex P2-1, converged): the matched
+# extension must genuinely END the token — reject when the next characters
+# CONTINUE it: any word char (the ``.mdx`` guard), ``/`` or ``~`` (a deeper
+# path / editor-backup continuation: ``foo.pdf/assets``), or
+# ``.``/``-``/``?``/``#`` immediately followed by a word char
+# (``foo.pdf.bak``, ``report.pdf-v2``, ``foo.md?download=1``, ``foo.md#anchor``
+# — prose mentioning ``secrets.json.bak`` must never mint a card claiming
+# ``secrets.json``). Legit trailing punctuation still matches: a sentence-final
+# ``report.md.`` / ``report.md,`` / ``(report.md)`` / ``"report.md"`` all have
+# NO word char after the punctuation.
 _EXT_ALTERNATION = "|".join(sorted(ARTIFACT_EXTS, key=len, reverse=True))
 _CANDIDATE_RE = re.compile(
     r"(?<![\w~./\-])"  # left boundary: not mid-token
     r"((?:~|\.{1,2})?/?(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _EXT_ALTERNATION + r"))"
-    r"(?![\w])",  # right boundary: ext not followed by a word char (.mdx guard)
+    r"(?![\w/~])(?![.\-?#]\w)",  # right boundary: the token must END here
     re.IGNORECASE,
 )
 # Guard against a pathological token (a giant no-space run) — well beyond any
@@ -303,7 +314,15 @@ def open_validated_artifact(
         return OpenResult(
             file=None, size=0, reason=f"file too large (over the {cap_mb:.0f} MB cap)"
         )
-    return OpenResult(file=os.fdopen(fd, "rb"), size=st.st_size, reason=None)
+    try:
+        file_obj = os.fdopen(fd, "rb")
+    except Exception:
+        # fdopen failing leaves the raw fd UNCONSUMED — close it here or the
+        # validated fd leaks for the process lifetime (fold item 4 — hermes
+        # P3-1; this is the security-sensitive fd contract, keep it airtight).
+        os.close(fd)
+        return OpenResult(file=None, size=0, reason="could not open the file")
+    return OpenResult(file=file_obj, size=st.st_size, reason=None)
 
 
 # ── Card text (§C body) ───────────────────────────────────────────────────
@@ -332,8 +351,21 @@ STATE_IN_FLIGHT = "in_flight"
 # dlf:<window_id>:<token> ≈ 22 bytes ≪ 64 (checked_callback_data enforces).
 _TOKEN_BYTES = 9
 _MAX_BUTTONS_PER_CARD = 6
+_BUTTON_LABEL_MAX_CHARS = 64
 OFFER_DEDUP_TTL_S = 30 * 60.0  # a re-mention of the same file within 30 min is cheap
 _TOKEN_TTL_S = 24 * 60 * 60.0  # lazy token TTL
+
+
+def clip_label(label: str) -> str:
+    """Clip a BUTTON label to ≤64 chars, keeping the TAIL (fold item 2 — codex
+    P2-2 / hermes P2-1). Telegram may reject the whole keyboard on an over-long
+    label AFTER the tokens were minted and the offer-dedup marked, so the clip
+    happens at mint. The filename is the discriminating part of a path, so
+    prefix-ellipsize (``…<tail>``) — the inverse of late_answer's suffix clip.
+    """
+    if len(label) <= _BUTTON_LABEL_MAX_CHARS:
+        return label
+    return "…" + label[-(_BUTTON_LABEL_MAX_CHARS - 1) :]
 
 
 @dataclass
@@ -352,9 +384,14 @@ class ArtifactRow:
 
 @dataclass
 class MintedCard:
-    """The card render inputs: buttoned rows + the count with no button."""
+    """The card render inputs: buttoned rows + body names + the no-button count."""
 
-    rows: list[tuple[str, str]] = field(default_factory=list)  # (label, callback_data)
+    # (button_label, callback_data) — the label is CLIPPED to ≤64 chars.
+    rows: list[tuple[str, str]] = field(default_factory=list)
+    # FULL display names of the buttoned files, UNCLIPPED — the card BODY lists
+    # these (the restart-safe /file fallback needs the real path; only the
+    # button labels are clipped — fold item 2).
+    names: list[str] = field(default_factory=list)
     overflow: int = 0
 
 
@@ -395,6 +432,7 @@ def mint(
         return None
     head = fresh[:max_buttons]
     rows: list[tuple[str, str]] = []
+    names: list[str] = []
     for art in head:
         _offer_dedup[(route, art.resolved_path)] = now
         token = secrets.token_urlsafe(_TOKEN_BYTES)
@@ -409,11 +447,12 @@ def mint(
         )
         rows.append(
             (
-                art.display_name,
+                clip_label(art.display_name),
                 checked_callback_data(f"{CB_DOWNLOAD_FILE}{window_id}:{token}"),
             )
         )
-    return MintedCard(rows=rows, overflow=len(fresh) - len(head))
+        names.append(art.display_name)
+    return MintedCard(rows=rows, names=names, overflow=len(fresh) - len(head))
 
 
 def lookup(token: str) -> ArtifactRow | None:

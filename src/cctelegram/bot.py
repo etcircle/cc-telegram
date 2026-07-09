@@ -1057,9 +1057,9 @@ async def _maybe_offer_artifacts(
     card = artifacts.mint(route, resolved)
     if card is None or not card.rows:
         return
-    body = artifacts.card_text(
-        [label for label, _cb in card.rows], overflow=card.overflow
-    )
+    # The body lists the FULL display names (card.names) — the restart-safe
+    # /file fallback; only the BUTTON labels are clipped (fold item 2).
+    body = artifacts.card_text(card.names, overflow=card.overflow)
     await enqueue_artifact_card(bot, route, body, card.rows)
 
 
