@@ -42,6 +42,9 @@ from ..utils import (
 from ..utils import is_task_notification as is_task_notification
 from ..utils import is_teammate_message as is_teammate_message
 from ..utils import parse_iso_timestamp as parse_iso_timestamp
+from ..utils import (
+    teammate_envelope_payload_regions as teammate_envelope_payload_regions,
+)
 
 
 # The async-launch background discriminator (GH #44 §3.2a). Anchored on the
@@ -290,53 +293,53 @@ class TeammateIdle:
     park_ts_unparseable: bool
 
 
-def parse_teammate_idle_notification(text: str) -> TeammateIdle | None:
-    """Strict-or-None parse of a teammate ``idle_notification`` envelope (GH #46).
+def parse_teammate_idle_notifications(text: str) -> list[TeammateIdle]:
+    """Strict parse of EVERY teammate ``idle_notification`` in ``text`` (GH #46).
 
-    Gates on ``is_teammate_message`` first (the byte-0-anchored envelope
-    predicate). Extracts the inner payload from WITHIN the FIRST envelope only —
-    the region between the opening tag's closing ``>`` and the first
-    ``</teammate-message>``, bounded by the same 64 KiB scan bound — takes the
-    substring from the first ``{`` to the last ``}`` in that region, and
-    ``json.loads`` it (any exception ⇒ ``None``). Requires ``type ==
-    "idle_notification"`` and a non-empty str ``from`` (⇒ ``name``); every other
-    shape returns ``None``. ``park_ts`` is the parsed ``timestamp`` (``None`` when
-    missing/unparseable); ``park_ts_unparseable`` mirrors ``park_ts is None`` so a
-    None stamp fails closed to an unconditional done downstream.
+    One parent user entry can carry MULTIPLE ``<teammate-message>`` envelopes
+    (real-data verified — the 2026-07-09T15:56:55.336Z entry carries two, and
+    the SECOND names the teammate whose leg has no other close signal; review
+    P1), so this enumerates every structurally-valid envelope via the shared
+    ``utils.teammate_envelope_payload_regions`` scanner (the SAME structural
+    judgment as ``is_teammate_message`` — review P2) and returns one
+    ``TeammateIdle`` per envelope whose inner payload parses as an idle
+    notification, in envelope order. Per envelope: take the substring from the
+    first ``{`` to the last ``}`` inside the payload region, ``json.loads`` it
+    (any failure ⇒ skip), require ``type == "idle_notification"`` and a
+    non-empty str ``from`` (⇒ ``name``). ``park_ts`` is the parsed
+    ``timestamp`` (``None`` when missing/unparseable); ``park_ts_unparseable``
+    mirrors ``park_ts is None`` so a None stamp fails closed to an
+    unconditional done downstream. Non-idle teammate envelopes (reports etc.)
+    contribute nothing — the predicate still classifies the ENTRY
+    machine-initiated; only parks come from here.
     """
-    if not is_teammate_message(text):
-        return None
-    prefix = text[:TEAMMATE_ENVELOPE_SCAN_BYTES]
-    open_idx = prefix.find("<teammate-message")
-    if open_idx < 0:
-        return None
-    gt = prefix.find(">", open_idx)
-    if gt < 0:
-        return None
-    close_idx = prefix.find("</teammate-message>", gt)
-    if close_idx < 0:
-        return None
-    region = prefix[gt + 1 : close_idx]
-    j0 = region.find("{")
-    j1 = region.rfind("}")
-    if j0 < 0 or j1 <= j0:
-        return None
-    try:
-        payload = json.loads(region[j0 : j1 + 1])
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("type") != "idle_notification":
-        return None
-    name = payload.get("from")
-    if not isinstance(name, str) or not name:
-        return None
-    ts_raw = payload.get("timestamp")
-    park_ts = parse_iso_timestamp(ts_raw) if isinstance(ts_raw, str) else None
-    # Fail-closed: any None stamp (missing OR unparseable) marks the park
-    # unparseable so the TEAMMATE done tombstones unconditionally.
-    return TeammateIdle(name=name, park_ts=park_ts, park_ts_unparseable=park_ts is None)
+    out: list[TeammateIdle] = []
+    for region in teammate_envelope_payload_regions(text):
+        j0 = region.find(b"{")
+        j1 = region.rfind(b"}")
+        if j0 < 0 or j1 <= j0:
+            continue
+        try:
+            payload = json.loads(region[j0 : j1 + 1])
+        except (ValueError, TypeError, UnicodeDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") != "idle_notification":
+            continue
+        name = payload.get("from")
+        if not isinstance(name, str) or not name:
+            continue
+        ts_raw = payload.get("timestamp")
+        park_ts = parse_iso_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+        # Fail-closed: any None stamp (missing OR unparseable) marks the park
+        # unparseable so the TEAMMATE done tombstones unconditionally.
+        out.append(
+            TeammateIdle(
+                name=name, park_ts=park_ts, park_ts_unparseable=park_ts is None
+            )
+        )
+    return out
 
 
 def _render_task_notification(text: str) -> str | None:

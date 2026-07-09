@@ -1681,7 +1681,7 @@ _FIXTURES = Path(__file__).parent / "fixtures"
 
 def _teammate_text(idx: int) -> str:
     line = (
-        (_FIXTURES / "teammate_idle_notification_v2.1.204.jsonl")
+        (_FIXTURES / "teammate_idle_notification_v2.1.197.jsonl")
         .read_text()
         .splitlines()[idx]
     )
@@ -1722,6 +1722,56 @@ async def test_teammate_arm_records_park_for_tracked_stem(
     park_ts, unparseable = activity[PARENT].teammate_parks[key]
     assert unparseable is False
     assert park_ts == parse_iso_timestamp(expected_ts_iso)
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_multi_envelope_entry_parks_both_teammates(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """Review P1 (REAL-DATA VERIFIED): ONE parent entry carries TWO envelopes
+    (the live 15:56:55.336Z entry); the SECOND teammate's park is its ONLY
+    close signal (its leg ends stop_reason=None), so dropping it reproduces
+    the 2 h strand. With BOTH stems tracked, BOTH keys must get parks with
+    their OWN per-envelope timestamps."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    _track_stem(monitor, "agent-aexplore-skill-dispatch-23a8cdc461b7635f")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(2), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    parks = monitor.pop_sidechain_activity()[PARENT].teammate_parks
+    k1 = "askill-inventory-1a048f189108dc46"
+    k2 = "aexplore-skill-dispatch-23a8cdc461b7635f"
+    assert set(parks) == {k1, k2}
+    assert parks[k1] == (parse_iso_timestamp("2026-07-09T15:56:41.351Z"), False)
+    assert parks[k2] == (parse_iso_timestamp("2026-07-09T15:56:45.564Z"), False)
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_ignores_nested_workflow_stems(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """hermes P3: the park mapping matches TOP-LEVEL stems only
+    (``sub:<parent>:agent-…``). A nested Fix-5 Workflow display key
+    (``sub:<parent>:<runid>:agent-…``) must NEVER receive a park — a Workflow
+    sub-agent's close is the ``wf-task:`` bracket, not a teammate park."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    monitor.state.update_session(
+        TrackedSession(
+            session_id=f"sub:{PARENT}:wf_r1:agent-askill-inventory-1a048f189108dc46",
+            file_path="/nonexistent-phantom",
+            last_byte_offset=0,
+            parent_session_id=PARENT,
+        )
+    )
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(1), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    parks = activity[PARENT].teammate_parks if PARENT in activity else {}
+    assert parks == {}
 
 
 @pytest.mark.asyncio

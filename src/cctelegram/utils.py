@@ -76,24 +76,74 @@ def extract_task_notification_task_id(text: str) -> str | None:
 
 # The agent-teams teammate ``idle_notification`` envelope (GH #46 PR-1). A
 # teammate's park report lands on the PARENT transcript as a ``type:"user"``
-# text entry that begins with the sentinel line below and wraps a
-# ``<teammate-message …>…</teammate-message>`` envelope. Scan ONLY the first
-# ``TEAMMATE_ENVELOPE_SCAN_BYTES`` bytes for the closing tag — a huge unclosed
-# body must never trigger an unbounded scan; a not-closed-within-bound envelope
-# fails CLOSED to genuine-user (never suppressing a real human turn).
+# text entry that begins with the sentinel line below and wraps one or more
+# ``<teammate-message …>…</teammate-message>`` envelopes. Scan ONLY the first
+# ``TEAMMATE_ENVELOPE_SCAN_BYTES`` UTF-8 BYTES (never a character count — a
+# multi-byte payload must not stretch the bound; review P2a) — a huge unclosed
+# body must never trigger an unbounded scan; an envelope not structurally
+# complete within the bound fails CLOSED to genuine-user (never suppressing a
+# real human turn).
 TEAMMATE_ENVELOPE_SCAN_BYTES = 65536
 
-_TEAMMATE_FIRST_LINE = "Another Claude session sent a message:"
-_TEAMMATE_CLOSE_TAG = "</teammate-message>"
+_TEAMMATE_OPEN_TAG = b"<teammate-message"
+_TEAMMATE_CLOSE_TAG = b"</teammate-message>"
 # Byte-0 anchored: line 1 EXACTLY the sentinel (trailing ``\r`` tolerated for
 # CRLF; a leading BOM/whitespace makes ``\A`` miss → rejected), zero+
 # blank/whitespace-only lines, then a line starting ``<teammate-message`` with a
 # trailing word boundary (``<teammate-message>`` or ``<teammate-message …>``).
 _TEAMMATE_HEAD_RE = re.compile(
-    r"\AAnother Claude session sent a message:\r?\n"
-    r"(?:[^\S\n]*\r?\n)*"
-    r"<teammate-message\b"
+    rb"\AAnother Claude session sent a message:\r?\n"
+    rb"(?:[^\S\n]*\r?\n)*"
+    rb"<teammate-message\b"
 )
+_TEAMMATE_OPEN_RE = re.compile(rb"<teammate-message\b")
+
+
+def teammate_envelope_payload_regions(text: str) -> list[bytes]:
+    """The SINGLE bounded teammate-envelope scanner (GH #46 review P2 —
+    predicate/parser structural parity).
+
+    Returns the inner-payload byte region (between the opening tag's completing
+    ``>`` and the closing ``</teammate-message>``) of EVERY structurally-valid
+    envelope within the first ``TEAMMATE_ENVELOPE_SCAN_BYTES`` UTF-8 bytes, in
+    order; ``[]`` when the byte-0 head anchor misses or no envelope is
+    structurally complete within the bound. Structural validity per envelope:
+    the opening tag COMPLETES (its ``>``) within the bound, and the closing tag
+    occurs strictly AFTER that completion point and completes within the bound —
+    so a close token embedded in the opening tag's quoted attribute text can
+    never satisfy the close (it precedes the tag's ``>``), and a never-completing
+    opening tag yields nothing. Enumeration continues after each close, so ONE
+    parent entry carrying MULTIPLE envelopes (real-data verified) yields every
+    region (review P1). Shared by ``is_teammate_message`` and
+    ``response_builder.parse_teammate_idle_notifications`` so the two can never
+    diverge on structure. Bound math is BYTES: the char pre-slice only caps the
+    encode cost (chars >= 1 byte each), the byte slice enforces the bound;
+    ``errors="replace"`` keeps a lone surrogate from raising (fail-closed to a
+    non-matching byte, never a crash).
+    """
+    if not text:
+        return []
+    data = text[:TEAMMATE_ENVELOPE_SCAN_BYTES].encode("utf-8", errors="replace")[
+        :TEAMMATE_ENVELOPE_SCAN_BYTES
+    ]
+    head = _TEAMMATE_HEAD_RE.match(data)
+    if head is None:
+        return []
+    regions: list[bytes] = []
+    pos = head.end() - len(_TEAMMATE_OPEN_TAG)
+    while True:
+        open_m = _TEAMMATE_OPEN_RE.search(data, pos)
+        if open_m is None:
+            break
+        gt = data.find(b">", open_m.end())
+        if gt < 0:
+            break  # the opening tag never completes within the bound
+        close_idx = data.find(_TEAMMATE_CLOSE_TAG, gt + 1)
+        if close_idx < 0:
+            break  # not closed after tag-completion within the bound — fail closed
+        regions.append(data[gt + 1 : close_idx])
+        pos = close_idx + len(_TEAMMATE_CLOSE_TAG)
+    return regions
 
 
 def is_teammate_message(text: str) -> bool:
@@ -103,16 +153,16 @@ def is_teammate_message(text: str) -> bool:
     delivered to the PARENT as a machine-initiated ``type:"user"`` text entry;
     ``route_runtime`` and the adapter use this predicate to classify it as
     machine-initiated (preserving background-agent tombstones/stash/pane-bit)
-    rather than a genuine user turn. Byte-0 anchored + bounded scan — fail-closed
-    to genuine-user on ANY drift (a longer first line, a leading BOM/space, an
-    envelope not closed within ``TEAMMATE_ENVELOPE_SCAN_BYTES``).
+    rather than a genuine user turn. Defined as "the shared scanner finds at
+    least one structurally-valid envelope" — the SAME
+    ``teammate_envelope_payload_regions`` the payload parser consumes, so the
+    predicate can never stamp text the parser judges structurally invalid
+    (review P2b). Fail-closed to genuine-user on ANY drift: a longer first
+    line, a leading BOM/space, an opening tag that never completes, a close
+    token only inside the opening tag's quoted attributes, or an envelope not
+    closed within the ``TEAMMATE_ENVELOPE_SCAN_BYTES`` BYTE bound.
     """
-    if not text:
-        return False
-    prefix = text[:TEAMMATE_ENVELOPE_SCAN_BYTES]
-    if _TEAMMATE_HEAD_RE.match(prefix) is None:
-        return False
-    return _TEAMMATE_CLOSE_TAG in prefix
+    return bool(teammate_envelope_payload_regions(text))
 
 
 def normalize_background_agent_key(raw: str) -> str:

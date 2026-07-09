@@ -544,9 +544,13 @@ class SessionMonitor:
         hex suffix, 8-32 chars). Resolve the teammate NAME → every tracked stem
         whose normalized key matches ``a<name>-<hex>`` (NO disk glob — we read the
         SAME ``tracked_sessions`` structure the sidechain code populates) and
-        record the park for each. PR-1 closes ALL same-name stems (documented safe
-        degradation — a double-``--resume`` sibling is rare and a park is the
-        agent going idle). Zero matching stems is a no-op (INFO).
+        record the park for each. TOP-LEVEL stems ONLY (hermes P3): a nested
+        Fix-5 Workflow display key is ``sub:<parent>:<runid>:agent-…`` — an
+        extra ``:`` segment — and must NEVER receive a teammate park (a Workflow
+        sub-agent's close is the ``wf-task:`` bracket, and its display key never
+        feeds run-state). PR-1 closes ALL same-name top-level stems (documented
+        safe degradation — a double-``--resume`` sibling is rare and a park is
+        the agent going idle). Zero matching stems is a no-op (INFO).
         """
         pattern = re.compile(r"^a" + re.escape(parked.name) + r"-[0-9a-f]{8,32}$")
         prefix = f"sub:{parent_session_id}:"
@@ -554,7 +558,11 @@ class SessionMonitor:
         for tk in self.state.tracked_sessions:
             if not tk.startswith(prefix):
                 continue
-            stem = tk.rsplit(":", 1)[-1]  # "agent-a<name>-<hex>"
+            stem = tk[len(prefix) :]
+            # Enforce the exact TOP-LEVEL shape sub:<parent>:agent-…: a nested
+            # Workflow key's remainder carries another ":" segment → skip.
+            if ":" in stem or not stem.startswith("agent-"):
+                continue
             key = normalize_background_agent_key(stem)  # "a<name>-<hex>"
             if pattern.match(key):
                 matched.append(key)
@@ -1660,21 +1668,22 @@ class SessionMonitor:
                         and entry.content_type == "text"
                         and entry.text
                     ):
-                        # GH #46 PR-1: an agent-teams teammate ``idle_notification``
-                        # park report. Mutually exclusive with the
+                        # GH #46 PR-1: agent-teams teammate ``idle_notification``
+                        # park reports. Mutually exclusive with the
                         # ``<task-notification>`` arm above (teammate text starts
                         # with "Another Claude session sent a message:", never
-                        # "<task-notification>"). Resolve the teammate name → this
-                        # parent's currently-tracked sidechain stem key(s) and
-                        # record a park close — the ONLY close signal for a teammate
-                        # leg that ends in plain text (no sidechain end-of-turn, no
-                        # ``<task-notification>``).
+                        # "<task-notification>"). ONE entry can carry MULTIPLE
+                        # envelopes (real-data verified — review P1), so EVERY
+                        # parsed idle notification records a park. Resolve each
+                        # teammate name → this parent's currently-tracked
+                        # sidechain stem key(s) — the ONLY close signal for a
+                        # teammate leg that ends in plain text (no sidechain
+                        # end-of-turn, no ``<task-notification>``).
                         from .handlers.response_builder import (
-                            parse_teammate_idle_notification,
+                            parse_teammate_idle_notifications,
                         )
 
-                        parked = parse_teammate_idle_notification(entry.text)
-                        if parked is not None:
+                        for parked in parse_teammate_idle_notifications(entry.text):
                             self._record_teammate_park(session_info.session_id, parked)
 
                     # Lifecycle-only entries exist purely to drive the

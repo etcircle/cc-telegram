@@ -4,15 +4,18 @@ Pins the two leaf primitives that let the bridge tombstone an agent-teams
 teammate's background key when the teammate parks (reports idle) instead of
 stranding typing/Busy for up to 2 h:
 
-  - ``utils.is_teammate_message`` — the byte-0-anchored envelope predicate
-    (line 1 exactly ``Another Claude session sent a message:``, an opening
-    ``<teammate-message`` tag, and a ``</teammate-message>`` close within the
-    64 KiB scan bound). Fail-closed to genuine-user on any drift.
-  - ``response_builder.parse_teammate_idle_notification`` — the strict-or-None
-    inner-payload parser (name + park_ts + park_ts_unparseable).
+  - ``utils.is_teammate_message`` — the byte-0-anchored envelope predicate,
+    backed by the SHARED bounded scanner ``teammate_envelope_payload_regions``
+    (review P2: predicate/parser structural parity; the 64 KiB bound is UTF-8
+    BYTES, and a close token inside the opening tag's quoted attributes never
+    counts). Fail-closed to genuine-user on any drift.
+  - ``response_builder.parse_teammate_idle_notifications`` — the strict
+    per-envelope parser returning EVERY idle notification (review P1: one
+    parent entry can carry multiple envelopes; each yields name + park_ts +
+    park_ts_unparseable).
 
 Uses the real sanitized captures in ``fixtures/teammate_idle_notification_
-v2.1.204.jsonl`` (Claude Code 2.1.204 agent-teams).
+v2.1.197.jsonl`` (Claude Code 2.1.197 agent-teams).
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from pathlib import Path
 
 from cctelegram.handlers.response_builder import (
     is_teammate_message,
-    parse_teammate_idle_notification,
+    parse_teammate_idle_notifications,
 )
 from cctelegram.utils import TEAMMATE_ENVELOPE_SCAN_BYTES, parse_iso_timestamp
 
@@ -42,7 +45,7 @@ def _content_str(obj: dict) -> str:
 def _fixture_lines() -> list[dict]:
     return [
         json.loads(ln)
-        for ln in (_FIXTURES / "teammate_idle_notification_v2.1.204.jsonl")
+        for ln in (_FIXTURES / "teammate_idle_notification_v2.1.197.jsonl")
         .read_text()
         .splitlines()
     ]
@@ -53,8 +56,10 @@ def _bare_text() -> str:
     return _content_str(_fixture_lines()[1])
 
 
-def _summary_text() -> str:
-    # line 2: an idle_notification whose JSON carries a ``summary`` field.
+def _multi_text() -> str:
+    # line 2: TWO envelopes — skill-inventory (with a ``summary`` field) then
+    # explore-skill-dispatch (bare). The real two-envelope entry Codex cited
+    # (outer ts 2026-07-09T15:56:55.336Z).
     return _content_str(_fixture_lines()[2])
 
 
@@ -76,8 +81,8 @@ def test_bare_fixture_is_teammate_message():
     assert is_teammate_message(_bare_text()) is True
 
 
-def test_summary_fixture_is_teammate_message():
-    assert is_teammate_message(_summary_text()) is True
+def test_multi_envelope_fixture_is_teammate_message():
+    assert is_teammate_message(_multi_text()) is True
 
 
 def test_task_notification_is_not_teammate_message():
@@ -141,29 +146,91 @@ def test_envelope_closing_beyond_scan_bound_rejects():
     assert is_teammate_message(text) is False
 
 
-# ── parse_teammate_idle_notification ────────────────────────────────────
+def test_multibyte_utf8_close_beyond_byte_bound_rejects():
+    """Review P2a (Hermes repro): the bound is UTF-8 BYTES, not characters.
+    43,650 '€' (3 bytes each) = 130,950 bytes but only ~43.7k chars — a
+    CHARACTER-sliced bound would keep the closing tag in view and accept."""
+    filler = "€" * 43_650
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x" color="red">\n'
+        + filler
+        + "\n</teammate-message>"
+    )
+    assert len(text.encode("utf-8")) > TEAMMATE_ENVELOPE_SCAN_BYTES
+    assert len(text) < TEAMMATE_ENVELOPE_SCAN_BYTES  # the char-slice trap
+    assert is_teammate_message(text) is False
+
+
+def test_close_tag_only_inside_opening_tag_quoted_attribute_rejects():
+    """Review P2b: a close token inside the opening tag's quoted attribute text
+    precedes the tag's completing '>' and must NOT satisfy the close — the old
+    ``close in prefix`` check accepted this where the parser returned None."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x" note="</teammate-message>">\n'
+        '{"type":"idle_notification","from":"x"}\n'
+    )
+    assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
+
+
+def test_opening_tag_never_completes_rejects():
+    """The opening tag's only '>' belongs to an embedded close token — the tag
+    never completes, so no structurally-valid envelope exists."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x" broken </teammate-message>'
+    )
+    assert is_teammate_message(text) is False
+    assert parse_teammate_idle_notifications(text) == []
+
+
+def test_attribute_embedded_close_with_genuine_close_still_accepts():
+    """An embedded close in the attributes does not poison a GENUINE envelope
+    that also carries a real close after the tag completes."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message a="</teammate-message>" b="x">\n'
+        '{"type":"idle_notification","from":"peer","timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    assert is_teammate_message(text) is True
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer"
+
+
+# ── parse_teammate_idle_notifications ───────────────────────────────────
 
 
 def test_parse_bare_happy_path():
-    idle = parse_teammate_idle_notification(_bare_text())
-    assert idle is not None
+    parsed = parse_teammate_idle_notifications(_bare_text())
+    assert len(parsed) == 1
+    idle = parsed[0]
     assert idle.name == "skill-inventory"
     assert idle.park_ts == parse_iso_timestamp("2026-07-09T15:55:48.387Z")
     assert idle.park_ts_unparseable is False
 
 
-def test_parse_summary_happy_path():
-    idle = parse_teammate_idle_notification(_summary_text())
-    assert idle is not None
-    # Parses the FIRST envelope only (skill-inventory, with a summary field).
-    assert idle.name == "skill-inventory"
-    assert idle.park_ts == parse_iso_timestamp("2026-07-09T15:56:41.351Z")
-    assert idle.park_ts_unparseable is False
+def test_parse_multi_envelope_returns_all():
+    """Review P1 (REAL-DATA VERIFIED): one parent entry carries TWO envelopes;
+    the SECOND names the teammate whose final leg ends stop_reason=None (its
+    ONLY close signal) — dropping it reproduces the original 2 h strand."""
+    parsed = parse_teammate_idle_notifications(_multi_text())
+    assert len(parsed) == 2
+    first, second = parsed
+    assert first.name == "skill-inventory"  # the with-summary variant
+    assert first.park_ts == parse_iso_timestamp("2026-07-09T15:56:41.351Z")
+    assert first.park_ts_unparseable is False
+    assert second.name == "explore-skill-dispatch"
+    assert second.park_ts == parse_iso_timestamp("2026-07-09T15:56:45.564Z")
+    assert second.park_ts_unparseable is False
 
 
-def test_parse_non_teammate_returns_none():
-    assert parse_teammate_idle_notification("just text") is None
-    assert parse_teammate_idle_notification(_spawn_text()) is None
+def test_parse_non_teammate_returns_empty():
+    assert parse_teammate_idle_notifications("just text") == []
+    assert parse_teammate_idle_notifications(_spawn_text()) == []
 
 
 def _envelope(payload: str) -> str:
@@ -175,36 +242,53 @@ def _envelope(payload: str) -> str:
     )
 
 
-def test_parse_malformed_inner_json_returns_none():
-    assert parse_teammate_idle_notification(_envelope("{not valid json,,,}")) is None
+def test_parse_malformed_inner_json_skips():
+    assert parse_teammate_idle_notifications(_envelope("{not valid json,,,}")) == []
 
 
-def test_parse_missing_from_returns_none():
+def test_parse_missing_from_skips():
     payload = '{"type":"idle_notification","timestamp":"2026-07-09T00:00:00Z"}'
-    assert parse_teammate_idle_notification(_envelope(payload)) is None
+    assert parse_teammate_idle_notifications(_envelope(payload)) == []
 
 
-def test_parse_wrong_type_returns_none():
+def test_parse_wrong_type_skips():
     payload = '{"type":"something_else","from":"x","timestamp":"2026-07-09T00:00:00Z"}'
-    assert parse_teammate_idle_notification(_envelope(payload)) is None
+    assert parse_teammate_idle_notifications(_envelope(payload)) == []
 
 
 def test_parse_missing_timestamp_is_unparseable():
     payload = '{"type":"idle_notification","from":"peer"}'
-    idle = parse_teammate_idle_notification(_envelope(payload))
-    assert idle is not None
-    assert idle.name == "peer"
-    assert idle.park_ts is None
-    assert idle.park_ts_unparseable is True
+    parsed = parse_teammate_idle_notifications(_envelope(payload))
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer"
+    assert parsed[0].park_ts is None
+    assert parsed[0].park_ts_unparseable is True
 
 
 def test_parse_present_but_unparseable_timestamp():
     payload = '{"type":"idle_notification","from":"peer","timestamp":"not-a-date"}'
-    idle = parse_teammate_idle_notification(_envelope(payload))
-    assert idle is not None
-    assert idle.name == "peer"
-    assert idle.park_ts is None
-    assert idle.park_ts_unparseable is True
+    parsed = parse_teammate_idle_notifications(_envelope(payload))
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer"
+    assert parsed[0].park_ts is None
+    assert parsed[0].park_ts_unparseable is True
+
+
+def test_parse_mixed_valid_and_invalid_envelopes():
+    """An invalid-payload envelope is SKIPPED, not fatal — later valid
+    envelopes still parse (the plural-enumeration contract)."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="x">\nnot json at all\n</teammate-message>\n'
+        "\n"
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-two",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>\n\ntrailing prose"
+    )
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer-two"
 
 
 # ── the never-tombstoned shape (defect B premise, real data) ─────────────
@@ -215,12 +299,12 @@ def test_sidechain_final_leg_ends_without_a_turn_end_reason():
     ``stop_reason=None`` — so the sidechain-done detector (``_TURN_END_REASONS``)
     NEVER fires, and (teammates emit no ``<task-notification>``) the key would
     strand to the 2 h TTL without the park-close lane. Pinned against the real
-    sanitized sidechain-leg capture."""
+    sanitized sidechain-leg capture (Claude Code 2.1.197)."""
     from cctelegram.session_monitor import _TURN_END_REASONS
 
     lines = [
         json.loads(ln)
-        for ln in (_FIXTURES / "teammate_sidechain_final_leg_v2.1.204.jsonl")
+        for ln in (_FIXTURES / "teammate_sidechain_final_leg_v2.1.197.jsonl")
         .read_text()
         .splitlines()
     ]
