@@ -102,15 +102,24 @@ _TEAMMATE_OPEN_RE = re.compile(r"<teammate-message(?=[\s>])")
 def _teammate_tag_completion(s: str, start: int) -> int:
     """Quote-aware scan for the opening tag's completing ``>`` (review r2
     P2(i)): a ``>`` inside a single- or double-quoted attribute value never
-    completes the tag. An UNQUOTED ``<`` before the completing ``>`` rejects
-    the opener (Hermes r3 P2 — a malformed opener must never borrow a LATER
-    opening/closing tag's ``>`` and then decode foreign JSON as its payload;
-    the current tag's own ``<`` precedes ``start``, and a legitimate attribute
-    ``<`` is always quoted). Returns the index of the completing ``>`` or
+    completes the tag. A raw ``<`` ANYWHERE before the completing ``>`` —
+    INCLUDING inside quote state — rejects the opener (Hermes r3 P2 + r4 P2):
+    a legitimate CC-generated opening tag's quoted attribute values
+    (``teammate_id``, ``color``) never contain ``<``, so an in-quote ``<`` is
+    always evidence the scan has crossed into a FOLLOWING tag. Without the
+    in-quote arm, an UNTERMINATED quoted attribute swallows a later tag
+    boundary: the quote state stays open across ``<teammate-message …>`` /
+    ``</teammate-message>``, a later quote char flips it closed, an unquoted
+    ``>`` "completes" the opener on foreign text, and the immediate-start rule
+    then decodes FOREIGN JSON into a park for a teammate this envelope never
+    named (the r3 bug class re-entered through quotes). The current tag's own
+    ``<`` precedes ``start``. Returns the index of the completing ``>`` or
     ``-1`` (never completed / structurally invalid — fail closed)."""
     quote: str | None = None
     for i in range(start, len(s)):
         ch = s[i]
+        if ch == "<":
+            return -1  # a tag boundary before completion — fail closed (r4)
         if quote is not None:
             if ch == quote:
                 quote = None
@@ -118,8 +127,6 @@ def _teammate_tag_completion(s: str, start: int) -> int:
             quote = ch
         elif ch == ">":
             return i
-        elif ch == "<":
-            return -1  # a new tag opened before this one completed
     return -1
 
 

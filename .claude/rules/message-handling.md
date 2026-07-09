@@ -527,9 +527,13 @@ EXPLICIT whitespace/`>` delimiter (`\b` accepted `<teammate-message!broken>`);
 the opening tag must COMPLETE via a QUOTE-AWARE `>` scan (a quoted `>` — or a
 close token embedded in a quoted attribute — never completes it; the old
 quote-blind `find(b">")` accepted a never-completed tag and produced a park;
-an UNQUOTED `<` before the completing `>` REJECTS the opener — Hermes r3 P2: a
-malformed opener must never borrow a LATER opening/closing tag's `>` and then
-decode foreign JSON as its payload);
+a raw `<` ANYWHERE before the completing `>` — INCLUDING inside quote state —
+REJECTS the opener: Hermes r3 P2 (a malformed opener must never borrow a LATER
+opening/closing tag's `>` and then decode foreign JSON as its payload) + r4 P2
+(an UNTERMINATED quoted attribute otherwise swallows a later tag boundary — the
+quote state rides across it, a later quote char flips closed, and an unquoted
+`>` completes on foreign text; legitimate CC attribute values never contain
+`<`, so an in-quote `<` is always a crossed boundary — fail-closed));
 the payload is decoded with `json.JSONDecoder().raw_decode` from the `{` that
 must IMMEDIATELY follow tag completion (whitespace-only gap — Codex r3 P1: a
 free-ranging `find("{")` could cross the envelope boundary and borrow FOREIGN
