@@ -1363,8 +1363,17 @@ async def _create_and_bind_window(
 
         # Wait for Claude Code's SessionStart hook to register in session_map.
         # Resume sessions take longer to start (loading session state), so use
-        # a longer timeout to avoid silently dropping messages.
-        hook_timeout = 15.0 if resume_session_id else 5.0
+        # a longer default. CC_TELEGRAM_HOOK_TIMEOUT (validated in config)
+        # OVERRIDES BOTH defaults when set — the stock 5s can be too tight when
+        # Claude starts on a slow filesystem (e.g. WSL DrvFs under /mnt/c) or
+        # loads several MCP servers and only reaches SessionStart after
+        # ~15-20s, which silently dropped the first message on every bind.
+        default_hook_timeout = 15.0 if resume_session_id else 5.0
+        hook_timeout = (
+            config.hook_timeout_override
+            if config.hook_timeout_override is not None
+            else default_hook_timeout
+        )
         hook_ok = await session_mgr.wait_for_session_map_entry(
             created_wid, timeout=hook_timeout
         )

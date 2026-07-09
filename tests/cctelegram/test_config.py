@@ -155,6 +155,64 @@ class TestConfigWindowGeometry:
 
 
 @pytest.mark.usefixtures("_base_env")
+class TestConfigHookTimeout:
+    """CC_TELEGRAM_HOOK_TIMEOUT — SessionStart-hook registration override."""
+
+    def test_hook_timeout_unset_is_none(self, monkeypatch):
+        monkeypatch.delenv("CC_TELEGRAM_HOOK_TIMEOUT", raising=False)
+        cfg = Config()
+        assert cfg.hook_timeout_override is None
+
+    def test_hook_timeout_valid_float(self, monkeypatch):
+        monkeypatch.setenv("CC_TELEGRAM_HOOK_TIMEOUT", "30")
+        cfg = Config()
+        assert cfg.hook_timeout_override == 30.0
+
+    def test_hook_timeout_valid_fractional(self, monkeypatch):
+        monkeypatch.setenv("CC_TELEGRAM_HOOK_TIMEOUT", "12.5")
+        cfg = Config()
+        assert cfg.hook_timeout_override == 12.5
+
+    def test_hook_timeout_empty_is_none_without_warning(self, monkeypatch, caplog):
+        # Empty string is treated as unset (silent None), matching the
+        # `if raw else default` guard semantics.
+        monkeypatch.setenv("CC_TELEGRAM_HOOK_TIMEOUT", "")
+        with caplog.at_level("WARNING", logger="cctelegram.config"):
+            cfg = Config()
+        assert cfg.hook_timeout_override is None
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING" and "CC_TELEGRAM_HOOK_TIMEOUT" in r.getMessage()
+        ]
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "abc",  # non-numeric
+            "inf",  # non-finite
+            "-inf",  # non-finite
+            "nan",  # non-finite
+            "0",  # not positive
+            "-5",  # negative
+        ],
+    )
+    def test_hook_timeout_invalid_falls_back_with_warning(
+        self, monkeypatch, caplog, raw
+    ):
+        monkeypatch.setenv("CC_TELEGRAM_HOOK_TIMEOUT", raw)
+        with caplog.at_level("WARNING", logger="cctelegram.config"):
+            cfg = Config()
+        assert cfg.hook_timeout_override is None
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING" and "CC_TELEGRAM_HOOK_TIMEOUT" in r.getMessage()
+        ]
+        assert len(warnings) == 1  # exactly one WARNING per bad value
+
+
+@pytest.mark.usefixtures("_base_env")
 class TestConfigOpenAI:
     def test_openai_defaults(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)

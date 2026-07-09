@@ -370,6 +370,77 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
     answer.assert_awaited_once_with("Hook timeout", show_alert=False)
 
 
+class _StopAfterWait(Exception):
+    """Sentinel to halt ``_create_and_bind_window`` right after the hook wait.
+
+    The only thing these focused tests pin is the ``timeout=`` argument the
+    resolved value produces at the ``wait_for_session_map_entry`` seam, so we
+    raise out of the awaited wait to skip the heavy post-wait bind/cleanup
+    flow entirely.
+    """
+
+
+async def _assert_hook_wait_timeout(
+    *, resume_session_id: str | None, override: float | None, expected_timeout: float
+) -> None:
+    query, user = _make_real_callback_query()
+    context = MagicMock()
+    context.user_data = {}
+
+    with (
+        patch.object(
+            bot_module.tmux_manager,
+            "create_window",
+            new_callable=AsyncMock,
+            return_value=(True, "Created window 'repo' at /repo", "repo", "@42"),
+        ),
+        patch.object(inbound_module.config, "hook_timeout_override", override),
+        patch.object(
+            bot_module.session_manager,
+            "wait_for_session_map_entry",
+            new_callable=AsyncMock,
+            side_effect=_StopAfterWait,
+        ) as wait_for_map,
+    ):
+        with pytest.raises(_StopAfterWait):
+            await bot_module._create_and_bind_window(
+                query,
+                context,
+                user,
+                "/repo",
+                pending_thread_id=None,
+                tmux_mgr=bot_module.tmux_manager,
+                session_mgr=bot_module.session_manager,
+                resume_session_id=resume_session_id,
+            )
+
+    wait_for_map.assert_awaited_once_with("@42", timeout=expected_timeout)
+
+
+@pytest.mark.asyncio
+async def test_hook_timeout_override_applies_to_fresh_bind() -> None:
+    """A set override replaces the stock 5s fresh-bind default."""
+    await _assert_hook_wait_timeout(
+        resume_session_id=None, override=42.0, expected_timeout=42.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_timeout_override_applies_to_resume_bind() -> None:
+    """A set override replaces the stock 15s resume default too."""
+    await _assert_hook_wait_timeout(
+        resume_session_id="sess-uuid", override=42.0, expected_timeout=42.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_timeout_default_resume_without_override() -> None:
+    """No override ⇒ the resume path keeps the stock 15s default."""
+    await _assert_hook_wait_timeout(
+        resume_session_id="sess-uuid", override=None, expected_timeout=15.0
+    )
+
+
 @pytest.mark.asyncio
 async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
     query, user = _make_real_callback_query()

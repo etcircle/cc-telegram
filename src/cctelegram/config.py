@@ -9,6 +9,7 @@ Key class: Config (singleton instantiated as `config`).
 """
 
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -64,6 +65,32 @@ class Config:
 
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
+
+        # SessionStart-hook registration timeout override (seconds).
+        # ``inbound_telegram._create_and_bind_window`` waits this long for
+        # Claude Code's SessionStart hook to register a newly-created window in
+        # session_map before giving up. The stock defaults (5s fresh / 15s
+        # resume) can be too tight when Claude starts on a slow filesystem
+        # (e.g. WSL DrvFs under /mnt/c) or loads several MCP servers and only
+        # reaches SessionStart after ~15-20s, so a valid, positive, finite
+        # value OVERRIDES BOTH defaults; an invalid value (non-numeric /
+        # non-finite / <= 0) logs a WARNING and leaves this None (the stock
+        # 5s/15s defaults apply). Unset ⇒ None. config OWNS this canonical
+        # declaration for docs + the README sync rule.
+        _raw_hook_timeout = os.getenv("CC_TELEGRAM_HOOK_TIMEOUT")
+        self.hook_timeout_override: float | None = None
+        if _raw_hook_timeout:
+            try:
+                _parsed_hook_timeout = float(_raw_hook_timeout)
+                if not math.isfinite(_parsed_hook_timeout) or _parsed_hook_timeout <= 0:
+                    raise ValueError("must be a positive, finite number of seconds")
+                self.hook_timeout_override = _parsed_hook_timeout
+            except ValueError:
+                logger.warning(
+                    "Invalid CC_TELEGRAM_HOOK_TIMEOUT=%r; ignoring "
+                    "(using the built-in 5s/15s SessionStart-hook defaults)",
+                    _raw_hook_timeout,
+                )
 
         # All state files live under config_dir
         self.state_file = self.config_dir / "state.json"
