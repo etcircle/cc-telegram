@@ -33,6 +33,7 @@ from cctelegram.handlers.response_builder import extract_task_notification_task_
 from cctelegram.route_runtime import (
     BG_AGENT_TTL_SECONDS,
     BG_BACKGROUND_TTL_SECONDS,
+    BgDoneSource,
     NotificationClearReason,
     NotificationMarkResult,
     RunState,
@@ -87,6 +88,7 @@ def _evt(
     stop_reason: str | None = None,
     timestamp: float | None = None,
     is_task_notification: bool = False,
+    is_teammate_notification: bool = False,
 ) -> TranscriptLifecycleEvent:
     return TranscriptLifecycleEvent(
         role=role,  # type: ignore[arg-type]
@@ -96,6 +98,7 @@ def _evt(
         stop_reason=stop_reason,
         timestamp=timestamp,
         is_task_notification=is_task_notification,
+        is_teammate_notification=is_teammate_notification,
     )
 
 
@@ -1073,3 +1076,116 @@ async def test_background_only_false_after_ttl_expiry(monkeypatch):
 async def test_default_snapshot_background_only_false():
     """An unseen route's default snapshot carries ``background_only`` False."""
     assert route_runtime.snapshot((99, 99, "@99")).background_only is False
+
+
+# ── GH #46: teammate idle_notification user events + BgDoneSource.TEAMMATE ──
+
+
+async def test_teammate_user_event_preserves_tombstones():
+    """Defect (A) fix: a teammate idle_notification is machine-initiated — it
+    must NOT reset the background-agent tombstone (the re-record amplifier)."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
+    await route_runtime.mark_background_agent_done(ROUTE, KEY)
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "text", timestamp=300.0, is_teammate_notification=True)
+    )
+    assert KEY in _st().background_agents_done
+
+
+async def test_teammate_user_event_preserves_suspended_tools():
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Agent")
+    )
+    await route_runtime.mark_pane_idle(ROUTE)
+    assert _st().suspended_tools == {"t1": False}
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "text", timestamp=200.0, is_teammate_notification=True)
+    )
+    assert _st().suspended_tools == {"t1": False}
+
+
+async def test_teammate_user_event_preserves_pane_bit_keeps_waiting():
+    await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
+    await route_runtime.mark_interactive_pending(ROUTE)
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "text", timestamp=200.0, is_teammate_notification=True)
+    )
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.interactive_pending is True
+
+
+async def test_teammate_user_event_stamps_teammate_clear_reason():
+    await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
+    await route_runtime.mark_notification_pending(ROUTE, set_at=500.0, generation="g")
+    assert _st().run_state is RunState.WAITING_ON_USER
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "text", timestamp=600.0, is_teammate_notification=True)
+    )
+    assert snap.notification_pending is False
+    assert (
+        snap.notification_clear_reason is NotificationClearReason.TEAMMATE_NOTIFICATION
+    )
+
+
+async def test_teammate_done_tombstones_when_no_resume_stamp():
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
+    snap = await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=170.0
+    )
+    assert KEY in _st().background_agents_done
+    assert snap.background_agents == ()
+
+
+async def test_teammate_done_suppression_parity_with_sidechain():
+    """TEAMMATE shares the SIDECHAIN ts-gate: a stale prior-leg park (ts ≤
+    resume) keeps a resumed key LIVE; a genuine newer park tombstones."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_resumed(ROUTE, KEY, 150.0)
+    await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=90.0
+    )
+    assert KEY not in _st().background_agents_done  # LIVE (stale prior-leg)
+    snap = await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=200.0
+    )
+    assert KEY in _st().background_agents_done  # tombstoned (newer park)
+    assert snap.background_agents == ()
+
+
+async def test_observed_strand_replay_no_re_record_after_teammate_event():
+    """The end-to-end regression: recorded → sidechain done (tombstone) →
+    teammate user event → trailing-batch activity ⇒ NO re-record, not lifted,
+    background_only False. Old code cleared the tombstone on the teammate
+    event and the trailing activity relit the route for the 2 h TTL."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
+    await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.SIDECHAIN, end_turn_ts=160.0
+    )
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "text", timestamp=170.0, is_teammate_notification=True)
+    )
+    assert KEY in _st().background_agents_done  # tombstone HELD
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, 180.0)
+    assert snap.background_agents == ()
+    assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+    assert snap.background_only is False
+    assert snap.typing_eligible is False
+
+
+async def test_never_tombstoned_shape_teammate_park_drops_typing_without_ttl():
+    """The teammate leg ends in plain text (stop_reason=None) so no sidechain
+    done ever fires; the teammate park (BgDoneSource.TEAMMATE) tombstones the
+    launched key so typing drops promptly instead of waiting out the 2 h TTL."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_launched(ROUTE, KEY)
+    assert route_runtime.snapshot(ROUTE).typing_eligible is True
+    snap = await route_runtime.mark_background_agent_done(
+        ROUTE, KEY, source=BgDoneSource.TEAMMATE, end_turn_ts=200.0
+    )
+    assert KEY in _st().background_agents_done
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()

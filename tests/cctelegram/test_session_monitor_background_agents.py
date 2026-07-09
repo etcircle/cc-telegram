@@ -1663,3 +1663,135 @@ async def test_bg_bash_prose_in_non_bash_tool_result_never_warns(
     assert not any(
         "backgroundTaskId is absent/malformed" in r.message for r in caplog.records
     )
+
+
+# ── GH #46 PR-1: teammate idle_notification park-close arm ────────────────
+#
+# A teammate ``idle_notification`` user entry on the PARENT transcript names a
+# teammate that maps to one (or more) currently-tracked sidechain stem(s)
+# ``sub:<parent>:agent-a<name>-<hex>``. The arm records ``teammate_parks[key] =
+# (park_ts, unparseable)`` for every matching stem so the bot fan-out can
+# tombstone the background key (a teammate leg ends in plain text with
+# stop_reason=None → the sidechain-done detector never fires).
+
+from pathlib import Path  # noqa: E402
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _teammate_text(idx: int) -> str:
+    line = (
+        (_FIXTURES / "teammate_idle_notification_v2.1.204.jsonl")
+        .read_text()
+        .splitlines()[idx]
+    )
+    return json.loads(line)["message"]["content"]
+
+
+def _track_stem(monitor, stem: str, parent: str = PARENT) -> None:
+    monitor.state.update_session(
+        TrackedSession(
+            session_id=f"sub:{parent}:{stem}",
+            file_path="/nonexistent-phantom",
+            last_byte_offset=0,
+            parent_session_id=parent,
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("idx", "expected_ts_iso"),
+    [
+        (1, "2026-07-09T15:55:48.387Z"),  # bare variant
+        (2, "2026-07-09T15:56:41.351Z"),  # with-summary variant (1st envelope)
+    ],
+)
+async def test_teammate_arm_records_park_for_tracked_stem(
+    monitor, tmp_path, make_jsonl_entry, idx, expected_ts_iso
+):
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(idx), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    key = "askill-inventory-1a048f189108dc46"
+    assert key in activity[PARENT].teammate_parks
+    park_ts, unparseable = activity[PARENT].teammate_parks[key]
+    assert unparseable is False
+    assert park_ts == parse_iso_timestamp(expected_ts_iso)
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_zero_matching_stems_is_noop(
+    monitor, tmp_path, make_jsonl_entry
+):
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    # A tracked stem for a DIFFERENT teammate name — no match for skill-inventory.
+    _track_stem(monitor, "agent-aexplore-turn-cache-5c243a231ef07300")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(1), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    parks = activity[PARENT].teammate_parks if PARENT in activity else {}
+    assert parks == {}
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_closes_all_same_name_stems(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """PR-1 documented safe degradation: a name matching MULTIPLE tracked stems
+    closes ALL of them."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    _track_stem(monitor, "agent-askill-inventory-deadbeefcafe0001")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(1), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    parks = activity[PARENT].teammate_parks
+    assert set(parks) == {
+        "askill-inventory-1a048f189108dc46",
+        "askill-inventory-deadbeefcafe0001",
+    }
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_rejects_non_hex_suffix_stem(
+    monitor, tmp_path, make_jsonl_entry
+):
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    # Suffix contains 'z'/uppercase — not pure lowercase hex 8-32 → no match.
+    _track_stem(monitor, "agent-askill-inventory-zzzzzzzz")
+    _track_stem(monitor, "agent-askill-inventory-DEADBEEF")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(1), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    parks = activity[PARENT].teammate_parks if PARENT in activity else {}
+    assert parks == {}
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_does_not_disturb_task_notification_arm(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """The two arms are mutually exclusive by prefix — a <task-notification>
+    still records completed and NEVER a teammate park."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    notif = (
+        "<task-notification>\n<task-id>abc123def456</task-id>\n"
+        "<status>completed</status>\n</task-notification>"
+    )
+    _append(parent_jsonl, [make_jsonl_entry("user", notif, session_id=PARENT)])
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    assert activity[PARENT].completed == {"abc123def456"}
+    assert activity[PARENT].teammate_parks == {}
