@@ -129,6 +129,15 @@ class ParentSidechainActivity:
     # transcript order (the parent-lane same-batch pair: ``.resumed`` XOR
     # ``.completed``).
     resumed: dict[str, float | None] = field(default_factory=dict)
+    # GH #46 PR-1: agent-teams teammate parks. A teammate ``idle_notification``
+    # user entry on the PARENT transcript names a teammate; the arm resolves the
+    # name → this parent's currently-tracked sidechain stem key(s)
+    # (``a<name>-<hex>``) and records ``key -> (park_ts, park_ts_unparseable)``.
+    # The bot fan-out applies each as ``mark_background_agent_done(...,
+    # source=BgDoneSource.TEAMMATE, end_turn_ts=park_ts, ...)`` — the ONLY close
+    # signal for a teammate leg that ends in plain text (no sidechain
+    # end-of-turn, no ``<task-notification>``).
+    teammate_parks: dict[str, tuple[float | None, bool]] = field(default_factory=dict)
 
 
 @dataclass
@@ -523,6 +532,42 @@ class SessionMonitor:
             rec = ParentSidechainActivity()
             self._sidechain_activity[parent_session_id] = rec
         return rec
+
+    def _record_teammate_park(self, parent_session_id: str, parked: Any) -> None:
+        """Record a teammate park (GH #46 PR-1) against this parent's tracked
+        sidechain stem(s).
+
+        ``parked`` is a ``response_builder.TeammateIdle``. A teammate's sidechain
+        file is a top-level Agent transcript ``subagents/agent-a<name>-<hex>.jsonl``,
+        so its tracking key is ``sub:<parent>:agent-a<name>-<hex>`` and its
+        normalized background-agent key is ``a<name>-<hex>`` (with a PURE lowercase
+        hex suffix, 8-32 chars). Resolve the teammate NAME → every tracked stem
+        whose normalized key matches ``a<name>-<hex>`` (NO disk glob — we read the
+        SAME ``tracked_sessions`` structure the sidechain code populates) and
+        record the park for each. PR-1 closes ALL same-name stems (documented safe
+        degradation — a double-``--resume`` sibling is rare and a park is the
+        agent going idle). Zero matching stems is a no-op (INFO).
+        """
+        pattern = re.compile(r"^a" + re.escape(parked.name) + r"-[0-9a-f]{8,32}$")
+        prefix = f"sub:{parent_session_id}:"
+        matched: list[str] = []
+        for tk in self.state.tracked_sessions:
+            if not tk.startswith(prefix):
+                continue
+            stem = tk.rsplit(":", 1)[-1]  # "agent-a<name>-<hex>"
+            key = normalize_background_agent_key(stem)  # "a<name>-<hex>"
+            if pattern.match(key):
+                matched.append(key)
+        if not matched:
+            logger.info(
+                "teammate park: no tracked stem for name=%r parent=%s",
+                parked.name,
+                parent_session_id[:8],
+            )
+            return
+        rec = self._parent_activity(parent_session_id)
+        for key in matched:
+            rec.teammate_parks[key] = (parked.park_ts, parked.park_ts_unparseable)
 
     def _open_workflow_bracket(self, parent_session_id: str, info: Any) -> None:
         """Open a persistent Workflow bracket (ISSUE-6 / Fix 2c).
@@ -1610,6 +1655,27 @@ class SessionMonitor:
                                 self._open_workflow_brackets[session_info.session_id][
                                     task_id
                                 ].closing = True
+                    elif (
+                        entry.role == "user"
+                        and entry.content_type == "text"
+                        and entry.text
+                    ):
+                        # GH #46 PR-1: an agent-teams teammate ``idle_notification``
+                        # park report. Mutually exclusive with the
+                        # ``<task-notification>`` arm above (teammate text starts
+                        # with "Another Claude session sent a message:", never
+                        # "<task-notification>"). Resolve the teammate name → this
+                        # parent's currently-tracked sidechain stem key(s) and
+                        # record a park close — the ONLY close signal for a teammate
+                        # leg that ends in plain text (no sidechain end-of-turn, no
+                        # ``<task-notification>``).
+                        from .handlers.response_builder import (
+                            parse_teammate_idle_notification,
+                        )
+
+                        parked = parse_teammate_idle_notification(entry.text)
+                        if parked is not None:
+                            self._record_teammate_park(session_info.session_id, parked)
 
                     # Lifecycle-only entries exist purely to drive the
                     # busy indicator; they have no visible content and must
