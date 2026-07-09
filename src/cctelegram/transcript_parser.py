@@ -737,11 +737,22 @@ class TranscriptParser:
                             # Store tool info for later tool_result formatting.
                             # Edit needs input_data for diff generation;
                             # Agent/Task carry it so §2.7's top-level render
-                            # can show description / subagent_type / prompt.
+                            # can show description / subagent_type / prompt;
+                            # SendMessage carries it so GH #46 PR-2's teammate-wake
+                            # cross-check can read the paired ``input["to"]`` on the
+                            # tool_result entry (an unavailable input fails the wake
+                            # closed).
                             input_data = (
                                 inp
                                 if name
-                                in ("Edit", "NotebookEdit", "Write", "Agent", "Task")
+                                in (
+                                    "Edit",
+                                    "NotebookEdit",
+                                    "Write",
+                                    "Agent",
+                                    "Task",
+                                    "SendMessage",
+                                )
                                 else None
                             )
                             pending_tools[tool_id] = PendingToolInfo(

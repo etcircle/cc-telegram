@@ -17,6 +17,7 @@ Key classes: SessionMonitor, NewMessage, SessionInfo.
 """
 
 import asyncio
+import glob
 import json
 import logging
 import re
@@ -69,6 +70,19 @@ _INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
 # of a route_runtime import (same pattern as _INTERACTIVE_TOOL_NAMES above) —
 # the fixture-gate test pins the two definitions equal.
 _TURN_END_REASONS = frozenset({"end_turn", "stop_sequence"})
+
+# GH #46 PR-2: how much a teammate sidechain file's first-entry / mtime timestamp
+# may precede the parent-observed spawn wall-clock and still bind. The parent's
+# spawn tool_result and the teammate's first sidechain line are written by the
+# same in-process CC on the same host but through different flushes, so a small
+# skew is expected; a larger backdate is evidence of a STALE prior-generation
+# file (a same-name teammate from an earlier spawn) that must not bind.
+TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S = 5.0
+
+# GH #46 PR-2: the byte cap for reading a candidate teammate sidechain's FIRST
+# JSONL line at the binding gate. One real entry is a few KiB; a line longer than
+# this (or with no newline yet) is a partial write ⇒ NO bind this tick (retry).
+_TEAMMATE_FIRST_LINE_MAX_BYTES = 262144
 
 
 @dataclass
@@ -192,6 +206,73 @@ class _WorkflowBracket:
     # bracket is removed. ``_emit_workflow_bracket_heartbeats`` skips closing
     # brackets (the run-state done already fired via ``rec.completed``).
     closing: bool = False
+
+
+@dataclass(frozen=True)
+class _PendingPark:
+    """GH #46 PR-2: a teammate PARK that arrived while its key was still UNBOUND
+    (no ``current_key`` yet), held in the registry until the binding applies it.
+
+    A TYPED slot, NOT a bare ``(ts, unparseable)`` tuple (Codex plan-r4
+    watchpoint): the merge is a CAUSAL REDUCTION and an unparseable park must
+    DOMINATE permanently — a tuple with last-write-wins could let a later
+    parseable park erase an earlier unparseable one's unconditional-tombstone
+    evidence. ``unknown_done`` True ⇒ the ``UnknownDone`` state (dominates
+    forever); ``unknown_done`` False ⇒ ``ParkAt(ts)`` with the causally-latest
+    (max) parseable timestamp. Build via :func:`_merge_pending_park` — never a
+    bare assignment.
+    """
+
+    unknown_done: bool
+    ts: float | None
+
+
+def _merge_pending_park(
+    existing: "_PendingPark | None", park_ts: float | None, unparseable: bool
+) -> "_PendingPark":
+    """Causal reduction of a pending teammate park (GH #46 PR-2, Codex r4).
+
+    UnknownDone dominates permanently; otherwise keep max(parseable ts). Mirrors
+    ``ParentSidechainActivity.merge_teammate_park`` so the pending (unbound) slot
+    and the bound-key per-tick merge share ONE causal rule. A new unparseable park
+    ⇒ UnknownDone; else a ParkAt whose ts is the max of the prior and the new."""
+    if existing is not None and existing.unknown_done:
+        return existing  # UnknownDone is permanent
+    if unparseable:
+        return _PendingPark(unknown_done=True, ts=None)
+    new_ts = park_ts
+    if existing is not None and existing.ts is not None:
+        if new_ts is None or new_ts <= existing.ts:
+            new_ts = existing.ts
+    return _PendingPark(unknown_done=False, ts=new_ts)
+
+
+@dataclass
+class _TeammateRec:
+    """GH #46 PR-2: one agent-teams teammate in a parent's generational registry.
+
+    A teammate becomes a FIRST-CLASS background key: ``current_key`` is the
+    normalized ``a<name>-<hex>`` key of the sidechain file currently BOUND to
+    this teammate (None until a matching stem binds). ``spawn_generation`` bumps
+    on every same-name RESPAWN so the binding gate can be strict about which
+    generation's file is genuine; ``retired_keys`` holds every stem key ever
+    quarantined/rotated off this teammate (never re-binds). ``pending_wake`` /
+    ``pending_park`` buffer a wake/park that arrived while UNBOUND, applied in
+    causal order at the bind. ``last_wake_ts`` is diagnostic.
+
+    route_runtime gains ZERO new mutators — the registry drives the EXISTING
+    launched / resumed / done marks through the bot fan-out.
+    """
+
+    name: str
+    teammate_id: str | None
+    spawn_generation: int
+    spawned_ts: float
+    current_key: str | None = None
+    retired_keys: set[str] = field(default_factory=set)
+    last_wake_ts: float | None = None
+    pending_wake: float | None = None
+    pending_park: _PendingPark | None = None
 
 
 def _record_resume_ts(
@@ -513,6 +594,26 @@ class SessionMonitor:
         # structured-meta DRIFT warning has already fired (rate-limit — once per
         # launch tool_result, never re-warn every poll).
         self._bg_bash_drift_warned: set[str] = set()
+        # GH #46 PR-2: the generational teammate registry — parent_sid ->
+        # {name -> _TeammateRec}. A teammate spawn (from the structured
+        # ``teammate_spawned`` tool_result) creates/rotates the rec; a matching
+        # sidechain stem binds as ``current_key``; a wake (SendMessage) relights
+        # it; a park (idle_notification) closes it. In-memory, torn down with the
+        # parent's tracking state; NOT restart-reconciled (disclosed — same class
+        # as the background-Bash T1.4b degradation).
+        self._teammate_registry: dict[str, dict[str, _TeammateRec]] = {}
+        # GH #46 PR-2 §3 discovery-quarantine: per-parent set of tracking_keys
+        # (``sub:<parent>:agent-a<name>-<hex>``) SEVERED from run-state tick
+        # emission — a same-name candidate that could NOT bind (occupied /
+        # gate-fail / gen>=2 ambiguity / retired). Its file is still tailed for
+        # DISPLAY (feed_run_state=False) but NEVER records a run-state tick, so a
+        # non-current same-name key can never be recorded live. Monitor-side, so
+        # immune to runtime tombstone resets. Torn down with the parent.
+        self._severed_teammate_stems: dict[str, set[str]] = {}
+        # typing-unification T1.6 analogue: tool_use_ids for which a teammate
+        # prose-spawn DRIFT warning (``Spawned successfully.`` prose without the
+        # structured ``teammate_spawned`` meta) has already fired (rate-limit).
+        self._teammate_spawn_drift_warned: set[str] = set()
         # Per-tick fan-out for sidechain activity (wired from bot.post_init,
         # like ``_message_callback`` / ``_event_callback``).
         self._subagent_activity_callback: (
@@ -561,51 +662,402 @@ class SessionMonitor:
             self._sidechain_activity[parent_session_id] = rec
         return rec
 
-    def _record_teammate_park(self, parent_session_id: str, parked: Any) -> None:
-        """Record a teammate park (GH #46 PR-1) against this parent's tracked
-        sidechain stem(s).
+    # ── GH #46 PR-2: the generational teammate registry ──────────────────
 
-        ``parked`` is a ``response_builder.TeammateIdle``. A teammate's sidechain
-        file is a top-level Agent transcript ``subagents/agent-a<name>-<hex>.jsonl``,
-        so its tracking key is ``sub:<parent>:agent-a<name>-<hex>`` and its
-        normalized background-agent key is ``a<name>-<hex>`` (with a PURE lowercase
-        hex suffix, 8-32 chars). Resolve the teammate NAME → every tracked stem
-        whose normalized key matches ``a<name>-<hex>`` (NO disk glob — we read the
-        SAME ``tracked_sessions`` structure the sidechain code populates) and
-        record the park for each. TOP-LEVEL stems ONLY (hermes P3): a nested
-        Fix-5 Workflow display key is ``sub:<parent>:<runid>:agent-…`` — an
-        extra ``:`` segment — and must NEVER receive a teammate park (a Workflow
-        sub-agent's close is the ``wf-task:`` bracket, and its display key never
-        feeds run-state). PR-1 closes ALL same-name top-level stems (documented
-        safe degradation — a double-``--resume`` sibling is rare and a park is
-        the agent going idle). Zero matching stems is a no-op (INFO).
-        """
-        pattern = re.compile(r"^a" + re.escape(parked.name) + r"-[0-9a-f]{8,32}$")
+    def _teammate_recs(self, parent_session_id: str) -> dict[str, "_TeammateRec"]:
+        """Get/create this parent's teammate registry (name -> _TeammateRec)."""
+        recs = self._teammate_registry.get(parent_session_id)
+        if recs is None:
+            recs = {}
+            self._teammate_registry[parent_session_id] = recs
+        return recs
+
+    def _severed_stems(self, parent_session_id: str) -> set[str]:
+        """Get/create this parent's set of run-state-SEVERED tracking_keys."""
+        sev = self._severed_teammate_stems.get(parent_session_id)
+        if sev is None:
+            sev = set()
+            self._severed_teammate_stems[parent_session_id] = sev
+        return sev
+
+    def _tracked_teammate_stems(
+        self, parent_session_id: str, name: str
+    ) -> list[tuple[str, str]]:
+        """Return every currently-tracked TOP-LEVEL sidechain (tracking_key,
+        normalized_key) whose normalized key matches ``a<name>-<hex>`` (hex 8-32).
+
+        NO disk glob — reads the SAME ``tracked_sessions`` structure the sidechain
+        tracker populates. TOP-LEVEL only (hermes P3): a nested Fix-5 Workflow
+        display key ``sub:<parent>:<runid>:agent-…`` carries an extra ``:`` and is
+        skipped (a Workflow sub-agent's close is the ``wf-task:`` bracket)."""
+        pattern = re.compile(r"^a" + re.escape(name) + r"-[0-9a-f]{8,32}$")
         prefix = f"sub:{parent_session_id}:"
-        matched: list[str] = []
+        out: list[tuple[str, str]] = []
         for tk in self.state.tracked_sessions:
             if not tk.startswith(prefix):
                 continue
             stem = tk[len(prefix) :]
-            # Enforce the exact TOP-LEVEL shape sub:<parent>:agent-…: a nested
-            # Workflow key's remainder carries another ":" segment → skip.
             if ":" in stem or not stem.startswith("agent-"):
                 continue
             key = normalize_background_agent_key(stem)  # "a<name>-<hex>"
             if pattern.match(key):
-                matched.append(key)
+                out.append((tk, key))
+        return out
+
+    def _quarantine_teammate_stem(
+        self, parent_session_id: str, rec: "_TeammateRec", key: str
+    ) -> None:
+        """§3 discovery-quarantine: retire ``key`` for teammate ``rec``, emit an
+        UNCONDITIONAL teammate done for it, and permanently sever its tracking_key
+        from run-state tick emission.
+
+        The sever is monitor-side, so it is immune to a runtime tombstone reset
+        (a genuine user turn clears ``background_agents_done`` but the severed stem
+        can never re-record a tick). ``key`` is the normalized ``a<name>-<hex>``;
+        the tracking_key is reconstructed as ``sub:<parent>:agent-<key>``."""
+        rec.retired_keys.add(key)
+        self._severed_stems(parent_session_id).add(
+            f"sub:{parent_session_id}:agent-{key}"
+        )
+        # Unconditional teammate done (end_turn_ts_unparseable=True bypasses the
+        # resume/stale gates by design — an extra tombstone on a non-current key
+        # is a no-op; we never peek route_runtime liveness here).
+        self._parent_activity(parent_session_id).merge_teammate_park(
+            key, park_ts=None, unparseable=True
+        )
+
+    def _rotate_teammate_generation(
+        self, parent_session_id: str, rec: "_TeammateRec", spawned_ts: float
+    ) -> None:
+        """A same-name RESPAWN: close the old leg's current_key, quarantine every
+        matching stem (tracked OR on disk), and bump the generation (§2 spawn).
+
+        The quarantine snapshot is ONE anchored ``glob`` of this parent's
+        ``subagents`` dir plus the in-memory tracked stems — so a stale prior-gen
+        file that is present on disk but NOT yet tracked can never bind to the new
+        generation (the disk-snapshot pin)."""
+        # (1) close the old current_key unconditionally (its leg is superseded).
+        if rec.current_key is not None:
+            self._quarantine_teammate_stem(parent_session_id, rec, rec.current_key)
+        # (3) quarantine every matching stem tracked OR on disk.
+        for key in self._matching_stems_on_disk_and_tracked(
+            parent_session_id, rec.name
+        ):
+            if key not in rec.retired_keys:
+                self._quarantine_teammate_stem(parent_session_id, rec, key)
+        # (4) reset for the new generation.
+        rec.current_key = None
+        rec.pending_wake = None
+        rec.pending_park = None
+        rec.spawn_generation += 1
+        rec.spawned_ts = spawned_ts
+
+    def _matching_stems_on_disk_and_tracked(
+        self, parent_session_id: str, name: str
+    ) -> set[str]:
+        """§3: the union of normalized keys ``a<name>-<hex>`` from (a) a single
+        anchored ``glob(glob.escape("agent-a<name>-") + "*.jsonl")`` snapshot of
+        this parent's ``subagents`` dir and (b) the in-memory tracked stems.
+
+        Anchored ONLY (never rglob); OSError on the dir → the tracked set alone.
+        The disk snapshot is what closes the ``untracked stale file`` hole: a
+        prior-generation file present but not yet tracked is quarantined before it
+        can ever be discovered + bound."""
+        keys: set[str] = {
+            key for _tk, key in self._tracked_teammate_stems(parent_session_id, name)
+        }
+        tracked = self.state.get_session(parent_session_id)
+        if tracked is not None and tracked.file_path:
+            sub_dir = Path(tracked.file_path).parent / parent_session_id / "subagents"
+            key_re = re.compile(r"^a" + re.escape(name) + r"-[0-9a-f]{8,32}$")
+            try:
+                if sub_dir.is_dir():
+                    for f in sub_dir.glob(glob.escape(f"agent-a{name}-") + "*.jsonl"):
+                        k = normalize_background_agent_key(f.stem)
+                        if key_re.match(k):
+                            keys.add(k)
+            except OSError:
+                pass
+        return keys
+
+    def _record_teammate_spawn(self, parent_session_id: str, info: Any) -> None:
+        """A teammate SPAWN (``response_builder.TeammateSpawnInfo``) on the parent
+        tool_result lane (§2 spawn).
+
+        NEW name → create a gen-1 rec. EXISTING name → generation rotation (close
+        + quarantine + bump). After either, a PRE-SPAWN scan attempts binding on
+        surviving already-tracked unbound matching stems (a sidechain discovered
+        BEFORE the spawn parsed must still bind)."""
+        spawned_ts = time.time()
+        recs = self._teammate_recs(parent_session_id)
+        rec = recs.get(info.name)
+        if rec is None:
+            recs[info.name] = _TeammateRec(
+                name=info.name,
+                teammate_id=info.teammate_id,
+                spawn_generation=1,
+                spawned_ts=spawned_ts,
+            )
+            logger.info(
+                "teammate spawn: registered name=%r parent=%s gen=1",
+                info.name,
+                parent_session_id[:8],
+            )
+        else:
+            self._rotate_teammate_generation(parent_session_id, rec, spawned_ts)
+            rec.teammate_id = info.teammate_id or rec.teammate_id
+            logger.info(
+                "teammate spawn: rotated name=%r parent=%s gen=%d",
+                info.name,
+                parent_session_id[:8],
+                recs[info.name].spawn_generation,
+            )
+        # (5) pre-spawn scan: bind an already-tracked, unretired, gate-passing stem.
+        self._try_bind_tracked_teammate_stems(parent_session_id, info.name)
+
+    def _record_teammate_wake(
+        self, parent_session_id: str, name: str, event_ts: float | None
+    ) -> None:
+        """A teammate WAKE (SendMessage to ``name``) on the parent tool_result lane
+        (§2 wake). BOUND → emit resume for the current_key (relights); UNBOUND →
+        buffer as pending_wake (max on repeats). Unknown name → no-op (a wake to a
+        teammate this parent never spawned is not ours to relight)."""
+        recs = self._teammate_registry.get(parent_session_id)
+        rec = recs.get(name) if recs else None
+        if rec is None:
+            return
+        rec.last_wake_ts = event_ts
+        if rec.current_key is not None:
+            _record_resume_ts(
+                self._parent_activity(parent_session_id).resumed,
+                rec.current_key,
+                event_ts,
+            )
+        else:
+            if event_ts is not None and (
+                rec.pending_wake is None or event_ts > rec.pending_wake
+            ):
+                rec.pending_wake = event_ts
+
+    def _record_teammate_park(self, parent_session_id: str, parked: Any) -> None:
+        """Record a teammate park (GH #46 PR-1 + PR-2) — the ONLY close signal for
+        a teammate leg that ends in plain text (no sidechain end-of-turn, no
+        ``<task-notification>``).
+
+        ``parked`` is a ``response_builder.TeammateIdle``. PR-2: when the name IS
+        in the registry, close CURRENT_KEY ONLY (bound) or buffer pending_park
+        (unbound). When the name is NOT in the registry (no spawn seen — e.g. a
+        pre-restart spawn), fall back to PR-1's all-tracked-stems close verbatim
+        (the documented no-registry degradation). TOP-LEVEL stems only (a nested
+        Workflow display key never matches). Every close merges CAUSALLY
+        (``merge_teammate_park``: unparseable dominates, else max park_ts)."""
+        recs = self._teammate_registry.get(parent_session_id)
+        rec = recs.get(parked.name) if recs else None
+        if rec is not None:
+            if rec.current_key is not None:
+                self._parent_activity(parent_session_id).merge_teammate_park(
+                    rec.current_key, parked.park_ts, parked.park_ts_unparseable
+                )
+            else:
+                rec.pending_park = _merge_pending_park(
+                    rec.pending_park, parked.park_ts, parked.park_ts_unparseable
+                )
+            return
+        # No-registry degradation (PR-1): close ALL same-name top-level stems.
+        matched = [
+            key
+            for _tk, key in self._tracked_teammate_stems(parent_session_id, parked.name)
+        ]
         if not matched:
             logger.info(
-                "teammate park: no tracked stem for name=%r parent=%s",
+                "teammate park: no registry rec + no tracked stem for name=%r parent=%s",
                 parked.name,
                 parent_session_id[:8],
             )
             return
-        rec = self._parent_activity(parent_session_id)
+        activity = self._parent_activity(parent_session_id)
         for key in matched:
-            # Causal merge, never last-write-wins (review r2 P2): unparseable
-            # dominates, else max park_ts — see merge_teammate_park.
-            rec.merge_teammate_park(key, parked.park_ts, parked.park_ts_unparseable)
+            activity.merge_teammate_park(
+                key, parked.park_ts, parked.park_ts_unparseable
+            )
+
+    def _resolve_teammate_name_for_stem(
+        self, parent_session_id: str, normalized_key: str
+    ) -> "_TeammateRec | None":
+        """Which registered teammate does ``normalized_key`` (``a<name>-<hex>``)
+        belong to? LONGEST registered name first so a nested name (``explore`` vs
+        ``explore-backend``) binds to the most specific; the pure-hex residual
+        (``-[0-9a-f]{8,32}$``) disambiguates. None when no registered name matches
+        (a non-teammate agent sidechain — the common case, no registry rec)."""
+        recs = self._teammate_registry.get(parent_session_id)
+        if not recs:
+            return None
+        for name in sorted(recs, key=len, reverse=True):
+            if re.match(r"^a" + re.escape(name) + r"-[0-9a-f]{8,32}$", normalized_key):
+                return recs[name]
+        return None
+
+    def _read_first_entry_ts(self, sc_file: Path) -> float | None:
+        """§2 binding gate: parse the FIRST JSONL line's entry timestamp.
+
+        Bounded read with an explicit byte cap; cap-reached / no newline /
+        JSON-parse-fail / unparseable ts ⇒ None (⇒ NO bind this tick, RETRY while
+        unbound — never consume-once). Synchronous stdlib read (a few KiB) is fine
+        on the poll thread; the mtime prefilter already gated us here."""
+        try:
+            with open(sc_file, "rb") as f:
+                chunk = f.read(_TEAMMATE_FIRST_LINE_MAX_BYTES)
+        except OSError:
+            return None
+        nl = chunk.find(b"\n")
+        if nl == -1:
+            return None  # no complete first line yet (partial write / cap) → retry
+        try:
+            entry = json.loads(chunk[:nl].decode("utf-8", errors="strict"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(entry, dict):
+            return None
+        return parse_iso_timestamp(entry.get("timestamp"))
+
+    def _teammate_bind_gate_passes(
+        self, rec: "_TeammateRec", sc_file: Path
+    ) -> bool | None:
+        """§2 binding gate for ONE candidate stem: mtime prefilter + first-entry-ts
+        generation gate.
+
+        Returns True (bind), False (never — the file's first entry predates the
+        spawn: a STALE prior-generation file), or None (INDETERMINATE — first line
+        not yet readable ⇒ NO bind this tick, RETRY). Gen-1 tolerates the skew
+        window (``spawned_ts - SKEW``); gen>=2 is STRICT (``>= spawned_ts``) so a
+        respawn never binds a file whose first entry predates the new spawn."""
+        try:
+            mtime = sc_file.stat().st_mtime
+        except OSError:
+            return None
+        if mtime < rec.spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S:
+            return False  # backdated file — stale prior generation
+        first_ts = self._read_first_entry_ts(sc_file)
+        if first_ts is None:
+            return None  # unreadable/mid-write first line → retry
+        if rec.spawn_generation >= 2:
+            return first_ts >= rec.spawned_ts
+        return first_ts >= rec.spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S
+
+    def _bind_teammate_key(
+        self, parent_session_id: str, rec: "_TeammateRec", key: str
+    ) -> None:
+        """Bind ``key`` as ``rec.current_key`` and emit its launched signal, then
+        apply the buffered pending signals in CAUSAL order (§2 binding).
+
+        pending_wake FIRST (→ ``resumed[key]``), pending_park SECOND (→
+        ``teammate_parks``) — so the runtime ts-gates arbitrate a wake-then-park
+        vs park-then-wake correctly; both pending slots are cleared."""
+        rec.current_key = key
+        activity = self._parent_activity(parent_session_id)
+        activity.launched.add(key)
+        if rec.pending_wake is not None:
+            _record_resume_ts(activity.resumed, key, rec.pending_wake)
+        if rec.pending_park is not None:
+            if rec.pending_park.unknown_done:
+                activity.merge_teammate_park(key, park_ts=None, unparseable=True)
+            else:
+                activity.merge_teammate_park(
+                    key, park_ts=rec.pending_park.ts, unparseable=False
+                )
+        rec.pending_wake = None
+        rec.pending_park = None
+        logger.info(
+            "teammate bind: name=%r key=%s parent=%s gen=%d",
+            rec.name,
+            key,
+            parent_session_id[:8],
+            rec.spawn_generation,
+        )
+
+    def _try_bind_or_quarantine_teammate_file(
+        self, parent_session_id: str, sc_file: Path, tracking_key: str
+    ) -> bool:
+        """Attempt to bind (or quarantine) ONE candidate teammate sidechain file
+        for the top-level Agent glob (§2 binding + §3 discovery-quarantine).
+
+        Returns True when the file is SEVERED from run-state (the caller must pass
+        ``feed_run_state=False`` for it this tick and forever after). Returns False
+        for a non-teammate file, an already-bound current_key, or an
+        indeterminate/retry gate (feed run-state normally).
+
+        Decision table for a candidate whose normalized key matches a registered
+        teammate name:
+          - already this teammate's ``current_key``           → bind stands (False)
+          - ``key in retired_keys``                           → quarantine (True)
+          - ``current_key`` occupied by a DIFFERENT key       → quarantine (True)
+          - gate returns False (stale prior gen)              → quarantine (True)
+          - gate returns None (retry)                         → no bind (False)
+          - gate returns True                                 → BIND (False)
+        """
+        stem = sc_file.stem
+        normalized = normalize_background_agent_key(stem)
+        rec = self._resolve_teammate_name_for_stem(parent_session_id, normalized)
+        if rec is None:
+            return False  # not a registered teammate → normal Agent sidechain
+        if rec.current_key == normalized:
+            return False  # already bound to this teammate → run-state normally
+        if normalized in rec.retired_keys:
+            self._quarantine_teammate_stem(parent_session_id, rec, normalized)
+            return True
+        if rec.current_key is not None:
+            # current_key occupied by a different key → this same-name file is a
+            # stale/sibling that must never record live (the sequential-ambiguity
+            # strand pin).
+            self._quarantine_teammate_stem(parent_session_id, rec, normalized)
+            return True
+        gate = self._teammate_bind_gate_passes(rec, sc_file)
+        if gate is None:
+            return False  # indeterminate — retry next tick, no run-state harm
+        if gate is False:
+            self._quarantine_teammate_stem(parent_session_id, rec, normalized)
+            return True
+        self._bind_teammate_key(parent_session_id, rec, normalized)
+        return False
+
+    def _try_bind_tracked_teammate_stems(
+        self, parent_session_id: str, name: str
+    ) -> None:
+        """§2 spawn step (5): a pre-spawn scan — attempt binding on the surviving
+        already-tracked, unretired matching stems for ``name`` (a sidechain
+        discovered BEFORE the spawn parsed must still bind). A gen>=2 simultaneity
+        (multiple candidates pass the strict gate at once) binds NONE + WARNs
+        fail-dark."""
+        recs = self._teammate_registry.get(parent_session_id)
+        rec = recs.get(name) if recs else None
+        if rec is None or rec.current_key is not None:
+            return
+        tracked = self.state.get_session(parent_session_id)
+        if tracked is None or not tracked.file_path:
+            return
+        sub_dir = Path(tracked.file_path).parent / parent_session_id / "subagents"
+        candidates: list[tuple[str, Path]] = []
+        for tk, key in self._tracked_teammate_stems(parent_session_id, name):
+            if key in rec.retired_keys:
+                continue
+            sc_file = sub_dir / f"{tk.split(':')[-1]}.jsonl"
+            gate = self._teammate_bind_gate_passes(rec, sc_file)
+            if gate is True:
+                candidates.append((key, sc_file))
+            elif gate is False:
+                self._quarantine_teammate_stem(parent_session_id, rec, key)
+        if len(candidates) > 1 and rec.spawn_generation >= 2:
+            logger.warning(
+                "teammate bind: %d simultaneous gen>=2 candidates for name=%r "
+                "parent=%s — binding NONE (fail-dark)",
+                len(candidates),
+                name,
+                parent_session_id[:8],
+            )
+            return
+        if candidates:
+            key, _sc = candidates[0]
+            self._bind_teammate_key(parent_session_id, rec, key)
 
     def _open_workflow_bracket(self, parent_session_id: str, info: Any) -> None:
         """Open a persistent Workflow bracket (ISSUE-6 / Fix 2c).
@@ -1521,7 +1973,38 @@ class SessionMonitor:
                     ):
                         from .handlers.response_builder import (
                             extract_async_agent_launch_id,
+                            teammate_spawn_info_from_meta,
                         )
+
+                        # GH #46 PR-2: an agent-teams teammate SPAWN — a DIFFERENT
+                        # tool_result shape from a plain async Agent launch
+                        # (``status=="teammate_spawned"`` + snake ``agent_id``, no
+                        # camelCase ``agentId``, so the prose regex below never
+                        # matches it). Register/rotate the teammate in the
+                        # generational registry; the launched key is emitted
+                        # LATER, at binding, once its sidechain stem appears.
+                        # STRUCTURED-ONLY — a prose ``Spawned successfully.`` line
+                        # without the meta fires a rate-limited drift WARNING (the
+                        # T1.6 pattern), never a lift.
+                        spawn = teammate_spawn_info_from_meta(entry.tool_result_meta)
+                        if spawn is not None:
+                            self._record_teammate_spawn(session_info.session_id, spawn)
+                        elif (
+                            entry.text
+                            and "Spawned successfully." in entry.text
+                            and entry.tool_result_meta is None
+                        ):
+                            tuid = entry.tool_use_id or ""
+                            if tuid not in self._teammate_spawn_drift_warned:
+                                self._teammate_spawn_drift_warned.add(tuid)
+                                logger.warning(
+                                    "teammate spawn: prose announces a spawn but the "
+                                    "structured toolUseResult (status="
+                                    "'teammate_spawned') is absent (tool_use_id=%s) "
+                                    "— Claude Code spawn-result format may have "
+                                    "drifted; NOT registering from prose",
+                                    tuid or "?",
+                                )
 
                         launch_id = extract_async_agent_launch_id(entry.text)
                         if launch_id:
@@ -1633,6 +2116,7 @@ class SessionMonitor:
                         # agentId == the ``<task-notification>`` close key.
                         from .handlers.response_builder import (
                             resumed_agent_id_from_meta,
+                            teammate_send_target_from_meta,
                         )
 
                         resumed_id = resumed_agent_id_from_meta(entry.tool_result_meta)
@@ -1647,6 +2131,45 @@ class SessionMonitor:
                             # then record the resume ts (max-preferring-parseable).
                             rec.completed.discard(key)
                             _record_resume_ts(rec.resumed, key, resume_ts)
+                        else:
+                            # GH #46 PR-2: a ``SendMessage`` to a teammate by NAME
+                            # (``routing.target == "@<name>"``, NO resumedAgentId)
+                            # WAKES it. DISJOINT from the resume lane above (0
+                            # overlap — verified). Cross-check the paired tool_use
+                            # ``input["to"] == <name>`` (Hermes r2 P2-2): a mismatch
+                            # REFUSES the wake + WARNs; an UNAVAILABLE input
+                            # (tool_use outside the scanned region) fails closed (no
+                            # wake). BOUND → relight the current_key; UNBOUND →
+                            # buffer pending_wake.
+                            target = teammate_send_target_from_meta(
+                                entry.tool_result_meta
+                            )
+                            if target is not None:
+                                to_field = (
+                                    entry.tool_input.get("to")
+                                    if isinstance(entry.tool_input, dict)
+                                    else None
+                                )
+                                if to_field == target:
+                                    self._record_teammate_wake(
+                                        session_info.session_id,
+                                        target,
+                                        parse_iso_timestamp(entry.timestamp),
+                                    )
+                                elif to_field is None:
+                                    logger.warning(
+                                        "teammate wake: routing.target=@%s but the "
+                                        "paired SendMessage input.to is unavailable "
+                                        "— refusing the wake (fail closed)",
+                                        target,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "teammate wake: routing.target=@%s != "
+                                        "input.to=%r — refusing the wake",
+                                        target,
+                                        to_field,
+                                    )
                     elif (
                         entry.role == "user"
                         and entry.content_type == "text"
@@ -1859,15 +2382,29 @@ class SessionMonitor:
             except OSError:
                 sidechain_files = []
 
+            severed = self._severed_teammate_stems.get(parent_session_id)
             for sc_file in sidechain_files:
                 # sc_file.stem looks like "agent-a05666f9d196136af"
                 tracking_key = f"sub:{parent_session_id}:{sc_file.stem}"
+                # GH #46 PR-2: a teammate registry may bind this stem (emit its
+                # launched key + apply pending wake/park) OR QUARANTINE it (a
+                # stale/sibling same-name file) — a quarantined stem is SEVERED
+                # from run-state tick emission (feed_run_state=False) but still
+                # tailed for DISPLAY, so a non-current same-name key can never
+                # record live. An already-severed stem stays severed forever.
+                feed_run_state = True
+                if severed is not None and tracking_key in severed:
+                    feed_run_state = False
+                elif self._try_bind_or_quarantine_teammate_file(
+                    parent_session_id, sc_file, tracking_key
+                ):
+                    feed_run_state = False
                 await self._track_and_emit_sidechain_file(
                     parent_session_id=parent_session_id,
                     sc_file=sc_file,
                     tracking_key=tracking_key,
                     new_messages=new_messages,
-                    feed_run_state=True,
+                    feed_run_state=feed_run_state,
                 )
 
             # ISSUE-6 / Fix 5 PR-B (DISPLAY ONLY): a Workflow's sub-agents live
@@ -2100,6 +2637,12 @@ class SessionMonitor:
         # session-change cleanup, the deleted-window cleanup, and both startup
         # sweeps).
         self._open_workflow_brackets.pop(parent_session_id, None)
+        # GH #46 PR-2: the teammate registry (incl. retired_keys) + the severed
+        # stem set die with the parent, mirroring the per-parent state above.
+        # NOT restart-reconciled (disclosed — a mid-leg teammate is not relit
+        # after kickstart, same class as background-Bash T1.4b).
+        self._teammate_registry.pop(parent_session_id, None)
+        self._severed_teammate_stems.pop(parent_session_id, None)
         prefix = f"sub:{parent_session_id}:"
         stale = [k for k in self.state.tracked_sessions if k.startswith(prefix)]
         for k in stale:
