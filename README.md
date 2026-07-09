@@ -52,6 +52,8 @@ cc-telegram              # foreground, or daemonize on macOS with: bash bin/inst
 - Telegram bot token from [@BotFather](https://t.me/BotFather)
 - A Telegram supergroup with forum topics enabled
 
+> **Windows:** the bot requires tmux and therefore runs under WSL2 — the bot, tmux, and the Claude Code sessions it drives all live inside WSL. See **[docs/windows-wsl.md](docs/windows-wsl.md)** for setup and for sharing Claude Code skills/settings between WSL and a native Windows install.
+
 ## Install
 
 Two modes — pick one.
@@ -391,6 +393,7 @@ bin/install-service.sh              generate + load the com.cc-telegram LaunchAg
 bin/install-log-rotate.sh           install the log-rotation LaunchAgent
 .claude/rules/                      architecture notes loaded by Claude Code
 docs/DEPLOYMENT.md                  end-to-end deploy + upgrade + troubleshooting guide
+docs/windows-wsl.md                 Windows/WSL2 setup + sharing Claude Code config across WSL and native Windows
 AGENTS.md                           top-level orientation for code agents
 CLAUDE.md                           build/test commands + core design constraints
 ```
