@@ -1022,6 +1022,19 @@ async def apply_sidechain_activity(
                         end_turn_ts=tick.max_end_turn_ts,
                         end_turn_ts_unparseable=tick.end_turn_ts_unparseable,
                     )
+            # GH #46 PR-1: agent-teams teammate parks — a teammate leg ends in
+            # plain text (no sidechain end-of-turn, no <task-notification>), so
+            # its parent-transcript idle_notification is the ONLY close signal.
+            # Applied BEFORE the parent-done loop, sharing the SIDECHAIN cross-file
+            # ts-gate (a stale prior-leg park keeps a resumed key LIVE).
+            for key, (park_ts, park_ts_unparseable) in rec.teammate_parks.items():
+                await route_runtime.mark_background_agent_done(
+                    route,
+                    key,
+                    source=route_runtime.BgDoneSource.TEAMMATE,
+                    end_turn_ts=park_ts,
+                    end_turn_ts_unparseable=park_ts_unparseable,
+                )
             for key in rec.completed:
                 # Fix C: PARENT-source done (<task-notification>) — same file as
                 # the resume, so the monitor already net-resolved a same-batch

@@ -71,6 +71,20 @@ def _is_task_notification_user_event(event: TranscriptEvent) -> bool:
     return is_task_notification(event.text)
 
 
+def _is_teammate_message_user_event(event: TranscriptEvent) -> bool:
+    """GH #46: stamp machine-initiated agent-teams teammate user events so
+    ``route_runtime`` classifies them (like a ``<task-notification>``) as
+    machine-initiated — preserving background-agent tombstones/stash/pane-bit
+    rather than resetting them as a genuine user turn would. Deferred import
+    (the byte-0-anchored envelope predicate lives in ``utils``, re-exported by
+    ``handlers.response_builder``), mirroring the task-notification twin."""
+    if event.role != "user" or event.block_type != "text":
+        return False
+    from .handlers.response_builder import is_teammate_message
+
+    return is_teammate_message(event.text)
+
+
 def to_lifecycle_event(event: TranscriptEvent) -> TranscriptLifecycleEvent | None:
     """Translate a raw ``TranscriptEvent`` into the normalized lifecycle
     shape that ``route_runtime`` consumes.
@@ -105,6 +119,7 @@ def to_lifecycle_event(event: TranscriptEvent) -> TranscriptLifecycleEvent | Non
         stop_reason=event.stop_reason,
         timestamp=_parse_event_timestamp(event.timestamp),
         is_task_notification=_is_task_notification_user_event(event),
+        is_teammate_notification=_is_teammate_message_user_event(event),
     )
 
 

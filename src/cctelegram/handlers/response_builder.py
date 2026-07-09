@@ -33,9 +33,15 @@ from ..transcript_parser import TranscriptParser
 from ..utils import _TASK_NOTIF_RE as _TASK_NOTIF_RE
 from ..utils import _TASK_NOTIF_TAG_RE as _TASK_NOTIF_TAG_RE
 from ..utils import (
+    TEAMMATE_ENVELOPE_SCAN_BYTES as TEAMMATE_ENVELOPE_SCAN_BYTES,
+)
+from ..utils import (
     extract_task_notification_task_id as extract_task_notification_task_id,
 )
 from ..utils import is_task_notification as is_task_notification
+from ..utils import is_teammate_message as is_teammate_message
+from ..utils import parse_iso_timestamp as parse_iso_timestamp
+from ..utils import teammate_envelope_payloads as teammate_envelope_payloads
 
 
 # The async-launch background discriminator (GH #44 §3.2a). Anchored on the
@@ -265,6 +271,63 @@ def resumed_agent_id_from_meta(meta: object) -> str | None:
     if not isinstance(rid, str) or not rid.strip():
         return None
     return rid
+
+
+@dataclass(frozen=True)
+class TeammateIdle:
+    """A parsed teammate ``idle_notification`` (GH #46 PR-1).
+
+    ``name`` — the ``from`` field (the teammate's name, e.g.
+    ``explore-skill-dispatch``). ``park_ts`` — the parked-at wall-clock epoch,
+    or ``None`` when the ``timestamp`` field is missing or unparseable.
+    ``park_ts_unparseable`` — True whenever ``park_ts`` is ``None`` (fail-closed:
+    the teammate park-close then tombstones UNCONDITIONALLY at the
+    ``BgDoneSource.TEAMMATE`` ts-gate — false-dark over false-typing).
+    """
+
+    name: str
+    park_ts: float | None
+    park_ts_unparseable: bool
+
+
+def parse_teammate_idle_notifications(text: str) -> list[TeammateIdle]:
+    """Strict parse of EVERY teammate ``idle_notification`` in ``text`` (GH #46).
+
+    One parent user entry can carry MULTIPLE ``<teammate-message>`` envelopes
+    (real-data verified — the 2026-07-09T15:56:55.336Z entry carries two, and
+    the SECOND names the teammate whose leg has no other close signal; review
+    P1), so this consumes the decoded payload of every structurally-valid
+    envelope from the shared ``utils.teammate_envelope_payloads`` scanner (the
+    SAME structural + raw_decode judgment as ``is_teammate_message`` — review
+    P2/r2, so the two can never diverge) and returns one ``TeammateIdle`` per
+    payload that is an idle notification, in envelope order. Requires
+    ``type == "idle_notification"`` and a non-empty str ``from`` (⇒ ``name``);
+    other payload shapes (teammate reports etc.) contribute nothing — the
+    predicate still classifies the ENTRY machine-initiated when at least one
+    envelope carries a decodable JSON payload; only parks come from here.
+    ``park_ts`` is the parsed ``timestamp`` (``None`` when missing/
+    unparseable); ``park_ts_unparseable`` mirrors ``park_ts is None`` so a
+    None stamp fails closed to an unconditional done downstream.
+    """
+    out: list[TeammateIdle] = []
+    for payload in teammate_envelope_payloads(text):
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") != "idle_notification":
+            continue
+        name = payload.get("from")
+        if not isinstance(name, str) or not name:
+            continue
+        ts_raw = payload.get("timestamp")
+        park_ts = parse_iso_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+        # Fail-closed: any None stamp (missing OR unparseable) marks the park
+        # unparseable so the TEAMMATE done tombstones unconditionally.
+        out.append(
+            TeammateIdle(
+                name=name, park_ts=park_ts, park_ts_unparseable=park_ts is None
+            )
+        )
+    return out
 
 
 def _render_task_notification(text: str) -> str | None:
