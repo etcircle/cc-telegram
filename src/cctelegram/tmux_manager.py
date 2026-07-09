@@ -319,8 +319,8 @@ class TmuxManager:
     # command names), so split-by-separator is normally unambiguous. Some tmux
     # builds (e.g. tmux 3.4) emit this control byte as its literal octal escape
     # "\037" rather than the raw byte, so both forms are accepted; a line that
-    # does not contain exactly five delimiters of a single form is treated as
-    # ambiguous and handed to the libtmux fallback (see `_list_windows_direct`).
+    # does not contain exactly five delimiters of a single form (and zero of
+    # the other) is ambiguous and skipped (see `_list_windows_direct`).
     _PANE_FIELD_SEP = "\x1f"
     # The literal octal-escape form some tmux builds emit for the separator.
     _ESCAPED_FIELD_SEP = "\\037"
@@ -382,14 +382,16 @@ class TmuxManager:
                 continue
             # Accept either separator form (raw 0x1F, or the literal "\037" that
             # some tmux builds — e.g. tmux 3.4 — emit for that control byte), but
-            # only when exactly five delimiters of a single form are present.
-            # Anything else (wrong field count, a value that itself contains a
-            # delimiter, or a mix of both forms) is malformed for our purposes
-            # and skipped so the remaining valid lines are still parsed. Normal
-            # lines keep the fast single-subprocess path across tmux versions.
+            # only when exactly five delimiters of a SINGLE form are present and
+            # ZERO of the other form (each branch is symmetric — a raw line with
+            # a literal "\037" inside a field value is mixed-form too). Anything
+            # else (wrong field count, a value that itself contains a delimiter,
+            # or a mix of both forms) is malformed for our purposes and skipped
+            # so the remaining valid lines are still parsed. Normal lines keep
+            # the fast single-subprocess path across tmux versions.
             raw_count = line.count(self._PANE_FIELD_SEP)
             esc_count = line.count(self._ESCAPED_FIELD_SEP)
-            if raw_count == 5:
+            if raw_count == 5 and esc_count == 0:
                 parts = line.split(self._PANE_FIELD_SEP)
             elif raw_count == 0 and esc_count == 5:
                 parts = line.split(self._ESCAPED_FIELD_SEP)

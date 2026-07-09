@@ -178,6 +178,48 @@ async def test_list_windows_direct_parses_escaped_separator(
 
 
 @pytest.mark.asyncio
+async def test_list_windows_direct_skips_raw_line_with_escaped_in_field(
+    manager: TmuxManager,
+) -> None:
+    """A raw-separated line whose field VALUE contains the literal "\\037" is
+    mixed-form and therefore ambiguous — it must be skipped, never parsed via
+    the raw branch (hermes port-review P2)."""
+    sess = config.tmux_session_name
+    mixed = _row(sess, "@3", f"bad{ESC_SEP}name", "1", "/x", "claude")
+    valid = _row(sess, "@4", "good", "1", "/y", "claude")
+    stdout = ("\n".join([mixed, valid]) + "\n").encode("utf-8")
+
+    with patch(
+        "cctelegram.tmux_manager.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=_make_proc(stdout=stdout)),
+    ):
+        windows = await manager._list_windows_direct()
+
+    assert [w.window_id for w in windows] == ["@4"]
+
+
+@pytest.mark.asyncio
+async def test_list_windows_direct_skips_escaped_line_with_raw_in_field(
+    manager: TmuxManager,
+) -> None:
+    """An escaped-separated line whose field VALUE contains a raw \\x1f is
+    mixed-form and therefore ambiguous — the escaped branch requires zero raw
+    separators, so it must be skipped (symmetry pin)."""
+    sess = config.tmux_session_name
+    mixed = _esc_row(sess, "@5", f"bad{SEP}name", "1", "/x", "claude")
+    valid = _esc_row(sess, "@6", "good", "1", "/y", "claude")
+    stdout = ("\n".join([mixed, valid]) + "\n").encode("utf-8")
+
+    with patch(
+        "cctelegram.tmux_manager.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=_make_proc(stdout=stdout)),
+    ):
+        windows = await manager._list_windows_direct()
+
+    assert [w.window_id for w in windows] == ["@6"]
+
+
+@pytest.mark.asyncio
 async def test_list_windows_direct_falls_back_on_nonzero_exit(
     manager: TmuxManager,
 ) -> None:
