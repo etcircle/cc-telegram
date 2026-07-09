@@ -169,7 +169,11 @@ Additional modules:
                                 drift): stored-idle + live key ⇒ visible
                                 RUNNING (typing + 🟡 Busy); a committed
                                 notification_pending projects WAITING above
-                                the lift. Marks: mark_background_agent_
+                                the lift. The same helper derives the read-only
+                                background_only snapshot field (stored-idle +
+                                projected RUNNING on live bg keys, False when the
+                                🔔 lift outranks) for the poller's labeled-silence
+                                card. Marks: mark_background_agent_
                                 activity (keyed Wave A successor — heartbeat +
                                 pane-false-idle resurrection unqualified; idle
                                 key SET strictly ts-qualified vs
@@ -393,7 +397,12 @@ Handler modules (handlers/):
                         since the side-file-form and pane-form fingerprints differ)
                         vs the live source; on mismatch re-render via
                         handle_interactive_ui so the first tap dispatches (the
-                        read-TTL itself is untouched). The D3-β sibling.
+                        read-TTL itself is untouched). The D3-β sibling. Also
+                        posts the edge-triggered background-only "labeled
+                        silence" card (_maybe_post_bg_only_card off
+                        snapshot.background_only + the poller-local one-shot
+                        _bg_only_card_posted cache) once per episode when a
+                        parent-idle route stays projected-Busy on live bg keys.
   response_builder.py ─ Response pagination and formatting
   interactive_ui.py   ─ AskUserQuestion / ExitPlanMode UI + the flag-gated
                         Permission / Workflow approval-gate cards (display-only

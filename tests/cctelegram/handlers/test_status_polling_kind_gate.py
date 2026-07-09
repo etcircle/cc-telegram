@@ -51,6 +51,7 @@ def _env(tmp_path, monkeypatch):
     status_polling._last_pane_capture.clear()
     status_polling._prev_run_state.clear()
     status_polling._decision_card_eot_grace.clear()
+    status_polling._bg_only_card_posted.clear()
     yield tmp_path
     session_manager.window_states.pop(_WID, None)
     route_runtime.reset_for_tests()
@@ -58,6 +59,7 @@ def _env(tmp_path, monkeypatch):
     status_polling._last_pane_capture.clear()
     status_polling._prev_run_state.clear()
     status_polling._decision_card_eot_grace.clear()
+    status_polling._bg_only_card_posted.clear()
 
 
 def _write_record(
@@ -145,8 +147,15 @@ async def test_idle_prompt_on_projected_busy_route_is_dropped(_env, mock_bot):
     assert snap.run_state is RunState.RUNNING  # projection lift intact
     assert snap.typing_eligible is True  # typing NOT dark
     assert not path.exists()  # generation-guarded unlink of the dropped record
-    # No decision card was posted (the spurious "🔔 needs a decision" nudge).
-    assert not mock_bot.send_message.called
+    # No spurious "🔔 needs a decision" nudge was posted. (The labeled-silence
+    # background-only card is a SEPARATE, correct surface on this projected-busy
+    # shape and does post — filter it out; it never carries "decision".)
+    decision_sends = [
+        c
+        for c in mock_bot.send_message.call_args_list
+        if "decision" in str(c.kwargs.get("text", "")).lower()
+    ]
+    assert decision_sends == []
 
 
 async def test_idle_prompt_on_plain_idle_route_is_dropped(_env, mock_bot):

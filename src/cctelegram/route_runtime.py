@@ -481,6 +481,17 @@ class RouteRuntimeSnapshot:
     # whether to KEEP the decision card (the END_OF_TURN projected-Busy gap)
     # or dismiss it. Defaulted so pre-Fix-3a constructors stay valid.
     notification_clear_reason: NotificationClearReason | None = None
+    # Background-only episode marker: True IFF the STORED run_state is idle
+    # AND the GH #44 projection lifted the VISIBLE run_state to RUNNING purely
+    # on account of live background keys (parent idle, only a background task
+    # keeps the route Busy — typing on, topic silent). False whenever a
+    # committed ``notification_pending`` outranks the lift to WAITING (the 🔔
+    # decision card owns that state) or the stored state is itself active.
+    # Computed ONLY in ``_build_snapshot`` from the same ``live_bg`` /
+    # ``projected`` the projection uses (no duplicate-freeze drift). The poller
+    # reads it to post ONE labeled-silence line per episode. Defaulted so
+    # pre-existing constructors stay valid.
+    background_only: bool = False
 
 
 @dataclass
@@ -818,6 +829,15 @@ def _build_snapshot(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
     paths (hermes r2 P3-1)."""
     live_bg = _live_background_keys(st)
     projected = _projected_run_state(st, live_bg)
+    # Background-only episode: the stored state is idle and the projection
+    # lifted the VISIBLE state to RUNNING solely on live background keys (a
+    # committed ``notification_pending`` would have projected WAITING above the
+    # lift — see ``_projected_run_state`` — so this is False there).
+    background_only = (
+        projected is RunState.RUNNING
+        and st.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+        and bool(live_bg)
+    )
     return RouteRuntimeSnapshot(
         route=route,
         run_state=projected,
@@ -838,6 +858,7 @@ def _build_snapshot(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
         last_user_turn_at=st.last_user_turn_at,
         last_assistant_turn_ended_at=st.last_assistant_turn_ended_at,
         background_agents=live_bg,
+        background_only=background_only,
     )
 
 

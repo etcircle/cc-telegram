@@ -995,3 +995,81 @@ async def test_no_live_bg_key_holds_notification(monkeypatch):
     snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 4)
     assert snap.notification_pending is True
     assert snap.notification_clear_reason is not NotificationClearReason.BG_RUNNING
+
+
+# ── background_only snapshot field (labeled-silence card derivation) ──────
+
+
+async def test_background_only_true_on_stored_idle_with_live_launched_key():
+    """The projection lifted a parent-idle route to RUNNING purely on a live
+    background key → ``background_only`` True (the labeled-silence episode)."""
+    await _idle_transcript(end_ts=100.0)
+    snap = await route_runtime.mark_background_agent_launched(ROUTE, KEY)
+    assert snap.run_state is RunState.RUNNING  # projected lift
+    assert snap.background_agents == (KEY,)
+    assert snap.background_only is True
+    # A pure snapshot read applies the same derivation.
+    assert route_runtime.snapshot(ROUTE).background_only is True
+
+
+async def test_background_only_false_when_stored_state_active():
+    """A FOREGROUND-active route (stored RUNNING) with a bg key is NOT a
+    background-only episode — the parent itself is busy."""
+    await route_runtime.mark_inbound_sent(ROUTE)  # stored RUNNING
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, 50.0)
+    assert snap.run_state is RunState.RUNNING
+    assert snap.background_agents == (KEY,)
+    assert _st().run_state is RunState.RUNNING  # stored, not idle
+    assert snap.background_only is False
+
+
+async def test_background_only_false_when_notification_outranks_lift():
+    """A committed 🔔 projects WAITING above the lift → ``background_only`` False
+    (the decision card owns that state; the silence card must not double-signal)."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_launched(ROUTE, KEY)
+    result = await route_runtime.mark_notification_pending(
+        ROUTE, set_at=T0 + 10, generation="g1"
+    )
+    assert result is NotificationMarkResult.COMMITTED_LIVE
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.notification_pending is True
+    assert snap.background_only is False
+
+
+async def test_background_only_false_with_no_live_keys():
+    """Plain idle route (no background keys) → ``background_only`` False."""
+    await _idle_transcript(end_ts=100.0)
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+    assert snap.background_only is False
+
+
+async def test_background_only_false_after_done_tombstone():
+    """A done-tombstoned key is not live → the episode ends, ``background_only``
+    goes False."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_launched(ROUTE, KEY)
+    assert route_runtime.snapshot(ROUTE).background_only is True
+    snap = await route_runtime.mark_background_agent_done(ROUTE, KEY)
+    assert snap.background_agents == ()
+    assert snap.background_only is False
+
+
+async def test_background_only_false_after_ttl_expiry(monkeypatch):
+    """A TTL-expired key drops out of the live set → ``background_only`` False."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_launched(ROUTE, KEY)
+    assert route_runtime.snapshot(ROUTE).background_only is True
+    monkeypatch.setattr(
+        route_runtime, "_wall_now", lambda: T0 + BG_BACKGROUND_TTL_SECONDS + 5
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.background_agents == ()
+    assert snap.background_only is False
+
+
+async def test_default_snapshot_background_only_false():
+    """An unseen route's default snapshot carries ``background_only`` False."""
+    assert route_runtime.snapshot((99, 99, "@99")).background_only is False
