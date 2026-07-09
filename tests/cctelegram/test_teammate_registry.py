@@ -320,10 +320,25 @@ def _spawn_meta_for(name: str) -> dict:
     }
 
 
-def _append_spawn(parent_jsonl, name: str, make_jsonl_entry, make_tool_use_block):
+def _append_spawn(
+    parent_jsonl,
+    name: str,
+    make_jsonl_entry,
+    make_tool_use_block,
+    spawn_ts: str | None = None,
+):
     """A teammate spawn: an Agent tool_use + its tool_result carrying the
     structured ``teammate_spawned`` toolUseResult (its text is snake ``agent_id:``,
-    which the plain-Agent ``agentId:`` regex never matches)."""
+    which the plain-Agent ``agentId:`` regex never matches).
+
+    ``spawn_ts`` is the tool_result's JSONL EVENT timestamp (CC's write instant) —
+    ``_record_teammate_spawn`` anchors ``spawned_ts`` to it, NOT the monitor's
+    parse instant (the adversarial-review P1 fix). It must be the SAME CC-clock as
+    the sidechain's first-entry ts so the binding gate compares apples to apples.
+    Defaults to the current UTC instant (correct-TZ, unlike ``make_jsonl_entry``'s
+    local-as-UTC strftime default), so a same-clock sidechain first entry binds."""
+    if spawn_ts is None:
+        spawn_ts = _iso(time.time())
     _append(
         parent_jsonl,
         [
@@ -331,6 +346,7 @@ def _append_spawn(parent_jsonl, name: str, make_jsonl_entry, make_tool_use_block
                 "assistant",
                 [make_tool_use_block("tu_spawn", "Agent", {"prompt": "go"})],
                 session_id=PARENT,
+                timestamp=spawn_ts,
             ),
             make_jsonl_entry(
                 "user",
@@ -351,6 +367,7 @@ def _append_spawn(parent_jsonl, name: str, make_jsonl_entry, make_tool_use_block
                     }
                 ],
                 session_id=PARENT,
+                timestamp=spawn_ts,
                 tool_use_result=_spawn_meta_for(name),
             ),
         ],
@@ -898,6 +915,50 @@ async def test_respawn_quarantines_untracked_disk_stem_before_first_bind(
 
 
 # ── first-entry-ts binding gate ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_gen2_binds_when_spawn_event_ts_precedes_monitor_parse(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """Adversarial-review P1 regression: the poll LAGS CC's write, so the genuine
+    gen-2 file's first entry is at ~the spawn's JSONL EVENT ts, which is EARLIER
+    than the monitor's parse wall-clock. ``spawned_ts`` must anchor to the spawn
+    EVENT ts (not ``time.time()`` at parse), else the gen>=2 STRICT gate
+    (``first_ts >= spawned_ts``) rejects the genuine file and the teammate goes
+    DARK on every respawn."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    # A spawn EVENT ts firmly in the PAST relative to the monitor's parse now, so
+    # if the code used time.time() the gen-2 gate would reject a same-event-ts file.
+    spawn_ts_wall = time.time() - 30
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(spawn_ts_wall)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    # Respawn at a slightly later event ts (still in the past vs parse-now).
+    respawn_event = spawn_ts_wall + 5
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(respawn_event)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert rec.spawn_generation == 2
+    # spawned_ts is the EVENT ts (past), NOT parse-now.
+    assert rec.spawned_ts < time.time() - 10
+
+    # The genuine gen-2 file's first entry is at the respawn event instant, and its
+    # mtime is at the event instant too — both < parse-now. It MUST bind.
+    key = _key_for(_NAME, "beadfeed00112233")
+    sc = _write_sidechain(sub_dir, key, _iso(respawn_event + 0.1))
+    import os
+
+    os.utime(sc, (respawn_event + 0.1, respawn_event + 0.1))
+    await monitor.check_sidechain_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert act[PARENT].launched == {key}  # NOT dark — binds despite the poll lag
+    assert monitor._teammate_registry[PARENT][_NAME].current_key == key
 
 
 @pytest.mark.asyncio

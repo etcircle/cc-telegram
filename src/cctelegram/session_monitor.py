@@ -780,15 +780,37 @@ class SessionMonitor:
                 pass
         return keys
 
-    def _record_teammate_spawn(self, parent_session_id: str, info: Any) -> None:
+    def _record_teammate_spawn(
+        self, parent_session_id: str, info: Any, spawn_event_ts: float | None
+    ) -> None:
         """A teammate SPAWN (``response_builder.TeammateSpawnInfo``) on the parent
         tool_result lane (§2 spawn).
 
         NEW name → create a gen-1 rec. EXISTING name → generation rotation (close
         + quarantine + bump). After either, a PRE-SPAWN scan attempts binding on
         surviving already-tracked unbound matching stems (a sidechain discovered
-        BEFORE the spawn parsed must still bind)."""
-        spawned_ts = time.time()
+        BEFORE the spawn parsed must still bind).
+
+        ``spawn_event_ts`` is the spawn tool_result's JSONL EVENT timestamp (CC's
+        actual write instant, ≈ the teammate's first sidechain-entry time), NOT the
+        monitor's parse instant — the poll can lag CC's write by up to the poll
+        interval, and the binding gate compares ``spawned_ts`` against the
+        candidate file's first-entry ts + mtime (both CC/filesystem wall-clock at
+        the real spawn). Using ``time.time()`` here would set ``spawned_ts`` AFTER
+        the genuine new-gen file's first entry, so the gen>=2 STRICT gate
+        (``first_ts >= spawned_ts``) would reject it and the teammate would go DARK
+        on every respawn (adversarial-review P1). An unparseable event ts falls
+        back to ``time.time()`` with a WARNING — a rare disclosed degradation
+        (the gen>=2 respawn may go dark that leg; fail-DARK over a wrong lift)."""
+        spawned_ts = spawn_event_ts
+        if spawned_ts is None:
+            spawned_ts = time.time()
+            logger.warning(
+                "teammate spawn: unparseable event ts for name=%r parent=%s — "
+                "falling back to wall clock (a gen>=2 respawn may go dark this leg)",
+                info.name,
+                parent_session_id[:8],
+            )
         recs = self._teammate_recs(parent_session_id)
         rec = recs.get(info.name)
         if rec is None:
@@ -1988,7 +2010,11 @@ class SessionMonitor:
                         # T1.6 pattern), never a lift.
                         spawn = teammate_spawn_info_from_meta(entry.tool_result_meta)
                         if spawn is not None:
-                            self._record_teammate_spawn(session_info.session_id, spawn)
+                            self._record_teammate_spawn(
+                                session_info.session_id,
+                                spawn,
+                                parse_iso_timestamp(entry.timestamp),
+                            )
                         elif (
                             entry.text
                             and "Spawned successfully." in entry.text
