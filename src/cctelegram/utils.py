@@ -74,6 +74,47 @@ def extract_task_notification_task_id(text: str) -> str | None:
     return None
 
 
+# The agent-teams teammate ``idle_notification`` envelope (GH #46 PR-1). A
+# teammate's park report lands on the PARENT transcript as a ``type:"user"``
+# text entry that begins with the sentinel line below and wraps a
+# ``<teammate-message …>…</teammate-message>`` envelope. Scan ONLY the first
+# ``TEAMMATE_ENVELOPE_SCAN_BYTES`` bytes for the closing tag — a huge unclosed
+# body must never trigger an unbounded scan; a not-closed-within-bound envelope
+# fails CLOSED to genuine-user (never suppressing a real human turn).
+TEAMMATE_ENVELOPE_SCAN_BYTES = 65536
+
+_TEAMMATE_FIRST_LINE = "Another Claude session sent a message:"
+_TEAMMATE_CLOSE_TAG = "</teammate-message>"
+# Byte-0 anchored: line 1 EXACTLY the sentinel (trailing ``\r`` tolerated for
+# CRLF; a leading BOM/whitespace makes ``\A`` miss → rejected), zero+
+# blank/whitespace-only lines, then a line starting ``<teammate-message`` with a
+# trailing word boundary (``<teammate-message>`` or ``<teammate-message …>``).
+_TEAMMATE_HEAD_RE = re.compile(
+    r"\AAnother Claude session sent a message:\r?\n"
+    r"(?:[^\S\n]*\r?\n)*"
+    r"<teammate-message\b"
+)
+
+
+def is_teammate_message(text: str) -> bool:
+    """True when ``text`` is an agent-teams teammate-message envelope (GH #46).
+
+    A teammate's ``idle_notification`` (and every other teammate message) is
+    delivered to the PARENT as a machine-initiated ``type:"user"`` text entry;
+    ``route_runtime`` and the adapter use this predicate to classify it as
+    machine-initiated (preserving background-agent tombstones/stash/pane-bit)
+    rather than a genuine user turn. Byte-0 anchored + bounded scan — fail-closed
+    to genuine-user on ANY drift (a longer first line, a leading BOM/space, an
+    envelope not closed within ``TEAMMATE_ENVELOPE_SCAN_BYTES``).
+    """
+    if not text:
+        return False
+    prefix = text[:TEAMMATE_ENVELOPE_SCAN_BYTES]
+    if _TEAMMATE_HEAD_RE.match(prefix) is None:
+        return False
+    return _TEAMMATE_CLOSE_TAG in prefix
+
+
 def normalize_background_agent_key(raw: str) -> str:
     """The GH #44 §3.0 single key-normalization contract.
 

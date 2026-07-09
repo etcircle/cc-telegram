@@ -13,6 +13,7 @@ Key function:
   - build_response_parts: Build paginated response messages
 """
 
+import json
 import re
 from dataclasses import dataclass
 
@@ -33,9 +34,14 @@ from ..transcript_parser import TranscriptParser
 from ..utils import _TASK_NOTIF_RE as _TASK_NOTIF_RE
 from ..utils import _TASK_NOTIF_TAG_RE as _TASK_NOTIF_TAG_RE
 from ..utils import (
+    TEAMMATE_ENVELOPE_SCAN_BYTES as TEAMMATE_ENVELOPE_SCAN_BYTES,
+)
+from ..utils import (
     extract_task_notification_task_id as extract_task_notification_task_id,
 )
 from ..utils import is_task_notification as is_task_notification
+from ..utils import is_teammate_message as is_teammate_message
+from ..utils import parse_iso_timestamp as parse_iso_timestamp
 
 
 # The async-launch background discriminator (GH #44 §3.2a). Anchored on the
@@ -265,6 +271,72 @@ def resumed_agent_id_from_meta(meta: object) -> str | None:
     if not isinstance(rid, str) or not rid.strip():
         return None
     return rid
+
+
+@dataclass(frozen=True)
+class TeammateIdle:
+    """A parsed teammate ``idle_notification`` (GH #46 PR-1).
+
+    ``name`` — the ``from`` field (the teammate's name, e.g.
+    ``explore-skill-dispatch``). ``park_ts`` — the parked-at wall-clock epoch,
+    or ``None`` when the ``timestamp`` field is missing or unparseable.
+    ``park_ts_unparseable`` — True whenever ``park_ts`` is ``None`` (fail-closed:
+    the teammate park-close then tombstones UNCONDITIONALLY at the
+    ``BgDoneSource.TEAMMATE`` ts-gate — false-dark over false-typing).
+    """
+
+    name: str
+    park_ts: float | None
+    park_ts_unparseable: bool
+
+
+def parse_teammate_idle_notification(text: str) -> TeammateIdle | None:
+    """Strict-or-None parse of a teammate ``idle_notification`` envelope (GH #46).
+
+    Gates on ``is_teammate_message`` first (the byte-0-anchored envelope
+    predicate). Extracts the inner payload from WITHIN the FIRST envelope only —
+    the region between the opening tag's closing ``>`` and the first
+    ``</teammate-message>``, bounded by the same 64 KiB scan bound — takes the
+    substring from the first ``{`` to the last ``}`` in that region, and
+    ``json.loads`` it (any exception ⇒ ``None``). Requires ``type ==
+    "idle_notification"`` and a non-empty str ``from`` (⇒ ``name``); every other
+    shape returns ``None``. ``park_ts`` is the parsed ``timestamp`` (``None`` when
+    missing/unparseable); ``park_ts_unparseable`` mirrors ``park_ts is None`` so a
+    None stamp fails closed to an unconditional done downstream.
+    """
+    if not is_teammate_message(text):
+        return None
+    prefix = text[:TEAMMATE_ENVELOPE_SCAN_BYTES]
+    open_idx = prefix.find("<teammate-message")
+    if open_idx < 0:
+        return None
+    gt = prefix.find(">", open_idx)
+    if gt < 0:
+        return None
+    close_idx = prefix.find("</teammate-message>", gt)
+    if close_idx < 0:
+        return None
+    region = prefix[gt + 1 : close_idx]
+    j0 = region.find("{")
+    j1 = region.rfind("}")
+    if j0 < 0 or j1 <= j0:
+        return None
+    try:
+        payload = json.loads(region[j0 : j1 + 1])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("type") != "idle_notification":
+        return None
+    name = payload.get("from")
+    if not isinstance(name, str) or not name:
+        return None
+    ts_raw = payload.get("timestamp")
+    park_ts = parse_iso_timestamp(ts_raw) if isinstance(ts_raw, str) else None
+    # Fail-closed: any None stamp (missing OR unparseable) marks the park
+    # unparseable so the TEAMMATE done tombstones unconditionally.
+    return TeammateIdle(name=name, park_ts=park_ts, park_ts_unparseable=park_ts is None)
 
 
 def _render_task_notification(text: str) -> str | None:
