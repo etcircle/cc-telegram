@@ -512,19 +512,31 @@ GENUINE user turn — resetting `background_agents_done` (the re-record amplifie
 so the key relit and never dropped. **(B)** the teammate leg ends in plain text
 (`stop_reason=None`), so the sidechain-done detector never fires, AND teammates
 emit no `<task-notification>` — the key had NO close signal. **Fix (A):** the
-teammate user event is machine-initiated. `utils.is_teammate_message` (byte-0
-anchored `Another Claude session sent a message:` + a `<teammate-message>`
-envelope closed within a 64 KiB scan bound) is stamped by the adapter as
-`TranscriptLifecycleEvent.is_teammate_notification`; `route_runtime`'s
-machine-initiated branch handles it identically to a `<task-notification>`
-(preserved tombstones/stash/pane-bit + stored-idle preserve; the notification
-clear stamps `TEAMMATE_NOTIFICATION`, ts-qualified). **Fix (B) — the park-close
-lane:** `response_builder.parse_teammate_idle_notification` extracts the FIRST
-envelope's inner `{…}` payload (`name` = `from`, `park_ts`); the monitor's
-parent user-text arm resolves the name → this parent's currently-tracked
-sidechain stem key(s) (`a<name>-<hex>`, hex 8-32 chars, read from
-`tracked_sessions` — NO disk glob; PR-1 closes ALL same-name stems, documented
-safe degradation) and records `teammate_parks[key] = (park_ts, unparseable)`;
+teammate user event is machine-initiated. `utils.is_teammate_message` is stamped
+by the adapter as `TranscriptLifecycleEvent.is_teammate_notification`;
+`route_runtime`'s machine-initiated branch handles it identically to a
+`<task-notification>` (preserved tombstones/stash/pane-bit + stored-idle
+preserve; the notification clear stamps `TEAMMATE_NOTIFICATION`, ts-qualified).
+**The shared bounded envelope scanner (review P2):** predicate AND parser both
+consume `utils.teammate_envelope_payload_regions` — byte-0 anchored `Another
+Claude session sent a message:`, then EVERY structurally-valid
+`<teammate-message>` envelope within the first 64 KiB of UTF-8 BYTES (never a
+character count — a multi-byte payload must not stretch the bound); per
+envelope the opening tag must COMPLETE (its `>`) within the bound and the close
+must occur strictly AFTER that completion (a close token inside the opening
+tag's quoted attributes never counts). Fail-closed to genuine-user on any
+structural drift, and the two callers can never diverge on structure. **Fix (B)
+— the park-close lane:** `response_builder.parse_teammate_idle_notifications`
+(PLURAL — one parent entry can carry MULTIPLE envelopes, real-data verified;
+the second envelope of the live 15:56:55Z entry names the teammate whose park
+is its ONLY close signal, review P1) extracts EVERY envelope's inner `{…}`
+payload (`name` = `from`, `park_ts`); the monitor's parent user-text arm
+resolves each name → this parent's currently-tracked TOP-LEVEL sidechain stem
+key(s) (`sub:<parent>:agent-a<name>-<hex>`, hex 8-32 chars, read from
+`tracked_sessions` — NO disk glob; a nested Fix-5 Workflow display key
+`sub:<parent>:<runid>:agent-…` NEVER matches, hermes P3 — its close is the
+`wf-task:` bracket; PR-1 closes ALL same-name top-level stems, documented safe
+degradation) and records `teammate_parks[key] = (park_ts, unparseable)`;
 the bot fan-out applies each as `mark_background_agent_done(...,
 source=BgDoneSource.TEAMMATE, end_turn_ts=park_ts, ...)`. `TEAMMATE` shares the
 `SIDECHAIN` cross-file ts-gate (a stale prior-leg park keeps a resumed key LIVE;
