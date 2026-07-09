@@ -1105,51 +1105,176 @@ async def test_gen2_strict_rejects_first_entry_in_pre_spawn_skew(
 
 
 @pytest.mark.asyncio
-async def test_simultaneous_gen2_multi_candidate_binds_none_and_warns(
+async def test_public_discovery_two_candidates_binds_none_sticky(
     monitor, tmp_path, make_jsonl_entry, make_tool_use_block, caplog
 ):
-    """gen>=2 with MULTIPLE unretired candidates passing the strict gate at once in
-    the pre-spawn scan ⇒ bind NONE + WARN (fail-dark). Drives
-    ``_try_bind_tracked_teammate_stems`` directly on a gen-2 rec — the realistic
-    respawn path quarantines everything via the disk snapshot, so this pins the
-    defense-in-depth guard that protects a residual two-tracked-candidate race."""
+    """Dual-review r1 item 2 (BOTH engines converged), PUBLIC path: TWO same-name
+    candidates pass the gate in one ``check_sidechain_updates`` sweep ⇒ bind NONE
+    + WARN + the rec goes STICKY-ambiguous — filesystem enumeration order must
+    never pick the "genuine" key. The unresolved candidates are NOT arbitrarily
+    quarantined/severed, stay OUT of run-state (item 3), and the ambiguity never
+    self-resolves (gate inputs are static): a later still-passing tick binds
+    nothing. Only the NEXT rotation clears it, after which the fresh gen binds
+    cleanly."""
     import logging
 
-    from cctelegram.session_monitor import _TeammateRec
-
-    _parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
-    base = time.time()
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
     k1 = _key_for(_NAME, "1111111122222222")
     k2 = _key_for(_NAME, "3333333344444444")
-    future = _iso(base + 100)  # both first entries clear the strict gen-2 gate
-    sc1 = _write_sidechain(sub_dir, k1, future)
-    sc2 = _write_sidechain(sub_dir, k2, future)
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+
+    # BOTH candidates appear in the same sweep, both gate-passing.
+    _write_sidechain(sub_dir, k1, _iso(time.time() + 0.2))
+    _write_sidechain(sub_dir, k2, _iso(time.time() + 0.2))
+    with caplog.at_level(logging.WARNING):
+        await monitor.check_sidechain_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert act.get(PARENT, ParentSidechainActivity()).launched == set()  # bind NONE
+    assert rec.current_key is None and rec.ambiguous is True  # sticky
+    assert any("binding NONE" in r.message for r in caplog.records)
+    # NOT arbitrarily quarantined/severed (item 2).
+    assert k1 not in rec.retired_keys and k2 not in rec.retired_keys
+    assert monitor._severed_teammate_stems.get(PARENT, set()) == set()
+
+    # Item 3: the unresolved candidates never feed run-state — activity on both
+    # produces ZERO ticks and no launched key.
+    for k in (k1, k2):
+        _append(
+            sub_dir / f"agent-{k}.jsonl",
+            [
+                make_jsonl_entry(
+                    "assistant",
+                    [{"type": "text", "text": "work"}],
+                    timestamp=_iso(time.time() + 1),
+                )
+            ],
+        )
+    await monitor.check_sidechain_updates({PARENT})
+    act2 = monitor.pop_sidechain_activity()
+    assert act2.get(PARENT, ParentSidechainActivity()).ticks == {}
+    assert act2.get(PARENT, ParentSidechainActivity()).launched == set()
+    assert monitor._teammate_registry[PARENT][_NAME].current_key is None  # sticky
+
+    # The NEXT rotation clears the ambiguity; the fresh gen file binds cleanly.
+    respawn_at = time.time() + 5
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(respawn_at)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert rec.ambiguous is False and rec.spawn_generation == 2
+    k3 = _key_for(_NAME, "5555555566666666")
+    sc3 = _write_sidechain(sub_dir, k3, _iso(respawn_at + 0.05))
     import os
 
-    os.utime(sc1, (base + 100, base + 100))
-    os.utime(sc2, (base + 100, base + 100))
-    # Track both files (unbound) so the pre-spawn scan sees two candidates.
-    for k in (k1, k2):
-        monitor.state.update_session(
-            TrackedSession(
-                session_id=f"sub:{PARENT}:agent-{k}",
-                file_path=str(sub_dir / f"agent-{k}.jsonl"),
-                parent_session_id=PARENT,
+    os.utime(sc3, (respawn_at + 0.05, respawn_at + 0.05))
+    await monitor.check_sidechain_updates({PARENT})
+    act3 = monitor.pop_sidechain_activity()
+    assert act3[PARENT].launched == {k3}
+    assert monitor._teammate_registry[PARENT][_NAME].current_key == k3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_line",
+    [
+        "this is never json\n",  # permanently malformed — never parses
+        '{"type": "assistant", "message": {"content": []}}\n',  # timestamp-less
+    ],
+    ids=["malformed", "timestamp_less"],
+)
+async def test_registered_unresolved_candidate_never_feeds_run_state(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, first_line
+):
+    """Dual-review r1 item 3 (BOTH engines converged): a REGISTERED-name candidate
+    whose gate stays INDETERMINATE forever (permanently malformed OR
+    timestamp-less first line) must NEVER feed run-state — zero ticks, zero
+    launched/background keys — even after subsequent valid activity, and a
+    GENUINE user turn (which resets runtime tombstones) changes nothing: the
+    darkness is the monitor-side classification, not a tombstone. Pre-fix, the
+    indeterminate gate fell through to feed_run_state=True and the unbound
+    candidate minted SidechainTicks (the strand re-entry)."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    key = _key_for(_NAME)
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+
+    # A PERMANENTLY indeterminate first line + valid activity after it.
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text(first_line)
+    _append(
+        sc,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [{"type": "text", "text": "working"}],
+                timestamp=_iso(time.time() + 1),
             )
-        )
-    # A gen-2 rec with NO retired keys and no current_key.
-    monitor._teammate_registry[PARENT] = {
-        _NAME: _TeammateRec(
-            name=_NAME,
-            teammate_id=None,
-            spawn_generation=2,
-            spawned_ts=base,
-        )
-    }
-    with caplog.at_level(logging.WARNING):
-        monitor._try_bind_tracked_teammate_stems(PARENT, _NAME)
-    assert monitor._teammate_registry[PARENT][_NAME].current_key is None
-    assert any("simultaneous gen>=2" in r.message for r in caplog.records)
+        ],
+    )
+    await monitor.check_sidechain_updates({PARENT})  # registers at EOF
+    await monitor.check_sidechain_updates({PARENT})
+    _append(
+        sc,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [{"type": "text", "text": "more work"}],
+                timestamp=_iso(time.time() + 2),
+            )
+        ],
+    )
+    await monitor.check_sidechain_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert act.get(PARENT, ParentSidechainActivity()).ticks == {}
+    assert act.get(PARENT, ParentSidechainActivity()).launched == set()
+    # Unresolved — not quarantined (retry stays possible), just dark.
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert key not in rec.retired_keys and rec.current_key is None
+
+    # A genuine user turn on the parent, then more sidechain activity — STILL
+    # zero ticks (tombstone-reset immune: classification, not tombstones).
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", "a genuine human", session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    _append(
+        sc,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [{"type": "text", "text": "still dark"}],
+                timestamp=_iso(time.time() + 3),
+            )
+        ],
+    )
+    await monitor.check_sidechain_updates({PARENT})
+    act2 = monitor.pop_sidechain_activity()
+    assert act2.get(PARENT, ParentSidechainActivity()).ticks == {}
+    # An UNREGISTERED name keeps legacy behavior (control: ticks flow).
+    other = sub_dir / "agent-abc999.jsonl"
+    other.write_text("")
+    await monitor.check_sidechain_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    _append(
+        other,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [{"type": "text", "text": "legacy"}],
+                timestamp=_iso(time.time() + 4),
+            )
+        ],
+    )
+    await monitor.check_sidechain_updates({PARENT})
+    act3 = monitor.pop_sidechain_activity()
+    assert "abc999" in act3[PARENT].ticks
 
 
 # ── the structural strand pins ───────────────────────────────────────────
@@ -1335,3 +1460,427 @@ async def test_same_batch_ticks_and_parks_ordering_pin(
     tick_ts = act[PARENT].ticks[key].max_event_ts
     park_ts, _ = act[PARENT].teammate_parks[key]
     assert park_ts is not None and tick_ts is not None and park_ts > tick_ts
+
+
+# ── generation-scope parks (dual-review r1 item 4, Codex P1) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_prior_generation_park_dropped_from_pending_slot(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """The Codex repro: respawn at T2 → a DELAYED prior-gen park (park_ts T1 < T2)
+    arrives while gen-2 is unbound. Pre-fix it was buffered into pending_park and
+    applied at bind, tombstoning the FRESH key (no activity/resume stamp yet to
+    defend it). Now a parseable park that predates the current generation's
+    spawned_ts is DROPPED — the key binds LIVE; the genuine park T3 closes it."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 60
+    key1 = _key_for(_NAME, "aaaa1111aaaa1111")
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    sc1 = _write_sidechain(sub_dir, key1, _iso(base + 0.05))
+    import os
+
+    os.utime(sc1, (base + 0.05, base + 0.05))
+    await monitor.check_sidechain_updates({PARENT})
+    monitor.pop_sidechain_activity()
+
+    # Respawn at T2; the delayed prior-gen park T1 (< T2) lands AFTER the
+    # rotation, while gen-2 is unbound.
+    t2 = base + 10
+    t1 = base + 5
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(t2))
+    _append_park(parent_jsonl, _NAME, make_jsonl_entry, _iso(t1))
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert rec.pending_park is None  # the stale park was DROPPED, not buffered
+
+    # gen-2 binds → NO park applied → the fresh key is LIVE.
+    key2 = _key_for(_NAME, "bbbb2222bbbb2222")
+    sc2 = _write_sidechain(sub_dir, key2, _iso(t2 + 0.05))
+    os.utime(sc2, (t2 + 0.05, t2 + 0.05))
+    await monitor.check_sidechain_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert act[PARENT].launched == {key2}
+    assert key2 not in act[PARENT].teammate_parks  # stays live
+
+    # The GENUINE park T3 (> T2) closes it.
+    t3 = t2 + 20
+    _append_park(parent_jsonl, _NAME, make_jsonl_entry, _iso(t3))
+    await monitor.check_for_updates({PARENT})
+    act2 = monitor.pop_sidechain_activity()
+    assert key2 in act2[PARENT].teammate_parks
+
+
+@pytest.mark.asyncio
+async def test_prior_generation_park_dropped_direct_on_bound_key(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """The direct (bound) variant: gen-2 already bound, the delayed prior-gen park
+    T1 < spawned_ts arrives ⇒ dropped (no teammate_parks entry — the fresh key is
+    never tombstoned by a park reporting the PRIOR leg's idleness)."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 60
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    t2 = base + 10
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(t2))
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    key2 = _key_for(_NAME, "cccc3333cccc3333")
+    sc2 = _write_sidechain(sub_dir, key2, _iso(t2 + 0.05))
+    import os
+
+    os.utime(sc2, (t2 + 0.05, t2 + 0.05))
+    await monitor.check_sidechain_updates({PARENT})
+    monitor.pop_sidechain_activity()
+
+    # Delayed prior-gen park (T1 < T2) against the BOUND gen-2 key → dropped.
+    _append_park(parent_jsonl, _NAME, make_jsonl_entry, _iso(base + 5))
+    await monitor.check_for_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert key2 not in act.get(PARENT, ParentSidechainActivity()).teammate_parks
+
+
+@pytest.mark.asyncio
+async def test_unparseable_park_still_records_after_rotation(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """An UNPARSEABLE park cannot be generation-checked, so it keeps unconditional
+    dominance (fail-dark doctrine; the disclosed residual: it darkens the new gen
+    until a wake / the next genuine park)."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 60
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    key = _key_for(_NAME, "dddd4444dddd4444")
+    sc = _write_sidechain(sub_dir, key, _iso(base + 0.05))
+    import os
+
+    os.utime(sc, (base + 0.05, base + 0.05))
+    await monitor.check_sidechain_updates({PARENT})
+    monitor.pop_sidechain_activity()
+
+    # An unparseable-ts park (no timestamp field) → recorded (dominates).
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "user",
+                (
+                    "Another Claude session sent a message:\n"
+                    f'<teammate-message teammate_id="{_NAME}" color="blue">\n'
+                    f'{{"type":"idle_notification","from":"{_NAME}"}}\n'
+                    "</teammate-message>\n"
+                ),
+                session_id=PARENT,
+            )
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert act[PARENT].teammate_parks[key] == (None, True)
+
+
+# ── result-before-use retro-pairing (dual-review r1 item 1, Hermes P1) ───
+
+
+def _append_spawn_result_before_use(
+    parent_jsonl, name: str, make_jsonl_entry, make_tool_use_block, spawn_ts: str
+):
+    """The GH #42 ordering (27/40 real session files): the tool_result line is
+    flushed BEFORE its tool_use line. The parser consumes the result with
+    tool_name=None, so the tool_name-gated spawn branch can't fire on it."""
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "user",
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_ooo_spawn",
+                        "content": [{"type": "text", "text": "Spawned successfully."}],
+                    }
+                ],
+                session_id=PARENT,
+                timestamp=spawn_ts,
+                tool_use_result=_spawn_meta_for(name),
+            ),
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("tu_ooo_spawn", "Agent", {"prompt": "go"})],
+                session_id=PARENT,
+                timestamp=spawn_ts,
+            ),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_result_before_use_spawn_registers(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """Item 1: a spawn tool_result flushed BEFORE its tool_use (same batch) must
+    still register the teammate — the stashed structured signal is applied at the
+    tool_use (retro-pairing), with spawned_ts anchored to the RESULT's event ts."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 30
+    _append_spawn_result_before_use(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert rec.spawn_generation == 1
+    assert abs(rec.spawned_ts - base) < 0.01  # anchored to the RESULT event ts
+
+    # And the registry is functional: the sidechain binds + launches.
+    key = _key_for(_NAME)
+    sc = _write_sidechain(sub_dir, key, _iso(base + 0.05))
+    import os
+
+    os.utime(sc, (base + 0.05, base + 0.05))
+    await monitor.check_sidechain_updates({PARENT})
+    assert monitor.pop_sidechain_activity()[PARENT].launched == {key}
+
+
+@pytest.mark.asyncio
+async def test_result_before_use_spawn_across_batches(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """Item 1 cross-batch: the result lands in batch N, its tool_use in batch N+1
+    — the stash persists across batches and the retro-pairing still registers."""
+    parent_jsonl, _sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 30
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "user",
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_split",
+                        "content": [{"type": "text", "text": "Spawned successfully."}],
+                    }
+                ],
+                session_id=PARENT,
+                timestamp=_iso(base),
+                tool_use_result=_spawn_meta_for(_NAME),
+            )
+        ],
+    )
+    await monitor.check_for_updates({PARENT})  # batch N: result only
+    monitor.pop_sidechain_activity()
+    assert _NAME not in monitor._teammate_registry.get(PARENT, {})
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("tu_split", "Agent", {"prompt": "go"})],
+                session_id=PARENT,
+                timestamp=_iso(base),
+            )
+        ],
+    )
+    await monitor.check_for_updates({PARENT})  # batch N+1: the tool_use
+    assert monitor._teammate_registry[PARENT][_NAME].spawn_generation == 1
+
+
+@pytest.mark.asyncio
+async def test_result_before_use_wake_relights(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """Item 1: a wake tool_result flushed BEFORE its SendMessage tool_use must
+    still relight the bound key — the input.to cross-check runs at retro-pair
+    time against the tool_use's input."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    key = _key_for(_NAME)
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    _write_sidechain(sub_dir, key, _iso(time.time() + 0.1))
+    await monitor.check_sidechain_updates({PARENT})
+    monitor.pop_sidechain_activity()
+
+    ts = _iso(time.time() + 1)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "user",
+                [{"type": "tool_result", "tool_use_id": "tu_ooo_w", "content": "ok"}],
+                session_id=PARENT,
+                timestamp=ts,
+                tool_use_result={
+                    "success": True,
+                    "routing": {"sender": "team-lead", "target": f"@{_NAME}"},
+                },
+            ),
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("tu_ooo_w", "SendMessage", {"to": _NAME})],
+                session_id=PARENT,
+                timestamp=ts,
+            ),
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert key in act[PARENT].resumed
+
+
+@pytest.mark.asyncio
+async def test_result_before_use_wake_mismatch_refuses(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, caplog
+):
+    """Item 1: the input.to cross-check applies on the RETRO path too — a
+    mismatching tool_use input refuses the wake + WARNs."""
+    import logging
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    key = _key_for(_NAME)
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    _write_sidechain(sub_dir, key, _iso(time.time() + 0.1))
+    await monitor.check_sidechain_updates({PARENT})
+    monitor.pop_sidechain_activity()
+
+    ts = _iso(time.time() + 1)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "user",
+                [{"type": "tool_result", "tool_use_id": "tu_ooo_m", "content": "ok"}],
+                session_id=PARENT,
+                timestamp=ts,
+                tool_use_result={
+                    "success": True,
+                    "routing": {"sender": "team-lead", "target": f"@{_NAME}"},
+                },
+            ),
+            make_jsonl_entry(
+                "assistant",
+                [
+                    make_tool_use_block(
+                        "tu_ooo_m", "SendMessage", {"to": "someone-else"}
+                    )
+                ],
+                session_id=PARENT,
+                timestamp=ts,
+            ),
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        await monitor.check_for_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert key not in act.get(PARENT, ParentSidechainActivity()).resumed
+    assert any("!= input.to" in r.message for r in caplog.records)
+
+
+# ── gen-2 tolerance boundaries (dual-review r1 item 5, fixture-derived) ──
+
+
+@pytest.mark.asyncio
+async def test_gen2_tolerance_boundary_inside_binds(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """A gen-2 candidate whose first entry is INSIDE the fixture-derived tolerance
+    below the spawn event ts binds (absorbs clock rounding — the observed real
+    cross-flush gap is ≤7ms, always AFTER the spawn)."""
+    from cctelegram.session_monitor import TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S as TOL
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 60
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    t2 = base + 10
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(t2))
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+
+    key = _key_for(_NAME, "eeee5555eeee5555")
+    sc = _write_sidechain(sub_dir, key, _iso(t2 - TOL * 0.5))  # inside tolerance
+    import os
+
+    os.utime(sc, (t2 + 0.01, t2 + 0.01))
+    await monitor.check_sidechain_updates({PARENT})
+    assert monitor.pop_sidechain_activity()[PARENT].launched == {key}
+
+
+@pytest.mark.asyncio
+async def test_gen2_tolerance_boundary_beyond_rejects(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """A gen-2 candidate whose first entry precedes the spawn by MORE than the
+    fixture-derived tolerance is a stale sibling → quarantined, never bound (the
+    r1 item-5 poisoning shape: a file written 0.2-0.4s pre-respawn now FAILS)."""
+    from cctelegram.session_monitor import TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S as TOL
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 60
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    t2 = base + 10
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(t2))
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+
+    key = _key_for(_NAME, "ffff6666ffff6666")
+    sc = _write_sidechain(sub_dir, key, _iso(t2 - (TOL + 0.05)))  # beyond tolerance
+    import os
+
+    os.utime(sc, (t2 + 0.01, t2 + 0.01))
+    await monitor.check_sidechain_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    assert act.get(PARENT, ParentSidechainActivity()).launched == set()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert key in rec.retired_keys  # quarantined (deterministically stale)
+
+
+# ── ownership-field PRESENCE checks (dual-review r1 item 6b, Codex P3) ───
+
+
+@pytest.mark.parametrize("falsy", ["", None])
+@pytest.mark.parametrize(
+    "ownership_field", ["agentId", "taskId", "backgroundTaskId", "resumedAgentId"]
+)
+def test_spawn_disjoint_refuses_present_but_falsy_ownership_field(
+    ownership_field, falsy
+):
+    """Item 6b: the guard is key-PRESENCE, not truthiness — an ownership field
+    present with an empty/None value is still another lane's shape."""
+    meta = dict(_spawn_meta())
+    meta[ownership_field] = falsy
+    assert teammate_spawn_info_from_meta(meta) is None
+
+
+@pytest.mark.parametrize("falsy", ["", None])
+def test_send_target_refuses_present_but_falsy_ownership_field(falsy):
+    meta = {
+        "success": True,
+        "routing": {"target": "@explore-x"},
+        "resumedAgentId": falsy,
+    }
+    assert teammate_send_target_from_meta(meta) is None

@@ -344,10 +344,12 @@ def parse_teammate_idle_notifications(text: str) -> list[TeammateIdle]:
 _TEAMMATE_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 # The four OTHER background-launch lanes' ownership fields (GH #44 / ISSUE-6 /
-# Fix C). A teammate discriminator returns None if ANY is present, so the five
-# lanes (Agent/Task ``agentId``, Workflow ``taskId``, background-Bash
-# ``backgroundTaskId``, resume ``resumedAgentId``, teammate) never double-record
-# one meta into two keys.
+# Fix C). A teammate discriminator returns None if ANY is PRESENT — a
+# key-PRESENCE check, never truthiness (dual-review r1 item 6b: an ownership
+# field present with an empty/None value is still another lane's shape claiming
+# the meta) — so the five lanes (Agent/Task ``agentId``, Workflow ``taskId``,
+# background-Bash ``backgroundTaskId``, resume ``resumedAgentId``, teammate)
+# never double-record one meta into two keys.
 _OTHER_OWNERSHIP_FIELDS = ("agentId", "taskId", "backgroundTaskId", "resumedAgentId")
 
 
@@ -397,7 +399,7 @@ def teammate_spawn_info_from_meta(meta: object) -> TeammateSpawnInfo | None:
         return None
     if meta.get("status") != "teammate_spawned":
         return None
-    if any(meta.get(f) for f in _OTHER_OWNERSHIP_FIELDS):
+    if any(f in meta for f in _OTHER_OWNERSHIP_FIELDS):
         return None
     raw_name = meta.get("name")
     name = _valid_teammate_name(raw_name)
@@ -439,7 +441,7 @@ def teammate_send_target_from_meta(meta: object) -> str | None:
         return None
     if meta.get("success") is not True:
         return None
-    if any(meta.get(f) for f in _OTHER_OWNERSHIP_FIELDS):
+    if any(f in meta for f in _OTHER_OWNERSHIP_FIELDS):
         return None
     routing = meta.get("routing")
     if not isinstance(routing, dict):
