@@ -9,7 +9,14 @@ file to the topic as a Telegram document. This leaf owns the pure primitives:
   - ``resolve_artifacts`` / ``resolve_single`` — filesystem validation
     (expanduser → cwd-join → resolve → containment under the resolved allowed
     roots → regular-file + size cap). Fail-closed on empty cwd / traversal /
-    symlink-escape.
+    symlink-escape. A RELATIVE candidate that misses under the session cwd
+    ALSO retries against the worktree's main repo root when the resolved cwd
+    carries the harness ``.claude/worktrees`` shape (a handoff written to
+    ``<main_repo>/temp/…`` from a ``<main_repo>/.claude/worktrees/<name>``
+    session); the cwd hit always wins, and the hit is pinned + displayed
+    relative to whichever root matched. NOTE: only the harness
+    ``.claude/worktrees`` layout is covered — a general ``git worktree add``
+    elsewhere is NOT (no shared string shape to derive the main root from).
   - ``open_validated_artifact`` — the TOCTOU-closing OPEN helper: re-check
     containment against the roots PINNED at mint time, ``O_RDONLY|O_NOFOLLOW``
     open, ``fstat`` regular-file + size ON THE FD, return the open file object
@@ -169,6 +176,27 @@ def _resolved_roots(cwd: str, extra_roots: list[str]) -> list[Path]:
     return roots
 
 
+def _worktree_main_root(resolved_cwd: Path) -> Path | None:
+    """The main-repo root of a HARNESS worktree cwd, else None.
+
+    A harness worktree cwd is ``<main_repo>/.claude/worktrees/<name>``, so the
+    main root is the prefix BEFORE the first ``.claude``/``worktrees`` segment
+    pair. Pure string/``Path`` logic on the ALREADY-RESOLVED cwd (a prefix of a
+    resolved path is itself canonical — no symlinks / ``..`` to re-resolve, no
+    git subprocess). Returns None when the shape is absent or the prefix is not
+    a proper directory (just the filesystem anchor). Only this exact layout is
+    covered — a general ``git worktree add`` elsewhere has no such shape.
+    """
+    parts = resolved_cwd.parts
+    for i in range(len(parts) - 1):
+        if parts[i] == ".claude" and parts[i + 1] == "worktrees":
+            prefix = parts[:i]
+            if len(prefix) < 2:  # anchor only (e.g. "/") — never a repo root
+                return None
+            return Path(*prefix)
+    return None
+
+
 def _within_roots(resolved: Path, roots: list[Path]) -> bool:
     """True iff ``resolved`` is one of, or nested under, a resolved root."""
     for root in roots:
@@ -193,31 +221,24 @@ def _display_name(resolved: Path, roots: list[Path]) -> str:
     return best if best else resolved.name
 
 
-def _classify_one(
-    candidate: str, cwd: str, roots: list[Path], max_bytes: int
-) -> tuple[Artifact | None, str | None]:
-    """Validate ONE candidate. Returns (Artifact, None) or (None, reason).
+# A cwd-attempt rejection that means "no valid file resolvable at this
+# candidate under cwd" (as opposed to "the cwd file EXISTS but is oversize / not
+# a regular file" — which the cwd OWNS, so the worktree fallback must NOT serve
+# a DIFFERENT main-root file in its place). Only these two trigger the fallback.
+_FALLBACK_REASONS = frozenset(
+    {"file not found", "outside the session's allowed folders"}
+)
 
-    ``reason`` is a short, user-facing rejection string for ``/file``; the card
-    path drops rejections silently (§A.3).
+
+def _validate_resolved(
+    resolved: Path, roots: list[Path], max_bytes: int
+) -> tuple[Artifact | None, str | None]:
+    """Containment → regular-file → size for an already-resolved path.
+
+    ``roots`` is the RESOLVED allowed-root set this resolution was validated
+    under; it is what the returned Artifact PINS (re-checked at fd-open time)
+    and what the display name is made relative to.
     """
-    raw = candidate.strip()
-    if not raw:
-        return None, "empty path"
-    try:
-        p = Path(raw).expanduser()
-    except (RuntimeError, ValueError):
-        return None, "invalid path"
-    if not p.is_absolute():
-        if not cwd:  # fail-closed: a relative path needs a working directory
-            return None, "this session has no working directory"
-        p = Path(cwd).expanduser() / p
-    try:
-        # resolve() FOLLOWS symlinks, so an in-cwd symlink pointing outside the
-        # root resolves outside and fails the containment test below.
-        resolved = p.resolve()
-    except (OSError, RuntimeError, ValueError):
-        return None, "invalid path"
     if not _within_roots(resolved, roots):
         return None, "outside the session's allowed folders"
     try:
@@ -238,6 +259,72 @@ def _classify_one(
         ),
         None,
     )
+
+
+def _classify_one(
+    candidate: str, cwd: str, roots: list[Path], max_bytes: int
+) -> tuple[Artifact | None, str | None]:
+    """Validate ONE candidate. Returns (Artifact, None) or (None, reason).
+
+    ``reason`` is a short, user-facing rejection string for ``/file``; the card
+    path drops rejections silently (§A.3).
+
+    Absolute candidates: resolve → containment against ``roots`` (unchanged). A
+    RELATIVE candidate joins against the session ``cwd`` first; if that yields
+    no valid file here AND ``cwd`` is a harness worktree, it retries the join
+    against the derived main repo root (pinned + displayed relative to it). The
+    cwd hit ALWAYS wins; traversal / symlink-escape reject under BOTH roots.
+    """
+    raw = candidate.strip()
+    if not raw:
+        return None, "empty path"
+    try:
+        p = Path(raw).expanduser()
+    except (RuntimeError, ValueError):
+        return None, "invalid path"
+
+    if p.is_absolute():
+        try:
+            # resolve() FOLLOWS symlinks, so a symlink pointing outside a root
+            # resolves outside and fails the containment test.
+            resolved = p.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None, "invalid path"
+        return _validate_resolved(resolved, roots, max_bytes)
+
+    # Relative candidate — needs a working directory to join against.
+    if not cwd:  # fail-closed
+        return None, "this session has no working directory"
+    try:
+        resolved_cwd = Path(cwd).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None, "invalid path"
+
+    # Attempt 1 — the session cwd (the primary root; cwd hit WINS).
+    try:
+        resolved = (resolved_cwd / p).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None, "invalid path"
+    art, reason = _validate_resolved(resolved, roots, max_bytes)
+    if art is not None:
+        return art, None
+    if reason not in _FALLBACK_REASONS:  # cwd file exists but was rejected — it owns it
+        return None, reason
+
+    # Attempt 2 — the harness worktree's main repo root (pinned to it alone, so
+    # containment / display are anchored on the matched root). A `../`-escape
+    # from main_root fails its containment too → rejected under BOTH roots.
+    main_root = _worktree_main_root(resolved_cwd)
+    if main_root is None:
+        return None, reason  # not a worktree cwd → no fallback invented
+    try:
+        fb_resolved = (main_root / p).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None, reason
+    fb_art, fb_reason = _validate_resolved(fb_resolved, [main_root], max_bytes)
+    if fb_art is not None:
+        return fb_art, None
+    return None, fb_reason
 
 
 def resolve_artifacts(

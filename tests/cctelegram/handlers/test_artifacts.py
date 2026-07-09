@@ -212,6 +212,107 @@ def test_resolve_single_reasons(tmp_path: Path) -> None:
     assert _art is None and reason is not None
 
 
+# ── Worktree-aware fallback root (harness worktree sessions) ──────────────
+#
+# A Claude session whose cwd is a HARNESS WORKTREE
+# (``<main_repo>/.claude/worktrees/<name>``) writes its handoff to the MAIN
+# repo (``<main_repo>/temp/sessions/x.md`` — the convention) and mentions it as
+# the relative path ``temp/sessions/x.md``. The join against the worktree cwd
+# misses, so the resolve now falls back to the worktree's main-repo root.
+
+
+def _worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """Return (main_root, worktree_cwd) with the harness ``.claude/worktrees``
+    shape. Both are real dirs so ``resolve()`` canonicalizes them."""
+    main_root = tmp_path / "myrepo"
+    worktree = main_root / ".claude" / "worktrees" / "agent-x"
+    worktree.mkdir(parents=True, exist_ok=True)
+    return main_root, worktree
+
+
+def test_worktree_fallback_relative_hits_main_root(tmp_path: Path) -> None:
+    """RED-first: a relative candidate that exists ONLY in the main repo root
+    (not under the worktree cwd) resolves via the derived main root, is pinned
+    to the main root, and the display name is root-relative to it."""
+    main_root, worktree = _worktree(tmp_path)
+    f = _write(main_root / "temp" / "sessions" / "x.md", b"handoff")
+    got = artifacts.resolve_artifacts(["temp/sessions/x.md"], str(worktree), [], 1024)
+    assert len(got) == 1
+    assert got[0].resolved_path == str(f.resolve())
+    assert got[0].display_name == "temp/sessions/x.md"
+    assert got[0].allowed_roots == (str(main_root.resolve()),)
+
+
+def test_worktree_fallback_cwd_copy_wins(tmp_path: Path) -> None:
+    """RED-first (order): the same-named file existing in BOTH the worktree cwd
+    and the main root resolves to the WORKTREE's own copy (cwd hit wins)."""
+    main_root, worktree = _worktree(tmp_path)
+    _write(main_root / "temp" / "sessions" / "x.md", b"MAIN")
+    cwd_copy = _write(worktree / "temp" / "sessions" / "x.md", b"WORKTREE")
+    got = artifacts.resolve_artifacts(["temp/sessions/x.md"], str(worktree), [], 1024)
+    assert len(got) == 1
+    assert got[0].resolved_path == str(cwd_copy.resolve())
+    # Pinned to the worktree cwd (the primary root), not the main root.
+    assert got[0].allowed_roots == (str(worktree.resolve()),)
+
+
+def test_worktree_fallback_missing_in_both_skipped(tmp_path: Path) -> None:
+    """RED-first: a relative candidate in NEITHER root → fail-closed skip."""
+    _main_root, worktree = _worktree(tmp_path)
+    got = artifacts.resolve_artifacts(["temp/sessions/x.md"], str(worktree), [], 1024)
+    assert got == []
+
+
+def test_non_worktree_cwd_no_fallback(tmp_path: Path) -> None:
+    """RED-first: a NON-harness-worktree cwd + a missing relative candidate is
+    skipped — the fallback is never invented for a plain cwd."""
+    # A regular repo directory that happens to have a file in its parent.
+    plain = tmp_path / "plainrepo"
+    plain.mkdir()
+    _write(tmp_path / "temp" / "sessions" / "x.md", b"parent")
+    got = artifacts.resolve_artifacts(["temp/sessions/x.md"], str(plain), [], 1024)
+    assert got == []
+
+
+def test_worktree_fallback_traversal_rejected_under_both(tmp_path: Path) -> None:
+    """RED-first: a ``../``-escaping candidate must reject under BOTH the cwd
+    and the derived main root (never serve a file outside either)."""
+    main_root, worktree = _worktree(tmp_path)
+    # A real file two levels above the main root; a traversal candidate aimed at
+    # it must not resolve under the worktree cwd NOR under the main root.
+    _write(tmp_path / "secret.json", b"secret")
+    got = artifacts.resolve_artifacts(
+        ["../../../../secret.json"], str(worktree), [], 1024
+    )
+    assert got == []
+
+
+def test_worktree_fallback_symlink_in_main_root_rejected(tmp_path: Path) -> None:
+    """RED-first: a symlink UNDER the main root pointing outside is rejected —
+    resolve() follows it, then containment against the main root fails."""
+    main_root, worktree = _worktree(tmp_path)
+    target = _write(tmp_path / "outside" / "secret.log", b"secret")
+    (main_root / "temp").mkdir(parents=True, exist_ok=True)
+    link = main_root / "temp" / "link.log"
+    link.symlink_to(target)
+    got = artifacts.resolve_artifacts(["temp/link.log"], str(worktree), [], 1024)
+    assert got == []
+
+
+def test_worktree_fallback_resolve_single_surfaces_hit(tmp_path: Path) -> None:
+    """``/file`` (resolve_single) shares the pipeline → the same fallback."""
+    main_root, worktree = _worktree(tmp_path)
+    f = _write(main_root / "temp" / "sessions" / "x.md", b"handoff")
+    art, reason = artifacts.resolve_single(
+        "temp/sessions/x.md", str(worktree), [], 1024
+    )
+    assert reason is None
+    assert art is not None
+    assert art.resolved_path == str(f.resolve())
+    assert art.display_name == "temp/sessions/x.md"
+    assert art.allowed_roots == (str(main_root.resolve()),)
+
+
 # ── open_validated_artifact (§A.4) ────────────────────────────────────────
 
 
