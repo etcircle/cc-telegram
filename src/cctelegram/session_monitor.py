@@ -107,6 +107,20 @@ _TEAMMATE_FIRST_LINE_MAX_BYTES = 262144
 # pathological never-paired stream — drop-oldest).
 _EARLY_TEAMMATE_SIGNALS_MAX = 64
 
+# GH #46 PR-2 r3 item 2 (Codex P1, probe-confirmed at the boundary): the
+# retraction-relight resume ts must sit STRICTLY BELOW the generation's
+# spawned_ts. The runtime resume gate SUPPRESSES a TEAMMATE/SIDECHAIN done whose
+# ts is <= resumed_event_ts, so a resume ts of exactly spawned_ts stranded a
+# genuine park stamped at exactly spawned_ts for the full 2h TTL (it passes the
+# generation filter — only park_ts < spawned_ts drops — but ties lose at the
+# resume gate). With the epsilon, every park surviving the generation filter
+# (>= spawned_ts) is strictly newer than the resume and closes. Safety walk:
+# parseable parks < spawned_ts are generation-dropped BEFORE the gate, so
+# nothing in (resume_ts, spawned_ts) can wrongly close via the PARK lane; a
+# prior-gen SIDECHAIN end_turn ts landing inside the 1ms window would tombstone
+# — fail-dark (the accepted direction) and vanishingly rare.
+TEAMMATE_RETRACT_RESUME_EPSILON_S = 1e-3
+
 
 @dataclass
 class SidechainTick:
@@ -177,6 +191,21 @@ class ParentSidechainActivity:
     # signal for a teammate leg that ends in plain text (no sidechain
     # end-of-turn, no ``<task-notification>``).
     teammate_parks: dict[str, tuple[float | None, bool]] = field(default_factory=dict)
+    # GH #46 PR-2 r3 P1 (BOTH engines converged): registration RETRACTION dones —
+    # DISTINCT PROVENANCE from genuine teammate parks. A retraction emitted into
+    # ``teammate_parks`` as a synthetic (None, True) park rode the genuine-park
+    # lane's unconditional dominance, so a SAME-TICK retraction→bind race (the
+    # candidate's indeterminate first line completes between check_for_updates
+    # and the sidechain scan) left the synthetic park in the SAME record as the
+    # bind's resumed relight — and the fan-out applied resumed FIRST, parks
+    # AFTER, permanently tombstoning the just-bound key. This slot keeps the
+    # retraction separable: ``_bind_teammate_key`` CANCELS a same-tick pending
+    # retraction for the key it binds (the retraction's premise — "unbound at
+    # registration" — is falsified by the bind), and the fan-out applies
+    # retraction-dones FIRST (registration precedes bind precedes leg activity)
+    # so even an uncancelled pair nets LIVE. Genuine unparseable-park dominance
+    # in ``teammate_parks`` is untouched.
+    retraction_dones: set[str] = field(default_factory=set)
 
     def merge_teammate_park(
         self, key: str, park_ts: float | None, unparseable: bool
@@ -948,16 +977,22 @@ class SessionMonitor:
         ``done_retracted_keys`` so a later bind knows to relight through the
         tombstone-popping RESUMED lane instead of the tombstone-blocked
         ``launched`` (an extra tombstone on a key that never existed is a
-        runtime no-op — we never peek route_runtime liveness)."""
+        runtime no-op — we never peek route_runtime liveness).
+
+        r3 P1 (BOTH engines): the retraction rides the DISTINCT
+        ``retraction_dones`` slot, NEVER the genuine-park lane — a synthetic
+        (None, True) park in ``teammate_parks`` shared the genuine unparseable
+        dominance and the fan-out's parks-after-resumed order, so a SAME-TICK
+        retraction→bind race permanently tombstoned the just-bound key.
+        ``_bind_teammate_key`` cancels a same-tick pending retraction; the
+        fan-out applies retraction-dones FIRST (registration precedes bind)."""
         for _tk, key in self._tracked_teammate_stems(parent_session_id, rec.name):
             if key == rec.current_key or key in rec.retired_keys:
                 continue  # bound = legitimately live; retired = already done'd
             if key in rec.done_retracted_keys:
                 continue  # already retracted this generation
             rec.done_retracted_keys.add(key)
-            self._parent_activity(parent_session_id).merge_teammate_park(
-                key, park_ts=None, unparseable=True
-            )
+            self._parent_activity(parent_session_id).retraction_dones.add(key)
             logger.info(
                 "teammate registration: retracting potentially pre-existing "
                 "key %s for unbound candidate of name=%r parent=%s "
@@ -1231,16 +1266,32 @@ class SessionMonitor:
         tombstone no-ops a later ``launched`` (done-before-launch fail-closes) —
         so the bind emits through the RESUMED lane instead (the Fix-C
         tombstone-popping path; binding is positive per-key proof of new work).
-        The resume ts is the GENERATION's ``spawned_ts`` — the leg-start
-        instant — so any genuine current-generation park (floored at
-        ``spawned_ts`` by the item-4 generation drop, in practice strictly
-        later) still closes the key through the runtime's strict-newer gate,
-        and a pending wake (necessarily newer) max-merges over it."""
+        The resume ts sits STRICTLY BELOW the generation's ``spawned_ts``
+        (``spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S`` — r3 item 2, Codex
+        P1: the runtime resume gate suppresses a park with ts <= resumed, so a
+        resume ts of exactly ``spawned_ts`` stranded a genuine park stamped at
+        exactly ``spawned_ts`` to the 2h TTL; with the epsilon every park
+        surviving the item-4 generation floor (>= spawned_ts) is strictly newer
+        and closes), and a pending wake (necessarily newer) max-merges over it.
+
+        SAME-TICK CANCEL (r3 P1, BOTH engines): a retraction emitted EARLIER in
+        THIS tick (registration in check_for_updates, bind in the immediately
+        following sidechain scan) is CANCELLED here — the retraction's premise
+        ("unbound at registration") is falsified by the bind; the resumed
+        relight stays (harmless on a never-tombstoned key, load-bearing when
+        the retraction applied in an earlier tick). Without the cancel, the
+        fan-out's parks-after-resumed order let the synthetic done tombstone
+        the just-relit key permanently."""
         rec.current_key = key
         activity = self._parent_activity(parent_session_id)
         if key in rec.done_retracted_keys:
             rec.done_retracted_keys.discard(key)
-            _record_resume_ts(activity.resumed, key, rec.spawned_ts)
+            activity.retraction_dones.discard(key)  # the same-tick cancel
+            _record_resume_ts(
+                activity.resumed,
+                key,
+                rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S,
+            )
         else:
             activity.launched.add(key)
         if rec.pending_wake is not None:

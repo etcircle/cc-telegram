@@ -146,14 +146,14 @@ async def test_teammate_full_lifecycle_typing(scenario: ScenarioHarness) -> None
 async def test_preregistration_retract_then_bind_relights_via_resumed(
     scenario: ScenarioHarness,
 ) -> None:
-    """r2 P1 design-constraint pin: the registration retraction emits an
-    UNCONDITIONAL teammate-done for a pre-registration live key, and the runtime
-    tombstone then NO-OPS a later ``launched`` (done-before-launch fail-closes)
-    — so the bind-after-retraction relight MUST ride the RESUMED lane (the Fix-C
-    tombstone-popping path). Sequence: pre-registration legacy tick lifts typing
-    → the retraction done drops it → a plain ``launched`` cannot relight
-    (negative control) → the bind's ``resumed`` relights → a genuine later park
-    closes."""
+    """r2 P1 design-constraint pin: the registration retraction (the DISTINCT
+    ``retraction_dones`` slot — r3 P1) emits an UNCONDITIONAL done for a
+    pre-registration live key, and the runtime tombstone then NO-OPS a later
+    ``launched`` (done-before-launch fail-closes) — so the bind-after-retraction
+    relight MUST ride the RESUMED lane (the Fix-C tombstone-popping path).
+    Sequence: pre-registration legacy tick lifts typing → the retraction done
+    drops it → a plain ``launched`` cannot relight (negative control) → the
+    bind's ``resumed`` relights → a genuine later park closes."""
     from cctelegram.utils import parse_iso_timestamp
 
     route = await _bind_idle_route(scenario)
@@ -171,9 +171,9 @@ async def test_preregistration_retract_then_bind_relights_via_resumed(
     )
     assert route_runtime.snapshot(route).typing_eligible is True
 
-    # Registration retraction: the unconditional teammate-done → typing OFF.
+    # Registration retraction (the distinct slot) → typing OFF.
     await bot_module.apply_sidechain_activity(
-        {_SID: ParentSidechainActivity(teammate_parks={_KEY: (None, True)})}
+        {_SID: ParentSidechainActivity(retraction_dones={_KEY})}
     )
     assert route_runtime.snapshot(route).typing_eligible is False
 
@@ -184,11 +184,11 @@ async def test_preregistration_retract_then_bind_relights_via_resumed(
     )
     assert route_runtime.snapshot(route).typing_eligible is False
 
-    # The bind relight (resumed lane, ts = the generation's spawned_ts): pops
-    # the tombstone → typing back ON.
+    # The bind relight (resumed lane, ts strictly below the generation's
+    # spawned_ts — r3 item 2): pops the tombstone → typing back ON.
     spawn_ts = eot + 20
     await bot_module.apply_sidechain_activity(
-        {_SID: ParentSidechainActivity(resumed={_KEY: spawn_ts})}
+        {_SID: ParentSidechainActivity(resumed={_KEY: spawn_ts - 0.001})}
     )
     snap = route_runtime.snapshot(route)
     assert snap.typing_eligible is True
@@ -198,6 +198,127 @@ async def test_preregistration_retract_then_bind_relights_via_resumed(
     # closes it — the strict-newer gate passes.
     await bot_module.apply_sidechain_activity(
         {_SID: ParentSidechainActivity(teammate_parks={_KEY: (spawn_ts + 60, False)})}
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_same_record_retraction_and_bind_resume_nets_live(
+    scenario: ScenarioHarness,
+) -> None:
+    """r3 P1 REQUIRED pin (both engines): ONE aggregated ParentSidechainActivity
+    record carrying BOTH the same-tick retraction AND the bind's resumed relight
+    — through the PRODUCTION fan-out. The causal apply order (retraction-dones
+    FIRST, resumed after: registration precedes bind) nets the key LIVE even
+    when the monitor-side cancel was missed — the pre-fix shape applied resumed
+    first and the synthetic park after, permanently tombstoning the just-bound
+    key (probe-reproduced by both engines)."""
+    from cctelegram.utils import parse_iso_timestamp
+
+    route = await _bind_idle_route(scenario)
+    eot = parse_iso_timestamp("2026-07-09T10:00:00.000Z")
+    assert eot is not None
+
+    # Pre-registration legacy tick → live key.
+    await bot_module.apply_sidechain_activity(
+        {
+            _SID: ParentSidechainActivity(
+                ticks={_KEY: SidechainTick(max_event_ts=eot + 10)}
+            )
+        }
+    )
+    assert route_runtime.snapshot(route).typing_eligible is True
+
+    # ONE record: the retraction AND the bind-resume together.
+    spawn_ts = eot + 20
+    await bot_module.apply_sidechain_activity(
+        {
+            _SID: ParentSidechainActivity(
+                retraction_dones={_KEY},
+                resumed={_KEY: spawn_ts - 0.001},
+            )
+        }
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True  # LIVE — never the permanent dark
+    assert snap.background_agents == (_KEY,)
+
+    # Genuine later activity keeps flowing (the pre-fix bug blocked it).
+    await bot_module.apply_sidechain_activity(
+        {
+            _SID: ParentSidechainActivity(
+                ticks={_KEY: SidechainTick(max_event_ts=spawn_ts + 5)}
+            )
+        }
+    )
+    assert route_runtime.snapshot(route).typing_eligible is True
+
+    # And the genuine park still closes.
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(teammate_parks={_KEY: (spawn_ts + 60, False)})}
+    )
+    assert route_runtime.snapshot(route).typing_eligible is False
+
+
+@pytest.mark.asyncio
+async def test_genuine_unparseable_park_with_same_record_resume_still_tombstones(
+    scenario: ScenarioHarness,
+) -> None:
+    """r3 P1 dominance preservation: the cancel/causal-order fix is scoped to the
+    SYNTHETIC retraction slot ONLY — a GENUINE unparseable park (from a real
+    idle_notification envelope) arriving in the same record as a resume STILL
+    tombstones (parks apply after resumed; unparseable dominance untouched)."""
+    from cctelegram.utils import parse_iso_timestamp
+
+    route = await _bind_idle_route(scenario)
+    eot = parse_iso_timestamp("2026-07-09T10:00:00.000Z")
+    assert eot is not None
+
+    await bot_module.apply_sidechain_activity(
+        {
+            _SID: ParentSidechainActivity(
+                resumed={_KEY: eot + 20},
+                teammate_parks={_KEY: (None, True)},  # genuine unparseable park
+            )
+        }
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False  # dominance holds — fail-dark
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_park_at_exactly_spawned_ts_closes_relit_key(
+    scenario: ScenarioHarness,
+) -> None:
+    """r3 item 2 REQUIRED boundary pin (Codex P1, probe-confirmed): a genuine
+    park stamped at EXACTLY the generation's spawned_ts passes the generation
+    filter (only park_ts < spawned_ts drops) — and with the relight resume ts at
+    ``spawned_ts - epsilon`` it is STRICTLY newer than the resume, so it CLOSES
+    (pre-fix, resume ts == spawned_ts made the runtime resume gate suppress the
+    tie and strand typing to the 2h TTL)."""
+    from cctelegram.utils import parse_iso_timestamp
+
+    route = await _bind_idle_route(scenario)
+    eot = parse_iso_timestamp("2026-07-09T10:00:00.000Z")
+    assert eot is not None
+    spawn_ts = eot + 20
+
+    # The retraction→bind relight, as the monitor emits it (resume strictly
+    # below the spawn instant).
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(retraction_dones={_KEY})}
+    )
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(resumed={_KEY: spawn_ts - 0.001})}
+    )
+    assert route_runtime.snapshot(route).typing_eligible is True
+
+    # The tie boundary: a genuine park at EXACTLY spawned_ts → typing drops.
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(teammate_parks={_KEY: (spawn_ts, False)})}
     )
     snap = route_runtime.snapshot(route)
     assert snap.typing_eligible is False

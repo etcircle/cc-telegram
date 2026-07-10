@@ -1927,7 +1927,11 @@ async def test_registration_retracts_preexisting_unresolved_key(
     _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
     await monitor.check_for_updates({PARENT})
     act = monitor.pop_sidechain_activity()
-    assert act[PARENT].teammate_parks[key] == (None, True)  # unconditional done
+    # r3 P1: the retraction rides its DISTINCT provenance slot — never the
+    # genuine-park lane (whose unparseable dominance + parks-after-resumed
+    # fan-out order would tombstone a same-tick bind).
+    assert key in act[PARENT].retraction_dones
+    assert key not in act[PARENT].teammate_parks
     rec = monitor._teammate_registry[PARENT][_NAME]
     assert key in rec.done_retracted_keys
     assert key not in rec.retired_keys  # NOT retired — stays bind-eligible
@@ -1976,8 +1980,9 @@ async def test_registration_retracts_both_keys_on_ambiguity(
     act = monitor.pop_sidechain_activity()
     rec = monitor._teammate_registry[PARENT][_NAME]
     assert rec.ambiguous is True and rec.current_key is None
-    assert act[PARENT].teammate_parks[k1] == (None, True)
-    assert act[PARENT].teammate_parks[k2] == (None, True)
+    assert {k1, k2} <= act[PARENT].retraction_dones  # the distinct slot (r3 P1)
+    assert k1 not in act[PARENT].teammate_parks
+    assert k2 not in act[PARENT].teammate_parks
     assert rec.done_retracted_keys == {k1, k2}
     assert k1 not in rec.retired_keys and k2 not in rec.retired_keys
 
@@ -2005,10 +2010,14 @@ async def test_retracted_candidate_bind_relights_via_resumed_lane(
     act = monitor.pop_sidechain_activity()
     rec = monitor._teammate_registry[PARENT][_NAME]
     assert key in rec.done_retracted_keys  # unresolved at registration → retracted
-    assert act[PARENT].teammate_parks[key] == (None, True)
+    assert key in act[PARENT].retraction_dones  # the distinct slot (r3 P1)
 
     # The first line completes (valid, within the gen-1 skew) → the next sweep
-    # binds — via RESUMED (never launched), ts == the generation's spawned_ts.
+    # binds — via RESUMED (never launched), ts STRICTLY BELOW the generation's
+    # spawned_ts (r3 item 2: a resume ts of exactly spawned_ts would suppress a
+    # genuine park stamped at exactly spawned_ts at the runtime resume gate).
+    from cctelegram.session_monitor import TEAMMATE_RETRACT_RESUME_EPSILON_S
+
     with open(sc, "w") as f:
         f.write(
             json.dumps(
@@ -2023,7 +2032,9 @@ async def test_retracted_candidate_bind_relights_via_resumed_lane(
     await monitor.check_sidechain_updates({PARENT})
     act2 = monitor.pop_sidechain_activity()
     assert act2[PARENT].launched == set()  # NOT the tombstone-blocked lane
-    assert act2[PARENT].resumed == {key: rec.spawned_ts}  # the popping lane
+    assert act2[PARENT].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }  # the popping lane, strictly below the spawn instant
     assert monitor._teammate_registry[PARENT][_NAME].current_key == key
     assert key not in rec.done_retracted_keys  # consumed at bind
 
@@ -2085,3 +2096,51 @@ def test_stash_duplicate_at_cap_replaces_in_place(monitor):
     monitor._stash_early_teammate_signal(PARENT, "tu_new", meta, _iso(10000.0))
     assert len(stash) == _EARLY_TEAMMATE_SIGNALS_MAX
     assert "tu0" not in stash and "tu_new" in stash
+
+
+@pytest.mark.asyncio
+async def test_same_tick_retraction_then_bind_cancels_retraction(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """r3 P1 (BOTH engines, probe-reproduced): registration retracts in
+    check_for_updates, then the candidate's indeterminate first line completes
+    BEFORE the same tick's sidechain scan and the bind lands in the SAME
+    activity record. The bind must CANCEL the pending retraction (its premise —
+    "unbound at registration" — is falsified); the drained record carries ONLY
+    the resumed relight, so the fan-out can never tombstone the just-bound key."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    key = _key_for(_NAME)
+    from cctelegram.session_monitor import TEAMMATE_RETRACT_RESUME_EPSILON_S
+
+    # Tracked pre-spawn with a MID-WRITE first line (gate None at registration).
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text('{"type":"assistant","timestamp":"' + _iso(time.time()))
+    await monitor.check_sidechain_updates({PARENT})  # register at EOF
+    monitor.pop_sidechain_activity()
+
+    # ONE tick, NO pop in between: registration (→ retraction) …
+    _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
+    await monitor.check_for_updates({PARENT})
+    # … the first line completes between the two scans (the race) …
+    with open(sc, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": []},
+                    "timestamp": _iso(time.time() + 0.2),
+                }
+            )
+            + "\n"
+        )
+    # … and the sidechain scan of the SAME tick binds.
+    await monitor.check_sidechain_updates({PARENT})
+    act = monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert rec.current_key == key
+    assert act[PARENT].retraction_dones == set()  # CANCELLED at bind
+    assert act[PARENT].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
+    assert act[PARENT].launched == set()
+    assert key not in act[PARENT].teammate_parks  # genuine-park lane untouched
