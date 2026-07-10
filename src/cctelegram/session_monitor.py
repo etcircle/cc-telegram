@@ -400,12 +400,16 @@ class _TeammateRec:
     r6 ``done_retracted_keys`` provenance set was cleared at rotation and could
     be bypassed by the dual-write lane, leaving a positively-bound key
     tombstone-blocked → dark). The ONLY uniformly-safe emission is the
-    tombstone-popping lane: ``resumed[key] = spawned_ts -
-    TEAMMATE_RETRACT_RESUME_EPSILON_S``. ``resumed`` == ``launched`` semantics on
+    tombstone-popping lane: ``resumed[key] = min(spawned_ts, first_entry_ts) - ε``
+    (r8 item 1 — the resume floor sits below the BOUND FILE's OWN first entry, not
+    merely below ``spawned_ts``, so a look-alike's pre-spawn trailing end_turn is
+    never shielded; it reduces to ``spawned_ts - ε`` in the normal
+    ``first_ts >= spawned_ts`` case — see :meth:`_bind_teammate_key`).
+    ``resumed`` == ``launched`` semantics on
     a fresh key (``is_background=True``, 2h TTL, projected RUNNING) plus a
     tombstone-pop + a ``resumed_event_ts`` stamp; the r3 epsilon walk already
     proved every generation-surviving park (``≥ spawned_ts``) is strictly newer
-    than ``spawned_ts - ε`` and closes correctly. The r6 provenance set
+    than the resume floor and closes correctly. The r6 provenance set
     (``done_retracted_keys``) is DELETED (its membership gate, rotation clear,
     and rec-side same-tick cancel bookkeeping with it); the retraction emission
     and the ``retraction_dones`` slot STAY, and the same-tick cancel at bind
@@ -1110,6 +1114,47 @@ class SessionMonitor:
                 parent_session_id[:8],
             )
 
+    def _orphan_entry_is_generation_droppable(
+        self, name: str, entry: _OrphanPending, recs: dict[str, "_TeammateRec"]
+    ) -> bool:
+        """r9 item 1 (CONVERGED P1 — Hermes + Codex, both probe-reproduced): the
+        REDUNDANCY predicate for the two-tier orphan eviction, defined by REUSING
+        THE DRAIN FILTER'S OWN semantics so the eviction predicate and the drain
+        filter can never disagree (redundant iff drain would drop it —
+        mint/validate parity).
+
+        An entry is REDUNDANT (tier-1 evictable) iff its retained signal(s) would
+        be GENERATION-DROPPED at drain against the name's CURRENT rec:
+
+        * NO rec for ``name`` → NOT droppable (PROTECTED). A pre-registration
+          ORPHAN is the buffer's whole reason for existing — its park is a
+          teammate's only close signal, arriving before the spawn registers.
+        * HAS a rec → run the SAME ``_generation_filter_park`` /
+          ``_generation_filter_wake`` the drain
+          (:meth:`_drain_orphan_teammate_park`) uses against ``rec.spawned_ts``.
+          Redundant iff EVERY retained signal is dropped: a park whose parseable
+          ``ts < rec.spawned_ts`` drops (it reports a PRIOR leg; ``spawned_ts`` is
+          event-ts-anchored and MONOTONIC across generations, so a future
+          generation spawns even later and such a copy can close NO generation);
+          a wake ``< rec.spawned_ts`` drops. Anything that SURVIVES a filter — a
+          park ``>= spawned_ts`` (the possibly-next-generation close), an
+          UnknownDone-dominance park that can't be ts-classified, or a wake ``>=
+          spawned_ts`` — makes the entry PROTECTED (fail-dark preference; a copy
+          that could still close a future bind is never a redundancy victim).
+
+        The r8 "name has a rec ⇒ redundant" rule was WRONG: the r7 lifecycle
+        deliberately RETAINS a park under a STILL-REGISTERED name because it may
+        belong to a stashed not-yet-registered NEXT generation — that copy is the
+        next gen's ONLY close and must be PROTECTED, not evicted."""
+        rec = recs.get(name)
+        if rec is None:
+            return False  # pre-registration orphan — the protected class
+        park_survives = _generation_filter_park(entry.park, rec.spawned_ts) is not None
+        wake_survives = _generation_filter_wake(entry.wake, rec.spawned_ts) is not None
+        # Redundant iff NO retained signal survives the drain filter (an empty
+        # entry — no park, no wake — has nothing to carry, so it is redundant too).
+        return not park_survives and not wake_survives
+
     def _orphan_pending_slot(self, parent_session_id: str, name: str) -> _OrphanPending:
         """Get-or-create the orphan pending pair for ``name`` (r5 + r6): lazy TTL
         sweep first (expired names evicted before the cap check), then
@@ -1117,8 +1162,8 @@ class SessionMonitor:
         in place — the r2 P3 discipline). The caller merges into the returned entry
         and refreshes ``wall``.
 
-        EVICTION PRIORITY (r8 item 2, CONVERGED P1 — Hermes + Codex, both
-        probe-reproduced): the buffer's REASON FOR EXISTING is to preserve a
+        EVICTION PRIORITY (r8 item 2 → r9 item 1, CONVERGED P1 — Hermes + Codex,
+        both probe-reproduced): the buffer's REASON FOR EXISTING is to preserve a
         pre-registration ORPHAN park (a park whose name has NO registry rec yet —
         its ONLY home, since a teammate's park is its only close signal and it
         arrives before the spawn registers). Since r7 made EVERY park dual-write a
@@ -1128,14 +1173,24 @@ class SessionMonitor:
         dropped at the next drain), and a blind ``next(iter(buf))`` drop-oldest
         evicted the sole retained ORPHAN the buffer exists to protect
         (probe: 32 distinct REGISTERED-name parks evict an unregistered ``future``
-        → it later binds with ``pending_park=None`` → 2h strand). Fix: a two-tier
-        oldest-first eviction — evict the oldest REGISTERED-name entry (a
-        redundant dual-write copy that has another home) FIRST; only when ALL
-        entries are unregistered orphans (the true cap bound) evict the oldest
-        orphan. The registry lookup for "this buffered name HAS a rec" is available
-        here via ``self._teammate_registry`` (name-keyed, same key space as
-        ``buf``). The lazy TTL sweep + replace-merge-in-place semantics are
-        byte-identical."""
+        → it later binds with ``pending_park=None`` → 2h strand). The r8 two-tier fix keyed the tiers on
+        "name has a rec", but that MIS-tiered a park retained under a
+        STILL-REGISTERED name that belongs to a stashed not-yet-registered NEXT
+        generation (gen-1 bound, gen-2 spawn stashed, gen-2 park retained under the
+        registered name → the next gen's ONLY close) into the evictable tier
+        (probe: 32 registered-stale parks + 1 new name evict it → gen-2 binds
+        ``pending_park=None`` → 2h strand).
+
+        Fix (r9 item 1): REDUNDANT is redefined via the DRAIN FILTER'S OWN
+        semantics — :meth:`_orphan_entry_is_generation_droppable` — an entry is
+        tier-1 evictable iff the drain WOULD generation-drop it (redundant iff
+        drain would drop it — the eviction predicate and the drain filter must
+        never disagree, mint/validate parity). Tier 1 (evict FIRST, oldest-first):
+        the redundant entries. Tier 2 (only when tier 1 is EMPTY — the true cap
+        bound): the oldest PROTECTED entry (no rec — a pre-registration orphan; OR
+        a park/wake that survives the drain filter — the possibly-next-gen close;
+        OR an unparseable-dominance park that can't be ts-classified). The lazy TTL
+        sweep + replace-merge-in-place semantics are byte-identical."""
         buf = self._orphan_teammate_parks.setdefault(parent_session_id, {})
         now = time.time()
         expired = [
@@ -1147,11 +1202,22 @@ class SessionMonitor:
         if entry is None:
             if len(buf) >= _ORPHAN_PARK_MAX_NAMES:
                 recs = self._teammate_registry.get(parent_session_id) or {}
-                # Tier 1: the oldest REGISTERED-name copy (a redundant dual-write
-                # whose primary close already applied — it has another home).
-                victim = next((n for n in buf if n in recs), None)
-                # Tier 2 (all entries are pre-registration orphans — the true cap
-                # bound): the oldest orphan (insertion order).
+                # Tier 1 (evict FIRST): the oldest REDUNDANT entry — one the DRAIN
+                # would generation-drop (redundant iff drain would drop it — the
+                # eviction predicate and the drain filter must never disagree;
+                # r9 item 1). Its retained signal can never close any bind.
+                victim = next(
+                    (
+                        n
+                        for n, e in buf.items()
+                        if self._orphan_entry_is_generation_droppable(n, e, recs)
+                    ),
+                    None,
+                )
+                # Tier 2 (all entries are PROTECTED — the true cap bound): the
+                # oldest protected entry (insertion order). A protected entry has
+                # no rec (a pre-registration orphan) OR a park/wake that SURVIVES
+                # the drain filter (the possibly-next-generation close).
                 if victim is None:
                     victim = next(iter(buf))
                 buf.pop(victim)
@@ -1258,6 +1324,28 @@ class SessionMonitor:
         it made a drained park tombstone a teammate whose LATER wake proved it
         resumed — false-dark AND a broken transcript-true arbitration).
 
+        UNIVERSAL DUAL-WRITE (r9 item 2, Codex P2, probe-reproduced — the wake
+        mirror of the r7 item-2 park RETAIN-ALWAYS): EVERY wake FIRST lands a NAMED
+        RAW copy in the orphan buffer via :meth:`_retain_orphan_teammate_wake` —
+        the FIRST thing this method does when ``event_ts`` is parseable, before ANY
+        branching. A bound OLD generation used to spend the NEW generation's only
+        wake: gen-1 bound → gen-2 spawn result stashed (result-before-use) → gen-2
+        parks at T4 (retained via the r7 park dual-write) → gen-2 wakes at T5, but
+        the wake applied ONLY to gen-1's ``current_key`` and was GONE → the late
+        gen-2 tool_use registers/rotates → the drained park (T4) closes the fresh
+        bind and NO pending wake survives → tombstoned although T5 proved it
+        resumed. The retained copy carries the RAW ``event_ts`` (NOT the
+        gen-1-``filtered`` value), so the drain (:meth:`_drain_orphan_teammate_park`)
+        re-attributes it against the FUTURE rec's ``spawned_ts`` — a wake ``>=
+        gen-2 spawned_ts`` carries into ``pending_wake`` and WINS the bind's
+        wake-vs-park arbitration (``pending_wake`` first → ``resumed[key]``); a
+        stale wake ``< gen-2 spawned_ts`` is generation-DROPPED at that drain (the
+        r7 item-1 filter, applied to the wake at the drain seam too). The immediate
+        application to the bound rec KEEPS today's semantics for the OUTGOING
+        generation, and the buffer's max-on-repeats reduction makes the dual-write
+        idempotent (a key binds exactly once). BUFFER-NOISE bounded by the 32 cap
+        (r9 item 1 protects a surviving-signal entry) + the 2h TTL.
+
         GENERATION FILTER (r7 item 1, Hermes P1, probe-reproduced): the
         registered-rec path must apply the SAME ``_generation_filter_wake`` the
         orphan drain (:meth:`_drain_orphan_teammate_park`) and the rotation
@@ -1270,11 +1358,16 @@ class SessionMonitor:
         ``None`` despite the filter's documented parseable-only contract. A
         ``None`` or pre-generation wake is REFUSED (INFO) BEFORE any of
         ``last_wake_ts`` / ``resumed`` / ``pending_wake`` is touched."""
+        # r9 item 2: retain a named RAW copy of EVERY parseable wake (registered or
+        # not) so a not-yet-registered NEWER generation's wake is never spent
+        # solely on the currently-bound OLD generation. The RAW event_ts is
+        # retained (never the old rec's generation-filtered value) so the drain
+        # attributes it against the FUTURE rec's spawned_ts.
+        if event_ts is not None:
+            self._retain_orphan_teammate_wake(parent_session_id, name, event_ts)
         recs = self._teammate_registry.get(parent_session_id)
         rec = recs.get(name) if recs else None
         if rec is None:
-            if event_ts is not None:
-                self._retain_orphan_teammate_wake(parent_session_id, name, event_ts)
             return
         filtered = _generation_filter_wake(event_ts, rec.spawned_ts)
         if filtered is None:

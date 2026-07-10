@@ -2300,66 +2300,73 @@ async def test_orphan_park_buffer_cap_and_ttl_hygiene(
     assert "tm_old" not in buf2 and "tm_fresh" in buf2
 
 
-# ── two-tier eviction priority (r8 item 2 — CONVERGED P1) ────────────────
+# ── two-tier eviction priority (r8 item 2 → r9 item 1 — CONVERGED P1) ─────
 
 
 @pytest.mark.asyncio
 async def test_item2_registered_copy_evicted_before_pre_registration_orphan(
     monitor, tmp_path, make_jsonl_entry, make_tool_use_block
 ):
-    """r8 item 2 (CONVERGED P1, Hermes + Codex, both probe-reproduced): the
-    universal park dual-write (r7) copies EVERY park — including the
+    """r8 item 2 → r9 item 1 (CONVERGED P1, Hermes + Codex, both probe-reproduced):
+    the universal park dual-write (r7) copies EVERY park — including the
     high-frequency registered/bound path — into the shared 32-name orphan buffer.
     A blind oldest-eviction then evicted the sole retained pre-registration ORPHAN
     (a park whose name has NO registry rec — its ONLY home) when the buffer filled
-    with redundant REGISTERED-name copies. The two-tier fix evicts the oldest
-    REGISTERED-name copy FIRST, so the orphan survives and later binds with its
-    close.
+    with redundant REGISTERED-name copies. The r9 rule keys the tiers on the DRAIN
+    FILTER'S OWN semantics: a GENUINELY STALE registered copy (park_ts <
+    rec.spawned_ts — the drain would generation-drop it) is tier-1 REDUNDANT and
+    evicts FIRST, so the orphan survives and later binds with its close.
 
     Probe: retain the sole park for unregistered ``future`` → fill the remaining
-    cap-1 slots with distinct REGISTERED-name parks → the (cap)th distinct
-    registered park must evict a REGISTERED copy, NOT ``future`` → ``future`` then
-    registers + binds and closes via the drained orphan park."""
+    cap-1 slots with distinct GENUINELY-STALE REGISTERED-name parks (park_ts <
+    spawned_ts) → the (cap)th distinct stale registered park must evict a STALE
+    REGISTERED copy, NOT ``future`` → ``future`` then registers + binds and closes
+    via the drained orphan park."""
     from cctelegram.handlers.response_builder import TeammateIdle
     from cctelegram.session_monitor import _ORPHAN_PARK_MAX_NAMES, _TeammateRec
 
     parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
 
     # 1. The sole pre-registration ORPHAN (no registry rec) — inserted FIRST so it
-    #    is the OLDEST entry (a blind next(iter(buf)) drop would take it).
+    #    is the OLDEST entry (a blind next(iter(buf)) drop would take it). No rec ⇒
+    #    PROTECTED (tier 2) under the r9 rule.
     monitor._retain_orphan_teammate_park(
         PARENT,
         TeammateIdle(name="future", park_ts=100.0, park_ts_unparseable=False),
     )
 
-    # 2. Fill the rest of the cap with distinct REGISTERED-name parks (each name
-    #    HAS a rec — a redundant dual-write whose primary close already applied).
+    # 2. Fill the rest of the cap with distinct GENUINELY-STALE REGISTERED-name
+    #    parks: each name HAS a rec whose spawned_ts (1000.0) is ABOVE the retained
+    #    park_ts (100.0 + i), so the drain WOULD generation-drop them → tier-1
+    #    REDUNDANT (the r9 predicate). This is the "genuinely stale registered
+    #    copy still evicts first" pin.
     recs = monitor._teammate_recs(PARENT)
     for i in range(_ORPHAN_PARK_MAX_NAMES - 1):
         rname = f"reg{i}"
         recs[rname] = _TeammateRec(
-            name=rname, teammate_id=None, spawn_generation=1, spawned_ts=1.0
+            name=rname, teammate_id=None, spawn_generation=1, spawned_ts=1000.0
         )
         monitor._retain_orphan_teammate_park(
             PARENT,
-            TeammateIdle(name=rname, park_ts=200.0 + i, park_ts_unparseable=False),
+            TeammateIdle(name=rname, park_ts=100.0 + i, park_ts_unparseable=False),
         )
     buf = monitor._orphan_teammate_parks[PARENT]
     assert len(buf) == _ORPHAN_PARK_MAX_NAMES
     assert "future" in buf
 
-    # 3. The (cap)th distinct REGISTERED-name park at cap — MUST evict the oldest
-    #    REGISTERED copy (reg0), NOT the pre-registration orphan (future).
+    # 3. The (cap)th distinct STALE REGISTERED-name park at cap — MUST evict the
+    #    oldest tier-1 REDUNDANT entry (reg0, stale), NOT the pre-registration
+    #    orphan (future, PROTECTED).
     rname = f"reg{_ORPHAN_PARK_MAX_NAMES - 1}"
     recs[rname] = _TeammateRec(
-        name=rname, teammate_id=None, spawn_generation=1, spawned_ts=1.0
+        name=rname, teammate_id=None, spawn_generation=1, spawned_ts=1000.0
     )
     monitor._retain_orphan_teammate_park(
-        PARENT, TeammateIdle(name=rname, park_ts=999.0, park_ts_unparseable=False)
+        PARENT, TeammateIdle(name=rname, park_ts=500.0, park_ts_unparseable=False)
     )
     assert len(buf) == _ORPHAN_PARK_MAX_NAMES
-    assert "future" in buf  # the orphan SURVIVES (registered copy evicted)
-    assert "reg0" not in buf  # the oldest registered copy was evicted
+    assert "future" in buf  # the orphan SURVIVES (stale registered copy evicted)
+    assert "reg0" not in buf  # the oldest stale registered copy was evicted
     assert rname in buf
 
     # 4. ``future`` registers + binds → the drained orphan park (100.0) is its
@@ -2377,9 +2384,10 @@ async def test_item2_registered_copy_evicted_before_pre_registration_orphan(
 
 @pytest.mark.asyncio
 async def test_item2_all_orphans_at_cap_evicts_oldest_orphan(monitor, tmp_path):
-    """r8 item 2 tier-2 pin: when the buffer is ALL pre-registration orphans (no
-    registered name has a copy — the TRUE cap bound), a NEW name evicts the OLDEST
-    orphan (insertion order), preserving the existing hygiene contract."""
+    """r8 item 2 → r9 item 1 tier-2 pin: when the buffer is ALL PROTECTED entries
+    (here all pre-registration orphans — no registry rec; the TRUE cap bound), a
+    NEW name evicts the OLDEST protected entry (insertion order), preserving the
+    existing hygiene contract."""
     from cctelegram.handlers.response_builder import TeammateIdle
     from cctelegram.session_monitor import _ORPHAN_PARK_MAX_NAMES
 
@@ -2391,12 +2399,218 @@ async def test_item2_all_orphans_at_cap_evicts_oldest_orphan(monitor, tmp_path):
         )
     buf = monitor._orphan_teammate_parks[PARENT]
     assert len(buf) == _ORPHAN_PARK_MAX_NAMES
-    # No registry recs at all → tier 1 finds no victim → tier 2 evicts the oldest.
+    # No registry recs at all → every entry is PROTECTED → tier 1 finds no victim
+    # → tier 2 evicts the oldest.
     monitor._retain_orphan_teammate_park(
         PARENT, TeammateIdle(name="orph_new", park_ts=999.0, park_ts_unparseable=False)
     )
     assert len(buf) == _ORPHAN_PARK_MAX_NAMES
     assert "orph0" not in buf and "orph_new" in buf  # oldest orphan evicted
+
+
+@pytest.mark.asyncio
+async def test_item1_future_generation_park_under_registered_name_survives_eviction(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """r9 item 1 (CONVERGED P1, Hermes + Codex, both probe-reproduced — the exact
+    converged probe): a park retained under a STILL-REGISTERED name that belongs to
+    a stashed not-yet-registered NEXT generation is the next gen's ONLY close and
+    MUST survive eviction. Under the r8 "name has a rec ⇒ redundant" rule that
+    copy sat in the evictable tier and 32 registered-stale parks + 1 new name
+    evicted it → gen-2 bound pending_park=None → 2h strand.
+
+    Under the r9 rule the copy SURVIVES a rec (park_ts >= rec.spawned_ts, so the
+    drain would NOT drop it → PROTECTED tier-2), the 32 genuinely-stale
+    registered parks fill tier 1, and the (cap)th stale park evicts a stale copy —
+    NOT the future-generation copy. Rotation then drains it into gen-2's
+    pending_park and the bind closes."""
+    from cctelegram.handlers.response_builder import (
+        TeammateIdle,
+        TeammateSpawnInfo,
+    )
+    from cctelegram.session_monitor import _ORPHAN_PARK_MAX_NAMES, _TeammateRec
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    name = "explore"
+    k1 = "aexplore-11111111"
+
+    # gen-1 is bound; the gen-2 spawn RESULT is stashed (not applied yet), and the
+    # gen-2 PARK arrives while the rec is STILL gen-1. Because the park_ts (135.0)
+    # is >= gen-1's spawned_ts (100.0) it is NOT dropped: it applies to gen-1's
+    # current_key AND is dual-write retained under the STILL-REGISTERED name.
+    recs = monitor._teammate_recs(PARENT)
+    recs[name] = _TeammateRec(
+        name=name,
+        teammate_id="g1",
+        spawn_generation=1,
+        spawned_ts=100.0,
+        current_key=k1,
+    )
+    monitor._record_teammate_park(
+        PARENT, TeammateIdle(name=name, park_ts=135.0, park_ts_unparseable=False)
+    )
+    monitor.pop_sidechain_activity()  # drop the immediate gen-1 close
+    buf = monitor._orphan_teammate_parks[PARENT]
+    assert name in buf  # the future-generation copy is retained
+    # The retained copy is PROTECTED under the r9 rule: park_ts 135.0 >= gen-1
+    # spawned_ts 100.0 → the drain filter would CARRY it (it may be the next gen's
+    # only close), so it is NOT tier-1 redundant.
+    assert not monitor._orphan_entry_is_generation_droppable(name, buf[name], recs)
+
+    # Fill the rest of the cap with GENUINELY-STALE registered-name parks
+    # (park_ts < spawned_ts → drain would drop → tier-1 REDUNDANT), plus one NEW
+    # name to trigger eviction. The stale copies must be the victims.
+    for i in range(_ORPHAN_PARK_MAX_NAMES - 1):
+        rname = f"reg{i}"
+        recs[rname] = _TeammateRec(
+            name=rname, teammate_id=None, spawn_generation=1, spawned_ts=1000.0
+        )
+        monitor._retain_orphan_teammate_park(
+            PARENT,
+            TeammateIdle(name=rname, park_ts=100.0 + i, park_ts_unparseable=False),
+        )
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    # A NEW name at cap → evicts a tier-1 redundant (stale registered) copy, NOT
+    # the future-generation `explore` copy.
+    monitor._retain_orphan_teammate_park(
+        PARENT,
+        TeammateIdle(name="brandnew", park_ts=1.0, park_ts_unparseable=False),
+    )
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    assert name in buf  # the future-generation copy SURVIVED
+    assert "reg0" not in buf  # the oldest stale registered copy was evicted
+    assert "brandnew" in buf
+
+    # The late gen-2 spawn tool_use rotates the rec to gen-2 and DRAINS the
+    # surviving orphan copy into gen-2's pending_park (park_ts 135.0 >= gen-2
+    # spawned_ts 130.0 → carries), then a matching sidechain binds and closes.
+    monitor._record_teammate_spawn(
+        PARENT, TeammateSpawnInfo(name, "g2", "explorer"), 130.0
+    )
+    rec = monitor._teammate_registry[PARENT][name]
+    assert rec.spawn_generation == 2
+    assert rec.pending_park is not None  # drained → gen-2's close is present
+    assert rec.pending_park.ts == 135.0
+    # Bind gen-2 → the pending_park closes it (a genuine post-spawn park).
+    k2 = "aexplore-22222222"
+    monitor._bind_teammate_key(PARENT, rec, k2, first_entry_ts=130.05)
+    activity = monitor.pop_sidechain_activity()[PARENT]
+    assert activity.teammate_parks.get(k2) == (135.0, False)  # gen-2 closes
+
+
+# ── wake universal dual-write (r9 item 2 — Codex P2) ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_item2_wake_dual_write_keeps_next_generation_bind_live(
+    monitor,
+    tmp_path,
+):
+    """r9 item 2 (Codex P2, probe-reproduced — the exact replay): a wake received
+    while an OLD generation is bound is applied ONLY to the old key AND (the fix)
+    universally orphan-retained RAW, so a stashed NEXT generation's later wake is
+    not lost. Replay: gen-1 bound → gen-2 spawn result stashed → gen-2 parks at T4
+    (135.0, r7 park dual-write) → gen-2 wakes at T5 (140.0) → late gen-2 tool_use
+    rotates. Pre-fix the park survived via retention but the wake was applied only
+    to gen-1, so gen-2 bound with the T4 park and NO pending wake → tombstoned
+    although T5 proved it resumed. Post-fix the wake's RAW copy drains into gen-2's
+    pending_wake and WINS the wake-vs-park arbitration → LIVE."""
+    from cctelegram.handlers.response_builder import (
+        TeammateIdle,
+        TeammateSpawnInfo,
+    )
+    from cctelegram.session_monitor import _TeammateRec
+
+    _setup_parent(monitor, tmp_path)
+    name = "explore"
+    k1 = "aexplore-11111111"
+    k2 = "aexplore-22222222"
+
+    # gen-1 bound; the gen-2 spawn RESULT is stashed (not applied yet).
+    recs = monitor._teammate_recs(PARENT)
+    recs[name] = _TeammateRec(
+        name=name,
+        teammate_id="g1",
+        spawn_generation=1,
+        spawned_ts=100.0,
+        current_key=k1,
+    )
+    # gen-2 park (T4=135.0) then gen-2 wake (T5=140.0) arrive while STILL gen-1.
+    monitor._record_teammate_park(
+        PARENT, TeammateIdle(name=name, park_ts=135.0, park_ts_unparseable=False)
+    )
+    monitor._record_teammate_wake(PARENT, name, 140.0)
+    monitor.pop_sidechain_activity()  # drop the immediate gen-1 close + resume
+
+    # The late gen-2 tool_use applies the spawn → rotation to gen-2 → drain the
+    # orphan-retained PAIR: park 135.0 AND wake 140.0 both >= gen-2 spawned_ts
+    # 130.0 → carry into pending_park / pending_wake.
+    monitor._record_teammate_spawn(
+        PARENT, TeammateSpawnInfo(name, "g2", "explorer"), 130.0
+    )
+    rec = monitor._teammate_registry[PARENT][name]
+    assert rec.spawn_generation == 2
+    assert rec.pending_park is not None and rec.pending_park.ts == 135.0
+    assert rec.pending_wake == 140.0  # the fix: the wake survived for gen-2
+
+    # Bind gen-2 → pending_wake first (resumed[k2]=140.0), pending_park second
+    # (teammate_parks[k2]=(135.0, False)). The runtime resume gate suppresses a
+    # done with ts <= resumed, so the older park (135.0 <= 140.0) is suppressed →
+    # gen-2 stays LIVE (the wake wins).
+    monitor._bind_teammate_key(PARENT, rec, k2, first_entry_ts=130.05)
+    activity = monitor.pop_sidechain_activity()[PARENT]
+    assert activity.resumed.get(k2) == 140.0  # the newer wake wins
+    assert activity.teammate_parks.get(k2) == (135.0, False)  # older park present
+
+
+@pytest.mark.asyncio
+async def test_item2_stale_wake_is_generation_dropped_at_drain(
+    monitor,
+    tmp_path,
+):
+    """r9 item 2 stale-wake pin (the r7 item-1 filter must catch a stale wake at
+    the DRAIN seam too): a wake whose ts is BELOW the NEXT generation's spawned_ts
+    reports a PRIOR leg and must NOT relight the fresh bind. gen-1 bound → gen-1
+    wake at T=110.0 (retained RAW) → late gen-2 spawn at spawned_ts=200.0 rotates
+    → the drain generation-filters the retained wake (110.0 < 200.0) and DROPS it
+    → gen-2 binds with NO pending wake."""
+    from cctelegram.handlers.response_builder import TeammateSpawnInfo
+    from cctelegram.session_monitor import _TeammateRec
+
+    _setup_parent(monitor, tmp_path)
+    name = "explore"
+    k1 = "aexplore-11111111"
+    k2 = "aexplore-22222222"
+
+    recs = monitor._teammate_recs(PARENT)
+    recs[name] = _TeammateRec(
+        name=name,
+        teammate_id="g1",
+        spawn_generation=1,
+        spawned_ts=100.0,
+        current_key=k1,
+    )
+    # A gen-1-era wake at 110.0 — retained RAW under the still-gen-1 name.
+    monitor._record_teammate_wake(PARENT, name, 110.0)
+    monitor.pop_sidechain_activity()
+    buf = monitor._orphan_teammate_parks[PARENT]
+    assert buf[name].wake == 110.0  # retained raw
+
+    # gen-2 spawns at a much LATER instant → the drain filters the stale wake out.
+    monitor._record_teammate_spawn(
+        PARENT, TeammateSpawnInfo(name, "g2", "explorer"), 200.0
+    )
+    rec = monitor._teammate_registry[PARENT][name]
+    assert rec.spawn_generation == 2
+    assert rec.pending_wake is None  # the stale wake was generation-dropped
+
+    monitor._bind_teammate_key(PARENT, rec, k2, first_entry_ts=200.05)
+    activity = monitor.pop_sidechain_activity()[PARENT]
+    # Only the always-resumed relight floor (below spawned_ts), never the stale
+    # wake at 110.0 — the fresh key is not falsely relit by a prior-leg wake.
+    assert activity.resumed.get(k2) is not None
+    assert activity.resumed[k2] < 200.0
+    assert activity.resumed[k2] != 110.0
 
 
 # ── rotation re-filters pending signals (r6 rule 2 rationale pin) ────────
