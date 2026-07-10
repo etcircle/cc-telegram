@@ -55,7 +55,6 @@ from cctelegram.terminal_parser import resolve_ask_form
 from tests.conftest import Fake168Picker, _Screen
 
 BUSY_TEXT = "⏳ Action in progress — try again in a second"
-USAGE_BUSY_TEXT = "⏳ Window busy — try again in a second"
 SEND_FAILED_TEXT = "❌ Failed to send — window may be gone"
 
 _FX = Path(__file__).parents[1] / "fixtures"
@@ -459,6 +458,9 @@ def _make_bot_tmux(
 
     tmux.send_keys = AsyncMock(side_effect=_send)
     tmux.capture_pane = AsyncMock(return_value="raw usage pane")
+    # v5: the /cost preflight + post-send captures go through the
+    # cancellation-safe wrapper; default it to the same value.
+    tmux.capture_pane_cancellation_safe = AsyncMock(return_value="raw usage pane")
     return tmux, locked_during_send
 
 
@@ -563,10 +565,15 @@ async def test_usage_rejected_while_lock_held() -> None:
     finally:
         lock.release()
     safe_reply_mock.assert_awaited_once()
-    assert safe_reply_mock.call_args.args[1] == USAGE_BUSY_TEXT
+    # v5: the lock-busy exit now posts a bridge-side snapshot card (with the
+    # lock_busy action line) instead of the bare "Window busy" retry text.
+    reply_text = safe_reply_mock.call_args.args[1]
+    assert "snapshot" in reply_text.lower()
+    assert "try again" in reply_text.lower()
     # No /usage text may land in the pane, and no dependent capture runs.
     tmux.send_keys.assert_not_called()
     tmux.capture_pane.assert_not_called()
+    tmux.capture_pane_cancellation_safe.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -593,7 +600,9 @@ async def test_usage_normal_transaction_under_lock_reply_after_release() -> None
         locked_during_capture.append(lock.locked())
         return captures.pop(0)
 
-    tmux.capture_pane = AsyncMock(side_effect=_capture)
+    # v5: the preflight + post-send captures go through the cancellation-safe
+    # wrapper, so drive the fixtures through it.
+    tmux.capture_pane_cancellation_safe = AsyncMock(side_effect=_capture)
     locked_during_reply: list[bool] = []
 
     async def _reply(*args: Any, **kwargs: Any) -> None:

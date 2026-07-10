@@ -25,6 +25,7 @@ from . import (
     notify_source,
     pane_signals,
     pick_intent,
+    usage_cache,
 )
 from .dashboard import clear_dashboards_in_thread
 from .inbound_aggregator import aggregator_clear_route
@@ -153,6 +154,10 @@ async def clear_topic_state(
     # the route_runtime teardown (same ownership rationale — pull-only
     # leaf state keyed by route must not survive the topic).
     pane_signals.clear_routes_for_topic(user_id, thread_id or 0)
+    # /cost overlay cache: drop the topic's cached usage overlays beside the
+    # route_runtime teardown (same ownership rationale — pull-only leaf state
+    # keyed by route must not survive the topic).
+    usage_cache.clear_routes_for_topic(user_id, thread_id or 0)
     # Wave A lifecycle seam (c): drop the topic's aql: late-answer cards
     # beside the route_runtime teardown — topic-keyed, NOT via the queued-
     # routes loop above, so a queue-less route's card dies with the topic

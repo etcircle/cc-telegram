@@ -49,6 +49,7 @@ from cctelegram.handlers import (
     pick_intent,
     pick_token,
     status_polling,
+    usage_cache,
 )
 
 
@@ -177,6 +178,19 @@ class FakeTmux:
         if not w:
             return ""
         return w.pane_text_ansi if with_ansi else w.pane_text
+
+    async def capture_pane_cancellation_safe(
+        self,
+        window_id: str,
+        with_ansi: bool = False,
+        scrollback_lines: int = 0,
+    ) -> str:
+        # The fake never hangs, so the cancellation-safe path is behaviorally
+        # identical to capture_pane here (the reap-on-cancel logic is unit-tested
+        # against the real subprocess mock in test_capture_pane_cancellation_safe).
+        return await self.capture_pane(
+            window_id, with_ansi=with_ansi, scrollback_lines=scrollback_lines
+        )
 
     async def create_window(
         self,
@@ -794,6 +808,8 @@ def _reset_all_handler_state() -> None:
     pick_intent.reset_for_tests()
     auq_source.reset_for_tests()
     dashboard.reset_for_tests()
+    # /cost + /usage overlay result cache (co-located reset seam).
+    usage_cache.reset_for_tests()
     # Re-inject the production JSONL-cache getter (bot.post_init wires this
     # once at startup, but post_init doesn't run under test). Without it the
     # ``jsonl_cache`` resolver branch would no-op and the render path would
@@ -833,6 +849,7 @@ def fake_tmux(monkeypatch: pytest.MonkeyPatch) -> FakeTmux:
         "rename_window",
         "send_keys",
         "capture_pane",
+        "capture_pane_cancellation_safe",
         "create_window",
         "get_or_create_session",
         "get_session",
