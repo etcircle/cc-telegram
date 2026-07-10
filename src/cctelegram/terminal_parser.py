@@ -3359,6 +3359,73 @@ def pane_looks_idle(visible_pane: str | None) -> bool:
     return True
 
 
+def classify_pane_idle_failure(visible_pane: str | None) -> str | None:
+    """Name the FIRST ``pane_looks_idle`` leg that a non-idle pane fails.
+
+    Diagnostic-only, REPLAY-only, NEVER authoritative — ``pane_looks_idle`` is
+    the decider (the deliberately fail-closed five-gate proof ``/update`` and the
+    ``/cost`` overlay interceptor rely on). This helper walks the SAME legs in the
+    SAME order purely to LABEL the first failure for logging + reason-specific
+    fallback copy. Its body mirrors ``pane_looks_idle`` line-for-line so the
+    invariant holds: it returns ``None`` iff ``pane_looks_idle`` returns ``True``
+    (pinned by an agreement test across every pane fixture). Never returns pane
+    text — only a fixed leg name.
+
+    Reason names:
+
+      - ``"capture_empty"`` — empty / None capture (indeterminate).
+      - ``"active_status"`` — leg 1, a live ``esc to interrupt`` run signal.
+      - ``"interactive"``  — leg 2, a live AUQ / EPM / gate / Settings surface.
+      - ``"no_input_box"`` — leg 3, no rendered input-box separator pair or no
+        ``❯`` prompt row (a mid-redraw / no-chrome frame — indeterminate).
+      - ``"input_not_empty"`` — leg 3, a non-empty / non-cursor input row (a
+        typed-but-unsent draft, or a ``> blockquote`` between separators).
+      - ``"no_ready_chrome"`` — leg 4, no ready-for-input status marker below the
+        box (a dropped-footer mid-redraw — indeterminate).
+      - ``"background_shells"`` — leg 5, a live ``· N shell`` background-jobs
+        token.
+      - ``None`` — all legs pass (the pane is idle).
+    """
+    if not visible_pane:
+        return "capture_empty"
+    lines = visible_pane.split("\n")
+    # (1) Active generation.
+    if is_status_active(visible_pane):
+        return "active_status"
+    # (2) Live interactive surface.
+    if is_interactive_ui(visible_pane):
+        return "interactive"
+    # (3) Structural input box: the bottom pair of rule separators.
+    search_start = max(0, len(lines) - _CHROME_SCAN_LINES)
+    sep_idxs = [
+        i for i in range(search_start, len(lines)) if _is_rule_separator(lines[i])
+    ]
+    if len(sep_idxs) < 2:
+        return "no_input_box"
+    top, bottom = sep_idxs[-2], sep_idxs[-1]
+    prompt_seen = False
+    for i in range(top + 1, bottom):
+        s = lines[i].strip()
+        if not s:
+            continue
+        if s[0] not in ("❯", "›", ">"):
+            return "input_not_empty"
+        if s[1:].strip():
+            return "input_not_empty"
+        prompt_seen = True
+    if not prompt_seen:
+        return "no_input_box"
+    # (4) Ready-for-input chrome below the box.
+    below = "\n".join(lines[bottom + 1 :])
+    if not any(marker in below for marker in _READY_STATUS_MARKERS):
+        return "no_ready_chrome"
+    # (5) Live background shells.
+    jobs = parse_background_jobs(visible_pane)
+    if jobs is not None and jobs >= 1:
+        return "background_shells"
+    return None
+
+
 # ── Context-window indicator ─────────────────────────────────────────────
 
 # Matches Claude Code's chrome footer line, e.g.
