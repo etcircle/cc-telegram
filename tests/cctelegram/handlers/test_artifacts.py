@@ -113,6 +113,44 @@ def test_extract_multiple_mixed_shapes() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # Owner 2026-07-10 widening: audio / video / archive / office / data
+        ("recording at ~/audio/take-01.wav", ["~/audio/take-01.wav"]),
+        ("song saved to music/track.mp3", ["music/track.mp3"]),
+        ("render at output/clip.mp4", ["output/clip.mp4"]),
+        ("screencast movie.mov here", ["movie.mov"]),
+        ("bundle.tgz built", ["bundle.tgz"]),
+        ("archive data.tar written", ["data.tar"]),
+        ("df.parquet exported", ["df.parquet"]),
+        ("legacy sheet.xls attached", ["sheet.xls"]),
+        ("book manual.epub delivered", ["manual.epub"]),
+        ("icon at assets/favicon.ico now", ["assets/favicon.ico"]),
+    ],
+)
+def test_extract_new_deliverable_extensions(text: str, expected: list[str]) -> None:
+    assert artifacts.extract_artifact_candidates(text) == expected
+
+
+def test_extract_tar_gz_is_the_whole_token_not_gz_suffixed() -> None:
+    """`file.tar.gz` extracts as the FULL `file.tar.gz` token — the `.` is inside
+    the path char class and the right boundary rejects stopping at `.tar` (a `.`
+    followed by a word char), so the token is never truncated to a `.gz` tail
+    (which would resolve to the wrong / nonexistent path)."""
+    assert artifacts.extract_artifact_candidates("archive temp/build.tar.gz done") == [
+        "temp/build.tar.gz"
+    ]
+
+
+def test_extract_still_excludes_source_code() -> None:
+    """The widening did NOT add source-code extensions (the anti-spam core)."""
+    assert (
+        artifacts.extract_artifact_candidates("edited main.py and lib.rs and app.ts")
+        == []
+    )
+
+
 # ── Validation (§A.3) ─────────────────────────────────────────────────────
 
 
@@ -137,6 +175,28 @@ def test_resolve_bare_relative_joined_to_cwd(tmp_path: Path) -> None:
     got = artifacts.resolve_artifacts(["temp/data.csv"], str(tmp_path), [], 1024)
     assert len(got) == 1
     assert got[0].display_name == "temp/data.csv"
+
+
+def test_resolve_wav_full_relative_path(tmp_path: Path) -> None:
+    """A new audio ext with a full relative path resolves to the real file."""
+    f = _write(tmp_path / "audio" / "take-01.wav", b"RIFFdata")
+    got = artifacts.resolve_artifacts(["audio/take-01.wav"], str(tmp_path), [], 1024)
+    assert len(got) == 1
+    assert got[0].resolved_path == str(f.resolve())
+    assert got[0].display_name == "audio/take-01.wav"
+    assert got[0].size == 8
+
+
+def test_resolve_tar_gz_points_at_the_real_file(tmp_path: Path) -> None:
+    """`build.tar.gz` extracts + resolves to the actual `build.tar.gz` file —
+    the resolved path is the real double-extension file, never a `.gz` sibling."""
+    f = _write(tmp_path / "dist" / "build.tar.gz", b"\x1f\x8b\x08\x00archive")
+    cands = artifacts.extract_artifact_candidates("archive dist/build.tar.gz ready")
+    assert cands == ["dist/build.tar.gz"]
+    got = artifacts.resolve_artifacts(cands, str(tmp_path), [], 1024)
+    assert len(got) == 1
+    assert Path(got[0].resolved_path).name == "build.tar.gz"
+    assert got[0].resolved_path == str(f.resolve())
 
 
 def test_resolve_extra_root(tmp_path: Path) -> None:

@@ -50,31 +50,74 @@ from .callback_data import CB_DOWNLOAD_FILE, checked_callback_data
 logger = logging.getLogger(__name__)
 
 # ── Extension allowlist (extraction-time filter; §A.1) ────────────────────
-# Deliverable formats only — no source-code extensions (the anti-spam core:
-# tool output is full of incidental .py/.ts paths). The ``/file`` escape hatch
-# is NOT ext-gated (an explicit request can fetch any file type under the
-# allowed roots), so this allowlist governs ONLY the auto-offered card path.
+# Every DELIVERABLE file type should be tap-to-downloadable (owner 2026-07-10),
+# so this allowlist covers docs, images, audio, video, archives, and office/data
+# formats. Source-code extensions stay EXCLUDED — the anti-spam core: tool output
+# is full of incidental .py/.ts/.rs paths, and code is edited in place, not
+# "delivered". The binary/media/archive types here are rarely mentioned
+# incidentally in assistant prose, and resolution ALREADY requires the path to
+# exist under an allowed root within the size cap (`resolve_artifacts`), so
+# widening the extraction set cannot offer a file that isn't actually there.
+# The ``/file`` escape hatch is NOT ext-gated (an explicit request can fetch any
+# file type under the roots), so this allowlist governs ONLY the auto-offered
+# card path.
 ARTIFACT_EXTS: frozenset[str] = frozenset(
     {
+        # docs / text
         "md",
         "pdf",
+        "html",
+        "htm",
+        "txt",
+        "log",
+        "rtf",
+        "epub",
+        # images
         "png",
         "jpg",
         "jpeg",
         "gif",
         "webp",
         "svg",
-        "html",
-        "htm",
+        "bmp",
+        "tiff",
+        "ico",
+        # data / spreadsheets
         "csv",
         "tsv",
-        "txt",
         "json",
-        "log",
-        "zip",
+        "parquet",
+        # office
         "xlsx",
+        "xls",
         "docx",
+        "doc",
         "pptx",
+        "ppt",
+        "odt",
+        "ods",
+        # audio
+        "wav",
+        "mp3",
+        "m4a",
+        "aac",
+        "flac",
+        "ogg",
+        "opus",
+        # video
+        "mp4",
+        "mov",
+        "mkv",
+        "webm",
+        "avi",
+        # archives
+        "zip",
+        "tar",
+        "gz",
+        "tgz",
+        "bz2",
+        "7z",
+        "rar",
     }
 )
 
@@ -504,6 +547,11 @@ class MintedCard:
     # (button_label, callback_data) — the label is CLIPPED to ≤64 chars.
     rows: list[tuple[str, str]] = field(default_factory=list)
     overflow: int = 0
+    # The artifacts ACTUALLY minted into buttons (== rows, 1:1, in order) —
+    # observability correlation ONLY (round-1 hermes P2: the caller must log
+    # exactly what was minted, never the full resolved list, and never
+    # absolute paths — it logs these rows' relative display names).
+    minted: list[Artifact] = field(default_factory=list)
 
 
 _rows: dict[str, ArtifactRow] = {}
@@ -561,7 +609,7 @@ def mint(
                 checked_callback_data(f"{CB_DOWNLOAD_FILE}{window_id}:{token}"),
             )
         )
-    return MintedCard(rows=rows, overflow=len(fresh) - len(head))
+    return MintedCard(rows=rows, overflow=len(fresh) - len(head), minted=list(head))
 
 
 def lookup(token: str) -> ArtifactRow | None:

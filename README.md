@@ -14,7 +14,7 @@ Why it's worth running:
 
 **Talk to it like a person.** Send a voice note and it's transcribed into a prompt. Send a photo or a document and it's downloaded and handed to Claude. Reply to a message to quote it back with role-aware context.
 
-**The rest just works.** Unknown slash commands forward straight into Claude Code, so `/clear`, `/compact`, `/model`, and `/cost` all work from your phone. `/dashboard` puts a live overview of every session in one pinned message. `/update` upgrades the CLI and restarts your idle sessions in place — without dropping a single topic binding.
+**The rest just works.** Unknown slash commands forward straight into Claude Code, so `/clear`, `/compact`, and `/model` all work from your phone. `/cost` and `/usage` are intercepted bot-side — the full-screen usage overlay is captured, answered as a message, and dismissed for you. `/dashboard` puts a live overview of every session in one pinned message. `/update` upgrades the CLI and restarts your idle sessions in place — without dropping a single topic binding.
 
 **It survives things.** Bot restart, tmux restart, phone in a tunnel — sessions live in tmux, state lives on disk, and the bridge reconciles on startup. Duplicate taps are caught by an append-only action ledger, so a double-press after a restart answers "already received" instead of doing the thing twice. 2,800+ tests keep it honest.
 
@@ -31,7 +31,7 @@ The pitch above covers the headline behavior. Also in the box:
 - **Live prose before prompts.** When Claude writes an explanation in the same turn as a question, Claude Code buffers the whole turn until you answer — so you'd normally choose blind. A lightweight `MessageDisplay` hook captures that prose live and the bot delivers it *ahead* of the picker.
 - **Late answers after the 60s AFK auto-resolve.** On Claude Code ≥2.1.198 an unanswered question self-resolves after ~60s. Instead of losing it, the card converts to "⏰ Claude proceeded after ~60s (no response)." whose buttons send your pick as a plain course-correction message.
 - **Per-user output verbosity.** `/settings` gives you presets (`verbose` / `standard` / `compact` / `quiet`) plus knobs, stored per user and applied to everything the bot sends *to you*. Another allowed user tapping your panel changes nothing.
-- **📎 downloads have a strict trust boundary.** Auto-offers come from Claude's own prose only — never tool output, sub-agent narration, or web URLs. A file is only offered if it actually resolves under the session's working directory (or `CC_TELEGRAM_ARTIFACT_ROOTS`) within the size cap, buttons answer only to you (owner-checked taps), and `/settings` has a 📎 Files toggle to turn the cards off. `/file` applies the same folder/size validation to any file type.
+- **📎 downloads have a strict trust boundary.** Auto-offers come from Claude's own prose only — never tool output, sub-agent narration, or web URLs. Any deliverable file type is offered (documents, images, audio, video, archives, office/data formats — source-code extensions stay excluded so incidental `.py`/`.ts` paths never mint a card). A file is only offered if it actually resolves under the session's working directory (or `CC_TELEGRAM_ARTIFACT_ROOTS`) within the size cap, buttons answer only to you (owner-checked taps), and `/settings` has a 📎 Files toggle to turn the cards off. `/file` applies the same folder/size validation to any file type.
 - **Reply context, voice, photos, documents.** Telegram replies inject fenced, role-aware quote context. Voice notes are transcribed (OpenAI-compatible). Photos go in as image blocks; documents up to 20 MB are downloaded and forwarded.
 - **Reactive broken-topic fallback.** If Telegram says a topic is gone/closed/forbidden, output falls back to DM rather than vanishing.
 - **Opt-in approval-gate and decision cards.** Behind `CC_TELEGRAM_PERMISSION_PROMPTS` / `CC_TELEGRAM_DECISION_CARDS`, permission prompts and generic confirmation prompts surface as cards (display-only by default; `CC_TELEGRAM_DECISION_DISPATCH` adds verified one-tap buttons for known-good prompt families on characterized CC versions). Off by default; a flag-off deploy changes nothing.
@@ -46,7 +46,8 @@ Bot-owned commands (handled by cc-telegram, never forwarded):
 | `/history` | Paginated message history for this topic's session. |
 | `/screenshot` | Capture the tmux pane as a PNG. |
 | `/esc` | Send Escape to interrupt Claude. |
-| `/usage` | Pull Claude Code's usage/limits from the TUI. |
+| `/usage` | Pull Claude Code's usage/limits from the TUI overlay. |
+| `/cost` | Same as `/usage` (alias) — pull cost/usage/limits from the TUI overlay. |
 | `/update` | Update the CLI, then restart idle sessions in place (owner-only). |
 | `/dashboard` | Claim this topic as a cross-session overview; `/dashboard pin` pins it. |
 | `/settings` | Your personal output-verbosity preferences (presets + knobs). |
@@ -54,7 +55,7 @@ Bot-owned commands (handled by cc-telegram, never forwarded):
 | `/unbind` | Detach the topic from its session; the tmux window keeps running. |
 | `/kill` | Kill the topic's tmux window; the topic stays open for a new session. |
 
-Any other slash command is forwarded straight into Claude Code — so `/clear`, `/compact`, `/model`, `/cost`, and `/effort` work from Telegram. (`/help` and `/memory` open interactive panels inside Claude Code that never reach the transcript, so they aren't useful over the bridge.)
+Any other slash command is forwarded straight into Claude Code — so `/clear`, `/compact`, `/model`, and `/effort` work from Telegram. `/help` and `/memory` open full-screen interactive panels inside Claude Code that can't render over Telegram and would freeze the topic, so the bot blocks them with a note instead of forwarding (use `/screenshot` to view the terminal).
 
 ## Install
 
