@@ -716,7 +716,16 @@ the rec goes STICKY-ambiguous** (the gate inputs are static, so the ambiguity
 never self-resolves — it clears ONLY at the next rotation; the passing
 candidates are NOT arbitrarily quarantined and stay out of run-state via item
 3). On bind it emits the EXISTING `launched` key at DISCOVERY (once-only; a
-bound file's later ticks feed run-state normally and never re-launch) then
+bound file's later ticks feed run-state normally and never re-launch),
+**retroactively generation-filters any pre-existing PARSEABLE park for the
+bound key in the current activity record (r4 P2, Codex, probe-reproduced):** a
+park recorded via the NO-REGISTRY fallback earlier in the SAME batch had no
+`spawned_ts` to filter against (the generation didn't exist yet — a delayed T1
+park followed by the T2 spawn in one batch), so the bind re-applies the item-4
+floor — parseable `park_ts < spawned_ts` is dropped, UNPARSEABLE dominance
+remains (fail-dark); the bind seam alone suffices because a registered name
+filters at record time and an unbound candidate's key is tombstoned by the
+registration retraction anyway — then
 applies the buffered pending signals in CAUSAL order — `pending_wake` first (→
 `resumed[key]`), `pending_park` second (→ the merge) — so the runtime ts-gates
 arbitrate. **Run-state classification (`_teammate_feed_run_state`, r1 item 3,
