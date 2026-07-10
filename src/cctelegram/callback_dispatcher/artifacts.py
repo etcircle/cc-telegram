@@ -94,6 +94,16 @@ async def execute_download_file_callback(authorized: Any, adapters: Any) -> None
     max_bytes = adapters.config.artifact_max_bytes
     name = row.display_name
 
+    # Observability (2026-07-10): the download lane logged NOTHING on success, so
+    # a delivery incident was unreconstructable. INFO at tap entry / open / send.
+    logger.info(
+        "dlf tap: window=%s token=…%s file=%s user=%s",
+        window_id,
+        token[-6:],
+        name,
+        user.id,
+    )
+
     # 6. ANSWER THE CALLBACK FIRST — an upload can exceed the callback-answer
     # deadline (Telegram rejects a late answer_callback_query).
     await safe_answer(query, f"Uploading {name}…")
@@ -103,6 +113,14 @@ async def execute_download_file_callback(authorized: Any, adapters: Any) -> None
     # upload source — the pathname is never re-opened.
     opened = artifacts.open_validated_artifact(
         row.resolved_path, row.pinned_roots, max_bytes
+    )
+    logger.info(
+        "dlf open: token=…%s file=%s ok=%s reason=%s size=%d",
+        token[-6:],
+        name,
+        opened.file is not None,
+        opened.reason,
+        opened.size,
     )
     if opened.file is None:
         artifacts.finish_send(token, False)
@@ -129,6 +147,9 @@ async def execute_download_file_callback(authorized: Any, adapters: Any) -> None
             # notice is BEST-EFFORT: safe_send itself re-raises RetryAfter, and
             # this lane must never depend on PTB's error handler (fold item 3 —
             # codex P3-1).
+            logger.info(
+                "dlf send: token=…%s file=%s outcome=rate_limited", token[-6:], name
+            )
             artifacts.finish_send(token, False)
             try:
                 await safe_send(
@@ -150,8 +171,20 @@ async def execute_download_file_callback(authorized: Any, adapters: Any) -> None
             pass
 
     if ok:
+        logger.info(
+            "dlf send: token=…%s file=%s outcome=success size=%d",
+            token[-6:],
+            name,
+            opened.size,
+        )
         artifacts.finish_send(token, True)
     else:
+        logger.info(
+            "dlf send: token=…%s file=%s outcome=failed reason=%s",
+            token[-6:],
+            name,
+            reason,
+        )
         artifacts.finish_send(token, False)
         await safe_send(
             bot, chat_id, f"❌ Upload failed: {reason}", message_thread_id=thread_id
