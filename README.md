@@ -14,7 +14,7 @@ Why it's worth running:
 
 **Talk to it like a person.** Send a voice note and it's transcribed into a prompt. Send a photo or a document and it's downloaded and handed to Claude. Reply to a message to quote it back with role-aware context.
 
-**The rest just works.** Unknown slash commands forward straight into Claude Code, so `/clear`, `/compact`, `/model`, and `/cost` all work from your phone. `/dashboard` puts a live overview of every session in one pinned message. `/update` upgrades the CLI and restarts your idle sessions in place — without dropping a single topic binding.
+**The rest just works.** Unknown slash commands forward straight into Claude Code, so `/clear`, `/compact`, and `/model` all work from your phone. `/cost` and `/usage` are intercepted bot-side — the full-screen usage overlay is captured, answered as a message, and dismissed for you. `/dashboard` puts a live overview of every session in one pinned message. `/update` upgrades the CLI and restarts your idle sessions in place — without dropping a single topic binding.
 
 **It survives things.** Bot restart, tmux restart, phone in a tunnel — sessions live in tmux, state lives on disk, and the bridge reconciles on startup. Duplicate taps are caught by an append-only action ledger, so a double-press after a restart answers "already received" instead of doing the thing twice. 2,800+ tests keep it honest.
 
