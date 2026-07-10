@@ -650,18 +650,48 @@ parsed (no registry rec existed → classification returned legacy-True) — if
 arbitration just left it UNRESOLVED or sticky-AMBIGUOUS, that already-recorded
 runtime key would stay live until the 2h TTL while all future writes are dark
 (the strand re-entry; with a post-turn pre-spawn tick this fully recreates
-GH #46). Registration therefore emits an UNCONDITIONAL teammate-done for every
-tracked matching candidate arbitration left unbound — WITHOUT retiring/severing
-it (item 2: it stays bind-eligible; an extra tombstone on a never-live key is a
-runtime no-op) — and records the key in `done_retracted_keys`. **The relight
-constraint:** the runtime tombstone NO-OPS a later `launched`
-(done-before-launch fail-closes), so when a retracted candidate later passes
-the gate, `_bind_teammate_key` emits through the RESUMED lane instead (the
-Fix-C tombstone-popping path — binding IS positive per-key proof of new work;
-ZERO new RouteRuntime mutators), with resume ts = the generation's `spawned_ts`
-(the leg-start instant — a genuine current-gen park, floored at `spawned_ts` by
-the item-4 drop and in practice strictly later, still closes through the
-strict-newer gate, and a pending wake max-merges over it).
+GH #46). Registration therefore emits an UNCONDITIONAL done for every tracked
+matching candidate arbitration left unbound — WITHOUT retiring/severing it
+(item 2: it stays bind-eligible; an extra tombstone on a never-live key is a
+runtime no-op) — and records the key in `done_retracted_keys`. **DISTINCT
+retraction provenance (r3 P1, BOTH engines converged, probe-reproduced):** the
+retraction rides the SEPARATE `ParentSidechainActivity.retraction_dones` slot,
+NEVER the genuine-park lane — a synthetic `(None, True)` park in
+`teammate_parks` shared the genuine unparseable dominance AND the fan-out's
+parks-after-resumed order, so a SAME-TICK retraction→bind race (the candidate's
+indeterminate first line completes between `check_for_updates` and the
+sidechain scan, landing the bind's resumed relight in the SAME record)
+permanently tombstoned the just-bound key (`done_retracted_keys` already
+consumed, `current_key` set — nothing recovered; genuine later activity blocked
+by the tombstone). Two coupled guarantees: (a) `_bind_teammate_key` CANCELS a
+same-tick pending retraction for the key it binds (`retraction_dones.discard` —
+the retraction's premise, "unbound at registration", is falsified by the bind;
+the resumed relight stays: harmless on a never-tombstoned key, load-bearing
+when the retraction applied in an earlier tick); (b) the fan-out applies ONE
+record in CAUSAL order — **retraction-dones FIRST → resumed → activity →
+genuine parks** (registration precedes bind precedes leg activity), each
+retraction as `mark_background_agent_done(source=TEAMMATE,
+end_turn_ts_unparseable=True)` (the same unconditional effect, zero new
+mutators) — so even an uncancelled pair nets LIVE. Genuine unparseable-park
+dominance in `teammate_parks` is untouched (a real park in the same record as
+a resume still tombstones — pinned). **The relight constraint:** the runtime
+tombstone NO-OPS a later `launched` (done-before-launch fail-closes), so when a
+retracted candidate later passes the gate, `_bind_teammate_key` emits through
+the RESUMED lane instead (the Fix-C tombstone-popping path — binding IS
+positive per-key proof of new work; ZERO new RouteRuntime mutators), with
+resume ts **STRICTLY BELOW** the generation's `spawned_ts` —
+`spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S` (1e-3; r3 item 2, Codex P1,
+probe-confirmed): the runtime resume gate suppresses a TEAMMATE/SIDECHAIN done
+with ts <= `resumed_event_ts`, so a resume ts of exactly `spawned_ts` stranded
+a genuine park stamped at exactly `spawned_ts` to the 2h TTL (it passes the
+item-4 generation filter, which only drops park_ts < spawned_ts — the "tie
+tombstones" claim belonged to the TEAMMATE stale-vs-activity gate, and the
+resume gate wins first). Safety walk: parseable parks < `spawned_ts` are
+generation-dropped BEFORE the gate, so nothing in (resume_ts, spawned_ts) can
+wrongly close via the PARK lane; a prior-gen SIDECHAIN end_turn ts landing
+inside the 1ms epsilon window would tombstone — fail-dark (the accepted
+direction) and vanishingly rare. A pending wake (necessarily newer) max-merges
+over the relight resume ts.
 **Binding — SET-BASED arbitration (dual-review
 r1 item 2, BOTH engines converged; `_arbitrate_and_bind`, shared by the public
 `check_sidechain_updates` pre-pass `_arbitrate_teammate_bindings` AND the
