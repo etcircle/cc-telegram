@@ -69,7 +69,7 @@ State + config live under **`$CC_TELEGRAM_DIR`** (default `~/.cc-telegram`, reso
 
 `.env` loading priority for the **running bot** (`config.py`): a local `./.env` in the cwd is loaded first (wins), then `$CC_TELEGRAM_DIR/.env`.
 
-> **Caveat — `cc-telegram doctor` is narrower:** doctor reads only the already-exported environment plus the config-dir `$CC_TELEGRAM_DIR/.env` — it does **not** read a cwd `./.env`. Keep your `.env` in `$CC_TELEGRAM_DIR` (as the steps below do) so the doctor verification gate sees it; the cwd-first precedence above applies to the running bot, not to `doctor`.
+`cc-telegram doctor` uses the same required-key precedence: the process environment wins when a key is present (even if empty), then cwd-local `./.env`, then `$CC_TELEGRAM_DIR/.env`. It rejects empty and whitespace-only required values. Each file is parsed independently, so staged cross-file dotenv interpolation is outside the diagnostic's scope.
 
 **Only two variables are required** — `config.py` raises `ValueError` and the bot exits with a help message if either is missing:
 
@@ -153,7 +153,7 @@ All three run the command `cc-telegram hook` (resolved to the installed binary's
 
 > **A fourth hook — `MessageDisplay` (live prose) — needs NO manual install.** The bot writes its own `$CC_TELEGRAM_DIR/md_hook_settings.json` and injects it per-window via `claude --settings`, so it is scoped to the bot's windows and never written into the global `~/.claude/settings.json`.
 
-> **Note:** `cc-telegram doctor` only verifies the `SessionStart` hook (see `doctor.py`). Use the `grep -c` above to confirm all three were installed.
+`cc-telegram doctor` verifies all three managed hooks. Missing PreToolUse or Notification entries are warnings; run the install command again to repair them.
 
 ---
 
@@ -165,7 +165,7 @@ All three run the command `cc-telegram hook` (resolved to the installed binary's
 cc-telegram doctor    # (dev: uv run cc-telegram doctor)
 ```
 
-`doctor.py` checks: `TELEGRAM_BOT_TOKEN` present, `ALLOWED_USERS` present, `tmux` on PATH, `claude` on PATH, the **SessionStart** hook installed, and the config dir writable. Exit 0 only when zero FAILs. It reads the already-exported environment plus the config-dir `$CC_TELEGRAM_DIR/.env` directly (**not** a cwd `./.env`), so it works before the bot runs — keep your `.env` in `$CC_TELEGRAM_DIR` so this gate sees it. **It does NOT check the PreToolUse/Notification hooks** — confirm those with the section 5 `grep -c`.
+`doctor.py` checks: `TELEGRAM_BOT_TOKEN` and `ALLOWED_USERS` using environment → cwd-local `.env` → config-dir `.env` key-presence precedence, `tmux` and `claude` on PATH, all three managed hooks, and config-dir writability. Exit 0 only when zero FAILs. Missing PreToolUse or Notification hooks are WARNs; SessionStart retains its existing severity. Empty and whitespace-only required values FAIL.
 
 ### Foreground smoke test
 
@@ -305,7 +305,7 @@ End-to-end smoke: bind a topic (section 9), send "say hi", confirm Claude's repl
 | **Topic shows opaque/empty output; tmux `claude` errors immediately** | Claude Code is unauthenticated (cc-telegram manages no Anthropic creds) | Run `claude` once interactively to log in, or export `ANTHROPIC_API_KEY` into the bot's launch env (e.g. add it to the plist `EnvironmentVariables`) |
 | **`cc-telegram: command not found`** | You ran `uv sync` (dev mode, not on PATH) but used a bare command | Use `uv run cc-telegram ...`, or install as a tool (section 3 Mode A) and ensure `~/.local/bin` is on PATH |
 | **Bot exits at startup with "TELEGRAM_BOT_TOKEN/ALLOWED_USERS required"** | Missing required env | Populate `~/.cc-telegram/.env` (section 4); `cc-telegram doctor` to confirm |
-| **AUQ option descriptions missing / "🔔 Waiting on you" never appears** | PreToolUse and/or Notification hook not installed (doctor won't flag these) | `cc-telegram hook --install`; verify `grep -c 'cc-telegram hook' ~/.claude/settings.json` == 3; check the bot startup-log warning |
+| **AUQ option descriptions missing / "🔔 Waiting on you" never appears** | PreToolUse and/or Notification hook not installed | Run `cc-telegram doctor`, then `cc-telegram hook --install` to repair warnings; check the bot startup-log warning |
 | **Voice note → opaque 401** | `OPENAI_API_KEY` unset (required for voice only) | Set `OPENAI_API_KEY` (+ `OPENAI_BASE_URL` if non-OpenAI) |
 | **Voice note → model-not-found** | Backend lacks the hardcoded `gpt-4o-transcribe` model (e.g. an OpenRouter/whisper-1 backend) | Point `OPENAI_BASE_URL` at a backend exposing `gpt-4o-transcribe`, or front it with a model-name-translating proxy |
 | **Interactive AUQ taps stop working after a Claude Code update** | The TUI parser is **version-sensitive** (dispatch was validated against v2.1.168) | Capture fresh terminal fixtures for the new version and re-test before relying on AUQ dispatch |

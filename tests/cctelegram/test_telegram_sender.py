@@ -114,3 +114,76 @@ class TestSplitMessage:
         for chunk in chunks:
             fence_count = chunk.count("```")
             assert fence_count % 2 == 0, f"Unbalanced fences in: {chunk!r}"
+
+    @pytest.mark.parametrize(
+        "text,max_length,forced_payload",
+        [
+            pytest.param(
+                "```py\n" + "a" * 24 + "\nb\n```",
+                32,
+                None,
+                id="plain-line-overflow-inside-fence",
+            ),
+            pytest.param(
+                "prefix-line\n```python\nvalue = 1\n```",
+                16,
+                None,
+                id="overflow-on-opening-fence",
+            ),
+            pytest.param(
+                "```py\n" + "x" * 18 + "\n```\nafter",
+                27,
+                None,
+                id="overflow-on-closing-fence",
+            ),
+            pytest.param(
+                "```text\n" + "z" * 90 + "\n```",
+                32,
+                "z",
+                id="overlong-line-inside-fence",
+            ),
+            pytest.param(
+                "```python\n" + "\n".join("x" * 19 for _ in range(8)) + "\n```",
+                32,
+                None,
+                id="long-fence-and-near-budget-lines",
+            ),
+        ],
+    )
+    def test_fence_boundary_regressions(
+        self, text: str, max_length: int, forced_payload: str | None
+    ):
+        chunks = split_message(text, max_length=max_length)
+
+        assert all(len(chunk) <= max_length for chunk in chunks)
+        assert all(chunk.count("```") % 2 == 0 for chunk in chunks)
+        if forced_payload is not None:
+            assert all(
+                chunk.count("```") == 2 for chunk in chunks if forced_payload in chunk
+            )
+
+    @pytest.mark.parametrize("max_length", [32, 100, 4096])
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "before\n```py\n" + "x" * 5000 + "\n```\nafter",
+            "```python\n" + "\n".join("y" * 95 for _ in range(60)) + "\n```",
+            "lead\n```\nalpha\n```\nmid\n```js\nbeta\n```\ntail",
+            # This apparent delimiter cannot be preserved whole at the
+            # smallest budget. The splitter deliberately treats it as plain
+            # text; Markdown balance is disclosed as degraded in that case.
+            "```" + "language" * 20 + "\npayload\n```",
+        ],
+    )
+    def test_adversarial_fence_budget_invariant(self, text: str, max_length: int):
+        chunks = split_message(text, max_length=max_length)
+        apparent_delimiter_over_budget = any(
+            line.strip().startswith("```") and len(line) > max_length
+            for line in text.split("\n")
+        )
+
+        assert all(len(chunk) <= max_length for chunk in chunks)
+        assert all(
+            chunk.count("```") % 2 == 0 or apparent_delimiter_over_budget
+            for chunk in chunks
+        )
