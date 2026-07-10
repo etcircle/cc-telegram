@@ -253,9 +253,14 @@ Additional modules:
                                 GH #46 PR-2 (teammates as first-class bg keys)
                                 adds ZERO new route_runtime mutators — the
                                 session_monitor generational teammate registry
-                                (_TeammateRec) drives the EXISTING launched (at
-                                bind) / resumed (wake) / TEAMMATE-done (park)
-                                marks; see message-handling.md.
+                                (_TeammateRec) drives the EXISTING resumed (r7
+                                item 3: EVERY bind relights via the tombstone-
+                                popping resumed lane, spawned_ts - ε, never
+                                launched — the monitor can't see route_runtime
+                                tombstones, so only the popping lane is
+                                uniformly safe) / resumed (wake, generation-
+                                filtered) / TEAMMATE-done (park, universally
+                                orphan-retained) marks; see message-handling.md.
                                 Clears: done / a PER-KEY wall-clock heartbeat
                                 TTL (_wall_now(), expire-before-classify) —
                                 T2 split: foreground-presumed keys age by

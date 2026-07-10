@@ -641,9 +641,9 @@ over-quarantine fix): only a stem that FAILS the gate (first entry predates the
 new spawn ⇒ prior gen) is severed; a same-name file ALREADY on disk at rotation
 whose first entry is ≥ the new spawn is the GENUINE new-gen file the poll lagged
 and is LEFT for the normal binding path (a mid-write file too), (4) resets
-`current_key` + clears the STICKY ambiguity flag + `done_retracted_keys` (a
-fresh spawn is new evidence — the ONLY clear) and **RE-FILTERS the pending
-signal slots instead of blind-clearing them (r6 rule 2, Codex P1b,
+`current_key` + clears the STICKY ambiguity flag (a fresh spawn is new
+evidence) and **RE-FILTERS the pending signal slots instead of blind-clearing
+them (r6 rule 2, Codex P1b,
 probe-reproduced):** pending signals are timestamp-attributed — generation
 membership is decided by the SHARED generation filter
 (`_generation_filter_park` / `_generation_filter_wake`, the same rule the
@@ -663,7 +663,7 @@ runtime key would stay live until the 2h TTL while all future writes are dark
 GH #46). Registration therefore emits an UNCONDITIONAL done for every tracked
 matching candidate arbitration left unbound — WITHOUT retiring/severing it
 (item 2: it stays bind-eligible; an extra tombstone on a never-live key is a
-runtime no-op) — and records the key in `done_retracted_keys`. **DISTINCT
+runtime no-op). **DISTINCT
 retraction provenance (r3 P1, BOTH engines converged, probe-reproduced):** the
 retraction rides the SEPARATE `ParentSidechainActivity.retraction_dones` slot,
 NEVER the genuine-park lane — a synthetic `(None, True)` park in
@@ -671,25 +671,43 @@ NEVER the genuine-park lane — a synthetic `(None, True)` park in
 parks-after-resumed order, so a SAME-TICK retraction→bind race (the candidate's
 indeterminate first line completes between `check_for_updates` and the
 sidechain scan, landing the bind's resumed relight in the SAME record)
-permanently tombstoned the just-bound key (`done_retracted_keys` already
-consumed, `current_key` set — nothing recovered; genuine later activity blocked
-by the tombstone). Two coupled guarantees: (a) `_bind_teammate_key` CANCELS a
-same-tick pending retraction for the key it binds (`retraction_dones.discard` —
-the retraction's premise, "unbound at registration", is falsified by the bind;
-the resumed relight stays: harmless on a never-tombstoned key, load-bearing
-when the retraction applied in an earlier tick); (b) the fan-out applies ONE
+permanently tombstoned the just-bound key. Two coupled guarantees: (a)
+`_bind_teammate_key` CANCELS a same-tick pending retraction for the key it
+binds (`retraction_dones.discard`, UNCONDITIONAL on every bind — a no-op when
+nothing is pending; it operates on the per-tick `activity` record, NOT the rec,
+so it is unaffected by the r7 `done_retracted_keys` deletion below — the
+retraction's premise, "unbound at registration", is falsified by the bind);
+(b) the fan-out applies ONE
 record in CAUSAL order — **retraction-dones FIRST → resumed → activity →
 genuine parks** (registration precedes bind precedes leg activity), each
 retraction as `mark_background_agent_done(source=TEAMMATE,
 end_turn_ts_unparseable=True)` (the same unconditional effect, zero new
 mutators) — so even an uncancelled pair nets LIVE. Genuine unparseable-park
 dominance in `teammate_parks` is untouched (a real park in the same record as
-a resume still tombstones — pinned). **The relight constraint:** the runtime
-tombstone NO-OPS a later `launched` (done-before-launch fail-closes), so when a
-retracted candidate later passes the gate, `_bind_teammate_key` emits through
-the RESUMED lane instead (the Fix-C tombstone-popping path — binding IS
-positive per-key proof of new work; ZERO new RouteRuntime mutators), with
-resume ts **STRICTLY BELOW** the generation's `spawned_ts` —
+a resume still tombstones — pinned). **The relight constraint — ALWAYS-RESUMED
+BIND (r7 item 3, Codex P2, probe-reproduced):** the runtime tombstone NO-OPS a
+later `launched` (done-before-launch fail-closes), and EVERY teammate bind now
+relights through the tombstone-POPPING RESUMED lane — `resumed[key] =
+spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S` — for ALL binds, retracted or
+not, never `launched`. The r6 code gated this on a monitor-side provenance set
+`_TeammateRec.done_retracted_keys` (emit `launched` for a never-retracted key,
+`resumed` for a retracted one), but **the monitor CANNOT observe route_runtime's
+tombstone state (it is in-memory in a DIFFERENT module, pull-only), so ANY
+bind-emission gated on monitor-side provenance is structurally unsound** — two
+probe-confirmed holes left a positively-bound key tombstone-blocked → DARK: (i)
+rotation CLEARED `done_retracted_keys`, so a stem retracted in late gen-1
+registration that binds during gen-2 rotation emitted `launched` which no-ops
+against its runtime tombstone; (ii) the dual-write fallback lane could tombstone
+an already-tracked eventual key that was NEVER in the set → the same dark bind.
+The ONLY uniformly-safe emission is the tombstone-popping lane. `resumed` ==
+`launched` semantics on a fresh key (`is_background=True`, 2 h TTL, projected
+RUNNING) PLUS a tombstone-pop + a `resumed_event_ts` stamp (the Fix-C
+`mark_background_agent_resumed` justification — binding IS positive per-key proof
+of new work); a fresh key with no tombstone treats resumed as a plain launch.
+So the `done_retracted_keys` field, its membership gate, its rotation clear, and
+its rec-side same-tick-cancel bookkeeping are **DELETED**; the retraction
+emission + the `retraction_dones` slot + the per-tick same-tick cancel STAY. The
+resume ts sits **STRICTLY BELOW** the generation's `spawned_ts` —
 `spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S` (1e-3; r3 item 2, Codex P1,
 probe-confirmed): the runtime resume gate suppresses a TEAMMATE/SIDECHAIN done
 with ts <= `resumed_event_ts`, so a resume ts of exactly `spawned_ts` stranded
@@ -725,8 +743,9 @@ quarantined); EXACTLY ONE gate-True → BIND; **>1 gate-True → bind NONE + WAR
 the rec goes STICKY-ambiguous** (the gate inputs are static, so the ambiguity
 never self-resolves — it clears ONLY at the next rotation; the passing
 candidates are NOT arbitrarily quarantined and stay out of run-state via item
-3). On bind it emits the EXISTING `launched` key at DISCOVERY (once-only; a
-bound file's later ticks feed run-state normally and never re-launch),
+3). On bind it relights the key via the ALWAYS-RESUMED lane at DISCOVERY (r7
+item 3 — `resumed[key] = spawned_ts - ε`, never `launched`; once-only; a bound
+file's later ticks feed run-state normally and never re-emit),
 **retroactively generation-filters any pre-existing PARSEABLE park for the
 bound key in the current activity record (r4 P2, Codex, probe-reproduced):** a
 park recorded via the NO-REGISTRY fallback earlier in the SAME batch had no
@@ -747,9 +766,17 @@ candidate can never mint a background key that a genuine-user tombstone reset
 could resurrect (pre-fix, an indeterminate gate fell through to
 `feed_run_state=True` and an unbound candidate emitted SidechainTicks — the
 strand re-entry). A name with no registry rec keeps legacy behavior. **Wake
-(`_record_teammate_wake`, the `SendMessage` lane):** BOUND →
-`resumed[current_key] = event_ts`; UNBOUND → `pending_wake` (max on repeats);
-NO registry rec → ORPHAN-RETAINED beside the park (r6 rule 3, Codex P2,
+(`_record_teammate_wake`, the `SendMessage` lane):** the registered-rec path
+GENERATION-FILTERS `event_ts` at the START via the SHARED
+`_generation_filter_wake` — the SAME rule the orphan drain and the rotation
+re-filter use (r7 item 1, Hermes P1, probe-reproduced): a `None` or
+pre-generation (`event_ts < spawned_ts`) wake is REFUSED (INFO) BEFORE
+`last_wake_ts` / `resumed` / `pending_wake` are touched. Without it, a
+result-before-use wake stashed at a gen-1-era ts retro-paired onto the BOUND
+gen-2 key and the runtime resume POPPED its park tombstone (a false relight of a
+parked newer generation until the next park / the 2h TTL). Past the filter:
+BOUND → `resumed[current_key] = event_ts`; UNBOUND → `pending_wake` (max on
+repeats); NO registry rec → ORPHAN-RETAINED beside the park (r6 rule 3, Codex P2,
 probe-reproduced: dropping a pre-registration wake made a drained park
 tombstone a teammate whose LATER wake proved it resumed — false-dark and a
 broken transcript-true arbitration; the retained wake is post-cross-check
@@ -758,7 +785,24 @@ paired `SendMessage
 input["to"] == <name>` (`transcript_parser` now carries `SendMessage` input
 onto its tool_result; the shared `_apply_teammate_wake_crosschecked` also runs
 on the item-1 retro path), a mismatch REFUSES + WARNs and an unavailable input
-FAILS CLOSED (no wake). **Park (`_record_teammate_park`):** name IN registry →
+FAILS CLOSED (no wake). **Park (`_record_teammate_park`):** EVERY park (registered
+or not) FIRST lands a NAMED retained copy in the orphan buffer via
+`_retain_orphan_teammate_park` (r7 item 2, Codex P1, probe-reproduced — the r6
+RETAIN-ALWAYS rule extended to ALL parks). A bound OLD generation used to SPEND
+the NEW generation's only park: gen-1 bound → a gen-2 spawn result stashed
+(result-before-use) → the gen-2 park arrives while the rec is STILL gen-1 (≥
+gen-1's `spawned_ts`, not dropped) → it applied ONLY to gen-1's `current_key`
+and was GONE → the late gen-2 tool_use rotated with `pending_park=None` → gen-2
+bound without its close → the 2 h strand. The retained copy drains at the next
+registration through `_generation_filter_park` (`park_ts ≥ gen-2 spawned_ts`
+carries into gen-2's `pending_park` → closes at bind). The immediate application
+to the bound rec KEEPS today's semantics for the OUTGOING generation (closing it
+early is harmless — the rotation retires it anyway), and the buffer's causal
+reduction makes the dual-write idempotent (a key binds exactly once, so no key
+ever receives both the immediate close AND the buffer copy). Buffer-noise
+consequence (disclosed): most retained copies are generation-dropped at the next
+drain or TTL-expire unused — bounded by the existing `_ORPHAN_PARK_MAX_NAMES`
+(32) cap + the `_ORPHAN_PARK_TTL_S` (2 h) wall TTL. THEN: name IN registry →
 **generation scope first (r1 item 4, Codex P1): a PARSEABLE park whose
 `park_ts` predates the CURRENT generation's `spawned_ts` is DROPPED (INFO) — it
 reports the PRIOR leg going idle and cannot close a generation it predates
@@ -771,16 +815,17 @@ park)** — then close `current_key` only (bound) or buffer a TYPED
 `_PendingPark` slot (unbound; `_merge_pending_park` — UnknownDone dominates
 permanently, else max parseable ts, NEVER a bare tuple last-write-wins); name
 NOT in registry → PR-1's all-tracked-stems close verbatim (the documented
-no-registry degradation, e.g. a pre-restart spawn) — and the park is
-**ORPHAN-RETAINED by teammate NAME UNCONDITIONALLY (r5 P1 + r6 rule 1
-RETAIN-ALWAYS, all probe-reproduced)**, a dual-write beside the immediate
-fallback closes: retention gated on zero-match let a tracked-but-INDETERMINATE
-stem (r6 A, Hermes P1) or a STALE same-name stem (r6 B, Codex P1a) absorb the
-park as its own immediate close and SPEND the eventual bind's only close
-signal (registration then retracted/quarantined the absorbing stem; the fresh
-bind relit with `pending_park` empty → the 2h strand); the immediate closes
-keep today's semantics for THOSE stems, and the buffer's causal reduction
-makes the dual-write idempotent-safe. In the r5 ordering (spawn tool_result
+no-registry degradation, e.g. a pre-restart spawn). The **UNCONDITIONAL
+ORPHAN-RETENTION (r5 P1 + r6 rule 1 RETAIN-ALWAYS + r7 item 2 UNIVERSAL, all
+probe-reproduced)** is the FIRST thing the method does above (the universal
+dual-write beside every immediate close): retention gated on zero-match let a
+tracked-but-INDETERMINATE stem (r6 A, Hermes P1) or a STALE same-name stem
+(r6 B, Codex P1a) absorb the park as its own immediate close and SPEND the
+eventual bind's only close signal, and r7 extended it to the registered-BOUND
+branch (item 2 — a not-yet-registered NEWER generation's park was spent solely
+on the currently-bound OLD generation); the immediate closes keep today's
+semantics for THOSE stems, and the buffer's causal reduction makes the
+dual-write idempotent-safe. In the r5 ordering (spawn tool_result
 stashed → GENUINE park → late Agent tool_use registers → sidechain
 discovered/bound) the park arrives before ANY anchor exists (a teammate's park
 is its ONLY close signal; an unparseable orphan park was a dominance bypass
