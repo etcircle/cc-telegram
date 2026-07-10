@@ -756,7 +756,25 @@ park)** — then close `current_key` only (bound) or buffer a TYPED
 `_PendingPark` slot (unbound; `_merge_pending_park` — UnknownDone dominates
 permanently, else max parseable ts, NEVER a bare tuple last-write-wins); name
 NOT in registry → PR-1's all-tracked-stems close verbatim (the documented
-no-registry degradation, e.g. a pre-restart spawn). **Discovery-quarantine
+no-registry degradation, e.g. a pre-restart spawn) — and when that fallback
+matches ZERO tracked stems, the park is **ORPHAN-RETAINED by teammate NAME
+(r5 P1, Codex, probe-reproduced)** instead of dropped: in the supported
+result-before-use ordering (spawn tool_result stashed → GENUINE park → late
+Agent tool_use registers → sidechain discovered/bound) the park arrives before
+ANY anchor exists, and dropping it stranded the fresh bind to the 2h TTL (a
+teammate's park is its ONLY close signal; an unparseable orphan park was a
+dominance bypass too). The buffer (`_orphan_teammate_parks`, the park-lane
+mirror of the item-1 spawn stash) is per-parent, name-keyed, causal-reduced via
+the SAME `_merge_pending_park` rules, bounded (`_ORPHAN_PARK_MAX_NAMES` 32 —
+replace-merge in place for an existing name, evict-oldest only for a NEW name
+at cap) with a per-entry wall TTL (`_ORPHAN_PARK_TTL_S` 7200s, mirroring the 2h
+background TTL the eventual key ages by; lazy sweep at retain, expiry-discard
+at drain), torn down with the parent. It DRAINS at registration (step 4.5,
+before the pre-spawn scan) into `rec.pending_park` — GENERATION-FILTERED at the
+drain (a parseable orphan park `< spawned_ts` is dropped, the r4 case does not
+regress through the buffer; UnknownDone keeps dominance) — so the bind applies
+it through the normal pending-park causal path and the freshly bound key closes
+instead of stranding. **Discovery-quarantine
 severing (`_quarantine_teammate_stem`):** a same-name candidate that
 DETERMINISTICALLY cannot bind (`current_key` occupied by a different key /
 gate-False stale-prior-gen / retired) is retired + an UNCONDITIONAL teammate
