@@ -272,7 +272,12 @@ async def route_is_idle(route: route_runtime.Route, window_id: str, tmux: Any) -
         is not route_runtime.RunState.IDLE_CLEARED
     ):
         return False
-    pane = await tmux.capture_pane(window_id)
+    # Capture WITH ANSI + pre-clean the idle-row ghost-suggestion (CC 2.1.206
+    # renders a DIM SGR-2 ghost in the empty input row; a plain capture reads it
+    # as a typed draft and ``pane_looks_idle`` false-defers the restart). See
+    # ``terminal_parser.clean_ghost_input_text``.
+    raw_pane = await tmux.capture_pane(window_id, with_ansi=True)
+    pane = terminal_parser.clean_ghost_input_text(raw_pane)
     return terminal_parser.pane_looks_idle(pane)
 
 
