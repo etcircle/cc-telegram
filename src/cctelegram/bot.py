@@ -1985,17 +1985,16 @@ def _build_startup_gc_liveness_predicate(
     ``{}`` and so cannot signal "read failed". On ANY read/parse error the
     predicate returns True for EVERY sid (conservative skip-all-GC this startup,
     one WARNING). The file is read ONCE here; the returned closure reuses the
-    frozen set at all three callsites (they are deliberately identical). A missing
-    file is the benign fresh-install state — an empty set, never a read failure,
-    since ``monitor.state`` alone then decides.
+    frozen set at all three callsites (they are deliberately identical). A MISSING
+    file is ALSO conservative skip-all (codex review: it is indistinguishable from
+    deletion / an unexpected startup state while ``monitor_state.json`` lags; on a
+    genuine fresh install there is nothing to reap, so skip-all is harmless).
     """
     read_failed = False
     session_ids: set[str] = set()
     try:
         raw = config.session_map_file.read_text()
-    except FileNotFoundError:
-        raw = None
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         read_failed = True
         logger.warning(
             "Startup GC liveness: session_map unreadable (%s); skipping all GC "

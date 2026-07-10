@@ -2036,13 +2036,24 @@ includes only bindings whose persisted `group_chat_ids` mapping
 (`session_manager.get_group_chat_id`) resolves to the dashboard's own chat —
 FAIL CLOSED, an unresolvable chat is excluded from every dashboard, so a
 dashboard in forum A never exposes forum B's topic names/states. That filter is
-only as trustworthy as the mapping, so the **trust boundary** (hermes R2 P1):
-`group_chat_ids` is written ONLY by the genuine bound-topic message seams
-(`text/photo/voice/document_handler`, `forward_command_handler`,
-`topic_edited_handler`) — `/dashboard` itself NEVER writes
-`set_group_chat_id`, because thread ids are chat-local and a host claim in
-chat B's unbound thread N would overwrite the mapping of chat A's bound topic
-N and leak it onto chat B's dashboard. The dashboard instead carries its OWN
+only as trustworthy as the mapping, so the **trust boundary** (hermes R2 P1,
+hardened by GH #41): `group_chat_ids` is written by the topic message seams
+(`text/photo/voice/document_handler`, `forward_command_handler` — now only
+with a real `thread_id`, `topic_edited_handler`) and by registry-RECOGNIZED
+callback taps (`callback_dispatcher` writes only when `registry.lookup`
+recognizes the callback data — unknown data never writes); an UNBOUND
+`(user, thread)` write remains legitimate (the directory-browser bootstrap
+into a brand-new topic). The load-bearing enforcement moved INTO
+`set_group_chat_id` itself (GH #41 sticky-when-BOUND): an existing entry
+with a DIFFERENT chat_id is REFUSED overwrite while the user holds a live
+thread BINDING for that thread — a colliding cross-forum thread id cannot
+steal a bound topic's mapping. Disclosed residual: the guard checks
+`thread_bindings` (bound), not tmux liveness, so a STALE binding freezes the
+old mapping until the stale-window unbind clears it, after which the write
+self-heals. `/dashboard` itself still NEVER writes `set_group_chat_id`,
+because thread ids are chat-local and a host claim in chat B's unbound
+thread N would overwrite the mapping of chat A's bound topic N and leak it
+onto chat B's dashboard. The dashboard instead carries its OWN
 chat explicitly (the command's `effective_chat.id` at claim time, the
 `dashboards` record key afterwards) through every
 `topic_send`/`topic_edit`/`topic_delete` — those helpers take an explicit
