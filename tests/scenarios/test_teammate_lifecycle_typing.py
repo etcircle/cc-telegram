@@ -377,7 +377,7 @@ def _iso_utc(ts: float) -> str:
     )
 
 
-def _spawn_pair(name: str, ts: str) -> list[dict]:
+def _spawn_pair(name: str, ts: str, tool_id: str = "tu_r4") -> list[dict]:
     return [
         {
             "type": "assistant",
@@ -385,7 +385,7 @@ def _spawn_pair(name: str, ts: str) -> list[dict]:
                 "content": [
                     {
                         "type": "tool_use",
-                        "id": "tu_r4",
+                        "id": tool_id,
                         "name": "Agent",
                         "input": {"prompt": "go"},
                     }
@@ -400,7 +400,7 @@ def _spawn_pair(name: str, ts: str) -> list[dict]:
                 "content": [
                     {
                         "type": "tool_result",
-                        "tool_use_id": "tu_r4",
+                        "tool_use_id": tool_id,
                         "content": [{"type": "text", "text": "Spawned successfully."}],
                     }
                 ]
@@ -546,10 +546,10 @@ async def test_no_registry_unparseable_park_then_spawn_still_tombstones(
     assert snap.background_agents == ()
 
 
-def _spawn_pair_result_first(name: str, ts: str) -> list[dict]:
+def _spawn_pair_result_first(name: str, ts: str, tool_id: str = "tu_r4") -> list[dict]:
     """The GH #42 result-before-use ordering: the spawn tool_result flushes
     BEFORE its Agent tool_use (the r1 retro-pairing lane)."""
-    pair = _spawn_pair(name, ts)
+    pair = _spawn_pair(name, ts, tool_id)
     return [pair[1], pair[0]]
 
 
@@ -711,6 +711,263 @@ async def test_stale_orphan_park_generation_dropped_at_drain_bind_stays_live(
 
     # A genuine park (> spawned_ts) still closes it.
     _append([_park_entry(name, _iso_utc(t2 + 60), _iso_utc(t2 + 60))])
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert route_runtime.snapshot(route).typing_eligible is False
+
+
+def _write_teammate_sidechain(sub_dir, key: str, first_ts: float, mtime: float):
+    import json as _json
+    import os
+
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text(
+        _json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": []},
+                "timestamp": _iso_utc(first_ts),
+            }
+        )
+        + "\n"
+    )
+    os.utime(sc, (mtime, mtime))
+    return sc
+
+
+@pytest.mark.asyncio
+async def test_park_absorbed_by_tracked_indeterminate_stem_still_closes_bind(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r6 A (Hermes P1, probe-reproduced): a TRACKED-but-INDETERMINATE stem match
+    spent the park as an immediate close; late registration then RETRACTED the
+    unbound stem, and the later bind's resumed relight popped that tombstone with
+    pending_park EMPTY → live to TTL. RETAIN-ALWAYS (rule 1) dual-writes the
+    named copy, so the drain + bind re-apply the park and the key closes."""
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY
+    base = time.time() - 30
+
+    # A MID-WRITE (indeterminate) same-name stem, PRE-TRACKED.
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text('{"type":"assistant","timestamp":"' + _iso_utc(base))  # no \n
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+
+    # ONE batch: spawn RESULT (stashed) → genuine park → late Agent use.
+    pair = _spawn_pair_result_first(name, _iso_utc(base))
+    t_park = base + 5
+    _append([pair[0]])
+    _append([_park_entry(name, _iso_utc(t_park), _iso_utc(t_park))])
+    _append([pair[1]])
+    await mon.check_for_updates({_SID})
+    await mon.check_sidechain_updates({_SID})  # stem still mid-write → no bind
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    rec = mon._teammate_registry[_SID][name]
+    assert rec.current_key is None
+    assert key in rec.done_retracted_keys  # retracted at registration
+    assert rec.pending_park is not None  # rule 1: the named copy survived
+
+    # The first line completes → the stem binds via the resumed relight AND the
+    # drained park closes it.
+    import json as _json
+    import os
+
+    with open(sc, "w") as f:
+        f.write(
+            _json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": []},
+                    "timestamp": _iso_utc(base + 0.05),
+                }
+            )
+            + "\n"
+        )
+    os.utime(sc, (base + 0.05, base + 0.05))
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert mon._teammate_registry[_SID][name].current_key == key
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False  # the park closed the relit key
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_park_absorbed_by_stale_tracked_stem_still_closes_fresh_bind(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r6 B (Codex P1a, probe-reproduced): a STALE tracked same-name stem (old
+    hex) absorbed the park as its own immediate close; the fresh key then bound
+    with launched and NO park → 2h strand. RETAIN-ALWAYS keeps the named copy;
+    the fresh bind closes."""
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    stale_key = f"a{name}-00ddc0ffee00dd00"
+    fresh_key = _KEY
+    base = time.time() - 30
+
+    # The STALE same-name stem (old first entry + old mtime), PRE-TRACKED.
+    _write_teammate_sidechain(sub_dir, stale_key, base - 100, base - 100)
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+
+    # ONE batch: new spawn RESULT (stashed) → genuine park → late Agent use.
+    pair = _spawn_pair_result_first(name, _iso_utc(base))
+    t_park = base + 5
+    _append([pair[0]])
+    _append([_park_entry(name, _iso_utc(t_park), _iso_utc(t_park))])
+    _append([pair[1]])
+    await mon.check_for_updates({_SID})
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    rec = mon._teammate_registry[_SID][name]
+    assert stale_key in rec.retired_keys  # gate-False → quarantined
+    assert rec.pending_park is not None  # the named copy survived (rule 1)
+
+    # The FRESH sidechain appears → binds (launched lane) + the drained park
+    # closes it.
+    _write_teammate_sidechain(sub_dir, fresh_key, base + 0.05, base + 0.05)
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert mon._teammate_registry[_SID][name].current_key == fresh_key
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_two_stashed_generations_newest_park_carries_through_rotation(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r6 C (Codex P1b, probe-reproduced): two stashed same-name generations —
+    the buffer reduced to the newest park T4, gen-1's registration drained it,
+    and gen-2's ROTATION blind-cleared pending_park → gen-2 bound without its
+    close → 2h strand. Rule 2: rotation RE-FILTERS instead of clears (T4 >= the
+    new spawned_ts carries), so the gen-2 bind closes with T4."""
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    base = time.time() - 60
+    t1, t2, t3, t4 = base, base + 2, base + 10, base + 12
+
+    # ONE batch: gen-1 result → park T2 → gen-2 result → park T4 → late gen-1
+    # use → late gen-2 use (both spawns result-before-use).
+    p1 = _spawn_pair_result_first(name, _iso_utc(t1), tool_id="tu_g1")
+    p2 = _spawn_pair_result_first(name, _iso_utc(t3), tool_id="tu_g2")
+    _append([p1[0]])
+    _append([_park_entry(name, _iso_utc(t2), _iso_utc(t2))])
+    _append([p2[0]])
+    _append([_park_entry(name, _iso_utc(t4), _iso_utc(t4))])
+    _append([p1[1]])
+    _append([p2[1]])
+    await mon.check_for_updates({_SID})
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    rec = mon._teammate_registry[_SID][name]
+    assert rec.spawn_generation == 2
+    # Rule 2: the newest park (T4 >= gen-2 spawned_ts T3) CARRIED through the
+    # rotation instead of being blind-cleared.
+    assert rec.pending_park is not None
+    assert rec.pending_park.ts is not None and rec.pending_park.ts >= t3
+
+    # The genuine gen-2 sidechain binds → the carried T4 closes it.
+    key = _KEY
+    _write_teammate_sidechain(sub_dir, key, t3 + 0.05, t3 + 0.05)
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert mon._teammate_registry[_SID][name].current_key == key
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False  # closed by T4, not stranded
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_orphan_wake_after_park_keeps_bind_live(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r6 D (Codex P2, probe-reproduced): spawn T1 → park T2 → wake T3 → late use
+    → bind. Pre-fix the pre-registration wake was DROPPED, so the drained park
+    tombstoned the key although T3 proved the teammate resumed — false-dark AND a
+    broken transcript-true arbitration. Rule 3 retains the wake beside the park
+    (the same pending pair the rec slots use); the bind applies both and the
+    runtime resume gate arbitrates: park T2 <= wake T3 → suppressed → LIVE."""
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY
+    base = time.time() - 30
+    t1, t2, t3 = base, base + 2, base + 4
+
+    # ONE batch: spawn RESULT (stashed) → park T2 → an IN-ORDER SendMessage wake
+    # T3 (routing.target + input.to cross-check passes) → the late Agent use.
+    pair = _spawn_pair_result_first(name, _iso_utc(t1))
+    _append([pair[0]])
+    _append([_park_entry(name, _iso_utc(t2), _iso_utc(t2))])
+    _append(
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu_wk",
+                            "name": "SendMessage",
+                            "input": {"to": name},
+                        }
+                    ]
+                },
+                "sessionId": _SID,
+                "timestamp": _iso_utc(t3),
+            },
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tu_wk", "content": "ok"}
+                    ]
+                },
+                "sessionId": _SID,
+                "timestamp": _iso_utc(t3),
+                "toolUseResult": {
+                    "success": True,
+                    "routing": {"sender": "team-lead", "target": f"@{name}"},
+                },
+            },
+        ]
+    )
+    _append([pair[1]])
+    await mon.check_for_updates({_SID})
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    rec = mon._teammate_registry[_SID][name]
+    assert rec.pending_wake is not None and rec.pending_wake >= t3 - 0.01
+    assert rec.pending_park is not None  # both signals drained
+
+    # The sidechain binds → wake T3 rides resumed, park T2 <= T3 is suppressed
+    # by the runtime resume gate → the key stays LIVE (transcript-true).
+    _write_teammate_sidechain(sub_dir, key, t1 + 0.05, t1 + 0.05)
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert mon._teammate_registry[_SID][name].current_key == key
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True  # the wake wins — no false-dark
+    assert snap.background_agents == (key,)
+
+    # A genuine later park (> T3) still closes it.
+    _append([_park_entry(name, _iso_utc(base + 60), _iso_utc(base + 60))])
     await mon.check_for_updates({_SID})
     await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
     assert route_runtime.snapshot(route).typing_eligible is False

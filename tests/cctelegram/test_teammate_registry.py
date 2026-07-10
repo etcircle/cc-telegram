@@ -2164,6 +2164,7 @@ async def test_orphan_park_buffer_cap_and_ttl_hygiene(
     from cctelegram.session_monitor import (
         _ORPHAN_PARK_MAX_NAMES,
         _ORPHAN_PARK_TTL_S,
+        _OrphanPending,
         _PendingPark,
     )
 
@@ -2185,12 +2186,18 @@ async def test_orphan_park_buffer_cap_and_ttl_hygiene(
     )
     assert len(buf) == _ORPHAN_PARK_MAX_NAMES
     assert set(buf) == {f"tm{i}" for i in range(_ORPHAN_PARK_MAX_NAMES)}
-    assert buf["tm5"][0] == _PendingPark(unknown_done=False, ts=9999.0)
+    assert buf["tm5"].park == _PendingPark(unknown_done=False, ts=9999.0)
     # And the causal reduction holds: an OLDER park never downgrades the slot.
     monitor._retain_orphan_teammate_park(
         PARENT, TeammateIdle(name="tm5", park_ts=50.0, park_ts_unparseable=False)
     )
-    assert buf["tm5"][0] == _PendingPark(unknown_done=False, ts=9999.0)
+    assert buf["tm5"].park == _PendingPark(unknown_done=False, ts=9999.0)
+    # r6: the WAKE slot rides the same entry, max-on-repeats (the rec's
+    # pending_wake reduction mirrored).
+    monitor._retain_orphan_teammate_wake(PARENT, "tm5", 500.0)
+    monitor._retain_orphan_teammate_wake(PARENT, "tm5", 400.0)  # older ignored
+    assert buf["tm5"].wake == 500.0
+    assert buf["tm5"].park == _PendingPark(unknown_done=False, ts=9999.0)
 
     # A genuinely NEW name at cap evicts exactly the oldest.
     monitor._retain_orphan_teammate_park(
@@ -2202,9 +2209,9 @@ async def test_orphan_park_buffer_cap_and_ttl_hygiene(
     # TTL: an entry aged past _ORPHAN_PARK_TTL_S is discarded at the DRAIN —
     # never applied to a fresh generation's pending slot.
     now = _time.time()
-    buf["tm_stale"] = (
-        _PendingPark(unknown_done=False, ts=now + 100),
-        now - _ORPHAN_PARK_TTL_S - 10,
+    buf["tm_stale"] = _OrphanPending(
+        park=_PendingPark(unknown_done=False, ts=now + 100),
+        wall=now - _ORPHAN_PARK_TTL_S - 10,
     )
     _append_spawn(
         parent_jsonl, "tm_stale", make_jsonl_entry, make_tool_use_block, _iso(now)
@@ -2217,11 +2224,56 @@ async def test_orphan_park_buffer_cap_and_ttl_hygiene(
 
     # And the lazy sweep evicts expired entries at retain time too.
     buf2 = monitor._orphan_teammate_parks.setdefault(PARENT, {})
-    buf2["tm_old"] = (
-        _PendingPark(unknown_done=False, ts=1.0),
-        now - _ORPHAN_PARK_TTL_S - 10,
+    buf2["tm_old"] = _OrphanPending(
+        park=_PendingPark(unknown_done=False, ts=1.0),
+        wall=now - _ORPHAN_PARK_TTL_S - 10,
     )
     monitor._retain_orphan_teammate_park(
         PARENT, TeammateIdle(name="tm_fresh", park_ts=300.0, park_ts_unparseable=False)
     )
     assert "tm_old" not in buf2 and "tm_fresh" in buf2
+
+
+# ── rotation re-filters pending signals (r6 rule 2 rationale pin) ────────
+
+
+@pytest.mark.asyncio
+async def test_rotation_refilters_pending_signals_instead_of_clearing(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """r6 rule 2 rationale: pending signals are TIMESTAMP-ATTRIBUTED — generation
+    membership is decided by the shared generation filter, never by which rec
+    object happened to hold them. At rotation: a pending park/wake with ts >= the
+    NEW generation's spawned_ts CARRIES into the new slot; ts < it DROPS; an
+    UnknownDone park carries (dominance, fail-dark)."""
+    from cctelegram.session_monitor import _PendingPark
+
+    parent_jsonl, _sub_dir = _setup_parent(monitor, tmp_path)
+    base = time.time() - 60
+    _append_spawn(
+        parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block, _iso(base)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    new_spawn = base + 10
+
+    # CARRY: park + wake at/after the new spawn survive the rotation.
+    rec.pending_park = _PendingPark(unknown_done=False, ts=new_spawn + 2)
+    rec.pending_wake = new_spawn + 3
+    monitor._rotate_teammate_generation(PARENT, rec, new_spawn)
+    assert rec.pending_park == _PendingPark(unknown_done=False, ts=new_spawn + 2)
+    assert rec.pending_wake == new_spawn + 3
+
+    # DROP: signals older than the newest spawn are prior-generation.
+    newer_spawn = new_spawn + 20
+    rec.pending_park = _PendingPark(unknown_done=False, ts=newer_spawn - 5)
+    rec.pending_wake = newer_spawn - 5
+    monitor._rotate_teammate_generation(PARENT, rec, newer_spawn)
+    assert rec.pending_park is None
+    assert rec.pending_wake is None
+
+    # UnknownDone CARRIES (it cannot be generation-checked — fail-dark).
+    rec.pending_park = _PendingPark(unknown_done=True, ts=None)
+    monitor._rotate_teammate_generation(PARENT, rec, newer_spawn + 20)
+    assert rec.pending_park == _PendingPark(unknown_done=True, ts=None)
