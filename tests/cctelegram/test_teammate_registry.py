@@ -2498,6 +2498,132 @@ async def test_item1_future_generation_park_under_registered_name_survives_evict
     assert activity.teammate_parks.get(k2) == (135.0, False)  # gen-2 closes
 
 
+# ── three-tier eviction (r10 item 1 — CONVERGED P1: protected splits into ──
+# ── speculative same-generation noise vs provable pending-generation value) ─
+
+
+@pytest.mark.asyncio
+async def test_item1_r10_future_park_with_stashed_spawn_survives_all_protected_cap(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """r10 item 1 (CONVERGED P1 — Hermes + Codex, both probe-reproduced): r9's
+    tier 2 evicted the oldest PROTECTED entry when ALL entries survive the drain
+    filter, and r9's universal wake retention makes that state ORDINARY — every
+    bound teammate's own wake (``event_ts >= its spawned_ts``) survives the filter.
+    Probe: a gen-2 park retained under bound gen-1 name ``future`` WITH its gen-2
+    spawn STASHED (so it is PROVABLY the pending generation's only close) + 31
+    ordinary bound-name self-WAKES (all >= their spawned_ts → all protected) → all
+    32 protected → a 33rd name must evict a tier-2 SPECULATIVE wake, NOT ``future``
+    (tier 3, provable). Then the late gen-2 spawn drains ``future``'s park + the
+    bind closes.
+
+    Under r9 (oldest-protected fallback) ``future`` — inserted first, hence the
+    oldest — is evicted → the late gen-2 spawn drains nothing → 2h strand."""
+    from cctelegram.handlers.response_builder import (
+        TeammateIdle,
+        TeammateSpawnInfo,
+    )
+    from cctelegram.session_monitor import _ORPHAN_PARK_MAX_NAMES, _TeammateRec
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    name = "future"
+    k1 = "afuture-11111111"
+
+    # gen-1 bound; its gen-2 spawn RESULT is STASHED (result-before-use — the
+    # tool_use has not arrived, so no rotation yet). The stash makes ``future``
+    # PROVABLE (tier 3): its retained copy is the pending generation's only close.
+    recs = monitor._teammate_recs(PARENT)
+    recs[name] = _TeammateRec(
+        name=name,
+        teammate_id="g1",
+        spawn_generation=1,
+        spawned_ts=100.0,
+        current_key=k1,
+    )
+    monitor._stash_early_teammate_signal(
+        PARENT, "tu_future_g2", _spawn_meta_for(name), _iso(130.0)
+    )
+
+    # The gen-2 PARK arrives while STILL gen-1 (park_ts 135.0 >= gen-1 spawned_ts
+    # 100.0 → applies to gen-1 AND dual-write retained under the registered name,
+    # inserted FIRST so it is the OLDEST entry — an r9 oldest-protected fallback
+    # would take it).
+    monitor._record_teammate_park(
+        PARENT, TeammateIdle(name=name, park_ts=135.0, park_ts_unparseable=False)
+    )
+    monitor.pop_sidechain_activity()  # drop the immediate gen-1 close
+    buf = monitor._orphan_teammate_parks[PARENT]
+    assert name in buf
+
+    # Fill the rest of the cap with 31 ORDINARY bound-name SELF-WAKES: each name
+    # HAS a rec (gen-1, spawned_ts 200.0) and its retained wake (300.0 + i) is
+    # >= its spawned_ts, so the drain filter CARRIES it → NOT tier-1 droppable.
+    # These are SPECULATIVE (rec present, NO stashed spawn) → tier 2.
+    for i in range(_ORPHAN_PARK_MAX_NAMES - 1):
+        rname = f"reg{i}"
+        recs[rname] = _TeammateRec(
+            name=rname, teammate_id=None, spawn_generation=1, spawned_ts=200.0
+        )
+        monitor._retain_orphan_teammate_wake(PARENT, rname, 300.0 + i)
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    # ALL 32 entries survive the drain filter (none is tier-1 droppable).
+    assert all(
+        not monitor._orphan_entry_is_generation_droppable(n, e, recs)
+        for n, e in buf.items()
+    )
+
+    # A NEW name at cap → tier 1 empty (all protected) → tier 2 evicts the OLDEST
+    # SPECULATIVE wake (reg0), NOT ``future`` (tier 3, provable via the stash).
+    monitor._retain_orphan_teammate_park(
+        PARENT, TeammateIdle(name="brandnew", park_ts=1.0, park_ts_unparseable=False)
+    )
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    assert name in buf  # the future-generation copy SURVIVED (provable)
+    assert "reg0" not in buf  # the oldest speculative same-gen wake was evicted
+    assert "brandnew" in buf
+
+    # The late gen-2 spawn tool_use rotates + DRAINS the surviving orphan copy into
+    # gen-2's pending_park (135.0 >= gen-2 spawned_ts 130.0 → carries), then binds.
+    monitor._record_teammate_spawn(
+        PARENT, TeammateSpawnInfo(name, "g2", "explorer"), 130.0
+    )
+    rec = monitor._teammate_registry[PARENT][name]
+    assert rec.spawn_generation == 2
+    assert rec.pending_park is not None
+    assert rec.pending_park.ts == 135.0
+    k2 = "afuture-22222222"
+    monitor._bind_teammate_key(PARENT, rec, k2, first_entry_ts=130.05)
+    activity = monitor.pop_sidechain_activity()[PARENT]
+    assert activity.teammate_parks.get(k2) == (135.0, False)  # gen-2 closes
+
+
+@pytest.mark.asyncio
+async def test_item1_r10_all_tier3_provable_at_cap_evicts_oldest(monitor, tmp_path):
+    """r10 item 1 tier-3 pin: when EVERY entry is PROVABLE — tiers 1 and 2 both
+    empty (no droppable entry, and no SPECULATIVE registered-noise entry) — a NEW
+    name evicts the OLDEST provable entry (insertion order), the absolute cap
+    bound. Here every entry is a no-rec pre-registration orphan (provable — its
+    park is its only home), so the bound holds exactly as before r10."""
+    from cctelegram.handlers.response_builder import TeammateIdle
+    from cctelegram.session_monitor import _ORPHAN_PARK_MAX_NAMES
+
+    _setup_parent(monitor, tmp_path)
+    for i in range(_ORPHAN_PARK_MAX_NAMES):
+        monitor._retain_orphan_teammate_park(
+            PARENT,
+            TeammateIdle(name=f"orph{i}", park_ts=100.0 + i, park_ts_unparseable=False),
+        )
+    buf = monitor._orphan_teammate_parks[PARENT]
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    # No registry recs → tier 1 empty (no droppable) AND tier 2 empty (no rec ⇒
+    # never speculative) → tier 3 evicts the oldest.
+    monitor._retain_orphan_teammate_park(
+        PARENT, TeammateIdle(name="orph_new", park_ts=999.0, park_ts_unparseable=False)
+    )
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    assert "orph0" not in buf and "orph_new" in buf  # oldest provable orphan evicted
+
+
 # ── wake universal dual-write (r9 item 2 — Codex P2) ─────────────────────
 
 

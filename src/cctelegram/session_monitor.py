@@ -1118,9 +1118,10 @@ class SessionMonitor:
         self, name: str, entry: _OrphanPending, recs: dict[str, "_TeammateRec"]
     ) -> bool:
         """r9 item 1 (CONVERGED P1 — Hermes + Codex, both probe-reproduced): the
-        REDUNDANCY predicate for the two-tier orphan eviction, defined by REUSING
-        THE DRAIN FILTER'S OWN semantics so the eviction predicate and the drain
-        filter can never disagree (redundant iff drain would drop it —
+        REDUNDANCY predicate for tier 1 of the three-tier orphan eviction (r10
+        item 1 split the protected class into speculative vs provable), defined by
+        REUSING THE DRAIN FILTER'S OWN semantics so the eviction predicate and the
+        drain filter can never disagree (redundant iff drain would drop it —
         mint/validate parity).
 
         An entry is REDUNDANT (tier-1 evictable) iff its retained signal(s) would
@@ -1155,6 +1156,30 @@ class SessionMonitor:
         # entry — no park, no wake — has nothing to carry, so it is redundant too).
         return not park_survives and not wake_survives
 
+    def _stashed_spawn_names(self, parent_session_id: str) -> set[str]:
+        """r10 item 1 (CONVERGED P1 — Hermes + Codex, both probe-reproduced): the
+        set of teammate NAMES that have a SPAWN-SHAPED result-before-use early
+        signal buffered in ``_early_teammate_signals`` — i.e. a not-yet-registered
+        NEXT-generation spawn whose tool_use has not arrived yet. A park retained
+        under a STILL-REGISTERED name whose name is in THIS set is PROVABLY the
+        pending generation's ONLY close (the tier-3 provable class), never
+        speculative registered noise.
+
+        Bounded name-membership scan over the per-parent stash (≤ the 64-entry
+        ``_EARLY_TEAMMATE_SIGNALS_MAX`` cap). The stash already holds the PARSED
+        ``TeammateSpawnInfo`` (the ``spawn`` slot of each ``(spawn, target, ts)``
+        tuple), which carries ``.name`` from ``teammate_spawn_info_from_meta`` — so
+        no re-parse is needed; a wake-only signal (``spawn is None``) contributes
+        no name. Precomputed ONCE per eviction call (not per candidate entry)."""
+        stash = self._early_teammate_signals.get(parent_session_id)
+        if not stash:
+            return set()
+        names: set[str] = set()
+        for spawn, _target, _ts in stash.values():
+            if spawn is not None:
+                names.add(spawn.name)
+        return names
+
     def _orphan_pending_slot(self, parent_session_id: str, name: str) -> _OrphanPending:
         """Get-or-create the orphan pending pair for ``name`` (r5 + r6): lazy TTL
         sweep first (expired names evicted before the cap check), then
@@ -1185,12 +1210,40 @@ class SessionMonitor:
         semantics — :meth:`_orphan_entry_is_generation_droppable` — an entry is
         tier-1 evictable iff the drain WOULD generation-drop it (redundant iff
         drain would drop it — the eviction predicate and the drain filter must
-        never disagree, mint/validate parity). Tier 1 (evict FIRST, oldest-first):
-        the redundant entries. Tier 2 (only when tier 1 is EMPTY — the true cap
-        bound): the oldest PROTECTED entry (no rec — a pre-registration orphan; OR
-        a park/wake that survives the drain filter — the possibly-next-gen close;
-        OR an unparseable-dominance park that can't be ts-classified). The lazy TTL
-        sweep + replace-merge-in-place semantics are byte-identical."""
+        never disagree, mint/validate parity).
+
+        Fix (r10 item 1, CONVERGED P1 — Hermes + Codex, both probe-reproduced):
+        r9's tier 2 (evict the oldest PROTECTED entry when ALL entries survive the
+        drain filter) is now REACHABLE as an ORDINARY steady state, because r9's
+        universal wake dual-write retains EVERY bound teammate's own wake and such
+        a wake (``event_ts >= its own spawned_ts``) SURVIVES the drain filter — so
+        a busy parent with 32 distinct bound names all carrying a self-wake makes
+        the buffer entirely protected, and the r9 "oldest protected" fallback then
+        evicts a stashed NEXT generation's ONLY close (probe: a gen-2 park retained
+        under a registered name ``future`` + 31 ordinary bound-name wakes + a 33rd
+        name → ``future`` is evicted → the late gen-2 spawn drains nothing → 2h
+        strand). This needs 33 DISTINCT names within the 2h TTL, not concurrent
+        teammates — realistic (18 spawns in the real incident corpus). Fix: SPLIT
+        the protected class into SPECULATIVE vs PROVABLE by whether the entry's
+        retained value can close a not-yet-visible future generation —
+
+        * Tier 1 (evict FIRST, oldest-first): generation-DROPPABLE entries — the
+          r9 drain-parity predicate, UNCHANGED.
+        * Tier 2 (next, oldest-first): entries whose name HAS a registry rec AND
+          has NO stashed spawn-shaped early signal — registered SAME-generation
+          noise. Their signals (``ts >= spawned_ts``) were already applied to the
+          bound ``current_key`` via the dual-write; the retained copy only serves
+          a not-yet-visible FUTURE generation, and with no stashed spawn there is
+          no evidence such a generation is pending → SPECULATIVE value.
+        * Tier 3 (LAST resort, oldest-first — the absolute cap bound): no-rec
+          ORPHANS (pre-registration signals with no other home) AND entries whose
+          name HAS a spawn-shaped early signal in ``_early_teammate_signals`` (a
+          stashed next-generation spawn — the retained copy is PROVABLY the pending
+          generation's close). Tier 2 vs 3 = speculative vs provable pending value;
+          the eviction may only sacrifice provable value at TRUE capacity (when
+          every entry is provable, i.e. tiers 1 and 2 are both empty).
+
+        The lazy TTL sweep + replace-merge-in-place semantics are byte-identical."""
         buf = self._orphan_teammate_parks.setdefault(parent_session_id, {})
         now = time.time()
         expired = [
@@ -1202,6 +1255,11 @@ class SessionMonitor:
         if entry is None:
             if len(buf) >= _ORPHAN_PARK_MAX_NAMES:
                 recs = self._teammate_registry.get(parent_session_id) or {}
+                # Precompute the stashed-spawn name-set ONCE per eviction call
+                # (not per candidate entry) — a name in it has a pending
+                # not-yet-registered NEXT generation, so its retained copy is
+                # PROVABLY that generation's close (tier 3, never tier 2).
+                stashed_spawn_names = self._stashed_spawn_names(parent_session_id)
                 # Tier 1 (evict FIRST): the oldest REDUNDANT entry — one the DRAIN
                 # would generation-drop (redundant iff drain would drop it — the
                 # eviction predicate and the drain filter must never disagree;
@@ -1214,10 +1272,20 @@ class SessionMonitor:
                     ),
                     None,
                 )
-                # Tier 2 (all entries are PROTECTED — the true cap bound): the
-                # oldest protected entry (insertion order). A protected entry has
-                # no rec (a pre-registration orphan) OR a park/wake that SURVIVES
-                # the drain filter (the possibly-next-generation close).
+                # Tier 2 (only when tier 1 is EMPTY): the oldest SPECULATIVE
+                # protected entry — a name that HAS a rec AND has NO stashed
+                # spawn-shaped early signal (registered same-generation noise; its
+                # value was already applied to current_key, the retained copy only
+                # serves a future generation that nothing proves is coming).
+                if victim is None:
+                    victim = next(
+                        (n for n in buf if n in recs and n not in stashed_spawn_names),
+                        None,
+                    )
+                # Tier 3 (LAST resort — every entry is PROVABLE, the true cap
+                # bound): the oldest entry (insertion order) — a no-rec
+                # pre-registration orphan OR a name with a stashed next-generation
+                # spawn (its retained copy is that generation's ONLY close).
                 if victim is None:
                     victim = next(iter(buf))
                 buf.pop(victim)
@@ -1680,8 +1748,10 @@ class SessionMonitor:
 
         ALWAYS-RESUMED RELIGHT (r7 item 3, Codex P2, probe-reproduced): EVERY
         teammate bind emits through the tombstone-POPPING RESUMED lane —
-        ``resumed[key] = spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S`` — for
-        ALL binds, never ``launched``. The r6 code gated this on the monitor-side
+        ``resumed[key] = min(spawned_ts, first_entry_ts) - ε`` (the r8-item-1
+        floor below; it reduces to r7's ``spawned_ts - ε`` in the normal
+        ``first_ts >= spawned_ts`` case) — for ALL binds, never ``launched``. The
+        r6 code gated this on the monitor-side
         provenance set ``done_retracted_keys`` (emit ``launched`` for a
         never-retracted key, ``resumed`` for a retracted one), but the monitor
         CANNOT observe route_runtime's tombstone state (in-memory, a DIFFERENT
