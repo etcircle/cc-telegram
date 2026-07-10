@@ -17,6 +17,7 @@ Key classes: SessionMonitor, NewMessage, SessionInfo.
 """
 
 import asyncio
+import glob
 import json
 import logging
 import re
@@ -69,6 +70,73 @@ _INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
 # of a route_runtime import (same pattern as _INTERACTIVE_TOOL_NAMES above) —
 # the fixture-gate test pins the two definitions equal.
 _TURN_END_REASONS = frozenset({"end_turn", "stop_sequence"})
+
+# GH #46 PR-2: how much a teammate sidechain file's first-entry / mtime timestamp
+# may precede the parent-observed spawn wall-clock and still bind. The parent's
+# spawn tool_result and the teammate's first sidechain line are written by the
+# same in-process CC on the same host but through different flushes, so a small
+# skew is expected; a larger backdate is evidence of a STALE prior-generation
+# file (a same-name teammate from an earlier spawn) that must not bind.
+TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S = 5.0
+
+# GH #46 PR-2: the SMALL cross-write-path tolerance the STRICT gen>=2 first-entry
+# gate allows below the new spawn's event ts. FIXTURE-DERIVED (dual-review r1
+# item 5 — never an unpinned guess): measured across ALL 18 real teammate spawns
+# in the live incident transcript (CC 2.1.197, di-copilot iss201 session
+# 00109f1a…), (spawn tool_result entry ts) − (that teammate's sidechain
+# first-entry ts) was NEGATIVE in every case — the first sidechain entry lands
+# 1–7 ms AFTER the spawn result. The six original teammates' deltas:
+# explore-backend-workflows −0.002s, explore-frontend-builder −0.002s,
+# explore-skills-system −0.006s, explore-turn-cache −0.005s,
+# explore-skill-dispatch −0.005s, skill-inventory −0.005s (the other 12 spawns
+# range −0.001..−0.007s). So a genuine new-gen first entry never PRECEDES the
+# spawn event; the below-spawn tolerance only needs to absorb clock rounding,
+# and 0.1s gives 14× headroom over the max observed 7 ms cross-flush gap while
+# rejecting a stale sibling written even 0.2s before the respawn (the r1 item-5
+# poisoning shape). (Gen-1 uses the larger MTIME skew above.)
+TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S = 0.1
+
+# GH #46 PR-2: the byte cap for reading a candidate teammate sidechain's FIRST
+# JSONL line at the binding gate. One real entry is a few KiB; a line longer than
+# this (or with no newline yet) is a partial write ⇒ NO bind this tick (retry).
+_TEAMMATE_FIRST_LINE_MAX_BYTES = 262144
+
+# GH #46 PR-2 item 1: per-parent cap on retained result-before-use teammate
+# signals (a stash entry is a tiny parsed tuple; the matching tool_use normally
+# arrives within the same batch or the next, so the cap only bounds a
+# pathological never-paired stream — drop-oldest).
+_EARLY_TEAMMATE_SIGNALS_MAX = 64
+
+# GH #46 PR-2 r3 item 2 (Codex P1, probe-confirmed at the boundary): the
+# retraction-relight resume ts must sit STRICTLY BELOW the generation's
+# spawned_ts. The runtime resume gate SUPPRESSES a TEAMMATE/SIDECHAIN done whose
+# ts is <= resumed_event_ts, so a resume ts of exactly spawned_ts stranded a
+# genuine park stamped at exactly spawned_ts for the full 2h TTL (it passes the
+# generation filter — only park_ts < spawned_ts drops — but ties lose at the
+# resume gate). With the epsilon, every park surviving the generation filter
+# (>= spawned_ts) is strictly newer than the resume and closes. Safety walk:
+# parseable parks < spawned_ts are generation-dropped BEFORE the gate, so
+# nothing in (resume_ts, spawned_ts) can wrongly close via the PARK lane; a
+# prior-gen SIDECHAIN end_turn ts landing inside the 1ms window would tombstone
+# — fail-dark (the accepted direction) and vanishingly rare.
+TEAMMATE_RETRACT_RESUME_EPSILON_S = 1e-3
+
+# GH #46 PR-2 r5 P1 (Codex, probe-reproduced): the orphan-park retention buffer.
+# A park that resolves to NO registry rec AND no tracked stem was DROPPED on the
+# floor — in the supported result-before-use ordering (spawn tool_result stashed
+# → GENUINE park arrives → late Agent tool_use registers → sidechain discovered
+# + bound) that park is the bound key's ONLY close signal (teammates emit no
+# sidechain end-of-turn / <task-notification>), so the fresh bind ran live to
+# the 2h TTL. Such parks are RETAINED keyed by teammate NAME (bounded names,
+# drop-oldest; per-entry wall TTL mirroring the 2h background TTL the eventual
+# key would age by — session_monitor deliberately doesn't import route_runtime,
+# the _RECONCILE_FRESH_WINDOW_S pattern) with the SAME causal reduction as the
+# pending slot (_merge_pending_park: unparseable dominates, else max park_ts),
+# and DRAINED at registration into rec.pending_park — where the r1 item-4
+# generation filter + the bind-time application arbitrate exactly like any
+# other pending park.
+_ORPHAN_PARK_MAX_NAMES = 32
+_ORPHAN_PARK_TTL_S = 7200.0
 
 
 @dataclass
@@ -140,6 +208,21 @@ class ParentSidechainActivity:
     # signal for a teammate leg that ends in plain text (no sidechain
     # end-of-turn, no ``<task-notification>``).
     teammate_parks: dict[str, tuple[float | None, bool]] = field(default_factory=dict)
+    # GH #46 PR-2 r3 P1 (BOTH engines converged): registration RETRACTION dones —
+    # DISTINCT PROVENANCE from genuine teammate parks. A retraction emitted into
+    # ``teammate_parks`` as a synthetic (None, True) park rode the genuine-park
+    # lane's unconditional dominance, so a SAME-TICK retraction→bind race (the
+    # candidate's indeterminate first line completes between check_for_updates
+    # and the sidechain scan) left the synthetic park in the SAME record as the
+    # bind's resumed relight — and the fan-out applied resumed FIRST, parks
+    # AFTER, permanently tombstoning the just-bound key. This slot keeps the
+    # retraction separable: ``_bind_teammate_key`` CANCELS a same-tick pending
+    # retraction for the key it binds (the retraction's premise — "unbound at
+    # registration" — is falsified by the bind), and the fan-out applies
+    # retraction-dones FIRST (registration precedes bind precedes leg activity)
+    # so even an uncancelled pair nets LIVE. Genuine unparseable-park dominance
+    # in ``teammate_parks`` is untouched.
+    retraction_dones: set[str] = field(default_factory=set)
 
     def merge_teammate_park(
         self, key: str, park_ts: float | None, unparseable: bool
@@ -192,6 +275,160 @@ class _WorkflowBracket:
     # bracket is removed. ``_emit_workflow_bracket_heartbeats`` skips closing
     # brackets (the run-state done already fired via ``rec.completed``).
     closing: bool = False
+
+
+@dataclass(frozen=True)
+class _PendingPark:
+    """GH #46 PR-2: a teammate PARK that arrived while its key was still UNBOUND
+    (no ``current_key`` yet), held in the registry until the binding applies it.
+
+    A TYPED slot, NOT a bare ``(ts, unparseable)`` tuple (Codex plan-r4
+    watchpoint): the merge is a CAUSAL REDUCTION and an unparseable park must
+    DOMINATE permanently — a tuple with last-write-wins could let a later
+    parseable park erase an earlier unparseable one's unconditional-tombstone
+    evidence. ``unknown_done`` True ⇒ the ``UnknownDone`` state (dominates
+    forever); ``unknown_done`` False ⇒ ``ParkAt(ts)`` with the causally-latest
+    (max) parseable timestamp. Build via :func:`_merge_pending_park` — never a
+    bare assignment.
+    """
+
+    unknown_done: bool
+    ts: float | None
+
+
+def _merge_pending_park(
+    existing: "_PendingPark | None", park_ts: float | None, unparseable: bool
+) -> "_PendingPark":
+    """Causal reduction of a pending teammate park (GH #46 PR-2, Codex r4).
+
+    UnknownDone dominates permanently; otherwise keep max(parseable ts). Mirrors
+    ``ParentSidechainActivity.merge_teammate_park`` so the pending (unbound) slot
+    and the bound-key per-tick merge share ONE causal rule. A new unparseable park
+    ⇒ UnknownDone; else a ParkAt whose ts is the max of the prior and the new."""
+    if existing is not None and existing.unknown_done:
+        return existing  # UnknownDone is permanent
+    if unparseable:
+        return _PendingPark(unknown_done=True, ts=None)
+    new_ts = park_ts
+    if existing is not None and existing.ts is not None:
+        if new_ts is None or new_ts <= existing.ts:
+            new_ts = existing.ts
+    return _PendingPark(unknown_done=False, ts=new_ts)
+
+
+def _generation_filter_park(
+    slot: "_PendingPark | None", spawned_ts: float
+) -> "_PendingPark | None":
+    """r6 unification: the ONE generation-attribution rule for a pending PARK
+    signal, shared by the orphan-buffer DRAIN and the rotation RE-FILTER (r6
+    rule 2). Pending signals are timestamp-attributed — generation membership is
+    decided by THIS filter, never by which rec object (or buffer slot) happened
+    to hold them. A parseable-and-stale park (``ts < spawned_ts`` — it reports a
+    PRIOR leg) drops; UnknownDone CARRIES (dominance — it cannot be
+    generation-checked; the documented fail-dark); a current-gen park
+    (``ts >= spawned_ts``) carries."""
+    if slot is None:
+        return None
+    if slot.unknown_done:
+        return slot
+    if slot.ts is not None and slot.ts < spawned_ts:
+        return None
+    return slot
+
+
+def _generation_filter_wake(wake: float | None, spawned_ts: float) -> float | None:
+    """The wake twin of :func:`_generation_filter_park` (a recorded wake always
+    carries a parseable ts — ``pending_wake`` is never set from a None event
+    ts): a wake older than the generation's spawn woke a PRIOR leg → drop."""
+    if wake is None:
+        return None
+    return wake if wake >= spawned_ts else None
+
+
+@dataclass
+class _OrphanPending:
+    """r6 unification: the orphan buffer entry MIRRORS the rec's pending pair
+    (``pending_park`` / ``pending_wake``) exactly — same shapes, same causal
+    reductions (``_merge_pending_park`` for the park, max for the wake), same
+    generation filters at the drain. A pre-registration WAKE is retained here
+    too (r6 D, Codex P2 — dropping it broke the wake lane's transcript-true
+    arbitration: a drained park tombstoned a teammate whose LATER wake proved it
+    resumed). ``wall`` is the retention TTL stamp, refreshed on each merge (a
+    newer signal is fresh evidence)."""
+
+    park: "_PendingPark | None" = None
+    wake: float | None = None
+    wall: float = 0.0
+
+
+@dataclass
+class _TeammateRec:
+    """GH #46 PR-2: one agent-teams teammate in a parent's generational registry.
+
+    A teammate becomes a FIRST-CLASS background key: ``current_key`` is the
+    normalized ``a<name>-<hex>`` key of the sidechain file currently BOUND to
+    this teammate (None until a matching stem binds). ``spawn_generation`` bumps
+    on every same-name RESPAWN so the binding gate can be strict about which
+    generation's file is genuine; ``retired_keys`` holds every stem key ever
+    quarantined/rotated off this teammate (never re-binds). ``pending_wake`` /
+    ``pending_park`` buffer a wake/park that arrived while UNBOUND, applied in
+    causal order at the bind. ``last_wake_ts`` is diagnostic.
+
+    ``ambiguous`` (dual-review r1 item 2, BOTH engines converged) — STICKY
+    bind-NONE: when MORE THAN ONE unretired candidate passes the bind gate in
+    one arbitration pass (the gate inputs — first-entry ts, spawn ts — are
+    STATIC, so the ambiguity never self-resolves), the rec binds NONE and this
+    flag freezes all further arbitration; the unresolved candidates stay out of
+    run-state (item 3) and are NOT arbitrarily quarantined. It clears ONLY at
+    the next rotation (a fresh spawn is new evidence).
+
+    RETRACTION + ALWAYS-RESUMED BIND (r2 P1 + r7 item 3, both engines) —
+    registration emits an unconditional teammate-done (via the per-tick
+    ``ParentSidechainActivity.retraction_dones`` slot) for every already-tracked
+    matching candidate arbitration left UNBOUND: an already-tracked matching
+    sidechain can feed run-state as a LEGACY agent before the spawn tool_result
+    is parsed, and if arbitration then leaves it unresolved/ambiguous, that
+    already-recorded key would stay live until TTL (the 2h strand re-entry). The
+    retraction tombstones the runtime key WITHOUT retiring/severing the
+    candidate, so it stays bind-eligible. A runtime tombstone no-ops a LATER
+    ``launched`` (done-before-launch fail-closes), so EVERY teammate bind
+    (``_bind_teammate_key``) relights through the tombstone-POPPING RESUMED lane
+    — never ``launched`` — for ALL binds, retracted or not. The decisive
+    argument (r7 item 3, Codex P2): the monitor CANNOT observe route_runtime's
+    tombstone state (it is in-memory in a DIFFERENT module, pull-only), so ANY
+    bind-emission gated on monitor-side provenance is structurally unsound (the
+    r6 ``done_retracted_keys`` provenance set was cleared at rotation and could
+    be bypassed by the dual-write lane, leaving a positively-bound key
+    tombstone-blocked → dark). The ONLY uniformly-safe emission is the
+    tombstone-popping lane: ``resumed[key] = min(spawned_ts, first_entry_ts) - ε``
+    (r8 item 1 — the resume floor sits below the BOUND FILE's OWN first entry, not
+    merely below ``spawned_ts``, so a look-alike's pre-spawn trailing end_turn is
+    never shielded; it reduces to ``spawned_ts - ε`` in the normal
+    ``first_ts >= spawned_ts`` case — see :meth:`_bind_teammate_key`).
+    ``resumed`` == ``launched`` semantics on
+    a fresh key (``is_background=True``, 2h TTL, projected RUNNING) plus a
+    tombstone-pop + a ``resumed_event_ts`` stamp; the r3 epsilon walk already
+    proved every generation-surviving park (``≥ spawned_ts``) is strictly newer
+    than the resume floor and closes correctly. The r6 provenance set
+    (``done_retracted_keys``) is DELETED (its membership gate, rotation clear,
+    and rec-side same-tick cancel bookkeeping with it); the retraction emission
+    and the ``retraction_dones`` slot STAY, and the same-tick cancel at bind
+    stays (it discards from the per-tick ``activity`` record, not the rec).
+
+    route_runtime gains ZERO new mutators — the registry drives the EXISTING
+    launched / resumed / done marks through the bot fan-out.
+    """
+
+    name: str
+    teammate_id: str | None
+    spawn_generation: int
+    spawned_ts: float
+    current_key: str | None = None
+    retired_keys: set[str] = field(default_factory=set)
+    last_wake_ts: float | None = None
+    pending_wake: float | None = None
+    pending_park: _PendingPark | None = None
+    ambiguous: bool = False
 
 
 def _record_resume_ts(
@@ -513,6 +750,57 @@ class SessionMonitor:
         # structured-meta DRIFT warning has already fired (rate-limit — once per
         # launch tool_result, never re-warn every poll).
         self._bg_bash_drift_warned: set[str] = set()
+        # GH #46 PR-2: the generational teammate registry — parent_sid ->
+        # {name -> _TeammateRec}. A teammate spawn (from the structured
+        # ``teammate_spawned`` tool_result) creates/rotates the rec; a matching
+        # sidechain stem binds as ``current_key``; a wake (SendMessage) relights
+        # it; a park (idle_notification) closes it. In-memory, torn down with the
+        # parent's tracking state; NOT restart-reconciled (disclosed — same class
+        # as the background-Bash T1.4b degradation).
+        self._teammate_registry: dict[str, dict[str, _TeammateRec]] = {}
+        # GH #46 PR-2 §3 discovery-quarantine: per-parent set of tracking_keys
+        # (``sub:<parent>:agent-a<name>-<hex>``) SEVERED from run-state tick
+        # emission — a same-name candidate that DETERMINISTICALLY cannot bind
+        # (current_key occupied by a different key / gate-fail stale prior gen /
+        # retired). An UNRESOLVED or sticky-AMBIGUOUS candidate is NOT severed
+        # (item 2 — never arbitrarily quarantined); it stays dark via the item-3
+        # classification instead. A severed file is still tailed for DISPLAY
+        # (feed_run_state=False) but NEVER records a run-state tick, so a
+        # non-current same-name key can never be recorded live. Monitor-side, so
+        # immune to runtime tombstone resets. Torn down with the parent.
+        self._severed_teammate_stems: dict[str, set[str]] = {}
+        # typing-unification T1.6 analogue: tool_use_ids for which a teammate
+        # prose-spawn DRIFT warning (``Spawned successfully.`` prose without the
+        # structured ``teammate_spawned`` meta) has already fired (rate-limit).
+        self._teammate_spawn_drift_warned: set[str] = set()
+        # GH #46 PR-2 (dual-review r1 item 1): teammate-relevant STRUCTURED
+        # tool_results observed BEFORE their tool_use (Claude Code flushes a
+        # result-before-use pair in 27/40 real session files — the GH #42
+        # ordering). The parser hands such a result to the monitor with
+        # tool_name=None, so the tool_name-gated spawn/wake branches never fire;
+        # instead the PARSED lightweight signals are retained here keyed by
+        # tool_use_id — parent_sid -> {tool_use_id -> (spawn_info, wake_target,
+        # result_ts_str)} — and applied when the matching Agent/Task/SendMessage
+        # tool_use arrives (whose entry carries the ``input`` the wake
+        # cross-check needs). Only teammate-shaped metas are stashed (bounded);
+        # per-parent cap with drop-oldest; torn down with the parent.
+        self._early_teammate_signals: dict[
+            str, dict[str, tuple[Any, str | None, str | None]]
+        ] = {}
+        # GH #46 PR-2 r5 P1 + r6 unification: the orphan-signal retention buffer
+        # — parent_sid -> {teammate_name -> _OrphanPending}, MIRRORING the rec's
+        # pending pair (park + wake). r6 rule 1 (RETAIN-ALWAYS): EVERY
+        # no-registry park dual-writes here (the immediate fallback closes to
+        # matched tracked stems keep today's semantics for THOSE stems — a
+        # tracked-but-indeterminate or STALE same-name stem must not SPEND the
+        # eventual bind's only close signal); r6 rule 3: a pre-registration
+        # WAKE (post-cross-check) is retained too. Bounded
+        # (_ORPHAN_PARK_MAX_NAMES, drop-oldest for a NEW name; replace-merge in
+        # place for an existing one), per-entry wall TTL (_ORPHAN_PARK_TTL_S),
+        # causal reductions identical to the rec slots. Drained at registration
+        # into rec.pending_park / rec.pending_wake (generation-filtered at the
+        # drain via the SHARED filters); torn down with the parent.
+        self._orphan_teammate_parks: dict[str, dict[str, _OrphanPending]] = {}
         # Per-tick fan-out for sidechain activity (wired from bot.post_init,
         # like ``_message_callback`` / ``_event_callback``).
         self._subagent_activity_callback: (
@@ -561,51 +849,1185 @@ class SessionMonitor:
             self._sidechain_activity[parent_session_id] = rec
         return rec
 
-    def _record_teammate_park(self, parent_session_id: str, parked: Any) -> None:
-        """Record a teammate park (GH #46 PR-1) against this parent's tracked
-        sidechain stem(s).
+    # ── GH #46 PR-2: the generational teammate registry ──────────────────
 
-        ``parked`` is a ``response_builder.TeammateIdle``. A teammate's sidechain
-        file is a top-level Agent transcript ``subagents/agent-a<name>-<hex>.jsonl``,
-        so its tracking key is ``sub:<parent>:agent-a<name>-<hex>`` and its
-        normalized background-agent key is ``a<name>-<hex>`` (with a PURE lowercase
-        hex suffix, 8-32 chars). Resolve the teammate NAME → every tracked stem
-        whose normalized key matches ``a<name>-<hex>`` (NO disk glob — we read the
-        SAME ``tracked_sessions`` structure the sidechain code populates) and
-        record the park for each. TOP-LEVEL stems ONLY (hermes P3): a nested
-        Fix-5 Workflow display key is ``sub:<parent>:<runid>:agent-…`` — an
-        extra ``:`` segment — and must NEVER receive a teammate park (a Workflow
-        sub-agent's close is the ``wf-task:`` bracket, and its display key never
-        feeds run-state). PR-1 closes ALL same-name top-level stems (documented
-        safe degradation — a double-``--resume`` sibling is rare and a park is
-        the agent going idle). Zero matching stems is a no-op (INFO).
-        """
-        pattern = re.compile(r"^a" + re.escape(parked.name) + r"-[0-9a-f]{8,32}$")
+    def _teammate_recs(self, parent_session_id: str) -> dict[str, "_TeammateRec"]:
+        """Get/create this parent's teammate registry (name -> _TeammateRec)."""
+        recs = self._teammate_registry.get(parent_session_id)
+        if recs is None:
+            recs = {}
+            self._teammate_registry[parent_session_id] = recs
+        return recs
+
+    def _severed_stems(self, parent_session_id: str) -> set[str]:
+        """Get/create this parent's set of run-state-SEVERED tracking_keys."""
+        sev = self._severed_teammate_stems.get(parent_session_id)
+        if sev is None:
+            sev = set()
+            self._severed_teammate_stems[parent_session_id] = sev
+        return sev
+
+    def _tracked_teammate_stems(
+        self, parent_session_id: str, name: str
+    ) -> list[tuple[str, str]]:
+        """Return every currently-tracked TOP-LEVEL sidechain (tracking_key,
+        normalized_key) whose normalized key matches ``a<name>-<hex>`` (hex 8-32).
+
+        NO disk glob — reads the SAME ``tracked_sessions`` structure the sidechain
+        tracker populates. TOP-LEVEL only (hermes P3): a nested Fix-5 Workflow
+        display key ``sub:<parent>:<runid>:agent-…`` carries an extra ``:`` and is
+        skipped (a Workflow sub-agent's close is the ``wf-task:`` bracket)."""
+        pattern = re.compile(r"^a" + re.escape(name) + r"-[0-9a-f]{8,32}$")
         prefix = f"sub:{parent_session_id}:"
-        matched: list[str] = []
+        out: list[tuple[str, str]] = []
         for tk in self.state.tracked_sessions:
             if not tk.startswith(prefix):
                 continue
             stem = tk[len(prefix) :]
-            # Enforce the exact TOP-LEVEL shape sub:<parent>:agent-…: a nested
-            # Workflow key's remainder carries another ":" segment → skip.
             if ":" in stem or not stem.startswith("agent-"):
                 continue
             key = normalize_background_agent_key(stem)  # "a<name>-<hex>"
             if pattern.match(key):
-                matched.append(key)
-        if not matched:
-            logger.info(
-                "teammate park: no tracked stem for name=%r parent=%s",
-                parked.name,
+                out.append((tk, key))
+        return out
+
+    def _quarantine_teammate_stem(
+        self, parent_session_id: str, rec: "_TeammateRec", key: str
+    ) -> None:
+        """§3 discovery-quarantine: retire ``key`` for teammate ``rec``, emit an
+        UNCONDITIONAL teammate done for it, and permanently sever its tracking_key
+        from run-state tick emission.
+
+        The sever is monitor-side, so it is immune to a runtime tombstone reset
+        (a genuine user turn clears ``background_agents_done`` but the severed stem
+        can never re-record a tick). ``key`` is the normalized ``a<name>-<hex>``;
+        the tracking_key is reconstructed as ``sub:<parent>:agent-<key>``."""
+        rec.retired_keys.add(key)
+        self._severed_stems(parent_session_id).add(
+            f"sub:{parent_session_id}:agent-{key}"
+        )
+        # Unconditional teammate done (end_turn_ts_unparseable=True bypasses the
+        # resume/stale gates by design — an extra tombstone on a non-current key
+        # is a no-op; we never peek route_runtime liveness here).
+        self._parent_activity(parent_session_id).merge_teammate_park(
+            key, park_ts=None, unparseable=True
+        )
+
+    def _rotate_teammate_generation(
+        self, parent_session_id: str, rec: "_TeammateRec", spawned_ts: float
+    ) -> None:
+        """A same-name RESPAWN: close the old leg's current_key, quarantine the
+        genuinely-STALE matching stems (tracked OR on disk), and bump the
+        generation (§2 spawn).
+
+        The quarantine snapshot is ONE anchored ``glob`` of this parent's
+        ``subagents`` dir plus the in-memory tracked stems — so a stale prior-gen
+        file that is present on disk but NOT yet tracked can never bind to the new
+        generation (the disk-snapshot pin). BUT the sever is GATED on the NEW
+        generation's bind gate (adversarial-review class-8): a same-name file that
+        ALREADY exists at rotation time and whose first entry is >= the new spawn
+        is the GENUINE new-gen file (a fast teammate the poll lagged), so it is
+        left UN-retired for the normal binding path; only a file that FAILS the
+        gate (first entry predates the new spawn ⇒ stale prior-gen) is quarantined.
+        An indeterminate file (mid-write) is left for the per-tick retry."""
+        # (1) close the old current_key unconditionally (its leg is superseded,
+        # regardless of its first-entry ts).
+        if rec.current_key is not None:
+            self._quarantine_teammate_stem(parent_session_id, rec, rec.current_key)
+        # (2) bump the generation + set spawned_ts FIRST so the gate below is the
+        # NEW generation's strict gate. A fresh spawn is new evidence, so the
+        # sticky bind-NONE ambiguity (item 2) clears HERE and only here.
+        old_current = rec.current_key
+        rec.current_key = None
+        rec.ambiguous = False
+        rec.spawn_generation += 1
+        rec.spawned_ts = spawned_ts
+        # r6 rule 2 (Codex P1b, probe-reproduced): rotation RE-FILTERS the
+        # pending signal slots instead of blind-clearing them. Pending signals
+        # are timestamp-attributed — generation membership is decided by the
+        # SHARED generation filter (the same rule the orphan drain uses), never
+        # by which rec object happened to hold them. The blind clear lost a
+        # NEWER-generation park that gen-1's registration had drained (two
+        # stashed same-name spawns: the buffer reduced to the newest park T4,
+        # gen-1 drained it, gen-2's rotation cleared it → gen-2 bound without
+        # its close → the 2h strand). A signal >= the NEW spawned_ts CARRIES
+        # into the new generation's slot; older drops; UnknownDone carries
+        # (dominance — documented fail-dark).
+        rec.pending_wake = _generation_filter_wake(rec.pending_wake, spawned_ts)
+        rec.pending_park = _generation_filter_park(rec.pending_park, spawned_ts)
+        # (3) quarantine only the STALE matching stems (gate==False); leave a
+        # genuine already-existing new-gen file (gate==True) + a mid-write file
+        # (gate==None) for the normal binding path.
+        tracked = self.state.get_session(parent_session_id)
+        sub_dir = (
+            Path(tracked.file_path).parent / parent_session_id / "subagents"
+            if tracked is not None and tracked.file_path
+            else None
+        )
+        for key in self._matching_stems_on_disk_and_tracked(
+            parent_session_id, rec.name
+        ):
+            if key in rec.retired_keys or key == old_current:
+                continue
+            if sub_dir is not None:
+                gate, _first_ts = self._teammate_bind_gate_passes(
+                    rec, sub_dir / f"agent-{key}.jsonl"
+                )
+                if gate is not False:
+                    continue  # genuine new-gen (True) or mid-write (None) → keep
+            self._quarantine_teammate_stem(parent_session_id, rec, key)
+
+    def _matching_stems_on_disk_and_tracked(
+        self, parent_session_id: str, name: str
+    ) -> set[str]:
+        """§3: the union of normalized keys ``a<name>-<hex>`` from (a) a single
+        anchored ``glob(glob.escape("agent-a<name>-") + "*.jsonl")`` snapshot of
+        this parent's ``subagents`` dir and (b) the in-memory tracked stems.
+
+        Anchored ONLY (never rglob); OSError on the dir → the tracked set alone.
+        The disk snapshot is what closes the ``untracked stale file`` hole: a
+        prior-generation file present but not yet tracked is quarantined before it
+        can ever be discovered + bound."""
+        keys: set[str] = {
+            key for _tk, key in self._tracked_teammate_stems(parent_session_id, name)
+        }
+        tracked = self.state.get_session(parent_session_id)
+        if tracked is not None and tracked.file_path:
+            sub_dir = Path(tracked.file_path).parent / parent_session_id / "subagents"
+            key_re = re.compile(r"^a" + re.escape(name) + r"-[0-9a-f]{8,32}$")
+            try:
+                if sub_dir.is_dir():
+                    for f in sub_dir.glob(glob.escape(f"agent-a{name}-") + "*.jsonl"):
+                        k = normalize_background_agent_key(f.stem)
+                        if key_re.match(k):
+                            keys.add(k)
+            except OSError:
+                pass
+        return keys
+
+    def _record_teammate_spawn(
+        self, parent_session_id: str, info: Any, spawn_event_ts: float | None
+    ) -> None:
+        """A teammate SPAWN (``response_builder.TeammateSpawnInfo``) on the parent
+        tool_result lane (§2 spawn).
+
+        NEW name → create a gen-1 rec. EXISTING name → generation rotation (close
+        + quarantine + bump). After either, a PRE-SPAWN scan attempts binding on
+        surviving already-tracked unbound matching stems (a sidechain discovered
+        BEFORE the spawn parsed must still bind).
+
+        ``spawn_event_ts`` is the spawn tool_result's JSONL EVENT timestamp (CC's
+        actual write instant, ≈ the teammate's first sidechain-entry time), NOT the
+        monitor's parse instant — the poll can lag CC's write by up to the poll
+        interval, and the binding gate compares ``spawned_ts`` against the
+        candidate file's first-entry ts + mtime (both CC/filesystem wall-clock at
+        the real spawn). Using ``time.time()`` here would set ``spawned_ts`` AFTER
+        the genuine new-gen file's first entry, so the gen>=2 STRICT gate
+        (``first_ts >= spawned_ts``) would reject it and the teammate would go DARK
+        on every respawn (adversarial-review P1). An unparseable event ts falls
+        back to ``time.time()`` with a WARNING — a rare disclosed degradation
+        (the gen>=2 respawn may go dark that leg; fail-DARK over a wrong lift)."""
+        spawned_ts = spawn_event_ts
+        if spawned_ts is None:
+            spawned_ts = time.time()
+            logger.warning(
+                "teammate spawn: unparseable event ts for name=%r parent=%s — "
+                "falling back to wall clock (a gen>=2 respawn may go dark this leg)",
+                info.name,
                 parent_session_id[:8],
             )
+        recs = self._teammate_recs(parent_session_id)
+        rec = recs.get(info.name)
+        if rec is None:
+            recs[info.name] = _TeammateRec(
+                name=info.name,
+                teammate_id=info.teammate_id,
+                spawn_generation=1,
+                spawned_ts=spawned_ts,
+            )
+            logger.info(
+                "teammate spawn: registered name=%r parent=%s gen=1",
+                info.name,
+                parent_session_id[:8],
+            )
+        else:
+            self._rotate_teammate_generation(parent_session_id, rec, spawned_ts)
+            rec.teammate_id = info.teammate_id or rec.teammate_id
+            logger.info(
+                "teammate spawn: rotated name=%r parent=%s gen=%d",
+                info.name,
+                parent_session_id[:8],
+                recs[info.name].spawn_generation,
+            )
+        # (4.5) r5 P1: drain an orphan-retained park for this name into
+        # rec.pending_park (generation-filtered at the drain — a stale
+        # prior-leg orphan park never poisons the fresh generation, the r4
+        # non-regression) BEFORE the pre-spawn scan, so a same-call bind
+        # applies it through the normal pending-park causal path.
+        self._drain_orphan_teammate_park(parent_session_id, recs[info.name])
+        # (5) pre-spawn scan: bind an already-tracked, unretired, gate-passing stem.
+        self._try_bind_tracked_teammate_stems(parent_session_id, info.name)
+        # (6) dual-review r2 P1 (BOTH engines): a candidate tracked BEFORE this
+        # registration may have fed run-state as a LEGACY agent (the registry
+        # didn't exist yet) — if arbitration just left it UNRESOLVED or
+        # AMBIGUOUS, its already-recorded runtime key would stay live until TTL
+        # while all future writes are classification-dark (the 2h strand
+        # re-entry). Retract those keys with an unconditional teammate-done,
+        # WITHOUT retiring/severing (they stay bind-eligible); a later bind
+        # relights through the resumed lane (see _bind_teammate_key).
+        self._retract_unbound_preexisting_candidates(parent_session_id, recs[info.name])
+
+    def _retract_unbound_preexisting_candidates(
+        self, parent_session_id: str, rec: "_TeammateRec"
+    ) -> None:
+        """r2 P1: emit an UNCONDITIONAL teammate-done for every already-tracked
+        matching candidate that arbitration left UNBOUND (unresolved or
+        sticky-ambiguous) at registration/rotation time — its potentially
+        pre-existing (pre-registration legacy) runtime key must not survive to
+        TTL. Deliberately NOT retired/severed (item 2 — the candidate stays
+        eligible for retry and eventual binding); an extra tombstone on a key
+        that never existed is a runtime no-op (we never peek route_runtime
+        liveness). Because EVERY teammate bind now relights through the
+        tombstone-popping RESUMED lane (r7 item 3), a later bind of a retracted
+        candidate recovers it WITHOUT needing a monitor-side provenance record —
+        the r6 ``done_retracted_keys`` set is DELETED; the retraction is
+        idempotent through the ``retraction_dones`` set (re-adding the same key
+        is a no-op), so no per-generation dedup guard is needed.
+
+        r3 P1 (BOTH engines): the retraction rides the DISTINCT
+        ``retraction_dones`` slot, NEVER the genuine-park lane — a synthetic
+        (None, True) park in ``teammate_parks`` shared the genuine unparseable
+        dominance and the fan-out's parks-after-resumed order, so a SAME-TICK
+        retraction→bind race permanently tombstoned the just-bound key.
+        ``_bind_teammate_key`` cancels a same-tick pending retraction; the
+        fan-out applies retraction-dones FIRST (registration precedes bind)."""
+        for _tk, key in self._tracked_teammate_stems(parent_session_id, rec.name):
+            if key == rec.current_key or key in rec.retired_keys:
+                continue  # bound = legitimately live; retired = already done'd
+            self._parent_activity(parent_session_id).retraction_dones.add(key)
+            logger.info(
+                "teammate registration: retracting potentially pre-existing "
+                "key %s for unbound candidate of name=%r parent=%s "
+                "(stays bind-eligible)",
+                key,
+                rec.name,
+                parent_session_id[:8],
+            )
+
+    def _orphan_entry_is_generation_droppable(
+        self, name: str, entry: _OrphanPending, recs: dict[str, "_TeammateRec"]
+    ) -> bool:
+        """r9 item 1 (CONVERGED P1 — Hermes + Codex, both probe-reproduced): the
+        REDUNDANCY predicate for tier 1 of the three-tier orphan eviction (r10
+        item 1 split the protected class into speculative vs provable), defined by
+        REUSING THE DRAIN FILTER'S OWN semantics so the eviction predicate and the
+        drain filter can never disagree (redundant iff drain would drop it —
+        mint/validate parity).
+
+        An entry is REDUNDANT (tier-1 evictable) iff its retained signal(s) would
+        be GENERATION-DROPPED at drain against the name's CURRENT rec:
+
+        * NO rec for ``name`` → NOT droppable (PROTECTED). A pre-registration
+          ORPHAN is the buffer's whole reason for existing — its park is a
+          teammate's only close signal, arriving before the spawn registers.
+        * HAS a rec → run the SAME ``_generation_filter_park`` /
+          ``_generation_filter_wake`` the drain
+          (:meth:`_drain_orphan_teammate_park`) uses against ``rec.spawned_ts``.
+          Redundant iff EVERY retained signal is dropped: a park whose parseable
+          ``ts < rec.spawned_ts`` drops (it reports a PRIOR leg; ``spawned_ts`` is
+          event-ts-anchored and MONOTONIC across generations, so a future
+          generation spawns even later and such a copy can close NO generation);
+          a wake ``< rec.spawned_ts`` drops. Anything that SURVIVES a filter — a
+          park ``>= spawned_ts`` (the possibly-next-generation close), an
+          UnknownDone-dominance park that can't be ts-classified, or a wake ``>=
+          spawned_ts`` — makes the entry PROTECTED (fail-dark preference; a copy
+          that could still close a future bind is never a redundancy victim).
+
+        The r8 "name has a rec ⇒ redundant" rule was WRONG: the r7 lifecycle
+        deliberately RETAINS a park under a STILL-REGISTERED name because it may
+        belong to a stashed not-yet-registered NEXT generation — that copy is the
+        next gen's ONLY close and must be PROTECTED, not evicted."""
+        rec = recs.get(name)
+        if rec is None:
+            return False  # pre-registration orphan — the protected class
+        park_survives = _generation_filter_park(entry.park, rec.spawned_ts) is not None
+        wake_survives = _generation_filter_wake(entry.wake, rec.spawned_ts) is not None
+        # Redundant iff NO retained signal survives the drain filter (an empty
+        # entry — no park, no wake — has nothing to carry, so it is redundant too).
+        return not park_survives and not wake_survives
+
+    def _stashed_spawn_names(self, parent_session_id: str) -> set[str]:
+        """r10 item 1 (CONVERGED P1 — Hermes + Codex, both probe-reproduced): the
+        set of teammate NAMES that have a SPAWN-SHAPED result-before-use early
+        signal buffered in ``_early_teammate_signals`` — i.e. a not-yet-registered
+        NEXT-generation spawn whose tool_use has not arrived yet. A park retained
+        under a STILL-REGISTERED name whose name is in THIS set is PROVABLY the
+        pending generation's ONLY close (the tier-3 provable class), never
+        speculative registered noise.
+
+        Bounded name-membership scan over the per-parent stash (≤ the 64-entry
+        ``_EARLY_TEAMMATE_SIGNALS_MAX`` cap). The stash already holds the PARSED
+        ``TeammateSpawnInfo`` (the ``spawn`` slot of each ``(spawn, target, ts)``
+        tuple), which carries ``.name`` from ``teammate_spawn_info_from_meta`` — so
+        no re-parse is needed; a wake-only signal (``spawn is None``) contributes
+        no name. Precomputed ONCE per eviction call (not per candidate entry)."""
+        stash = self._early_teammate_signals.get(parent_session_id)
+        if not stash:
+            return set()
+        names: set[str] = set()
+        for spawn, _target, _ts in stash.values():
+            if spawn is not None:
+                names.add(spawn.name)
+        return names
+
+    def _orphan_pending_slot(self, parent_session_id: str, name: str) -> _OrphanPending:
+        """Get-or-create the orphan pending pair for ``name`` (r5 + r6): lazy TTL
+        sweep first (expired names evicted before the cap check), then
+        evict-at-cap ONLY for a genuinely NEW name (an existing name replace-merges
+        in place — the r2 P3 discipline). The caller merges into the returned entry
+        and refreshes ``wall``.
+
+        EVICTION PRIORITY (r8 item 2 → r9 item 1, CONVERGED P1 — Hermes + Codex,
+        both probe-reproduced): the buffer's REASON FOR EXISTING is to preserve a
+        pre-registration ORPHAN park (a park whose name has NO registry rec yet —
+        its ONLY home, since a teammate's park is its only close signal and it
+        arrives before the spawn registers). Since r7 made EVERY park dual-write a
+        named copy — INCLUDING the high-frequency registered/bound path — a busy
+        multi-teammate parent churns the 32-name buffer with REDUNDANT copies
+        (their primary immediate close already applied; the copy is generation-
+        dropped at the next drain), and a blind ``next(iter(buf))`` drop-oldest
+        evicted the sole retained ORPHAN the buffer exists to protect
+        (probe: 32 distinct REGISTERED-name parks evict an unregistered ``future``
+        → it later binds with ``pending_park=None`` → 2h strand). The r8 two-tier fix keyed the tiers on
+        "name has a rec", but that MIS-tiered a park retained under a
+        STILL-REGISTERED name that belongs to a stashed not-yet-registered NEXT
+        generation (gen-1 bound, gen-2 spawn stashed, gen-2 park retained under the
+        registered name → the next gen's ONLY close) into the evictable tier
+        (probe: 32 registered-stale parks + 1 new name evict it → gen-2 binds
+        ``pending_park=None`` → 2h strand).
+
+        Fix (r9 item 1): REDUNDANT is redefined via the DRAIN FILTER'S OWN
+        semantics — :meth:`_orphan_entry_is_generation_droppable` — an entry is
+        tier-1 evictable iff the drain WOULD generation-drop it (redundant iff
+        drain would drop it — the eviction predicate and the drain filter must
+        never disagree, mint/validate parity).
+
+        Fix (r10 item 1, CONVERGED P1 — Hermes + Codex, both probe-reproduced):
+        r9's tier 2 (evict the oldest PROTECTED entry when ALL entries survive the
+        drain filter) is now REACHABLE as an ORDINARY steady state, because r9's
+        universal wake dual-write retains EVERY bound teammate's own wake and such
+        a wake (``event_ts >= its own spawned_ts``) SURVIVES the drain filter — so
+        a busy parent with 32 distinct bound names all carrying a self-wake makes
+        the buffer entirely protected, and the r9 "oldest protected" fallback then
+        evicts a stashed NEXT generation's ONLY close (probe: a gen-2 park retained
+        under a registered name ``future`` + 31 ordinary bound-name wakes + a 33rd
+        name → ``future`` is evicted → the late gen-2 spawn drains nothing → 2h
+        strand). This needs 33 DISTINCT names within the 2h TTL, not concurrent
+        teammates — realistic (18 spawns in the real incident corpus). Fix: SPLIT
+        the protected class into SPECULATIVE vs PROVABLE by whether the entry's
+        retained value can close a not-yet-visible future generation —
+
+        * Tier 1 (evict FIRST, oldest-first): generation-DROPPABLE entries — the
+          r9 drain-parity predicate, UNCHANGED.
+        * Tier 2 (next, oldest-first): entries whose name HAS a registry rec AND
+          has NO stashed spawn-shaped early signal — registered SAME-generation
+          noise. Their signals (``ts >= spawned_ts``) were already applied to the
+          bound ``current_key`` via the dual-write; the retained copy only serves
+          a not-yet-visible FUTURE generation, and with no stashed spawn there is
+          no evidence such a generation is pending → SPECULATIVE value.
+        * Tier 3 (LAST resort, oldest-first — the absolute cap bound): no-rec
+          ORPHANS (pre-registration signals with no other home) AND entries whose
+          name HAS a spawn-shaped early signal in ``_early_teammate_signals`` (a
+          stashed next-generation spawn — the retained copy is PROVABLY the pending
+          generation's close). Tier 2 vs 3 = speculative vs provable pending value;
+          the eviction may only sacrifice provable value at TRUE capacity (when
+          every entry is provable, i.e. tiers 1 and 2 are both empty).
+
+        The lazy TTL sweep + replace-merge-in-place semantics are byte-identical."""
+        buf = self._orphan_teammate_parks.setdefault(parent_session_id, {})
+        now = time.time()
+        expired = [
+            n for n, entry in buf.items() if now - entry.wall > _ORPHAN_PARK_TTL_S
+        ]
+        for n in expired:
+            del buf[n]
+        entry = buf.get(name)
+        if entry is None:
+            if len(buf) >= _ORPHAN_PARK_MAX_NAMES:
+                recs = self._teammate_registry.get(parent_session_id) or {}
+                # Precompute the stashed-spawn name-set ONCE per eviction call
+                # (not per candidate entry) — a name in it has a pending
+                # not-yet-registered NEXT generation, so its retained copy is
+                # PROVABLY that generation's close (tier 3, never tier 2).
+                stashed_spawn_names = self._stashed_spawn_names(parent_session_id)
+                # Tier 1 (evict FIRST): the oldest REDUNDANT entry — one the DRAIN
+                # would generation-drop (redundant iff drain would drop it — the
+                # eviction predicate and the drain filter must never disagree;
+                # r9 item 1). Its retained signal can never close any bind.
+                victim = next(
+                    (
+                        n
+                        for n, e in buf.items()
+                        if self._orphan_entry_is_generation_droppable(n, e, recs)
+                    ),
+                    None,
+                )
+                # Tier 2 (only when tier 1 is EMPTY): the oldest SPECULATIVE
+                # protected entry — a name that HAS a rec AND has NO stashed
+                # spawn-shaped early signal (registered same-generation noise; its
+                # value was already applied to current_key, the retained copy only
+                # serves a future generation that nothing proves is coming).
+                if victim is None:
+                    victim = next(
+                        (n for n in buf if n in recs and n not in stashed_spawn_names),
+                        None,
+                    )
+                # Tier 3 (LAST resort — every entry is PROVABLE, the true cap
+                # bound): the oldest entry (insertion order) — a no-rec
+                # pre-registration orphan OR a name with a stashed next-generation
+                # spawn (its retained copy is that generation's ONLY close).
+                if victim is None:
+                    victim = next(iter(buf))
+                buf.pop(victim)
+            entry = _OrphanPending(wall=now)
+            buf[name] = entry
+        return entry
+
+    def _retain_orphan_teammate_park(self, parent_session_id: str, parked: Any) -> None:
+        """r5 P1 + r6 rule 1 (RETAIN-ALWAYS): retain a no-registry park keyed by
+        teammate NAME until registration drains it — UNCONDITIONALLY, whether or
+        not tracked stems matched (dual-write; the immediate fallback closes to
+        matched stems keep today's semantics for THOSE stems, but a
+        tracked-but-indeterminate or STALE same-name stem absorbing the park
+        must never SPEND the eventual bind's only close signal — r6 A + B, both
+        engines probe-reproduced).
+
+        The park-lane mirror of the item-1 result-before-use spawn stash: in the
+        supported ordering (spawn tool_result stashed → genuine park → late
+        Agent tool_use → sidechain discovery/bind) the park arrives before ANY
+        anchor exists. Causal reduction WITHIN the buffer via the shared
+        ``_merge_pending_park`` rules (the dual-write is idempotent-safe under
+        it); the wall stamp refreshes on each merge."""
+        entry = self._orphan_pending_slot(parent_session_id, parked.name)
+        entry.park = _merge_pending_park(
+            entry.park, parked.park_ts, parked.park_ts_unparseable
+        )
+        entry.wall = time.time()
+        logger.info(
+            "teammate park: retained orphan park for unregistered name=%r "
+            "parent=%s (unparseable=%s)",
+            parked.name,
+            parent_session_id[:8],
+            parked.park_ts_unparseable,
+        )
+
+    def _retain_orphan_teammate_wake(
+        self, parent_session_id: str, name: str, wake_ts: float
+    ) -> None:
+        """r6 rule 3 (Codex P2): retain a pre-registration WAKE — post-cross-check
+        evidence, mirroring ``pending_wake``'s max-on-repeats reduction. Dropping
+        it broke the wake lane's transcript-true arbitration (a drained park
+        tombstoned a teammate whose LATER wake proved it resumed)."""
+        entry = self._orphan_pending_slot(parent_session_id, name)
+        if entry.wake is None or wake_ts > entry.wake:
+            entry.wake = wake_ts
+        entry.wall = time.time()
+        logger.info(
+            "teammate wake: retained orphan wake for unregistered name=%r parent=%s",
+            name,
+            parent_session_id[:8],
+        )
+
+    def _drain_orphan_teammate_park(
+        self, parent_session_id: str, rec: "_TeammateRec"
+    ) -> None:
+        """r5 P1 + r6: drain the orphan-retained pending PAIR for ``rec.name``
+        into ``rec.pending_park`` / ``rec.pending_wake`` at registration — the
+        eventual bind then applies both through the NORMAL pending causal path
+        (wake-vs-park arbitration at the runtime ts-gates).
+
+        GENERATION-FILTERED at the drain via the SHARED filters
+        (``_generation_filter_park`` / ``_generation_filter_wake`` — the same
+        rule the r6 rotation re-filter uses): a parseable signal older than
+        ``rec.spawned_ts`` reports a PRIOR leg and drops (INFO for the park);
+        UnknownDone keeps dominance (fail-dark). A TTL-expired entry is
+        discarded whole."""
+        buf = self._orphan_teammate_parks.get(parent_session_id)
+        if not buf:
             return
-        rec = self._parent_activity(parent_session_id)
+        entry = buf.pop(rec.name, None)
+        if not buf:
+            self._orphan_teammate_parks.pop(parent_session_id, None)
+        if entry is None:
+            return
+        if time.time() - entry.wall > _ORPHAN_PARK_TTL_S:
+            return  # expired while orphaned — discard
+        wake = _generation_filter_wake(entry.wake, rec.spawned_ts)
+        if wake is not None and (rec.pending_wake is None or wake > rec.pending_wake):
+            rec.pending_wake = wake
+        park = _generation_filter_park(entry.park, rec.spawned_ts)
+        if park is None and entry.park is not None:
+            logger.info(
+                "teammate park: dropping stale orphan park at drain for "
+                "name=%r parent=%s (park_ts=%s < gen-%d spawned_ts=%.3f)",
+                rec.name,
+                parent_session_id[:8],
+                entry.park.ts,
+                rec.spawn_generation,
+                rec.spawned_ts,
+            )
+        elif park is not None:
+            rec.pending_park = _merge_pending_park(
+                rec.pending_park, park.ts, park.unknown_done
+            )
+
+    def _record_teammate_wake(
+        self, parent_session_id: str, name: str, event_ts: float | None
+    ) -> None:
+        """A teammate WAKE (SendMessage to ``name``) on the parent tool_result lane
+        (§2 wake). BOUND → emit resume for the current_key (relights); UNBOUND →
+        buffer as pending_wake (max on repeats). NO registry rec → orphan-retain
+        (r6 rule 3, Codex P2 — the callers already ran the ``input["to"]``
+        cross-check, so the retained wake is post-cross-check evidence; dropping
+        it made a drained park tombstone a teammate whose LATER wake proved it
+        resumed — false-dark AND a broken transcript-true arbitration).
+
+        UNIVERSAL DUAL-WRITE (r9 item 2, Codex P2, probe-reproduced — the wake
+        mirror of the r7 item-2 park RETAIN-ALWAYS): EVERY wake FIRST lands a NAMED
+        RAW copy in the orphan buffer via :meth:`_retain_orphan_teammate_wake` —
+        the FIRST thing this method does when ``event_ts`` is parseable, before ANY
+        branching. A bound OLD generation used to spend the NEW generation's only
+        wake: gen-1 bound → gen-2 spawn result stashed (result-before-use) → gen-2
+        parks at T4 (retained via the r7 park dual-write) → gen-2 wakes at T5, but
+        the wake applied ONLY to gen-1's ``current_key`` and was GONE → the late
+        gen-2 tool_use registers/rotates → the drained park (T4) closes the fresh
+        bind and NO pending wake survives → tombstoned although T5 proved it
+        resumed. The retained copy carries the RAW ``event_ts`` (NOT the
+        gen-1-``filtered`` value), so the drain (:meth:`_drain_orphan_teammate_park`)
+        re-attributes it against the FUTURE rec's ``spawned_ts`` — a wake ``>=
+        gen-2 spawned_ts`` carries into ``pending_wake`` and WINS the bind's
+        wake-vs-park arbitration (``pending_wake`` first → ``resumed[key]``); a
+        stale wake ``< gen-2 spawned_ts`` is generation-DROPPED at that drain (the
+        r7 item-1 filter, applied to the wake at the drain seam too). The immediate
+        application to the bound rec KEEPS today's semantics for the OUTGOING
+        generation, and the buffer's max-on-repeats reduction makes the dual-write
+        idempotent (a key binds exactly once). BUFFER-NOISE bounded by the 32 cap
+        (r9 item 1 protects a surviving-signal entry) + the 2h TTL.
+
+        GENERATION FILTER (r7 item 1, Hermes P1, probe-reproduced): the
+        registered-rec path must apply the SAME ``_generation_filter_wake`` the
+        orphan drain (:meth:`_drain_orphan_teammate_park`) and the rotation
+        re-filter use — generation membership is timestamp-attributed, never
+        decided by which rec object holds the signal. Without it, a
+        result-before-use wake stashed at T1 < the new generation's
+        ``spawned_ts`` retro-paired onto the bound gen-2 key and popped its park
+        tombstone (a false relight until the next park / the 2h TTL); an
+        UNPARSEABLE (``None``) registered wake similarly reached ``resumed`` as
+        ``None`` despite the filter's documented parseable-only contract. A
+        ``None`` or pre-generation wake is REFUSED (INFO) BEFORE any of
+        ``last_wake_ts`` / ``resumed`` / ``pending_wake`` is touched."""
+        # r9 item 2: retain a named RAW copy of EVERY parseable wake (registered or
+        # not) so a not-yet-registered NEWER generation's wake is never spent
+        # solely on the currently-bound OLD generation. The RAW event_ts is
+        # retained (never the old rec's generation-filtered value) so the drain
+        # attributes it against the FUTURE rec's spawned_ts.
+        if event_ts is not None:
+            self._retain_orphan_teammate_wake(parent_session_id, name, event_ts)
+        recs = self._teammate_registry.get(parent_session_id)
+        rec = recs.get(name) if recs else None
+        if rec is None:
+            return
+        filtered = _generation_filter_wake(event_ts, rec.spawned_ts)
+        if filtered is None:
+            logger.info(
+                "teammate wake: dropping pre-generation/unparseable wake for "
+                "name=%r parent=%s (event_ts=%s < gen-%d spawned_ts=%.3f)",
+                name,
+                parent_session_id[:8],
+                event_ts,
+                rec.spawn_generation,
+                rec.spawned_ts,
+            )
+            return
+        rec.last_wake_ts = filtered
+        if rec.current_key is not None:
+            _record_resume_ts(
+                self._parent_activity(parent_session_id).resumed,
+                rec.current_key,
+                filtered,
+            )
+        else:
+            if rec.pending_wake is None or filtered > rec.pending_wake:
+                rec.pending_wake = filtered
+
+    def _apply_teammate_wake_crosschecked(
+        self,
+        parent_session_id: str,
+        target: str,
+        tool_input: Any,
+        event_ts: float | None,
+    ) -> None:
+        """The wake ``input["to"]`` cross-check (Hermes plan-review r2 P2-2),
+        shared by the LIVE SendMessage tool_result branch and the item-1
+        result-before-use retro-pairing: ``tool_input`` (the paired tool_use's
+        input) must name the SAME teammate as ``routing.target``. A mismatch
+        REFUSES the wake + WARNs; an UNAVAILABLE input fails closed (no wake)."""
+        to_field = tool_input.get("to") if isinstance(tool_input, dict) else None
+        if to_field == target:
+            self._record_teammate_wake(parent_session_id, target, event_ts)
+        elif to_field is None:
+            logger.warning(
+                "teammate wake: routing.target=@%s but the paired SendMessage "
+                "input.to is unavailable — refusing the wake (fail closed)",
+                target,
+            )
+        else:
+            logger.warning(
+                "teammate wake: routing.target=@%s != input.to=%r — refusing the wake",
+                target,
+                to_field,
+            )
+
+    def _stash_early_teammate_signal(
+        self, parent_session_id: str, tool_use_id: str, meta: Any, ts: str | None
+    ) -> None:
+        """Item 1: retain a teammate-shaped STRUCTURED tool_result observed
+        BEFORE its tool_use (the parser hands it over with tool_name=None, so the
+        tool_name-gated spawn/wake branches can't fire). Only metas that parse as
+        a spawn or a wake are stashed (bounded — junk metas never accumulate);
+        applied + popped when the matching tool_use arrives."""
+        from .handlers.response_builder import (
+            teammate_send_target_from_meta,
+            teammate_spawn_info_from_meta,
+        )
+
+        spawn = teammate_spawn_info_from_meta(meta)
+        target = teammate_send_target_from_meta(meta) if spawn is None else None
+        if spawn is None and target is None:
+            return
+        stash = self._early_teammate_signals.setdefault(parent_session_id, {})
+        # r2 P3 (Hermes): REPLACE an existing id in place — evicting first would
+        # drop an unrelated oldest signal and then overwrite anyway, leaving the
+        # stash one short. Evict only when inserting a genuinely NEW id at cap.
+        if tool_use_id not in stash:
+            while len(stash) >= _EARLY_TEAMMATE_SIGNALS_MAX:
+                stash.pop(next(iter(stash)))  # drop-oldest (insertion order)
+        stash[tool_use_id] = (spawn, target, ts)
+
+    def _apply_early_teammate_signal(self, parent_session_id: str, entry: Any) -> None:
+        """Item 1: the retro-pairing — a tool_use arrived whose tool_use_id has a
+        retained result-before-use teammate signal. ``entry`` is the tool_use
+        ParsedEntry (its ``tool_input`` carries the SendMessage ``to`` the wake
+        cross-check needs; the parser stashes SendMessage input). The spawn's
+        ``spawned_ts`` uses the RESULT's event ts (the spawn instant), matching
+        the live path."""
+        stash = self._early_teammate_signals.get(parent_session_id)
+        if not stash:
+            return
+        sig = stash.pop(entry.tool_use_id, None)
+        if sig is None:
+            return
+        # r2 P2 (Codex): a retro-paired id's tool_result was ALREADY consumed
+        # (result-before-use), so the PendingToolInfo the parser just stored for
+        # this late tool_use will never be popped by a result — without this, its
+        # full (potentially large) input is retained until teardown, one leak per
+        # retro-paired spawn/wake. The persisted carry is the SAME dict object
+        # ``parse_entries`` returned (stored before the entry loop), so the pop
+        # persists. Scoped STRICTLY to the retro-paired id — the normal in-order
+        # tool_use↔tool_result display pairing never reaches here.
+        pending = self._pending_tools.get(parent_session_id)
+        if pending is not None:
+            pending.pop(entry.tool_use_id, None)
+            if not pending:
+                self._pending_tools.pop(parent_session_id, None)
+        spawn, target, ts = sig
+        if spawn is not None and entry.tool_name in ("Agent", "Task"):
+            self._record_teammate_spawn(
+                parent_session_id, spawn, parse_iso_timestamp(ts)
+            )
+        elif target is not None and entry.tool_name == "SendMessage":
+            self._apply_teammate_wake_crosschecked(
+                parent_session_id, target, entry.tool_input, parse_iso_timestamp(ts)
+            )
+
+    def _record_teammate_park(self, parent_session_id: str, parked: Any) -> None:
+        """Record a teammate park (GH #46 PR-1 + PR-2) — the ONLY close signal for
+        a teammate leg that ends in plain text (no sidechain end-of-turn, no
+        ``<task-notification>``).
+
+        ``parked`` is a ``response_builder.TeammateIdle``. PR-2: when the name IS
+        in the registry, close CURRENT_KEY ONLY (bound) or buffer pending_park
+        (unbound). When the name is NOT in the registry (no spawn seen — e.g. a
+        pre-restart spawn), fall back to PR-1's all-tracked-stems close verbatim
+        (the documented no-registry degradation). TOP-LEVEL stems only (a nested
+        Workflow display key never matches). Every close merges CAUSALLY
+        (``merge_teammate_park``: unparseable dominates, else max park_ts).
+
+        UNIVERSAL DUAL-WRITE (r7 item 2, Codex P1, probe-reproduced — the r6
+        RETAIN-ALWAYS rule extended to ALL parks, not just the no-registry
+        branch): EVERY park additionally lands a NAMED retained copy in the
+        orphan buffer via :meth:`_retain_orphan_teammate_park` — the FIRST thing
+        this method does, before ANY branching. A bound OLD generation used to
+        spend the NEW generation's only park: gen-1 bound → gen-2 spawn result
+        stashed (result-before-use) → the gen-2 park arrives while the rec is
+        STILL gen-1 (≥ gen-1's ``spawned_ts``, so not dropped) → it applied
+        immediately to gen-1's ``current_key`` and was GONE → the late gen-2
+        tool_use registers/rotates with ``pending_park=None`` → gen-2 binds
+        without its close → the 2h strand. The retained copy is drained at the
+        next registration through ``_generation_filter_park`` (r7's next
+        registration for the name → ``park_ts ≥ gen-2 spawned_ts`` carries into
+        gen-2's ``pending_park`` → closes at bind). The immediate application to
+        the bound rec KEEPS today's semantics for the OUTGOING generation
+        (closing it early is harmless — the rotation retires it anyway), and the
+        buffer's ``_merge_pending_park`` causal reduction makes the dual-write
+        idempotent (a key is bound exactly once, so no key ever receives both
+        the immediate close AND the buffer copy). BUFFER-NOISE consequence
+        (disclosed): most retained copies are generation-dropped at the next
+        drain (same-generation parks whose gen already applied them immediately)
+        or TTL-expire unused; bounded by the existing ``_ORPHAN_PARK_MAX_NAMES``
+        (32) cap + the ``_ORPHAN_PARK_TTL_S`` (2 h) wall TTL.
+
+        GENERATION SCOPE (dual-review r1 item 4, Codex P1): a PARSEABLE park
+        whose ``park_ts`` predates the CURRENT generation's ``spawned_ts`` is
+        DROPPED (INFO) — it reports the PRIOR leg going idle and cannot close a
+        generation it predates. Without the drop, a delayed prior-gen park
+        buffered into ``pending_park`` after a rotation is applied at bind and
+        tombstones the FRESH key (which has no activity/resume stamp yet to
+        defend it at the runtime ts-gates). An UNPARSEABLE park keeps its
+        unconditional dominance (it cannot be generation-checked; fail-dark
+        doctrine — disclosed residual: an unparseable post-rotation stale park
+        still darkens the new gen until a wake / the next genuine park). The
+        drop applies ONLY to the immediate application; the retained copy above
+        is generation-filtered independently at its own drain."""
+        # r7 item 2: retain a named copy of EVERY park (registered or not) so a
+        # not-yet-registered NEWER generation's park is never spent solely on the
+        # currently-bound OLD generation.
+        self._retain_orphan_teammate_park(parent_session_id, parked)
+        recs = self._teammate_registry.get(parent_session_id)
+        rec = recs.get(parked.name) if recs else None
+        if rec is not None:
+            if (
+                not parked.park_ts_unparseable
+                and parked.park_ts is not None
+                and parked.park_ts < rec.spawned_ts
+            ):
+                logger.info(
+                    "teammate park: dropping prior-generation park for name=%r "
+                    "parent=%s (park_ts=%.3f < gen-%d spawned_ts=%.3f)",
+                    parked.name,
+                    parent_session_id[:8],
+                    parked.park_ts,
+                    rec.spawn_generation,
+                    rec.spawned_ts,
+                )
+                return
+            if rec.current_key is not None:
+                self._parent_activity(parent_session_id).merge_teammate_park(
+                    rec.current_key, parked.park_ts, parked.park_ts_unparseable
+                )
+            else:
+                rec.pending_park = _merge_pending_park(
+                    rec.pending_park, parked.park_ts, parked.park_ts_unparseable
+                )
+            return
+        # No-registry degradation (PR-1): close ALL same-name top-level stems.
+        # r5 P1 + r6 rule 1 (RETAIN-ALWAYS, both engines probe-reproduced): the
+        # named copy was retained UNCONDITIONALLY above — retention gated on
+        # zero-match let a tracked-but-INDETERMINATE stem (r6 A) or a STALE
+        # same-name stem (r6 B) absorb the park as its own immediate close and
+        # SPEND the eventual bind's only close signal (registration then
+        # retracted/quarantined the absorbing stem; the fresh bind relit with
+        # pending_park empty → the 2h strand). The immediate closes to matched
+        # stems below keep today's semantics for THOSE stems; the buffer's
+        # causal reduction makes the dual-write idempotent-safe.
+        matched = [
+            key
+            for _tk, key in self._tracked_teammate_stems(parent_session_id, parked.name)
+        ]
+        activity = self._parent_activity(parent_session_id)
         for key in matched:
-            # Causal merge, never last-write-wins (review r2 P2): unparseable
-            # dominates, else max park_ts — see merge_teammate_park.
-            rec.merge_teammate_park(key, parked.park_ts, parked.park_ts_unparseable)
+            activity.merge_teammate_park(
+                key, parked.park_ts, parked.park_ts_unparseable
+            )
+
+    def _resolve_teammate_name_for_stem(
+        self, parent_session_id: str, normalized_key: str
+    ) -> "_TeammateRec | None":
+        """Which registered teammate does ``normalized_key`` (``a<name>-<hex>``)
+        belong to? LONGEST registered name first so a nested name (``explore`` vs
+        ``explore-backend``) binds to the most specific; the pure-hex residual
+        (``-[0-9a-f]{8,32}$``) disambiguates. None when no registered name matches
+        (a non-teammate agent sidechain — the common case, no registry rec)."""
+        recs = self._teammate_registry.get(parent_session_id)
+        if not recs:
+            return None
+        for name in sorted(recs, key=len, reverse=True):
+            if re.match(r"^a" + re.escape(name) + r"-[0-9a-f]{8,32}$", normalized_key):
+                return recs[name]
+        return None
+
+    def _read_first_entry_ts(self, sc_file: Path) -> float | None:
+        """§2 binding gate: parse the FIRST JSONL line's entry timestamp.
+
+        Bounded read with an explicit byte cap; cap-reached / no newline /
+        JSON-parse-fail / unparseable ts ⇒ None (⇒ NO bind this tick, RETRY while
+        unbound — never consume-once). Synchronous stdlib read (a few KiB) is fine
+        on the poll thread; the mtime prefilter already gated us here."""
+        try:
+            with open(sc_file, "rb") as f:
+                chunk = f.read(_TEAMMATE_FIRST_LINE_MAX_BYTES)
+        except OSError:
+            return None
+        nl = chunk.find(b"\n")
+        if nl == -1:
+            return None  # no complete first line yet (partial write / cap) → retry
+        try:
+            entry = json.loads(chunk[:nl].decode("utf-8", errors="strict"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(entry, dict):
+            return None
+        return parse_iso_timestamp(entry.get("timestamp"))
+
+    def _teammate_bind_gate_passes(
+        self, rec: "_TeammateRec", sc_file: Path
+    ) -> tuple[bool | None, float | None]:
+        """§2 binding gate for ONE candidate stem: mtime prefilter + first-entry-ts
+        generation gate.
+
+        Returns ``(gate, first_ts)``: gate True (bind), False (never — the file's
+        first entry predates the spawn: a STALE prior-generation file), or None
+        (INDETERMINATE — first line not yet readable ⇒ NO bind this tick, RETRY).
+        Gen-1 tolerates the larger MTIME skew window (``spawned_ts - MTIME_SKEW``);
+        gen>=2 tolerates only the SMALL cross-write-path jitter
+        (``spawned_ts - GEN2_FIRST_TS_TOLERANCE``, adversarial-review P2) — far
+        below the respawn interval, so a stale prior-gen file (first entry seconds
+        before the new spawn) still fails while the genuine new-gen file (first
+        entry a sub-second before the parent tool_result flush) binds.
+
+        The SECOND element (``first_ts``, r8 item 1, Hermes P1) is the candidate's
+        FIRST-entry timestamp — read at the gate and plumbed to the bind so the
+        relight resume ts can sit strictly BELOW the bound file's own first entry
+        (see :meth:`_bind_teammate_key`). It is non-None IFF the first line was
+        readable (gate True/False on the gen check); None only when the first line
+        could not be read (gate None) or the mtime prefilter rejected before the
+        read (gate False). A gate-True result therefore always carries the
+        first_ts, so the bind never falls back."""
+        try:
+            mtime = sc_file.stat().st_mtime
+        except OSError:
+            return None, None
+        if mtime < rec.spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S:
+            return False, None  # backdated file — stale prior generation
+        first_ts = self._read_first_entry_ts(sc_file)
+        if first_ts is None:
+            return None, None  # unreadable/mid-write first line → retry
+        if rec.spawn_generation >= 2:
+            return (
+                first_ts >= rec.spawned_ts - TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S,
+                first_ts,
+            )
+        return (
+            first_ts >= rec.spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S,
+            first_ts,
+        )
+
+    def _bind_teammate_key(
+        self,
+        parent_session_id: str,
+        rec: "_TeammateRec",
+        key: str,
+        first_entry_ts: float | None = None,
+    ) -> None:
+        """Bind ``key`` as ``rec.current_key`` and emit its (re)light signal, then
+        apply the buffered pending signals in CAUSAL order (§2 binding).
+
+        pending_wake FIRST (→ ``resumed[key]``), pending_park SECOND (→
+        ``teammate_parks``) — so the runtime ts-gates arbitrate a wake-then-park
+        vs park-then-wake correctly; both pending slots are cleared.
+
+        ALWAYS-RESUMED RELIGHT (r7 item 3, Codex P2, probe-reproduced): EVERY
+        teammate bind emits through the tombstone-POPPING RESUMED lane —
+        ``resumed[key] = min(spawned_ts, first_entry_ts) - ε`` (the r8-item-1
+        floor below; it reduces to r7's ``spawned_ts - ε`` in the normal
+        ``first_ts >= spawned_ts`` case) — for ALL binds, never ``launched``. The
+        r6 code gated this on the monitor-side
+        provenance set ``done_retracted_keys`` (emit ``launched`` for a
+        never-retracted key, ``resumed`` for a retracted one), but the monitor
+        CANNOT observe route_runtime's tombstone state (in-memory, a DIFFERENT
+        module, pull-only), so any provenance-gated emission is structurally
+        unsound — two probe-confirmed holes left a positively-bound key
+        tombstone-blocked → DARK: (i) rotation CLEARED ``done_retracted_keys``, so
+        a stem retracted in late gen-1 registration that binds during gen-2
+        rotation emitted ``launched`` which no-ops against its runtime tombstone;
+        (ii) the dual-write fallback lane could tombstone an already-tracked
+        eventual key that was NEVER in the set → the same dark bind. The ONLY
+        uniformly-safe emission is the tombstone-popping lane. Binding is
+        positive per-key proof of new work (the Fix-C
+        ``mark_background_agent_resumed`` justification): ``resumed`` ==
+        ``launched`` semantics on a fresh key (``is_background=True``, 2h TTL,
+        projected RUNNING) PLUS a tombstone-pop + a ``resumed_event_ts`` stamp; a
+        fresh key with no tombstone treats resumed as a plain launch. The resume
+        ts sits STRICTLY BELOW the generation's ``spawned_ts`` (r3 item 2, Codex
+        P1: the runtime resume gate suppresses a done with ts <= resumed, so a
+        resume ts of exactly ``spawned_ts`` stranded a genuine park stamped at
+        exactly ``spawned_ts`` to the 2h TTL; the r3 epsilon walk proved every
+        park surviving the item-4 generation floor (>= spawned_ts) is strictly
+        newer than ``spawned_ts - ε`` and closes correctly), and a pending wake
+        (necessarily newer) max-merges over it.
+
+        RESUME-TS FLOOR (r8 item 1, Hermes P1, probe-reproduced): the resume ts is
+        ``min(rec.spawned_ts, first_entry_ts) - ε`` — strictly below the BOUND
+        FILE's OWN first-entry ts, not just below ``spawned_ts``. The gen-1 bind
+        gate tolerates a first entry up to ``spawned_ts - MTIME_SKEW`` (5s) below
+        the spawn, so an accepted look-alike candidate can bind with a first entry
+        (and thus a TRAILING end_turn ≥ that first entry, e.g. ``spawned_ts - 2s``)
+        BELOW ``spawned_ts - ε``; the r7 always-resumed stamp of ``spawned_ts - ε``
+        then SHIELDED that pre-spawn end_turn at the runtime SIDECHAIN done gate
+        (``end_turn_ts <= resumed_event_ts`` keeps the key LIVE), recreating the 2h
+        strand where the pre-r7 ``launched`` path fail-closed to DONE (no
+        ``resumed_event_ts`` ⇒ a stale end_turn tombstones). Flooring at the bound
+        file's first entry makes EVERY signal in that file (including its trailing
+        end_turn, which is ≥ its first entry) STRICTLY NEWER than the resume, so
+        nothing from the bound file can ever be shielded. In the normal case
+        (``first_ts >= spawned_ts``, measured 1–7 ms after) the ``min`` reduces to
+        ``spawned_ts - ε``, preserving the r3 tie fix (a park at exactly
+        ``spawned_ts`` still strictly-newer closes) and the r7 semantics
+        byte-for-byte. ``first_entry_ts`` is None only for a bind lane where the
+        first entry is genuinely unknown (defensive — every real gate-True carries
+        it); it then falls back to ``spawned_ts - ε`` (the r7 stamp) and logs.
+
+        SAME-TICK CANCEL (r3 P1, BOTH engines): a retraction emitted EARLIER in
+        THIS tick (registration in check_for_updates, bind in the immediately
+        following sidechain scan) is CANCELLED here (``activity.retraction_dones
+        .discard`` — UNCONDITIONAL on every bind now, a no-op when the key isn't
+        pending; it operates on the per-tick ``activity`` record, not the rec, so
+        it survives the ``done_retracted_keys`` deletion). The retraction's
+        premise ("unbound at registration") is falsified by the bind; without the
+        cancel, the fan-out's parks-after-resumed order let the synthetic done
+        tombstone the just-relit key permanently.
+
+        RETROACTIVE GENERATION FILTER (r4 P2, Codex, probe-reproduced): a park
+        recorded EARLIER IN THIS BATCH via the NO-REGISTRY fallback had no
+        ``spawned_ts`` to filter against at record time (the generation didn't
+        exist yet) — a delayed prior-leg park at T1 followed by the fresh spawn
+        at T2 in ONE parent batch left a stale PARSEABLE park in the current
+        record, and the fan-out (parks after launched/resumed) tombstoned the
+        newly bound key with no activity/resume stamp to defend it. The bind
+        re-applies the r1 item-4 generation floor to the pre-existing park:
+        parseable-and-stale (``park_ts < spawned_ts``) is dropped; UNPARSEABLE
+        dominance remains (fail-dark). The bind seam alone suffices: once the
+        name is registered, ``_record_teammate_park`` filters at record time
+        (so a stale current-record park can only pre-exist via the no-registry
+        fallback, i.e. only when the spawn landed later in the SAME batch), and
+        an UNBOUND candidate's key is tombstoned by the registration retraction
+        anyway — both are dones — with a later bind relighting via the resumed
+        lane."""
+        rec.current_key = key
+        activity = self._parent_activity(parent_session_id)
+        # r7 item 3: ALWAYS relight through the tombstone-popping RESUMED lane
+        # (never ``launched``); the same-tick cancel is unconditional (a no-op
+        # when nothing is pending for this key).
+        activity.retraction_dones.discard(key)
+        # r8 item 1: floor the resume ts strictly BELOW the bound file's OWN first
+        # entry (not just below spawned_ts), so no signal from the bound file —
+        # including a TRAILING end_turn ≥ its first entry — can be shielded by the
+        # runtime resume gate. Normal case (first_ts >= spawned_ts) reduces to
+        # spawned_ts - ε (r7 semantics preserved). None ⇒ the r7 fallback.
+        resume_floor = rec.spawned_ts
+        if first_entry_ts is not None:
+            resume_floor = min(resume_floor, first_entry_ts)
+        else:
+            logger.info(
+                "teammate bind: first-entry ts unavailable for key %s — "
+                "flooring the relight resume at spawned_ts (r7 fallback)",
+                key,
+            )
+        _record_resume_ts(
+            activity.resumed,
+            key,
+            resume_floor - TEAMMATE_RETRACT_RESUME_EPSILON_S,
+        )
+        existing_park = activity.teammate_parks.get(key)
+        if existing_park is not None:
+            ex_park_ts, ex_unparseable = existing_park
+            if (
+                not ex_unparseable
+                and ex_park_ts is not None
+                and ex_park_ts < rec.spawned_ts
+            ):
+                # The r4 retroactive generation filter — see docstring.
+                del activity.teammate_parks[key]
+                logger.info(
+                    "teammate bind: dropping pre-registration stale park for "
+                    "key %s (park_ts=%.3f < gen-%d spawned_ts=%.3f)",
+                    key,
+                    ex_park_ts,
+                    rec.spawn_generation,
+                    rec.spawned_ts,
+                )
+        if rec.pending_wake is not None:
+            _record_resume_ts(activity.resumed, key, rec.pending_wake)
+        if rec.pending_park is not None:
+            if rec.pending_park.unknown_done:
+                activity.merge_teammate_park(key, park_ts=None, unparseable=True)
+            else:
+                activity.merge_teammate_park(
+                    key, park_ts=rec.pending_park.ts, unparseable=False
+                )
+        rec.pending_wake = None
+        rec.pending_park = None
+        logger.info(
+            "teammate bind: name=%r key=%s parent=%s gen=%d",
+            rec.name,
+            key,
+            parent_session_id[:8],
+            rec.spawn_generation,
+        )
+
+    def _arbitrate_and_bind(
+        self,
+        parent_session_id: str,
+        rec: "_TeammateRec",
+        candidates: list[tuple[str, Path]],
+    ) -> None:
+        """SET-BASED bind arbitration for one unbound teammate rec (dual-review
+        r1 item 2 — the shared engine for BOTH the public per-tick discovery and
+        the pre-spawn scan; never first-wins).
+
+        ``candidates`` are the (normalized_key, sc_file) pairs visible in ONE
+        pass, pre-filtered to this rec's name with retired keys excluded. All
+        gates are evaluated BEFORE any ``current_key`` mutation:
+          - gate False (stale prior gen)  → quarantine + sever (deterministic);
+          - gate None  (mid-write)        → unresolved, retry next pass;
+          - gate True                     → the passing set.
+        Exactly ONE passing candidate binds. MORE THAN ONE binds NONE and marks
+        the rec STICKY-ambiguous (the gate inputs are static — first-entry ts vs
+        spawn ts — so the ambiguity never self-resolves; it clears only at the
+        next rotation); the passing candidates are NOT arbitrarily quarantined
+        (filesystem enumeration order must never pick the "genuine" key) and
+        stay out of run-state via the item-3 classification. A rec already
+        sticky-ambiguous FREEZES: no gates run, nothing binds, nothing new is
+        quarantined."""
+        if rec.ambiguous:
+            return
+        # r8 item 1: carry each gate-passer's FIRST-entry ts so the bind can floor
+        # the relight resume ts strictly below the bound file's own first entry.
+        passing: list[tuple[str, float | None]] = []
+        for key, sc_file in candidates:
+            gate, first_ts = self._teammate_bind_gate_passes(rec, sc_file)
+            if gate is False:
+                self._quarantine_teammate_stem(parent_session_id, rec, key)
+            elif gate is True:
+                passing.append((key, first_ts))
+            # None → unresolved, retry (never quarantined, never run-state)
+        if len(passing) > 1:
+            rec.ambiguous = True
+            logger.warning(
+                "teammate bind: %d simultaneous gate-passing candidates for "
+                "name=%r parent=%s gen=%d — binding NONE (sticky fail-dark "
+                "until the next rotation): %s",
+                len(passing),
+                rec.name,
+                parent_session_id[:8],
+                rec.spawn_generation,
+                sorted(k for k, _ in passing),
+            )
+            return
+        if passing:
+            bind_key, bind_first_ts = passing[0]
+            self._bind_teammate_key(
+                parent_session_id, rec, bind_key, first_entry_ts=bind_first_ts
+            )
+
+    def _arbitrate_teammate_bindings(
+        self, parent_session_id: str, sidechain_files: list[Path]
+    ) -> None:
+        """The PUBLIC per-tick arbitration pre-pass (item 2): group THIS tick's
+        discovered sidechain files by registered teammate rec and run the
+        set-based arbitration for every UNBOUND rec BEFORE any per-file
+        run-state classification — so two same-name candidates appearing in one
+        sweep are judged as a SET, never sequentially first-wins."""
+        recs = self._teammate_registry.get(parent_session_id)
+        if not recs:
+            return
+        by_name: dict[str, list[tuple[str, Path]]] = {}
+        for sc_file in sidechain_files:
+            key = normalize_background_agent_key(sc_file.stem)
+            rec = self._resolve_teammate_name_for_stem(parent_session_id, key)
+            if rec is None or rec.ambiguous or rec.current_key is not None:
+                continue
+            if key in rec.retired_keys:
+                continue
+            by_name.setdefault(rec.name, []).append((key, sc_file))
+        for name, candidates in by_name.items():
+            self._arbitrate_and_bind(parent_session_id, recs[name], candidates)
+
+    def _teammate_feed_run_state(
+        self, parent_session_id: str, sc_file: Path, tracking_key: str
+    ) -> bool:
+        """Per-file run-state classification (item 3): may THIS sidechain file's
+        parsed entries feed run-state ticks this tick?
+
+        Runs AFTER the arbitration pre-pass. The STRUCTURAL rule: for a
+        REGISTERED teammate name, ONLY the bound ``current_key`` ever feeds
+        run-state — every other same-name candidate (retired / occupied-newcomer
+        / unresolved / ambiguous) is dark, so an unbound candidate can never
+        mint a background key that a genuine-user tombstone reset could
+        resurrect (the r1 item-3 strand re-entry, BOTH engines). A name with no
+        registry rec keeps the legacy behavior (True — a plain Agent sidechain).
+
+          - tracking_key in the severed set                → False
+          - not a registered teammate name                 → True  (legacy)
+          - key == rec.current_key                         → True  (the ONE feeder)
+          - key in retired_keys                            → quarantine (idempotent
+            sever so future ticks take the fast path) → False
+          - current_key occupied by a DIFFERENT key        → quarantine + sever
+            (a same-name newcomer while bound — the sequential-ambiguity strand
+            pin) → False
+          - unbound (unresolved / sticky-ambiguous)        → False (no quarantine
+            — item 2: never arbitrarily severed)
+        """
+        severed = self._severed_teammate_stems.get(parent_session_id)
+        if severed is not None and tracking_key in severed:
+            return False
+        key = normalize_background_agent_key(sc_file.stem)
+        rec = self._resolve_teammate_name_for_stem(parent_session_id, key)
+        if rec is None:
+            return True
+        if rec.current_key == key:
+            return True
+        if key in rec.retired_keys:
+            self._quarantine_teammate_stem(parent_session_id, rec, key)
+            return False
+        if rec.current_key is not None:
+            self._quarantine_teammate_stem(parent_session_id, rec, key)
+            return False
+        return False
+
+    def _try_bind_tracked_teammate_stems(
+        self, parent_session_id: str, name: str
+    ) -> None:
+        """§2 spawn step (5): a pre-spawn scan — attempt binding on the surviving
+        already-tracked, unretired matching stems for ``name`` (a sidechain
+        discovered BEFORE the spawn parsed must still bind). Shares the SET-BASED
+        arbitration with the public discovery path (item 2): >1 gate-passing
+        candidate binds NONE + marks the rec sticky-ambiguous, uniformly across
+        generations."""
+        recs = self._teammate_registry.get(parent_session_id)
+        rec = recs.get(name) if recs else None
+        if rec is None or rec.current_key is not None or rec.ambiguous:
+            return
+        tracked = self.state.get_session(parent_session_id)
+        if tracked is None or not tracked.file_path:
+            return
+        sub_dir = Path(tracked.file_path).parent / parent_session_id / "subagents"
+        candidates: list[tuple[str, Path]] = []
+        for tk, key in self._tracked_teammate_stems(parent_session_id, name):
+            if key in rec.retired_keys:
+                continue
+            candidates.append((key, sub_dir / f"{tk.split(':')[-1]}.jsonl"))
+        self._arbitrate_and_bind(parent_session_id, rec, candidates)
 
     def _open_workflow_bracket(self, parent_session_id: str, info: Any) -> None:
         """Open a persistent Workflow bracket (ISSUE-6 / Fix 2c).
@@ -1521,7 +2943,43 @@ class SessionMonitor:
                     ):
                         from .handlers.response_builder import (
                             extract_async_agent_launch_id,
+                            teammate_spawn_info_from_meta,
                         )
+
+                        # GH #46 PR-2: an agent-teams teammate SPAWN — a DIFFERENT
+                        # tool_result shape from a plain async Agent launch
+                        # (``status=="teammate_spawned"`` + snake ``agent_id``, no
+                        # camelCase ``agentId``, so the prose regex below never
+                        # matches it). Register/rotate the teammate in the
+                        # generational registry; the relight signal is emitted
+                        # LATER, at binding, once its sidechain stem appears —
+                        # always via the tombstone-popping RESUMED lane, never
+                        # ``launched`` (r7 item 3). STRUCTURED-ONLY — a prose
+                        # ``Spawned successfully.`` line without the meta fires a
+                        # rate-limited drift WARNING (the T1.6 pattern), never a lift.
+                        spawn = teammate_spawn_info_from_meta(entry.tool_result_meta)
+                        if spawn is not None:
+                            self._record_teammate_spawn(
+                                session_info.session_id,
+                                spawn,
+                                parse_iso_timestamp(entry.timestamp),
+                            )
+                        elif (
+                            entry.text
+                            and "Spawned successfully." in entry.text
+                            and entry.tool_result_meta is None
+                        ):
+                            tuid = entry.tool_use_id or ""
+                            if tuid not in self._teammate_spawn_drift_warned:
+                                self._teammate_spawn_drift_warned.add(tuid)
+                                logger.warning(
+                                    "teammate spawn: prose announces a spawn but the "
+                                    "structured toolUseResult (status="
+                                    "'teammate_spawned') is absent (tool_use_id=%s) "
+                                    "— Claude Code spawn-result format may have "
+                                    "drifted; NOT registering from prose",
+                                    tuid or "?",
+                                )
 
                         launch_id = extract_async_agent_launch_id(entry.text)
                         if launch_id:
@@ -1633,6 +3091,7 @@ class SessionMonitor:
                         # agentId == the ``<task-notification>`` close key.
                         from .handlers.response_builder import (
                             resumed_agent_id_from_meta,
+                            teammate_send_target_from_meta,
                         )
 
                         resumed_id = resumed_agent_id_from_meta(entry.tool_result_meta)
@@ -1647,6 +3106,59 @@ class SessionMonitor:
                             # then record the resume ts (max-preferring-parseable).
                             rec.completed.discard(key)
                             _record_resume_ts(rec.resumed, key, resume_ts)
+                        else:
+                            # GH #46 PR-2: a ``SendMessage`` to a teammate by NAME
+                            # (``routing.target == "@<name>"``, NO resumedAgentId)
+                            # WAKES it. DISJOINT from the resume lane above (0
+                            # overlap — verified). Cross-check the paired tool_use
+                            # ``input["to"] == <name>`` (Hermes r2 P2-2): a mismatch
+                            # REFUSES the wake + WARNs; an UNAVAILABLE input
+                            # (tool_use outside the scanned region) fails closed (no
+                            # wake). BOUND → relight the current_key; UNBOUND →
+                            # buffer pending_wake.
+                            target = teammate_send_target_from_meta(
+                                entry.tool_result_meta
+                            )
+                            if target is not None:
+                                self._apply_teammate_wake_crosschecked(
+                                    session_info.session_id,
+                                    target,
+                                    entry.tool_input,
+                                    parse_iso_timestamp(entry.timestamp),
+                                )
+                    elif (
+                        entry.content_type == "tool_result"
+                        and entry.tool_name is None
+                        and entry.tool_result_meta is not None
+                        and entry.tool_use_id
+                    ):
+                        # GH #46 PR-2 item 1 (dual-review r1, Hermes P1): a
+                        # RESULT-BEFORE-USE pair (27/40 real session files) — the
+                        # parser consumed the tool_result with tool_name=None, so
+                        # NONE of the tool_name-gated arms above could fire and a
+                        # teammate spawn/wake would be silently dropped (the
+                        # registry never created / a parked teammate never
+                        # relit). Retain the teammate-shaped parsed signal keyed
+                        # by tool_use_id; the matching tool_use arm below applies
+                        # it (with the tool_use's input for the wake cross-check).
+                        self._stash_early_teammate_signal(
+                            session_info.session_id,
+                            entry.tool_use_id,
+                            entry.tool_result_meta,
+                            entry.timestamp,
+                        )
+                    elif (
+                        entry.content_type == "tool_use"
+                        and entry.tool_use_id
+                        and entry.tool_name in ("Agent", "Task", "SendMessage")
+                    ):
+                        # Item 1 retro-pairing: this tool_use's result was
+                        # observed FIRST (stashed above, possibly a prior batch).
+                        # Apply the retained spawn/wake now that the tool_name +
+                        # input are known.
+                        self._apply_early_teammate_signal(
+                            session_info.session_id, entry
+                        )
                     elif (
                         entry.role == "user"
                         and entry.content_type == "text"
@@ -1859,15 +3371,31 @@ class SessionMonitor:
             except OSError:
                 sidechain_files = []
 
+            # GH #46 PR-2 (dual-review r1 item 2): SET-BASED arbitration pre-pass
+            # — this tick's same-name teammate candidates are judged as a SET
+            # (bind exactly one, or NONE + sticky-ambiguous on >1 passing) BEFORE
+            # any per-file processing, so filesystem enumeration order never
+            # picks the "genuine" key. A successful bind relights via the RESUMED
+            # lane (r7 item 3, never ``launched``) + applies pending wake/park here.
+            self._arbitrate_teammate_bindings(parent_session_id, sidechain_files)
+
             for sc_file in sidechain_files:
                 # sc_file.stem looks like "agent-a05666f9d196136af"
                 tracking_key = f"sub:{parent_session_id}:{sc_file.stem}"
+                # Item 3: for a REGISTERED teammate name, ONLY the bound
+                # current_key ever feeds run-state — retired/occupied-newcomer
+                # candidates are quarantined + severed, unresolved/ambiguous ones
+                # are dark WITHOUT quarantine; all stay tailed for DISPLAY (the
+                # Fix-5 discipline). Non-teammate files keep legacy behavior.
+                feed_run_state = self._teammate_feed_run_state(
+                    parent_session_id, sc_file, tracking_key
+                )
                 await self._track_and_emit_sidechain_file(
                     parent_session_id=parent_session_id,
                     sc_file=sc_file,
                     tracking_key=tracking_key,
                     new_messages=new_messages,
-                    feed_run_state=True,
+                    feed_run_state=feed_run_state,
                 )
 
             # ISSUE-6 / Fix 5 PR-B (DISPLAY ONLY): a Workflow's sub-agents live
@@ -2100,6 +3628,15 @@ class SessionMonitor:
         # session-change cleanup, the deleted-window cleanup, and both startup
         # sweeps).
         self._open_workflow_brackets.pop(parent_session_id, None)
+        # GH #46 PR-2: the teammate registry (incl. retired_keys) + the severed
+        # stem set + the item-1 result-before-use stash die with the parent,
+        # mirroring the per-parent state above. NOT restart-reconciled
+        # (disclosed — a mid-leg teammate is not relit after kickstart, same
+        # class as background-Bash T1.4b).
+        self._teammate_registry.pop(parent_session_id, None)
+        self._severed_teammate_stems.pop(parent_session_id, None)
+        self._early_teammate_signals.pop(parent_session_id, None)
+        self._orphan_teammate_parks.pop(parent_session_id, None)
         prefix = f"sub:{parent_session_id}:"
         stale = [k for k in self.state.tracked_sessions if k.startswith(prefix)]
         for k in stale:

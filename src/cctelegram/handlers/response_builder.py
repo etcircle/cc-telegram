@@ -13,6 +13,7 @@ Key function:
   - build_response_parts: Build paginated response messages
 """
 
+import logging
 import re
 from dataclasses import dataclass
 
@@ -42,6 +43,8 @@ from ..utils import is_task_notification as is_task_notification
 from ..utils import is_teammate_message as is_teammate_message
 from ..utils import parse_iso_timestamp as parse_iso_timestamp
 from ..utils import teammate_envelope_payloads as teammate_envelope_payloads
+
+logger = logging.getLogger(__name__)
 
 
 # The async-launch background discriminator (GH #44 §3.2a). Anchored on the
@@ -328,6 +331,125 @@ def parse_teammate_idle_notifications(text: str) -> list[TeammateIdle]:
             )
         )
     return out
+
+
+# GH #46 PR-2: the teammate NAME feeds a glob (``glob.escape("agent-a<name>-")``)
+# and a regex (``re.escape(name)``) in the monitor's registry, so it must be a
+# safe identifier before it can be trusted from a structured field. CC agent-team
+# names are slugs (``explore-backend-workflows``); anything else is refused
+# fail-DARK (a `None` discriminator ⇒ no lift + a WARNING) rather than turned
+# into an unbounded / injection-prone pattern.
+# ``\A``/``\Z`` (never ``^``/``$``) so a trailing ``\n`` is rejected — ``$``
+# matches just before a final newline and would admit ``name\n`` into the glob.
+_TEAMMATE_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+# The four OTHER background-launch lanes' ownership fields (GH #44 / ISSUE-6 /
+# Fix C). A teammate discriminator returns None if ANY is PRESENT — a
+# key-PRESENCE check, never truthiness (dual-review r1 item 6b: an ownership
+# field present with an empty/None value is still another lane's shape claiming
+# the meta) — so the five lanes (Agent/Task ``agentId``, Workflow ``taskId``,
+# background-Bash ``backgroundTaskId``, resume ``resumedAgentId``, teammate)
+# never double-record one meta into two keys.
+_OTHER_OWNERSHIP_FIELDS = ("agentId", "taskId", "backgroundTaskId", "resumedAgentId")
+
+
+def _valid_teammate_name(name: object) -> str | None:
+    """Return ``name`` if it is a non-empty, glob/regex-safe teammate slug, else
+    None (a metacharacter / over-long name logs a WARNING at the callsite)."""
+    if not isinstance(name, str) or not _TEAMMATE_NAME_RE.match(name):
+        return None
+    return name
+
+
+@dataclass(frozen=True)
+class TeammateSpawnInfo:
+    """A parsed agent-teams teammate SPAWN (GH #46 PR-2).
+
+    ``name`` — the teammate's slug (e.g. ``explore-backend-workflows``); the
+    registry key and the ``agent-a<name>-<hex>`` sidechain-stem anchor.
+    ``teammate_id`` / ``agent_type`` — best-effort context (the ``name@team``
+    id and the agent kind); None when absent.
+    """
+
+    name: str
+    teammate_id: str | None
+    agent_type: str | None
+
+
+def teammate_spawn_info_from_meta(meta: object) -> TeammateSpawnInfo | None:
+    """Extract a teammate SPAWN from the STRUCTURED entry-level ``toolUseResult``
+    (GH #46 PR-2 — the registry-launch anchor; STRUCTURED-ONLY, no prose lift).
+
+    A ``teammate_spawned`` Agent-tool result carries (verified real JSONL, Claude
+    Code 2.1.197): ``{status:"teammate_spawned", name:"<slug>", teammate_id:
+    "<name>@<team>", agent_id:"<name>@<team>", agent_type:"<kind>", model, color,
+    team_name, tmux_*, prompt, ...}``. Note the id is ``agent_id`` (snake) — there
+    is NO camelCase ``agentId``, so this is DISJOINT from the plain-Agent
+    async-launch lane (``agentId`` + ``status=="async_launched"``).
+
+    Keys on ``status == "teammate_spawned"`` AND a valid (glob/regex-safe)
+    non-empty ``name``. Returns None when ``meta`` is not a dict, the status
+    differs, the name is absent/empty/metacharacter-laden (⇒ WARNING — the name
+    feeds a glob + regex), OR any OTHER lane's ownership field is present
+    (five-way disjointness — a defensive guard; the real spawn shape carries none
+    of them). Structured-ONLY: a prose ``Spawned successfully.`` line without this
+    meta fires a rate-limited drift WARNING at the monitor callsite, never a lift.
+    """
+    if not isinstance(meta, dict):
+        return None
+    if meta.get("status") != "teammate_spawned":
+        return None
+    if any(f in meta for f in _OTHER_OWNERSHIP_FIELDS):
+        return None
+    raw_name = meta.get("name")
+    name = _valid_teammate_name(raw_name)
+    if name is None:
+        if raw_name:
+            logger.warning(
+                "teammate spawn: invalid name %r (not a glob/regex-safe slug) — "
+                "refusing the lift",
+                raw_name,
+            )
+        return None
+    tid = meta.get("teammate_id")
+    atype = meta.get("agent_type")
+    return TeammateSpawnInfo(
+        name=name,
+        teammate_id=tid if isinstance(tid, str) and tid else None,
+        agent_type=atype if isinstance(atype, str) and atype else None,
+    )
+
+
+def teammate_send_target_from_meta(meta: object) -> str | None:
+    """Extract the WAKE target teammate name from a ``SendMessage`` tool_result's
+    STRUCTURED entry-level ``toolUseResult`` (GH #46 PR-2 — the wake anchor).
+
+    A ``SendMessage`` to a teammate carries (verified real JSONL, Claude Code
+    2.1.197): ``{success:true, message:"Message sent to <name>'s inbox", msg_id,
+    routing:{sender, target:"@<name>", ...}}``. Returns the bare ``<name>`` (the
+    leading ``@`` stripped, name-validated) or None.
+
+    DISJOINT from the Fix C resume lane: a resume tool_result carries
+    ``resumedAgentId`` and NO ``routing`` (verified 0-overlap). Returns None when
+    ``resumedAgentId`` (or any other lane's ownership field) is present so the
+    resume lane keeps ownership; when ``success`` is not True; when ``routing``
+    is not a dict; when ``target`` is not an ``@``-prefixed non-empty str; or when
+    the stripped name is not a glob/regex-safe slug. The caller ADDITIONALLY
+    cross-checks the paired tool_use ``input["to"] == <name>`` (the wake refuses
+    on mismatch — Hermes plan-review r2 P2-2)."""
+    if not isinstance(meta, dict):
+        return None
+    if meta.get("success") is not True:
+        return None
+    if any(f in meta for f in _OTHER_OWNERSHIP_FIELDS):
+        return None
+    routing = meta.get("routing")
+    if not isinstance(routing, dict):
+        return None
+    target = routing.get("target")
+    if not isinstance(target, str) or not target.startswith("@"):
+        return None
+    return _valid_teammate_name(target[1:])
 
 
 def _render_task_notification(text: str) -> str | None:
