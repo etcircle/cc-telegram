@@ -124,7 +124,7 @@
 | **BotCommand + set_my_commands** | ✅ | 11 commands registered in the bot menu: 7 cc-telegram controls plus 4 Claude Code forwards |
 | **sendDocument** | ✅ | Screenshots sent as PNG documents |
 | **ReplyKeyboardRemove** | ✅ | Used when switching away from reply keyboard |
-| **Claude Code command forwarding** | ✅ | `/clear`, `/compact`, `/cost`, and `/model` are registered in the bot menu and forwarded to tmux |
+| **Claude Code command forwarding** | ✅ | `/clear`, `/compact`, and `/model` are registered in the bot menu and forwarded to tmux; `/cost`/`/usage` are intercepted bot-side |
 | **Message rate limiting** | ✅ | 1.1s minimum interval per user to avoid flood control |
 | **Per-user message queues** | ✅ | FIFO ordering, content/status task separation, message merging |
 | **Status message deduplication** | ✅ | Skip edit if status text unchanged |

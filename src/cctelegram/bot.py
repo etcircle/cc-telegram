@@ -1208,7 +1208,8 @@ def _artifact_root_kind(art: artifacts.Artifact, cwd: str) -> str:
         for r in config.artifact_roots:
             try:
                 extra_res.add(str(Path(r).expanduser().resolve()))
-            except OSError:
+            except (OSError, RuntimeError):
+                # RuntimeError: Path.resolve() on a symlink loop (codex r2 P3).
                 continue
         for root in art.allowed_roots:
             if not resolved.is_relative_to(root):
@@ -1218,7 +1219,9 @@ def _artifact_root_kind(art: artifacts.Artifact, cwd: str) -> str:
             if root in extra_res:
                 return "extra"
             return "main-root"
-    except OSError:
+    except (OSError, RuntimeError):
+        # RuntimeError: a symlink-loop root must degrade the LABEL to
+        # "unknown", never abort the card enqueue (codex r2 P3).
         pass
     return "unknown"
 
