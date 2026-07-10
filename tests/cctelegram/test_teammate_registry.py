@@ -36,6 +36,7 @@ from cctelegram.handlers.response_builder import (
     teammate_spawn_info_from_meta,
 )
 from cctelegram.session_monitor import (
+    TEAMMATE_RETRACT_RESUME_EPSILON_S,
     ParentSidechainActivity,
     SessionInfo,
     SessionMonitor,
@@ -497,7 +498,10 @@ async def test_spawn_bind_wake_park_happy_path(
     _write_sidechain(sub_dir, key, _iso(time.time() + 0.1))
     await monitor.check_sidechain_updates({PARENT})
     activity = monitor.pop_sidechain_activity()
-    assert activity[PARENT].launched == {key}
+    assert activity[PARENT].launched == set()
+    assert activity[PARENT].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
     assert monitor._teammate_registry[PARENT][_NAME].current_key == key
 
     # 3. Wake relights the bound key (resumed).
@@ -643,7 +647,11 @@ async def test_first_seen_eof_binds_and_launches_with_zero_parsed_entries(
     _write_sidechain(sub_dir, key, _iso(time.time() + 0.1))
     await monitor.check_sidechain_updates({PARENT})  # first-seen EOF
     act = monitor.pop_sidechain_activity()
-    assert act[PARENT].launched == {key}
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert act[PARENT].launched == set()
+    assert act[PARENT].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
     assert act[PARENT].ticks == {}  # zero run-state ticks at discovery
 
     # Second tick: already bound → no re-launch, and its own entries feed
@@ -736,7 +744,7 @@ async def test_pending_wake_applied_at_binding(
     _write_sidechain(sub_dir, key, _iso(time.time() + 0.1))
     await monitor.check_sidechain_updates({PARENT})
     act = monitor.pop_sidechain_activity()
-    assert act[PARENT].launched == {key}
+    assert act[PARENT].launched == set()
     assert key in act[PARENT].resumed  # pending wake applied at bind
 
 
@@ -757,7 +765,11 @@ async def test_park_before_bind_same_tick_tombstones(
     _write_sidechain(sub_dir, key, _iso(time.time() + 0.1))
     await monitor.check_sidechain_updates({PARENT})
     act = monitor.pop_sidechain_activity()
-    assert act[PARENT].launched == {key}
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert act[PARENT].launched == set()
+    assert act[PARENT].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
     assert key in act[PARENT].teammate_parks  # parked at bind → tombstoned
 
 
@@ -810,9 +822,14 @@ async def test_respawn_rotation_relights_only_the_new_key(
     _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
     await monitor.check_for_updates({PARENT})
     monitor.pop_sidechain_activity()
+    rec1 = monitor._teammate_registry[PARENT][_NAME]
     _write_sidechain(sub_dir, key1, _iso(time.time() + 0.1))
     await monitor.check_sidechain_updates({PARENT})
-    assert monitor.pop_sidechain_activity()[PARENT].launched == {key1}
+    act1 = monitor.pop_sidechain_activity()
+    assert act1[PARENT].launched == set()
+    assert act1[PARENT].resumed == {
+        key1: rec1.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
     assert monitor._teammate_registry[PARENT][_NAME].current_key == key1
 
     # Respawn same name → rotation: gen-1 key tombstoned + severed, gen bumps.
@@ -829,7 +846,11 @@ async def test_respawn_rotation_relights_only_the_new_key(
     key2 = _key_for(_NAME, "cccc3333dddd4444")
     _write_sidechain(sub_dir, key2, _iso(respawn_ts + 1))
     await monitor.check_sidechain_updates({PARENT})
-    assert monitor.pop_sidechain_activity()[PARENT].launched == {key2}
+    act_bind2 = monitor.pop_sidechain_activity()
+    assert act_bind2[PARENT].launched == set()
+    assert act_bind2[PARENT].resumed == {
+        key2: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
 
     # A wake after respawn relights ONLY the new key.
     _append_wake(
@@ -891,12 +912,17 @@ async def test_respawn_new_gen_file_already_on_disk_at_rotation_still_binds(
     )
     await monitor.check_for_updates({PARENT})
     monitor.pop_sidechain_activity()
+    rec1 = monitor._teammate_registry[PARENT][_NAME]
     sc1 = _write_sidechain(sub_dir, key1, _iso(base + 0.1))
     import os
 
     os.utime(sc1, (base + 0.1, base + 0.1))
     await monitor.check_sidechain_updates({PARENT})
-    assert monitor.pop_sidechain_activity()[PARENT].launched == {key1}
+    act_bind1 = monitor.pop_sidechain_activity()
+    assert act_bind1[PARENT].launched == set()
+    assert act_bind1[PARENT].resumed == {
+        key1: rec1.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
 
     # The RESPAWN + the new-gen file BOTH land on disk BEFORE the monitor observes
     # the respawn tool_result (the realistic lag). The new file's first entry is at
@@ -921,7 +947,10 @@ async def test_respawn_new_gen_file_already_on_disk_at_rotation_still_binds(
     # The new-gen file binds on the next sidechain sweep.
     await monitor.check_sidechain_updates({PARENT})
     act = monitor.pop_sidechain_activity()
-    assert act[PARENT].launched == {key2}
+    assert act[PARENT].launched == set()
+    assert act[PARENT].resumed == {
+        key2: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
     assert monitor._teammate_registry[PARENT][_NAME].current_key == key2
 
 
@@ -962,7 +991,10 @@ async def test_respawn_quarantines_untracked_disk_stem_before_first_bind(
     _write_sidechain(sub_dir, new_key, _iso(respawn_ts + 1))
     await monitor.check_sidechain_updates({PARENT})
     act = monitor.pop_sidechain_activity()
-    assert act[PARENT].launched == {new_key}
+    assert act[PARENT].launched == set()
+    assert act[PARENT].resumed == {
+        new_key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
     assert monitor._teammate_registry[PARENT][_NAME].current_key == new_key
 
 
@@ -1009,7 +1041,11 @@ async def test_gen2_binds_when_spawn_event_ts_precedes_monitor_parse(
     os.utime(sc, (respawn_event + 0.1, respawn_event + 0.1))
     await monitor.check_sidechain_updates({PARENT})
     act = monitor.pop_sidechain_activity()
-    assert act[PARENT].launched == {key}  # NOT dark — binds despite the poll lag
+    # NOT dark — binds despite the poll lag (via the resumed relight lane).
+    assert act[PARENT].launched == set()
+    assert act[PARENT].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
     assert monitor._teammate_registry[PARENT][_NAME].current_key == key
 
 
@@ -1077,7 +1113,11 @@ async def test_unreadable_first_line_no_bind_this_tick_binds_on_retry(
         )
     await monitor.check_sidechain_updates({PARENT})
     act2 = monitor.pop_sidechain_activity()
-    assert act2[PARENT].launched == {key}
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    assert act2[PARENT].launched == set()
+    assert act2[PARENT].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
 
 
 @pytest.mark.asyncio
@@ -1174,7 +1214,10 @@ async def test_public_discovery_two_candidates_binds_none_sticky(
     os.utime(sc3, (respawn_at + 0.05, respawn_at + 0.05))
     await monitor.check_sidechain_updates({PARENT})
     act3 = monitor.pop_sidechain_activity()
-    assert act3[PARENT].launched == {k3}
+    assert act3[PARENT].launched == set()
+    assert act3[PARENT].resumed == {
+        k3: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
     assert monitor._teammate_registry[PARENT][_NAME].current_key == k3
 
 
@@ -1294,9 +1337,14 @@ async def test_sequential_ambiguity_strand_pin(
     await monitor.check_for_updates({PARENT})
     monitor.pop_sidechain_activity()
     # gen-1 file binds ALONE.
+    rec = monitor._teammate_registry[PARENT][_NAME]
     _write_sidechain(sub_dir, key1, _iso(time.time() + 0.1))
     await monitor.check_sidechain_updates({PARENT})
-    assert monitor.pop_sidechain_activity()[PARENT].launched == {key1}
+    act_bind = monitor.pop_sidechain_activity()
+    assert act_bind[PARENT].launched == set()
+    assert act_bind[PARENT].resumed == {
+        key1: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
 
     # A SECOND same-name file appears later (a sibling / double --resume) — it is
     # quarantined on sight, NEVER records a live key.
@@ -1506,7 +1554,10 @@ async def test_prior_generation_park_dropped_from_pending_slot(
     os.utime(sc2, (t2 + 0.05, t2 + 0.05))
     await monitor.check_sidechain_updates({PARENT})
     act = monitor.pop_sidechain_activity()
-    assert act[PARENT].launched == {key2}
+    assert act[PARENT].launched == set()
+    assert act[PARENT].resumed == {
+        key2: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
     assert key2 not in act[PARENT].teammate_parks  # stays live
 
     # The GENUINE park T3 (> T2) closes it.
@@ -1653,7 +1704,11 @@ async def test_result_before_use_spawn_registers(
 
     os.utime(sc, (base + 0.05, base + 0.05))
     await monitor.check_sidechain_updates({PARENT})
-    assert monitor.pop_sidechain_activity()[PARENT].launched == {key}
+    act = monitor.pop_sidechain_activity()
+    assert act[PARENT].launched == set()
+    assert act[PARENT].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
 
 
 @pytest.mark.asyncio
@@ -1823,7 +1878,12 @@ async def test_gen2_tolerance_boundary_inside_binds(
 
     os.utime(sc, (t2 + 0.01, t2 + 0.01))
     await monitor.check_sidechain_updates({PARENT})
-    assert monitor.pop_sidechain_activity()[PARENT].launched == {key}
+    rec = monitor._teammate_registry[PARENT][_NAME]
+    act = monitor.pop_sidechain_activity()
+    assert act[PARENT].launched == set()
+    assert act[PARENT].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
 
 
 @pytest.mark.asyncio
@@ -1933,7 +1993,6 @@ async def test_registration_retracts_preexisting_unresolved_key(
     assert key in act[PARENT].retraction_dones
     assert key not in act[PARENT].teammate_parks
     rec = monitor._teammate_registry[PARENT][_NAME]
-    assert key in rec.done_retracted_keys
     assert key not in rec.retired_keys  # NOT retired — stays bind-eligible
     assert f"sub:{PARENT}:agent-{key}" not in monitor._severed_teammate_stems.get(
         PARENT, set()
@@ -1983,7 +2042,6 @@ async def test_registration_retracts_both_keys_on_ambiguity(
     assert {k1, k2} <= act[PARENT].retraction_dones  # the distinct slot (r3 P1)
     assert k1 not in act[PARENT].teammate_parks
     assert k2 not in act[PARENT].teammate_parks
-    assert rec.done_retracted_keys == {k1, k2}
     assert k1 not in rec.retired_keys and k2 not in rec.retired_keys
 
 
@@ -2009,7 +2067,6 @@ async def test_retracted_candidate_bind_relights_via_resumed_lane(
     await monitor.check_for_updates({PARENT})
     act = monitor.pop_sidechain_activity()
     rec = monitor._teammate_registry[PARENT][_NAME]
-    assert key in rec.done_retracted_keys  # unresolved at registration → retracted
     assert key in act[PARENT].retraction_dones  # the distinct slot (r3 P1)
 
     # The first line completes (valid, within the gen-1 skew) → the next sweep
@@ -2036,7 +2093,6 @@ async def test_retracted_candidate_bind_relights_via_resumed_lane(
         key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
     }  # the popping lane, strictly below the spawn instant
     assert monitor._teammate_registry[PARENT][_NAME].current_key == key
-    assert key not in rec.done_retracted_keys  # consumed at bind
 
     # Park/close still works after the relight (park strictly newer than the
     # resume ts) — the monitor emits it; the runtime strict-newer gate closes.

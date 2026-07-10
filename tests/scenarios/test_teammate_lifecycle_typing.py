@@ -29,6 +29,7 @@ import pytest
 from cctelegram import bot as bot_module
 from cctelegram import route_runtime, transcript_event_adapter
 from cctelegram.session_monitor import (
+    TEAMMATE_RETRACT_RESUME_EPSILON_S,
     ParentSidechainActivity,
     SidechainTick,
     TranscriptEvent,
@@ -769,7 +770,6 @@ async def test_park_absorbed_by_tracked_indeterminate_stem_still_closes_bind(
     await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
     rec = mon._teammate_registry[_SID][name]
     assert rec.current_key is None
-    assert key in rec.done_retracted_keys  # retracted at registration
     assert rec.pending_park is not None  # rule 1: the named copy survived
 
     # The first line completes → the stem binds via the resumed relight AND the
@@ -971,3 +971,286 @@ async def test_orphan_wake_after_park_keeps_bind_live(
     await mon.check_for_updates({_SID})
     await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
     assert route_runtime.snapshot(route).typing_eligible is False
+
+
+@pytest.mark.asyncio
+async def test_item1_pregeneration_wake_cannot_revive_parked_newer_generation(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r7 item 1 (Hermes P1, probe-reproduced, cross-batch retro-pair): a
+    RESULT-BEFORE-USE wake stashed with a gen-1-era ts T_w is retro-paired onto
+    the BOUND gen-2 key AFTER gen-2 parked. Pre-fix the registered-rec wake path
+    sent T_w straight to ``resumed[current_key]`` (no generation filter), the
+    runtime resume pop revived the parked gen-2 key → false typing until the next
+    park / the 2h TTL. The r7 fix applies ``_generation_filter_wake`` at the START
+    of the registered path: T_w < gen-2 ``spawned_ts`` → REFUSED → the parked key
+    stays dark."""
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    k1 = f"a{name}-11111111aaaaaaaa"  # gen-1 key
+    k2 = _KEY  # gen-2 key
+    base = time.time() - 90
+    t_s1, t_s2 = base, base + 30  # gen-1 / gen-2 spawn instants
+    t_w = base + 5  # the wake ts: gen-1-era, STRICTLY BELOW t_s2
+
+    # gen-1 spawn (in-order) + gen-1 sidechain binds k1 → typing ON.
+    _append(_spawn_pair(name, _iso_utc(t_s1), tool_id="g1"))
+    await mon.check_for_updates({_SID})
+    _write_teammate_sidechain(sub_dir, k1, t_s1 + 0.05, t_s1 + 0.05)
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert mon._teammate_registry[_SID][name].current_key == k1
+    assert route_runtime.snapshot(route).typing_eligible is True
+
+    # gen-2 respawn (rotation) at t_s2 → gen-2; gen-2 sidechain binds k2 → ON.
+    _append(_spawn_pair(name, _iso_utc(t_s2), tool_id="g2"))
+    await mon.check_for_updates({_SID})
+    _write_teammate_sidechain(sub_dir, k2, t_s2 + 0.05, t_s2 + 0.05)
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    rec = mon._teammate_registry[_SID][name]
+    assert rec.spawn_generation == 2 and rec.current_key == k2
+    assert route_runtime.snapshot(route).typing_eligible is True
+
+    # gen-2 park (>= t_s2) → k2 tombstoned → typing OFF.
+    _append([_park_entry(name, _iso_utc(t_s2 + 20), _iso_utc(t_s2 + 20))])
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert route_runtime.snapshot(route).typing_eligible is False
+    assert route_runtime.snapshot(route).background_agents == ()
+
+    # A STALE gen-1-era wake T_w delivered late via retro-pairing (the wake
+    # tool_result flushes BEFORE its SendMessage tool_use, so it is stashed at
+    # T_w, then applied to the BOUND gen-2 rec when the tool_use arrives).
+    wake_result = {
+        "type": "user",
+        "message": {
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tu_late_wake", "content": "ok"}
+            ]
+        },
+        "sessionId": _SID,
+        "timestamp": _iso_utc(t_w),
+        "toolUseResult": {
+            "success": True,
+            "routing": {"sender": "team-lead", "target": f"@{name}"},
+        },
+    }
+    wake_use = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tu_late_wake",
+                    "name": "SendMessage",
+                    "input": {"to": name},
+                }
+            ]
+        },
+        "sessionId": _SID,
+        "timestamp": _iso_utc(t_s2 + 25),  # delivered NOW (well after gen-2)
+    }
+    _append([wake_result])  # result first → stashed at T_w
+    _append([wake_use])  # the late use → retro-pairs the wake onto k2
+    await mon.check_for_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    # The pre-generation wake is REFUSED — no resume for the parked key.
+    assert k2 not in act.get(_SID, ParentSidechainActivity()).resumed
+    await bot_module.apply_sidechain_activity(act)
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False  # the parked gen-2 key was NOT revived
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_item2_bound_old_generation_does_not_consume_new_generation_park(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r7 item 2 (Codex P1, probe-reproduced): gen-1 bound → a gen-2 spawn RESULT
+    stashed (result-before-use) → the gen-2 park T4 arrives while the rec is STILL
+    gen-1 (T4 >= gen-1 spawned_ts, so not dropped) → pre-fix it applied ONLY to
+    gen-1's current_key immediately and was GONE → the late gen-2 tool_use rotates
+    with pending_park=None → gen-2 binds LIVE → 2h strand. The r7 fix (universal
+    park dual-write) retains a NAMED copy of EVERY park; the rotation's drain
+    generation-filters T4 (>= gen-2 spawned_ts) into pending_park → the gen-2 bind
+    closes with T4."""
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    k1 = f"a{name}-11111111aaaaaaaa"  # gen-1 key
+    k2 = _KEY  # gen-2 key
+    base = time.time() - 90
+    t1, t3, t4 = base, base + 30, base + 35  # gen-1 spawn, gen-2 spawn, gen-2 park
+
+    # gen-1 spawn (in-order) + gen-1 sidechain binds k1 → typing ON.
+    _append(_spawn_pair(name, _iso_utc(t1), tool_id="g1"))
+    await mon.check_for_updates({_SID})
+    _write_teammate_sidechain(sub_dir, k1, t1 + 0.05, t1 + 0.05)
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert mon._teammate_registry[_SID][name].current_key == k1
+    assert route_runtime.snapshot(route).typing_eligible is True
+
+    # ONE batch: gen-2 spawn RESULT (stashed) → gen-2 park T4 (rec still gen-1) →
+    # the late gen-2 Agent tool_use (registers/rotates → drains the retained T4).
+    g2 = _spawn_pair_result_first(name, _iso_utc(t3), tool_id="g2")
+    _append([g2[0]])
+    _append([_park_entry(name, _iso_utc(t4), _iso_utc(t4))])
+    _append([g2[1]])
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    rec = mon._teammate_registry[_SID][name]
+    assert rec.spawn_generation == 2 and rec.current_key is None
+    # The retained copy of T4 drained into gen-2's pending_park (NOT lost to the
+    # gen-1 immediate close).
+    assert rec.pending_park is not None
+    assert rec.pending_park.ts is not None and rec.pending_park.ts >= t3
+
+    # The genuine gen-2 sidechain binds → the carried T4 closes it (NOT stranded).
+    _write_teammate_sidechain(sub_dir, k2, t3 + 0.05, t3 + 0.05)
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert mon._teammate_registry[_SID][name].current_key == k2
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False  # closed by T4, not the 2h strand
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_item3_rotation_cleared_provenance_bind_stays_live(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r7 item 3 probe (i) (Codex P2, probe-reproduced): a stem retracted during
+    late gen-1 registration (tombstoned in the runtime) that becomes gate-positive
+    and BINDS during the gen-2 rotation. Pre-fix the rotation CLEARED the r6
+    ``done_retracted_keys`` provenance set, so the bind emitted ``launched`` which
+    no-ops against the still-live runtime tombstone → the positively-bound key ran
+    DARK. The r7 fix (always-resumed bind) pops the tombstone on every bind → the
+    bound key is LIVE."""
+    import json as _json
+    import os
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY
+    base = time.time() - 90
+    t_s1, t_s2 = base, base + 30  # gen-1 / gen-2 spawn instants
+    first_ts = t_s2 + 0.05  # the stem's genuine gen-2-era first-entry ts
+
+    # A same-name stem, tracked but INDETERMINATE (mid-write, no newline) so gen-1
+    # registration RETRACTS it (unbound) rather than binding it.
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text('{"type":"assistant","timestamp":"' + _iso_utc(first_ts))  # no \n
+    os.utime(sc, (first_ts, first_ts))
+    await mon.check_sidechain_updates({_SID})  # register at EOF (indeterminate)
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+
+    # gen-1 spawn → registration retracts the unbound indeterminate stem →
+    # the runtime tombstones the key.
+    _append(_spawn_pair(name, _iso_utc(t_s1), tool_id="g1"))
+    await mon.check_for_updates({_SID})
+    act1 = mon.pop_sidechain_activity()
+    assert key in act1[_SID].retraction_dones  # retracted at gen-1 registration
+    await bot_module.apply_sidechain_activity(act1)  # key now tombstoned
+    assert mon._teammate_registry[_SID][name].current_key is None
+    assert route_runtime.snapshot(route).background_agents == ()  # dark (tombstoned)
+
+    # The stem's first line COMPLETES (a genuine gen-2-era file, first entry >=
+    # t_s2 - the gen>=2 tolerance).
+    with open(sc, "w") as f:
+        f.write(
+            _json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": []},
+                    "timestamp": _iso_utc(first_ts),
+                }
+            )
+            + "\n"
+        )
+    os.utime(sc, (first_ts, first_ts))
+
+    # gen-2 respawn (rotation clears the r6 provenance set) → the pre-spawn scan
+    # binds the now-complete stem BEFORE the gen-2 retraction runs (so it is NOT
+    # re-retracted). The bind must relight through the RESUMED lane (pop the
+    # gen-1 tombstone), never the tombstone-blocked launched.
+    _append(_spawn_pair(name, _iso_utc(t_s2), tool_id="g2"))
+    await mon.check_for_updates({_SID})
+    act2 = mon.pop_sidechain_activity()
+    rec = mon._teammate_registry[_SID][name]
+    assert rec.spawn_generation == 2 and rec.current_key == key
+    assert act2[_SID].launched == set()  # NOT the tombstone-blocked lane
+    assert act2[_SID].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
+    await bot_module.apply_sidechain_activity(act2)
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True  # the tombstone was popped → LIVE
+    assert snap.background_agents == (key,)
+
+
+@pytest.mark.asyncio
+async def test_item3_dual_write_tombstoned_never_retracted_bind_stays_live(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r7 item 3 probe (ii) (Codex P2, probe-reproduced): a STALE no-registry park
+    tombstones an already-tracked eventual key via the dual-write fallback's
+    immediate all-stems close (the key was NEVER retracted, so it never entered
+    the r6 ``done_retracted_keys`` set); the retained copy is generation-DROPPED at
+    the drain, so pending_park is empty. Pre-fix the bind emitted ``launched``
+    which no-ops against the stale-park tombstone → DARK. The r7 fix (always-
+    resumed bind) pops the tombstone → LIVE, and the generation-dropped park never
+    re-closes it."""
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY
+    base = time.time() - 90
+    t_stale, t_s = base, base + 30  # stale park (prior leg), then the spawn
+    first_ts = t_s + 0.05  # the tracked stem is a genuine gen-1 (t_s)-era file
+
+    # A genuine same-name stem, tracked (complete) before the spawn. Its first
+    # entry is t_s-era, so the spawn's pre-spawn scan binds it.
+    _write_teammate_sidechain(sub_dir, key, first_ts, first_ts)
+    await mon.check_sidechain_updates({_SID})  # track (legacy, no registry yet)
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+
+    # A STALE park (park_ts < the eventual spawned_ts) arrives with NO registry
+    # rec → the no-registry fallback closes ALL matched tracked stems immediately
+    # → the tracked key is TOMBSTONED (never retracted). Its retained copy will be
+    # generation-dropped at the drain.
+    _append([_park_entry(name, _iso_utc(t_stale), _iso_utc(t_stale))])
+    await mon.check_for_updates({_SID})
+    park_act = mon.pop_sidechain_activity()
+    assert key in park_act[_SID].teammate_parks  # immediate all-stems close
+    await bot_module.apply_sidechain_activity(park_act)  # key tombstoned
+    assert route_runtime.snapshot(route).background_agents == ()  # dark
+
+    # The spawn registers (t_s > t_stale) → drains the retained STALE park
+    # (generation-dropped, < spawned_ts) → pending_park empty → the pre-spawn
+    # scan binds the tracked key via the RESUMED lane (pops the tombstone).
+    _append(_spawn_pair(name, _iso_utc(t_s), tool_id="g1"))
+    await mon.check_for_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    rec = mon._teammate_registry[_SID][name]
+    assert rec.current_key == key
+    assert rec.pending_park is None  # the stale park was generation-dropped
+    assert act[_SID].launched == set()
+    assert act[_SID].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
+    assert key not in act[_SID].teammate_parks  # no re-close
+    await bot_module.apply_sidechain_activity(act)
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True  # tombstone popped → LIVE (not dark)
+    assert snap.background_agents == (key,)

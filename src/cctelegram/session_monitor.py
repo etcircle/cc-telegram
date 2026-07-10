@@ -382,17 +382,34 @@ class _TeammateRec:
     run-state (item 3) and are NOT arbitrarily quarantined. It clears ONLY at
     the next rotation (a fresh spawn is new evidence).
 
-    ``done_retracted_keys`` (dual-review r2 P1, BOTH engines) — candidates whose
-    POTENTIALLY PRE-EXISTING runtime key was retracted with an unconditional
-    teammate-done at FIRST registration (an already-tracked matching sidechain
-    can feed run-state as a LEGACY agent before the spawn tool_result is parsed;
-    if arbitration then leaves it unresolved/ambiguous, that already-recorded
-    key would stay live until TTL — the 2h strand re-entry). The retraction
-    tombstones the runtime key WITHOUT retiring/severing the candidate, so it
-    stays bind-eligible; because a runtime tombstone no-ops a LATER ``launched``
-    (done-before-launch fail-closes), a retracted candidate that later BINDS
-    must relight through the RESUMED lane (the Fix-C tombstone-popping path —
-    binding IS positive per-key proof of new work). Reset at rotation.
+    RETRACTION + ALWAYS-RESUMED BIND (r2 P1 + r7 item 3, both engines) —
+    registration emits an unconditional teammate-done (via the per-tick
+    ``ParentSidechainActivity.retraction_dones`` slot) for every already-tracked
+    matching candidate arbitration left UNBOUND: an already-tracked matching
+    sidechain can feed run-state as a LEGACY agent before the spawn tool_result
+    is parsed, and if arbitration then leaves it unresolved/ambiguous, that
+    already-recorded key would stay live until TTL (the 2h strand re-entry). The
+    retraction tombstones the runtime key WITHOUT retiring/severing the
+    candidate, so it stays bind-eligible. A runtime tombstone no-ops a LATER
+    ``launched`` (done-before-launch fail-closes), so EVERY teammate bind
+    (``_bind_teammate_key``) relights through the tombstone-POPPING RESUMED lane
+    — never ``launched`` — for ALL binds, retracted or not. The decisive
+    argument (r7 item 3, Codex P2): the monitor CANNOT observe route_runtime's
+    tombstone state (it is in-memory in a DIFFERENT module, pull-only), so ANY
+    bind-emission gated on monitor-side provenance is structurally unsound (the
+    r6 ``done_retracted_keys`` provenance set was cleared at rotation and could
+    be bypassed by the dual-write lane, leaving a positively-bound key
+    tombstone-blocked → dark). The ONLY uniformly-safe emission is the
+    tombstone-popping lane: ``resumed[key] = spawned_ts -
+    TEAMMATE_RETRACT_RESUME_EPSILON_S``. ``resumed`` == ``launched`` semantics on
+    a fresh key (``is_background=True``, 2h TTL, projected RUNNING) plus a
+    tombstone-pop + a ``resumed_event_ts`` stamp; the r3 epsilon walk already
+    proved every generation-surviving park (``≥ spawned_ts``) is strictly newer
+    than ``spawned_ts - ε`` and closes correctly. The r6 provenance set
+    (``done_retracted_keys``) is DELETED (its membership gate, rotation clear,
+    and rec-side same-tick cancel bookkeeping with it); the retraction emission
+    and the ``retraction_dones`` slot STAY, and the same-tick cancel at bind
+    stays (it discards from the per-tick ``activity`` record, not the rec).
 
     route_runtime gains ZERO new mutators — the registry drives the EXISTING
     launched / resumed / done marks through the bot fan-out.
@@ -408,7 +425,6 @@ class _TeammateRec:
     pending_wake: float | None = None
     pending_park: _PendingPark | None = None
     ambiguous: bool = False
-    done_retracted_keys: set[str] = field(default_factory=set)
 
 
 def _record_resume_ts(
@@ -920,7 +936,6 @@ class SessionMonitor:
         old_current = rec.current_key
         rec.current_key = None
         rec.ambiguous = False
-        rec.done_retracted_keys.clear()
         rec.spawn_generation += 1
         rec.spawned_ts = spawned_ts
         # r6 rule 2 (Codex P1b, probe-reproduced): rotation RE-FILTERS the
@@ -1066,11 +1081,14 @@ class SessionMonitor:
         sticky-ambiguous) at registration/rotation time — its potentially
         pre-existing (pre-registration legacy) runtime key must not survive to
         TTL. Deliberately NOT retired/severed (item 2 — the candidate stays
-        eligible for retry and eventual binding); the key is recorded in
-        ``done_retracted_keys`` so a later bind knows to relight through the
-        tombstone-popping RESUMED lane instead of the tombstone-blocked
-        ``launched`` (an extra tombstone on a key that never existed is a
-        runtime no-op — we never peek route_runtime liveness).
+        eligible for retry and eventual binding); an extra tombstone on a key
+        that never existed is a runtime no-op (we never peek route_runtime
+        liveness). Because EVERY teammate bind now relights through the
+        tombstone-popping RESUMED lane (r7 item 3), a later bind of a retracted
+        candidate recovers it WITHOUT needing a monitor-side provenance record —
+        the r6 ``done_retracted_keys`` set is DELETED; the retraction is
+        idempotent through the ``retraction_dones`` set (re-adding the same key
+        is a no-op), so no per-generation dedup guard is needed.
 
         r3 P1 (BOTH engines): the retraction rides the DISTINCT
         ``retraction_dones`` slot, NEVER the genuine-park lane — a synthetic
@@ -1082,9 +1100,6 @@ class SessionMonitor:
         for _tk, key in self._tracked_teammate_stems(parent_session_id, rec.name):
             if key == rec.current_key or key in rec.retired_keys:
                 continue  # bound = legitimately live; retired = already done'd
-            if key in rec.done_retracted_keys:
-                continue  # already retracted this generation
-            rec.done_retracted_keys.add(key)
             self._parent_activity(parent_session_id).retraction_dones.add(key)
             logger.info(
                 "teammate registration: retracting potentially pre-existing "
@@ -1213,25 +1228,48 @@ class SessionMonitor:
         (r6 rule 3, Codex P2 — the callers already ran the ``input["to"]``
         cross-check, so the retained wake is post-cross-check evidence; dropping
         it made a drained park tombstone a teammate whose LATER wake proved it
-        resumed — false-dark AND a broken transcript-true arbitration)."""
+        resumed — false-dark AND a broken transcript-true arbitration).
+
+        GENERATION FILTER (r7 item 1, Hermes P1, probe-reproduced): the
+        registered-rec path must apply the SAME ``_generation_filter_wake`` the
+        orphan drain (:meth:`_drain_orphan_teammate_park`) and the rotation
+        re-filter use — generation membership is timestamp-attributed, never
+        decided by which rec object holds the signal. Without it, a
+        result-before-use wake stashed at T1 < the new generation's
+        ``spawned_ts`` retro-paired onto the bound gen-2 key and popped its park
+        tombstone (a false relight until the next park / the 2h TTL); an
+        UNPARSEABLE (``None``) registered wake similarly reached ``resumed`` as
+        ``None`` despite the filter's documented parseable-only contract. A
+        ``None`` or pre-generation wake is REFUSED (INFO) BEFORE any of
+        ``last_wake_ts`` / ``resumed`` / ``pending_wake`` is touched."""
         recs = self._teammate_registry.get(parent_session_id)
         rec = recs.get(name) if recs else None
         if rec is None:
             if event_ts is not None:
                 self._retain_orphan_teammate_wake(parent_session_id, name, event_ts)
             return
-        rec.last_wake_ts = event_ts
+        filtered = _generation_filter_wake(event_ts, rec.spawned_ts)
+        if filtered is None:
+            logger.info(
+                "teammate wake: dropping pre-generation/unparseable wake for "
+                "name=%r parent=%s (event_ts=%s < gen-%d spawned_ts=%.3f)",
+                name,
+                parent_session_id[:8],
+                event_ts,
+                rec.spawn_generation,
+                rec.spawned_ts,
+            )
+            return
+        rec.last_wake_ts = filtered
         if rec.current_key is not None:
             _record_resume_ts(
                 self._parent_activity(parent_session_id).resumed,
                 rec.current_key,
-                event_ts,
+                filtered,
             )
         else:
-            if event_ts is not None and (
-                rec.pending_wake is None or event_ts > rec.pending_wake
-            ):
-                rec.pending_wake = event_ts
+            if rec.pending_wake is None or filtered > rec.pending_wake:
+                rec.pending_wake = filtered
 
     def _apply_teammate_wake_crosschecked(
         self,
@@ -1336,6 +1374,30 @@ class SessionMonitor:
         Workflow display key never matches). Every close merges CAUSALLY
         (``merge_teammate_park``: unparseable dominates, else max park_ts).
 
+        UNIVERSAL DUAL-WRITE (r7 item 2, Codex P1, probe-reproduced — the r6
+        RETAIN-ALWAYS rule extended to ALL parks, not just the no-registry
+        branch): EVERY park additionally lands a NAMED retained copy in the
+        orphan buffer via :meth:`_retain_orphan_teammate_park` — the FIRST thing
+        this method does, before ANY branching. A bound OLD generation used to
+        spend the NEW generation's only park: gen-1 bound → gen-2 spawn result
+        stashed (result-before-use) → the gen-2 park arrives while the rec is
+        STILL gen-1 (≥ gen-1's ``spawned_ts``, so not dropped) → it applied
+        immediately to gen-1's ``current_key`` and was GONE → the late gen-2
+        tool_use registers/rotates with ``pending_park=None`` → gen-2 binds
+        without its close → the 2h strand. The retained copy is drained at the
+        next registration through ``_generation_filter_park`` (r7's next
+        registration for the name → ``park_ts ≥ gen-2 spawned_ts`` carries into
+        gen-2's ``pending_park`` → closes at bind). The immediate application to
+        the bound rec KEEPS today's semantics for the OUTGOING generation
+        (closing it early is harmless — the rotation retires it anyway), and the
+        buffer's ``_merge_pending_park`` causal reduction makes the dual-write
+        idempotent (a key is bound exactly once, so no key ever receives both
+        the immediate close AND the buffer copy). BUFFER-NOISE consequence
+        (disclosed): most retained copies are generation-dropped at the next
+        drain (same-generation parks whose gen already applied them immediately)
+        or TTL-expire unused; bounded by the existing ``_ORPHAN_PARK_MAX_NAMES``
+        (32) cap + the ``_ORPHAN_PARK_TTL_S`` (2 h) wall TTL.
+
         GENERATION SCOPE (dual-review r1 item 4, Codex P1): a PARSEABLE park
         whose ``park_ts`` predates the CURRENT generation's ``spawned_ts`` is
         DROPPED (INFO) — it reports the PRIOR leg going idle and cannot close a
@@ -1345,7 +1407,13 @@ class SessionMonitor:
         defend it at the runtime ts-gates). An UNPARSEABLE park keeps its
         unconditional dominance (it cannot be generation-checked; fail-dark
         doctrine — disclosed residual: an unparseable post-rotation stale park
-        still darkens the new gen until a wake / the next genuine park)."""
+        still darkens the new gen until a wake / the next genuine park). The
+        drop applies ONLY to the immediate application; the retained copy above
+        is generation-filtered independently at its own drain."""
+        # r7 item 2: retain a named copy of EVERY park (registered or not) so a
+        # not-yet-registered NEWER generation's park is never spent solely on the
+        # currently-bound OLD generation.
+        self._retain_orphan_teammate_park(parent_session_id, parked)
         recs = self._teammate_registry.get(parent_session_id)
         rec = recs.get(parked.name) if recs else None
         if rec is not None:
@@ -1375,15 +1443,14 @@ class SessionMonitor:
             return
         # No-registry degradation (PR-1): close ALL same-name top-level stems.
         # r5 P1 + r6 rule 1 (RETAIN-ALWAYS, both engines probe-reproduced): the
-        # named copy is retained UNCONDITIONALLY (dual-write) — retention gated
-        # on zero-match let a tracked-but-INDETERMINATE stem (r6 A) or a STALE
+        # named copy was retained UNCONDITIONALLY above — retention gated on
+        # zero-match let a tracked-but-INDETERMINATE stem (r6 A) or a STALE
         # same-name stem (r6 B) absorb the park as its own immediate close and
         # SPEND the eventual bind's only close signal (registration then
         # retracted/quarantined the absorbing stem; the fresh bind relit with
         # pending_park empty → the 2h strand). The immediate closes to matched
         # stems below keep today's semantics for THOSE stems; the buffer's
         # causal reduction makes the dual-write idempotent-safe.
-        self._retain_orphan_teammate_park(parent_session_id, parked)
         matched = [
             key
             for _tk, key in self._tracked_teammate_stems(parent_session_id, parked.name)
@@ -1464,34 +1531,50 @@ class SessionMonitor:
     def _bind_teammate_key(
         self, parent_session_id: str, rec: "_TeammateRec", key: str
     ) -> None:
-        """Bind ``key`` as ``rec.current_key`` and emit its launch signal, then
+        """Bind ``key`` as ``rec.current_key`` and emit its (re)light signal, then
         apply the buffered pending signals in CAUSAL order (§2 binding).
 
         pending_wake FIRST (→ ``resumed[key]``), pending_park SECOND (→
         ``teammate_parks``) — so the runtime ts-gates arbitrate a wake-then-park
         vs park-then-wake correctly; both pending slots are cleared.
 
-        RELIGHT LANE (r2 P1): a key retracted at registration
-        (``done_retracted_keys``) carries a runtime done TOMBSTONE, and a
-        tombstone no-ops a later ``launched`` (done-before-launch fail-closes) —
-        so the bind emits through the RESUMED lane instead (the Fix-C
-        tombstone-popping path; binding is positive per-key proof of new work).
-        The resume ts sits STRICTLY BELOW the generation's ``spawned_ts``
-        (``spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S`` — r3 item 2, Codex
-        P1: the runtime resume gate suppresses a park with ts <= resumed, so a
+        ALWAYS-RESUMED RELIGHT (r7 item 3, Codex P2, probe-reproduced): EVERY
+        teammate bind emits through the tombstone-POPPING RESUMED lane —
+        ``resumed[key] = spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S`` — for
+        ALL binds, never ``launched``. The r6 code gated this on the monitor-side
+        provenance set ``done_retracted_keys`` (emit ``launched`` for a
+        never-retracted key, ``resumed`` for a retracted one), but the monitor
+        CANNOT observe route_runtime's tombstone state (in-memory, a DIFFERENT
+        module, pull-only), so any provenance-gated emission is structurally
+        unsound — two probe-confirmed holes left a positively-bound key
+        tombstone-blocked → DARK: (i) rotation CLEARED ``done_retracted_keys``, so
+        a stem retracted in late gen-1 registration that binds during gen-2
+        rotation emitted ``launched`` which no-ops against its runtime tombstone;
+        (ii) the dual-write fallback lane could tombstone an already-tracked
+        eventual key that was NEVER in the set → the same dark bind. The ONLY
+        uniformly-safe emission is the tombstone-popping lane. Binding is
+        positive per-key proof of new work (the Fix-C
+        ``mark_background_agent_resumed`` justification): ``resumed`` ==
+        ``launched`` semantics on a fresh key (``is_background=True``, 2h TTL,
+        projected RUNNING) PLUS a tombstone-pop + a ``resumed_event_ts`` stamp; a
+        fresh key with no tombstone treats resumed as a plain launch. The resume
+        ts sits STRICTLY BELOW the generation's ``spawned_ts`` (r3 item 2, Codex
+        P1: the runtime resume gate suppresses a done with ts <= resumed, so a
         resume ts of exactly ``spawned_ts`` stranded a genuine park stamped at
-        exactly ``spawned_ts`` to the 2h TTL; with the epsilon every park
-        surviving the item-4 generation floor (>= spawned_ts) is strictly newer
-        and closes), and a pending wake (necessarily newer) max-merges over it.
+        exactly ``spawned_ts`` to the 2h TTL; the r3 epsilon walk proved every
+        park surviving the item-4 generation floor (>= spawned_ts) is strictly
+        newer than ``spawned_ts - ε`` and closes correctly), and a pending wake
+        (necessarily newer) max-merges over it.
 
         SAME-TICK CANCEL (r3 P1, BOTH engines): a retraction emitted EARLIER in
         THIS tick (registration in check_for_updates, bind in the immediately
-        following sidechain scan) is CANCELLED here — the retraction's premise
-        ("unbound at registration") is falsified by the bind; the resumed
-        relight stays (harmless on a never-tombstoned key, load-bearing when
-        the retraction applied in an earlier tick). Without the cancel, the
-        fan-out's parks-after-resumed order let the synthetic done tombstone
-        the just-relit key permanently.
+        following sidechain scan) is CANCELLED here (``activity.retraction_dones
+        .discard`` — UNCONDITIONAL on every bind now, a no-op when the key isn't
+        pending; it operates on the per-tick ``activity`` record, not the rec, so
+        it survives the ``done_retracted_keys`` deletion). The retraction's
+        premise ("unbound at registration") is falsified by the bind; without the
+        cancel, the fan-out's parks-after-resumed order let the synthetic done
+        tombstone the just-relit key permanently.
 
         RETROACTIVE GENERATION FILTER (r4 P2, Codex, probe-reproduced): a park
         recorded EARLIER IN THIS BATCH via the NO-REGISTRY fallback had no
@@ -1511,16 +1594,15 @@ class SessionMonitor:
         lane."""
         rec.current_key = key
         activity = self._parent_activity(parent_session_id)
-        if key in rec.done_retracted_keys:
-            rec.done_retracted_keys.discard(key)
-            activity.retraction_dones.discard(key)  # the same-tick cancel
-            _record_resume_ts(
-                activity.resumed,
-                key,
-                rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S,
-            )
-        else:
-            activity.launched.add(key)
+        # r7 item 3: ALWAYS relight through the tombstone-popping RESUMED lane
+        # (never ``launched``); the same-tick cancel is unconditional (a no-op
+        # when nothing is pending for this key).
+        activity.retraction_dones.discard(key)
+        _record_resume_ts(
+            activity.resumed,
+            key,
+            rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S,
+        )
         existing_park = activity.teammate_parks.get(key)
         if existing_park is not None:
             ex_park_ts, ex_unparseable = existing_park
