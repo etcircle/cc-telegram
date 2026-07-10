@@ -1,7 +1,14 @@
 """Doctor health checks for CC Telegram.
 
 Reports the state of the local install: required env vars, tmux + claude on
-PATH, the Claude Code SessionStart hook, and the config directory.
+PATH, the three managed Claude Code hooks, and the config directory.
+
+Required-key precedence mirrors ``Config``: an existing process environment
+key wins even when empty, followed by cwd-local ``.env`` and then the config-dir
+``.env``. Doctor deliberately rejects whitespace-only values, which ``Config``
+may technically accept but which indicate a broken deployment. Each dotenv
+file is parsed independently; staged cross-file interpolation is out of scope
+for this diagnostic.
 """
 
 import argparse
@@ -10,50 +17,56 @@ import os
 import shutil
 from pathlib import Path
 
+from dotenv import dotenv_values
+
 from .utils import app_dir
 
 
 def _check_env_value(name: str, app_dir_path: Path) -> str:
-    """Return env var value, falling back to value parsed from app_dir/.env."""
-    value = os.environ.get(name, "").strip()
-    if value:
-        return value
-    env_file = app_dir_path / ".env"
-    if not env_file.is_file():
-        return ""
-    try:
-        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            if key.strip() != name:
-                continue
-            val = val.strip()
-            if len(val) >= 2 and val[0] == val[-1] and val[0] in {'"', "'"}:
-                val = val[1:-1]
-            return val
-    except OSError:
-        return ""
-    return ""
+    """Return the stripped effective required-key value.
+
+    Key presence, including an empty process value, is first-wins. This tracks
+    ``config.py``'s two ``load_dotenv(..., override=False)`` calls without
+    importing the stateful ``Config`` singleton.
+    """
+    if name in os.environ:
+        return os.environ[name].strip()
+
+    local_values = dotenv_values(Path(".env"))
+    config_values = dotenv_values(app_dir_path / ".env")
+    if name in local_values:
+        return (local_values[name] or "").strip()
+
+    return (config_values.get(name) or "").strip()
 
 
-def _check_hook_installed(settings_file: Path) -> tuple[str, str]:
-    """Return (status, detail) where status is OK | WARN | FAIL."""
+def _load_hook_settings(settings_file: Path) -> tuple[dict | None, str]:
+    """Return parsed hook settings and an error detail when unavailable."""
     if not settings_file.is_file():
-        return "FAIL", f"{settings_file} not found"
+        return None, f"{settings_file} not found"
     try:
         settings = json.loads(settings_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
-        return "FAIL", f"could not parse {settings_file}: {e}"
+        return None, f"could not parse {settings_file}: {e}"
     if not isinstance(settings, dict):
-        return "FAIL", f"{settings_file} is not a JSON object"
+        return None, f"{settings_file} is not a JSON object"
+    return settings, ""
+
+
+def _managed_hook_present(
+    settings: dict, event: str, *, matcher: str | None = None
+) -> tuple[bool, str]:
+    """Return whether one managed command exists for an event/matcher."""
     hooks = settings.get("hooks", {})
-    session_start = hooks.get("SessionStart", []) if isinstance(hooks, dict) else []
-    if not isinstance(session_start, list):
-        return "FAIL", "hooks.SessionStart is not a list"
-    for entry in session_start:
+    if not isinstance(hooks, dict):
+        return False, "hooks is not a JSON object"
+    entries = hooks.get(event, [])
+    if not isinstance(entries, list):
+        return False, f"hooks.{event} is not a list"
+    for entry in entries:
         if not isinstance(entry, dict):
+            continue
+        if matcher is not None and entry.get("matcher") != matcher:
             continue
         inner = entry.get("hooks", [])
         if not isinstance(inner, list):
@@ -63,8 +76,8 @@ def _check_hook_installed(settings_file: Path) -> tuple[str, str]:
                 continue
             cmd = h.get("command", "")
             if isinstance(cmd, str) and "cc-telegram hook" in cmd:
-                return "OK", ""
-    return "WARN", "SessionStart hook missing"
+                return True, ""
+    return False, f"{event} hook missing"
 
 
 def _run_health_checks(target: Path) -> tuple[int, int, int]:
@@ -118,14 +131,27 @@ def _run_health_checks(target: Path) -> tuple[int, int, int]:
         emit("FAIL", "claude not on PATH", "install Claude Code CLI")
 
     settings_file = Path.home() / ".claude" / "settings.json"
-    hook_status, hook_detail = _check_hook_installed(settings_file)
-    label = "SessionStart hook"
-    if hook_status == "OK":
-        emit("OK", label)
-    elif hook_status == "WARN":
-        emit("WARN", f"{label}: {hook_detail}", "run `cc-telegram hook --install`")
-    else:
-        emit("FAIL", f"{label}: {hook_detail}", "run `cc-telegram hook --install`")
+    settings, settings_error = _load_hook_settings(settings_file)
+    hook_specs = (
+        ("SessionStart", None, "SessionStart hook"),
+        ("PreToolUse", "AskUserQuestion", "PreToolUse(AskUserQuestion) hook"),
+        ("Notification", None, "Notification hook"),
+    )
+    for event, matcher, label in hook_specs:
+        if settings is None:
+            status = "FAIL" if event == "SessionStart" else "WARN"
+            emit(status, f"{label}: {settings_error}", "cc-telegram hook --install")
+            continue
+        present, detail = _managed_hook_present(settings, event, matcher=matcher)
+        if present:
+            emit("OK", label)
+        else:
+            status = (
+                "FAIL"
+                if event == "SessionStart" and not detail.endswith("hook missing")
+                else "WARN"
+            )
+            emit(status, f"{label}: {detail}", "cc-telegram hook --install")
 
     if target.is_dir() and os.access(target, os.W_OK):
         emit("OK", f"config dir writable ({target})")

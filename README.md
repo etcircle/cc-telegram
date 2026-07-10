@@ -357,13 +357,10 @@ The hooks have separate jobs:
 - `PreToolUse` captures the structured AskUserQuestion payload before Claude renders its picker.
 - `Notification` records that Claude is blocked on an approval prompt that may never appear in the session JSONL.
 
-`cc-telegram doctor` currently verifies only SessionStart. To confirm that all three hooks are present:
-
-```bash
-grep -c 'cc-telegram hook' ~/.claude/settings.json
-```
-
-The expected count is `3`.
+`cc-telegram doctor` verifies all three managed hooks. A missing SessionStart
+hook retains the existing health-check severity; missing PreToolUse or
+Notification hooks are reported as warnings. Repair any missing entry with
+`cc-telegram hook --install`.
 
 ## AskUserQuestion cards
 

@@ -1,8 +1,8 @@
 """Tests for CC Telegram doctor health checks.
 
-Covers the fresh-setup health-check readout: env vars, tmux/claude on PATH,
-the SessionStart hook, and config dir writability. All tests run against
-tmp_path; HOME is monkeypatched.
+Covers the fresh-setup health-check readout: env precedence, tmux/claude on
+PATH, all three managed hooks, and config dir writability. All tests run
+against tmp_path; HOME is monkeypatched.
 """
 
 import json
@@ -43,7 +43,16 @@ def _stub_environment_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
                 "hooks": {
                     "SessionStart": [
                         {"hooks": [{"command": "cc-telegram hook"}]},
-                    ]
+                    ],
+                    "PreToolUse": [
+                        {
+                            "matcher": "AskUserQuestion",
+                            "hooks": [{"command": "cc-telegram hook"}],
+                        }
+                    ],
+                    "Notification": [
+                        {"hooks": [{"command": "cc-telegram hook"}]},
+                    ],
                 }
             }
         ),
@@ -89,7 +98,16 @@ class TestHealthChecks:
                                     }
                                 ]
                             }
-                        ]
+                        ],
+                        "PreToolUse": [
+                            {
+                                "matcher": "AskUserQuestion",
+                                "hooks": [{"command": "cc-telegram hook"}],
+                            }
+                        ],
+                        "Notification": [
+                            {"hooks": [{"command": "cc-telegram hook"}]},
+                        ],
                     }
                 }
             ),
@@ -105,9 +123,10 @@ class TestHealthChecks:
         assert "OK   tmux on PATH" in out
         assert "OK   claude on PATH" in out
         assert "OK   SessionStart hook" in out
+        assert "OK   PreToolUse(AskUserQuestion) hook" in out
+        assert "OK   Notification hook" in out
         assert "OK   config dir writable" in out
-        # Summary line: 6 ok / 0 warn / 0 fail
-        assert "6 ok / 0 warn / 0 fail" in out
+        assert "8 ok / 0 warn / 0 fail" in out
 
     def test_health_reports_missing_token_and_missing_tools(
         self,
@@ -130,10 +149,12 @@ class TestHealthChecks:
         assert "FAIL tmux not on PATH (fix: brew install tmux)" in out
         assert "FAIL claude not on PATH (fix: install Claude Code CLI)" in out
         assert "FAIL SessionStart hook" in out
+        assert "WARN PreToolUse(AskUserQuestion) hook" in out
+        assert "WARN Notification hook" in out
         # config dir is writable; that one is OK.
         assert "OK   config dir writable" in out
         summary = [line for line in out.splitlines() if line.endswith(" fail")][-1]
-        assert summary.startswith("1 ok / 0 warn / 5 fail")
+        assert summary.startswith("1 ok / 2 warn / 5 fail")
 
     def test_health_warns_when_hook_missing_with_settings_present(
         self,
@@ -152,4 +173,68 @@ class TestHealthChecks:
 
         out = capsys.readouterr().out
         assert "WARN SessionStart hook" in out
-        assert "run `cc-telegram hook --install`" in out
+        assert "WARN PreToolUse(AskUserQuestion) hook" in out
+        assert "WARN Notification hook" in out
+        assert "cc-telegram hook --install" in out
+
+
+@pytest.mark.parametrize("name", ["TELEGRAM_BOT_TOKEN", "ALLOWED_USERS"])
+@pytest.mark.parametrize("config_present", [False, True])
+@pytest.mark.parametrize("local_present", [False, True])
+@pytest.mark.parametrize("env_state", ["set", "empty", "absent"])
+def test_required_key_presence_precedence_matrix(
+    name: str,
+    config_present: bool,
+    local_present: bool,
+    env_state: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _isolate_home(tmp_path, monkeypatch)
+    target.mkdir()
+    monkeypatch.chdir(tmp_path)
+    if config_present:
+        (target / ".env").write_text(f"{name}=config-value\n", encoding="utf-8")
+    if local_present:
+        (tmp_path / ".env").write_text(f"{name}=local-value\n", encoding="utf-8")
+
+    if env_state == "set":
+        monkeypatch.setenv(name, "env-value")
+        expected = "env-value"
+    elif env_state == "empty":
+        monkeypatch.setenv(name, "")
+        expected = ""
+    else:
+        monkeypatch.delenv(name, raising=False)
+        expected = (
+            "local-value" if local_present else "config-value" if config_present else ""
+        )
+
+    assert doctor._check_env_value(name, target) == expected
+
+
+def test_empty_environment_value_shadows_dotenv_and_fails_health_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = _isolate_home(tmp_path, monkeypatch)
+    target.mkdir()
+    (target / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=config-token\nALLOWED_USERS=1234\n", encoding="utf-8"
+    )
+    _stub_environment_healthy(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
+
+    assert doctor.doctor_main([]) == 1
+    assert "FAIL TELEGRAM_BOT_TOKEN" in capsys.readouterr().out
+
+
+def test_whitespace_only_value_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _isolate_home(tmp_path, monkeypatch)
+    target.mkdir()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "   ")
+
+    assert doctor._check_env_value("TELEGRAM_BOT_TOKEN", target) == ""
