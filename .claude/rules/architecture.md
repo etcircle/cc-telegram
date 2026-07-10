@@ -519,15 +519,28 @@ Handler modules (handlers/):
                         session_manager.get_group_chat_id, FAIL CLOSED: an
                         unresolvable chat is excluded, never leaked cross-forum
                         (hermes review P1) + route_runtime.snapshot per route.
-                        TRUST BOUNDARY (hermes R2 P1): /dashboard NEVER writes
-                        set_group_chat_id — thread ids are chat-local, so a
-                        host claim in chat B's unbound thread N would poison
-                        the mapping of chat A's bound topic N and leak it onto
-                        chat B's dashboard; group_chat_ids is written ONLY by
-                        the genuine bound-topic message seams, and the
-                        dashboard carries its OWN chat (effective_chat.id at
-                        claim, the record key afterwards) explicitly through
-                        every topic_send/topic_edit/topic_delete;
+                        TRUST BOUNDARY (hermes R2 P1 + GH #41): /dashboard
+                        NEVER writes set_group_chat_id — thread ids are
+                        chat-local, so a host claim in chat B's unbound
+                        thread N would poison the mapping of chat A's bound
+                        topic N and leak it onto chat B's dashboard.
+                        group_chat_ids is written by the topic message seams
+                        (text/photo/voice/document, forward_command with a
+                        real thread_id, topic_edited) AND — GH #41 — by
+                        registry-RECOGNIZED callback taps (unknown callback
+                        data never writes); an UNBOUND (user, thread) write
+                        is the legitimate directory-browser bootstrap. The
+                        enforcement moved INTO set_group_chat_id itself: the
+                        sticky-when-BOUND guard REFUSES overwriting an
+                        existing entry with a different chat_id while the
+                        user holds a live thread BINDING for that thread (a
+                        colliding cross-forum thread id can't steal a bound
+                        topic's mapping; a STALE binding freezes the old
+                        mapping until the stale-window unbind clears it —
+                        disclosed residual). The dashboard carries its OWN
+                        chat (effective_chat.id at claim, the record key
+                        afterwards) explicitly through every
+                        topic_send/topic_edit/topic_delete;
                         🔔 = WAITING_ON_USER or idle with
                         last_assistant_turn_ended_at > last_user_turn_at, both
                         non-None; ages minute-coarse from the monotonic

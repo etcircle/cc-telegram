@@ -138,6 +138,13 @@ TEAMMATE_RETRACT_RESUME_EPSILON_S = 1e-3
 _ORPHAN_PARK_MAX_NAMES = 32
 _ORPHAN_PARK_TTL_S = 7200.0
 
+# GH #39: the AUQ startup reconciler's age-cap for an empty-tool_use_id side file
+# on a tracked session. An empty captured id can't be matched to a tool_result,
+# so "no pending AUQ" is not proof THIS AUQ resolved — but a genuinely orphaned
+# empty-id file must not linger unbounded. 24h is enormous headroom over the
+# ~60s AUQ self-resolve on CC >= 2.1.198.
+_AUQ_EMPTY_ID_ORPHAN_MAX_AGE_S = 86400.0
+
 
 @dataclass
 class SidechainTick:
@@ -4053,23 +4060,52 @@ class SessionMonitor:
                 # mint/validate parity trap (Hermes round-2 P2).
                 from .handlers.auq_source import (
                     peek_side_file_tool_use_id,
+                    peek_side_file_tool_use_id_and_written_at,
                     unlink_for_session,
                 )
 
-                side_tuid = peek_side_file_tool_use_id(session_id)
-                if side_tuid is None:
+                side_info = peek_side_file_tool_use_id_and_written_at(session_id)
+                if side_info is None:
                     # No valid/live side file → nothing to reconcile.
                     continue
+                side_tuid, side_written_at = side_info
                 if not side_tuid:
                     # P3 (Codex R3): an empty captured tool_use_id cannot be
                     # matched to a tool_result, so "no pending AUQ" is NOT proof
-                    # THIS AUQ resolved. Leave it for session-replacement /
-                    # /clear / topic-close. NOTE (review finding 26): the 1h
-                    # startup GC is NOT a backstop for a TRACKED session —
-                    # gc_stale's injected liveness predicate skips any tracked
-                    # session — so an empty-id orphan on a long-lived tracked
-                    # session is UNBOUNDED. Documented residual, bundled with
-                    # finding 25 for the next architecture wave.
+                    # THIS AUQ resolved. PRESERVE it for the normal seams
+                    # (session-replacement / /clear / topic-close). GH #39
+                    # (finding-26 twin): the 1h startup GC is NOT a backstop for a
+                    # TRACKED session — gc_stale's injected liveness predicate
+                    # skips any live session — so bound the orphan with a 24h age
+                    # cap here.
+                    if time.time() - side_written_at <= _AUQ_EMPTY_ID_ORPHAN_MAX_AGE_S:
+                        continue
+                    # Aged past the cap. Pre-unlink guard (CRITICAL): the
+                    # tool_use_id re-peek CANNOT discriminate two empty-id
+                    # generations, so re-read the record and require the SAME
+                    # written_at (exact match with the value that aged past the
+                    # cap) AND a still-empty id — a fresh PreToolUse that
+                    # atomically replaced the file (fresh written_at / non-empty
+                    # id) or an unreadable file MUST NOT be unlinked.
+                    guard = peek_side_file_tool_use_id_and_written_at(session_id)
+                    if guard is None or guard[0] or guard[1] != side_written_at:
+                        logger.info(
+                            "AUQ reconcile: empty-id side file for window %s "
+                            "session %s aged past the 24h cap but changed before "
+                            "unlink (aged written_at=%r, now %r) — skipping",
+                            window_id,
+                            session_id[:8],
+                            side_written_at,
+                            guard,
+                        )
+                        continue
+                    unlink_for_session(session_id)
+                    logger.info(
+                        "AUQ reconcile: unlinked empty-id orphan side file for "
+                        "window %s session %s (written_at aged past 24h)",
+                        window_id,
+                        session_id[:8],
+                    )
                     continue
                 if await self._auq_tool_result_present(jsonl_path, side_tuid):
                     # TOCTOU re-peek (review finding 12): the proof scan above

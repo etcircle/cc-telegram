@@ -89,6 +89,41 @@ class TestGroupChatId:
         # The stored key is "100:0", only accessible with explicit thread_id=0
         assert mgr.group_chat_ids.get("100:0") == -999
 
+    def test_bound_thread_blocks_cross_forum_overwrite(
+        self, mgr: SessionManager
+    ) -> None:
+        """GH #41: a colliding (user, thread) from another forum cannot steal a
+        BOUND topic's mapping."""
+        mgr.set_group_chat_id(100, 1, -1001111111111)  # chat A bootstrap
+        mgr.bind_thread(100, 1, "@0")  # topic bound in chat A
+        # chat B's unbound thread 1 tries to move the mapping
+        mgr.set_group_chat_id(100, 1, -1002222222222)
+        assert mgr.group_chat_ids.get("100:1") == -1001111111111
+
+    def test_stale_binding_self_heals_after_unbind(self, mgr: SessionManager) -> None:
+        """GH #41: after the stale-window unbind clears the binding, the overwrite
+        succeeds (BOUND guard, not liveness — self-heals)."""
+        mgr.set_group_chat_id(100, 1, -1001111111111)
+        mgr.bind_thread(100, 1, "@0")
+        mgr.set_group_chat_id(100, 1, -1002222222222)  # blocked while bound
+        assert mgr.group_chat_ids.get("100:1") == -1001111111111
+        mgr.unbind_thread(100, 1)  # the stale-window unbind
+        mgr.set_group_chat_id(100, 1, -1002222222222)  # now self-heals
+        assert mgr.group_chat_ids.get("100:1") == -1002222222222
+
+    def test_unbound_thread_overwrite_still_moves(self, mgr: SessionManager) -> None:
+        """GH #41: no binding → overwrite proceeds as today (bootstrap unaffected)."""
+        mgr.set_group_chat_id(100, 1, -111)
+        mgr.set_group_chat_id(100, 1, -222)
+        assert mgr.group_chat_ids.get("100:1") == -222
+
+    def test_same_chat_reset_is_noop_not_refused(self, mgr: SessionManager) -> None:
+        """GH #41: re-writing the SAME chat_id for a bound topic is never refused."""
+        mgr.set_group_chat_id(100, 1, -111)
+        mgr.bind_thread(100, 1, "@0")
+        mgr.set_group_chat_id(100, 1, -111)  # same chat — allowed
+        assert mgr.group_chat_ids.get("100:1") == -111
+
 
 class TestWindowState:
     def test_get_creates_new(self, mgr: SessionManager) -> None:

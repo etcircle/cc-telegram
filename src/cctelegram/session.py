@@ -572,10 +572,35 @@ class SessionManager:
         DO NOT REMOVE this method or the group_chat_ids mapping.
         Without it, all outbound messages in forum topics fail with
         "Message thread not found". See commit history: 5afc111 → 26cb81f → PR #23.
+
+        GH #41 sticky-when-BOUND overwrite guard: thread ids are chat-local, so
+        a colliding (user, thread) message from a DIFFERENT forum would otherwise
+        overwrite the mapping of a genuinely-bound topic in the first forum and
+        misroute its outbound sends. When an entry already exists with a DIFFERENT
+        chat_id AND the user has a live thread BINDING for that thread, the
+        overwrite is REFUSED. This is a BOUND guard, not a liveness guard —
+        ``get_window_for_thread`` reads ``thread_bindings`` only and does not prove
+        the tmux window exists, so a STALE binding freezes the old mapping until
+        the stale-window unbind clears the binding, after which the overwrite
+        self-heals. No existing entry / no binding → write as today (the
+        directory-browser bootstrap into a brand-new topic still works).
         """
         tid = thread_id or 0
         key = f"{user_id}:{tid}"
-        if self.group_chat_ids.get(key) != chat_id:
+        existing = self.group_chat_ids.get(key)
+        if existing is not None and existing != chat_id:
+            if self.get_window_for_thread(user_id, tid) is not None:
+                logger.warning(
+                    "Refusing to overwrite bound group chat_id: user=%d thread=%s "
+                    "old_chat=%d new_chat=%d (a colliding cross-forum thread id "
+                    "cannot steal a bound topic's mapping)",
+                    user_id,
+                    thread_id,
+                    existing,
+                    chat_id,
+                )
+                return
+        if existing != chat_id:
             self.group_chat_ids[key] = chat_id
             self._save_state()
             logger.debug(

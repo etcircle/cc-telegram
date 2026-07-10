@@ -1294,7 +1294,9 @@ class TestAuqCacheClearOnSessionChange:
             auq_ledger.reset_for_tests()
 
     @staticmethod
-    def _write_side_file(tmp_path, session_id: str, tool_use_id: str) -> "object":
+    def _write_side_file(
+        tmp_path, session_id: str, tool_use_id: str, *, written_at: float | None = None
+    ) -> "object":
         pending = tmp_path / "auq_pending"
         pending.mkdir(mode=0o700, exist_ok=True)
         path = pending / f"{session_id}.json"
@@ -1304,7 +1306,7 @@ class TestAuqCacheClearOnSessionChange:
                     "schema_version": 1,
                     "session_id": session_id,
                     "tool_use_id": tool_use_id,
-                    "written_at": time.time(),
+                    "written_at": time.time() if written_at is None else written_at,
                     "tool_input": {
                         "questions": [
                             {
@@ -1524,6 +1526,101 @@ class TestAuqCacheClearOnSessionChange:
                 "must be PRESERVED"
             )
         finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_empty_id_orphan_unlinked_past_24h(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """GH #39 finding-26 twin: an empty-tool_use_id side file aged past the
+        24h cap on a tracked session is unlinked (else it lingers UNBOUNDED — the
+        startup GC always skips a live session)."""
+        from cctelegram.handlers import auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        sid = "55555555-5555-4555-8555-555555555555"
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("other"), _tool_result_entry("other")],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        aged = time.time() - (24 * 60 * 60 + 3600)  # 25h old
+        side = self._write_side_file(tmp_path, sid, "", written_at=aged)
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+            assert not side.exists(), (
+                "empty-id side file aged past 24h must be unlinked"
+            )
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_empty_id_orphan_guard_preserves_on_written_at_change(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """GH #39 pre-unlink guard: an aged empty-id file that is atomically
+        REPLACED (fresh written_at) between the decision read and the guard
+        re-read must NOT be unlinked (the tool_use_id re-peek alone can't
+        discriminate two empty-id generations)."""
+        from cctelegram.handlers import auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        sid = "66666666-6666-4666-8666-666666666666"
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("other"), _tool_result_entry("other")],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        aged = time.time() - (24 * 60 * 60 + 3600)
+        fresh = time.time()
+        side = self._write_side_file(tmp_path, sid, "", written_at=aged)
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+
+        # Decision read sees the aged tuple; the guard re-read sees a FRESH
+        # written_at (a fresh PreToolUse replaced the file mid-scan).
+        real = auq_source.peek_side_file_tool_use_id_and_written_at
+        calls = {"n": 0}
+
+        def _fake(session_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ("", aged)
+            return ("", fresh)
+
+        monkeypatch.setattr(
+            auq_source, "peek_side_file_tool_use_id_and_written_at", _fake
+        )
+        try:
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+            assert side.exists(), (
+                "guard must preserve when written_at changed before unlink"
+            )
+            assert calls["n"] >= 2, "guard re-read must run"
+        finally:
+            monkeypatch.setattr(
+                auq_source, "peek_side_file_tool_use_id_and_written_at", real
+            )
             session_manager.window_states.pop("@7", None)
             auq_source.reset_for_tests()
 
