@@ -14,7 +14,7 @@ Why it's worth running:
 
 **Talk to it like a person.** Send a voice note and it's transcribed into a prompt. Send a photo or a document and it's downloaded and handed to Claude. Reply to a message to quote it back with role-aware context.
 
-**The rest just works.** Unknown slash commands forward straight into Claude Code, so `/clear`, `/compact`, and `/model` all work from your phone. `/cost` and `/usage` are intercepted bot-side — the full-screen usage overlay is captured, answered as a message, and dismissed for you. `/dashboard` puts a live overview of every session in one pinned message. `/update` upgrades the CLI and restarts your idle sessions in place — without dropping a single topic binding.
+**The rest just works.** Unknown slash commands forward straight into Claude Code, so `/clear`, `/compact`, and `/model` all work from your phone. `/cost` and `/usage` are intercepted bot-side — the full-screen usage overlay is captured, answered as a message, and dismissed for you; when the session is busy (or has an unsent draft in the terminal) the bot won't inject a keystroke and instead replies with a bridge-side snapshot — your context usage plus the last full overlay it saw ("as of 12:03, 26 min ago") — so you get metrics without a dead end. `/dashboard` puts a live overview of every session in one pinned message. `/update` upgrades the CLI and restarts your idle sessions in place — without dropping a single topic binding.
 
 **It survives things.** Bot restart, tmux restart, phone in a tunnel — sessions live in tmux, state lives on disk, and the bridge reconciles on startup. Duplicate taps are caught by an append-only action ledger, so a double-press after a restart answers "already received" instead of doing the thing twice. 2,800+ tests keep it honest.
 
@@ -46,8 +46,8 @@ Bot-owned commands (handled by cc-telegram, never forwarded):
 | `/history` | Paginated message history for this topic's session. |
 | `/screenshot` | Capture the tmux pane as a PNG. |
 | `/esc` | Send Escape to interrupt Claude. |
-| `/usage` | Pull Claude Code's usage/limits from the TUI overlay. |
-| `/cost` | Same as `/usage` (alias) — pull cost/usage/limits from the TUI overlay. |
+| `/usage` | Pull Claude Code's usage/limits from the TUI overlay (idle sessions); on a busy session, replies with a bridge-side snapshot instead of a dead-end refusal. |
+| `/cost` | Same as `/usage` (alias) — pull cost/usage/limits from the TUI overlay, with the same busy-session snapshot fallback. |
 | `/update` | Update the CLI, then restart idle sessions in place (owner-only). |
 | `/dashboard` | Claim this topic as a cross-session overview; `/dashboard pin` pins it. |
 | `/settings` | Your personal output-verbosity preferences (presets + knobs). |
