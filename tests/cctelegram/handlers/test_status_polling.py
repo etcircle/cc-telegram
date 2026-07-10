@@ -1776,6 +1776,136 @@ class TestAbsentStreakHysteresis:
             assert mock_clear.call_args.kwargs.get("tombstone") is True
 
     @pytest.mark.asyncio
+    async def test_unknown_blocking_successor_frame_renders_excerpt_card(
+        self, mock_bot: AsyncMock
+    ):
+        """GH #47-R1: the absent pane advanced to an UNRECOGNIZED blocking
+        prompt (the 2026-07-09 footer-less "Switch model?" frame). At the
+        absent-streak clear the card must be tombstoned with the honest
+        ``⚠️ … the bridge can't parse …`` excerpt text (NO keyboard), NOT the
+        misleading ``🪦 … resolved`` tombstone — the AUQ did not resolve.
+        """
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        pane = (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "unknown_blocking_confirm_switch_model_v2.1.197.txt"
+        ).read_text()
+
+        window_id = "@37"
+        user_id = 6427984308
+        thread_id = 10636
+        ikey = (user_id, thread_id)
+        _interactive_mode[ikey] = window_id
+        _interactive_msgs[ikey] = 55501
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ) as mock_clear,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling.auq_source,
+                "side_file_live_for_window",
+                return_value=False,
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane)
+
+            for _ in range(status_polling.ABSENT_STREAK_THRESHOLD):
+                await status_polling.update_status_message(
+                    mock_bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    thread_id=thread_id,
+                )
+
+            mock_clear.assert_called_once()
+            kwargs = mock_clear.call_args.kwargs
+            assert kwargs.get("tombstone") is True
+            text = kwargs.get("tombstone_text")
+            assert text is not None
+            assert "the bridge can't parse" in text
+            assert "Switch model?" in text
+            assert "Yes, switch to Fable 5" in text
+            assert "No, go back" in text
+            assert "/screenshot" in text
+            # NO keyboard is passed through clear_interactive_msg's contract
+            # (it strips reply_markup), and the excerpt card carries no options.
+            assert "🪦" not in text
+
+    @pytest.mark.asyncio
+    async def test_recognizer_none_frame_keeps_default_tombstone(
+        self, mock_bot: AsyncMock
+    ):
+        """GH #47-R1 complement: when the absent pane is NOT a recognized
+        blocking prompt (a mid-redraw task-list frame), the tombstone stays
+        byte-identical — ``tombstone_text`` is None (the default 🪦 text)."""
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@37"
+        user_id = 6427984308
+        thread_id = 10636
+        ikey = (user_id, thread_id)
+        _interactive_mode[ikey] = window_id
+        _interactive_msgs[ikey] = 55502
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ) as mock_clear,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling.auq_source,
+                "side_file_live_for_window",
+                return_value=False,
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=self._BAD_FRAME_PANE)
+
+            for _ in range(status_polling.ABSENT_STREAK_THRESHOLD):
+                await status_polling.update_status_message(
+                    mock_bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    thread_id=thread_id,
+                )
+
+            mock_clear.assert_called_once()
+            kwargs = mock_clear.call_args.kwargs
+            assert kwargs.get("tombstone") is True
+            assert kwargs.get("tombstone_text") is None
+
+    @pytest.mark.asyncio
     async def test_absent_streak_resets_on_pane_recovery(self, mock_bot: AsyncMock):
         """absent → live → absent → absent → live: streak must reset on every
         live observation so transient flickers can't accumulate toward a false

@@ -35,6 +35,14 @@ Key components:
     background keys (typing on, topic silent), post ONE silent note per
     episode so the silence is explained (``snapshot.background_only``,
     poller-local ``_bg_only_card_posted`` one-shot cache; pull-only).
+  - GH #47-R1 honest successor-frame fallback: at the absent-streak in-mode
+    tombstone, ``terminal_parser.parse_unknown_blocking_prompt`` re-checks the
+    same capture — if the pane advanced to an UNRECOGNIZED blocking prompt
+    (a footer-less "Switch model?" successor frame), the card is edited to an
+    honest TEXT-ONLY excerpt (``_unknown_frame_tombstone_text``, NO keyboard)
+    via ``clear_interactive_msg(tombstone_text=…)`` instead of the misleading
+    "🪦 AskUserQuestion resolved…" tombstone. ``None`` keeps today's tombstone
+    byte-identical.
 """
 
 import asyncio
@@ -59,6 +67,7 @@ from ..terminal_parser import (
     is_status_active,
     parse_background_jobs,
     parse_status_line,
+    parse_unknown_blocking_prompt,
     resolve_ask_form,
 )
 from ..transcript_parser import read_latest_usage
@@ -134,6 +143,39 @@ TYPING_ACTION_INTERVAL = 3.0
 # state, and the notification bit exists only for approval gates. Everything
 # else fails open (commits as today).
 _NOTIFY_IDLE_PROMPT_KIND = "idle_prompt"
+
+# GH #47-R1 honest successor-frame fallback. When the absent-streak clear fires
+# but the pane actually advanced to an UNRECOGNIZED blocking prompt (the
+# 2026-07-09 footer-less "Switch model?" incident), the card is edited to an
+# honest TEXT-ONLY excerpt notice (NO keyboard — acting stays terminal-side)
+# instead of the misleading "🪦 AskUserQuestion resolved…" tombstone.
+_UNKNOWN_FRAME_HEADER = "⚠️ Claude is showing a prompt the bridge can't parse:"
+_UNKNOWN_FRAME_FOOTER = (
+    "Use /screenshot for the full frame and drive it in the terminal."
+)
+# Keep the whole card comfortably under Telegram's single-message limit; the
+# excerpt is clipped from the TOP (the numbered options live at the bottom and
+# are the most useful part to preserve) when it would blow the budget.
+_UNKNOWN_FRAME_MAX_CHARS = 3500
+
+
+def _unknown_frame_tombstone_text(excerpt: str) -> str:
+    """Compose the GH #47-R1 excerpt card body (plain text, no keyboard).
+
+    Clips the excerpt from the TOP if the assembled card would exceed
+    ``_UNKNOWN_FRAME_MAX_CHARS`` (the bottom option lines are preserved).
+    """
+    frame = "{header}\n\n{excerpt}\n\n{footer}"
+    fixed = len(_UNKNOWN_FRAME_HEADER) + len(_UNKNOWN_FRAME_FOOTER) + 4
+    budget = _UNKNOWN_FRAME_MAX_CHARS - fixed
+    body = excerpt
+    if budget > 0 and len(body) > budget:
+        marker = "…\n"
+        body = marker + body[-(budget - len(marker)) :]
+    return frame.format(
+        header=_UNKNOWN_FRAME_HEADER, excerpt=body, footer=_UNKNOWN_FRAME_FOOTER
+    )
+
 
 # Fix B (2026-07-08): a small floor on the elapsed-compensated post-tick sleep so
 # a chronically over-interval typing tick never hot-loops (Hermes r1 P3).
@@ -1176,7 +1218,37 @@ async def update_status_message(
         # "resolved without Telegram input" notice and strips the
         # keyboard. The other clear_interactive_msg call sites (topic
         # close, window switch, callback-handled picks) keep delete.
-        await clear_interactive_msg(user_id, bot, thread_id, tombstone=True)
+        #
+        # GH #47-R1: BEFORE assuming resolution, re-check whether the
+        # visible pane actually advanced to an UNRECOGNIZED blocking prompt
+        # (the 2026-07-09 footer-less "Switch model?" successor frame). If
+        # so, the AUQ did NOT resolve — Claude is blocked on a prompt the
+        # bridge can't parse — so replace the misleading "🪦 resolved…"
+        # tombstone with an honest TEXT-ONLY excerpt card (NO keyboard: raw
+        # keystrokes on a loose heuristic violate the fail-closed dispatch
+        # discipline; acting stays terminal-side). ``pane_text`` is the
+        # capture that produced this absence — no extra tmux capture.
+        # ``parse_unknown_blocking_prompt`` is fail-closed (it re-runs the
+        # named-UI check itself), so ``None`` keeps the byte-identical
+        # tombstone path.
+        unknown_excerpt = parse_unknown_blocking_prompt(pane_text)
+        if unknown_excerpt is not None:
+            logger.info(
+                "Unrecognized blocking successor frame on window_id %s — "
+                "rendering honest excerpt card instead of the resolved "
+                "tombstone (route=%s)",
+                window_id,
+                route,
+            )
+            await clear_interactive_msg(
+                user_id,
+                bot,
+                thread_id,
+                tombstone=True,
+                tombstone_text=_unknown_frame_tombstone_text(unknown_excerpt),
+            )
+        else:
+            await clear_interactive_msg(user_id, bot, thread_id, tombstone=True)
         # CLEAR (ii): genuine in-mode absence (mode still set for this window,
         # side file not live, pane absent ≥ ABSENT_STREAK_THRESHOLD). Retract
         # the pane-set WAITING bit alongside the card tombstone + repaint. The

@@ -385,8 +385,10 @@ def invalidate_on_dispatch(window_id: str) -> None:
 # display-only. The characterization basis is the wave-1 rig re-run on live CC
 # 2.1.204 (E1 digit-commits / E2 arrows-move-only / E3 Enter-commits — the
 # plan's 2.1.201 is SUPERSEDED); the committed shape fixtures are
-# ``decision_trust_folder_v2.1.200.txt`` (the folder-trust prompt shape is
-# version-stable, so the signature holds across 2.1.20x).
+# ``decision_trust_folder_v2.1.200.txt`` + ``folder_trust_arrival_plain_v2.1.206.txt``
+# (the folder-trust prompt shape is version-stable, so the signature holds
+# across 2.1.20x — 2.1.206 is licensed in ``_DECISION_DISPATCH_TABLE`` below,
+# the B2.4 canary precondition).
 _FamilySignature = tuple[tuple[str, ...], "re.Pattern[str]"]
 
 _FAMILY_SIGNATURES: Final[dict[str, _FamilySignature]] = {
@@ -402,7 +404,12 @@ _FAMILY_SIGNATURES: Final[dict[str, _FamilySignature]] = {
 # characterization. Membership is EXACT-STRING (a CC upgrade empties the
 # effective allowlist → buttons revert to display-only until re-characterized).
 _DECISION_DISPATCH_TABLE: Final[dict[str, frozenset[str]]] = {
-    "folder-trust": frozenset({"2.1.204"}),
+    # 2.1.206 licensed from the real rig fixture
+    # ``folder_trust_arrival_plain_v2.1.206.txt`` (title "Accessing workspace:",
+    # options ["Yes, I trust this folder", "No, exit"], footer
+    # "Enter to confirm · Esc to cancel" — identical shape to 2.1.204, so the
+    # existing family signature holds; B2.4 canary precondition).
+    "folder-trust": frozenset({"2.1.204", "2.1.206"}),
 }
 
 

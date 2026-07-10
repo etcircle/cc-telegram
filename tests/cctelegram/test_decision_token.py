@@ -270,6 +270,18 @@ def test_family_positive_on_the_licensed_v2_1_204_fixture() -> None:
     assert dt.lookup("folder-trust", "2.1.204") is True
 
 
+def test_family_positive_on_the_licensed_v2_1_206_fixture() -> None:
+    """B2.4 canary precondition (version-pin ↔ fixture-pin parity): the REAL
+    2.1.206 rig fixture must parse → identify folder-trust → be licensed, and
+    an unknown version must NOT be licensed. Drives the whole chain end-to-end
+    on the fixture (never a synthetic form)."""
+    form = parse_generic_decision(_load("folder_trust_arrival_plain_v2.1.206.txt"))
+    assert form is not None
+    assert dt.identify_family(form) == "folder-trust"
+    assert dt.lookup("folder-trust", "2.1.206") is True
+    assert dt.lookup("folder-trust", "9.9.9") is False
+
+
 def test_family_negative_option_tuple_mismatch() -> None:
     form = AskUserQuestionForm(
         current_question_title="Accessing workspace:",

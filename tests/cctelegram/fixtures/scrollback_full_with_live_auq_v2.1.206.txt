@@ -1,0 +1,51 @@
+
+
+
+❯ run the shell command: ls -la
+
+  Listed 1 directory
+
+⏺ The directory contains only one entry: a subdirectory called cctdir (everything else is just . and ..).
+
+✻ Crunched for 13s
+
+❯ run this exact bash command: rm -rf /tmp/ccrig-nonexistent-test-dir
+
+  Ran 1 shell command
+
+✻ Worked for 23s
+
+❯ Use the AskUserQuestion tool with ONE question, multiSelect true, and 4 options labeled A, B, C, D. I will answer in the terminal.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which options do you want to select? → A, C
+
+⏺ You selected A and C.
+
+✻ Sautéed for 10s
+
+❯ Run this bash command: for i in $(seq 1 100); do echo "line $i"; done
+
+  Ran 1 shell command
+
+⏺ The command ran successfully, printing "line 1" through "line 100" — 100 lines total.
+
+✻ Churned for 10s
+
+❯ Read the file bigfile.txt in the current directory, then use the AskUserQuestion tool to ask me a single-select question with options X and Y.
+
+  Read 1 file
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Choice
+
+Which option do you choose?
+
+❯ 1. X
+     Option X
+  2. Y
+     Option Y
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
