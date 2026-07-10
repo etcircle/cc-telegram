@@ -3834,7 +3834,7 @@ class SessionMonitor:
             from .session import session_manager
             from .handlers.interactive_ui import forget_ask_tool_input
             from . import route_runtime
-            from .handlers import decision_token, pane_signals
+            from .handlers import decision_token, pane_signals, usage_cache
 
             for user_id, thread_id, wid in session_manager.iter_thread_bindings():
                 if wid in changed_window_ids:
@@ -3847,6 +3847,10 @@ class SessionMonitor:
                     # stale dcp: tap can't dispatch into the NEW session's
                     # same-fingerprint re-raised prompt within the token TTL.
                     decision_token.teardown_route(user_id, thread_id, wid)
+                    # /cost overlay cache: the rotated session's cached usage
+                    # overlay is stale for the NEW session — drop it beside the
+                    # other route-scoped caches.
+                    usage_cache.clear_route((user_id, thread_id or 0, wid))
                     logger.info(
                         "Reset route_runtime route after session change: "
                         "user=%d thread=%s window=%s",

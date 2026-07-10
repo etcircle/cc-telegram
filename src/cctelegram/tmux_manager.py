@@ -583,6 +583,69 @@ class TmuxManager:
             logger.error(f"Unexpected error capturing pane {window_id}: {e}")
             return None
 
+    async def capture_pane_cancellation_safe(
+        self,
+        window_id: str,
+        with_ansi: bool = False,
+        scrollback_lines: int = 0,
+    ) -> str | None:
+        """``capture_pane`` that REAPS its subprocess if the await is cancelled.
+
+        Identical return semantics to ``capture_pane`` on the normal paths.
+        The difference: ``capture_pane`` has no subprocess timeout, so when a
+        caller wraps the await in ``asyncio.wait_for`` and the deadline fires (or
+        the task is otherwise cancelled) mid-``communicate``, the raw method would
+        ORPHAN the tmux subprocess. This variant best-effort ``proc.kill()`` +
+        ``await proc.wait()`` in a ``finally`` on ``CancelledError`` before
+        re-raising, so repeated /cost against a hung tmux never accumulates
+        zombies. The DEFAULT ``capture_pane`` stays byte-identical for every
+        other caller.
+        """
+        tmux_bin = _TMUX_BIN if _TMUX_BIN is not None else "tmux"
+        args: list[str] = [tmux_bin, "capture-pane"]
+        if with_ansi:
+            args.append("-e")
+        if scrollback_lines > 0:
+            args.extend(["-S", f"-{scrollback_lines}"])
+        args.extend(["-p", "-t", window_id])
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                return stdout.decode("utf-8", errors="replace")
+            logger.error(
+                f"Failed to capture pane {window_id}: "
+                f"{stderr.decode('utf-8', errors='replace')}"
+            )
+            return None
+        except asyncio.CancelledError:
+            # The await was cancelled (a wait_for deadline / task cancel). Kill
+            # AND reap the orphaned subprocess before propagating the cancel.
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:  # pragma: no cover — proc already gone
+                    pass
+                # The reap must survive a REPEATED cancellation (review r1 P2):
+                # a second CancelledError landing in a bare ``await proc.wait()``
+                # would escape an ``except Exception`` and leave the killed proc
+                # unreaped. ``shield`` keeps the reap task running even if THIS
+                # await is cancelled again; BaseException is caught so the
+                # ORIGINAL cancellation is what re-raises below.
+                try:
+                    await asyncio.shield(proc.wait())
+                except BaseException:  # noqa: BLE001 — reap best-effort
+                    pass
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error capturing pane {window_id}: {e}")
+            return None
+
     @staticmethod
     def _cmd_send_literal(pane: libtmux.Pane, window_id: str, chars: str) -> bool:
         """Send literal text via raw ``send-keys -l -- <chars>`` and check stderr.

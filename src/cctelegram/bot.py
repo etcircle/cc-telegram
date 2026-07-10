@@ -26,6 +26,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import time
 from pathlib import Path
 
 from telegram import (
@@ -146,9 +147,9 @@ from .handlers.message_sender import (
 from .handlers.response_builder import build_response_parts, is_task_notification
 from .handlers.status_polling import status_poll_loop, typing_action_loop
 from . import route_runtime, terminal_parser, transcript_event_adapter
-from .handlers import artifacts, decision_token, pane_signals
+from .handlers import artifacts, decision_token, pane_signals, usage_cache
 from .screenshot import text_to_image
-from .session import session_manager
+from .session import peek_session_id_for_window, session_manager
 from .session_monitor import (
     NewMessage,
     ParentSidechainActivity,
@@ -543,6 +544,157 @@ async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             pass
 
 
+# The honest "keystroke send failed" reply shared by /esc + the /cost overlay.
+SEND_FAILED_TEXT = "❌ Failed to send — window may be gone"
+
+
+# ── /cost + /usage overlay interceptor: constants + snapshot fallback ──────
+
+# One HARD deadline over the WHOLE preflight (captures + inter-capture sleeps)
+# and a separate bound on the post-send capture. ``capture_pane`` has no
+# subprocess timeout, so these ``asyncio.wait_for`` deadlines are the only bound
+# on a hung tmux (a repeated /cost against a hung server must not wedge the send
+# lock or accumulate zombie subprocesses — the captures go through
+# ``tmux_manager.capture_pane_cancellation_safe``). Module-level so tests can
+# patch them to a tiny value.
+PREFLIGHT_DEADLINE_S = 2.5
+POST_SEND_CAPTURE_DEADLINE_S = 2.5
+
+# INDETERMINATE-frame preflight retry: up to this many EXTRA captures, spaced by
+# ``_PREFLIGHT_RETRY_SLEEP_S``, when the frame is a mid-redraw / empty capture
+# (no verdict yet). A POSITIVE hazard (active generation / live picker / draft /
+# background shells) refuses IMMEDIATELY with exactly ONE capture — retrying it
+# only wastes lock-held time and cannot change the verdict.
+_PREFLIGHT_MAX_RETRIES = 2
+_PREFLIGHT_RETRY_SLEEP_S = 0.3
+
+# The classifier leg names that mean "the pane can't be read cleanly yet" (retry)
+# vs the positive hazards (refuse immediately). Mirrors
+# ``terminal_parser.classify_pane_idle_failure``.
+_INDETERMINATE_LEGS = frozenset({"capture_empty", "no_input_box", "no_ready_chrome"})
+
+# The canonical fallback-reason set — every reason a non-overlay exit can carry.
+# EXHAUSTIVE over the classifier's positive hazards + the transient/indeterminate
+# reasons. Pinned by an exhaustiveness test (a reason with no mapped copy fails).
+USAGE_FALLBACK_REASONS = frozenset(
+    {
+        "lock_busy",
+        "capture_failed",
+        "capture_timeout",
+        "active_status",
+        "input_not_empty",
+        "interactive",
+        "interactive_surface",
+        "background_shells",
+        "chrome_indeterminate",
+        "send_failed",
+        "post_send_capture_failed",
+        "post_send_capture_timeout",
+        "overlay_never_opened",
+        "dismiss_failed",
+    }
+)
+
+# REASON-SPECIFIC action copy — never asserts more than the classifier knows
+# (never pane text). The input-row line is TRUTHFUL-CONDITIONAL: tmux capture
+# cannot distinguish an unsent draft from placeholder chrome, so it never claims
+# "wait for the next turn" / "needs an idle session" (inaccurate for a draft).
+_USAGE_FALLBACK_ACTION: dict[str, str] = {
+    "lock_busy": "The window is busy with another action — try again in a moment.",
+    "capture_failed": "Couldn't read the terminal — try again in a moment.",
+    "capture_timeout": "Couldn't read the terminal in time — try again in a moment.",
+    "active_status": "Claude is working — try again when the turn ends.",
+    "input_not_empty": (
+        "The terminal input row isn't empty — if you have an unsent draft "
+        "there, submit or clear it, then retry."
+    ),
+    "interactive": (
+        "Answer the live prompt first (use the Telegram card if one is up, or "
+        "the terminal), then retry."
+    ),
+    "interactive_surface": (
+        "Answer the live prompt first (use the Telegram card if one is up, or "
+        "the terminal), then retry."
+    ),
+    "background_shells": (
+        "Background shells are running — the safety gate defers this until they finish."
+    ),
+    "chrome_indeterminate": ("Couldn't read the terminal cleanly — try again."),
+    "send_failed": "Couldn't send into the window — try again in a moment.",
+    "post_send_capture_failed": "Couldn't read the terminal — try again in a moment.",
+    "post_send_capture_timeout": (
+        "Couldn't read the terminal in time — try again in a moment."
+    ),
+    "overlay_never_opened": "Try again when the session is idle.",
+    "dismiss_failed": "Try again in a moment.",
+}
+
+
+def usage_fallback_action_line(reason: str) -> str:
+    """Return the reason-specific fallback action line (graceful default)."""
+    return _USAGE_FALLBACK_ACTION.get(reason, "Try again in a moment.")
+
+
+def _fmt_overlay_age(written_at: float, now: float) -> str:
+    """Render 'as of HH:MM, N min ago' for a cached overlay (date when not today)."""
+    when = time.localtime(written_at)
+    today = time.localtime(now)
+    same_day = (when.tm_year, when.tm_yday) == (today.tm_year, today.tm_yday)
+    stamp = (
+        time.strftime("%H:%M", when)
+        if same_day
+        else time.strftime("%Y-%m-%d %H:%M", when)
+    )
+    delta = max(0, int(now - written_at))
+    if delta < 60:
+        rel = f"{delta}s ago"
+    elif delta < 3600:
+        rel = f"{delta // 60} min ago"
+    else:
+        rel = f"{delta // 3600}h {delta % 3600 // 60}m ago"
+    return f"as of {stamp}, {rel}"
+
+
+def _build_usage_snapshot(
+    route: tuple[int, int, str],
+    session_id: str | None,
+    reason: str,
+    label: str,
+) -> str:
+    """Build the pane-free 'cost snapshot' fallback card body.
+
+    Content: context usage from ``route_runtime`` + the cached last successful
+    overlay (absolute + age, 30-min TTL) + the reason-specific action line. The
+    NO-DATA shape (post-/clear, no cache) still renders a card — never a bare
+    dead-end refusal.
+    """
+    now = time.time()
+    lines: list[str] = [f"📊 {label.capitalize()} snapshot"]
+    have_metric = False
+
+    snap = route_runtime.snapshot(route)
+    cu = snap.context_usage
+    if cu is not None and cu.max_tokens > 0:
+        pct = round(cu.tokens / cu.max_tokens * 100)
+        lines.append(f"• Context: {pct}% ({cu.tokens:,} / {cu.max_tokens:,} tokens)")
+        have_metric = True
+
+    cached = usage_cache.peek(route, session_id, now=now)
+    if cached is not None:
+        age = _fmt_overlay_age(cached.written_at, now)
+        body = cached.text.strip()
+        if len(body) > 1500:
+            body = body[:1500] + "\n... (truncated)"
+        lines.append(f"• Last full {label} ({age}):\n```\n{body}\n```")
+        have_metric = True
+
+    if not have_metric:
+        lines.append("• No bridge-side metrics cached yet for this session.")
+
+    lines.append(usage_fallback_action_line(reason))
+    return "\n".join(lines)
+
+
 async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> None:
     """Shared scaffold for the /usage and /cost interceptors.
 
@@ -551,20 +703,27 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
     pattern, so it is invisible to the bridge and blocks the topic if forwarded
     raw. Both are intercepted bot-side, under the window send lock:
 
-    1. PREFLIGHT — capture the pane and require POSITIVE idle evidence
-       (``pane_looks_idle`` — the /update precedent — plus no live interactive
-       surface) before sending ANYTHING. Typing "/cost" + Enter into a live
-       AUQ picker would COMMIT the highlighted option (round-1 converged P1).
-    2. Send ``slash_command``, settle, capture.
+    1. PREFLIGHT — capture the pane (bounded by ``PREFLIGHT_DEADLINE_S``) and
+       require POSITIVE idle evidence (``pane_looks_idle`` — the /update
+       precedent — plus no live interactive surface) before sending ANYTHING.
+       Typing "/cost" + Enter into a live AUQ picker would COMMIT the highlighted
+       option (round-1 converged P1). An INDETERMINATE mid-redraw frame retries
+       (bounded); a POSITIVE hazard refuses IMMEDIATELY with one capture.
+    2. Send ``slash_command``, settle, capture (bounded by
+       ``POST_SEND_CAPTURE_DEADLINE_S``).
     3. CONDITIONAL DISMISS — send Escape ONLY when the capture shows the
        overlay chrome (``usage_overlay_present``); if the overlay never
        opened, the pane is left untouched (an Escape into an active
        generation would interrupt it — the /esc hazard) and the reply is
        honest.
 
-    All replies happen strictly after the lock releases. Parse failure on an
-    OPEN overlay is fail-open: the overlay is still dismissed and the raw
-    capture is presented with an honest note.
+    Every non-overlay exit (refusals AND post-preflight failures) posts a
+    bridge-side "cost snapshot" (context % + the cached last overlay + a
+    reason-specific action line) instead of a dead end. Every exit emits ONE
+    classified INFO log (leg names + outcomes only, never pane text). All
+    replies happen strictly after the lock releases. Parse failure on an OPEN
+    overlay is fail-open: the overlay is still dismissed and the raw capture is
+    presented with an honest note; the SUCCESS path caches the rendered result.
     """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -584,10 +743,42 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
         return
 
     from .terminal_parser import (
+        classify_pane_idle_failure,
         extract_interactive_content,
         pane_looks_idle,
         parse_usage_output,
         usage_overlay_present,
+    )
+
+    route = (user.id, thread_id or 0, wid)
+    message = update.message  # narrowed above; bind for the closures
+
+    def _log_exit(reason: str, **fields: object) -> None:
+        extras = "".join(f" {k}={v}" for k, v in fields.items())
+        logger.info(
+            "usage-overlay exit command=%s route=%s window=%s reason=%s%s",
+            slash_command,
+            route,
+            wid,
+            reason,
+            extras,
+        )
+
+    async def _reply_snapshot(reason: str, *, prefix: str | None = None) -> None:
+        # Session identity is re-read AT the peek (review r1 P2): a session can
+        # rotate mid-transaction (rotation doesn't take the window send lock),
+        # so a pre-transaction sample could read the previous session's entry.
+        card = _build_usage_snapshot(
+            route, peek_session_id_for_window(wid), reason, label
+        )
+        text = f"{prefix}\n\n{card}" if prefix else card
+        await safe_reply(message, text)
+
+    logger.info(
+        "usage-overlay receipt command=%s route=%s window=%s",
+        slash_command,
+        route,
+        wid,
     )
 
     # Wave 3b compound transaction (Hermes P2-5): hold the window send lock
@@ -603,82 +794,162 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
     # between them (atomic on the event loop — a genuine try-acquire).
     lock = tmux_manager.window_send_lock(w.window_id)
     if _lock_busy(lock):
-        await safe_reply(update.message, "⏳ Window busy — try again in a second")
+        _log_exit("lock_busy")
+        await _reply_snapshot("lock_busy")
         return
-    preflight_failed = False
-    pane_busy = False
+
+    # Exit classification set inside the lock; the Telegram reply happens after.
+    exit_reason: str | None = None  # a snapshot-fallback reason to reply with
+    exit_prefix: str | None = None  # honest safety text prepended to the snapshot
     sent = False
     pane_text: str | None = None
     overlay_open = False
     dismiss_ok = False
+
     async with lock:
-        # 1. PREFLIGHT: positive idle evidence before ANY keystroke. A busy
-        # generation or a live picker/prompt refuses fail-closed with zero
-        # keys sent (round-1 converged P1 — "/cost" + Enter into a live AUQ
-        # picker commits the highlighted option).
-        preflight = await tmux_manager.capture_pane(w.window_id)
-        if preflight is None:
-            preflight_failed = True
-        elif not pane_looks_idle(preflight) or (
-            extract_interactive_content(preflight) is not None
-        ):
-            pane_busy = True
-        else:
-            # 2. Open the overlay in the Claude Code TUI.
-            sent = await tmux_manager.send_keys(w.window_id, slash_command)
-            if sent:
-                # Wait for the modal to render.
-                await asyncio.sleep(2.0)
-                pane_text = await tmux_manager.capture_pane(w.window_id)
-                # 3. CONDITIONAL DISMISS: Esc ONLY when the overlay chrome is
-                # actually on the pane. If it never opened (or the capture
-                # failed), leave the pane untouched — a blind Escape into an
-                # active generation is the /esc hazard.
-                overlay_open = usage_overlay_present(pane_text)
-                if overlay_open:
-                    dismiss_ok = await tmux_manager.send_keys(
-                        w.window_id, "Escape", enter=False, literal=False
+        # 1. PREFLIGHT: positive idle evidence before ANY keystroke, bounded by
+        # ONE hard deadline over the whole retry loop (a hung capture must not
+        # wedge the lock). A POSITIVE hazard refuses immediately (one capture);
+        # an INDETERMINATE mid-redraw frame retries.
+        preflight_reason: str | None = None  # None ⇒ idle ⇒ proceed
+        try:
+
+            async def _preflight() -> str | None:
+                last_leg = "capture_failed"
+                for attempt in range(_PREFLIGHT_MAX_RETRIES + 1):
+                    pane = await tmux_manager.capture_pane_cancellation_safe(
+                        w.window_id
                     )
-    if preflight_failed:
-        await safe_reply(
-            update.message,
-            "Couldn't read the terminal to verify it's idle — nothing was "
-            "sent. Try again in a moment.",
-        )
+                    if pane is None:
+                        # A tmux capture FAILURE (subprocess error) — distinct
+                        # from an empty/mid-redraw frame (review r1 P2); retry,
+                        # then classify as capture_failed at exhaustion.
+                        last_leg = "capture_failed"
+                    else:
+                        if extract_interactive_content(pane):
+                            return "interactive"
+                        # AUTHORITY (review r1 P1): ``pane_looks_idle`` ALONE
+                        # decides whether a keystroke may be injected — the
+                        # classifier is replay-only and must never authorize
+                        # (classifier drift must stay a labeling bug, never a
+                        # wrong-keystroke risk).
+                        if pane_looks_idle(pane):
+                            return None  # idle → proceed
+                        # Not idle. The classifier only NAMES the failing leg
+                        # for the log + fallback copy.
+                        leg = classify_pane_idle_failure(pane)
+                        if leg is not None and leg not in _INDETERMINATE_LEGS:
+                            return leg  # positive hazard → refuse immediately
+                        # Indeterminate frame — or an authority/replay drift
+                        # where no leg is named (fail closed, never proceed).
+                        last_leg = leg or "chrome_indeterminate"
+                    if attempt < _PREFLIGHT_MAX_RETRIES:
+                        await asyncio.sleep(_PREFLIGHT_RETRY_SLEEP_S)
+                # Exhausted retries: a None capture is a capture FAILURE;
+                # anything else is a chrome-indeterminate frame.
+                return (
+                    "capture_failed"
+                    if last_leg == "capture_failed"
+                    else "chrome_indeterminate"
+                )
+
+            preflight_reason = await asyncio.wait_for(
+                _preflight(), timeout=PREFLIGHT_DEADLINE_S
+            )
+        except asyncio.TimeoutError:
+            # ONLY the deadline is classified — a genuine caller cancellation
+            # (shutdown) must propagate, never be swallowed into a normal
+            # fallback reply (review r1 P2).
+            exit_reason = "capture_timeout"
+
+        if exit_reason is None and preflight_reason is not None:
+            # The preflight already returns normalized fallback reasons
+            # (positive-hazard leg names, or capture_failed /
+            # chrome_indeterminate at retry exhaustion).
+            exit_reason = preflight_reason
+        elif exit_reason is None:
+            # 2. Idle proof held — open the overlay in the Claude Code TUI.
+            sent = await tmux_manager.send_keys(w.window_id, slash_command)
+            if not sent:
+                exit_reason = "send_failed"
+                exit_prefix = SEND_FAILED_TEXT
+            else:
+                await asyncio.sleep(2.0)
+                try:
+                    pane_text = await asyncio.wait_for(
+                        tmux_manager.capture_pane_cancellation_safe(w.window_id),
+                        timeout=POST_SEND_CAPTURE_DEADLINE_S,
+                    )
+                except asyncio.TimeoutError:
+                    # ONLY the deadline — a genuine cancellation propagates
+                    # (review r1 P2; the lock releases via the async-with).
+                    pane_text = None
+                    # A hung post-send capture: NO blind Escape (Esc only on
+                    # proven overlay chrome — the conditional-Esc contract).
+                    exit_reason = "post_send_capture_timeout"
+                    exit_prefix = (
+                        f"Sent {slash_command} but couldn't read the pane in "
+                        "time — the usage screen may be open. Check with "
+                        "/screenshot; /esc dismisses it."
+                    )
+                if exit_reason is None:
+                    # 3. CONDITIONAL DISMISS: Esc ONLY when the overlay chrome
+                    # is actually on the pane. A blind Escape into an active
+                    # generation is the /esc hazard.
+                    overlay_open = usage_overlay_present(pane_text)
+                    if overlay_open:
+                        dismiss_ok = await tmux_manager.send_keys(
+                            w.window_id, "Escape", enter=False, literal=False
+                        )
+
+    # ── Non-overlay exits (refusals + post-preflight failures): snapshot. ──
+    if exit_reason == "capture_timeout":
+        _log_exit("capture_timeout")
+        await _reply_snapshot("capture_timeout")
         return
-    if pane_busy:
-        await safe_reply(
-            update.message,
-            f"⏳ The session is busy or a prompt is live in the terminal — "
-            f"{slash_command} wasn't sent so it can't interfere. Try again "
-            "when the session is idle.",
-        )
+    if exit_reason == "send_failed":
+        _log_exit("send_failed", sent=False)
+        await _reply_snapshot("send_failed", prefix=exit_prefix)
         return
-    if not sent:
-        await safe_reply(update.message, "❌ Failed to send — window may be gone")
+    if exit_reason == "post_send_capture_timeout":
+        _log_exit("post_send_capture_timeout")
+        await _reply_snapshot("post_send_capture_timeout", prefix=exit_prefix)
         return
+    if exit_reason is not None:
+        # A preflight refusal (pane_busy / interactive / chrome-indeterminate).
+        _log_exit(exit_reason)
+        await _reply_snapshot(exit_reason)
+        return
+
     if pane_text is None:
         # Sent, but the post-settle capture failed — overlay state UNKNOWN, so
-        # no blind Escape was sent. Be honest about the possible open modal.
-        await safe_reply(
-            update.message,
-            f"Sent {slash_command} but couldn't read the pane — the usage "
-            "screen may be open. Check with /screenshot; /esc dismisses it.",
+        # no blind Escape was sent. Honest note + snapshot.
+        _log_exit("post_send_capture_failed", sent=True)
+        await _reply_snapshot(
+            "post_send_capture_failed",
+            prefix=(
+                f"Sent {slash_command} but couldn't read the pane — the usage "
+                "screen may be open. Check with /screenshot; /esc dismisses it."
+            ),
         )
         return
     if not overlay_open:
         # The overlay never appeared (busy race / version drift). The pane was
         # deliberately left untouched — no Escape into an unknown state.
-        await safe_reply(
-            update.message,
-            f"Sent {slash_command} but the usage screen didn't open — check "
-            "the window with /screenshot. If it opened late, /esc dismisses it.",
+        _log_exit("overlay_never_opened", sent=True)
+        await _reply_snapshot(
+            "overlay_never_opened",
+            prefix=(
+                f"Sent {slash_command} but the usage screen didn't open — check "
+                "the window with /screenshot. If it opened late, /esc dismisses it."
+            ),
         )
         return
     if not dismiss_ok:
-        # The window vanished mid-dismiss — don't present the capture as
-        # usage output with a modal possibly left stranded on the pane.
-        await safe_reply(update.message, "❌ Failed to send — window may be gone")
+        # The window vanished mid-dismiss — don't present the capture as usage
+        # output with a modal possibly left stranded on the pane.
+        _log_exit("dismiss_failed", overlay_present=True)
+        await _reply_snapshot("dismiss_failed", prefix=SEND_FAILED_TEXT)
         return
 
     # The overlay was captured + dismissed. Every branch below is fail-open —
@@ -686,6 +957,10 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
     usage = parse_usage_output(pane_text)
     if usage and usage.parsed_lines:
         text = "\n".join(usage.parsed_lines)
+        # Session identity re-read AT the record (review r1 P2 — a rotation
+        # mid-transaction must not record under a stale identity).
+        usage_cache.record(route, peek_session_id_for_window(wid), text)
+        _log_exit("overlay_present", esc_sent=dismiss_ok, parse="ok")
         await safe_reply(update.message, f"```\n{text}\n```")
         return
 
@@ -695,6 +970,9 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
     trimmed = pane_text.strip()
     if len(trimmed) > 3000:
         trimmed = trimmed[:3000] + "\n... (truncated)"
+    # Session identity re-read AT the record (review r1 P2).
+    usage_cache.record(route, peek_session_id_for_window(wid), trimmed)
+    _log_exit("overlay_present", esc_sent=dismiss_ok, parse="raw_fallback")
     await safe_reply(
         update.message,
         f"Couldn't parse the {label} screen on this Claude version — "
@@ -982,6 +1260,10 @@ async def forward_command_handler(
             # rendering the dead session's 1M latch.
             await route_runtime.mark_session_reset(route)
             pane_signals.clear_route(route)  # GH #43: dead session's count
+            # /cost overlay cache: the rotated session's cached usage overlay is
+            # stale for the NEW session — drop it (session-keyed, so a peek would
+            # already miss, but tear it down at the same seam for hygiene).
+            usage_cache.clear_route(route)
             # B2.3 review fold P2-A: /clear rotates the session but the SAME
             # window id stays bound — a same-fingerprint Decision (e.g. the
             # folder-trust prompt for the same cwd) re-raised by the NEW

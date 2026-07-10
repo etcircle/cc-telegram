@@ -93,9 +93,11 @@ def _make_tmux(
     else:
         tmux.send_keys = AsyncMock(return_value=send_results)
     if isinstance(pane_text, list):
-        tmux.capture_pane = AsyncMock(side_effect=pane_text)
+        tmux.capture_pane = AsyncMock(side_effect=list(pane_text))
+        tmux.capture_pane_cancellation_safe = AsyncMock(side_effect=list(pane_text))
     else:
         tmux.capture_pane = AsyncMock(return_value=pane_text)
+        tmux.capture_pane_cancellation_safe = AsyncMock(return_value=pane_text)
     return tmux
 
 
@@ -108,15 +110,22 @@ _PATCH_REPLY = "cctelegram.bot.safe_reply"
 
 async def _run(command_name: str, tmux: MagicMock) -> AsyncMock:
     """Drive usage_command/cost_command against the given tmux mock; return safe_reply."""
+    from cctelegram.handlers import usage_cache
+
+    usage_cache.reset_for_tests()
     update = _make_update()
     context = _make_context()
     safe_reply_mock = AsyncMock()
+    snap = MagicMock()
+    snap.context_usage = None  # no bridge-side metrics unless a test seeds them
     with (
         patch(_PATCH_ALLOWED, return_value=True),
         patch(_PATCH_THREAD, return_value=42),
         patch(_PATCH_SM) as mock_sm,
         patch(_PATCH_TMUX, tmux),
         patch(_PATCH_REPLY, safe_reply_mock),
+        patch("cctelegram.bot.route_runtime.snapshot", return_value=snap),
+        patch("cctelegram.bot.peek_session_id_for_window", return_value="sess-1"),
         patch("asyncio.sleep", new=AsyncMock()),
     ):
         mock_sm.resolve_window_for_thread.return_value = "@1"
@@ -189,7 +198,10 @@ class TestUsageOverlayPreflight:
         tmux.send_keys.assert_not_called()
         safe_reply_mock.assert_awaited_once()
         notice = safe_reply_mock.call_args.args[1]
-        assert "busy" in notice.lower() or "prompt" in notice.lower()
+        # v5: a bridge-side snapshot card with the reason-specific action line
+        # (active generation → "Claude is working — try again when the turn ends").
+        assert "working" in notice.lower() or "turn ends" in notice.lower()
+        assert "snapshot" in notice.lower()
 
     @pytest.mark.asyncio
     async def test_live_picker_pane_refuses_with_zero_keystrokes(self):
@@ -202,8 +214,9 @@ class TestUsageOverlayPreflight:
 
     @pytest.mark.asyncio
     async def test_preflight_capture_failure_refuses_with_zero_keystrokes(self):
-        """No preflight capture ⇒ no idle proof ⇒ nothing is typed."""
-        tmux = _make_tmux(send_results=True, pane_text=[None])
+        """No preflight capture ⇒ no idle proof (after bounded retries) ⇒ nothing typed."""
+        # Indeterminate frames retry up to 2 extra times; feed 3 Nones.
+        tmux = _make_tmux(send_results=True, pane_text=[None, None, None])
         safe_reply_mock = await _run("cost_command", tmux)
 
         tmux.send_keys.assert_not_called()
@@ -257,9 +270,11 @@ class TestUsageCommand:
 
         safe_reply_mock.assert_awaited_once()
         args, _ = safe_reply_mock.call_args
-        assert args[1] == SEND_FAILED_TEXT
+        # v5: the honest safety text is preserved VERBATIM, snapshot appended.
+        assert args[1].startswith(SEND_FAILED_TEXT)
+        assert "snapshot" in args[1].lower()
         # Exactly ONE capture (the preflight); the post-send capture is skipped.
-        assert tmux.capture_pane.await_count == 1
+        assert tmux.capture_pane_cancellation_safe.await_count == 1
         # Only the /usage send happened; no dismiss-Escape after a failed send.
         assert tmux.send_keys.await_count == 1
 
@@ -274,7 +289,9 @@ class TestUsageCommand:
 
         safe_reply_mock.assert_awaited_once()
         args, _ = safe_reply_mock.call_args
-        assert args[1] == SEND_FAILED_TEXT
+        # v5: the honest safety text is preserved VERBATIM, snapshot appended;
+        # never presented as usage output.
+        assert args[1].startswith(SEND_FAILED_TEXT)
         assert "Total cost:" not in args[1]
 
     @pytest.mark.asyncio

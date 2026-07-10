@@ -268,7 +268,7 @@ The bot is topic-only (1 Topic = 1 tmux window = 1 Claude session).
 3. If that dir has existing Claude sessions you get a **session picker** (resume via `claude --resume <id>`); otherwise the bot creates a new tmux window running `CLAUDE_COMMAND`, binds the topic to that window id (in `state.json` `thread_bindings`), and forwards your pending message.
 4. From then on, every message in that topic streams to that Claude session, and Claude's output / interactive prompts / status return to the topic.
 
-Useful Telegram commands: `/history`, `/screenshot`, `/esc`, `/settings`, `/dashboard [pin]`, `/kill`, `/unbind`, `/usage`, `/cost` (intercepted bot-side: captured, answered as a message, auto-dismissed). Forwarded Claude commands: `/clear`, `/compact`, `/model`, `/effort`. Closing/deleting the topic kills the tmux window and unbinds it.
+Useful Telegram commands: `/history`, `/screenshot`, `/esc`, `/settings`, `/dashboard [pin]`, `/kill`, `/unbind`, `/usage`, `/cost` (intercepted bot-side: on an idle session captured, answered as a message, auto-dismissed; on a busy session — or one with an unsent terminal draft — no keystroke is injected and the bot replies with a bridge-side snapshot: context usage + the last full overlay it cached, with an age label). Forwarded Claude commands: `/clear`, `/compact`, `/model`, `/effort`. Closing/deleting the topic kills the tmux window and unbinds it.
 
 ---
 

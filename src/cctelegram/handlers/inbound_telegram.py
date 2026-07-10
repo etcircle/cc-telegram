@@ -54,7 +54,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from .. import route_runtime
-from . import artifacts, decision_token, pane_signals
+from . import artifacts, decision_token, pane_signals, usage_cache
 from ..config import config
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
@@ -547,6 +547,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # /cost overlay cache: the vanished window's cached usage overlay dies
+        # with the binding — a later window reusing the id must not inherit it.
+        usage_cache.clear_route((user.id, thread_id or 0, wid))
         # B2.3 review fold P2-A: the unbound route's Decision tokens + nav
         # generation die with the binding — a stale dcp:/gate-nav tap must
         # never survive into a window id a later binding may reuse.
@@ -644,6 +647,9 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # /cost overlay cache: the vanished window's cached usage overlay dies
+        # with the binding — a later window reusing the id must not inherit it.
+        usage_cache.clear_route((user.id, thread_id or 0, wid))
         # B2.3 review fold P2-A: the unbound route's Decision tokens + nav
         # generation die with the binding — a stale dcp:/gate-nav tap must
         # never survive into a window id a later binding may reuse.
@@ -829,6 +835,9 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # /cost overlay cache: the vanished window's cached usage overlay dies
+        # with the binding — a later window reusing the id must not inherit it.
+        usage_cache.clear_route((user.id, thread_id or 0, wid))
         # B2.3 review fold P2-A: the unbound route's Decision tokens + nav
         # generation die with the binding — a stale dcp:/gate-nav tap must
         # never survive into a window id a later binding may reuse.
@@ -1112,6 +1121,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
         pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
+        # /cost overlay cache: the vanished window's cached usage overlay dies
+        # with the binding — a later window reusing the id must not inherit it.
+        usage_cache.clear_route((user.id, thread_id or 0, wid))
         # B2.3 review fold P2-A: the unbound route's Decision tokens + nav
         # generation die with the binding — a stale dcp:/gate-nav tap must
         # never survive into a window id a later binding may reuse.
