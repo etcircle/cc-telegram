@@ -378,6 +378,32 @@ class TestRouteIsIdle:
         tmux = SimpleNamespace(capture_pane=AsyncMock(return_value=busy))
         assert await updater.route_is_idle((1, 2, "@1"), "@1", tmux) is False
 
+    @pytest.mark.asyncio
+    async def test_ghost_input_row_is_idle_after_preclean(self, monkeypatch):
+        # CC 2.1.206 renders a DIM (SGR-2) ghost suggestion in the empty input
+        # row; the ANSI capture + ``clean_ghost_input_text`` pre-clean blanks it
+        # so ``pane_looks_idle`` no longer false-defers the restart.
+        _patch_snapshot(monkeypatch, {})  # IDLE_CLEARED
+        raw = (FIX / "idle_ghost_input_row_v2.1.206.txt").read_text(encoding="utf-8")
+        ghost_idle = raw.replace("\x1b[38;5;246m · \x1b[38;5;44m1 shell", "")
+        cap = AsyncMock(return_value=ghost_idle)
+        tmux = SimpleNamespace(capture_pane=cap)
+        assert await updater.route_is_idle((1, 2, "@1"), "@1", tmux) is True
+        # The gate captures WITH ANSI so the pre-clean can see the dim styling.
+        assert cap.await_args.kwargs.get("with_ansi") is True
+
+    @pytest.mark.asyncio
+    async def test_real_draft_ansi_still_blocks_idle_gate(self, monkeypatch):
+        # A genuine NORMAL-intensity draft is NOT blanked (fail closed) → defer.
+        _patch_snapshot(monkeypatch, {})  # IDLE_CLEARED
+        raw = (FIX / "idle_ghost_input_row_v2.1.206.txt").read_text(encoding="utf-8")
+        draft = raw.replace("\x1b[38;5;246m · \x1b[38;5;44m1 shell", "").replace(
+            "\x1b[2mok fix it and let me know when I can test\x1b[0m",
+            "please run the tests",
+        )
+        tmux = SimpleNamespace(capture_pane=AsyncMock(return_value=draft))
+        assert await updater.route_is_idle((1, 2, "@1"), "@1", tmux) is False
+
 
 class TestReassociateRouting:
     @pytest.mark.asyncio

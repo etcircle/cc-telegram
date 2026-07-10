@@ -695,3 +695,59 @@ class TestExitLogging:
         msg = _exit_records(caplog)[0].getMessage()
         assert "esc_sent=True" in msg
         assert "parse=ok" in msg
+
+
+# ── Ghost-suggestion pre-clean (CC 2.1.206 dim SGR-2 input-row suggestion) ──
+
+
+def _ghost_ansi_idle_pane() -> str:
+    """The real 2.1.206 ghost capture, ANSI verbatim, minus the ``· N shell``
+    token so the ghost text is the SOLE blocker before the pre-clean."""
+    raw = (_FIXTURES / "idle_ghost_input_row_v2.1.206.txt").read_text(encoding="utf-8")
+    return raw.replace("\x1b[38;5;246m · \x1b[38;5;44m1 shell", "")
+
+
+def _real_draft_ansi_pane() -> str:
+    """Same idle shape but a NORMAL-intensity (non-dim) draft after the prompt —
+    a genuine unsent draft the pre-clean must NOT blank (fail closed)."""
+    return _ghost_ansi_idle_pane().replace(
+        "\x1b[2mok fix it and let me know when I can test\x1b[0m",
+        "please run the tests",
+    )
+
+
+class TestGhostSuggestionPreClean:
+    @pytest.mark.asyncio
+    async def test_ghost_row_idle_pane_proceeds_to_overlay(self):
+        # The preflight sees the ANSI ghost-row pane; the pre-clean blanks the
+        # dim ghost so it reads idle and the overlay is sent (no refusal).
+        tmux = _make_tmux(pane_text=[_ghost_ansi_idle_pane(), _overlay_fixture()])
+        reply = await _run("cost_command", tmux)
+        # One preflight capture (idle) + one post-send capture.
+        assert tmux.capture_pane_cancellation_safe.await_count == 2
+        calls = tmux.send_keys.await_args_list
+        assert calls[0].args[1] == "/cost"
+        assert "Total cost:" in reply.call_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_ghost_preflight_captures_with_ansi(self):
+        tmux = _make_tmux(pane_text=[_ghost_ansi_idle_pane(), _overlay_fixture()])
+        await _run("cost_command", tmux)
+        first = tmux.capture_pane_cancellation_safe.await_args_list[0]
+        assert first.kwargs.get("with_ansi") is True
+
+    @pytest.mark.asyncio
+    async def test_real_draft_ansi_pane_still_refuses(self):
+        tmux = _make_tmux(pane_text=[_real_draft_ansi_pane()])
+        reply = await _run("cost_command", tmux)
+        # Positive hazard (input_not_empty) → exactly ONE capture, no keystroke.
+        assert tmux.capture_pane_cancellation_safe.await_count == 1
+        tmux.send_keys.assert_not_called()
+        assert "draft" in reply.call_args.args[1].lower()
+
+    @pytest.mark.asyncio
+    async def test_real_draft_ansi_exit_reason_input_not_empty(self, caplog):
+        tmux = _make_tmux(pane_text=[_real_draft_ansi_pane()])
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "input_not_empty")

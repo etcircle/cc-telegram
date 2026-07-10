@@ -3281,6 +3281,189 @@ def _is_rule_separator(line: str) -> bool:
     return bool(_RE_RULE_SEPARATOR.match(line.strip()))
 
 
+# A CSI (Control Sequence Introducer) escape sequence: ``ESC [ <params> <final>``.
+# The final byte is any char in the 0x40-0x7E range; SGR (styling) uses the ``m``
+# final. We match the general CSI so a non-SGR sequence (cursor moves, etc.) is
+# also consumed and stripped, and isolate SGR params for dim-state tracking.
+_RE_CSI = re.compile(r"\x1b\[([0-9;]*)([\x40-\x7e])")
+# Any remaining ESC-introduced sequence (non-CSI: OSC, single-char, etc.) — a
+# catch-all so ``clean_ghost_input_text`` returns text with EVERY escape removed.
+_RE_ANSI_ANY = re.compile(r"\x1b[\[\]][0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
+# The input-row prompt cursor glyphs ``pane_looks_idle`` accepts (kept in lockstep
+# with its ``s[0] not in (...)`` gate). A ghost-suggestion pre-clean only ever
+# rewrites a line whose visible content starts with one of these.
+_GHOST_PROMPT_GLYPHS: Final = ("❯", "›", ">")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ALL ANSI escape sequences, returning plain text.
+
+    Local (leaf-safe) strip — ``screenshot.py`` has a richer ANSI parser but it
+    imports PIL, which ``terminal_parser`` must not. Handles CSI sequences (the
+    common SGR/styling + cursor family) plus a catch-all for the rarer
+    ESC-introduced forms.
+    """
+    text = _RE_CSI.sub("", text)
+    return _RE_ANSI_ANY.sub("", text)
+
+
+def _sgr_updates_dim(params: str, dim: bool) -> bool:
+    """Fold one SGR parameter list into the running dim (SGR-2) state.
+
+    ``ESC[2m`` sets dim; ``ESC[0m`` (reset-all) and ``ESC[22m`` (normal
+    intensity) clear it. Colour / other SGR codes (e.g. ``39``, ``38;5;244``)
+    do NOT touch dim — a 256-colour selector (``38;5;N`` / ``48;5;N``) or a
+    truecolour selector (``38;2;R;G;B``) consumes its trailing sub-parameters
+    so a ``2`` inside ``38;5;2`` is never misread as the dim code.
+    """
+    # Empty param list ``ESC[m`` == ``ESC[0m`` (reset).
+    if params == "":
+        return False
+    parts = params.split(";")
+    i = 0
+    while i < len(parts):
+        code = parts[i]
+        if code in ("38", "48"):
+            # Extended colour selector — skip its sub-parameters so their
+            # digits can never be misread as intensity codes.
+            if i + 1 < len(parts) and parts[i + 1] == "5":
+                i += 3  # 38;5;N
+                continue
+            if i + 1 < len(parts) and parts[i + 1] == "2":
+                i += 5  # 38;2;R;G;B
+                continue
+            i += 1
+            continue
+        if code in ("0", ""):  # reset-all (a bare '' inside a list == 0)
+            dim = False
+        elif code == "2":
+            dim = True
+        elif code == "22":  # normal intensity
+            dim = False
+        i += 1
+    return dim
+
+
+def clean_ghost_input_text(ansi_text: str | None) -> str:
+    """Blank a DIM ghost-suggestion in the input row, then strip ANSI.
+
+    Claude Code (CC 2.1.206) renders a contextual GHOST suggestion inside the
+    idle input row — e.g. ``❯ ok fix it and let me know when I can test`` —
+    styled ENTIRELY DIM (SGR-2, ``ESC[2m…ESC[0m``). tmux plain capture returns
+    it as literal text, so ``pane_looks_idle``'s empty-input-row leg reads a
+    genuinely idle pane as a typed draft (``input_not_empty``) and ``/cost`` /
+    ``/update`` false-refuse. This pre-clean (fed an ANSI capture,
+    ``capture_pane(..., with_ansi=True)``) BLANKS the ghost text so the cleaned
+    plain text passes ``pane_looks_idle``.
+
+    Contract:
+      - Operates ONLY on input-row lines: the visible content (ANSI-stripped)
+        starts with a prompt glyph (``❯`` / ``›`` / ``>``). Every other line is
+        ANSI-stripped verbatim.
+      - The prompt-text region qualifies for blanking ONLY when EVERY visible
+        non-whitespace char after the glyph falls inside an ACTIVE dim (SGR-2)
+        region. If ANY such char is non-dim — a real typed draft, or a
+        dim/normal MIX — the line is left untouched (ANSI-stripped only), so the
+        idle gate FAILS CLOSED to today's refusal.
+      - Dim state is tracked as a running SGR state across the line
+        (``ESC[2m`` on — including combined forms like ``ESC[1;2m`` /
+        ``ESC[0;2m`` / ``ESC[38;5;244;2m``; ``ESC[0m`` / ``ESC[22m`` off;
+        colours do not clear it).
+      - Returns plain text (all ANSI removed) suitable for ``pane_looks_idle``.
+        A capture with no input row / no ANSI passes through equivalently
+        (ANSI-stripping is then a no-op).
+
+    EMPIRICAL BASIS (FIXTURE-PINNED on CC 2.1.206 — a documented TUI-drift
+    audit surface, alongside the /update ``pane_command_is_claude`` A.0 note):
+    dim is EXCLUSIVELY the ghost suggestion on this version. Probed live, both
+    input-row-with-real-text states render the typed text at DEFAULT intensity
+    with NO SGR-2: a draft typed WHILE Claude runs
+    (``ESC[38;5;246m❯ ESC[39m<text>``) and the SAME draft at rest after the
+    turn ended (``ESC[39m❯ <text>`` —
+    ``fixtures/idle_real_draft_input_row_v2.1.206.txt``), vs the ghost
+    (``ESC[39m❯ ESC[2m<text>ESC[0m`` —
+    ``fixtures/idle_ghost_input_row_v2.1.206.txt``). A FUTURE CC version that
+    renders a queued/real draft dim would make this blanking unsafe — the
+    failure mode is blanking a genuine draft and letting /cost type over it —
+    which is exactly why the fixture pin + this drift note exist: re-verify
+    both captures on the next TUI-drift audit before trusting the SGR-2
+    discriminator on a new version.
+
+    Pure, stdlib-only, leaf-safe. ``pane_looks_idle`` /
+    ``classify_pane_idle_failure`` are BYTE-UNTOUCHED — the pre-clean is applied
+    at the callsite before them.
+    """
+    if not ansi_text:
+        return ansi_text or ""
+    out_lines: list[str] = []
+    for raw_line in ansi_text.split("\n"):
+        out_lines.append(_clean_ghost_input_line(raw_line))
+    return "\n".join(out_lines)
+
+
+def _clean_ghost_input_line(raw_line: str) -> str:
+    """Clean ONE line: blank a fully-dim ghost after the prompt, then strip ANSI.
+
+    Returns the ANSI-stripped line. When the line is an input row whose entire
+    post-prompt text is dim, the text is replaced by nothing (a bare prompt +
+    single trailing space, preserving everything up to and including the glyph).
+    Otherwise the plain ANSI-stripped line is returned unchanged in content.
+    """
+    # Fast path: a line with NO escape byte at all is plain text — pass it
+    # through unchanged (stripping would be a no-op). Every ESC-carrying line
+    # runs through the SGR state machine below: a substring probe for the dim
+    # code is NOT safe — valid COMBINED forms (``ESC[1;2m``, ``ESC[0;2m``,
+    # ``ESC[38;5;244;2m``) carry dim without a literal ``ESC[2m`` byte shape,
+    # and mis-classifying them would leave the ghost visible → the very false
+    # refusal this helper exists to prevent (codex review P3).
+    if "\x1b" not in raw_line:
+        return raw_line
+
+    # Walk the raw line, tracking dim state, and classify each VISIBLE char.
+    dim = False
+    pos = 0
+    visible: list[tuple[str, bool]] = []  # (char, is_dim)
+    n = len(raw_line)
+    while pos < n:
+        if raw_line[pos] == "\x1b":
+            m = _RE_CSI.match(raw_line, pos)
+            if m is not None:
+                if m.group(2) == "m":  # SGR
+                    dim = _sgr_updates_dim(m.group(1), dim)
+                pos = m.end()
+                continue
+            m2 = _RE_ANSI_ANY.match(raw_line, pos)
+            if m2 is not None:
+                pos = m2.end()
+                continue
+            # A lone ESC with no recognized sequence — drop it, advance one.
+            pos += 1
+            continue
+        visible.append((raw_line[pos], dim))
+        pos += 1
+
+    plain = "".join(c for c, _ in visible)
+    stripped = plain.strip()
+    if not stripped or stripped[0] not in _GHOST_PROMPT_GLYPHS:
+        return plain  # not an input row → ANSI-stripped verbatim
+
+    # Find the glyph position in ``visible`` and inspect the text after it.
+    glyph_idx = next(i for i, (c, _) in enumerate(visible) if not c.isspace())
+    after = visible[glyph_idx + 1 :]
+    non_ws_after = [(c, d) for c, d in after if not c.isspace()]
+    if not non_ws_after:
+        return plain  # bare prompt already → nothing to blank
+    if not all(d for _, d in non_ws_after):
+        # A real draft or a dim/normal MIX → leave the text (fail closed).
+        return plain
+    # Every visible non-whitespace char after the prompt is dim → ghost. Blank
+    # the text, preserving everything up to and including the prompt glyph plus
+    # a single trailing space so the row reads ``❯ `` (empty input box).
+    prefix = "".join(c for c, _ in visible[: glyph_idx + 1])
+    return prefix + " "
+
+
 def pane_looks_idle(visible_pane: str | None) -> bool:
     """Ground-truth cross-check that a pane is idle at an EMPTY input box.
 

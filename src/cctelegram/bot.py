@@ -744,6 +744,7 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
 
     from .terminal_parser import (
         classify_pane_idle_failure,
+        clean_ghost_input_text,
         extract_interactive_content,
         pane_looks_idle,
         parse_usage_output,
@@ -817,8 +818,18 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
             async def _preflight() -> str | None:
                 last_leg = "capture_failed"
                 for attempt in range(_PREFLIGHT_MAX_RETRIES + 1):
-                    pane = await tmux_manager.capture_pane_cancellation_safe(
-                        w.window_id
+                    # Capture WITH ANSI so the idle-row ghost-suggestion
+                    # pre-clean can discriminate CC 2.1.206's dim (SGR-2)
+                    # ghost text from a real typed draft (see
+                    # ``clean_ghost_input_text``); a plain capture reads the
+                    # ghost as ``input_not_empty`` and false-refuses.
+                    raw_pane = await tmux_manager.capture_pane_cancellation_safe(
+                        w.window_id, with_ansi=True
+                    )
+                    pane = (
+                        clean_ghost_input_text(raw_pane)
+                        if raw_pane is not None
+                        else None
                     )
                     if pane is None:
                         # A tmux capture FAILURE (subprocess error) — distinct
