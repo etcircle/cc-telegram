@@ -547,6 +547,11 @@ class MintedCard:
     # (button_label, callback_data) — the label is CLIPPED to ≤64 chars.
     rows: list[tuple[str, str]] = field(default_factory=list)
     overflow: int = 0
+    # The artifacts ACTUALLY minted into buttons (== rows, 1:1, in order) —
+    # observability correlation ONLY (round-1 hermes P2: the caller must log
+    # exactly what was minted, never the full resolved list, and never
+    # absolute paths — it logs these rows' relative display names).
+    minted: list[Artifact] = field(default_factory=list)
 
 
 _rows: dict[str, ArtifactRow] = {}
@@ -604,7 +609,7 @@ def mint(
                 checked_callback_data(f"{CB_DOWNLOAD_FILE}{window_id}:{token}"),
             )
         )
-    return MintedCard(rows=rows, overflow=len(fresh) - len(head))
+    return MintedCard(rows=rows, overflow=len(fresh) - len(head), minted=list(head))
 
 
 def lookup(token: str) -> ArtifactRow | None:

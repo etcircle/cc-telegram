@@ -56,7 +56,18 @@ class TestForwardCommand:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "cmd", ["/memory", "/help", "/memory@botname", "/help extra"]
+        "cmd",
+        [
+            "/memory",
+            "/help",
+            "/memory@botname",
+            "/help extra",
+            # Case-insensitive (round-1 codex P2): Claude Code's command lookup
+            # is case-insensitive, so /Memory reopens the same blocking panel.
+            "/Memory@MyBot",
+            "/HELP@botname",
+            "/MEMORY",
+        ],
     )
     async def test_tui_overlay_blocklist_refuses_and_does_not_forward(self, cmd):
         """A known interceptor-less TUI panel (/memory, /help) is blocked, not forwarded."""
@@ -88,9 +99,11 @@ class TestForwardCommand:
             assert "/screenshot" in notice
 
     @pytest.mark.asyncio
-    async def test_non_blocklisted_command_still_forwards(self):
-        """A command that is neither bot-owned nor blocklisted forwards normally."""
-        update = _make_update("/compact")
+    @pytest.mark.parametrize("cmd", ["/compact", "/Compact"])
+    async def test_non_blocklisted_command_still_forwards(self, cmd):
+        """A command that is neither bot-owned nor blocklisted forwards normally —
+        including mixed-case (the casefold must not widen the blocklist)."""
+        update = _make_update(cmd)
         context = _make_context()
 
         with (
@@ -109,7 +122,8 @@ class TestForwardCommand:
 
             await forward_command_handler(update, context)
 
-            mock_sm.send_to_window.assert_called_once_with("@5", "/compact")
+            # Forwarded verbatim (original casing preserved on the wire).
+            mock_sm.send_to_window.assert_called_once_with("@5", cmd)
 
     @pytest.mark.asyncio
     async def test_bot_mention_preserves_args(self):

@@ -575,9 +575,23 @@ async def test_usage_normal_transaction_under_lock_reply_after_release() -> None
     tmux, locked_during_send = _make_bot_tmux(lock)
     locked_during_capture: list[bool] = []
 
+    # The round-1 P1 flow: capture #1 is the idle PREFLIGHT (must show a
+    # genuinely idle frame or nothing is typed), capture #2 is the post-settle
+    # overlay read (must show the overlay chrome or no Escape is sent). Both
+    # run UNDER the lock.
+    _sep = "─" * 56
+    idle_pane = (
+        f"✻ Cooked for 2s\n\n{_sep}\n❯\n{_sep}\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+    overlay_pane = (
+        Path(__file__).parent.parent / "fixtures" / "cost_overlay_live_v2.1.206.txt"
+    ).read_text()
+    captures = [idle_pane, overlay_pane]
+
     async def _capture(*args: Any, **kwargs: Any) -> str:
         locked_during_capture.append(lock.locked())
-        return "raw usage pane"
+        return captures.pop(0)
 
     tmux.capture_pane = AsyncMock(side_effect=_capture)
     locked_during_reply: list[bool] = []
@@ -590,13 +604,13 @@ async def test_usage_normal_transaction_under_lock_reply_after_release() -> None
         from cctelegram.bot import usage_command
 
         await usage_command(_make_update(), MagicMock())
-    # send /usage + dismiss Escape + the capture all ran UNDER the lock …
+    # send /usage + dismiss Escape + BOTH captures all ran UNDER the lock …
     assert tmux.send_keys.await_count == 2
     assert locked_during_send == [True, True]
-    assert locked_during_capture == [True]
+    assert locked_during_capture == [True, True]
     # … and the usage output was presented strictly AFTER release.
     safe_reply_mock.assert_awaited_once()
-    assert "raw usage pane" in safe_reply_mock.call_args.args[1]
+    assert "Total cost:" in safe_reply_mock.call_args.args[1]
     assert locked_during_reply == [False]
     assert not lock.locked()
 
