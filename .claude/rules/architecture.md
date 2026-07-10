@@ -239,7 +239,47 @@ Additional modules:
                                 max_event_ts activity — is STRICTLY newer;
                                 missing record / no resumed_event_ts /
                                 unparseable end_turn ts all fail closed to
-                                DONE]).
+                                DONE]. GH #46: a TEAMMATE source (an agent-teams
+                                teammate's park / idle_notification — the ONLY
+                                close signal for a teammate leg that ends in
+                                plain text, no sidechain end-of-turn + no
+                                <task-notification>) SHARES the SIDECHAIN
+                                resume ts-gate PLUS (r2, a documented plan
+                                amendment) a TEAMMATE-only stale-vs-activity
+                                gate: a PARSEABLE park strictly older than the
+                                record's own last_event_ts is SUPPRESSED (a
+                                redelivered old park must not tombstone a
+                                working teammate mid-leg / strand the
+                                genuinely-final park); a tie tombstones
+                                (dark-safe), unparseable/missing-record
+                                tombstones — SIDECHAIN byte-untouched).
+                                GH #46 PR-2 (teammates as first-class bg keys)
+                                adds ZERO new route_runtime mutators — the
+                                session_monitor generational teammate registry
+                                (_TeammateRec) drives the EXISTING resumed (r7
+                                item 3: EVERY bind relights via the tombstone-
+                                popping resumed lane, never launched — the
+                                monitor can't see route_runtime tombstones, so
+                                only the popping lane is uniformly safe; r8
+                                item 1: the resume ts is floored at
+                                min(spawned_ts, first_entry_ts) - ε, below the
+                                bound file's OWN first entry, so a look-alike's
+                                pre-spawn trailing end_turn isn't shielded) /
+                                resumed (wake, generation-filtered AND — r9
+                                item 2 — universally orphan-retained RAW so a
+                                stashed next-gen wake is never spent on the
+                                bound old gen) /
+                                TEAMMATE-done (park, universally orphan-retained
+                                — r8 item 2 → r9 item 1 → r10 item 1: the
+                                32-name buffer's at-cap eviction is three-tier
+                                oldest-first keyed on the DRAIN FILTER's own
+                                semantics — tier 1 evicts a REDUNDANT entry
+                                (drain would generation-drop it), tier 2 a
+                                SPECULATIVE one (has a rec, no stashed spawn —
+                                same-gen noise), tier 3 (last resort) a PROVABLE
+                                one (no rec, or a stashed next-gen spawn — the
+                                pending gen's only close)) marks; see
+                                message-handling.md.
                                 Clears: done / a PER-KEY wall-clock heartbeat
                                 TTL (_wall_now(), expire-before-classify) —
                                 T2 split: foreground-presumed keys age by
@@ -252,7 +292,12 @@ Additional modules:
                                 mark_notification_pending commits on
                                 stored-idle + live bg key (🔔 outranks the
                                 lift). Task-notification user events
-                                (is_task_notification, adapter-stamped)
+                                (is_task_notification, adapter-stamped) — and
+                                (GH #46) agent-teams teammate user events
+                                (is_teammate_notification, via
+                                utils.is_teammate_message) which ride the SAME
+                                machine-initiated branch (clear reason
+                                TEAMMATE_NOTIFICATION) —
                                 preserve tombstones/pane-bit/stash, clear the
                                 notification bit ts-qualified, and re-derive
                                 with preserved gates — and (T1.3) PRESERVE the

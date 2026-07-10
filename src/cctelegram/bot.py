@@ -1045,6 +1045,23 @@ async def apply_sidechain_activity(
             if route in seen_routes:
                 continue
             seen_routes.add(route)
+            # GH #46 PR-2 r3 P1: registration RETRACTION dones — applied FIRST
+            # (the causal order for one record is retraction → resumed →
+            # activity → genuine parks: registration precedes bind precedes leg
+            # activity). An unconditional TEAMMATE done (end_turn_ts_unparseable
+            # bypasses the resume/stale gates by design — the same effect the
+            # synthetic unparseable park had, zero new RouteRuntime mutators);
+            # riding a DISTINCT slot so a same-tick bind's resumed relight is
+            # applied AFTER it and nets LIVE even if the monitor-side cancel was
+            # missed (belt to _bind_teammate_key's cancel).
+            for key in rec.retraction_dones:
+                await route_runtime.mark_background_agent_done(
+                    route,
+                    key,
+                    source=route_runtime.BgDoneSource.TEAMMATE,
+                    end_turn_ts=None,
+                    end_turn_ts_unparseable=True,
+                )
             for key in rec.launched:
                 # PR-1 Half B: seed an IDLE _RouteState if the parent route is
                 # unseeded (the restart reconciler's relit ``wf-task:`` keys land
@@ -1092,6 +1109,19 @@ async def apply_sidechain_activity(
                         end_turn_ts=tick.max_end_turn_ts,
                         end_turn_ts_unparseable=tick.end_turn_ts_unparseable,
                     )
+            # GH #46 PR-1: agent-teams teammate parks — a teammate leg ends in
+            # plain text (no sidechain end-of-turn, no <task-notification>), so
+            # its parent-transcript idle_notification is the ONLY close signal.
+            # Applied BEFORE the parent-done loop, sharing the SIDECHAIN cross-file
+            # ts-gate (a stale prior-leg park keeps a resumed key LIVE).
+            for key, (park_ts, park_ts_unparseable) in rec.teammate_parks.items():
+                await route_runtime.mark_background_agent_done(
+                    route,
+                    key,
+                    source=route_runtime.BgDoneSource.TEAMMATE,
+                    end_turn_ts=park_ts,
+                    end_turn_ts_unparseable=park_ts_unparseable,
+                )
             for key in rec.completed:
                 # Fix C: PARENT-source done (<task-notification>) — same file as
                 # the resume, so the monitor already net-resolved a same-batch

@@ -264,3 +264,38 @@ def test_assistant_text_is_never_stamped():
     )
     assert out is not None
     assert out.is_task_notification is False
+
+
+# ── GH #46: is_teammate_notification stamping ───────────────────────────
+
+_TEAMMATE_TEXT = (
+    "Another Claude session sent a message:\n"
+    '<teammate-message teammate_id="peer" color="green">\n'
+    '{"type":"idle_notification","from":"peer",'
+    '"timestamp":"2026-07-09T15:00:48.197Z","idleReason":"available"}\n'
+    "</teammate-message>\n\ntrailing safety prose"
+)
+
+
+def test_teammate_message_user_event_is_stamped():
+    """The teammate flag must be derivable from a RAW TranscriptEvent through
+    the adapter (mirrors the task-notification stamp test)."""
+    out = transcript_event_adapter.to_lifecycle_event(_user_text_event(_TEAMMATE_TEXT))
+    assert out is not None
+    assert out.is_teammate_notification is True
+    # It is NOT a task-notification — the two lanes are disjoint.
+    assert out.is_task_notification is False
+
+
+def test_ordinary_user_text_is_not_teammate_stamped():
+    out = transcript_event_adapter.to_lifecycle_event(_user_text_event("hi there"))
+    assert out is not None
+    assert out.is_teammate_notification is False
+
+
+def test_assistant_text_is_never_teammate_stamped():
+    out = transcript_event_adapter.to_lifecycle_event(
+        _event(role="assistant", block_type="text")
+    )
+    assert out is not None
+    assert out.is_teammate_notification is False

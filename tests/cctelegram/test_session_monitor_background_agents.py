@@ -15,7 +15,12 @@ import os
 
 import pytest
 
-from cctelegram.session_monitor import SessionInfo, SessionMonitor, TrackedSession
+from cctelegram.session_monitor import (
+    ParentSidechainActivity,
+    SessionInfo,
+    SessionMonitor,
+    TrackedSession,
+)
 from cctelegram.utils import parse_iso_timestamp
 
 PARENT = "parent-sid"
@@ -1663,3 +1668,317 @@ async def test_bg_bash_prose_in_non_bash_tool_result_never_warns(
     assert not any(
         "backgroundTaskId is absent/malformed" in r.message for r in caplog.records
     )
+
+
+# ── GH #46 PR-1: teammate idle_notification park-close arm ────────────────
+#
+# A teammate ``idle_notification`` user entry on the PARENT transcript names a
+# teammate that maps to one (or more) currently-tracked sidechain stem(s)
+# ``sub:<parent>:agent-a<name>-<hex>``. The arm records ``teammate_parks[key] =
+# (park_ts, unparseable)`` for every matching stem so the bot fan-out can
+# tombstone the background key (a teammate leg ends in plain text with
+# stop_reason=None → the sidechain-done detector never fires).
+
+from pathlib import Path  # noqa: E402
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _teammate_text(idx: int) -> str:
+    line = (
+        (_FIXTURES / "teammate_idle_notification_v2.1.197.jsonl")
+        .read_text()
+        .splitlines()[idx]
+    )
+    return json.loads(line)["message"]["content"]
+
+
+def _track_stem(monitor, stem: str, parent: str = PARENT) -> None:
+    monitor.state.update_session(
+        TrackedSession(
+            session_id=f"sub:{parent}:{stem}",
+            file_path="/nonexistent-phantom",
+            last_byte_offset=0,
+            parent_session_id=parent,
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("idx", "expected_ts_iso"),
+    [
+        (1, "2026-07-09T15:55:48.387Z"),  # bare variant
+        (2, "2026-07-09T15:56:41.351Z"),  # with-summary variant (1st envelope)
+    ],
+)
+async def test_teammate_arm_records_park_for_tracked_stem(
+    monitor, tmp_path, make_jsonl_entry, idx, expected_ts_iso
+):
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(idx), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    key = "askill-inventory-1a048f189108dc46"
+    assert key in activity[PARENT].teammate_parks
+    park_ts, unparseable = activity[PARENT].teammate_parks[key]
+    assert unparseable is False
+    assert park_ts == parse_iso_timestamp(expected_ts_iso)
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_multi_envelope_entry_parks_both_teammates(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """Review P1 (REAL-DATA VERIFIED): ONE parent entry carries TWO envelopes
+    (the live 15:56:55.336Z entry); the SECOND teammate's park is its ONLY
+    close signal (its leg ends stop_reason=None), so dropping it reproduces
+    the 2 h strand. With BOTH stems tracked, BOTH keys must get parks with
+    their OWN per-envelope timestamps."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    _track_stem(monitor, "agent-aexplore-skill-dispatch-23a8cdc461b7635f")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(2), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    parks = monitor.pop_sidechain_activity()[PARENT].teammate_parks
+    k1 = "askill-inventory-1a048f189108dc46"
+    k2 = "aexplore-skill-dispatch-23a8cdc461b7635f"
+    assert set(parks) == {k1, k2}
+    assert parks[k1] == (parse_iso_timestamp("2026-07-09T15:56:41.351Z"), False)
+    assert parks[k2] == (parse_iso_timestamp("2026-07-09T15:56:45.564Z"), False)
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_ignores_nested_workflow_stems(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """hermes P3: the park mapping matches TOP-LEVEL stems only
+    (``sub:<parent>:agent-…``). A nested Fix-5 Workflow display key
+    (``sub:<parent>:<runid>:agent-…``) must NEVER receive a park — a Workflow
+    sub-agent's close is the ``wf-task:`` bracket, not a teammate park."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    monitor.state.update_session(
+        TrackedSession(
+            session_id=f"sub:{PARENT}:wf_r1:agent-askill-inventory-1a048f189108dc46",
+            file_path="/nonexistent-phantom",
+            last_byte_offset=0,
+            parent_session_id=PARENT,
+        )
+    )
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(1), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    parks = activity[PARENT].teammate_parks if PARENT in activity else {}
+    assert parks == {}
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_zero_matching_stems_is_noop(
+    monitor, tmp_path, make_jsonl_entry
+):
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    # A tracked stem for a DIFFERENT teammate name — no match for skill-inventory.
+    _track_stem(monitor, "agent-aexplore-turn-cache-5c243a231ef07300")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(1), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    parks = activity[PARENT].teammate_parks if PARENT in activity else {}
+    assert parks == {}
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_closes_all_same_name_stems(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """PR-1 documented safe degradation: a name matching MULTIPLE tracked stems
+    closes ALL of them."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    _track_stem(monitor, "agent-askill-inventory-deadbeefcafe0001")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(1), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    parks = activity[PARENT].teammate_parks
+    assert set(parks) == {
+        "askill-inventory-1a048f189108dc46",
+        "askill-inventory-deadbeefcafe0001",
+    }
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_rejects_non_hex_suffix_stem(
+    monitor, tmp_path, make_jsonl_entry
+):
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    # Suffix contains 'z'/uppercase — not pure lowercase hex 8-32 → no match.
+    _track_stem(monitor, "agent-askill-inventory-zzzzzzzz")
+    _track_stem(monitor, "agent-askill-inventory-DEADBEEF")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(1), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    parks = activity[PARENT].teammate_parks if PARENT in activity else {}
+    assert parks == {}
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_does_not_disturb_task_notification_arm(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """The two arms are mutually exclusive by prefix — a <task-notification>
+    still records completed and NEVER a teammate park."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    notif = (
+        "<task-notification>\n<task-id>abc123def456</task-id>\n"
+        "<status>completed</status>\n</task-notification>"
+    )
+    _append(parent_jsonl, [make_jsonl_entry("user", notif, session_id=PARENT)])
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    assert activity[PARENT].completed == {"abc123def456"}
+    assert activity[PARENT].teammate_parks == {}
+
+
+# ── GH #46 r2: causal per-key park merge + the causally-final park fixture ──
+#
+# BOTH engines converged (r2 P2): ``teammate_parks[key] = …`` was
+# last-write-wins — an unparseable park's unconditional-tombstone evidence
+# could be discarded by a later parseable one (Hermes), and an older park
+# could bury the newer one whose ts is the only one clearing the
+# route_runtime stale/resume gates (Codex). The merge is a CAUSAL REDUCTION:
+# unparseable dominates the key permanently within the tick record; otherwise
+# max(park_ts) wins.
+
+
+def test_merge_unparseable_dominates():
+    """Hermes r2 repro: (None, True) then (10.0, False) — the unconditional-
+    tombstone evidence must NOT be discarded by a later parseable park."""
+    rec = ParentSidechainActivity()
+    rec.merge_teammate_park("k", None, True)
+    rec.merge_teammate_park("k", 10.0, False)
+    assert rec.teammate_parks["k"] == (None, True)
+
+
+def test_merge_unparseable_after_parseable_dominates():
+    rec = ParentSidechainActivity()
+    rec.merge_teammate_park("k", 100.0, False)
+    rec.merge_teammate_park("k", None, True)
+    assert rec.teammate_parks["k"] == (None, True)
+
+
+def test_merge_keeps_max_parseable_ts():
+    """Codex r2 repro: parks ts 200 then 100 (vs a resume at 150) —
+    last-write-wins retained only 100 → suppressed as stale → the key was
+    wrongly left live though the 200 park should close it. Max wins."""
+    rec = ParentSidechainActivity()
+    rec.merge_teammate_park("k", 200.0, False)
+    rec.merge_teammate_park("k", 100.0, False)
+    assert rec.teammate_parks["k"] == (200.0, False)
+    rec.merge_teammate_park("k", 300.0, False)
+    assert rec.teammate_parks["k"] == (300.0, False)
+
+
+def _idle_payload(name: str, ts: str | None) -> str:
+    d: dict = {"type": "idle_notification", "from": name, "idleReason": "available"}
+    if ts is not None:
+        d["timestamp"] = ts
+    return json.dumps(d)
+
+
+def _mk_teammate_entry(*payloads: str) -> str:
+    parts = ["Another Claude session sent a message:"]
+    for p in payloads:
+        parts.append('<teammate-message teammate_id="x" color="red">')
+        parts.append(p)
+        parts.append("</teammate-message>")
+        parts.append("")
+    parts.append("trailing safety prose")
+    return "\n".join(parts)
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_same_entry_two_parks_merge_causal_max(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """ONE entry carrying TWO parks for the SAME teammate (later envelope
+    OLDER) merges to the causal max, never last-write-wins."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    newer = "2026-07-09T15:00:10.000Z"
+    older = "2026-07-09T15:00:00.000Z"
+    text = _mk_teammate_entry(
+        _idle_payload("skill-inventory", newer),
+        _idle_payload("skill-inventory", older),
+    )
+    _append(parent_jsonl, [make_jsonl_entry("user", text, session_id=PARENT)])
+    await monitor.check_for_updates({PARENT})
+    parks = monitor.pop_sidechain_activity()[PARENT].teammate_parks
+    key = "askill-inventory-1a048f189108dc46"
+    assert parks[key] == (parse_iso_timestamp(newer), False)
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_cross_entry_same_tick_unparseable_dominates(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """TWO entries in one poll batch: an unparseable park (no timestamp) then
+    a parseable one — the unconditional-tombstone evidence survives the tick
+    (cross-entry merge, same causal reduction)."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-askill-inventory-1a048f189108dc46")
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "user",
+                _mk_teammate_entry(_idle_payload("skill-inventory", None)),
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                _mk_teammate_entry(
+                    _idle_payload("skill-inventory", "2026-07-09T15:00:10.000Z")
+                ),
+                session_id=PARENT,
+            ),
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    parks = monitor.pop_sidechain_activity()[PARENT].teammate_parks
+    assert parks["askill-inventory-1a048f189108dc46"] == (None, True)
+
+
+@pytest.mark.asyncio
+async def test_teammate_arm_final_park_fixture_records_causal_close(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """Fixture line 3 is the CAUSALLY-FINAL park (park #2, inner ts
+    15:58:10.253Z — strictly newer than the sidechain leg's last write
+    15:58:10.097Z), so the fixture proves causal close, not accidental
+    close (r2)."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    _track_stem(monitor, "agent-aexplore-skill-dispatch-23a8cdc461b7635f")
+    _append(
+        parent_jsonl, [make_jsonl_entry("user", _teammate_text(3), session_id=PARENT)]
+    )
+    await monitor.check_for_updates({PARENT})
+    parks = monitor.pop_sidechain_activity()[PARENT].teammate_parks
+    park_ts, unparseable = parks["aexplore-skill-dispatch-23a8cdc461b7635f"]
+    assert unparseable is False
+    assert park_ts == parse_iso_timestamp("2026-07-09T15:58:10.253Z")
+    last_write = parse_iso_timestamp("2026-07-09T15:58:10.097Z")
+    assert last_write is not None and park_ts is not None
+    assert park_ts > last_write  # the causal-close provenance
