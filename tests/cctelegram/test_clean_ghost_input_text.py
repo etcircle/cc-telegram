@@ -69,6 +69,38 @@ def test_uncleaned_ghost_pane_reads_not_empty_without_the_fix():
 
 # ── (b) a real typed draft is left untouched → still refuses ────────────────
 
+# The REAL 2.1.206 at-rest draft capture (raw ANSI, escapes verbatim): a typed
+# unsent draft renders at DEFAULT intensity — ``ESC[39m❯ RIGTEST dim probe do
+# not send`` — with NO SGR-2 anywhere; the mid-run probe of the same draft
+# rendered ``ESC[38;5;246m❯ ESC[39m<text>``, also non-dim. Empirical proof that
+# on 2.1.206 dim is EXCLUSIVELY the ghost suggestion (codex P2 evidence).
+REAL_DRAFT_FIXTURE = (FIX / "idle_real_draft_input_row_v2.1.206.txt").read_text(
+    encoding="utf-8"
+)
+
+
+def test_real_draft_fixture_row_is_never_blanked():
+    cleaned = clean_ghost_input_text(REAL_DRAFT_FIXTURE)
+    # The typed draft text survives verbatim on the prompt row.
+    assert "RIGTEST dim probe do not send" in cleaned
+    prompt_rows = [ln for ln in cleaned.split("\n") if ln.strip().startswith("❯")]
+    assert prompt_rows and "RIGTEST" in prompt_rows[0]
+    # And the idle gate still refuses on the draft.
+    assert classify_pane_idle_failure(cleaned) == "input_not_empty"
+    assert pane_looks_idle(cleaned) is False
+
+
+def test_real_draft_fixture_without_running_status_line_still_refuses():
+    # Drop the spinner/status first line (`✻ Sautéed … 1 shell still running`)
+    # so the draft row is evaluated in a fully at-rest pane shape.
+    lines = REAL_DRAFT_FIXTURE.split("\n")
+    at_rest = "\n".join(ln for ln in lines if "Sautéed" not in ln)
+    assert "Sautéed" not in at_rest  # the variant actually removed the line
+    cleaned = clean_ghost_input_text(at_rest)
+    assert "RIGTEST dim probe do not send" in cleaned
+    assert classify_pane_idle_failure(cleaned) == "input_not_empty"
+    assert pane_looks_idle(cleaned) is False
+
 
 def _draft_pane(text: str) -> str:
     # A normal-intensity (NON-dim) draft after the prompt, otherwise an
@@ -128,6 +160,43 @@ def test_reset_all_zero_ends_dim():
     line = "\x1b[39m❯ \x1b[2mghost \x1b[0mreal"
     cleaned = clean_ghost_input_text(line)
     assert "real" in cleaned and "ghost" in cleaned
+
+
+# ── (d2) COMBINED SGR forms must reach the state machine (codex P3) ─────────
+# A substring probe for ``ESC[2m`` misses valid combined parameter lists; the
+# helper must classify these as dim and blank the ghost.
+
+
+def test_combined_bold_dim_1_2m_classifies_dim():
+    line = "\x1b[39m❯ \x1b[1;2mghost suggestion\x1b[0m"
+    assert clean_ghost_input_text(line).strip() == "❯"
+
+
+def test_combined_reset_then_dim_0_2m_applies_dim():
+    # ``0;2`` = reset-all THEN dim → dim is active for the following text.
+    line = "\x1b[39m❯ \x1b[0;2mghost suggestion\x1b[0m"
+    assert clean_ghost_input_text(line).strip() == "❯"
+
+
+def test_combined_color_then_dim_38_5_244_2m_classifies_dim():
+    # A 256-colour selector followed by dim in ONE param list — the selector's
+    # sub-params are consumed, then the trailing ``2`` applies dim.
+    line = "\x1b[39m❯ \x1b[38;5;244;2mghost suggestion\x1b[0m"
+    assert clean_ghost_input_text(line).strip() == "❯"
+
+
+def test_combined_reset_then_22_stays_normal_intensity():
+    # ``0;22`` nets normal intensity — following text is NON-dim → untouched.
+    line = "\x1b[39m❯ \x1b[2m\x1b[0;22mreal draft text"
+    cleaned = clean_ghost_input_text(line)
+    assert "real draft text" in cleaned
+
+
+def test_dim_then_combined_clear_2_22m_ends_dim():
+    # A single list that sets then clears (``2;22``) nets NON-dim.
+    line = "\x1b[39m❯ \x1b[2;22mreal draft text"
+    cleaned = clean_ghost_input_text(line)
+    assert "real draft text" in cleaned
 
 
 # ── (e) no input row / no ANSI passes through equivalently ─────────────────

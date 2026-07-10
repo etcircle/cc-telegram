@@ -3367,10 +3367,28 @@ def clean_ghost_input_text(ansi_text: str | None) -> str:
         dim/normal MIX — the line is left untouched (ANSI-stripped only), so the
         idle gate FAILS CLOSED to today's refusal.
       - Dim state is tracked as a running SGR state across the line
-        (``ESC[2m`` on; ``ESC[0m`` / ``ESC[22m`` off; colours do not clear it).
+        (``ESC[2m`` on — including combined forms like ``ESC[1;2m`` /
+        ``ESC[0;2m`` / ``ESC[38;5;244;2m``; ``ESC[0m`` / ``ESC[22m`` off;
+        colours do not clear it).
       - Returns plain text (all ANSI removed) suitable for ``pane_looks_idle``.
         A capture with no input row / no ANSI passes through equivalently
         (ANSI-stripping is then a no-op).
+
+    EMPIRICAL BASIS (FIXTURE-PINNED on CC 2.1.206 — a documented TUI-drift
+    audit surface, alongside the /update ``pane_command_is_claude`` A.0 note):
+    dim is EXCLUSIVELY the ghost suggestion on this version. Probed live, both
+    input-row-with-real-text states render the typed text at DEFAULT intensity
+    with NO SGR-2: a draft typed WHILE Claude runs
+    (``ESC[38;5;246m❯ ESC[39m<text>``) and the SAME draft at rest after the
+    turn ended (``ESC[39m❯ <text>`` —
+    ``fixtures/idle_real_draft_input_row_v2.1.206.txt``), vs the ghost
+    (``ESC[39m❯ ESC[2m<text>ESC[0m`` —
+    ``fixtures/idle_ghost_input_row_v2.1.206.txt``). A FUTURE CC version that
+    renders a queued/real draft dim would make this blanking unsafe — the
+    failure mode is blanking a genuine draft and letting /cost type over it —
+    which is exactly why the fixture pin + this drift note exist: re-verify
+    both captures on the next TUI-drift audit before trusting the SGR-2
+    discriminator on a new version.
 
     Pure, stdlib-only, leaf-safe. ``pane_looks_idle`` /
     ``classify_pane_idle_failure`` are BYTE-UNTOUCHED — the pre-clean is applied
@@ -3392,10 +3410,15 @@ def _clean_ghost_input_line(raw_line: str) -> str:
     single trailing space, preserving everything up to and including the glyph).
     Otherwise the plain ANSI-stripped line is returned unchanged in content.
     """
-    # Fast path: a line with no dim escape at all can never carry a ghost — just
-    # strip. (A real draft has no ``ESC[2m`` either, so it also lands here.)
-    if "\x1b[2m" not in raw_line and "\x1b[2;" not in raw_line:
-        return _strip_ansi(raw_line)
+    # Fast path: a line with NO escape byte at all is plain text — pass it
+    # through unchanged (stripping would be a no-op). Every ESC-carrying line
+    # runs through the SGR state machine below: a substring probe for the dim
+    # code is NOT safe — valid COMBINED forms (``ESC[1;2m``, ``ESC[0;2m``,
+    # ``ESC[38;5;244;2m``) carry dim without a literal ``ESC[2m`` byte shape,
+    # and mis-classifying them would leave the ghost visible → the very false
+    # refusal this helper exists to prevent (codex review P3).
+    if "\x1b" not in raw_line:
+        return raw_line
 
     # Walk the raw line, tracking dim state, and classify each VISIBLE char.
     dim = False
