@@ -475,21 +475,223 @@ class TestCacheTTLInBusyCard:
         assert "20%" in body
 
 
+# ── P1 pin: the classifier NEVER authorizes — pane_looks_idle decides ──────
+
+
+class TestClassifierNeverAuthorizes:
+    @pytest.mark.asyncio
+    async def test_drifted_classifier_none_on_busy_pane_never_sends(self):
+        """review r1 P1: a classifier that (wrongly) names no failing leg on a
+        NOT-idle pane must never permit injection — authorization is
+        ``pane_looks_idle`` alone; the classifier only labels."""
+        tmux = _make_tmux(pane_text=[BUSY_PANE, BUSY_PANE, BUSY_PANE])
+        with patch(
+            "cctelegram.terminal_parser.classify_pane_idle_failure",
+            return_value=None,  # simulated drift: names NO failing leg
+        ):
+            reply = await _run("cost_command", tmux)
+        # The authority (pane_looks_idle) said not-idle → zero keystrokes,
+        # fail-closed to the indeterminate fallback.
+        tmux.send_keys.assert_not_called()
+        reply.assert_awaited_once()
+
+
+# ── P2 pin: genuine caller cancellation PROPAGATES (never a fallback) ──────
+
+
+class TestCancellationPropagates:
+    @pytest.mark.asyncio
+    async def test_caller_cancel_mid_preflight_propagates(self):
+        """review r1 P2: only the wait_for DEADLINE classifies as
+        capture_timeout — a genuine shutdown/caller cancellation must
+        propagate, never be swallowed into a normal fallback reply."""
+
+        async def _hang(*_a, **_kw):
+            await asyncio.Event().wait()
+
+        tmux = _make_tmux()
+        tmux.capture_pane_cancellation_safe = AsyncMock(side_effect=_hang)
+        update = _make_update()
+        context = _make_context()
+        safe_reply_mock = AsyncMock()
+        snap = MagicMock()
+        snap.context_usage = None
+        with (
+            patch(_PATCH_ALLOWED, return_value=True),
+            patch(_PATCH_THREAD, return_value=42),
+            patch(_PATCH_SM) as mock_sm,
+            patch(_PATCH_TMUX, tmux),
+            patch(_PATCH_REPLY, safe_reply_mock),
+            patch("cctelegram.bot.route_runtime.snapshot", return_value=snap),
+            patch("cctelegram.bot.peek_session_id_for_window", return_value=None),
+        ):
+            mock_sm.resolve_window_for_thread.return_value = "@1"
+            from cctelegram import bot as bot_module
+
+            task = asyncio.create_task(bot_module.cost_command(update, context))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # No fallback reply was sent — the cancellation propagated.
+        safe_reply_mock.assert_not_awaited()
+
+
+# ── capture_failed vs chrome_indeterminate classification (review r1 P2) ───
+
+
+class TestCaptureFailedClassification:
+    @pytest.mark.asyncio
+    async def test_all_none_captures_classify_capture_failed(self, caplog):
+        # A None capture is a tmux FAILURE — distinct from the empty/mid-redraw
+        # chrome-indeterminate class, in both the log reason and the copy.
+        tmux = _make_tmux(pane_text=[None, None, None])
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            reply = await _run("cost_command", tmux)
+        recs = _exit_records(caplog)
+        assert len(recs) == 1
+        assert "reason=capture_failed" in recs[0].getMessage()
+        tmux.send_keys.assert_not_called()
+        # The capture_failed action copy, NOT the chrome-indeterminate line.
+        body = reply.call_args.args[1]
+        assert "try again in a moment" in body.lower()
+        assert "cleanly" not in body.lower()
+
+    @pytest.mark.asyncio
+    async def test_all_midredraw_frames_classify_chrome_indeterminate(self, caplog):
+        tmux = _make_tmux(pane_text=[MIDREDRAW_PANE, MIDREDRAW_PANE, MIDREDRAW_PANE])
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux)
+        recs = _exit_records(caplog)
+        assert len(recs) == 1
+        assert "reason=chrome_indeterminate" in recs[0].getMessage()
+
+
 # ── Test 10: every exit emits exactly one classified INFO line ─────────────
 
 
+def _exit_records(caplog) -> list[logging.LogRecord]:
+    """The classified exit records (the receipt line is excluded by prefix)."""
+    return [
+        r for r in caplog.records if r.getMessage().startswith("usage-overlay exit")
+    ]
+
+
+def _assert_one_exit(caplog, reason: str) -> None:
+    recs = _exit_records(caplog)
+    assert len(recs) == 1, (
+        f"expected exactly ONE classified exit record, got {len(recs)}: "
+        f"{[r.getMessage() for r in recs]}"
+    )
+    assert f"reason={reason}" in recs[0].getMessage()
+
+
 class TestExitLogging:
+    """Every exit path emits EXACTLY ONE classified INFO record (review r1 P2 —
+    counted on the record marker, never substring-in-caplog.text)."""
+
     @pytest.mark.asyncio
-    async def test_busy_exit_logs_pane_busy_reason(self, caplog):
+    async def test_lock_busy_exit(self, caplog):
+        tmux = _make_tmux(pane_text=[IDLE_PANE])
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux, locked=True)
+        _assert_one_exit(caplog, "lock_busy")
+
+    @pytest.mark.asyncio
+    async def test_capture_failed_exit(self, caplog):
+        tmux = _make_tmux(pane_text=[None, None, None])
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "capture_failed")
+
+    @pytest.mark.asyncio
+    async def test_capture_timeout_exit(self, caplog):
+        async def _hang(*_a, **_kw):
+            await asyncio.Event().wait()
+
+        tmux = _make_tmux()
+        tmux.capture_pane_cancellation_safe = AsyncMock(side_effect=_hang)
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            with patch("cctelegram.bot.PREFLIGHT_DEADLINE_S", 0.05):
+                await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "capture_timeout")
+
+    @pytest.mark.asyncio
+    async def test_pane_busy_active_status_exit(self, caplog):
         tmux = _make_tmux(pane_text=[BUSY_PANE])
         with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
             await _run("cost_command", tmux)
-        # One receipt + one classified exit.
-        assert "active_status" in caplog.text
+        _assert_one_exit(caplog, "active_status")
 
     @pytest.mark.asyncio
-    async def test_success_exit_logs_lifecycle(self, caplog):
+    async def test_interactive_surface_exit(self, caplog):
+        tmux = _make_tmux(pane_text=[_picker_fixture()])
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "interactive")
+
+    @pytest.mark.asyncio
+    async def test_send_failed_exit(self, caplog):
+        tmux = _make_tmux(send_results=False, pane_text=[IDLE_PANE])
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "send_failed")
+
+    @pytest.mark.asyncio
+    async def test_post_send_capture_failed_exit(self, caplog):
+        tmux = _make_tmux(send_results=True, pane_text=[IDLE_PANE, None])
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "post_send_capture_failed")
+
+    @pytest.mark.asyncio
+    async def test_post_send_capture_timeout_exit(self, caplog):
+        async def _capture(*_a, **_kw):
+            if not _capture.first_done:
+                _capture.first_done = True
+                return IDLE_PANE
+            await asyncio.Event().wait()
+
+        _capture.first_done = False  # type: ignore[attr-defined]
+        tmux = _make_tmux(send_results=True)
+        tmux.capture_pane_cancellation_safe = AsyncMock(side_effect=_capture)
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            with patch("cctelegram.bot.POST_SEND_CAPTURE_DEADLINE_S", 0.05):
+                await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "post_send_capture_timeout")
+
+    @pytest.mark.asyncio
+    async def test_overlay_never_opened_exit(self, caplog):
+        tmux = _make_tmux(
+            send_results=True,
+            pane_text=[IDLE_PANE, "✻ Cooking… (esc to interrupt)"],
+        )
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "overlay_never_opened")
+
+    @pytest.mark.asyncio
+    async def test_dismiss_failed_exit(self, caplog):
+        tmux = _make_tmux(
+            send_results=[True, False], pane_text=[IDLE_PANE, _overlay_fixture()]
+        )
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "dismiss_failed")
+
+    @pytest.mark.asyncio
+    async def test_chrome_indeterminate_exit(self, caplog):
+        tmux = _make_tmux(pane_text=[MIDREDRAW_PANE, MIDREDRAW_PANE, MIDREDRAW_PANE])
+        with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
+            await _run("cost_command", tmux)
+        _assert_one_exit(caplog, "chrome_indeterminate")
+
+    @pytest.mark.asyncio
+    async def test_success_exit_logs_overlay_lifecycle(self, caplog):
         tmux = _make_tmux(pane_text=[IDLE_PANE, _overlay_fixture()])
         with caplog.at_level(logging.INFO, logger="cctelegram.bot"):
             await _run("cost_command", tmux)
-        assert "esc_sent" in caplog.text or "overlay_present" in caplog.text
+        _assert_one_exit(caplog, "overlay_present")
+        msg = _exit_records(caplog)[0].getMessage()
+        assert "esc_sent=True" in msg
+        assert "parse=ok" in msg

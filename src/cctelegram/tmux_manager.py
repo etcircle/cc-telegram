@@ -631,9 +631,15 @@ class TmuxManager:
                     proc.kill()
                 except Exception:  # pragma: no cover — proc already gone
                     pass
+                # The reap must survive a REPEATED cancellation (review r1 P2):
+                # a second CancelledError landing in a bare ``await proc.wait()``
+                # would escape an ``except Exception`` and leave the killed proc
+                # unreaped. ``shield`` keeps the reap task running even if THIS
+                # await is cancelled again; BaseException is caught so the
+                # ORIGINAL cancellation is what re-raises below.
                 try:
-                    await proc.wait()
-                except Exception:  # pragma: no cover — reap best-effort
+                    await asyncio.shield(proc.wait())
+                except BaseException:  # noqa: BLE001 — reap best-effort
                     pass
             raise
         except Exception as e:

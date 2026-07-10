@@ -107,7 +107,14 @@ class TestTeardown:
 
 
 class TestTeardownSeamWiring:
-    """The cache is torn down at the same route-scoped seams as pane_signals."""
+    """The cache is torn down at the same route-scoped seams as pane_signals.
+
+    Each test drives the REAL seam function (review r1 P2 — never
+    usage_cache directly): topic teardown via cleanup.clear_topic_state and
+    the monitor rotation sweep via _detect_and_cleanup_changes here; the bot
+    /clear branch + the inbound stale-window unbind are scenario tests
+    (tests/scenarios/test_usage_cache_teardown.py).
+    """
 
     @pytest.mark.asyncio
     async def test_clear_topic_state_tears_down_cache(self):
@@ -119,3 +126,35 @@ class TestTeardownSeamWiring:
         assert usage_cache.peek(route, "sess-x") is not None
         await cleanup.clear_topic_state(7, 314)
         assert usage_cache.peek(route, "sess-x") is None
+
+    @pytest.mark.asyncio
+    async def test_monitor_rotation_sweep_tears_down_cache(self, tmp_path):
+        # The session-rotation sweep (_detect_and_cleanup_changes) clears the
+        # rotated window's route-scoped caches — usage_cache beside
+        # pane_signals/decision_token (the test_session_monitor flip pattern).
+        from cctelegram.session import session_manager
+        from cctelegram.session_monitor import SessionMonitor
+
+        monitor = SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+        route = (7, 314, "@11")
+        usage_cache.record(route, "sess-old", "cost", now=None)
+        assert usage_cache.peek(route, "sess-old") is not None
+
+        monitor._last_session_map = {"@11": "session-old"}
+
+        async def fake_load_current_map():
+            return {"@11": "session-new"}
+
+        monitor._load_current_session_map = fake_load_current_map  # type: ignore[method-assign]
+        saved_bindings = dict(session_manager.thread_bindings)
+        session_manager.thread_bindings[7] = {314: "@11"}
+        try:
+            await monitor._detect_and_cleanup_changes()
+        finally:
+            session_manager.thread_bindings.clear()
+            session_manager.thread_bindings.update(saved_bindings)
+
+        assert usage_cache.peek(route, "sess-old") is None

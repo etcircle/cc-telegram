@@ -745,12 +745,12 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
     from .terminal_parser import (
         classify_pane_idle_failure,
         extract_interactive_content,
+        pane_looks_idle,
         parse_usage_output,
         usage_overlay_present,
     )
 
     route = (user.id, thread_id or 0, wid)
-    session_id = peek_session_id_for_window(wid)
     message = update.message  # narrowed above; bind for the closures
 
     def _log_exit(reason: str, **fields: object) -> None:
@@ -765,7 +765,12 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
         )
 
     async def _reply_snapshot(reason: str, *, prefix: str | None = None) -> None:
-        card = _build_usage_snapshot(route, session_id, reason, label)
+        # Session identity is re-read AT the peek (review r1 P2): a session can
+        # rotate mid-transaction (rotation doesn't take the window send lock),
+        # so a pre-transaction sample could read the previous session's entry.
+        card = _build_usage_snapshot(
+            route, peek_session_id_for_window(wid), reason, label
+        )
         text = f"{prefix}\n\n{card}" if prefix else card
         await safe_reply(message, text)
 
@@ -815,32 +820,53 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
                     pane = await tmux_manager.capture_pane_cancellation_safe(
                         w.window_id
                     )
-                    if pane is not None and extract_interactive_content(pane):
-                        return "interactive"
-                    leg = classify_pane_idle_failure(pane)
-                    if leg is None:
-                        return None  # idle → proceed
-                    if leg not in _INDETERMINATE_LEGS:
-                        return leg  # positive hazard → refuse immediately
-                    last_leg = leg
+                    if pane is None:
+                        # A tmux capture FAILURE (subprocess error) — distinct
+                        # from an empty/mid-redraw frame (review r1 P2); retry,
+                        # then classify as capture_failed at exhaustion.
+                        last_leg = "capture_failed"
+                    else:
+                        if extract_interactive_content(pane):
+                            return "interactive"
+                        # AUTHORITY (review r1 P1): ``pane_looks_idle`` ALONE
+                        # decides whether a keystroke may be injected — the
+                        # classifier is replay-only and must never authorize
+                        # (classifier drift must stay a labeling bug, never a
+                        # wrong-keystroke risk).
+                        if pane_looks_idle(pane):
+                            return None  # idle → proceed
+                        # Not idle. The classifier only NAMES the failing leg
+                        # for the log + fallback copy.
+                        leg = classify_pane_idle_failure(pane)
+                        if leg is not None and leg not in _INDETERMINATE_LEGS:
+                            return leg  # positive hazard → refuse immediately
+                        # Indeterminate frame — or an authority/replay drift
+                        # where no leg is named (fail closed, never proceed).
+                        last_leg = leg or "chrome_indeterminate"
                     if attempt < _PREFLIGHT_MAX_RETRIES:
                         await asyncio.sleep(_PREFLIGHT_RETRY_SLEEP_S)
-                # Exhausted retries on an indeterminate frame.
-                return "chrome_indeterminate" if last_leg else "capture_failed"
+                # Exhausted retries: a None capture is a capture FAILURE;
+                # anything else is a chrome-indeterminate frame.
+                return (
+                    "capture_failed"
+                    if last_leg == "capture_failed"
+                    else "chrome_indeterminate"
+                )
 
             preflight_reason = await asyncio.wait_for(
                 _preflight(), timeout=PREFLIGHT_DEADLINE_S
             )
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError:
+            # ONLY the deadline is classified — a genuine caller cancellation
+            # (shutdown) must propagate, never be swallowed into a normal
+            # fallback reply (review r1 P2).
             exit_reason = "capture_timeout"
 
         if exit_reason is None and preflight_reason is not None:
-            # Normalize the classifier leg into a fallback reason.
-            exit_reason = (
-                "chrome_indeterminate"
-                if preflight_reason in _INDETERMINATE_LEGS
-                else preflight_reason
-            )
+            # The preflight already returns normalized fallback reasons
+            # (positive-hazard leg names, or capture_failed /
+            # chrome_indeterminate at retry exhaustion).
+            exit_reason = preflight_reason
         elif exit_reason is None:
             # 2. Idle proof held — open the overlay in the Claude Code TUI.
             sent = await tmux_manager.send_keys(w.window_id, slash_command)
@@ -854,7 +880,9 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
                         tmux_manager.capture_pane_cancellation_safe(w.window_id),
                         timeout=POST_SEND_CAPTURE_DEADLINE_S,
                     )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                except asyncio.TimeoutError:
+                    # ONLY the deadline — a genuine cancellation propagates
+                    # (review r1 P2; the lock releases via the async-with).
                     pane_text = None
                     # A hung post-send capture: NO blind Escape (Esc only on
                     # proven overlay chrome — the conditional-Esc contract).
@@ -929,7 +957,9 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
     usage = parse_usage_output(pane_text)
     if usage and usage.parsed_lines:
         text = "\n".join(usage.parsed_lines)
-        usage_cache.record(route, session_id, text)
+        # Session identity re-read AT the record (review r1 P2 — a rotation
+        # mid-transaction must not record under a stale identity).
+        usage_cache.record(route, peek_session_id_for_window(wid), text)
         _log_exit("overlay_present", esc_sent=dismiss_ok, parse="ok")
         await safe_reply(update.message, f"```\n{text}\n```")
         return
@@ -940,7 +970,8 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
     trimmed = pane_text.strip()
     if len(trimmed) > 3000:
         trimmed = trimmed[:3000] + "\n... (truncated)"
-    usage_cache.record(route, session_id, trimmed)
+    # Session identity re-read AT the record (review r1 P2).
+    usage_cache.record(route, peek_session_id_for_window(wid), trimmed)
     _log_exit("overlay_present", esc_sent=dismiss_ok, parse="raw_fallback")
     await safe_reply(
         update.message,

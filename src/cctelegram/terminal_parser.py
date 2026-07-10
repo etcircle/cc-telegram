@@ -3359,6 +3359,24 @@ def pane_looks_idle(visible_pane: str | None) -> bool:
     return True
 
 
+# The COMPLETE set of leg names ``classify_pane_idle_failure`` can return
+# (non-None). The /cost fallback copy map is exhaustiveness-tested against this
+# set — adding a new leg name to the classifier without mapped action copy in
+# ``bot._USAGE_FALLBACK_ACTION`` (directly or via the bot's indeterminate
+# normalization) fails that test.
+PANE_IDLE_FAILURE_REASONS = frozenset(
+    {
+        "capture_empty",
+        "active_status",
+        "interactive",
+        "no_input_box",
+        "input_not_empty",
+        "no_ready_chrome",
+        "background_shells",
+    }
+)
+
+
 def classify_pane_idle_failure(visible_pane: str | None) -> str | None:
     """Name the FIRST ``pane_looks_idle`` leg that a non-idle pane fails.
 
