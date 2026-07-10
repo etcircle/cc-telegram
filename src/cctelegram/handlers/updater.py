@@ -7,15 +7,16 @@ window id, via ``tmux_manager.restart_claude_in_window``) so it adopts the new
 on-disk version, defers busy sessions, and reports a progressive summary.
 
 **Scope (owner decision 2026-07-10).** ``scope=None`` is the FLEET walk (every
-bound topic). ``scope=(user_id, thread_id, window_id)`` is the SCOPED default —
-only the invoking topic's window. ``bot.update_command`` maps ``/update`` →
-scoped (the invoking topic) and ``/update all`` → fleet, so the fleet walk never
-silently revives sessions in dormant topics (a ``claude --resume`` of a dormant
-session is not inert — it generates contextual ghost suggestions and other
-background token-drip). Reviving dormant topics must be EXPLICIT (``/update
-all``), never a side effect of updating the topic you're in. The CLI binary
-update (phase 1) is global by nature and costs no tokens, so it runs in both
-modes.
+bound topic). ``scope=(user_id, thread_id)`` is the SCOPED default — only the
+invoking topic's window, re-resolved AFTER the CLI phase (the scope carries the
+resolution inputs, never a pre-captured window id — codex review P2, see
+``run_update``). ``bot.update_command`` maps ``/update`` → scoped (the invoking
+topic) and ``/update all`` → fleet, so the fleet walk never silently revives
+sessions in dormant topics (a ``claude --resume`` of a dormant session is not
+inert — it generates contextual ghost suggestions and other background
+token-drip). Reviving dormant topics must be EXPLICIT (``/update all``), never
+a side effect of updating the topic you're in. The CLI binary update (phase 1)
+is global by nature and costs no tokens, so it runs in both modes.
 
 Fail-closed + non-regressive: only ``IDLE_CLEARED`` + pane-idle routes are
 restarted (busy / waiting / background-agent routes defer), restarts run
@@ -210,15 +211,24 @@ async def run_update(
     monitor: Any,
     claude_command: str,
     md_settings: str,
-    scope: tuple[int, int, str] | None = None,
+    scope: tuple[int, int] | None = None,
 ) -> None:
     """Update the CLI, then restart idle bound session(s) in place.
 
     ``scope=None`` is the FLEET walk — every bound topic. ``scope=(user_id,
-    thread_id, window_id)`` is SCOPED — only that one window (the invoking
-    topic). Phase 1 (the ``claude update`` binary refresh) runs in BOTH modes
-    (global by nature, no tokens); only the restart set differs. The
-    single-flight guard covers both modes.
+    thread_id)`` is SCOPED — only the invoking topic's window. The scope
+    carries the RESOLUTION INPUTS, not a resolved window id (codex review P2):
+    the up-to-120s ``claude update`` phase runs first, and the topic can be
+    unbound / closed / rebound to a DIFFERENT window during that interval — a
+    window captured at invocation could restart the OLD window (possibly
+    dormant or now belonging to a different topic), violating the exact scope
+    guarantee. So the authoritative ``(user_id, thread_id) → window_id``
+    resolution happens HERE, after ``_run_cli_update``, immediately before the
+    restart walk (``session_mgr.resolve_window_for_thread`` — the same lookup
+    the command handler uses for its fast unbound-topic error). Unbound by
+    then → an honest scoped summary, nothing restarted. Phase 1 (the ``claude
+    update`` binary refresh) runs in BOTH modes (global by nature, no tokens);
+    only the restart set differs. The single-flight guard covers both modes.
 
     ``report`` is an async callback the caller wires to a progressive Telegram
     message (edit-in-place). ``monitor`` may be ``None`` (routing re-association
@@ -247,11 +257,24 @@ async def run_update(
         deferred_reasons: list[str] = []
         skipped: list[tuple[str, str]] = []
 
-        # Scoped → the single (user, thread, window) target; fleet → a stable
-        # snapshot of the bindings up front (restarts don't mutate bindings, but
-        # a concurrent topic close could).
+        # Scoped → re-resolve the invoking topic's binding NOW (post-CLI —
+        # the fresh resolution is authoritative; see the docstring); fleet →
+        # a stable snapshot of the bindings up front (restarts don't mutate
+        # bindings, but a concurrent topic close could).
         if scope is not None:
-            targets: list[tuple[int, int, str]] = [scope]
+            scoped_user, scoped_thread = scope
+            scoped_wid = session_mgr.resolve_window_for_thread(
+                scoped_user, scoped_thread
+            )
+            if not scoped_wid:
+                await report(
+                    f"{version_line}\n⚠️ This topic was unbound during the "
+                    "update — nothing restarted."
+                )
+                return
+            targets: list[tuple[int, int, str]] = [
+                (scoped_user, scoped_thread, scoped_wid)
+            ]
         else:
             targets = list(session_mgr.iter_thread_bindings())
 

@@ -71,15 +71,35 @@ class _WS:
 
 
 class FakeSessionMgr:
-    def __init__(self, bindings, window_states=None, names=None, file_path=None):
+    def __init__(
+        self,
+        bindings,
+        window_states=None,
+        names=None,
+        file_path=None,
+        resolve_map=None,
+    ):
         self._bindings = list(bindings)
         self._ws = window_states or {}
         self._names = names or {}
         self._file_path = file_path
+        # Post-CLI scoped re-resolution results: {(user_id, thread_id): wid}.
+        # None → derive from the bindings (the stable-binding normal path).
+        self._resolve_map = resolve_map
+        self.resolve_calls: list[tuple[int, int]] = []
         self.saves = 0
 
     def iter_thread_bindings(self):
         return iter(self._bindings)
+
+    def resolve_window_for_thread(self, user_id, thread_id):
+        self.resolve_calls.append((user_id, thread_id))
+        if self._resolve_map is not None:
+            return self._resolve_map.get((user_id, thread_id))
+        for uid, tid, wid in self._bindings:
+            if uid == user_id and tid == thread_id:
+                return wid
+        return None
 
     def get_display_name(self, wid):
         return self._names.get(wid, wid)
@@ -317,10 +337,12 @@ class TestScopedUpdate:
             monitor=None,
             claude_command="claude",
             md_settings="",
-            scope=(1, 20, "@2"),  # only the invoking topic's window
+            scope=(1, 20),  # the invoking topic — resolved to @2 post-CLI
         )
         # ONLY @2 was restarted; @1 and @3 were never touched.
         assert [c[0] for c in tmux.restart_calls] == ["@2"]
+        # The authoritative resolution ran inside run_update (post-CLI).
+        assert sm.resolve_calls == [(1, 20)]
         summary = reports[-1]
         assert "Restarted @2" in summary
         # Scoped summary is a single line — never the fleet multi-bucket format.
@@ -345,7 +367,7 @@ class TestScopedUpdate:
             monitor=None,
             claude_command="claude",
             md_settings="",
-            scope=(1, 20, "@2"),
+            scope=(1, 20),
         )
         assert tmux.restart_calls == []  # busy → never touched tmux
         summary = reports[-1]
@@ -381,10 +403,80 @@ class TestScopedUpdate:
             monitor=None,
             claude_command="claude",
             md_settings="",
-            scope=(1, 10, "@1"),
+            scope=(1, 10),
         )
         assert called["iter"] is False
         assert [c[0] for c in tmux.restart_calls] == ["@1"]
+
+    @pytest.mark.asyncio
+    async def test_scoped_unbound_during_cli_phase_skips_with_honest_summary(
+        self, monkeypatch
+    ):
+        # Codex P2 (a): the topic was bound at invocation but is UNBOUND by the
+        # time the (up-to-120s) CLI phase finishes — the post-CLI re-resolution
+        # finds nothing → NO restart, honest scoped summary.
+        _patch_snapshot(monkeypatch, {})
+        sm = FakeSessionMgr(
+            [(1, 20, "@2")],
+            window_states={"@2": _WS(session_id="s2")},
+            resolve_map={},  # post-CLI: the binding is gone
+        )
+        tmux = FakeTmux(windows={"@2"})
+        reports: list[str] = []
+
+        async def report(t):
+            reports.append(t)
+
+        await updater.run_update(
+            report=report,
+            session_mgr=sm,
+            tmux=tmux,
+            monitor=None,
+            claude_command="claude",
+            md_settings="",
+            scope=(1, 20),
+        )
+        assert tmux.restart_calls == []  # the stale @2 was never touched
+        assert sm.resolve_calls == [(1, 20)]
+        assert "unbound during the update" in reports[-1]
+        assert "nothing restarted" in reports[-1]
+        # The CLI phase still ran (phase 1 is global) — the flow got that far.
+        assert reports[0] == "🔄 Updating Claude Code CLI…"
+
+    @pytest.mark.asyncio
+    async def test_scoped_rebound_during_cli_phase_restarts_current_window(
+        self, monkeypatch
+    ):
+        # Codex P2 (b): the topic was bound to @7 at invocation but REBOUND to
+        # @9 during the CLI phase — the fresh post-CLI resolution is
+        # authoritative: @9 (the topic's live session) restarts, @7 is never
+        # touched.
+        _patch_snapshot(monkeypatch, {})
+        sm = FakeSessionMgr(
+            [(1, 20, "@7")],  # the stale invocation-time view
+            window_states={
+                "@7": _WS(session_id="s7"),
+                "@9": _WS(session_id="s9"),
+            },
+            resolve_map={(1, 20): "@9"},  # post-CLI: rebound to @9
+        )
+        tmux = FakeTmux(windows={"@7", "@9"})
+        reports: list[str] = []
+
+        async def report(t):
+            reports.append(t)
+
+        await updater.run_update(
+            report=report,
+            session_mgr=sm,
+            tmux=tmux,
+            monitor=None,
+            claude_command="claude",
+            md_settings="",
+            scope=(1, 20),
+        )
+        assert [c[0] for c in tmux.restart_calls] == ["@9"]  # @7 never touched
+        assert "Restarted @9" in reports[-1]
 
 
 class TestRunCliUpdate:

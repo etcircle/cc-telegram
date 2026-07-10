@@ -1038,20 +1038,24 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     parts = raw.split(None, 1)
     arg = parts[1].strip().casefold() if len(parts) > 1 else ""
 
-    scope: tuple[int, int, str] | None = None
+    scope: tuple[int, int] | None = None
     if arg == "":
-        # SCOPED — resolve the invoking topic's binding (the same lookup the
-        # other topic commands use). Unbound → error, nothing executed.
+        # SCOPED — pre-resolve the invoking topic's binding ONLY for the fast
+        # unbound-topic error (the same lookup the other topic commands use).
+        # The AUTHORITATIVE resolution happens inside run_update AFTER the
+        # up-to-120s CLI phase (codex review P2): the topic can be unbound /
+        # rebound during that interval, so the scope carries the (user_id,
+        # thread_id) resolution INPUTS, never a captured window id.
         thread_id = _get_thread_id(update)
         wid = session_manager.resolve_window_for_thread(user.id, thread_id)
-        if not wid:
+        if thread_id is None or not wid:
             await safe_reply(
                 update.message,
                 "❌ No session bound to this topic. Use /update all to update "
                 "every idle session.",
             )
             return
-        scope = (user.id, thread_id or 0, wid)
+        scope = (user.id, thread_id)
     elif arg != "all":
         await safe_reply(
             update.message,

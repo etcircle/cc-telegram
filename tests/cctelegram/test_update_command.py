@@ -110,7 +110,9 @@ class TestUpdateCommand:
     @pytest.mark.asyncio
     async def test_scoped_default_resolves_invoking_topic(self):
         # ``/update`` (no arg) → SCOPED mode: run_update called with the
-        # invoking topic's (user, thread, window) scope.
+        # invoking topic's (user, thread) RESOLUTION INPUTS — never a captured
+        # window id (run_update re-resolves post-CLI; codex review P2). The
+        # pre-resolve here is only the fast unbound-topic gate.
         update = _make_update(user_id=1, thread_id=42, text="/update")
         context = _make_context()
         status_msg = MagicMock()
@@ -137,7 +139,7 @@ class TestUpdateCommand:
             await update_command(update, context)
 
         run_update.assert_awaited_once()
-        assert run_update.call_args.kwargs["scope"] == (1, 42, "@7")
+        assert run_update.call_args.kwargs["scope"] == (1, 42)
 
     @pytest.mark.asyncio
     async def test_scoped_unbound_topic_replies_and_runs_nothing(self):
