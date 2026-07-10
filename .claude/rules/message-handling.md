@@ -689,7 +689,9 @@ a resume still tombstones — pinned). **The relight constraint — ALWAYS-RESUM
 BIND (r7 item 3, Codex P2, probe-reproduced):** the runtime tombstone NO-OPS a
 later `launched` (done-before-launch fail-closes), and EVERY teammate bind now
 relights through the tombstone-POPPING RESUMED lane — `resumed[key] =
-spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S` — for ALL binds, retracted or
+min(spawned_ts, first_entry_ts) - ε` (r8 item 1: the floor is the bound file's
+OWN first entry, reducing to `spawned_ts - ε` in the normal case — see the
+RESUME-TS FLOOR paragraph below) — for ALL binds, retracted or
 not, never `launched`. The r6 code gated this on a monitor-side provenance set
 `_TeammateRec.done_retracted_keys` (emit `launched` for a never-retracted key,
 `resumed` for a retracted one), but **the monitor CANNOT observe route_runtime's
@@ -764,7 +766,8 @@ the rec goes STICKY-ambiguous** (the gate inputs are static, so the ambiguity
 never self-resolves — it clears ONLY at the next rotation; the passing
 candidates are NOT arbitrarily quarantined and stay out of run-state via item
 3). On bind it relights the key via the ALWAYS-RESUMED lane at DISCOVERY (r7
-item 3 — `resumed[key] = spawned_ts - ε`, never `launched`; once-only; a bound
+item 3 + r8 item 1 — `resumed[key] = min(spawned_ts, first_entry_ts) - ε`,
+never `launched`; once-only; a bound
 file's later ticks feed run-state normally and never re-emit),
 **retroactively generation-filters any pre-existing PARSEABLE park for the
 bound key in the current activity record (r4 P2, Codex, probe-reproduced):** a
@@ -786,7 +789,21 @@ candidate can never mint a background key that a genuine-user tombstone reset
 could resurrect (pre-fix, an indeterminate gate fell through to
 `feed_run_state=True` and an unbound candidate emitted SidechainTicks — the
 strand re-entry). A name with no registry rec keeps legacy behavior. **Wake
-(`_record_teammate_wake`, the `SendMessage` lane):** the registered-rec path
+(`_record_teammate_wake`, the `SendMessage` lane):** EVERY wake (registered or
+not) FIRST lands a NAMED RAW copy in the orphan buffer UNCONDITIONALLY
+(`_retain_orphan_teammate_wake`, r9 item 2, Codex P2, probe-reproduced — the wake
+mirror of the r7 item-2 park RETAIN-ALWAYS/UNIVERSAL): a bound OLD generation used
+to spend a not-yet-registered NEWER generation's only wake solely on itself —
+gen-1 bound → gen-2 spawn result stashed → gen-2 parks at T4 (retained via the r7
+park dual-write) → gen-2 wakes at T5 but the wake applied ONLY to gen-1's
+`current_key` → the late gen-2 tool_use registers → the drained park (T4) closes
+the fresh bind with NO surviving wake → tombstoned though T5 proved it resumed.
+The retained copy carries the RAW `event_ts` (NOT the gen-1-`filtered` value), so
+the drain re-attributes it against the FUTURE rec's `spawned_ts` and a wake `>=
+gen-2 spawned_ts` carries into `pending_wake` and WINS the bind's wake-vs-park
+arbitration (`pending_wake` first → `resumed[key]`); a stale wake `< gen-2
+spawned_ts` is generation-DROPPED at the SAME drain filter (the r7 item-1 rule,
+applied to the wake at the drain seam too). THEN the registered-rec path
 GENERATION-FILTERS `event_ts` at the START via the SHARED
 `_generation_filter_wake` — the SAME rule the orphan drain and the rotation
 re-filter use (r7 item 1, Hermes P1, probe-reproduced): a `None` or
@@ -796,10 +813,10 @@ result-before-use wake stashed at a gen-1-era ts retro-paired onto the BOUND
 gen-2 key and the runtime resume POPPED its park tombstone (a false relight of a
 parked newer generation until the next park / the 2h TTL). Past the filter:
 BOUND → `resumed[current_key] = event_ts`; UNBOUND → `pending_wake` (max on
-repeats); NO registry rec → ORPHAN-RETAINED beside the park (r6 rule 3, Codex P2,
-probe-reproduced: dropping a pre-registration wake made a drained park
-tombstone a teammate whose LATER wake proved it resumed — false-dark and a
-broken transcript-true arbitration; the retained wake is post-cross-check
+repeats); the universal RAW retention above ALSO covers the NO-registry-rec case
+(r6 rule 3, Codex P2, probe-reproduced: dropping a pre-registration wake made a
+drained park tombstone a teammate whose LATER wake proved it resumed — false-dark
+and a broken transcript-true arbitration; the retained wake is post-cross-check
 evidence, max-on-repeats like `pending_wake`); the monitor cross-checks the
 paired `SendMessage
 input["to"] == <name>` (`transcript_parser` now carries `SendMessage` input
@@ -854,20 +871,32 @@ item-1 spawn stash) holds an `_OrphanPending` **pending PAIR mirroring the rec
 slots exactly** — park (causal-reduced via the SAME `_merge_pending_park`
 rules) + wake (max-on-repeats, r6 rule 3) — per-parent, name-keyed, bounded
 (`_ORPHAN_PARK_MAX_NAMES` 32 — replace-merge in place for an existing name,
-**TWO-TIER oldest-first eviction only for a NEW name at cap (r8 item 2, CONVERGED
-P1 — Hermes + Codex, both probe-reproduced):** since r7 made EVERY park
-dual-write a named copy — including the high-frequency registered/bound path — a
-busy multi-teammate parent churns the buffer with REDUNDANT registered-name
-copies (their primary immediate close already applied; each is generation-dropped
-at the next drain), and a blind `next(iter(buf))` drop-oldest evicted the sole
-retained pre-registration ORPHAN the buffer EXISTS to protect (probe: 32 distinct
-registered-name parks evict an unregistered `future` → it later binds with
-`pending_park=None` → 2h strand). So the eviction evicts the oldest
-REGISTERED-name entry — a redundant dual-write copy that has another home — FIRST,
-and only when ALL entries are pre-registration orphans (the TRUE cap bound)
-evicts the oldest orphan. The "name HAS a rec" test uses
-`self._teammate_registry` at the eviction seam, same name-key space as the
-buffer) with a per-entry wall TTL
+**TWO-TIER oldest-first eviction only for a NEW name at cap (r8 item 2 → r9
+item 1, CONVERGED P1 — Hermes + Codex, both probe-reproduced):** since r7 made
+EVERY park dual-write a named copy — including the high-frequency
+registered/bound path — a busy multi-teammate parent churns the buffer with
+copies, and a blind `next(iter(buf))` drop-oldest evicted the sole retained
+pre-registration ORPHAN the buffer EXISTS to protect. The r8 two-tier fix keyed
+the tiers on "name HAS a rec", but that MIS-tiered a park retained under a
+STILL-REGISTERED name that belongs to a stashed not-yet-registered NEXT
+generation (gen-1 bound, gen-2 spawn stashed, gen-2 park retained under the
+registered name → the next gen's ONLY close) into the evictable tier (probe: 32
+registered-stale parks + 1 new name evict it → gen-2 binds `pending_park=None`
+→ 2h strand). **Fix (r9 item 1): REDUNDANT is redefined via the DRAIN FILTER'S
+OWN semantics** (`_orphan_entry_is_generation_droppable` — redundant iff the
+drain would generation-DROP the entry; the eviction predicate and the drain
+filter must never disagree, mint/validate parity). An entry is tier-1 evictable
+iff it has a rec AND EVERY retained signal is generation-dropped (a park with
+parseable `ts < rec.spawned_ts` — and since `spawned_ts` is event-ts-anchored
+and MONOTONIC across generations, any FUTURE generation spawns even later, so it
+can close NO generation; a wake `< rec.spawned_ts`). Tier 1 evicts the oldest
+REDUNDANT entry FIRST; tier 2 (only when tier 1 is EMPTY — the TRUE cap bound)
+evicts the oldest PROTECTED entry (no rec — a pre-registration orphan; OR a
+park/wake that SURVIVES the drain filter — the possibly-next-gen close; OR an
+unparseable-dominance park that can't be ts-classified). The
+`_orphan_entry_is_generation_droppable` seam reads `self._teammate_registry` +
+the SHARED `_generation_filter_park` / `_generation_filter_wake` (same name-key
+space, same filters as the drain) with a per-entry wall TTL
 (`_ORPHAN_PARK_TTL_S` 7200s, mirroring the 2h background TTL the eventual key
 ages by; lazy sweep at retain, expiry-discard at drain), torn down with the
 parent. It DRAINS at registration (step 4.5, before the pre-spawn scan) into

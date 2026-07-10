@@ -262,13 +262,18 @@ Additional modules:
                                 min(spawned_ts, first_entry_ts) - ε, below the
                                 bound file's OWN first entry, so a look-alike's
                                 pre-spawn trailing end_turn isn't shielded) /
-                                resumed (wake, generation-filtered) /
+                                resumed (wake, generation-filtered AND — r9
+                                item 2 — universally orphan-retained RAW so a
+                                stashed next-gen wake is never spent on the
+                                bound old gen) /
                                 TEAMMATE-done (park, universally orphan-retained
-                                — r8 item 2: the 32-name buffer's at-cap
-                                eviction is two-tier oldest-first, evicting a
-                                redundant registered-name copy before a
-                                pre-registration orphan) marks; see
-                                message-handling.md.
+                                — r8 item 2 → r9 item 1: the 32-name buffer's
+                                at-cap eviction is two-tier oldest-first keyed on
+                                the DRAIN FILTER's own semantics — tier 1 evicts a
+                                REDUNDANT entry (drain would generation-drop it)
+                                before a PROTECTED one (no rec, or a signal that
+                                survives the drain filter — the possibly-next-gen
+                                close)) marks; see message-handling.md.
                                 Clears: done / a PER-KEY wall-clock heartbeat
                                 TTL (_wall_now(), expire-before-classify) —
                                 T2 split: foreground-presumed keys age by
