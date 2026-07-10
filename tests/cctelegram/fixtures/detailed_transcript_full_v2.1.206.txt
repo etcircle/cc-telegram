@@ -1,0 +1,51 @@
+
+     line 72
+     line 73
+     line 74
+     line 75
+     line 76
+     line 77
+     line 78
+     line 79
+     line 80
+     line 81
+     line 82
+     line 83
+     line 84
+     line 85
+     line 86
+     line 87
+     line 88
+     line 89
+     line 90
+     line 91
+     line 92
+     line 93
+     line 94
+     line 95
+     line 96
+     line 97
+     line 98
+     line 99
+     line 100
+
+                                                                                                                                 10:07 PM claude-fable-5
+⏺ The command ran successfully, printing "line 1" through "line 100" — 100 lines total.
+
+✻ Worked for 10s
+
+❯ Read the file bigfile.txt in the current directory, then use the AskUserQuestion tool to ask me a single-select question with options X and Y.
+
+⏺ Read(/private/tmp/ccrig-20260710/bigfile.txt)
+  ⎿  Read 101 lines
+
+⏺ User answered Claude's questions:
+  ⎿  · Which option do you choose? → Y
+
+                                                                                                                                 10:09 PM claude-fable-5
+⏺ I read bigfile.txt (100 numbered lines, numbered_line_1 through numbered_line_100), and you chose Y.
+
+✻ Churned for 15s
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll · v to open in vi · ? for shortcuts                                                        verbose

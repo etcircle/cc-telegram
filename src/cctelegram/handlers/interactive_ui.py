@@ -15,6 +15,11 @@ Provides:
   - Terminal capture and display
   - Interactive mode tracking per user and thread
 
+``clear_interactive_msg`` accepts an optional ``tombstone_text`` (GH #47-R1):
+when tombstoning, the poller passes an honest "⚠️ … the bridge can't parse …"
+excerpt card for an unrecognized blocking successor frame instead of the default
+"🪦 … resolved" tombstone; all other teardown is byte-identical.
+
 State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
@@ -3989,6 +3994,7 @@ async def clear_interactive_msg(
     *,
     session_mgr=None,
     tombstone: bool = False,
+    tombstone_text: str | None = None,
 ) -> None:
     """Clear the tracked interactive single-card surface for this route.
 
@@ -4003,6 +4009,17 @@ async def clear_interactive_msg(
     Code moved past the AUQ on its own (e.g. bypassPermissions
     auto-resolution). Without the tombstone the user would wake up to
     a chat with no record of the question.
+
+    ``tombstone_text``: GH #47-R1 honest successor-frame fallback. When
+    provided AND ``tombstone`` is True, the Phase-2 edit uses this text
+    instead of the default "🪦 AskUserQuestion resolved…" — the poller
+    passes an excerpt card ("⚠️ … the bridge can't parse …") when the
+    absent pane actually advanced to an UNRECOGNIZED blocking prompt (so
+    the card never falsely claims resolution while the prompt still
+    blocks the pane). EVERYTHING else — state drop, ``_interactive_mode``
+    pop, pick-token / Decision-token teardown, the ``_fire_clear``
+    lifecycle callback, keyboard removal, plain-text edit mode, shielding
+    — is byte-identical. ``None`` (the default) = current behavior.
     """
     if session_mgr is None:
         session_mgr = session_manager
@@ -4071,7 +4088,7 @@ async def clear_interactive_msg(
                 thread_id=thread_id,
                 window_id=cleared_window_id,
                 message_id=single_msg_id,
-                text=_TOMBSTONE_TEXT,
+                text=tombstone_text if tombstone_text is not None else _TOMBSTONE_TEXT,
                 plain=True,
                 reply_markup=None,
             )

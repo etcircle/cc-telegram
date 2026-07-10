@@ -3661,3 +3661,50 @@ class TestGeometry160x50FixturePins:
     def test_status_line_parses_at_160x50(self):
         pane = _fixture("status_busy_160x50_v2.1.198.txt")
         assert parse_status_line(pane) == "Actioning…"
+
+
+class TestParseUnknownBlockingPrompt:
+    """GH #47-R1 ``parse_unknown_blocking_prompt`` — the honest successor-frame
+    recognizer (pure, replay-only, NEVER authorizes a keystroke).
+
+    Positive: the synthesized 2026-07-09 footer-less "Switch model?" incident
+    frame → an excerpt containing the heading + both option lines.
+    Negatives (fail-closed): a named-UI pane (a live AUQ picker owns it), a plain
+    idle frame (no options), a resolved/transcript frame (no options), and an
+    empty pane.
+    """
+
+    from cctelegram.terminal_parser import parse_unknown_blocking_prompt
+
+    _parse = staticmethod(parse_unknown_blocking_prompt)
+
+    def test_switch_model_incident_frame_returns_excerpt(self):
+        excerpt = self._parse(
+            _fixture("unknown_blocking_confirm_switch_model_v2.1.197.txt")
+        )
+        assert excerpt is not None
+        assert "Switch model?" in excerpt
+        assert "1. Yes, switch to Fable 5" in excerpt
+        assert "2. No, go back" in excerpt
+
+    def test_live_named_ui_pane_returns_none(self):
+        # A live AUQ picker: a NAMED UI owns the pane → the helper defers.
+        pane = _fixture("scrollback_full_with_live_auq_v2.1.206.txt")
+        assert extract_interactive_content(pane) is not None
+        assert self._parse(pane) is None
+
+    def test_existing_auq_fixture_returns_none(self):
+        # Any recognized AUQ pane must return None (defense in depth beyond the
+        # scrollback fixture).
+        pane = _fixture("auq_single_select_with_affordances_pane.txt")
+        assert self._parse(pane) is None
+
+    def test_idle_frame_returns_none(self):
+        assert self._parse(_fixture("idle_frame_plain_v2.1.206.txt")) is None
+
+    def test_resolved_transcript_frame_returns_none(self):
+        assert self._parse(_fixture("detailed_transcript_full_v2.1.206.txt")) is None
+
+    def test_empty_pane_returns_none(self):
+        assert self._parse("") is None
+        assert self._parse("   \n\n  ") is None

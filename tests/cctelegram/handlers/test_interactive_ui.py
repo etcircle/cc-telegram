@@ -1942,6 +1942,56 @@ class TestClearInteractiveMsgPrunesTokens:
         # No tokens to assert about; this is just a non-crash check.
 
 
+class TestClearInteractiveMsgTombstoneText:
+    """GH #47-R1: ``clear_interactive_msg`` gains an optional ``tombstone_text``.
+
+    Default (None) is byte-identical to today (the ``🪦`` tombstone); when
+    provided AND tombstoning, the Phase-2 edit uses the custom text. Everything
+    else (plain-text edit, reply_markup cleared) is unchanged.
+    """
+
+    async def _drive(self, *, tombstone_text):
+        from cctelegram.handlers import interactive_ui as iui
+
+        user_id, thread_id, window_id = 4242, 77, "@9"
+        ikey = (user_id, thread_id)
+        set_interactive_mode(user_id, window_id, thread_id)
+        iui._interactive_msgs[ikey] = 71234
+
+        mock_sm = MagicMock()
+        mock_sm.resolve_chat_id.return_value = 555
+
+        kwargs = {"tombstone": True}
+        if tombstone_text is not None:
+            kwargs["tombstone_text"] = tombstone_text
+
+        with patch.object(iui, "topic_edit", new_callable=AsyncMock) as mock_edit:
+            await clear_interactive_msg(
+                user_id,
+                bot=MagicMock(),
+                thread_id=thread_id,
+                session_mgr=mock_sm,
+                **kwargs,
+            )
+        mock_edit.assert_called_once()
+        return iui, mock_edit.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_default_tombstone_text_is_byte_identical(self):
+        iui, edit_kwargs = await self._drive(tombstone_text=None)
+        assert edit_kwargs["text"] == iui._TOMBSTONE_TEXT
+        assert edit_kwargs["reply_markup"] is None
+        assert edit_kwargs["plain"] is True
+
+    @pytest.mark.asyncio
+    async def test_custom_tombstone_text_is_used(self):
+        custom = "⚠️ custom successor-frame excerpt"
+        iui, edit_kwargs = await self._drive(tombstone_text=custom)
+        assert edit_kwargs["text"] == custom
+        assert edit_kwargs["reply_markup"] is None
+        assert edit_kwargs["plain"] is True
+
+
 # ── PR 2: callback-validator parity via resolve_ask_form ─────────────────
 
 

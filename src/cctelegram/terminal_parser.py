@@ -40,9 +40,16 @@ bot token, which would force a token into parser unit tests). The bot's
 ``CC_TELEGRAM_DECISION_CARDS`` declarations for documentation; the parser just
 reads the same env vars.
 
+A GH #47-R1 helper ``parse_unknown_blocking_prompt`` (pure, replay-only, NEVER
+authorizes a keystroke) recognizes an UNRECOGNIZED bottom-most blocking
+numbered-option prompt (no named UI owns the pane) so the poller's absent-streak
+clear can render an honest text-only excerpt card instead of a misleading
+"resolved" tombstone.
+
 Key functions: is_interactive_ui(), extract_interactive_content(),
 parse_status_line(), strip_pane_chrome(), extract_bash_output(),
-parse_permission_prompt(), parse_workflow_approval(), parse_generic_decision().
+parse_permission_prompt(), parse_workflow_approval(), parse_generic_decision(),
+parse_unknown_blocking_prompt().
 """
 
 import hashlib
@@ -2570,6 +2577,79 @@ def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
         select_mode="single",
         options_complete=options[0].number == 1,
     )
+
+
+def parse_unknown_blocking_prompt(pane_text: str) -> str | None:
+    """Excerpt of a bottom-most UNRECOGNIZED blocking numbered-option prompt, or
+    ``None`` (GH #47-R1 successor-frame fallback).
+
+    PURE + replay-only — it NEVER authorizes a keystroke; it only decides whether
+    the poller's absent-streak clear should render an honest TEXT-ONLY excerpt
+    card instead of the misleading "🪦 AskUserQuestion resolved…" tombstone. The
+    2026-07-09 incident: a tracked interactive card's pane advanced to an
+    unrecognized blocking confirm (a footer-less "Switch model?" prompt) and the
+    absent-streak tombstone claimed the AUQ had resolved while the prompt still
+    blocked the pane.
+
+    POSITIVE + fail-closed — ALL must hold, else ``None``:
+      1. ``extract_interactive_content`` returns ``None`` — no NAMED UI
+         (AUQ/EPM/Settings/RestoreCheckpoint/Permission/Workflow/Decision) owns
+         the pane. Re-checked here so the helper is safe standalone (the
+         absent-streak branch already implies it, but the helper never trusts the
+         caller);
+      2. a bottom-most contiguous numbered-option block (≥2 options) with a
+         resolved live ``❯`` cursor (reuses the gate machinery
+         ``_gate_options_above`` / ``_decision_option_block_top``);
+      3. only gate-chrome below the option block (``_only_chrome_below``) — a
+         ready ``❯`` input box, a ``? for shortcuts`` / status bar, a
+         ``· N shell`` line, or any trailing assistant prose ⇒ ``None`` (a
+         resolved pane / a quoted block in scrollback above a live input box
+         never fires).
+
+    Returns the pane excerpt = the contiguous prompt block above the options (a
+    bounded walk-up, ``_decision_prompt_block_top``) through the option lines —
+    the trusted region only, never the input box / status chrome below.
+    """
+    if not pane_text:
+        return None
+    # (1) A named UI owning the pane is handled by its own lane — never here.
+    if extract_interactive_content(pane_text) is not None:
+        return None
+    lines = pane_text.split("\n")
+
+    # (2) Bottom-most numbered-option line with ONLY gate chrome below it. Scan up
+    # from the pane bottom; the first numbered option found is the bottom of the
+    # block. Everything below it must be chrome (blank / bare separator /
+    # ctrl-hint) — a ready input box / status bar / prose below rejects
+    # (``_only_chrome_below`` is the shared live-bottom-prompt guard; the option
+    # cursor ``❯ 1.`` is ABOVE this index, so any ``❯`` below is the input box).
+    bottom_opt_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _RE_NUMBERED_OPTION.match(lines[i]):
+            bottom_opt_idx = i
+            break
+    if bottom_opt_idx is None:
+        return None
+    if not _only_chrome_below(lines, bottom_opt_idx):
+        return None
+
+    # (3) The contiguous option block: ≥2 options + a resolved live cursor.
+    options = _gate_options_above(lines, bottom_opt_idx + 1)
+    if len(options) < 2:
+        return None
+    if not any(o.cursor for o in options):
+        return None
+
+    # Excerpt = the prompt block above the options (bounded walk-up) → the last
+    # option line. The trusted region only (never the chrome below).
+    block_top_idx = _decision_option_block_top(lines, bottom_opt_idx + 1)
+    excerpt_start = block_top_idx if block_top_idx is not None else bottom_opt_idx
+    if block_top_idx is not None:
+        prompt_top_idx = _decision_prompt_block_top(lines, block_top_idx)
+        if prompt_top_idx is not None:
+            excerpt_start = prompt_top_idx
+    excerpt = "\n".join(lines[excerpt_start : bottom_opt_idx + 1]).rstrip()
+    return excerpt or None
 
 
 def decision_prompt_fingerprint(form: AskUserQuestionForm) -> str:
