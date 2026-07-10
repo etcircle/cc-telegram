@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.206 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│               Welcome back Emiliyan!               │ Ask Claude to create a new app or clone a repository                                                    │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                              │
+│                      ▝▜█████▛▘                     │ Added directory path suggestions to `/cd`, matching `/add-dir` behavior                                 │
+│                        ▘▘ ▝▝                       │ Added a `/doctor` check that proposes trimming checked-in `CLAUDE.md` files by cutting content Claude … │
+│      Fable 5 with xhigh effort · Claude Max ·      │ `/commit-push-pr` now auto-allows `git push` to the repo's configured push remote (`remote.pushDefault… │
+│      thecodingacc@gmail.com's Organization         │ /release-notes for more                                                                                 │
+│               /…/scratchpad/ccrig_cwd              │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ▎ Extended: Fable 5 is included in your weekly limit
+ ▎ Through July 12, you can use up to 50% of your weekly usage limit on Fable 5. If you hit your limit, you can continue on Fable 5 with usage credits. Fable 5
+ ▎ draws down usage faster than Opus 4.8. Run /model and select Fable to use it. Learn more
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.2819
+   Total duration (API):  19s
+   Total duration (wall): 3m 22s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage by model:
+         claude-fable-5:  9.2k input, 17 output, 18.9k cache read, 8.5k cache write ($0.2819)
+
+   Current session
+   ██████████████████████████████                     60% used
+   Resets 11:49am (Europe/London)
+
+   Current week (all models)
+   █████████████████████████▌                         51% used
+   Resets Jul 12 at 11:59am (Europe/London)
+
+   Current week (Fable)
+   ████████████████████████████████████████████       88% used
+   Resets Jul 12 at 11:59am (Europe/London)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+   Scanning local sessions…
+
+   Usage credits
+   Usage credits are off · /usage-credits to turn them on
+
+   Esc to cancel

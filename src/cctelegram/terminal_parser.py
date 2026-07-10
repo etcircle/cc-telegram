@@ -3462,31 +3462,55 @@ class UsageInfo:
     parsed_lines: list[str]  # Cleaned content lines from the modal
 
 
+# The /usage (== /cost) modal tab bar, verbatim on Claude Code 2.1.206:
+#     "   Settings  Status   Config   Usage   Stats"
+# This same bar renders for BOTH /cost and /usage (fixture-verified — the two
+# frames are byte-identical templates). We anchor on the individual tab tokens
+# (whitespace-tolerant membership) rather than the exact spacing so a minor
+# chrome reflow doesn't break detection.
+_USAGE_TAB_TOKENS: tuple[str, ...] = ("Settings", "Status", "Config", "Usage", "Stats")
+
+
+def _is_usage_tab_bar(stripped: str) -> bool:
+    """True if ``stripped`` is the /usage modal's tab-bar line (all tabs present)."""
+    return all(tok in stripped for tok in _USAGE_TAB_TOKENS)
+
+
 def parse_usage_output(pane_text: str) -> UsageInfo | None:
-    """Extract usage information from Claude Code's /usage settings tab.
+    """Extract usage information from Claude Code's /usage (== /cost) overlay.
 
-    The /usage modal shows a Settings overlay with a "Usage" tab containing
-    progress bars and reset times.  This parser looks for the Settings header
-    line, then collects all content until "Esc to cancel".
+    The /cost and /usage commands open the SAME full-screen modal (fixture
+    verified on 2.1.206): a tab bar ``Settings  Status  Config  Usage  Stats``
+    at the top of the modal body and an ``Esc to cancel`` footer at the bottom
+    of the scrollable body. The parser anchors on that stable chrome — it takes
+    everything AFTER the tab-bar line and BEFORE ``Esc to cancel`` (or the end
+    of the captured pane if the footer scrolled off), strips the box-drawing
+    rule + progress-bar block characters, and returns the readable body lines.
 
-    Returns UsageInfo with cleaned lines, or None if not detected.
+    Tolerant by design: the goal is a readable Telegram message, not a lossless
+    model. Version drift that moves the tab bar / footer → ``None`` → the
+    command's fail-open raw-pane fallback (``bot.usage_command``).
+
+    Returns UsageInfo with cleaned lines, or None if the modal isn't detected.
     """
     if not pane_text:
         return None
 
     lines = pane_text.strip().split("\n")
 
-    # Find the Settings header that indicates we're in the usage modal
+    # Find the tab-bar line that marks the top of the modal body. Anything above
+    # it (a welcome card / limit banner left in scrollback above the overlay —
+    # see the usage_overlay fixture) is ignored.
     start_idx: int | None = None
     end_idx: int | None = None
 
     for i, line in enumerate(lines):
         stripped = line.strip()
         if start_idx is None:
-            # The usage tab header line
-            if "Settings:" in stripped and "Usage" in stripped:
-                start_idx = i + 1  # skip the header itself
+            if _is_usage_tab_bar(stripped):
+                start_idx = i + 1  # skip the tab-bar header itself
         else:
+            # The overlay's own footer bottom-anchors the body.
             if stripped.startswith("Esc to"):
                 end_idx = i
                 break
@@ -3496,11 +3520,19 @@ def parse_usage_output(pane_text: str) -> UsageInfo | None:
     if end_idx is None:
         end_idx = len(lines)
 
-    # Collect content lines, stripping progress bar characters and whitespace
+    # Collect content lines, stripping the top box-drawing rule, progress-bar
+    # block characters, and scroll indicators the overlay paints at the margin.
     cleaned: list[str] = []
     for line in lines[start_idx:end_idx]:
-        # Strip the line but preserve meaningful content
         stripped = line.strip()
+        if not stripped:
+            continue
+        # Drop a full-width box-drawing rule (the rule that opens the modal
+        # body, or a bare separator).
+        if all(c in "▔▁─" for c in stripped):
+            continue
+        # Strip a trailing scroll indicator (up/down arrow at the right margin).
+        stripped = stripped.rstrip("↑↓ ").rstrip()
         if not stripped:
             continue
         # Remove progress bar block characters but keep the rest

@@ -187,3 +187,97 @@ class TestUsageCommand:
         args, _ = safe_reply_mock.call_args
         assert "raw usage pane" in args[1]
         assert tmux.send_keys.await_count == 2
+
+
+class TestCostCommand:
+    """`/cost` is intercepted bot-side (alias of /usage) — same overlay scaffold."""
+
+    @pytest.mark.asyncio
+    async def test_cost_sends_slash_cost_and_always_dismisses(self):
+        """/cost sends the "/cost" overlay command then an Escape to dismiss it."""
+        update = _make_update()
+        context = _make_context()
+        tmux = _make_tmux(send_results=True, pane_text="raw cost pane")
+        safe_reply_mock = AsyncMock()
+
+        with (
+            patch("cctelegram.bot.is_user_allowed", return_value=True),
+            patch("cctelegram.bot._get_thread_id", return_value=42),
+            patch("cctelegram.bot.session_manager") as mock_sm,
+            patch("cctelegram.bot.tmux_manager", tmux),
+            patch("cctelegram.bot.safe_reply", safe_reply_mock),
+            patch("asyncio.sleep", new=AsyncMock()),
+        ):
+            mock_sm.resolve_window_for_thread.return_value = "@1"
+
+            from cctelegram.bot import cost_command
+
+            await cost_command(update, context)
+
+        # First key is "/cost" (NOT "/usage"); second is the dismiss Escape.
+        calls = tmux.send_keys.await_args_list
+        assert calls[0].args[1] == "/cost"
+        assert calls[1].args[1] == "Escape"
+        assert tmux.send_keys.await_count == 2
+        safe_reply_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cost_parse_miss_fails_open_with_note_and_raw(self):
+        """A pane that doesn't parse still gets dismissed + a fail-open reply."""
+        update = _make_update()
+        context = _make_context()
+        tmux = _make_tmux(send_results=True, pane_text="unparseable cost pane")
+        safe_reply_mock = AsyncMock()
+
+        with (
+            patch("cctelegram.bot.is_user_allowed", return_value=True),
+            patch("cctelegram.bot._get_thread_id", return_value=42),
+            patch("cctelegram.bot.session_manager") as mock_sm,
+            patch("cctelegram.bot.tmux_manager", tmux),
+            patch("cctelegram.bot.safe_reply", safe_reply_mock),
+            patch("asyncio.sleep", new=AsyncMock()),
+        ):
+            mock_sm.resolve_window_for_thread.return_value = "@1"
+
+            from cctelegram.bot import cost_command
+
+            await cost_command(update, context)
+
+        # The overlay was still dismissed (Escape sent) even on a parse miss.
+        assert tmux.send_keys.await_args_list[1].args[1] == "Escape"
+        args, _ = safe_reply_mock.call_args
+        assert "Couldn't parse the cost screen" in args[1]
+        assert "unparseable cost pane" in args[1]
+
+    @pytest.mark.asyncio
+    async def test_cost_parses_real_overlay_fixture(self):
+        """A real 2.1.206 overlay capture is parsed to readable body lines."""
+        from pathlib import Path
+
+        fixture = (
+            Path(__file__).parent / "fixtures" / "cost_overlay_live_v2.1.206.txt"
+        ).read_text()
+        update = _make_update()
+        context = _make_context()
+        tmux = _make_tmux(send_results=True, pane_text=fixture)
+        safe_reply_mock = AsyncMock()
+
+        with (
+            patch("cctelegram.bot.is_user_allowed", return_value=True),
+            patch("cctelegram.bot._get_thread_id", return_value=42),
+            patch("cctelegram.bot.session_manager") as mock_sm,
+            patch("cctelegram.bot.tmux_manager", tmux),
+            patch("cctelegram.bot.safe_reply", safe_reply_mock),
+            patch("asyncio.sleep", new=AsyncMock()),
+        ):
+            mock_sm.resolve_window_for_thread.return_value = "@1"
+
+            from cctelegram.bot import cost_command
+
+            await cost_command(update, context)
+
+        args, _ = safe_reply_mock.call_args
+        assert "Total cost:" in args[1]
+        assert "56% used" in args[1]
+        # A clean parse does NOT prepend the fail-open note.
+        assert "Couldn't parse" not in args[1]

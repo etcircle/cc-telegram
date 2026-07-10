@@ -244,17 +244,30 @@ async def _message_refs_gc_loop(bot: Bot) -> None:
             raise
 
 
-# Claude Code commands shown in bot menu (forwarded via tmux).
-# Only commands whose output actually lands in the JSONL transcript belong
-# here. /memory and /help open TUI-interactive panels inside Claude Code
-# that never reach the transcript, so they're useless over Telegram.
+# Claude Code commands shown in bot menu.
+# Two kinds belong here: (1) commands whose output actually lands in the JSONL
+# transcript (forwarded via tmux), and (2) commands that open a TUI overlay but
+# have a bot-side INTERCEPTOR that captures + presents the overlay and auto-Escs
+# it (so it never strands the topic) — e.g. /cost, handled by ``cost_command``.
+# /memory and /help open TUI-interactive panels with NO interceptor that never
+# reach the transcript, so they're useless over Telegram and are NOT listed.
 CC_COMMANDS: dict[str, str] = {
     "clear": "↗ Clear conversation history",
     "compact": "↗ Compact conversation context",
-    "cost": "↗ Show token/cost usage",
+    "cost": "↗ Show token/cost/limit usage (from the TUI overlay)",
     "model": "↗ Switch AI model",
     "effort": "↗ Set reasoning effort level",
 }
+
+
+# Known Claude Code slash commands that open a full-screen / interactive TUI
+# panel with NO bot-side interceptor. Forwarding them raw opens a modal that
+# renders nothing over Telegram (it writes no JSONL, matches no UI pattern) and
+# freezes the topic — so ``forward_command_handler`` blocks them with a helpful
+# notice instead. Conservative floor: only commands verified to open a blocking
+# panel. (Overlay commands that DO have an interceptor — /cost, /usage — are
+# bot-owned handlers registered before the forwarder, so they never reach here.)
+_TUI_OVERLAY_BLOCKLIST: frozenset[str] = frozenset({"memory", "help"})
 
 
 # --- Command handlers ---
@@ -530,8 +543,17 @@ async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             pass
 
 
-async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetch Claude Code usage stats from TUI and send to Telegram."""
+async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> None:
+    """Shared scaffold for the /usage and /cost interceptors.
+
+    ``/cost`` is an alias of ``/usage`` on Claude Code 2.1.206 — both open the
+    SAME full-screen TUI overlay that writes nothing to JSONL and matches no UI
+    pattern, so it is invisible to the bridge and blocks the topic if forwarded
+    raw. Both are intercepted bot-side: send ``slash_command`` into the pane
+    under the window send lock, settle, capture, ALWAYS auto-Esc to dismiss the
+    modal (never leave the pane stranded), then present the parsed overlay body
+    (or a fail-open fallback on parse failure / drift).
+    """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
@@ -551,8 +573,8 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Wave 3b compound transaction (Hermes P2-5): hold the window send lock
     # across the WHOLE send→settle→capture→dismiss sequence so no other writer
-    # (a pick dispatch, user text, a control key) can land inside the /usage
-    # modal window — and conversely /usage can't inject "/usage" + Escape into
+    # (a pick dispatch, user text, a control key) can land inside the overlay
+    # window — and conversely this probe can't inject its command + Escape into
     # someone else's in-flight transaction. Reject-if-held rather than queue:
     # blocking a user command behind a multi-second transaction would just
     # pile up surprise keystrokes. All Telegram replies happen strictly AFTER
@@ -567,14 +589,16 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     pane_text: str | None = None
     dismiss_ok = False
     async with lock:
-        # Send /usage command to Claude Code TUI
-        sent = await tmux_manager.send_keys(w.window_id, "/usage")
+        # Open the overlay in the Claude Code TUI.
+        sent = await tmux_manager.send_keys(w.window_id, slash_command)
         if sent:
-            # Wait for the modal to render
+            # Wait for the modal to render.
             await asyncio.sleep(2.0)
-            # Capture the pane content
+            # Capture the pane content.
             pane_text = await tmux_manager.capture_pane(w.window_id)
-            # Dismiss the modal
+            # ALWAYS dismiss the modal — even on a parse miss below, the overlay
+            # is a full-screen modal that would otherwise strand the topic. The
+            # single Esc cleanly restores the input box (verified on 2.1.206).
             dismiss_ok = await tmux_manager.send_keys(
                 w.window_id, "Escape", enter=False, literal=False
             )
@@ -588,19 +612,51 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, "Failed to capture usage info.")
         return
 
-    # Try to parse structured usage info
+    # Try to parse the structured overlay body. The overlay was already
+    # dismissed under the lock above, so every branch here is fail-open — the
+    # pane is never left blocked, regardless of whether parsing succeeded.
     from .terminal_parser import parse_usage_output
 
     usage = parse_usage_output(pane_text)
     if usage and usage.parsed_lines:
         text = "\n".join(usage.parsed_lines)
         await safe_reply(update.message, f"```\n{text}\n```")
-    else:
-        # Fallback: send raw pane capture trimmed
-        trimmed = pane_text.strip()
+        return
+
+    # Fail-open fallback: parsing yielded nothing useful (version drift moved
+    # the tab bar / footer). Present the raw captured overlay region trimmed so
+    # the numbers are still readable, with an honest note.
+    trimmed = pane_text.strip()
+    if trimmed:
         if len(trimmed) > 3000:
             trimmed = trimmed[:3000] + "\n... (truncated)"
-        await safe_reply(update.message, f"```\n{trimmed}\n```")
+        await safe_reply(
+            update.message,
+            f"Couldn't parse the {label} screen on this Claude version — "
+            f"raw capture below (or use /screenshot):\n```\n{trimmed}\n```",
+        )
+    else:
+        await safe_reply(
+            update.message,
+            f"Couldn't parse the {label} screen on this Claude version. "
+            "Use /screenshot to view the terminal.",
+        )
+
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch Claude Code usage stats from the TUI overlay and send to Telegram."""
+    await _run_usage_overlay(update, "/usage", "usage")
+
+
+async def cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch Claude Code cost/usage from the TUI overlay and send to Telegram.
+
+    ``/cost`` is an alias of ``/usage`` on Claude Code 2.1.206 (identical
+    full-screen overlay). It is intercepted bot-side rather than forwarded raw
+    so the overlay never strands the topic (it writes nothing to JSONL and
+    matches no UI pattern).
+    """
+    await _run_usage_overlay(update, "/cost", "cost")
 
 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -781,6 +837,20 @@ async def forward_command_handler(
     parts_text = cmd_text.strip().split(None, 1)
     base = parts_text[0].split("@")[0] if parts_text else ""
     cc_slash = base + (" " + parts_text[1] if len(parts_text) > 1 else "")
+
+    # TUI-overlay blocklist floor: a known interceptor-less full-screen panel
+    # (e.g. /memory, /help) renders nothing over Telegram and freezes the topic
+    # if forwarded raw. Refuse it with a helpful notice instead of forwarding.
+    cmd_name = base[1:] if base.startswith("/") else base
+    if cmd_name in _TUI_OVERLAY_BLOCKLIST:
+        await safe_reply(
+            update.message,
+            f"/{cmd_name} opens a full-screen terminal panel that can't render "
+            "over Telegram — blocked so it doesn't freeze this topic. Use "
+            "/screenshot to view the terminal.",
+        )
+        return
+
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
         await safe_reply(update.message, "❌ No session bound to this topic.")
@@ -1057,6 +1127,16 @@ async def _maybe_offer_artifacts(
     card = artifacts.mint(route, resolved)
     if card is None or not card.rows:
         return
+    # Observability (2026-07-10): log the mint so a download-lane incident is
+    # reconstructable from the resolved paths + pinned roots + row count.
+    logger.info(
+        "artifact card mint: window=%s user=%s rows=%d paths=%s roots=%s",
+        wid,
+        user_id,
+        len(card.rows),
+        [a.resolved_path for a in resolved],
+        [a.allowed_roots for a in resolved],
+    )
     # Pathless body (owner decision 2026-07-09): the prose above already names
     # the file(s), and a plain-text path here gets TLD-auto-linkified into a
     # dead link (.md = Moldova, .zip, …). The BUTTON labels carry the names;
@@ -1811,6 +1891,11 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    # /cost is an alias of /usage on Claude Code 2.1.206 (identical full-screen
+    # overlay that writes nothing to JSONL and matches no UI pattern). Intercept
+    # it bot-side — register BEFORE the catch-all forwarder below or it lands in
+    # tmux, opens the overlay invisibly, and freezes the topic.
+    application.add_handler(CommandHandler("cost", cost_command))
     # /file is bot-owned (upload a local file from the session to the topic) —
     # register before the catch-all forwarder below so it never lands in tmux.
     application.add_handler(CommandHandler("file", file_command))

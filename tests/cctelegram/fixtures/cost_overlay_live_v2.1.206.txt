@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.206 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.2819
+   Total duration (API):  19s
+   Total duration (wall): 1m 16s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage by model:
+         claude-fable-5:  9.2k input, 17 output, 18.9k cache read, 8.5k cache write ($0.2819)
+
+   Current session
+   ████████████████████████████                       56% used
+   Resets 11:49am (Europe/London)
+
+   Current week (all models)
+   █████████████████████████▌                         51% used
+   Resets Jul 12 at 11:59am (Europe/London)
+
+   Current week (Fable)
+   ███████████████████████████████████████████▌       87% used
+   Resets Jul 12 at 11:59am (Europe/London)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+   Last 24h · these are independent characteristics of your usage, not a breakdown
+
+   97% of your usage came from subagent-heavy sessions
+    Each subagent runs its own requests. Be deliberate about spawning them — and
+    consider configuring a cheaper model for simpler subagents.
+
+   88% of your usage was at >150k context
+    Longer sessions are more expensive even when cached. /compact mid-task, /clear
+    when switching to new tasks.
+
+   84% of your usage came from sessions active for 8+ hours
+    These are often background/loop sessions. Continuous usage can add up quickly
+    so make sure it is intentional.
+
+   25% of your usage was while 4+ sessions ran in parallel
+    All sessions share one limit. If you don't need them all at once, queueing uses
+    it more evenly.
+
+   30% of your usage came from subagents under "general-purpose"
+    If this runs frequently, consider configuring its subagents with a cheaper
+    model or tightening their prompts.                                                                                                                        ↓

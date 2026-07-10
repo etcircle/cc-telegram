@@ -55,9 +55,42 @@ class TestForwardCommand:
             mock_sm.send_to_window.assert_called_once_with("@5", "/model")
 
     @pytest.mark.asyncio
-    async def test_cost_sends_command_to_tmux(self):
-        """/cost → send_to_window called with "/cost"."""
-        update = _make_update("/cost")
+    @pytest.mark.parametrize(
+        "cmd", ["/memory", "/help", "/memory@botname", "/help extra"]
+    )
+    async def test_tui_overlay_blocklist_refuses_and_does_not_forward(self, cmd):
+        """A known interceptor-less TUI panel (/memory, /help) is blocked, not forwarded."""
+        update = _make_update(cmd)
+        context = _make_context()
+
+        with (
+            patch("cctelegram.bot.is_user_allowed", return_value=True),
+            patch("cctelegram.bot._get_thread_id", return_value=42),
+            patch("cctelegram.bot.session_manager") as mock_sm,
+            patch("cctelegram.bot.tmux_manager") as mock_tmux,
+            patch("cctelegram.bot.safe_reply", new_callable=AsyncMock) as mock_reply,
+        ):
+            mock_sm.resolve_window_for_thread.return_value = "@5"
+            mock_sm.get_display_name.return_value = "project"
+            mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
+            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+
+            from cctelegram.bot import forward_command_handler
+
+            await forward_command_handler(update, context)
+
+            # Never forwarded to tmux.
+            mock_sm.send_to_window.assert_not_called()
+            # A helpful "blocked" notice was sent.
+            assert mock_reply.await_count == 1
+            notice = mock_reply.await_args.args[1]
+            assert "full-screen terminal panel" in notice
+            assert "/screenshot" in notice
+
+    @pytest.mark.asyncio
+    async def test_non_blocklisted_command_still_forwards(self):
+        """A command that is neither bot-owned nor blocklisted forwards normally."""
+        update = _make_update("/compact")
         context = _make_context()
 
         with (
@@ -76,7 +109,7 @@ class TestForwardCommand:
 
             await forward_command_handler(update, context)
 
-            mock_sm.send_to_window.assert_called_once_with("@5", "/cost")
+            mock_sm.send_to_window.assert_called_once_with("@5", "/compact")
 
     @pytest.mark.asyncio
     async def test_bot_mention_preserves_args(self):
