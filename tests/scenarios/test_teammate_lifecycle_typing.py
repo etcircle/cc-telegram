@@ -323,3 +323,224 @@ async def test_park_at_exactly_spawned_ts_closes_relit_key(
     snap = route_runtime.snapshot(route)
     assert snap.typing_eligible is False
     assert snap.background_agents == ()
+
+
+def _make_hybrid_monitor(tmp_path):
+    """A REAL SessionMonitor over tmp_path whose parent is _SID, for the r4
+    hybrid pins (real check_for_updates → production apply_sidechain_activity)."""
+    import json as _json
+
+    from cctelegram.session_monitor import (
+        SessionInfo,
+        SessionMonitor,
+        TrackedSession,
+    )
+
+    mon = SessionMonitor(
+        projects_path=tmp_path / "projects",
+        state_file=tmp_path / "monitor_state.json",
+    )
+    proj = tmp_path / "projects" / "-p"
+    proj.mkdir(parents=True, exist_ok=True)
+    parent_jsonl = proj / f"{_SID}.jsonl"
+    parent_jsonl.write_text("")
+    sub_dir = proj / _SID / "subagents"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    mon.state.update_session(
+        TrackedSession(
+            session_id=_SID,
+            file_path=str(parent_jsonl),
+            last_byte_offset=0,
+        )
+    )
+
+    async def _scan():
+        return [SessionInfo(session_id=_SID, file_path=parent_jsonl)]
+
+    mon.scan_projects = _scan  # type: ignore[method-assign]
+
+    def _append(entries):
+        with open(parent_jsonl, "a") as f:
+            for e in entries:
+                f.write(_json.dumps(e) + "\n")
+
+    return mon, sub_dir, _append
+
+
+def _iso_utc(ts: float) -> str:
+    from datetime import datetime, timezone
+
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _spawn_pair(name: str, ts: str) -> list[dict]:
+    return [
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tu_r4",
+                        "name": "Agent",
+                        "input": {"prompt": "go"},
+                    }
+                ]
+            },
+            "sessionId": _SID,
+            "timestamp": ts,
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_r4",
+                        "content": [{"type": "text", "text": "Spawned successfully."}],
+                    }
+                ]
+            },
+            "sessionId": _SID,
+            "timestamp": ts,
+            "toolUseResult": {
+                "status": "teammate_spawned",
+                "name": name,
+                "teammate_id": f"{name}@team",
+                "agent_type": "explorer",
+            },
+        },
+    ]
+
+
+def _park_entry(name: str, payload_ts: str | None, entry_ts: str) -> dict:
+    payload = f'{{"type":"idle_notification","from":"{name}"'
+    if payload_ts is not None:
+        payload += f',"timestamp":"{payload_ts}"'
+    payload += "}"
+    return {
+        "type": "user",
+        "message": {
+            "content": (
+                "Another Claude session sent a message:\n"
+                f'<teammate-message teammate_id="{name}" color="blue">\n'
+                f"{payload}\n"
+                "</teammate-message>\n"
+            )
+        },
+        "sessionId": _SID,
+        "timestamp": entry_ts,
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_registry_stale_park_then_spawn_one_batch_binds_live(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r4 P2 REQUIRED pin (Codex, probe-reproduced): stem pre-discovered at EOF
+    (no registry rec) → ONE parent batch carries a delayed park at T1 followed by
+    the fresh spawn at T2 → the park lands via the no-registry fallback (no
+    spawned_ts existed to filter against), the spawn registers + binds — and the
+    bind's RETROACTIVE generation filter drops the stale parseable park, so
+    through real check_for_updates + the PRODUCTION fan-out the key is bound AND
+    typing lifts (pre-fix: launched then the stale park → tombstoned dark). A
+    genuine park at ts > spawned_ts still closes it."""
+    import json as _json
+    import os
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY  # aexplore-backend-11223344aabbccdd
+
+    # Pre-discover the stem at EOF (tracked, NO registry rec yet).
+    t2 = time.time() - 30
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text(
+        _json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": []},
+                "timestamp": _iso_utc(t2 - 1),
+            }
+        )
+        + "\n"
+    )
+    os.utime(sc, (t2 - 1, t2 - 1))
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+
+    # ONE batch: the delayed park (T1 < T2) THEN the fresh spawn (T2).
+    _append([_park_entry(name, _iso_utc(t2 - 2), _iso_utc(t2 - 2))])
+    _append(_spawn_pair(name, _iso_utc(t2)))
+    await mon.check_for_updates({_SID})
+    await mon.check_sidechain_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    await bot_module.apply_sidechain_activity(act)
+
+    # Bound + LIVE: the stale park was retroactively generation-filtered.
+    assert mon._teammate_registry[_SID][name].current_key == key
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True
+    assert snap.background_agents == (key,)
+
+    # A GENUINE park (ts > spawned_ts) still closes it.
+    _append([_park_entry(name, _iso_utc(t2 + 60), _iso_utc(t2 + 60))])
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_no_registry_unparseable_park_then_spawn_still_tombstones(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r4 dominance variant: an UNPARSEABLE pre-registration park (no timestamp —
+    it cannot be generation-checked) is KEPT by the retroactive filter and still
+    tombstones the bound key through the production fan-out (fail-dark
+    preserved; the retroactive drop is scoped strictly to parseable-and-stale)."""
+    import json as _json
+    import os
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY
+
+    t2 = time.time() - 30
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text(
+        _json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": []},
+                "timestamp": _iso_utc(t2 - 1),
+            }
+        )
+        + "\n"
+    )
+    os.utime(sc, (t2 - 1, t2 - 1))
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+
+    # ONE batch: an UNPARSEABLE park (no ts) THEN the spawn.
+    _append([_park_entry(name, None, _iso_utc(t2 - 2))])
+    _append(_spawn_pair(name, _iso_utc(t2)))
+    await mon.check_for_updates({_SID})
+    await mon.check_sidechain_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    assert act[_SID].teammate_parks.get(key) == (None, True)  # kept (dominance)
+    await bot_module.apply_sidechain_activity(act)
+
+    assert mon._teammate_registry[_SID][name].current_key == key  # still binds
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False  # fail-dark holds
+    assert snap.background_agents == ()

@@ -1281,7 +1281,24 @@ class SessionMonitor:
         relight stays (harmless on a never-tombstoned key, load-bearing when
         the retraction applied in an earlier tick). Without the cancel, the
         fan-out's parks-after-resumed order let the synthetic done tombstone
-        the just-relit key permanently."""
+        the just-relit key permanently.
+
+        RETROACTIVE GENERATION FILTER (r4 P2, Codex, probe-reproduced): a park
+        recorded EARLIER IN THIS BATCH via the NO-REGISTRY fallback had no
+        ``spawned_ts`` to filter against at record time (the generation didn't
+        exist yet) — a delayed prior-leg park at T1 followed by the fresh spawn
+        at T2 in ONE parent batch left a stale PARSEABLE park in the current
+        record, and the fan-out (parks after launched/resumed) tombstoned the
+        newly bound key with no activity/resume stamp to defend it. The bind
+        re-applies the r1 item-4 generation floor to the pre-existing park:
+        parseable-and-stale (``park_ts < spawned_ts``) is dropped; UNPARSEABLE
+        dominance remains (fail-dark). The bind seam alone suffices: once the
+        name is registered, ``_record_teammate_park`` filters at record time
+        (so a stale current-record park can only pre-exist via the no-registry
+        fallback, i.e. only when the spawn landed later in the SAME batch), and
+        an UNBOUND candidate's key is tombstoned by the registration retraction
+        anyway — both are dones — with a later bind relighting via the resumed
+        lane."""
         rec.current_key = key
         activity = self._parent_activity(parent_session_id)
         if key in rec.done_retracted_keys:
@@ -1294,6 +1311,24 @@ class SessionMonitor:
             )
         else:
             activity.launched.add(key)
+        existing_park = activity.teammate_parks.get(key)
+        if existing_park is not None:
+            ex_park_ts, ex_unparseable = existing_park
+            if (
+                not ex_unparseable
+                and ex_park_ts is not None
+                and ex_park_ts < rec.spawned_ts
+            ):
+                # The r4 retroactive generation filter — see docstring.
+                del activity.teammate_parks[key]
+                logger.info(
+                    "teammate bind: dropping pre-registration stale park for "
+                    "key %s (park_ts=%.3f < gen-%d spawned_ts=%.3f)",
+                    key,
+                    ex_park_ts,
+                    rec.spawn_generation,
+                    rec.spawned_ts,
+                )
         if rec.pending_wake is not None:
             _record_resume_ts(activity.resumed, key, rec.pending_wake)
         if rec.pending_park is not None:
