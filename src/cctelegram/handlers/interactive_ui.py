@@ -2938,10 +2938,9 @@ _LIVE_PROSE_RETRY_STEP_S = 0.05
 _LIVE_PROSE_STREAM_WAIT_BUDGET_S = 3.0
 
 # Conservative per-chunk cap for the pre-card live-prose split (< Telegram's 4096
-# hard limit). ``split_message`` can return a chunk a few chars OVER its
-# ``max_length`` when it auto-closes a fenced code block or wraps an expandable
-# quote at the boundary (observed ~4097 at 4096), which would trip "Message is
-# too long"; the headroom keeps every boundary chunk sendable.
+# hard limit). The headroom remains useful for any later send-layer expansion;
+# ``split_message`` itself now guarantees that every chunk stays within its
+# requested maximum, including auto-closed fenced code blocks.
 _LIVE_PROSE_CHUNK_MAX = 4000
 
 
