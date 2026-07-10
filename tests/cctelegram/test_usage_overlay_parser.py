@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from cctelegram.terminal_parser import parse_usage_output
+from cctelegram.terminal_parser import parse_usage_output, usage_overlay_present
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -96,3 +96,51 @@ def test_non_overlay_pane_returns_none():
 
 def test_empty_pane_returns_none():
     assert parse_usage_output("") is None
+
+
+# ── Adversarial anchor probes (round-1 converged P3) ───────────────────────
+# The old anchor was unordered substring membership: the five tab words in ANY
+# order / concatenated / embedded in prose matched, so with a delayed overlay
+# arbitrary pane prose could be reported as structured usage. The anchor now
+# requires the five ORDERED whole tokens (whitespace-separated, no other word
+# chars on the line) + structural overlay evidence (the modal's top rule /
+# the Esc footer / the Session sub-header).
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        # The five words embedded in ordinary prose (in order, other words
+        # interleaved) — plus secret-looking output below.
+        (
+            "I checked the Settings page, the Status view, the Config file, "
+            "the Usage tab and the Stats panel\nsecret output\n❯ "
+        ),
+        # Reversed order (the literal Hermes probe).
+        "Stats Usage Config Status Settings\nsecret output\n❯ ",
+        # Concatenated (no whitespace between tokens — the Codex probe).
+        "SettingsStatusConfigUsageStats\nsecret output\n❯ ",
+        # The EXACT tab-bar line but with NO structural overlay evidence
+        # around it (no rule above, no footer, no Session sub-header) —
+        # e.g. assistant prose QUOTING the tab bar.
+        (
+            "some earlier prose\n"
+            "   Settings  Status   Config   Usage   Stats\n"
+            "more prose\n❯ "
+        ),
+    ],
+)
+def test_adversarial_probes_return_none(pane: str):
+    assert parse_usage_output(pane) is None
+    assert usage_overlay_present(pane) is False
+
+
+@pytest.mark.parametrize("fixture", _OVERLAY_FIXTURES)
+def test_usage_overlay_present_true_on_real_captures(fixture: str):
+    assert usage_overlay_present(_read(fixture)) is True
+
+
+def test_usage_overlay_present_false_on_non_overlay_panes():
+    assert usage_overlay_present("✻ Cooked for 2s\n❯\n  ? for shortcuts") is False
+    assert usage_overlay_present(None) is False
+    assert usage_overlay_present("") is False

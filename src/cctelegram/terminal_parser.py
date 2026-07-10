@@ -3465,15 +3465,70 @@ class UsageInfo:
 # The /usage (== /cost) modal tab bar, verbatim on Claude Code 2.1.206:
 #     "   Settings  Status   Config   Usage   Stats"
 # This same bar renders for BOTH /cost and /usage (fixture-verified — the two
-# frames are byte-identical templates). We anchor on the individual tab tokens
-# (whitespace-tolerant membership) rather than the exact spacing so a minor
-# chrome reflow doesn't break detection.
-_USAGE_TAB_TOKENS: tuple[str, ...] = ("Settings", "Status", "Config", "Usage", "Stats")
+# frames are byte-identical templates). The anchor requires the five ORDERED
+# whole tokens separated by whitespace only, with NO other word characters on
+# the line (leading/trailing non-word chrome — spaces, box glyphs, a scroll
+# indicator — is tolerated). Unordered / concatenated / prose-embedded probes
+# ("Stats Usage Config Status Settings", "SettingsStatusConfigUsageStats",
+# a sentence containing the five words) must NOT match (round-1 converged P3).
+_RE_USAGE_TAB_BAR = re.compile(
+    r"^[^\w]*Settings\s+Status\s+Config\s+Usage\s+Stats[^\w]*$"
+)
+
+# A full-width box-drawing rule (the modal body's top rule / a bare separator)
+# — one of the structural-evidence anchors below.
+_RE_USAGE_RULE_LINE = re.compile(r"^[▔▁─]{20,}$")
 
 
-def _is_usage_tab_bar(stripped: str) -> bool:
-    """True if ``stripped`` is the /usage modal's tab-bar line (all tabs present)."""
-    return all(tok in stripped for tok in _USAGE_TAB_TOKENS)
+def _usage_overlay_anchor(lines: list[str]) -> int | None:
+    """Return the index of the /usage modal's tab-bar line, or None.
+
+    A matching tab-bar line alone is NOT enough (arbitrary pane prose could
+    reproduce it — the round-1 P3): the match must be corroborated by
+    STRUCTURAL overlay evidence — any of (fixture-supported on 2.1.206):
+
+    - the full-width box-drawing rule that opens the modal body, within the 3
+      non-blank lines ABOVE the tab bar (present in every capture, including
+      the scrolled day/week toggles);
+    - the overlay's own ``Esc to …`` footer anywhere BELOW it;
+    - the ``Session`` sub-header within the 6 lines BELOW it (the unscrolled
+      top-of-modal shape).
+    """
+    for i, line in enumerate(lines):
+        if not _RE_USAGE_TAB_BAR.match(line.strip()):
+            continue
+        # (a) the modal's top rule above the tab bar (skip blank lines).
+        seen = 0
+        for j in range(i - 1, -1, -1):
+            stripped_above = lines[j].strip()
+            if not stripped_above:
+                continue
+            if _RE_USAGE_RULE_LINE.match(stripped_above):
+                return i
+            seen += 1
+            if seen >= 3:
+                break
+        # (b) the footer below / (c) the Session sub-header just below.
+        for k in range(i + 1, len(lines)):
+            stripped_below = lines[k].strip()
+            if stripped_below.startswith("Esc to"):
+                return i
+            if k <= i + 6 and stripped_below == "Session":
+                return i
+        # A tab-bar-shaped line without structural evidence — keep scanning.
+    return None
+
+
+def usage_overlay_present(pane_text: str | None) -> bool:
+    """True when the captured pane shows the live /usage (== /cost) modal.
+
+    The conditional-dismiss gate for ``bot._run_usage_overlay``: Escape is sent
+    ONLY when this returns True — an Escape into a pane where the overlay never
+    opened would interrupt an active generation (the /esc hazard; round-1 P1).
+    """
+    if not pane_text:
+        return False
+    return _usage_overlay_anchor(pane_text.strip().split("\n")) is not None
 
 
 def parse_usage_output(pane_text: str) -> UsageInfo | None:
@@ -3482,10 +3537,12 @@ def parse_usage_output(pane_text: str) -> UsageInfo | None:
     The /cost and /usage commands open the SAME full-screen modal (fixture
     verified on 2.1.206): a tab bar ``Settings  Status  Config  Usage  Stats``
     at the top of the modal body and an ``Esc to cancel`` footer at the bottom
-    of the scrollable body. The parser anchors on that stable chrome — it takes
-    everything AFTER the tab-bar line and BEFORE ``Esc to cancel`` (or the end
-    of the captured pane if the footer scrolled off), strips the box-drawing
-    rule + progress-bar block characters, and returns the readable body lines.
+    of the scrollable body. The parser anchors on that stable chrome — the
+    ORDERED whole-token tab bar corroborated by structural overlay evidence
+    (``_usage_overlay_anchor``) — takes everything AFTER the tab-bar line and
+    BEFORE ``Esc to cancel`` (or the end of the captured pane if the footer
+    scrolled off), strips the box-drawing rule + progress-bar block characters,
+    and returns the readable body lines.
 
     Tolerant by design: the goal is a readable Telegram message, not a lossless
     model. Version drift that moves the tab bar / footer → ``None`` → the
@@ -3498,25 +3555,21 @@ def parse_usage_output(pane_text: str) -> UsageInfo | None:
 
     lines = pane_text.strip().split("\n")
 
-    # Find the tab-bar line that marks the top of the modal body. Anything above
-    # it (a welcome card / limit banner left in scrollback above the overlay —
-    # see the usage_overlay fixture) is ignored.
-    start_idx: int | None = None
+    # The validated tab-bar anchor marks the top of the modal body. Anything
+    # above it (a welcome card / limit banner left in scrollback above the
+    # overlay — see the usage_overlay fixture) is ignored.
+    anchor = _usage_overlay_anchor(lines)
+    if anchor is None:
+        return None
+    start_idx = anchor + 1  # skip the tab-bar header itself
     end_idx: int | None = None
 
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if start_idx is None:
-            if _is_usage_tab_bar(stripped):
-                start_idx = i + 1  # skip the tab-bar header itself
-        else:
-            # The overlay's own footer bottom-anchors the body.
-            if stripped.startswith("Esc to"):
-                end_idx = i
-                break
+    for i in range(start_idx, len(lines)):
+        # The overlay's own footer bottom-anchors the body.
+        if lines[i].strip().startswith("Esc to"):
+            end_idx = i
+            break
 
-    if start_idx is None:
-        return None
     if end_idx is None:
         end_idx = len(lines)
 
