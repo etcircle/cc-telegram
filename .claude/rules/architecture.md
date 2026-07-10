@@ -267,13 +267,16 @@ Additional modules:
                                 stashed next-gen wake is never spent on the
                                 bound old gen) /
                                 TEAMMATE-done (park, universally orphan-retained
-                                — r8 item 2 → r9 item 1: the 32-name buffer's
-                                at-cap eviction is two-tier oldest-first keyed on
-                                the DRAIN FILTER's own semantics — tier 1 evicts a
-                                REDUNDANT entry (drain would generation-drop it)
-                                before a PROTECTED one (no rec, or a signal that
-                                survives the drain filter — the possibly-next-gen
-                                close)) marks; see message-handling.md.
+                                — r8 item 2 → r9 item 1 → r10 item 1: the
+                                32-name buffer's at-cap eviction is three-tier
+                                oldest-first keyed on the DRAIN FILTER's own
+                                semantics — tier 1 evicts a REDUNDANT entry
+                                (drain would generation-drop it), tier 2 a
+                                SPECULATIVE one (has a rec, no stashed spawn —
+                                same-gen noise), tier 3 (last resort) a PROVABLE
+                                one (no rec, or a stashed next-gen spawn — the
+                                pending gen's only close)) marks; see
+                                message-handling.md.
                                 Clears: done / a PER-KEY wall-clock heartbeat
                                 TTL (_wall_now(), expire-before-classify) —
                                 T2 split: foreground-presumed keys age by

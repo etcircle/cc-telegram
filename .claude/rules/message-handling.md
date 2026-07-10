@@ -710,8 +710,10 @@ of new work); a fresh key with no tombstone treats resumed as a plain launch.
 So the `done_retracted_keys` field, its membership gate, its rotation clear, and
 its rec-side same-tick-cancel bookkeeping are **DELETED**; the retraction
 emission + the `retraction_dones` slot + the per-tick same-tick cancel STAY. The
-resume ts sits **STRICTLY BELOW** the generation's `spawned_ts` —
-`spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S` (1e-3; r3 item 2, Codex P1,
+resume ts sits **STRICTLY BELOW** the generation's `spawned_ts` — the emission
+is `min(spawned_ts, first_entry_ts) - TEAMMATE_RETRACT_RESUME_EPSILON_S` (1e-3;
+the r8-item-1 floor below, reducing to r3's `spawned_ts - ε` in the normal
+`first_ts >= spawned_ts` case; r3 item 2, Codex P1,
 probe-confirmed): the runtime resume gate suppresses a TEAMMATE/SIDECHAIN done
 with ts <= `resumed_event_ts`, so a resume ts of exactly `spawned_ts` stranded
 a genuine park stamped at exactly `spawned_ts` to the 2h TTL (it passes the
@@ -871,8 +873,9 @@ item-1 spawn stash) holds an `_OrphanPending` **pending PAIR mirroring the rec
 slots exactly** — park (causal-reduced via the SAME `_merge_pending_park`
 rules) + wake (max-on-repeats, r6 rule 3) — per-parent, name-keyed, bounded
 (`_ORPHAN_PARK_MAX_NAMES` 32 — replace-merge in place for an existing name,
-**TWO-TIER oldest-first eviction only for a NEW name at cap (r8 item 2 → r9
-item 1, CONVERGED P1 — Hermes + Codex, both probe-reproduced):** since r7 made
+**THREE-TIER oldest-first eviction only for a NEW name at cap (r8 item 2 → r9
+item 1 → r10 item 1, CONVERGED P1 — Hermes + Codex, all probe-reproduced):**
+since r7 made
 EVERY park dual-write a named copy — including the high-frequency
 registered/bound path — a busy multi-teammate parent churns the buffer with
 copies, and a blind `next(iter(buf))` drop-oldest evicted the sole retained
@@ -889,11 +892,33 @@ filter must never disagree, mint/validate parity). An entry is tier-1 evictable
 iff it has a rec AND EVERY retained signal is generation-dropped (a park with
 parseable `ts < rec.spawned_ts` — and since `spawned_ts` is event-ts-anchored
 and MONOTONIC across generations, any FUTURE generation spawns even later, so it
-can close NO generation; a wake `< rec.spawned_ts`). Tier 1 evicts the oldest
-REDUNDANT entry FIRST; tier 2 (only when tier 1 is EMPTY — the TRUE cap bound)
-evicts the oldest PROTECTED entry (no rec — a pre-registration orphan; OR a
-park/wake that SURVIVES the drain filter — the possibly-next-gen close; OR an
-unparseable-dominance park that can't be ts-classified). The
+can close NO generation; a wake `< rec.spawned_ts`). **Fix (r10 item 1): r9's
+tier 2 (evict the oldest PROTECTED entry when ALL survive the drain filter) is
+an ORDINARY steady state** — r9's universal wake retention keeps every bound
+teammate's own wake (`event_ts >= its spawned_ts`) protected even after its
+immediate copy was applied, so a busy parent with 32 distinct bound names all
+carrying a self-wake makes the buffer entirely protected and the r9 fallback
+evicts a stashed NEXT generation's ONLY close (probe: a gen-2 park retained
+under bound gen-1 name `future` + 31 ordinary bound-name wakes + a 33rd name →
+`future` evicted → the late gen-2 spawn drains nothing → 2h strand; 33 DISTINCT
+names within the 2h TTL, not concurrent teammates — realistic, 18 spawns in the
+real incident corpus). The protected class is SPLIT into speculative vs provable
+by whether the entry's value can close a not-yet-visible future generation:
+**Tier 1** evicts the oldest
+REDUNDANT entry (drain-droppable) FIRST; **tier 2** (only when tier 1 is EMPTY)
+evicts the oldest SPECULATIVE entry (a name that HAS a rec AND has NO
+spawn-shaped early signal in `_early_teammate_signals` — registered
+SAME-generation noise whose signals were already applied to the bound
+`current_key`; the retained copy only serves a future generation nothing proves
+is pending); **tier 3** (LAST resort, only when tiers 1+2 are EMPTY — the TRUE
+cap bound) evicts the oldest PROVABLE entry (no rec — a pre-registration orphan;
+OR a name WITH a spawn-shaped early signal — a stashed next-generation spawn, so
+the retained copy is PROVABLY that generation's ONLY close; OR an
+unparseable-dominance park that can't be ts-classified). Tier 2 vs 3 =
+speculative vs provable pending value; the eviction may only sacrifice provable
+value at TRUE capacity. The stash probe is a bounded name-membership scan over
+`_early_teammate_signals[parent]` (≤ the 64-entry cap; the parsed
+`TeammateSpawnInfo` carries `.name`), precomputed ONCE per eviction call. The
 `_orphan_entry_is_generation_droppable` seam reads `self._teammate_registry` +
 the SHARED `_generation_filter_park` / `_generation_filter_wake` (same name-key
 space, same filters as the drain) with a per-entry wall TTL
