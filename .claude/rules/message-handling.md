@@ -586,7 +586,8 @@ fail-closed to DONE. The stale-vs-activity gate is TEAMMATE-only; `SIDECHAIN`
 semantics are byte-untouched. Pull-only; no observer (c313657 stays forbidden).
 
 **GH #46 PR-2 (teammates as FIRST-CLASS background keys — the generational
-registry, launch-at-binding, wake lane, discovery-quarantine).** PR-1 closed a
+registry, always-resumed relight-at-binding, wake lane, discovery-quarantine).**
+PR-1 closed a
 teammate's PARK; PR-2 makes the teammate a first-class background key so typing
 stays ON while it genuinely works ACROSS the parent's own turns, relights when
 re-woken, and drops promptly at park — WITHOUT ever stranding on a stale
@@ -719,7 +720,26 @@ generation-dropped BEFORE the gate, so nothing in (resume_ts, spawned_ts) can
 wrongly close via the PARK lane; a prior-gen SIDECHAIN end_turn ts landing
 inside the 1ms epsilon window would tombstone — fail-dark (the accepted
 direction) and vanishingly rare. A pending wake (necessarily newer) max-merges
-over the relight resume ts.
+over the relight resume ts. **RESUME-TS FLOOR (r8 item 1, Hermes P1,
+probe-reproduced):** the stamp is `min(spawned_ts, first_entry_ts) - ε` —
+strictly below the BOUND FILE's OWN first entry, not merely below `spawned_ts`.
+The gen-1 bind gate tolerates a first entry up to `spawned_ts -
+TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S` (5s) below the spawn (gen≥2 only 0.1s), so
+an accepted look-alike candidate can bind with a first entry — and thus a
+TRAILING sidechain end_turn ≥ that first entry, e.g. `spawned_ts - 2s` — BELOW
+`spawned_ts - ε`; the r7 `spawned_ts - ε` stamp then SHIELDED that pre-spawn
+end_turn at the runtime SIDECHAIN done gate (`end_turn_ts <= resumed_event_ts`
+keeps the key LIVE), recreating the 2h strand where the pre-r7 `launched` path
+fail-closed to DONE (no `resumed_event_ts` ⇒ a stale end_turn tombstones).
+Flooring at the bound file's first entry makes EVERY signal in that file
+(including its trailing end_turn, which is ≥ its first entry) STRICTLY NEWER than
+the resume, so nothing from the bound file can be shielded. In the normal case
+(`first_ts >= spawned_ts`, measured 1–7 ms after) the `min` reduces to
+`spawned_ts - ε` — the r3 tie fix and the r7 semantics are preserved
+byte-for-byte. The `first_entry_ts` is read at the gate
+(`_teammate_bind_gate_passes` now returns `(gate, first_ts)`) and plumbed through
+`_arbitrate_and_bind` to `_bind_teammate_key`; a gate-True result always carries
+it, so the fallback (`spawned_ts - ε`, logged) is defensive only.
 **Binding — SET-BASED arbitration (dual-review
 r1 item 2, BOTH engines converged; `_arbitrate_and_bind`, shared by the public
 `check_sidechain_updates` pre-pass `_arbitrate_teammate_bindings` AND the
@@ -834,7 +854,20 @@ item-1 spawn stash) holds an `_OrphanPending` **pending PAIR mirroring the rec
 slots exactly** — park (causal-reduced via the SAME `_merge_pending_park`
 rules) + wake (max-on-repeats, r6 rule 3) — per-parent, name-keyed, bounded
 (`_ORPHAN_PARK_MAX_NAMES` 32 — replace-merge in place for an existing name,
-evict-oldest only for a NEW name at cap) with a per-entry wall TTL
+**TWO-TIER oldest-first eviction only for a NEW name at cap (r8 item 2, CONVERGED
+P1 — Hermes + Codex, both probe-reproduced):** since r7 made EVERY park
+dual-write a named copy — including the high-frequency registered/bound path — a
+busy multi-teammate parent churns the buffer with REDUNDANT registered-name
+copies (their primary immediate close already applied; each is generation-dropped
+at the next drain), and a blind `next(iter(buf))` drop-oldest evicted the sole
+retained pre-registration ORPHAN the buffer EXISTS to protect (probe: 32 distinct
+registered-name parks evict an unregistered `future` → it later binds with
+`pending_park=None` → 2h strand). So the eviction evicts the oldest
+REGISTERED-name entry — a redundant dual-write copy that has another home — FIRST,
+and only when ALL entries are pre-registration orphans (the TRUE cap bound)
+evicts the oldest orphan. The "name HAS a rec" test uses
+`self._teammate_registry` at the eviction seam, same name-key space as the
+buffer) with a per-entry wall TTL
 (`_ORPHAN_PARK_TTL_S` 7200s, mirroring the 2h background TTL the eventual key
 ages by; lazy sweep at retain, expiry-discard at drain), torn down with the
 parent. It DRAINS at registration (step 4.5, before the pre-spawn scan) into

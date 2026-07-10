@@ -255,12 +255,20 @@ Additional modules:
                                 session_monitor generational teammate registry
                                 (_TeammateRec) drives the EXISTING resumed (r7
                                 item 3: EVERY bind relights via the tombstone-
-                                popping resumed lane, spawned_ts - ε, never
-                                launched — the monitor can't see route_runtime
-                                tombstones, so only the popping lane is
-                                uniformly safe) / resumed (wake, generation-
-                                filtered) / TEAMMATE-done (park, universally
-                                orphan-retained) marks; see message-handling.md.
+                                popping resumed lane, never launched — the
+                                monitor can't see route_runtime tombstones, so
+                                only the popping lane is uniformly safe; r8
+                                item 1: the resume ts is floored at
+                                min(spawned_ts, first_entry_ts) - ε, below the
+                                bound file's OWN first entry, so a look-alike's
+                                pre-spawn trailing end_turn isn't shielded) /
+                                resumed (wake, generation-filtered) /
+                                TEAMMATE-done (park, universally orphan-retained
+                                — r8 item 2: the 32-name buffer's at-cap
+                                eviction is two-tier oldest-first, evicting a
+                                redundant registered-name copy before a
+                                pre-registration orphan) marks; see
+                                message-handling.md.
                                 Clears: done / a PER-KEY wall-clock heartbeat
                                 TTL (_wall_now(), expire-before-classify) —
                                 T2 split: foreground-presumed keys age by
