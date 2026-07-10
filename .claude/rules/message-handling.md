@@ -641,8 +641,18 @@ over-quarantine fix): only a stem that FAILS the gate (first entry predates the
 new spawn ⇒ prior gen) is severed; a same-name file ALREADY on disk at rotation
 whose first entry is ≥ the new spawn is the GENUINE new-gen file the poll lagged
 and is LEFT for the normal binding path (a mid-write file too), (4) resets
-`current_key`/pending + clears the STICKY ambiguity flag + `done_retracted_keys`
-(a fresh spawn is new evidence — the ONLY clear), then (5) a PRE-SPAWN scan
+`current_key` + clears the STICKY ambiguity flag + `done_retracted_keys` (a
+fresh spawn is new evidence — the ONLY clear) and **RE-FILTERS the pending
+signal slots instead of blind-clearing them (r6 rule 2, Codex P1b,
+probe-reproduced):** pending signals are timestamp-attributed — generation
+membership is decided by the SHARED generation filter
+(`_generation_filter_park` / `_generation_filter_wake`, the same rule the
+orphan drain uses), never by which rec object happened to hold them; a signal
+`>= the NEW spawned_ts` CARRIES into the new generation's slot (the blind clear
+lost a newer-generation park that gen-1's registration had drained — two
+stashed same-name spawns reduced to the newest park T4, gen-1 drained it,
+gen-2's rotation cleared it → gen-2 bound without its close), older drops,
+UnknownDone carries (dominance, fail-dark), then (5) a PRE-SPAWN scan
 attempts binding on surviving tracked unbound stems, then (6) **pre-registration
 key RETRACTION (r2 P1, BOTH engines, probe-reproduced):** an already-tracked
 matching candidate may have fed run-state as a LEGACY agent BEFORE the spawn
@@ -739,7 +749,12 @@ could resurrect (pre-fix, an indeterminate gate fell through to
 strand re-entry). A name with no registry rec keeps legacy behavior. **Wake
 (`_record_teammate_wake`, the `SendMessage` lane):** BOUND →
 `resumed[current_key] = event_ts`; UNBOUND → `pending_wake` (max on repeats);
-UNKNOWN name → no-op; the monitor cross-checks the paired `SendMessage
+NO registry rec → ORPHAN-RETAINED beside the park (r6 rule 3, Codex P2,
+probe-reproduced: dropping a pre-registration wake made a drained park
+tombstone a teammate whose LATER wake proved it resumed — false-dark and a
+broken transcript-true arbitration; the retained wake is post-cross-check
+evidence, max-on-repeats like `pending_wake`); the monitor cross-checks the
+paired `SendMessage
 input["to"] == <name>` (`transcript_parser` now carries `SendMessage` input
 onto its tool_result; the shared `_apply_teammate_wake_crosschecked` also runs
 on the item-1 retro path), a mismatch REFUSES + WARNs and an unavailable input
@@ -756,25 +771,34 @@ park)** — then close `current_key` only (bound) or buffer a TYPED
 `_PendingPark` slot (unbound; `_merge_pending_park` — UnknownDone dominates
 permanently, else max parseable ts, NEVER a bare tuple last-write-wins); name
 NOT in registry → PR-1's all-tracked-stems close verbatim (the documented
-no-registry degradation, e.g. a pre-restart spawn) — and when that fallback
-matches ZERO tracked stems, the park is **ORPHAN-RETAINED by teammate NAME
-(r5 P1, Codex, probe-reproduced)** instead of dropped: in the supported
-result-before-use ordering (spawn tool_result stashed → GENUINE park → late
-Agent tool_use registers → sidechain discovered/bound) the park arrives before
-ANY anchor exists, and dropping it stranded the fresh bind to the 2h TTL (a
-teammate's park is its ONLY close signal; an unparseable orphan park was a
-dominance bypass too). The buffer (`_orphan_teammate_parks`, the park-lane
-mirror of the item-1 spawn stash) is per-parent, name-keyed, causal-reduced via
-the SAME `_merge_pending_park` rules, bounded (`_ORPHAN_PARK_MAX_NAMES` 32 —
-replace-merge in place for an existing name, evict-oldest only for a NEW name
-at cap) with a per-entry wall TTL (`_ORPHAN_PARK_TTL_S` 7200s, mirroring the 2h
-background TTL the eventual key ages by; lazy sweep at retain, expiry-discard
-at drain), torn down with the parent. It DRAINS at registration (step 4.5,
-before the pre-spawn scan) into `rec.pending_park` — GENERATION-FILTERED at the
-drain (a parseable orphan park `< spawned_ts` is dropped, the r4 case does not
-regress through the buffer; UnknownDone keeps dominance) — so the bind applies
-it through the normal pending-park causal path and the freshly bound key closes
-instead of stranding. **Discovery-quarantine
+no-registry degradation, e.g. a pre-restart spawn) — and the park is
+**ORPHAN-RETAINED by teammate NAME UNCONDITIONALLY (r5 P1 + r6 rule 1
+RETAIN-ALWAYS, all probe-reproduced)**, a dual-write beside the immediate
+fallback closes: retention gated on zero-match let a tracked-but-INDETERMINATE
+stem (r6 A, Hermes P1) or a STALE same-name stem (r6 B, Codex P1a) absorb the
+park as its own immediate close and SPEND the eventual bind's only close
+signal (registration then retracted/quarantined the absorbing stem; the fresh
+bind relit with `pending_park` empty → the 2h strand); the immediate closes
+keep today's semantics for THOSE stems, and the buffer's causal reduction
+makes the dual-write idempotent-safe. In the r5 ordering (spawn tool_result
+stashed → GENUINE park → late Agent tool_use registers → sidechain
+discovered/bound) the park arrives before ANY anchor exists (a teammate's park
+is its ONLY close signal; an unparseable orphan park was a dominance bypass
+too). The buffer (`_orphan_teammate_parks`, the signal-lane mirror of the
+item-1 spawn stash) holds an `_OrphanPending` **pending PAIR mirroring the rec
+slots exactly** — park (causal-reduced via the SAME `_merge_pending_park`
+rules) + wake (max-on-repeats, r6 rule 3) — per-parent, name-keyed, bounded
+(`_ORPHAN_PARK_MAX_NAMES` 32 — replace-merge in place for an existing name,
+evict-oldest only for a NEW name at cap) with a per-entry wall TTL
+(`_ORPHAN_PARK_TTL_S` 7200s, mirroring the 2h background TTL the eventual key
+ages by; lazy sweep at retain, expiry-discard at drain), torn down with the
+parent. It DRAINS at registration (step 4.5, before the pre-spawn scan) into
+`rec.pending_park` / `rec.pending_wake` — GENERATION-FILTERED at the drain via
+the SHARED filters (a parseable orphan signal `< spawned_ts` is dropped, the
+r4 case does not regress through the buffer; UnknownDone keeps dominance) — so
+the bind applies both through the normal pending causal path (the runtime
+resume gate arbitrates wake-vs-park) and the freshly bound key closes — or
+stays LIVE when a newer wake proves resumption — instead of stranding. **Discovery-quarantine
 severing (`_quarantine_teammate_stem`):** a same-name candidate that
 DETERMINISTICALLY cannot bind (`current_key` occupied by a different key /
 gate-False stale-prior-gen / retired) is retired + an UNCONDITIONAL teammate
