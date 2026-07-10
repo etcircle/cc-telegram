@@ -984,13 +984,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else None
     )
 
-    # Capture group chat_id for supergroup forum topic routing.
-    # Required: Telegram Bot API needs group chat_id (not user_id) to send
-    # messages with message_thread_id. Do NOT remove — see session.py docs.
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
-        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
-
     # Must be in a named topic — rejected BEFORE the cross-thread stale-picker
     # guards below (matching photo_handler/document_handler ordering). PTB
     # user_data is per-user across chats, so a stray DM/General text would
@@ -1004,6 +997,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "❌ Please use a named topic. Create a new topic to start a session.",
         )
         return
+
+    # Capture group chat_id for supergroup forum topic routing. GH #41: written
+    # AFTER the thread_id-None reject so a DM/General message never mints a
+    # ``user:0`` garbage key (an unbound named topic still writes it — the
+    # directory-browser bootstrap needs the mapping before any binding exists).
+    # Required: Telegram Bot API needs group chat_id (not user_id) to send
+    # messages with message_thread_id. Do NOT remove — see session.py docs.
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     text = update.message.text
 

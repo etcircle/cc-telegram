@@ -168,7 +168,16 @@ async def dispatch_callback(
         return CallbackResult(False)
     thread_id = _get_thread_id(update)
     chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
+    # GH #41: write the group chat mapping only AFTER the registry RECOGNIZES the
+    # callback (a real executor is registered for this data). Garbage / unknown
+    # callback data in a group topic — the CallbackResult(False) reject path in
+    # ``execute`` — writes NO mapping. Directory-browser callbacks have registered
+    # executors, so the new-topic bootstrap still writes it.
+    if (
+        chat
+        and chat.type in ("group", "supergroup")
+        and lookup(command.data) is not None
+    ):
         adapters.session_manager.set_group_chat_id(user.id, thread_id, chat.id)
     authorized = authorize_initial(
         command,

@@ -1215,11 +1215,13 @@ async def forward_command_handler(
 
     thread_id = _get_thread_id(update)
 
-    # Capture group chat_id for supergroup forum topic routing.
+    # Capture group chat_id for supergroup forum topic routing. GH #41: the
+    # thread_id-truthy guard skips a DM/General command so it never mints a
+    # ``user:0`` garbage key (the other writers already require thread_id).
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
     # messages with message_thread_id. Do NOT remove — see session.py docs.
     chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup"):
+    if chat and chat.type in ("group", "supergroup") and thread_id:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     cmd_text = update.message.text or ""
