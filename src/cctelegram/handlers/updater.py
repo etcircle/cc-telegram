@@ -1,17 +1,28 @@
 """``/update`` orchestration — update the Claude Code CLI + restart idle sessions.
 
 Owner-only manual command flow (no scheduler). ``run_update`` (1) updates the
-Claude Code CLI binary via ``<claude executable> update``, (2) walks every bound
-topic and restarts each genuinely-IDLE session IN PLACE inside its existing tmux
-window (preserving the window id, via ``tmux_manager.restart_claude_in_window``)
-so it adopts the new on-disk version, (3) defers busy sessions, and (4) reports a
-progressive summary.
+Claude Code CLI binary via ``<claude executable> update``, then restarts each
+genuinely-IDLE session IN PLACE inside its existing tmux window (preserving the
+window id, via ``tmux_manager.restart_claude_in_window``) so it adopts the new
+on-disk version, defers busy sessions, and reports a progressive summary.
+
+**Scope (owner decision 2026-07-10).** ``scope=None`` is the FLEET walk (every
+bound topic). ``scope=(user_id, thread_id, window_id)`` is the SCOPED default —
+only the invoking topic's window. ``bot.update_command`` maps ``/update`` →
+scoped (the invoking topic) and ``/update all`` → fleet, so the fleet walk never
+silently revives sessions in dormant topics (a ``claude --resume`` of a dormant
+session is not inert — it generates contextual ghost suggestions and other
+background token-drip). Reviving dormant topics must be EXPLICIT (``/update
+all``), never a side effect of updating the topic you're in. The CLI binary
+update (phase 1) is global by nature and costs no tokens, so it runs in both
+modes.
 
 Fail-closed + non-regressive: only ``IDLE_CLEARED`` + pane-idle routes are
 restarted (busy / waiting / background-agent routes defer), restarts run
 SEQUENTIALLY under each window's send lock, and a single-flight guard rejects a
-concurrent ``/update``. Collaborators (session manager, tmux manager, monitor)
-are injected so the flow is unit-testable with fakes.
+concurrent ``/update`` (covering BOTH modes — a scoped update while a fleet
+update runs is rejected, and vice versa). Collaborators (session manager, tmux
+manager, monitor) are injected so the flow is unit-testable with fakes.
 
 Key entry point: ``run_update``.
 """
@@ -150,7 +161,7 @@ def _format_summary(
     deferred: list[str],
     skipped: list[tuple[str, str]],
 ) -> str:
-    """Render the final ``♻️ Restarted N · deferred M · skipped K`` summary."""
+    """Render the final FLEET ``♻️ Restarted N · deferred M · skipped K`` summary."""
 
     def _names(items: list[str]) -> str:
         return ", ".join(items) if items else "—"
@@ -167,6 +178,30 @@ def _format_summary(
     return "\n".join(lines)
 
 
+def _format_scoped_summary(
+    restarted: list[str],
+    deferred: list[str],
+    deferred_reasons: list[str],
+    skipped: list[tuple[str, str]],
+) -> str:
+    """Render the SCOPED single-window summary (one line for the one topic).
+
+    Exactly one of the buckets carries the single window in scoped mode; the
+    line discloses restarted / deferred-with-reason / skipped-with-reason.
+    """
+    if restarted:
+        return f"♻️ Restarted {restarted[0]} — it's now on the updated CLI."
+    if deferred:
+        reason = deferred_reasons[0] if deferred_reasons else "it's busy"
+        return (
+            f"⏸ Deferred {deferred[0]} — {reason}. Re-run /update here once it's idle."
+        )
+    if skipped:
+        name, reason = skipped[0]
+        return f"⚠️ Skipped {name} — {reason}."
+    return "⚠️ Nothing to restart in this topic."
+
+
 async def run_update(
     *,
     report: Callable[[str], Awaitable[None]],
@@ -175,8 +210,15 @@ async def run_update(
     monitor: Any,
     claude_command: str,
     md_settings: str,
+    scope: tuple[int, int, str] | None = None,
 ) -> None:
-    """Update the CLI, then restart every idle bound session in place.
+    """Update the CLI, then restart idle bound session(s) in place.
+
+    ``scope=None`` is the FLEET walk — every bound topic. ``scope=(user_id,
+    thread_id, window_id)`` is SCOPED — only that one window (the invoking
+    topic). Phase 1 (the ``claude update`` binary refresh) runs in BOTH modes
+    (global by nature, no tokens); only the restart set differs. The
+    single-flight guard covers both modes.
 
     ``report`` is an async callback the caller wires to a progressive Telegram
     message (edit-in-place). ``monitor`` may be ``None`` (routing re-association
@@ -190,15 +232,30 @@ async def run_update(
     try:
         await report("🔄 Updating Claude Code CLI…")
         version_line = await _run_cli_update(claude_command)
-        await report(f"{version_line}\n♻️ Restarting idle sessions…")
+        restart_label = (
+            "♻️ Restarting this session…"
+            if scope is not None
+            else "♻️ Restarting idle sessions…"
+        )
+        await report(f"{version_line}\n{restart_label}")
 
         restarted: list[str] = []
         deferred: list[str] = []
+        # Parallel to ``deferred``, consumed only by the SCOPED summary so it
+        # can disclose WHY the single window deferred; the fleet summary lists
+        # names only and ignores this.
+        deferred_reasons: list[str] = []
         skipped: list[tuple[str, str]] = []
 
-        # Snapshot the bindings up front — restarts don't mutate bindings, but a
-        # concurrent topic close could; iterate a stable list.
-        for user_id, thread_id, window_id in list(session_mgr.iter_thread_bindings()):
+        # Scoped → the single (user, thread, window) target; fleet → a stable
+        # snapshot of the bindings up front (restarts don't mutate bindings, but
+        # a concurrent topic close could).
+        if scope is not None:
+            targets: list[tuple[int, int, str]] = [scope]
+        else:
+            targets = list(session_mgr.iter_thread_bindings())
+
+        for user_id, thread_id, window_id in targets:
             route: route_runtime.Route = (user_id, thread_id or 0, window_id)
             name = session_mgr.get_display_name(window_id)
 
@@ -208,6 +265,9 @@ async def run_update(
             snap = route_runtime.snapshot(route)
             if snap.run_state is not route_runtime.RunState.IDLE_CLEARED:
                 deferred.append(name)
+                deferred_reasons.append(
+                    "it's busy, waiting on a prompt, or a background agent is active"
+                )
                 continue
 
             w = await tmux.find_window_by_id(window_id)
@@ -248,6 +308,9 @@ async def run_update(
                 RestartOutcome.SKIPPED_NOT_IDLE,
             ):
                 deferred.append(name)
+                deferred_reasons.append(
+                    "the window went active (or a background shell is running)"
+                )
             elif outcome is RestartOutcome.SKIPPED_NO_EXIT:
                 skipped.append((name, _NO_EXIT_REASON))
             elif outcome is RestartOutcome.RELAUNCH_UNCONFIRMED:
@@ -255,7 +318,13 @@ async def run_update(
             else:  # RestartOutcome.ERROR
                 skipped.append((name, "restart error"))
 
-        await report(f"{version_line}\n{_format_summary(restarted, deferred, skipped)}")
+        if scope is not None:
+            summary = _format_scoped_summary(
+                restarted, deferred, deferred_reasons, skipped
+            )
+        else:
+            summary = _format_summary(restarted, deferred, skipped)
+        await report(f"{version_line}\n{summary}")
     finally:
         _update_running = False
 

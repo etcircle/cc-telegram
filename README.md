@@ -14,7 +14,7 @@ Why it's worth running:
 
 **Talk to it like a person.** Send a voice note and it's transcribed into a prompt. Send a photo or a document and it's downloaded and handed to Claude. Reply to a message to quote it back with role-aware context.
 
-**The rest just works.** Unknown slash commands forward straight into Claude Code, so `/clear`, `/compact`, and `/model` all work from your phone. `/cost` and `/usage` are intercepted bot-side — the full-screen usage overlay is captured, answered as a message, and dismissed for you; when the session is busy (or has an unsent draft in the terminal) the bot won't inject a keystroke and instead replies with a bridge-side snapshot — your context usage plus the last full overlay it saw ("as of 12:03, 26 min ago") — so you get metrics without a dead end. `/dashboard` puts a live overview of every session in one pinned message. `/update` upgrades the CLI and restarts your idle sessions in place — without dropping a single topic binding.
+**The rest just works.** Unknown slash commands forward straight into Claude Code, so `/clear`, `/compact`, and `/model` all work from your phone. `/cost` and `/usage` are intercepted bot-side — the full-screen usage overlay is captured, answered as a message, and dismissed for you; when the session is busy (or has an unsent draft in the terminal) the bot won't inject a keystroke and instead replies with a bridge-side snapshot — your context usage plus the last full overlay it saw ("as of 12:03, 26 min ago") — so you get metrics without a dead end. `/dashboard` puts a live overview of every session in one pinned message. `/update` upgrades the CLI and restarts this topic's idle session in place — without dropping its binding — while `/update all` does the whole fleet.
 
 **It survives things.** Bot restart, tmux restart, phone in a tunnel — sessions live in tmux, state lives on disk, and the bridge reconciles on startup. Duplicate taps are caught by an append-only action ledger, so a double-press after a restart answers "already received" instead of doing the thing twice. 2,800+ tests keep it honest.
 
@@ -48,7 +48,7 @@ Bot-owned commands (handled by cc-telegram, never forwarded):
 | `/esc` | Send Escape to interrupt Claude. |
 | `/usage` | Pull Claude Code's usage/limits from the TUI overlay (idle sessions); on a busy session, replies with a bridge-side snapshot instead of a dead-end refusal. |
 | `/cost` | Same as `/usage` (alias) — pull cost/usage/limits from the TUI overlay, with the same busy-session snapshot fallback. |
-| `/update` | Update the CLI, then restart idle sessions in place (owner-only). |
+| `/update` | Update the CLI, then restart **this topic's** idle session in place; `/update all` restarts every idle session (owner-only). |
 | `/dashboard` | Claim this topic as a cross-session overview; `/dashboard pin` pins it. |
 | `/settings` | Your personal output-verbosity preferences (presets + knobs). |
 | `/file <path>` | Upload a file from the session's directory to the topic (any type, spaces OK). |
@@ -191,12 +191,14 @@ Useful for testing or running multiple profiles against one install.
 
 ## The `/update` command in detail
 
-`/update` updates the Claude Code CLI binary, then restarts each **idle** bound session inside its existing tmux window (via `claude --resume`, so it adopts the new version and the topic keeps its window id / routing). It is owner-only, fail-closed, and idle-only:
+`/update` (no argument) updates the Claude Code CLI binary, then restarts **only the invoking topic's** idle session in place (via `claude --resume`, so it adopts the new version and the topic keeps its window id / routing). `/update all` does the same to **every** idle bound session (the fleet walk). Both are owner-only, fail-closed, and idle-only.
+
+The default is topic-scoped so the fleet walk never silently revives a session in a dormant topic you've deliberately left idle — a resumed session is not inert (it generates contextual ghost suggestions and other background activity, a token drip), so reviving dormant topics must be explicit (`/update all`). The CLI binary update runs in both modes (it's global and costs no tokens); only the set of sessions restarted differs. `/update` in an unbound topic replies with an error and does nothing; any other argument gets a usage reply and does nothing.
 
 - Busy, waiting, or background-agent sessions are **deferred**, never interrupted — as are sessions with live background shells (a `· N shell` status-bar token; a restart would kill those jobs).
 - A session that won't cleanly exit within a bounded ~15s wait is **skipped**, not force-killed. The summary then warns that the session may be dead and to check the window before sending messages, since `/exit` was already sent.
 - A skipped window is **quarantined**: the bot refuses to type new messages into it until it observes Claude running there again (a message typed into a dead session's bare shell would be *executed* by the shell), replying with an explicit "Message NOT delivered" error in the topic instead. "Claude running" is strict — the pane must report Claude's own version-string process; any other foreground command, including vim/python/ssh you started while checking the window, keeps sends blocked. The quarantine clears once Claude is seen alive, on a later confirmed restart, or when the window/topic is torn down; it is in-memory, so a bot restart clears it.
-- Restarts run one at a time; a second `/update` while one is running is rejected. There's no scheduler — run it when you want the running sessions on a freshly-updated CLI. It reports a progressive summary (`♻️ Restarted N idle · deferred M busy · skipped K`).
+- Restarts run one at a time; a second `/update` (scoped or `all`) while one is running is rejected. There's no scheduler — run it when you want the running session(s) on a freshly-updated CLI. `/update all` reports a progressive fleet summary (`♻️ Restarted N idle · deferred M busy · skipped K`); scoped `/update` reports a single line for the one topic (restarted / deferred-with-reason / skipped-with-reason).
 
 Note: `CLAUDE_COMMAND` must exec the claude binary directly (or via an exec-ing wrapper). A non-exec shell wrapper makes the pane report the wrapper shell while Claude is still alive, which defeats `/update`'s shell-detection safety gate in the dangerous direction.
 
@@ -382,7 +384,7 @@ src/cctelegram/handlers/            Telegram interaction layer
   interactive_ui.py                 AskUserQuestion / ExitPlanMode / permission UI
   notify_source.py                  Notification-hook side-file trust boundary (waiting-on-you)
   dashboard.py                      /dashboard cross-topic overview message
-  updater.py                        /update CLI-update + idle in-place session restart
+  updater.py                        /update CLI-update + idle in-place session restart (scoped default; /update all = fleet)
   directory_browser.py              directory + session picker
   history.py                        /history paginator
   cleanup.py                        centralized topic teardown

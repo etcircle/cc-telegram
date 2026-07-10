@@ -293,6 +293,100 @@ class TestRunUpdateBucketing:
         assert "Restarted 0 idle" in reports[-1]
 
 
+class TestScopedUpdate:
+    @pytest.mark.asyncio
+    async def test_scoped_restarts_only_the_targeted_window(self, monkeypatch):
+        # ``scope`` targets ONE window; the other two bound windows are never
+        # touched (their restart mechanic is never invoked).
+        _patch_snapshot(monkeypatch, {})  # all IDLE_CLEARED
+        bindings = [(1, 10, "@1"), (1, 20, "@2"), (1, 30, "@3")]
+        sm = FakeSessionMgr(
+            bindings,
+            window_states={f"@{i}": _WS(session_id=f"s{i}") for i in (1, 2, 3)},
+        )
+        tmux = FakeTmux(windows={"@1", "@2", "@3"})
+        reports: list[str] = []
+
+        async def report(t):
+            reports.append(t)
+
+        await updater.run_update(
+            report=report,
+            session_mgr=sm,
+            tmux=tmux,
+            monitor=None,
+            claude_command="claude",
+            md_settings="",
+            scope=(1, 20, "@2"),  # only the invoking topic's window
+        )
+        # ONLY @2 was restarted; @1 and @3 were never touched.
+        assert [c[0] for c in tmux.restart_calls] == ["@2"]
+        summary = reports[-1]
+        assert "Restarted @2" in summary
+        # Scoped summary is a single line — never the fleet multi-bucket format.
+        assert "Restarted 1 idle" not in summary
+        assert "Deferred 0 busy" not in summary
+
+    @pytest.mark.asyncio
+    async def test_scoped_busy_current_topic_defers_no_restart(self, monkeypatch):
+        # A busy invoking topic → deferred, no restart, honest scoped summary.
+        _patch_snapshot(monkeypatch, {(1, 20, "@2"): route_runtime.RunState.RUNNING})
+        sm = FakeSessionMgr([(1, 20, "@2")], window_states={"@2": _WS(session_id="s2")})
+        tmux = FakeTmux(windows={"@2"})
+        reports: list[str] = []
+
+        async def report(t):
+            reports.append(t)
+
+        await updater.run_update(
+            report=report,
+            session_mgr=sm,
+            tmux=tmux,
+            monitor=None,
+            claude_command="claude",
+            md_settings="",
+            scope=(1, 20, "@2"),
+        )
+        assert tmux.restart_calls == []  # busy → never touched tmux
+        summary = reports[-1]
+        assert "Deferred @2" in summary
+        assert "background agent" in summary  # deferred-with-reason
+        assert "Re-run /update" in summary
+
+    @pytest.mark.asyncio
+    async def test_scoped_does_not_iterate_all_bindings(self, monkeypatch):
+        # Scoped mode must NOT walk iter_thread_bindings (the whole point).
+        _patch_snapshot(monkeypatch, {})
+        sm = FakeSessionMgr(
+            [(1, 10, "@1"), (1, 20, "@2")],
+            window_states={f"@{i}": _WS(session_id=f"s{i}") for i in (1, 2)},
+        )
+        called = {"iter": False}
+        _orig = sm.iter_thread_bindings
+
+        def _spy():
+            called["iter"] = True
+            return _orig()
+
+        sm.iter_thread_bindings = _spy  # type: ignore[method-assign]
+        tmux = FakeTmux(windows={"@1", "@2"})
+
+        async def report(t):
+            pass
+
+        await updater.run_update(
+            report=report,
+            session_mgr=sm,
+            tmux=tmux,
+            monitor=None,
+            claude_command="claude",
+            md_settings="",
+            scope=(1, 10, "@1"),
+        )
+        assert called["iter"] is False
+        assert [c[0] for c in tmux.restart_calls] == ["@1"]
+
+
 class TestRunCliUpdate:
     @pytest.mark.asyncio
     async def test_shlex_split_extracts_executable_only(self, monkeypatch):
