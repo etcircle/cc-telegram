@@ -1,6 +1,7 @@
 """GH #46 PR-2 — teammate first-class background keys: discriminators, the
-generational registry, launch-at-binding, the wake lane, and discovery-
-quarantine severing.
+generational registry, always-resumed relight-at-binding (r7 item 3: every
+teammate bind relights via the tombstone-popping ``resumed`` lane, never
+``launched``), the wake lane, and discovery-quarantine severing.
 
 PR-2 makes an agent-teams teammate a first-class background key so typing stays
 ON while it genuinely works across parent turns, promptly drops when it parks,
@@ -486,15 +487,16 @@ async def test_spawn_bind_wake_park_happy_path(
     parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
     key = _key_for(_NAME)
 
-    # 1. Spawn registers the teammate (gen-1), no launched key yet.
+    # 1. Spawn registers the teammate (gen-1), no relight signal yet.
     _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
     await monitor.check_for_updates({PARENT})
-    assert monitor.pop_sidechain_activity() == {}  # launched deferred to bind
+    assert monitor.pop_sidechain_activity() == {}  # relight deferred to bind
     rec = monitor._teammate_registry[PARENT][_NAME]
     assert rec.spawn_generation == 1 and rec.current_key is None
 
     # 2. The sidechain file appears (mtime + first entry AFTER the spawn) → BIND
-    #    emits the launched key at discovery (zero parsed run-state entries).
+    #    relights via the resumed lane at discovery (r7 item 3, never launched;
+    #    zero parsed run-state entries).
     _write_sidechain(sub_dir, key, _iso(time.time() + 0.1))
     await monitor.check_sidechain_updates({PARENT})
     activity = monitor.pop_sidechain_activity()
@@ -636,8 +638,8 @@ async def test_first_seen_eof_binds_and_launches_with_zero_parsed_entries(
     monitor, tmp_path, make_jsonl_entry, make_tool_use_block
 ):
     """The tracker registers a NEW sidechain file at EOF and returns WITHOUT
-    parsing — so the launched key MUST be emitted at DISCOVERY, once-only, with no
-    parsed run-state ticks."""
+    parsing — so the relight signal (the resumed lane, r7 item 3) MUST be emitted
+    at DISCOVERY, once-only, with no parsed run-state ticks."""
     parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
     key = _key_for(_NAME)
     _append_spawn(parent_jsonl, _NAME, make_jsonl_entry, make_tool_use_block)
@@ -1857,7 +1859,11 @@ async def test_gen2_tolerance_boundary_inside_binds(
 ):
     """A gen-2 candidate whose first entry is INSIDE the fixture-derived tolerance
     below the spawn event ts binds (absorbs clock rounding — the observed real
-    cross-flush gap is ≤7ms, always AFTER the spawn)."""
+    cross-flush gap is ≤7ms, always AFTER the spawn). r8 item 1: since this first
+    entry is BELOW ``spawned_ts``, the relight resume ts is floored at the bound
+    file's OWN first entry (``min(spawned_ts, first_ts) - ε``), NOT ``spawned_ts -
+    ε`` — so nothing from the bound file (incl. a trailing end_turn ≥ its first
+    entry) can be shielded by the runtime resume gate."""
     from cctelegram.session_monitor import TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S as TOL
 
     parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
@@ -1877,13 +1883,17 @@ async def test_gen2_tolerance_boundary_inside_binds(
     import os
 
     os.utime(sc, (t2 + 0.01, t2 + 0.01))
+    first_ts = monitor._read_first_entry_ts(sc)  # what the bind floors against
     await monitor.check_sidechain_updates({PARENT})
     rec = monitor._teammate_registry[PARENT][_NAME]
     act = monitor.pop_sidechain_activity()
     assert act[PARENT].launched == set()
+    assert first_ts is not None and first_ts < rec.spawned_ts  # below-spawn bind
     assert act[PARENT].resumed == {
-        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+        key: min(rec.spawned_ts, first_ts) - TEAMMATE_RETRACT_RESUME_EPSILON_S
     }
+    # The floor is strictly below the bound file's first entry (r8 item 1).
+    assert act[PARENT].resumed[key] < first_ts
 
 
 @pytest.mark.asyncio
@@ -2288,6 +2298,105 @@ async def test_orphan_park_buffer_cap_and_ttl_hygiene(
         PARENT, TeammateIdle(name="tm_fresh", park_ts=300.0, park_ts_unparseable=False)
     )
     assert "tm_old" not in buf2 and "tm_fresh" in buf2
+
+
+# ── two-tier eviction priority (r8 item 2 — CONVERGED P1) ────────────────
+
+
+@pytest.mark.asyncio
+async def test_item2_registered_copy_evicted_before_pre_registration_orphan(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """r8 item 2 (CONVERGED P1, Hermes + Codex, both probe-reproduced): the
+    universal park dual-write (r7) copies EVERY park — including the
+    high-frequency registered/bound path — into the shared 32-name orphan buffer.
+    A blind oldest-eviction then evicted the sole retained pre-registration ORPHAN
+    (a park whose name has NO registry rec — its ONLY home) when the buffer filled
+    with redundant REGISTERED-name copies. The two-tier fix evicts the oldest
+    REGISTERED-name copy FIRST, so the orphan survives and later binds with its
+    close.
+
+    Probe: retain the sole park for unregistered ``future`` → fill the remaining
+    cap-1 slots with distinct REGISTERED-name parks → the (cap)th distinct
+    registered park must evict a REGISTERED copy, NOT ``future`` → ``future`` then
+    registers + binds and closes via the drained orphan park."""
+    from cctelegram.handlers.response_builder import TeammateIdle
+    from cctelegram.session_monitor import _ORPHAN_PARK_MAX_NAMES, _TeammateRec
+
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+
+    # 1. The sole pre-registration ORPHAN (no registry rec) — inserted FIRST so it
+    #    is the OLDEST entry (a blind next(iter(buf)) drop would take it).
+    monitor._retain_orphan_teammate_park(
+        PARENT,
+        TeammateIdle(name="future", park_ts=100.0, park_ts_unparseable=False),
+    )
+
+    # 2. Fill the rest of the cap with distinct REGISTERED-name parks (each name
+    #    HAS a rec — a redundant dual-write whose primary close already applied).
+    recs = monitor._teammate_recs(PARENT)
+    for i in range(_ORPHAN_PARK_MAX_NAMES - 1):
+        rname = f"reg{i}"
+        recs[rname] = _TeammateRec(
+            name=rname, teammate_id=None, spawn_generation=1, spawned_ts=1.0
+        )
+        monitor._retain_orphan_teammate_park(
+            PARENT,
+            TeammateIdle(name=rname, park_ts=200.0 + i, park_ts_unparseable=False),
+        )
+    buf = monitor._orphan_teammate_parks[PARENT]
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    assert "future" in buf
+
+    # 3. The (cap)th distinct REGISTERED-name park at cap — MUST evict the oldest
+    #    REGISTERED copy (reg0), NOT the pre-registration orphan (future).
+    rname = f"reg{_ORPHAN_PARK_MAX_NAMES - 1}"
+    recs[rname] = _TeammateRec(
+        name=rname, teammate_id=None, spawn_generation=1, spawned_ts=1.0
+    )
+    monitor._retain_orphan_teammate_park(
+        PARENT, TeammateIdle(name=rname, park_ts=999.0, park_ts_unparseable=False)
+    )
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    assert "future" in buf  # the orphan SURVIVES (registered copy evicted)
+    assert "reg0" not in buf  # the oldest registered copy was evicted
+    assert rname in buf
+
+    # 4. ``future`` registers + binds → the drained orphan park (100.0) is its
+    #    pending_park (a genuine post-spawn park would then close it). The park is
+    #    generation-filtered at the drain; a spawn BEFORE the park ts keeps it.
+    _append_spawn(
+        parent_jsonl, "future", make_jsonl_entry, make_tool_use_block, _iso(50.0)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT]["future"]
+    assert rec.pending_park is not None  # drained from the surviving orphan
+    assert rec.pending_park.ts == 100.0
+
+
+@pytest.mark.asyncio
+async def test_item2_all_orphans_at_cap_evicts_oldest_orphan(monitor, tmp_path):
+    """r8 item 2 tier-2 pin: when the buffer is ALL pre-registration orphans (no
+    registered name has a copy — the TRUE cap bound), a NEW name evicts the OLDEST
+    orphan (insertion order), preserving the existing hygiene contract."""
+    from cctelegram.handlers.response_builder import TeammateIdle
+    from cctelegram.session_monitor import _ORPHAN_PARK_MAX_NAMES
+
+    _setup_parent(monitor, tmp_path)
+    for i in range(_ORPHAN_PARK_MAX_NAMES):
+        monitor._retain_orphan_teammate_park(
+            PARENT,
+            TeammateIdle(name=f"orph{i}", park_ts=100.0 + i, park_ts_unparseable=False),
+        )
+    buf = monitor._orphan_teammate_parks[PARENT]
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    # No registry recs at all → tier 1 finds no victim → tier 2 evicts the oldest.
+    monitor._retain_orphan_teammate_park(
+        PARENT, TeammateIdle(name="orph_new", park_ts=999.0, park_ts_unparseable=False)
+    )
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    assert "orph0" not in buf and "orph_new" in buf  # oldest orphan evicted
 
 
 # ── rotation re-filters pending signals (r6 rule 2 rationale pin) ────────

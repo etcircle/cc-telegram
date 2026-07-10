@@ -5,16 +5,18 @@ ON) → a delayed STALE park (stays ON) → a final park (OFF).
 Black-box at the public seams — no monkeypatch of run-state internals:
 
   - the bot's ``apply_sidechain_activity`` fan-out (the sink the monitor's
-    teammate registry feeds — a launched key at bind, a ``resumed`` map at wake,
-    a ``teammate_parks`` entry at park), and
+    teammate registry feeds — a ``resumed`` map at bind AND at wake (r7 item 3:
+    EVERY teammate bind relights via the tombstone-popping resumed lane, never
+    ``launched``), a ``teammate_parks`` entry at park), and
   - ``transcript_event_adapter.dispatch_transcript_event`` for the parent
     lifecycle,
 
 with reads only from ``route_runtime.snapshot(route)``.
 
-PR-2 makes a teammate a FIRST-CLASS background key: its launched key survives
-the parent's end-of-turn (typing stays on across parent turns), a wake relights
-it, and a park is its ONLY close signal (a teammate leg ends in plain text — no
+PR-2 makes a teammate a FIRST-CLASS background key: its relight (via the
+always-resumed lane, never ``launched``) survives the parent's end-of-turn
+(typing stays on across parent turns), a wake relights it, and a park is its
+ONLY close signal (a teammate leg ends in plain text — no
 sidechain end-of-turn, no ``<task-notification>``). The TEAMMATE done shares the
 SIDECHAIN resume ts-gate PLUS a TEAMMATE-only stale-vs-activity gate, so a
 redelivered OLD park never darkens a demonstrably-working teammate mid-leg.
@@ -90,10 +92,13 @@ async def _bind_idle_route(scenario: ScenarioHarness):
 async def test_teammate_full_lifecycle_typing(scenario: ScenarioHarness) -> None:
     route = await _bind_idle_route(scenario)
 
-    # BIND — the teammate's launched key lifts the parent-idle route to typing
-    # (survives the end-of-turn prune; a first-class background key).
+    # BIND — the teammate's relight (via the always-resumed lane, r7 item 3,
+    # never ``launched``: a fresh key with no tombstone treats resumed as a plain
+    # launch — is_background, 2h TTL, projected RUNNING) lifts the parent-idle
+    # route to typing (survives the end-of-turn prune; a first-class background
+    # key). The bind resume ts (50) sits below every later park (200/250/400).
     await bot_module.apply_sidechain_activity(
-        {_SID: ParentSidechainActivity(launched={_KEY})}
+        {_SID: ParentSidechainActivity(resumed={_KEY: 50.0})}
     )
     snap = route_runtime.snapshot(route)
     assert snap.typing_eligible is True
@@ -832,8 +837,8 @@ async def test_park_absorbed_by_stale_tracked_stem_still_closes_fresh_bind(
     assert stale_key in rec.retired_keys  # gate-False → quarantined
     assert rec.pending_park is not None  # the named copy survived (rule 1)
 
-    # The FRESH sidechain appears → binds (launched lane) + the drained park
-    # closes it.
+    # The FRESH sidechain appears → binds (relights via the resumed lane, r7
+    # item 3) + the drained park closes it.
     _write_teammate_sidechain(sub_dir, fresh_key, base + 0.05, base + 0.05)
     await mon.check_sidechain_updates({_SID})
     await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
@@ -1254,3 +1259,166 @@ async def test_item3_dual_write_tombstoned_never_retracted_bind_stays_live(
     snap = route_runtime.snapshot(route)
     assert snap.typing_eligible is True  # tombstone popped → LIVE (not dark)
     assert snap.background_agents == (key,)
+
+
+async def _bind_gen1_within_tolerance(scenario, tmp_path, name, key, first_gap):
+    """Bind a gen-1 teammate whose sidechain first entry is ``first_gap`` seconds
+    BELOW the spawn event ts (within the gen-1 5s mtime-skew tolerance) — the r8
+    item-1 look-alike shape. Returns ``(route, mon, sub_dir, _append, spawned_ts,
+    first_ts)`` with the key BOUND + relit (typing ON)."""
+    import os
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    spawned_ts = time.time() - 60
+    first_ts = spawned_ts - first_gap  # BELOW spawned_ts, within the 5s skew
+
+    _append(_spawn_pair(name, _iso_utc(spawned_ts)))
+    await mon.check_for_updates({_SID})
+    # mtime within the 5s skew so the mtime prefilter passes; first entry below.
+    sc = _write_teammate_sidechain(sub_dir, key, first_ts, spawned_ts - 1.0)
+    os.utime(sc, (spawned_ts - 1.0, spawned_ts - 1.0))
+    # The bind floors against the ISO-serialized first entry (ms-rounded), so read
+    # it back the SAME way the code does.
+    first_ts_read = mon._read_first_entry_ts(sc)
+    assert first_ts_read is not None
+    await mon.check_sidechain_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    rec = mon._teammate_registry[_SID][name]
+    assert rec.current_key == key
+    # r8 item 1: the resume ts is floored at the bound file's OWN first entry.
+    assert act[_SID].resumed == {
+        key: min(rec.spawned_ts, first_ts_read) - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
+    assert act[_SID].resumed[key] < first_ts_read
+    await bot_module.apply_sidechain_activity(act)
+    assert route_runtime.snapshot(route).typing_eligible is True
+    return route, mon, sub_dir, _append, rec.spawned_ts, first_ts_read
+
+
+@pytest.mark.asyncio
+async def test_item1_prespawn_endturn_on_within_tolerance_bind_goes_dark(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r8 item 1 (Hermes P1, probe-reproduced): a look-alike candidate binds within
+    the gen-1 mtime-skew tolerance with a first entry BELOW ``spawned_ts`` (here
+    2s below). Its TRAILING sidechain end_turn is also pre-spawn (≥ the file's own
+    first entry, ≤ spawned_ts). Pre-fix the r7 always-resumed stamp of
+    ``spawned_ts - ε`` SHIELDED that end_turn at the runtime SIDECHAIN done gate
+    (``end_turn_ts <= resumed_event_ts`` keeps the key LIVE) → the key stranded
+    LIVE for the full 2h TTL, where the pre-r7 ``launched`` path fail-closed to
+    DONE. The r8 fix floors the resume at ``min(spawned_ts, first_ts) - ε`` — below
+    the bound file's own first entry — so the trailing end_turn is STRICTLY NEWER
+    and TOMBSTONES → the key goes DARK, not live."""
+    name = "explore-backend"
+    key = _KEY
+    route, mon, _sub, _append, spawned_ts, first_ts = await _bind_gen1_within_tolerance(
+        scenario, tmp_path, name, key, first_gap=2.0
+    )
+
+    # A trailing SIDECHAIN end_turn at the file's first entry (pre-spawn, ≥ first
+    # entry) MUST tombstone the key (not be shielded by the relight resume).
+    end_turn_ts = first_ts  # ≥ the bound file's first entry, well below spawned_ts
+    assert end_turn_ts < spawned_ts
+    await bot_module.apply_sidechain_activity(
+        {
+            _SID: ParentSidechainActivity(
+                ticks={
+                    key: SidechainTick(
+                        max_event_ts=end_turn_ts,
+                        saw_end_of_turn=True,
+                        max_end_turn_ts=end_turn_ts,
+                    )
+                }
+            )
+        }
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False  # DARK — the pre-spawn end_turn closed it
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_item1_genuine_post_spawn_park_still_closes_within_tolerance_bind(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r8 item 1 CONTROL: the floor never over-suppresses a GENUINE close. Same
+    below-spawn bind (first entry 0.5s below spawned_ts), but a genuine POST-spawn
+    park (ts > spawned_ts > the resume floor) still tombstones → typing drops. The
+    r3 tie fix is preserved (a park at exactly spawned_ts stays strictly newer than
+    the resume floor and closes)."""
+    import time
+
+    name = "explore-backend"
+    key = _KEY
+    (
+        route,
+        mon,
+        _sub,
+        _append,
+        spawned_ts,
+        _first_ts,
+    ) = await _bind_gen1_within_tolerance(scenario, tmp_path, name, key, first_gap=0.5)
+
+    # A genuine park AFTER the spawn closes the relit key.
+    park_ts = spawned_ts + 5
+    _append([_park_entry(name, _iso_utc(park_ts), _iso_utc(time.time()))])
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False  # genuine post-spawn park closed it
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_item1_normal_bind_floor_reduces_to_spawned_ts_minus_eps(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r8 item 1 CONTROL (normal case, the byte-for-byte r7 preservation): a bind
+    whose first entry is AFTER the spawn (the measured 1–7 ms real shape) floors at
+    ``spawned_ts - ε`` (``min(spawned_ts, first_ts) == spawned_ts``), and a stale
+    prior-leg sidechain end_turn (≤ spawned_ts - ε, the r7-accepted vanishingly-rare
+    residual) still keeps the key LIVE while a genuine post-spawn end_turn closes
+    it."""
+    import os
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY
+    spawned_ts = time.time() - 60
+    first_ts = spawned_ts + 0.05  # AFTER the spawn (the normal real shape)
+
+    _append(_spawn_pair(name, _iso_utc(spawned_ts)))
+    await mon.check_for_updates({_SID})
+    sc = _write_teammate_sidechain(sub_dir, key, first_ts, first_ts)
+    os.utime(sc, (first_ts, first_ts))
+    await mon.check_sidechain_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    rec = mon._teammate_registry[_SID][name]
+    # min(spawned_ts, first_ts) == spawned_ts → r7-identical resume ts.
+    assert act[_SID].resumed == {
+        key: rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S
+    }
+    await bot_module.apply_sidechain_activity(act)
+    assert route_runtime.snapshot(route).typing_eligible is True
+
+    # A genuine post-spawn sidechain end_turn (ts > resume floor) closes it.
+    await bot_module.apply_sidechain_activity(
+        {
+            _SID: ParentSidechainActivity(
+                ticks={
+                    key: SidechainTick(
+                        max_event_ts=spawned_ts + 10,
+                        saw_end_of_turn=True,
+                        max_end_turn_ts=spawned_ts + 10,
+                    )
+                }
+            )
+        }
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()

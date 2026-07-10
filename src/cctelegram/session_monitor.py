@@ -966,7 +966,7 @@ class SessionMonitor:
             if key in rec.retired_keys or key == old_current:
                 continue
             if sub_dir is not None:
-                gate = self._teammate_bind_gate_passes(
+                gate, _first_ts = self._teammate_bind_gate_passes(
                     rec, sub_dir / f"agent-{key}.jsonl"
                 )
                 if gate is not False:
@@ -1113,9 +1113,29 @@ class SessionMonitor:
     def _orphan_pending_slot(self, parent_session_id: str, name: str) -> _OrphanPending:
         """Get-or-create the orphan pending pair for ``name`` (r5 + r6): lazy TTL
         sweep first (expired names evicted before the cap check), then
-        evict-oldest ONLY for a genuinely NEW name at cap (an existing name
-        replace-merges in place — the r2 P3 discipline). The caller merges into
-        the returned entry and refreshes ``wall``."""
+        evict-at-cap ONLY for a genuinely NEW name (an existing name replace-merges
+        in place — the r2 P3 discipline). The caller merges into the returned entry
+        and refreshes ``wall``.
+
+        EVICTION PRIORITY (r8 item 2, CONVERGED P1 — Hermes + Codex, both
+        probe-reproduced): the buffer's REASON FOR EXISTING is to preserve a
+        pre-registration ORPHAN park (a park whose name has NO registry rec yet —
+        its ONLY home, since a teammate's park is its only close signal and it
+        arrives before the spawn registers). Since r7 made EVERY park dual-write a
+        named copy — INCLUDING the high-frequency registered/bound path — a busy
+        multi-teammate parent churns the 32-name buffer with REDUNDANT copies
+        (their primary immediate close already applied; the copy is generation-
+        dropped at the next drain), and a blind ``next(iter(buf))`` drop-oldest
+        evicted the sole retained ORPHAN the buffer exists to protect
+        (probe: 32 distinct REGISTERED-name parks evict an unregistered ``future``
+        → it later binds with ``pending_park=None`` → 2h strand). Fix: a two-tier
+        oldest-first eviction — evict the oldest REGISTERED-name entry (a
+        redundant dual-write copy that has another home) FIRST; only when ALL
+        entries are unregistered orphans (the true cap bound) evict the oldest
+        orphan. The registry lookup for "this buffered name HAS a rec" is available
+        here via ``self._teammate_registry`` (name-keyed, same key space as
+        ``buf``). The lazy TTL sweep + replace-merge-in-place semantics are
+        byte-identical."""
         buf = self._orphan_teammate_parks.setdefault(parent_session_id, {})
         now = time.time()
         expired = [
@@ -1126,7 +1146,15 @@ class SessionMonitor:
         entry = buf.get(name)
         if entry is None:
             if len(buf) >= _ORPHAN_PARK_MAX_NAMES:
-                buf.pop(next(iter(buf)))  # drop-oldest (insertion order)
+                recs = self._teammate_registry.get(parent_session_id) or {}
+                # Tier 1: the oldest REGISTERED-name copy (a redundant dual-write
+                # whose primary close already applied — it has another home).
+                victim = next((n for n in buf if n in recs), None)
+                # Tier 2 (all entries are pre-registration orphans — the true cap
+                # bound): the oldest orphan (insertion order).
+                if victim is None:
+                    victim = next(iter(buf))
+                buf.pop(victim)
             entry = _OrphanPending(wall=now)
             buf[name] = entry
         return entry
@@ -1502,34 +1530,53 @@ class SessionMonitor:
 
     def _teammate_bind_gate_passes(
         self, rec: "_TeammateRec", sc_file: Path
-    ) -> bool | None:
+    ) -> tuple[bool | None, float | None]:
         """§2 binding gate for ONE candidate stem: mtime prefilter + first-entry-ts
         generation gate.
 
-        Returns True (bind), False (never — the file's first entry predates the
-        spawn: a STALE prior-generation file), or None (INDETERMINATE — first line
-        not yet readable ⇒ NO bind this tick, RETRY). Gen-1 tolerates the larger
-        MTIME skew window (``spawned_ts - MTIME_SKEW``); gen>=2 tolerates only the
-        SMALL cross-write-path jitter (``spawned_ts - GEN2_FIRST_TS_TOLERANCE``,
-        adversarial-review P2) — far below the respawn interval, so a stale
-        prior-gen file (first entry seconds before the new spawn) still fails while
-        the genuine new-gen file (first entry a sub-second before the parent
-        tool_result flush) binds."""
+        Returns ``(gate, first_ts)``: gate True (bind), False (never — the file's
+        first entry predates the spawn: a STALE prior-generation file), or None
+        (INDETERMINATE — first line not yet readable ⇒ NO bind this tick, RETRY).
+        Gen-1 tolerates the larger MTIME skew window (``spawned_ts - MTIME_SKEW``);
+        gen>=2 tolerates only the SMALL cross-write-path jitter
+        (``spawned_ts - GEN2_FIRST_TS_TOLERANCE``, adversarial-review P2) — far
+        below the respawn interval, so a stale prior-gen file (first entry seconds
+        before the new spawn) still fails while the genuine new-gen file (first
+        entry a sub-second before the parent tool_result flush) binds.
+
+        The SECOND element (``first_ts``, r8 item 1, Hermes P1) is the candidate's
+        FIRST-entry timestamp — read at the gate and plumbed to the bind so the
+        relight resume ts can sit strictly BELOW the bound file's own first entry
+        (see :meth:`_bind_teammate_key`). It is non-None IFF the first line was
+        readable (gate True/False on the gen check); None only when the first line
+        could not be read (gate None) or the mtime prefilter rejected before the
+        read (gate False). A gate-True result therefore always carries the
+        first_ts, so the bind never falls back."""
         try:
             mtime = sc_file.stat().st_mtime
         except OSError:
-            return None
+            return None, None
         if mtime < rec.spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S:
-            return False  # backdated file — stale prior generation
+            return False, None  # backdated file — stale prior generation
         first_ts = self._read_first_entry_ts(sc_file)
         if first_ts is None:
-            return None  # unreadable/mid-write first line → retry
+            return None, None  # unreadable/mid-write first line → retry
         if rec.spawn_generation >= 2:
-            return first_ts >= rec.spawned_ts - TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S
-        return first_ts >= rec.spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S
+            return (
+                first_ts >= rec.spawned_ts - TEAMMATE_GEN2_FIRST_TS_TOLERANCE_S,
+                first_ts,
+            )
+        return (
+            first_ts >= rec.spawned_ts - TEAMMATE_BIND_MTIME_SKEW_TOLERANCE_S,
+            first_ts,
+        )
 
     def _bind_teammate_key(
-        self, parent_session_id: str, rec: "_TeammateRec", key: str
+        self,
+        parent_session_id: str,
+        rec: "_TeammateRec",
+        key: str,
+        first_entry_ts: float | None = None,
     ) -> None:
         """Bind ``key`` as ``rec.current_key`` and emit its (re)light signal, then
         apply the buffered pending signals in CAUSAL order (§2 binding).
@@ -1566,6 +1613,27 @@ class SessionMonitor:
         newer than ``spawned_ts - ε`` and closes correctly), and a pending wake
         (necessarily newer) max-merges over it.
 
+        RESUME-TS FLOOR (r8 item 1, Hermes P1, probe-reproduced): the resume ts is
+        ``min(rec.spawned_ts, first_entry_ts) - ε`` — strictly below the BOUND
+        FILE's OWN first-entry ts, not just below ``spawned_ts``. The gen-1 bind
+        gate tolerates a first entry up to ``spawned_ts - MTIME_SKEW`` (5s) below
+        the spawn, so an accepted look-alike candidate can bind with a first entry
+        (and thus a TRAILING end_turn ≥ that first entry, e.g. ``spawned_ts - 2s``)
+        BELOW ``spawned_ts - ε``; the r7 always-resumed stamp of ``spawned_ts - ε``
+        then SHIELDED that pre-spawn end_turn at the runtime SIDECHAIN done gate
+        (``end_turn_ts <= resumed_event_ts`` keeps the key LIVE), recreating the 2h
+        strand where the pre-r7 ``launched`` path fail-closed to DONE (no
+        ``resumed_event_ts`` ⇒ a stale end_turn tombstones). Flooring at the bound
+        file's first entry makes EVERY signal in that file (including its trailing
+        end_turn, which is ≥ its first entry) STRICTLY NEWER than the resume, so
+        nothing from the bound file can ever be shielded. In the normal case
+        (``first_ts >= spawned_ts``, measured 1–7 ms after) the ``min`` reduces to
+        ``spawned_ts - ε``, preserving the r3 tie fix (a park at exactly
+        ``spawned_ts`` still strictly-newer closes) and the r7 semantics
+        byte-for-byte. ``first_entry_ts`` is None only for a bind lane where the
+        first entry is genuinely unknown (defensive — every real gate-True carries
+        it); it then falls back to ``spawned_ts - ε`` (the r7 stamp) and logs.
+
         SAME-TICK CANCEL (r3 P1, BOTH engines): a retraction emitted EARLIER in
         THIS tick (registration in check_for_updates, bind in the immediately
         following sidechain scan) is CANCELLED here (``activity.retraction_dones
@@ -1598,10 +1666,24 @@ class SessionMonitor:
         # (never ``launched``); the same-tick cancel is unconditional (a no-op
         # when nothing is pending for this key).
         activity.retraction_dones.discard(key)
+        # r8 item 1: floor the resume ts strictly BELOW the bound file's OWN first
+        # entry (not just below spawned_ts), so no signal from the bound file —
+        # including a TRAILING end_turn ≥ its first entry — can be shielded by the
+        # runtime resume gate. Normal case (first_ts >= spawned_ts) reduces to
+        # spawned_ts - ε (r7 semantics preserved). None ⇒ the r7 fallback.
+        resume_floor = rec.spawned_ts
+        if first_entry_ts is not None:
+            resume_floor = min(resume_floor, first_entry_ts)
+        else:
+            logger.info(
+                "teammate bind: first-entry ts unavailable for key %s — "
+                "flooring the relight resume at spawned_ts (r7 fallback)",
+                key,
+            )
         _record_resume_ts(
             activity.resumed,
             key,
-            rec.spawned_ts - TEAMMATE_RETRACT_RESUME_EPSILON_S,
+            resume_floor - TEAMMATE_RETRACT_RESUME_EPSILON_S,
         )
         existing_park = activity.teammate_parks.get(key)
         if existing_park is not None:
@@ -1666,13 +1748,15 @@ class SessionMonitor:
         quarantined."""
         if rec.ambiguous:
             return
-        passing: list[str] = []
+        # r8 item 1: carry each gate-passer's FIRST-entry ts so the bind can floor
+        # the relight resume ts strictly below the bound file's own first entry.
+        passing: list[tuple[str, float | None]] = []
         for key, sc_file in candidates:
-            gate = self._teammate_bind_gate_passes(rec, sc_file)
+            gate, first_ts = self._teammate_bind_gate_passes(rec, sc_file)
             if gate is False:
                 self._quarantine_teammate_stem(parent_session_id, rec, key)
             elif gate is True:
-                passing.append(key)
+                passing.append((key, first_ts))
             # None → unresolved, retry (never quarantined, never run-state)
         if len(passing) > 1:
             rec.ambiguous = True
@@ -1684,11 +1768,14 @@ class SessionMonitor:
                 rec.name,
                 parent_session_id[:8],
                 rec.spawn_generation,
-                sorted(passing),
+                sorted(k for k, _ in passing),
             )
             return
         if passing:
-            self._bind_teammate_key(parent_session_id, rec, passing[0])
+            bind_key, bind_first_ts = passing[0]
+            self._bind_teammate_key(
+                parent_session_id, rec, bind_key, first_entry_ts=bind_first_ts
+            )
 
     def _arbitrate_teammate_bindings(
         self, parent_session_id: str, sidechain_files: list[Path]
@@ -2701,11 +2788,12 @@ class SessionMonitor:
                         # (``status=="teammate_spawned"`` + snake ``agent_id``, no
                         # camelCase ``agentId``, so the prose regex below never
                         # matches it). Register/rotate the teammate in the
-                        # generational registry; the launched key is emitted
-                        # LATER, at binding, once its sidechain stem appears.
-                        # STRUCTURED-ONLY — a prose ``Spawned successfully.`` line
-                        # without the meta fires a rate-limited drift WARNING (the
-                        # T1.6 pattern), never a lift.
+                        # generational registry; the relight signal is emitted
+                        # LATER, at binding, once its sidechain stem appears —
+                        # always via the tombstone-popping RESUMED lane, never
+                        # ``launched`` (r7 item 3). STRUCTURED-ONLY — a prose
+                        # ``Spawned successfully.`` line without the meta fires a
+                        # rate-limited drift WARNING (the T1.6 pattern), never a lift.
                         spawn = teammate_spawn_info_from_meta(entry.tool_result_meta)
                         if spawn is not None:
                             self._record_teammate_spawn(
@@ -3124,8 +3212,8 @@ class SessionMonitor:
             # — this tick's same-name teammate candidates are judged as a SET
             # (bind exactly one, or NONE + sticky-ambiguous on >1 passing) BEFORE
             # any per-file processing, so filesystem enumeration order never
-            # picks the "genuine" key. A successful bind emits the launched key
-            # + applies pending wake/park here.
+            # picks the "genuine" key. A successful bind relights via the RESUMED
+            # lane (r7 item 3, never ``launched``) + applies pending wake/park here.
             self._arbitrate_teammate_bindings(parent_session_id, sidechain_files)
 
             for sc_file in sidechain_files:
