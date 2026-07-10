@@ -913,8 +913,10 @@ SAME-generation noise whose signals were already applied to the bound
 is pending); **tier 3** (LAST resort, only when tiers 1+2 are EMPTY — the TRUE
 cap bound) evicts the oldest PROVABLE entry (no rec — a pre-registration orphan;
 OR a name WITH a spawn-shaped early signal — a stashed next-generation spawn, so
-the retained copy is PROVABLY that generation's ONLY close; OR an
-unparseable-dominance park that can't be ts-classified). Tier 2 vs 3 =
+the retained copy is PROVABLY that generation's ONLY close; an unparseable park
+has no tier of its own — it protects its entry from tier 1, since the drain
+would NOT drop it, but a registered/no-stash name is tier 2 regardless of
+parseability). Tier 2 vs 3 =
 speculative vs provable pending value; the eviction may only sacrifice provable
 value at TRUE capacity. The stash probe is a bounded name-membership scan over
 `_early_teammate_signals[parent]` (≤ the 64-entry cap; the parsed
