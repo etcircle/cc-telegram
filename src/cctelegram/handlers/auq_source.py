@@ -1193,6 +1193,28 @@ def peek_side_file_written_at(session_id: str) -> float | None:
     return rec.written_at
 
 
+def peek_side_file_tool_use_id_and_written_at(
+    session_id: str,
+) -> tuple[str, float] | None:
+    """Return ``(tool_use_id, written_at)`` from the side file for ``session_id``
+    in ONE read, or ``None`` when no valid side file exists.
+
+    The combined accessor the GH #39 empty-id orphan age-cap needs: the reconciler
+    decides on ``(tool_use_id, written_at)`` and re-reads the SAME tuple as its
+    pre-unlink guard, so both the decision and the guard observe ONE atomic record
+    read — an empty id + an exact ``written_at`` match discriminates two empty-id
+    generations that the ``tool_use_id`` re-peek alone cannot. Applies the same
+    future-skew guard as :func:`peek_side_file_written_at` (a skewed stamp ⇒
+    ``None`` ⇒ never aged past the cap). Read-only; pane-AGNOSTIC; no read-TTL.
+    """
+    rec = _read_pretool_side_file(session_id)
+    if rec is None:
+        return None
+    if time.time() - rec.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
+        return None
+    return rec.tool_use_id, rec.written_at
+
+
 @dataclass(frozen=True)
 class RecoverySideFile:
     """The read-TTL-free side-file payload + its canonical source fingerprint.

@@ -25,8 +25,10 @@ Key functions: create_bot(), handle_new_message().
 
 import asyncio
 import io
+import json
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from telegram import (
@@ -1964,6 +1966,67 @@ async def _reconcile_window_geometry() -> None:
         logger.warning("Startup geometry reconcile failed: %s", e)
 
 
+def _build_startup_gc_liveness_predicate(
+    monitor: SessionMonitor,
+) -> Callable[[str], bool]:
+    """Build the startup-GC liveness predicate shared by the AUQ / Notification /
+    MessageDisplay reap gates (GH #39).
+
+    ``monitor.state`` (persisted ``monitor_state.json``) LAGS ``session_map.json``
+    at startup, so ``monitor.state.get_session`` alone misses a session whose side
+    file / capture file was born during a >1h outage — the GC would reap its live
+    authority. The predicate is live-if-EITHER a tracked session OR a session id
+    present in a DIRECT validated read of ``config.session_map_file``.
+
+    The session_map read is DIRECT (json load + dict shape check) — NOT
+    ``SessionMonitor._load_current_session_map``, which swallows read errors into
+    ``{}`` and so cannot signal "read failed". On ANY read/parse error the
+    predicate returns True for EVERY sid (conservative skip-all-GC this startup,
+    one WARNING). The file is read ONCE here; the returned closure reuses the
+    frozen set at all three callsites (they are deliberately identical). A missing
+    file is the benign fresh-install state — an empty set, never a read failure,
+    since ``monitor.state`` alone then decides.
+    """
+    read_failed = False
+    session_ids: set[str] = set()
+    try:
+        raw = config.session_map_file.read_text()
+    except FileNotFoundError:
+        raw = None
+    except OSError as e:
+        read_failed = True
+        logger.warning(
+            "Startup GC liveness: session_map unreadable (%s); skipping all GC "
+            "this startup (conservative)",
+            e,
+        )
+        raw = None
+    if raw is not None:
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("session_map is not a dict")
+            for info in data.values():
+                if isinstance(info, dict):
+                    sid = info.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        session_ids.add(sid)
+        except (json.JSONDecodeError, ValueError) as e:
+            read_failed = True
+            logger.warning(
+                "Startup GC liveness: session_map malformed (%s); skipping all "
+                "GC this startup (conservative)",
+                e,
+            )
+
+    def _predicate(sid: str) -> bool:
+        if read_failed:
+            return True
+        return monitor.state.get_session(sid) is not None or sid in session_ids
+
+    return _predicate
+
+
 async def post_init(application: Application) -> None:
     global \
         session_monitor, \
@@ -2191,6 +2254,13 @@ async def post_init(application: Application) -> None:
     session_monitor = monitor
     logger.info("Session monitor started")
 
+    # GH #39: ONE session_map-consulting liveness predicate, read once and shared
+    # by all three startup GC gates below. monitor.state (monitor_state.json) lags
+    # session_map.json at startup, so a side file / capture file born during a
+    # >1h outage would be falsely reaped; the predicate is live-if-EITHER. The
+    # leaves (auq_source / notify_source / md_capture) stay injection-only.
+    startup_gc_is_live = _build_startup_gc_liveness_predicate(monitor)
+
     # AUQ PreToolUse side-file maintenance:
     #   1. Garbage-collect stale files (>1h old) left over from crashes
     #      / kickstart-between-AUQs cases.
@@ -2206,11 +2276,11 @@ async def post_init(application: Application) -> None:
         # Liveness gate: Claude buffers the AskUserQuestion tool_use in JSONL
         # until the prompt resolves, so a live AUQ left open >1h has a
         # stale-mtime side file that is STILL its card's liveness authority.
-        # Skip reaping it while the session is tracked (same predicate shape as
-        # the md_capture.gc_stale callsite below). The side file stem IS the
-        # <session_id> the monitor tracks; the predicate is INJECTED so
-        # auq_source stays a leaf.
-        gc_stale(is_live_session=lambda sid: monitor.state.get_session(sid) is not None)
+        # Skip reaping it while the session is live (GH #39: tracked OR present
+        # in session_map, since monitor.state lags the map at startup). The side
+        # file stem IS the <session_id> the monitor tracks; the predicate is
+        # INJECTED so auq_source stays a leaf.
+        gc_stale(is_live_session=startup_gc_is_live)
         warn_if_pre_tool_use_hook_missing()
     except Exception as e:  # noqa: BLE001
         # Never let cleanup/maintenance crash bot startup.
@@ -2230,9 +2300,7 @@ async def post_init(application: Application) -> None:
         from .handlers import notify_source
         from .handlers.interactive_ui import warn_if_notification_hook_missing
 
-        notify_source.gc_stale(
-            is_live_session=lambda sid: monitor.state.get_session(sid) is not None
-        )
+        notify_source.gc_stale(is_live_session=startup_gc_is_live)
         warn_if_notification_hook_missing()
     except Exception as e:  # noqa: BLE001
         logger.warning("Notification startup maintenance raised: %s", e)
@@ -2259,9 +2327,9 @@ async def post_init(application: Application) -> None:
         # monitor tracks (under --resume the bot tracks the original id), so
         # tracked-session membership is the AUQ+EPM-covering liveness test. The
         # predicate is INJECTED (md_capture stays a leaf, never imports here).
-        md_capture.gc_stale(
-            is_live_session=lambda sid: monitor.state.get_session(sid) is not None
-        )
+        # GH #39: the shared predicate also consults session_map (monitor.state
+        # lags the map at startup).
+        md_capture.gc_stale(is_live_session=startup_gc_is_live)
         if not md_capture.capture_settings_has_message_display():
             logger.warning(
                 "MessageDisplay capture settings missing the hook (%s); live "

@@ -405,6 +405,54 @@ class TestPeekSideFileWrittenAt:
         assert auq_source.peek_side_file_written_at(self._SID) == pytest.approx(ts)
 
 
+class TestPeekSideFileToolUseIdAndWrittenAt:
+    """GH #39 combined accessor: ONE read yields ``(tool_use_id, written_at)`` so
+    the empty-id orphan age-cap reconciler's decision and its pre-unlink guard
+    observe an atomic record read (future-skew guarded, no read-TTL)."""
+
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    def test_returns_tuple(self, _cc_dir):
+        ts = time.time() - 42.0
+        _write_side_file_at(_cc_dir, self._SID, written_at=ts)
+        got = auq_source.peek_side_file_tool_use_id_and_written_at(self._SID)
+        assert got is not None
+        tuid, written_at = got
+        assert tuid  # affordance fixture carries a non-empty id
+        assert written_at == pytest.approx(ts)
+        assert not auq_source._pretool_ask_records  # read-only
+
+    def test_none_when_absent(self, _cc_dir):
+        assert auq_source.peek_side_file_tool_use_id_and_written_at(self._SID) is None
+
+    def test_none_on_future_skew(self, _cc_dir):
+        _write_side_file_at(
+            _cc_dir,
+            self._SID,
+            written_at=time.time() + auq_source._PRETOOL_FUTURE_SKEW_SECONDS + 30,
+        )
+        assert auq_source.peek_side_file_tool_use_id_and_written_at(self._SID) is None
+
+    def test_empty_id_preserved(self, _cc_dir):
+        ts = time.time() - 10.0
+        pending = _cc_dir / "auq_pending"
+        pending.mkdir(mode=0o700, exist_ok=True)
+        sidefile = json.loads(_AFFORDANCE_SIDEFILE.read_text())
+        (pending / f"{self._SID}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "session_id": self._SID,
+                    "tool_use_id": "",
+                    "written_at": ts,
+                    "tool_input": sidefile["tool_input"],
+                }
+            )
+        )
+        got = auq_source.peek_side_file_tool_use_id_and_written_at(self._SID)
+        assert got == ("", pytest.approx(ts))
+
+
 class TestSideFileLiveForWindow:
     """The pane-INDEPENDENT card-clear authority (2026-05-31 disappearing-card
     fix). ``side_file_live_for_window`` is True iff a schema-valid side file
