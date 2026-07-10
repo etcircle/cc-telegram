@@ -2144,3 +2144,84 @@ async def test_same_tick_retraction_then_bind_cancels_retraction(
     }
     assert act[PARENT].launched == set()
     assert key not in act[PARENT].teammate_parks  # genuine-park lane untouched
+
+
+# ── orphan-park buffer hygiene (r5 P1 — TTL + cap) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_orphan_park_buffer_cap_and_ttl_hygiene(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block
+):
+    """r5 P1 buffer hygiene: parks for never-registered names cannot grow the
+    buffer unboundedly — the per-parent cap evicts the OLDEST name only for a
+    genuinely NEW name (an existing name replace-merges in place), and a
+    TTL-expired entry is discarded at the drain instead of closing a fresh
+    generation's key."""
+    import time as _time
+
+    from cctelegram.handlers.response_builder import TeammateIdle
+    from cctelegram.session_monitor import (
+        _ORPHAN_PARK_MAX_NAMES,
+        _ORPHAN_PARK_TTL_S,
+        _PendingPark,
+    )
+
+    parent_jsonl, _sub_dir = _setup_parent(monitor, tmp_path)
+
+    # Fill the cap with distinct never-registered names.
+    for i in range(_ORPHAN_PARK_MAX_NAMES):
+        monitor._retain_orphan_teammate_park(
+            PARENT,
+            TeammateIdle(name=f"tm{i}", park_ts=100.0 + i, park_ts_unparseable=False),
+        )
+    buf = monitor._orphan_teammate_parks[PARENT]
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+
+    # An EXISTING name at cap replace-merges in place (max park_ts wins) — no
+    # unrelated eviction, size unchanged.
+    monitor._retain_orphan_teammate_park(
+        PARENT, TeammateIdle(name="tm5", park_ts=9999.0, park_ts_unparseable=False)
+    )
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    assert set(buf) == {f"tm{i}" for i in range(_ORPHAN_PARK_MAX_NAMES)}
+    assert buf["tm5"][0] == _PendingPark(unknown_done=False, ts=9999.0)
+    # And the causal reduction holds: an OLDER park never downgrades the slot.
+    monitor._retain_orphan_teammate_park(
+        PARENT, TeammateIdle(name="tm5", park_ts=50.0, park_ts_unparseable=False)
+    )
+    assert buf["tm5"][0] == _PendingPark(unknown_done=False, ts=9999.0)
+
+    # A genuinely NEW name at cap evicts exactly the oldest.
+    monitor._retain_orphan_teammate_park(
+        PARENT, TeammateIdle(name="tm_new", park_ts=200.0, park_ts_unparseable=False)
+    )
+    assert len(buf) == _ORPHAN_PARK_MAX_NAMES
+    assert "tm0" not in buf and "tm_new" in buf
+
+    # TTL: an entry aged past _ORPHAN_PARK_TTL_S is discarded at the DRAIN —
+    # never applied to a fresh generation's pending slot.
+    now = _time.time()
+    buf["tm_stale"] = (
+        _PendingPark(unknown_done=False, ts=now + 100),
+        now - _ORPHAN_PARK_TTL_S - 10,
+    )
+    _append_spawn(
+        parent_jsonl, "tm_stale", make_jsonl_entry, make_tool_use_block, _iso(now)
+    )
+    await monitor.check_for_updates({PARENT})
+    monitor.pop_sidechain_activity()
+    rec = monitor._teammate_registry[PARENT]["tm_stale"]
+    assert rec.pending_park is None  # expired at drain — discarded
+    assert "tm_stale" not in monitor._orphan_teammate_parks.get(PARENT, {})
+
+    # And the lazy sweep evicts expired entries at retain time too.
+    buf2 = monitor._orphan_teammate_parks.setdefault(PARENT, {})
+    buf2["tm_old"] = (
+        _PendingPark(unknown_done=False, ts=1.0),
+        now - _ORPHAN_PARK_TTL_S - 10,
+    )
+    monitor._retain_orphan_teammate_park(
+        PARENT, TeammateIdle(name="tm_fresh", park_ts=300.0, park_ts_unparseable=False)
+    )
+    assert "tm_old" not in buf2 and "tm_fresh" in buf2

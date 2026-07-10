@@ -544,3 +544,173 @@ async def test_no_registry_unparseable_park_then_spawn_still_tombstones(
     snap = route_runtime.snapshot(route)
     assert snap.typing_eligible is False  # fail-dark holds
     assert snap.background_agents == ()
+
+
+def _spawn_pair_result_first(name: str, ts: str) -> list[dict]:
+    """The GH #42 result-before-use ordering: the spawn tool_result flushes
+    BEFORE its Agent tool_use (the r1 retro-pairing lane)."""
+    pair = _spawn_pair(name, ts)
+    return [pair[1], pair[0]]
+
+
+@pytest.mark.asyncio
+async def test_orphan_park_between_stashed_spawn_and_late_use_closes_bind(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r5 P1 REQUIRED pin (Codex, probe-reproduced): the exact repro ordering —
+    spawn tool_result (stashed by the r1 retro-pairing) → GENUINE park → late
+    Agent tool_use (registers) → sidechain discovery/bind. At park-record time
+    there is NO registry rec AND no tracked stem, so pre-fix the park was
+    dropped on the floor and the bind ran live to the 2h TTL (teammates have no
+    other close signal). The orphan-park buffer retains it by name; the
+    registration drain routes it through pending_park; the bind applies it —
+    the key must NOT stay live (typing drops through the production fan-out)."""
+    import json as _json
+    import os
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY
+
+    # The sidechain file exists ON DISK but is NOT tracked (never swept).
+    t2 = time.time() - 30
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text(
+        _json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": []},
+                "timestamp": _iso_utc(t2 + 0.05),
+            }
+        )
+        + "\n"
+    )
+    os.utime(sc, (t2 + 0.05, t2 + 0.05))
+
+    # ONE batch, the repro order: spawn RESULT (stashed) → genuine park (T3 ≥
+    # spawn) → the late Agent tool_use (retro-pairs → registers → drains).
+    pair = _spawn_pair_result_first(name, _iso_utc(t2))
+    t3 = t2 + 5
+    _append([pair[0]])
+    _append([_park_entry(name, _iso_utc(t3), _iso_utc(t3))])
+    _append([pair[1]])
+    await mon.check_for_updates({_SID})
+    await mon.check_sidechain_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    # The drained park rode pending_park into the bind's record (the ISO
+    # round-trip truncates to milliseconds - compare with tolerance).
+    park_ts, unparseable = act[_SID].teammate_parks[key]
+    assert unparseable is False and park_ts == pytest.approx(t3, abs=0.01)
+    await bot_module.apply_sidechain_activity(act)
+
+    # Bound — but NOT live: the retained park closed it.
+    assert mon._teammate_registry[_SID][name].current_key == key
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_orphan_unparseable_park_through_same_ordering_still_tombstones(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r5 dominance variant: an UNPARSEABLE park through the same orphan ordering
+    keeps its unconditional dominance — retained as UnknownDone, drained (never
+    generation-checked), applied at bind, tombstones the key (fail-dark)."""
+    import json as _json
+    import os
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY
+
+    t2 = time.time() - 30
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text(
+        _json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": []},
+                "timestamp": _iso_utc(t2 + 0.05),
+            }
+        )
+        + "\n"
+    )
+    os.utime(sc, (t2 + 0.05, t2 + 0.05))
+
+    pair = _spawn_pair_result_first(name, _iso_utc(t2))
+    _append([pair[0]])
+    _append([_park_entry(name, None, _iso_utc(t2 + 5))])  # unparseable (no ts)
+    _append([pair[1]])
+    await mon.check_for_updates({_SID})
+    await mon.check_sidechain_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    assert act[_SID].teammate_parks.get(key) == (None, True)  # dominance held
+    await bot_module.apply_sidechain_activity(act)
+
+    assert mon._teammate_registry[_SID][name].current_key == key
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_stale_orphan_park_generation_dropped_at_drain_bind_stays_live(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """r5 non-regression (the r4 case through the NEW buffer): a STALE orphan
+    park (park_ts < the eventual generation's spawned_ts — a prior-leg park
+    retained before any registration) is generation-DROPPED at the drain, so the
+    fresh bind stays LIVE; a genuine later park still closes."""
+    import json as _json
+    import os
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+    name = "explore-backend"
+    key = _KEY
+
+    t2 = time.time() - 30
+    # The STALE park (T1 < T2) arrives first — orphan-retained (no rec, no stem).
+    _append([_park_entry(name, _iso_utc(t2 - 10), _iso_utc(t2 - 10))])
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert name in mon._orphan_teammate_parks.get(_SID, {})
+
+    # The spawn (T2) registers → drain drops the stale park (T1 < spawned_ts).
+    _append(_spawn_pair(name, _iso_utc(t2)))
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    rec = mon._teammate_registry[_SID][name]
+    assert rec.pending_park is None  # dropped at drain, never buffered
+
+    # The genuine file binds → LIVE (typing lifts).
+    sc = sub_dir / f"agent-{key}.jsonl"
+    sc.write_text(
+        _json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": []},
+                "timestamp": _iso_utc(t2 + 0.05),
+            }
+        )
+        + "\n"
+    )
+    os.utime(sc, (t2 + 0.05, t2 + 0.05))
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert mon._teammate_registry[_SID][name].current_key == key
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True  # the r4 case does NOT regress
+    assert snap.background_agents == (key,)
+
+    # A genuine park (> spawned_ts) still closes it.
+    _append([_park_entry(name, _iso_utc(t2 + 60), _iso_utc(t2 + 60))])
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert route_runtime.snapshot(route).typing_eligible is False

@@ -121,6 +121,23 @@ _EARLY_TEAMMATE_SIGNALS_MAX = 64
 # — fail-dark (the accepted direction) and vanishingly rare.
 TEAMMATE_RETRACT_RESUME_EPSILON_S = 1e-3
 
+# GH #46 PR-2 r5 P1 (Codex, probe-reproduced): the orphan-park retention buffer.
+# A park that resolves to NO registry rec AND no tracked stem was DROPPED on the
+# floor — in the supported result-before-use ordering (spawn tool_result stashed
+# → GENUINE park arrives → late Agent tool_use registers → sidechain discovered
+# + bound) that park is the bound key's ONLY close signal (teammates emit no
+# sidechain end-of-turn / <task-notification>), so the fresh bind ran live to
+# the 2h TTL. Such parks are RETAINED keyed by teammate NAME (bounded names,
+# drop-oldest; per-entry wall TTL mirroring the 2h background TTL the eventual
+# key would age by — session_monitor deliberately doesn't import route_runtime,
+# the _RECONCILE_FRESH_WINDOW_S pattern) with the SAME causal reduction as the
+# pending slot (_merge_pending_park: unparseable dominates, else max park_ts),
+# and DRAINED at registration into rec.pending_park — where the r1 item-4
+# generation filter + the bind-time application arbitrate exactly like any
+# other pending park.
+_ORPHAN_PARK_MAX_NAMES = 32
+_ORPHAN_PARK_TTL_S = 7200.0
+
 
 @dataclass
 class SidechainTick:
@@ -705,6 +722,19 @@ class SessionMonitor:
         self._early_teammate_signals: dict[
             str, dict[str, tuple[Any, str | None, str | None]]
         ] = {}
+        # GH #46 PR-2 r5 P1: the orphan-park retention buffer — parent_sid ->
+        # {teammate_name -> (_PendingPark, retained_wall_ts)}. Holds parks that
+        # resolved to NO registry rec AND no tracked stem (pre-registration,
+        # pre-discovery — the park-lane mirror of the item-1 spawn stash), so
+        # the eventual bind still has its close signal. Bounded
+        # (_ORPHAN_PARK_MAX_NAMES, drop-oldest for a NEW name; replace-merge in
+        # place for an existing one), per-entry wall TTL (_ORPHAN_PARK_TTL_S),
+        # causal reduction via _merge_pending_park. Drained at registration into
+        # rec.pending_park (generation-filtered there); torn down with the
+        # parent.
+        self._orphan_teammate_parks: dict[
+            str, dict[str, tuple[_PendingPark, float]]
+        ] = {}
         # Per-tick fan-out for sidechain activity (wired from bot.post_init,
         # like ``_message_callback`` / ``_event_callback``).
         self._subagent_activity_callback: (
@@ -953,6 +983,12 @@ class SessionMonitor:
                 parent_session_id[:8],
                 recs[info.name].spawn_generation,
             )
+        # (4.5) r5 P1: drain an orphan-retained park for this name into
+        # rec.pending_park (generation-filtered at the drain — a stale
+        # prior-leg orphan park never poisons the fresh generation, the r4
+        # non-regression) BEFORE the pre-spawn scan, so a same-call bind
+        # applies it through the normal pending-park causal path.
+        self._drain_orphan_teammate_park(parent_session_id, recs[info.name])
         # (5) pre-spawn scan: bind an already-tracked, unretired, gate-passing stem.
         self._try_bind_tracked_teammate_stems(parent_session_id, info.name)
         # (6) dual-review r2 P1 (BOTH engines): a candidate tracked BEFORE this
@@ -1001,6 +1037,85 @@ class SessionMonitor:
                 rec.name,
                 parent_session_id[:8],
             )
+
+    def _retain_orphan_teammate_park(self, parent_session_id: str, parked: Any) -> None:
+        """r5 P1: retain a park that resolved to NO registry rec AND no tracked
+        stem — keyed by teammate NAME until registration drains it.
+
+        The park-lane mirror of the item-1 result-before-use spawn stash: in the
+        supported ordering (spawn tool_result stashed → genuine park → late
+        Agent tool_use → sidechain discovery/bind) the park arrives before ANY
+        anchor exists, and dropping it strands the eventual bound key to the 2h
+        TTL (teammates have no other close signal). Causal reduction WITHIN the
+        buffer via the shared ``_merge_pending_park`` rules (unparseable
+        dominates permanently, else max park_ts); the wall stamp refreshes on
+        each merge (a newer park is fresh evidence). Lazy TTL sweep before the
+        cap check; evict-oldest only for a genuinely NEW name at cap (the r2 P3
+        discipline). Torn down with the parent."""
+        buf = self._orphan_teammate_parks.setdefault(parent_session_id, {})
+        now = time.time()
+        expired = [
+            name
+            for name, (_slot, wall) in buf.items()
+            if now - wall > _ORPHAN_PARK_TTL_S
+        ]
+        for name in expired:
+            del buf[name]
+        existing = buf.get(parked.name)
+        if existing is None and len(buf) >= _ORPHAN_PARK_MAX_NAMES:
+            buf.pop(next(iter(buf)))  # drop-oldest (insertion order)
+        slot = _merge_pending_park(
+            existing[0] if existing is not None else None,
+            parked.park_ts,
+            parked.park_ts_unparseable,
+        )
+        buf[parked.name] = (slot, now)
+        logger.info(
+            "teammate park: retained orphan park for unregistered name=%r "
+            "parent=%s (unparseable=%s)",
+            parked.name,
+            parent_session_id[:8],
+            parked.park_ts_unparseable,
+        )
+
+    def _drain_orphan_teammate_park(
+        self, parent_session_id: str, rec: "_TeammateRec"
+    ) -> None:
+        """r5 P1: drain the orphan-retained park for ``rec.name`` into
+        ``rec.pending_park`` at registration — the eventual bind then applies it
+        through the NORMAL pending-park causal path (wake-vs-park arbitration at
+        the runtime ts-gates).
+
+        GENERATION-FILTERED at the drain (the r4 non-regression through the new
+        buffer): a PARSEABLE orphan park with ``ts < rec.spawned_ts`` reports a
+        PRIOR leg and is DROPPED (INFO); an UNPARSEABLE one keeps unconditional
+        dominance (fail-dark — it cannot be generation-checked). A TTL-expired
+        entry is discarded."""
+        buf = self._orphan_teammate_parks.get(parent_session_id)
+        if not buf:
+            return
+        entry = buf.pop(rec.name, None)
+        if not buf:
+            self._orphan_teammate_parks.pop(parent_session_id, None)
+        if entry is None:
+            return
+        slot, wall = entry
+        if time.time() - wall > _ORPHAN_PARK_TTL_S:
+            return  # expired while orphaned — discard
+        if slot.unknown_done:
+            rec.pending_park = _merge_pending_park(rec.pending_park, None, True)
+        elif slot.ts is not None and slot.ts < rec.spawned_ts:
+            logger.info(
+                "teammate park: dropping stale orphan park at drain for "
+                "name=%r parent=%s (park_ts=%.3f < gen-%d spawned_ts=%.3f)",
+                rec.name,
+                parent_session_id[:8],
+                slot.ts,
+                rec.spawn_generation,
+                rec.spawned_ts,
+            )
+        else:
+            rec.pending_park = _merge_pending_park(rec.pending_park, slot.ts, False)
 
     def _record_teammate_wake(
         self, parent_session_id: str, name: str, event_ts: float | None
@@ -1172,11 +1287,14 @@ class SessionMonitor:
             for _tk, key in self._tracked_teammate_stems(parent_session_id, parked.name)
         ]
         if not matched:
-            logger.info(
-                "teammate park: no registry rec + no tracked stem for name=%r parent=%s",
-                parked.name,
-                parent_session_id[:8],
-            )
+            # r5 P1 (Codex, probe-reproduced): NO registry rec AND no tracked
+            # stem — dropping the park here recreated the 2h strand in the
+            # supported ordering "spawn tool_result (stashed) → genuine park →
+            # late Agent tool_use → sidechain discovery/bind": the park is the
+            # eventual bound key's ONLY close signal. RETAIN it by name; the
+            # registration drain routes it through the pending-park slot + the
+            # generation filter.
+            self._retain_orphan_teammate_park(parent_session_id, parked)
             return
         activity = self._parent_activity(parent_session_id)
         for key in matched:
@@ -3093,6 +3211,7 @@ class SessionMonitor:
         self._teammate_registry.pop(parent_session_id, None)
         self._severed_teammate_stems.pop(parent_session_id, None)
         self._early_teammate_signals.pop(parent_session_id, None)
+        self._orphan_teammate_parks.pop(parent_session_id, None)
         prefix = f"sub:{parent_session_id}:"
         stale = [k for k in self.state.tracked_sessions if k.startswith(prefix)]
         for k in stale:
