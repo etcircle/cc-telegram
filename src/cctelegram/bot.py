@@ -1008,12 +1008,21 @@ async def cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: update the Claude Code CLI and restart idle sessions in place.
+    """Owner-only: update the Claude Code CLI and restart idle session(s).
 
-    Updates the ``claude`` binary, then restarts each IDLE bound session inside
-    its existing tmux window (preserving the window id, via ``--resume`` so it
-    adopts the new version). Busy sessions are deferred. Fail-closed + idle-only:
-    it never restarts a session that is mid-work or waiting on a prompt.
+    Two modes (owner decision 2026-07-10):
+
+    - ``/update`` (no arg) — SCOPED: update the CLI binary, then restart ONLY
+      the invoking topic's idle session in place. The default is scoped so the
+      fleet walk never silently revives dormant topics (a ``claude --resume`` of
+      a dormant session is not inert — it drips background tokens).
+    - ``/update all`` — FLEET: today's behavior — restart every idle bound
+      session in place.
+
+    Both restart in place (preserving the window id, via ``--resume`` so it
+    adopts the new version), defer busy sessions, and are fail-closed +
+    idle-only. Any other argument gets a usage reply and executes nothing (the
+    CLI is NOT updated).
     """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -1022,6 +1031,38 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     from .handlers import updater
+
+    # Parse the arg tail: empty → SCOPED (this topic); the literal "all"
+    # (casefolded) → FLEET; anything else → usage reply, nothing executed.
+    raw = update.message.text or ""
+    parts = raw.split(None, 1)
+    arg = parts[1].strip().casefold() if len(parts) > 1 else ""
+
+    scope: tuple[int, int] | None = None
+    if arg == "":
+        # SCOPED — pre-resolve the invoking topic's binding ONLY for the fast
+        # unbound-topic error (the same lookup the other topic commands use).
+        # The AUTHORITATIVE resolution happens inside run_update AFTER the
+        # up-to-120s CLI phase (codex review P2): the topic can be unbound /
+        # rebound during that interval, so the scope carries the (user_id,
+        # thread_id) resolution INPUTS, never a captured window id.
+        thread_id = _get_thread_id(update)
+        wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+        if thread_id is None or not wid:
+            await safe_reply(
+                update.message,
+                "❌ No session bound to this topic. Use /update all to update "
+                "every idle session.",
+            )
+            return
+        scope = (user.id, thread_id)
+    elif arg != "all":
+        await safe_reply(
+            update.message,
+            "Usage: /update (this topic) or /update all (every idle session).",
+        )
+        return
+    # arg == "all" → FLEET (scope stays None).
 
     # Progressive status message we edit in place through the run.
     status_msg = await safe_reply(update.message, "🔄 Updating…")
@@ -1052,6 +1093,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         monitor=session_monitor,
         claude_command=config.claude_command,
         md_settings=md_settings,
+        scope=scope,
     )
 
 
@@ -2321,8 +2363,9 @@ def create_bot() -> Application:
     # /file is bot-owned (upload a local file from the session to the topic) —
     # register before the catch-all forwarder below so it never lands in tmux.
     application.add_handler(CommandHandler("file", file_command))
-    # /update is bot-owned (update the CLI + restart idle sessions in place) —
-    # register before the catch-all forwarder below so it never lands in tmux.
+    # /update is bot-owned (update the CLI + restart this topic's idle session
+    # in place; /update all = every idle session) — register before the
+    # catch-all forwarder below so it never lands in tmux.
     application.add_handler(CommandHandler("update", update_command))
     # /dashboard MUST register before the catch-all command forwarder below —
     # it is a bot-owned command and must never be forwarded to Claude Code
