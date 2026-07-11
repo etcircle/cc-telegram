@@ -1,0 +1,50 @@
+
+
+❯ Run this exact bash command in the foreground, verbatim, nothing else: awk "BEGIN{for(i=0;i<900000000;i++)x+=i;print x}"
+
+  Read 1 file
+
+⏺ The command ran in the foreground and completed. Output:
+
+  404999999167108992
+
+  That's awk's floating-point approximation of the sum 0+1+…+899,999,999 (the exact value is 404,999,999,550,000,000, but awk's 64-bit doubles lose precision at
+  that magnitude).
+
+✻ Churned for 1m 48s
+
+❯ /copy
+  ⎿  Copy cancelled
+
+❯ Run this in the BACKGROUND (run_in_background: true): awk "BEGIN{for(i=0;i<3000000000;i++)x+=i;print x}"
+
+  Read 1 file
+
+⏺ Running in the background with ID bam1bii2u. This one loops 3 billion iterations (~3–4× the previous run, so likely a couple of minutes). I'll report the
+  output when it completes.
+
+✻ Churned for 12s · 1 shell still running
+
+❯ say OK and nothing else
+
+⏺ OK
+
+✻ Baked for 6s · 1 shell still running
+
+⏺ Background command "Compute sum of integers 0 to 2999999999 in awk (background)" completed (exit code 0)
+
+  Read 1 file
+
+⏺ The background awk job (bam1bii2u) finished with exit code 0. Output:
+
+  4499999997067113984
+
+  As before, that's a floating-point approximation — the exact sum 0+1+…+2,999,999,999 is 4,499,999,998,500,000,000, but awk's doubles can't represent it
+  precisely at that magnitude.
+
+✻ Cogitated for 11s
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! echo hi
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ! for shell mode

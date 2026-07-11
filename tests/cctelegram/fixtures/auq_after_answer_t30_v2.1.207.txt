@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.207 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│               Welcome back Emiliyan!               │ Run /init to create a CLAUDE.md file with instructions for Claude                                       │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                              │
+│                      ▝▜█████▛▘                     │ Auto mode is now available without `CLAUDE_CODE_ENABLE_AUTO_MODE` opt-in on Bedrock, Vertex AI, and Fo… │
+│                        ▘▘ ▝▝                       │ Fixed the terminal freezing and keystrokes lagging while streaming responses containing very long list… │
+│      Fable 5 with high effort · Claude Max ·       │ Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… │
+│      em.tanev@gmail.com's Organization             │ /release-notes for more                                                                                 │
+│            /private/tmp/rig-postresolve            │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 3 MCP servers need authentication · run /mcp
+
+❯ Use the AskUserQuestion tool RIGHT NOW to ask me one single-select question with 3 short options. Do nothing else first.
+
+⏺ User answered Claude's questions:
+  ⎿  · What would you like to work on in this session? → Start a new task
+
+⏺ You picked Start a new task — I'm ready when you are. Tell me what you'd like to build, fix, plan, or investigate, and I'll get going.
+
+✻ Worked for 13s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

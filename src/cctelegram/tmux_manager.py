@@ -30,6 +30,18 @@ Concurrency (Wave 3a):
     route locks / route_runtime / message_queue internals while holding it,
     and (with the single exception of an already-in-flight callback answer)
     no Telegram I/O may run while it is held.
+
+    NAMED EXCEPTION to the leaf rule (GH #50, plan §1.5 — the ONLY one):
+    ``SessionManager.deliver_to_window`` invokes exactly one SYNCHRONOUS
+    ``message_queue.set_route_user_turn_at`` (→ ``route_runtime.stamp_user_turn``)
+    while holding this lock — the narrowly-typed ``delivery.UserTurnStamp``
+    pre-commit hook, fired after every delivery gate passes and immediately
+    before the Enter. It exists so a REFUSED send is never stamped (the
+    turn-boundary the live-prose freshness gate and the dashboard 🔔 derivation
+    depend on must mark an actual delivery). The hook may not await, may not
+    schedule work, and may not mutate anything else; a raise fails CLOSED
+    (draft_written, no Enter, no stamp). Any WIDENING of this exception is a
+    contract change, not a refactor.
   - mark/clear/window_quarantined is the post-/exit quarantine registry
     (Hermes P1): a /update restart that irrevocably sent /exit but could not
     CONFIRM a relaunch (the shell-wait expired, the relaunch keystroke send
@@ -41,6 +53,19 @@ Concurrency (Wave 3a):
     ssh in the stranded pane must keep refusing; r2 P1-B). In-memory only;
     cleared on that positive proof, a later CONFIRMED restart, kill_window,
     and the topic teardown seams.
+  - mark/clear/window_has_stranded_draft is the GH #50 stranded-draft brake
+    (r2 F2), the quarantine's sibling: a gated delivery that WROTE its payload
+    but withheld the Enter leaves that text sitting in the pane's input box,
+    so the next payload would be APPENDED to it and its Enter would commit
+    BOTH. session.deliver_to_window refuses while the brake is up. It lives
+    HERE, beside the quarantine, because it is a property of the PANE, not of
+    a topic binding — and therefore it may only be released by (a) positive
+    proof the input row is EMPTY (session's own self-heal) or (b) proof the
+    WINDOW IS DEAD: a CONFIRMED kill_window, or the creation of a brand-new
+    window under that id. Topic-level teardown (/unbind, topic close, a
+    stale-binding unbind) DELIBERATELY does NOT clear it — unbinding a topic
+    says nothing about whether the draft is still in the box, and /unbind
+    leaves the window ALIVE (see the "brake lifecycle" comment below).
 
 Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 """
@@ -268,6 +293,10 @@ class TmuxManager:
         # quarantined window before typing user text. In-memory only — a bot
         # restart clears it (documented residual).
         self._quarantined_windows: dict[str, float] = {}
+        # GH #50 stranded-draft brake (r2 F2): window_id → wall stamp. See the
+        # module docstring + the "brake lifecycle" comment on the mutators.
+        # In-memory only — a bot restart clears it (documented residual).
+        self._stranded_draft_windows: dict[str, float] = {}
 
     @property
     def server(self) -> libtmux.Server:
@@ -779,6 +808,72 @@ class TmuxManager:
         """Drop all window quarantines (test isolation seam)."""
         self._quarantined_windows.clear()
 
+    # ── The GH #50 stranded-draft brake (r2 F2) ────────────────────────────
+    #
+    # BRAKE LIFECYCLE — the one rule that makes this safe (peer-review P1):
+    #
+    #   The brake is a property of the PANE'S CONTENTS, never of a topic
+    #   binding. A ``draft_written`` / ``commit_unknown`` delivery left the
+    #   user's text sitting in this window's input box with its Enter withheld,
+    #   and the user was TOLD it was not delivered. A live input box holding a
+    #   draft is legitimately WRITABLE, so until that text is gone the next
+    #   payload would be appended to it and ITS Enter would commit BOTH.
+    #
+    #   Therefore the brake is released on exactly two proofs:
+    #
+    #     (a) POSITIVE PROOF THE BOX IS EMPTY — ``session._stranded_draft_gate``
+    #         captures the pane and requires ``pane_input_row_empty`` True (an
+    #         INDETERMINATE frame keeps it). Nothing is ever auto-cleared with a
+    #         keystroke: Esc has surface-specific semantics (on folder-trust it
+    #         KILLS Claude) and mid-run it interrupts.
+    #     (b) PROOF THE WINDOW IS DEAD — a CONFIRMED ``kill_window`` (its entry
+    #         is then pure garbage), or ``create_window`` minting a brand-new
+    #         window under that id (tmux ids RESET to @0 on a tmux-server
+    #         restart, which a long-lived bot process can outlive).
+    #
+    #   TOPIC TEARDOWN DELIBERATELY DOES NOT CLEAR IT. ``/unbind`` explicitly
+    #   LEAVES THE WINDOW ALIVE, and ``cleanup.clear_topic_state`` /
+    #   ``inbound_telegram``'s stale-window unbinds run with NO synchronization
+    #   against ``window_send_lock`` — so clearing there re-opened the exact
+    #   commit chain the brake exists to break: delivery A arms the brake inside
+    #   the lock; teardown clears it; send B (an already-popped boundary flush,
+    #   or a slash command) — which has been BLOCKED on that same window lock the
+    #   whole time — then acquires it, sees a structurally valid input box that
+    #   still contains A's draft, appends its own payload and presses Enter,
+    #   committing both.
+    #
+    #   A leaked entry for a window that died WITHOUT a kill_window (an external
+    #   `tmux kill-window`, the poller's stale-binding path) is inert, not a
+    #   wedge: ``_deliver_locked`` refuses ``window_gone`` on ``find_window_by_id``
+    #   BEFORE it ever consults the brake, and (a) self-heals any id that is
+    #   later reused. Disclosed residual: a bot restart wipes the brake entirely
+    #   (identical to the quarantine registry's).
+
+    def mark_window_stranded_draft(self, window_id: str) -> None:
+        """Arm the brake: this window's input box holds a bot-written, unsent draft."""
+        if window_id not in self._stranded_draft_windows:
+            logger.warning(
+                "stranded-draft brake ARMED for window %s — further sends refused "
+                "until the input box is cleared",
+                window_id,
+            )
+        self._stranded_draft_windows[window_id] = time.time()
+
+    def window_has_stranded_draft(self, window_id: str) -> bool:
+        """True iff a bot-written payload may still be sitting unsent in the box."""
+        return window_id in self._stranded_draft_windows
+
+    def clear_window_stranded_draft(self, window_id: str, *, reason: str) -> None:
+        """Release the brake — ONLY on empty-box proof or confirmed window death."""
+        if self._stranded_draft_windows.pop(window_id, None) is not None:
+            logger.info(
+                "stranded-draft brake cleared for window %s (%s)", window_id, reason
+            )
+
+    def reset_stranded_drafts_for_tests(self) -> None:
+        """Drop all stranded-draft brakes (test isolation seam)."""
+        self._stranded_draft_windows.clear()
+
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
     ) -> bool:
@@ -941,6 +1036,13 @@ class TmuxManager:
             # A killed window's quarantine must not leak onto a later window
             # that reuses the id (tmux ids reset on server restart).
             self._quarantined_windows.pop(window_id, None)
+            # GH #50 peer-review P1: a CONFIRMED kill is the ONLY window-death
+            # proof that releases the stranded-draft brake. A window that
+            # SURVIVES its topic's teardown (/unbind leaves it alive!) keeps its
+            # brake — the draft is still in the box. A dead window's entry is
+            # pure garbage. Gated on ``result`` for the same reason the send lock
+            # is: a FAILED kill can leave the window alive with the draft intact.
+            self.clear_window_stranded_draft(window_id, reason="window killed")
         return result
 
     async def create_window(
@@ -1047,6 +1149,19 @@ class TmuxManager:
         # Invalidate AFTER to_thread returns so the brand-new window is
         # visible to the next list_windows call from the resume flow.
         self._invalidate_list_cache()
+        # GH #50: a window tmux JUST created cannot hold a bot-written draft, so
+        # a brake entry under this id is provably stale. It only exists because
+        # tmux window ids RESET to @0 when the tmux SERVER restarts, and a
+        # launchd-kept bot process outlives that — so an entry armed on the OLD
+        # @0 (whose window died without a kill_window, e.g. with the server)
+        # could otherwise meet a brand-new @0. This is the *second* death proof
+        # of the brake lifecycle; it does not depend on the window being reaped
+        # by us. (It would eventually self-heal anyway, on the first send whose
+        # capture proves the fresh window's input row is empty — but a session
+        # still BOOTING would first refuse a message with the wrong reason.)
+        created, _msg, _name, new_wid = result
+        if created and new_wid:
+            self.clear_window_stranded_draft(new_wid, reason="window newly created")
         return result
 
     async def pane_current_command(self, window_id: str) -> str | None:

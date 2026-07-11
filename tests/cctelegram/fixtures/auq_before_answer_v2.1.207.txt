@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.207 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│               Welcome back Emiliyan!               │ Run /init to create a CLAUDE.md file with instructions for Claude                                       │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                              │
+│                      ▝▜█████▛▘                     │ Auto mode is now available without `CLAUDE_CODE_ENABLE_AUTO_MODE` opt-in on Bedrock, Vertex AI, and Fo… │
+│                        ▘▘ ▝▝                       │ Fixed the terminal freezing and keystrokes lagging while streaming responses containing very long list… │
+│      Fable 5 with high effort · Claude Max ·       │ Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… │
+│      em.tanev@gmail.com's Organization             │ /release-notes for more                                                                                 │
+│            /private/tmp/rig-postresolve            │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 3 MCP servers need authentication · run /mcp
+
+❯ Use the AskUserQuestion tool RIGHT NOW to ask me one single-select question with 3 short options. Do nothing else first.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Session goal
+
+What would you like to work on in this session?
+
+❯ 1. Start a new task
+     Kick off new implementation, planning, or research work in this directory.
+  2. Resume prior work
+     Pick up something from a previous session (I can check hindsight/memory for context).
+  3. Just exploring
+     Poke around, ask questions, or test the setup — no concrete deliverable yet.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

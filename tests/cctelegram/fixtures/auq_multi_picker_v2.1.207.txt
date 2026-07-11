@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.207 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│               Welcome back Emiliyan!               │ Run /init to create a CLAUDE.md file with instructions for Claude                                       │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                              │
+│                      ▝▜█████▛▘                     │ Auto mode is now available without `CLAUDE_CODE_ENABLE_AUTO_MODE` opt-in on Bedrock, Vertex AI, and Fo… │
+│                        ▘▘ ▝▝                       │ Fixed the terminal freezing and keystrokes lagging while streaming responses containing very long list… │
+│      Fable 5 with high effort · Claude Max ·       │ Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… │
+│      em.tanev@gmail.com's Organization             │ /release-notes for more                                                                                 │
+│              /private/tmp/ccrig2-cwd               │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 3 MCP servers need authentication · run /mcp
+
+❯ Use the AskUserQuestion tool RIGHT NOW to ask me which programming languages I like. Set multiSelect true with 4 options: Python, Rust, Go, TypeScript. Do
+  not do anything else first.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Languages  ✔ Submit  →
+
+Which programming languages do you like?
+
+❯ 1. [ ] Python
+  General-purpose language popular for scripting, data science, and ML.
+  2. [ ] Rust
+  Systems language focused on memory safety and performance.
+  3. [ ] Go
+  Simple, fast compiled language great for services and tooling.
+  4. [ ] TypeScript
+  Typed superset of JavaScript for web and Node development.
+  5. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cctelegram.delivery import UserTurnStamp
+
 
 def _make_update(text: str, user_id: int = 1, thread_id: int = 42) -> MagicMock:
     """Build a minimal mock Update with message text in a forum topic."""
@@ -52,7 +54,9 @@ class TestForwardCommand:
 
             await forward_command_handler(update, context)
 
-            mock_sm.send_to_window.assert_called_once_with("@5", "/model")
+            mock_sm.send_to_window.assert_called_once_with(
+                "@5", "/model", user_turn=UserTurnStamp(1, 42, "@5")
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -123,7 +127,9 @@ class TestForwardCommand:
             await forward_command_handler(update, context)
 
             # Forwarded verbatim (original casing preserved on the wire).
-            mock_sm.send_to_window.assert_called_once_with("@5", cmd)
+            mock_sm.send_to_window.assert_called_once_with(
+                "@5", cmd, user_turn=UserTurnStamp(1, 42, "@5")
+            )
 
     @pytest.mark.asyncio
     async def test_bot_mention_preserves_args(self):
@@ -147,7 +153,9 @@ class TestForwardCommand:
 
             await forward_command_handler(update, context)
 
-            mock_sm.send_to_window.assert_called_once_with("@5", "/effort max")
+            mock_sm.send_to_window.assert_called_once_with(
+                "@5", "/effort max", user_turn=UserTurnStamp(1, 42, "@5")
+            )
 
     @pytest.mark.asyncio
     async def test_clear_clears_session(self):
@@ -171,5 +179,51 @@ class TestForwardCommand:
 
             await forward_command_handler(update, context)
 
-            mock_sm.send_to_window.assert_called_once_with("@5", "/clear")
+            mock_sm.send_to_window.assert_called_once_with(
+                "@5", "/clear", user_turn=UserTurnStamp(1, 42, "@5")
+            )
             mock_sm.clear_window_session.assert_called_once_with("@5")
+
+
+class TestForwardCommandAbortsOnARefusedPreFlush:
+    """GH #50 r2 F2(i): the §2.8 pre-flush is FORCED, and its result was ignored.
+
+    A refused flush means the user's earlier message never reached the pane — and
+    on a ``draft_written`` refusal it is still sitting UNSENT in the input box.
+    Forwarding the slash command anyway would either jump the queue or be typed
+    ONTO that stranded draft, whose Enter would then commit BOTH.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_refused_flush_aborts_the_command(self):
+        from cctelegram import delivery
+
+        update = _make_update("/model")
+        context = _make_context()
+        refusal = delivery.refuse(delivery.REASON_PROMPT_PRESENT, written=False)
+
+        with (
+            patch("cctelegram.bot.is_user_allowed", return_value=True),
+            patch("cctelegram.bot._get_thread_id", return_value=42),
+            patch("cctelegram.bot.session_manager") as mock_sm,
+            patch("cctelegram.bot.tmux_manager") as mock_tmux,
+            patch("cctelegram.bot.safe_reply", new_callable=AsyncMock) as reply,
+            patch(
+                "cctelegram.bot.aggregator_flush_route",
+                new_callable=AsyncMock,
+                return_value=refusal,
+            ),
+        ):
+            mock_sm.resolve_window_for_thread.return_value = "@5"
+            mock_sm.get_display_name.return_value = "project"
+            mock_tmux.find_window_by_id = AsyncMock(return_value=MagicMock())
+            mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+
+            from cctelegram.bot import forward_command_handler
+
+            await forward_command_handler(update, context)
+
+            mock_sm.send_to_window.assert_not_called()
+            body = reply.await_args.args[1]
+            assert "NOT sent" in body
+            assert refusal.message in body

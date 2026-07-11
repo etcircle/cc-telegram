@@ -436,17 +436,26 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         # offer-path background/intermediate flushes hiding failures.
         route = (user.id, thread_id, selected_wid)
         pending_delivered = await _flush_pending_route_payload(route, context.user_data)
-        if pending_delivered is False:
+        if pending_delivered is not None and not pending_delivered.ok:
+            # GH #50 §1.4: surface the REAL refusal reason — the fresh-session
+            # folder-trust prompt is exactly this case.
             await safe_edit(
                 query,
                 f"✅ Bound to window `{display}`\n\n"
-                "⚠️ First message failed to send. The pending payload was "
-                "cleared; please resend it here.",
+                "The first message was not delivered.\n\n"
+                f"⚠️ {pending_delivered.message}\n\n"
+                "The pending payload was cleared; please resend it here.",
             )
-            await safe_answer(query, "Bound; first message failed", show_alert=True)
+            await safe_answer(
+                query, "Bound; first message not delivered", show_alert=True
+            )
             return
 
-        first_turn_note = "\n\nFirst message sent." if pending_delivered is True else ""
+        first_turn_note = (
+            "\n\nFirst message sent."
+            if pending_delivered is not None and pending_delivered.ok
+            else ""
+        )
         await safe_edit(
             query,
             f"✅ Bound to window `{display}`{first_turn_note}",

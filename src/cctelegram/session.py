@@ -35,12 +35,139 @@ from typing import Any
 
 import aiofiles
 
+from . import delivery, terminal_parser
 from .config import config
+from .delivery import DeliveryOutcome, DeliveryResult, UserTurnStamp
 from .tmux_manager import pane_command_is_claude, tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
+
+
+# ── The GH #50 delivery gate: bounds + sentinels ─────────────────────────
+# Every probe is BOUNDED (``capture_pane`` / ``pane_current_command`` shell out
+# to tmux with no timeout of their own): a stalled probe must never let a STALE
+# frame authorize the Enter (r2 F4). Only ``asyncio.TimeoutError`` classifies.
+GATE_CAPTURE_DEADLINE_S = 2.5
+# The same bound for the ``pane_current_command`` proof-of-life probe. It runs
+# TWICE per delivery: at the pre-write gate, and — FIRST, before the capture —
+# at the re-verify, so the pane capture is the LAST observation before the Enter
+# (r2 F4: a stalled probe let a stale input-box frame authorize the commit).
+CMD_PROBE_DEADLINE_S = 2.5
+# An INDETERMINATE frame (a mid-redraw capture) is retried; a POSITIVE hazard
+# refuses on the FIRST capture. The /cost preflight precedent.
+GATE_CAPTURE_RETRIES = 2
+GATE_RETRY_DELAY_S = 0.3
+# Overall transaction budget, checked at the phase boundaries (never as a
+# ``wait_for`` around the WRITE — cancelling mid-write would leave a half-typed
+# payload). Exhaustion before the write ⇒ not_written; after ⇒ draft_written.
+DELIVERY_DEADLINE_S = 20.0
+# Mirrors ``tmux_manager.send_keys``'s own settles so the withheld-Enter writer
+# reproduces the shipped timing exactly.
+BASH_MODE_SETTLE_S = 1.0
+TEXT_SETTLE_S = 0.5
+
+# Sentinel distinguishing "the bounded capture timed out" from "tmux returned
+# no pane" (``None``) — the two classify differently.
+delivery_CAPTURE_TIMEOUT: object = object()
+# The same, for the bounded ``pane_current_command`` probe.
+delivery_CMD_TIMEOUT: object = object()
+
+
+# ── The stranded-draft brake (r2 F2) ─────────────────────────────────────
+#
+# A ``DRAFT_WRITTEN`` / ``COMMIT_UNKNOWN`` transaction leaves the payload sitting
+# in the input box with its Enter withheld — and the user is TOLD it was not
+# delivered. But a live input box holding a pre-existing draft is legitimately
+# DELIVERABLE (rig D10, a hard non-regression), so without a brake the very next
+# message passed the gate, was APPENDED to the stranded text, and its Enter
+# committed BOTH — silently submitting the message the bot had already disclaimed,
+# concatenated with the new one.
+#
+# So a window that carries a bot-stranded draft is marked, and further payloads
+# are REFUSED until the draft is provably gone. Released ONLY on positive proof:
+#   (a) ``terminal_parser.pane_input_row_empty`` True on a fresh capture (the user
+#       cleared it; an INDETERMINATE frame KEEPS the brake) — the self-heal in
+#       ``_stranded_draft_gate`` below; or
+#   (b) the WINDOW IS PROVABLY DEAD (a confirmed ``kill_window``) or brand-new
+#       (``create_window``).
+# NEVER auto-cleared with a keystroke: Esc has surface-specific semantics (on
+# folder-trust it KILLS Claude) and mid-run it interrupts.
+#
+# The REGISTRY LIVES IN ``tmux_manager`` (peer-review P1), beside the post-/exit
+# quarantine it mirrors, because the brake is a property of the PANE'S CONTENTS —
+# not of a topic binding. Topic teardown must NOT clear it: ``/unbind``
+# deliberately leaves the window ALIVE, and the teardown seams hold no
+# ``window_send_lock``, so clearing there let a send already BLOCKED on that lock
+# proceed straight onto the leftover draft and commit both. See the "brake
+# lifecycle" comment in ``tmux_manager`` for the full rule + the residuals. These
+# four names stay here as the delivery-path vocabulary (and the test seam).
+#
+# DISCLOSED RESIDUAL: a bot restart wipes it, so a draft stranded before the
+# restart is no longer braked and the next message can concatenate onto it
+# (identical to the quarantine registry's restart residual).
+
+
+def mark_window_stranded_draft(window_id: str) -> None:
+    """Arm the brake: this window's input box holds a bot-written, unsent draft."""
+    tmux_manager.mark_window_stranded_draft(window_id)
+
+
+def window_has_stranded_draft(window_id: str) -> bool:
+    return tmux_manager.window_has_stranded_draft(window_id)
+
+
+def clear_stranded_draft(window_id: str, *, reason: str) -> None:
+    """Release the brake — empty-input-row proof ONLY (window death is tmux's seam)."""
+    tmux_manager.clear_window_stranded_draft(window_id, reason=reason)
+
+
+def reset_stranded_drafts_for_tests() -> None:
+    tmux_manager.reset_stranded_drafts_for_tests()
+
+
+class _WriteAttempt:
+    """Did the gated transaction ATTEMPT a literal write into the input box?
+
+    The brake used to be armed ONLY from the RETURNED ``DeliveryResult``
+    (``result.draft_stranded``), so a ``CancelledError`` — or any unexpected
+    exception — raised AFTER the payload was typed but BEFORE the Enter left the
+    transaction without a result and the brake UNARMED: the next delivery passed
+    the gate (a box holding a draft IS a writable box), APPENDED its own text and
+    committed BOTH with its Enter. That is exactly the F2 hazard the brake exists
+    to close, re-entered through the cancellation door — and it is reachable in
+    production (``cleanup.clear_topic_state`` cancels per-topic tasks; shutdown
+    cancels in-flight work; and a cancelled ``asyncio.to_thread``/subprocess await
+    can still have COMPLETED its tmux write).
+
+    The flag is set immediately BEFORE the first ``send_keys`` write — never
+    after — because a write whose await is cancelled may still have landed. It is
+    the SAME information the ``DRAFT_WRITTEN`` classification already uses (r2 F5:
+    every post-write-attempt failure classifies WRITTEN), so arming on it adds no
+    new imprecision. A raise BEFORE any write attempt leaves it False and does NOT
+    arm the brake — the hard non-regression: a raise proves nothing about the
+    pane, and arming there would false-refuse a HUMAN's pre-existing draft after
+    an unrelated tmux error.
+    """
+
+    __slots__ = ("attempted",)
+
+    def __init__(self) -> None:
+        self.attempted = False
+
+
+def _stamp_user_turn(stamp: UserTurnStamp) -> None:
+    """The pre-commit hook body (plan §1.5) — the ONE mutation the send lock allows.
+
+    Deferred import: ``handlers.message_queue`` imports ``session`` at module
+    level, so a top-level import here would cycle (the repo's subprocess
+    import-cycle test pins it). The call is SYNCHRONOUS and cheap — it must not
+    await, must not schedule work, and must not mutate anything else.
+    """
+    from .handlers.message_queue import set_route_user_turn_at
+
+    set_route_user_turn_at(stamp.user_id, stamp.thread_id, stamp.window_id)
 
 
 # Post-/exit quarantine refusal (Hermes P1). The EXACT string is the contract
@@ -1095,65 +1222,451 @@ class SessionManager:
 
     # --- Tmux helpers ---
 
-    async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
-        """Send text to a tmux window by ID.
+    async def send_to_window(
+        self,
+        window_id: str,
+        text: str,
+        *,
+        user_turn: UserTurnStamp | None = None,
+    ) -> tuple[bool, str]:
+        """Send text to a tmux window by ID (legacy ``(ok, message)`` shape).
 
-        The whole text→settle→Enter transaction (send_keys with
-        ``literal+enter`` sleeps 500ms between the text and the Enter) runs
-        under the per-window send lock, so concurrent sends to the SAME
-        window — e.g. the inbound aggregator's unawaited boundary-flush vs a
-        cap-flush — serialize FIFO instead of interleaving keystrokes
-        (finding 9). The lock is a leaf: nothing here does Telegram I/O or
-        touches route locks while holding it.
+        Thin wrapper over :meth:`deliver_to_window` for the synchronous callers
+        that only surface the message. New callers that need the REASON (the
+        aggregator flush + the pending-bind replay) use ``deliver_to_window``.
+        """
+        return (
+            await self.deliver_to_window(window_id, text, user_turn=user_turn)
+        ).as_tuple
+
+    async def deliver_to_window(
+        self,
+        window_id: str,
+        text: str,
+        *,
+        user_turn: UserTurnStamp | None = None,
+    ) -> DeliveryResult:
+        """Type ``text`` into a window and commit it with Enter — GATED (GH #50).
+
+        THE SINGLE CHOKE POINT for every user payload that reaches a pane. The
+        whole transaction runs under the per-window send lock, so concurrent
+        sends to the SAME window (the aggregator's unawaited boundary-flush vs a
+        cap-flush) serialize FIFO instead of interleaving keystrokes.
+
+        Sequence (plan §1.2 — every step fail-closed):
+
+          0. SEGMENT-aware hotkey refusal (``delivery.lone_hotkey_line``) —
+             BEFORE any capture, so a lone-digit payload is NEVER written.
+          1. Bounded, cancellation-safe pane capture (``capture_pane_cancellation_safe``
+             under ``asyncio.wait_for``); the whole transaction carries an overall
+             deadline.
+          2. ``pane_command_is_claude`` — the strict version-string fullmatch, on
+             a BOUNDED probe (r2 F4). Closes M3: ``/esc`` on a folder-trust prompt
+             EXITS Claude, and a bare-shell pane would EXECUTE the payload as a
+             shell command.
+          2b. The stranded-draft brake (r2 F2) — refuse while a previous payload
+             may still be sitting unsent in the input box; released only on a
+             capture proving the input row is EMPTY.
+          3. ``pane_input_box_present`` — the POSITIVE structural proof that the
+             pane is at Claude's ready input box (bounded retry on an
+             INDETERMINATE frame; a positive hazard refuses on the first capture).
+          4. Write the text with the Enter WITHHELD (mode-aware: the ``!``
+             bash-mode two-step is reproduced explicitly — ``send_keys`` performs
+             it ONLY when ``literal and enter`` are BOTH true).
+          5. Re-verify: the BOUNDED ``pane_command_is_claude`` probe FIRST, then
+             the pane capture LAST (r2 F4 — the capture must be the final
+             observation before the Enter, or a stalled probe lets a stale frame
+             authorize a commit into a freshly-drawn prompt). The re-verify is
+             payload-aware (``expected_draft``), so an ordinary ``1. buy milk``
+             is not mistaken for a picker cursor.
+          6. The pre-commit user-turn stamp (the ONE documented ``route_runtime``
+             mutation allowed under this lock — see ``tmux_manager``'s contract).
+          7. Enter. A failed Enter is ``COMMIT_UNKNOWN``, never "withheld".
+
+        Residuals (bounded + disclosed, NOT closed):
+          - gate → write: a prompt appearing in that window can still take a
+            keystroke. Mitigated empirically (a multi-char payload written in ONE
+            ``send-keys -l`` is consumed paste-shaped and is inert) and by step 0.
+          - final capture → Enter: one tmux round-trip. No terminal protocol can
+            make this atomic — the identical residual the shipped ``_dispatch_pick``
+            / ``_dispatch_decision`` already accept.
+          - a bot restart wipes the stranded-draft brake (in-memory, like the
+            tmux quarantine registry).
         """
         display = self.get_display_name(window_id)
         logger.debug(
-            "send_to_window: window_id=%s (%s), text_len=%d",
+            "deliver_to_window: window_id=%s (%s), text_len=%d",
             window_id,
             display,
             len(text),
         )
+
+        # (0) The lone-hotkey SEGMENT refusal — payload-only, no capture needed,
+        # and it must never be written even onto an idle pane (the gate→write
+        # window is exactly what makes it dangerous).
+        hotkey = delivery.lone_hotkey_line(text)
+        if hotkey is not None:
+            logger.info(
+                "DELIVERY REFUSED window=%s reason=%s outcome=not_written",
+                window_id,
+                delivery.REASON_LONE_HOTKEY,
+            )
+            return delivery.refuse(delivery.REASON_LONE_HOTKEY, written=False)
+
+        # r2 F2 + the cancellation fold: the brake is armed through ONE seam, and
+        # INSIDE the send lock — a queued send already waiting on
+        # ``window_send_lock`` must never acquire it before the brake is up.
+        # BOTH paths arm it: the normal ``draft_stranded`` return, and a raise
+        # (cancellation or otherwise) that happened after a write was ATTEMPTED.
         async with tmux_manager.window_send_lock(window_id):
-            window = await tmux_manager.find_window_by_id(window_id)
-            if not window:
-                return False, "Window not found (may have been closed)"
-            # Post-/exit quarantine re-check-before-typing (Hermes P1): a
-            # /update that sent /exit without a confirmed relaunch may leave
-            # this pane a bare shell — typing user text + Enter there would
-            # EXECUTE it. Proof of life is STRICTLY the Claude version-string
-            # pane command (pane_command_is_claude): "not a shell" is NOT
-            # proof (r2 P1-B — a user checking the stranded window may be
-            # running vim/python/ssh there, the exact hazard). Anything else
-            # (shell, editor, REPL, None) refuses fail-closed. Zero overhead
-            # for unquarantined windows (one dict lookup), and the query runs
-            # INSIDE the send lock the restart mechanic itself holds — no new
-            # lock ordering.
-            if tmux_manager.window_quarantined(window_id):
-                cmd = await tmux_manager.pane_current_command(window_id)
-                if pane_command_is_claude(cmd):
-                    tmux_manager.clear_window_quarantine(
-                        window_id, reason="claude alive at send re-check"
-                    )
-                else:
+            write = _WriteAttempt()
+            try:
+                result = await self._deliver_locked(
+                    window_id, text, display, user_turn, write
+                )
+            except BaseException:
+                # CancelledError MUST propagate (never swallowed into a
+                # DeliveryResult) — but the draft it may have left behind is
+                # exactly as stranded as a DRAFT_WRITTEN one, so the brake goes
+                # up first. Cancellation during the settle, the re-verify, the
+                # stamp, or the ENTER await all land here: the Enter may not have
+                # landed, and if it did the brake's empty-input-row self-heal
+                # releases it on the next send (fail-closed, self-correcting).
+                if write.attempted:
                     logger.warning(
-                        "send_to_window: window %s quarantined (pane cmd=%r is "
-                        "not Claude) — REFUSING delivery of %d chars",
+                        "deliver_to_window: raised AFTER a write attempt on "
+                        "window %s — arming the stranded-draft brake before "
+                        "re-raising",
                         window_id,
-                        cmd,
-                        len(text),
                     )
-                    return False, QUARANTINE_SEND_REFUSED_MSG
-            success = await tmux_manager.send_keys(window.window_id, text)
-        if success:
+                    mark_window_stranded_draft(window_id)
+                raise
+            if result.draft_stranded:
+                mark_window_stranded_draft(window_id)
+
+        if result.ok or result.outcome is DeliveryOutcome.COMMIT_UNKNOWN:
             # Record the bot-originated send so the session_monitor can
             # suppress the matching user-message echo from JSONL. Without
             # this, every Telegram-typed message gets re-delivered as a
             # "👤 …" bubble — pure duplication for our workflow.
+            # COMMIT_UNKNOWN records too: if that Enter DID land, Claude logs the
+            # text as a user entry and the echo must still be suppressed; if it
+            # did not, the record simply expires unmatched (TTL 60s).
             state = self.window_states.get(window_id)
             if state and state.session_id:
                 _track_bot_sent_text(state.session_id, text)
-            return True, f"Sent to {display}"
-        return False, "Failed to send keys"
+        if not result.ok:
+            # §1.6 observability: ONE INFO per refusal carrying the machine
+            # reason + the written-state classification. NEVER pane text, NEVER
+            # message content.
+            logger.info(
+                "DELIVERY REFUSED window=%s reason=%s outcome=%s",
+                window_id,
+                result.reason,
+                result.outcome.value,
+            )
+        return result
+
+    async def _deliver_locked(
+        self,
+        window_id: str,
+        text: str,
+        display: str,
+        user_turn: UserTurnStamp | None,
+        write: _WriteAttempt,
+    ) -> DeliveryResult:
+        """The gated delivery transaction. Caller holds ``window_send_lock``.
+
+        ``write`` is the caller's write-attempt probe: this method SETS it
+        immediately before the first literal ``send_keys``, so a cancellation /
+        unexpected raise anywhere from that instant on (the settle, the
+        re-verify, the stamp, the Enter) still arms the stranded-draft brake in
+        ``deliver_to_window``'s handler — see ``_WriteAttempt``.
+        """
+        deadline = time.monotonic() + DELIVERY_DEADLINE_S
+
+        window = await tmux_manager.find_window_by_id(window_id)
+        if not window:
+            return delivery.refuse(delivery.REASON_WINDOW_GONE, written=False)
+
+        # (2) Proof of life. Runs on EVERY send now (not just quarantined
+        # windows): "not a shell" is NOT proof — a user who followed "check the
+        # window" may be running vim/python/ssh there, and typing user text +
+        # Enter would land in THAT program. A quarantined window keeps its own
+        # explicit refusal copy (the exact-string contract the aggregator
+        # disclosure matches on).
+        quarantined = tmux_manager.window_quarantined(window_id)
+        cmd = await self._pane_command_for_gate(window_id)
+        if cmd is delivery_CMD_TIMEOUT:
+            return delivery.refuse(delivery.REASON_CMD_PROBE_TIMEOUT, written=False)
+        assert cmd is None or isinstance(cmd, str)
+        if not pane_command_is_claude(cmd):
+            if quarantined:
+                logger.warning(
+                    "deliver_to_window: window %s quarantined (pane cmd=%r is "
+                    "not Claude) — REFUSING delivery of %d chars",
+                    window_id,
+                    cmd,
+                    len(text),
+                )
+                return delivery.refuse(
+                    delivery.REASON_QUARANTINED,
+                    written=False,
+                    message=QUARANTINE_SEND_REFUSED_MSG,
+                )
+            logger.warning(
+                "deliver_to_window: window %s pane cmd=%r is not Claude — "
+                "REFUSING delivery of %d chars (a bare shell would EXECUTE it)",
+                window_id,
+                cmd,
+                len(text),
+            )
+            return delivery.refuse(delivery.REASON_NOT_CLAUDE, written=False)
+        if quarantined:
+            tmux_manager.clear_window_quarantine(
+                window_id, reason="claude alive at send re-check"
+            )
+
+        # (2b) The stranded-draft brake (r2 F2). An earlier transaction left a
+        # payload in the input box with its Enter withheld and TOLD the user it
+        # was not delivered; appending to it now would commit BOTH on our Enter.
+        # Released only on positive proof the box is empty again.
+        brake = await self._stranded_draft_gate(window_id, deadline=deadline)
+        if brake is not None:
+            return brake
+
+        # (1)+(3) The positive input-box gate, with a bounded retry on an
+        # INDETERMINATE frame (a mid-redraw capture); a POSITIVE hazard (a live
+        # prompt, a picker option row, the tasks mode, a completion overlay)
+        # refuses on the FIRST capture.
+        gate = await self._gate_input_box(window_id, deadline=deadline)
+        if gate is not None:
+            return gate
+
+        # (4) Write with the Enter WITHHELD. The ``!`` bash-mode two-step is
+        # reproduced explicitly — ``send_keys``'s own two-step fires ONLY when
+        # ``literal and enter`` are BOTH true.
+        for i, segment in enumerate(delivery.literal_segments(text)):
+            if i:
+                await asyncio.sleep(BASH_MODE_SETTLE_S)
+            # Set BEFORE the write, never after: a write whose await is CANCELLED
+            # can still have landed in the pane, so the brake must consider the
+            # payload potentially stranded from the instant the attempt begins.
+            write.attempted = True
+            ok = await tmux_manager.send_keys(
+                window.window_id, segment, enter=False, literal=True
+            )
+            if not ok:
+                # r2 F5: a False from ``send_keys`` does NOT prove zero bytes
+                # reached the pane — tmux may have failed AFTER writing, and a
+                # later segment's failure certainly leaves the earlier ones
+                # there. EVERY post-write-attempt failure is therefore classified
+                # WRITTEN (fail-closed): it arms the stranded-draft brake, whose
+                # empty-input-row self-heal releases it if nothing landed.
+                return delivery.refuse(delivery.REASON_SEND_FAILED, written=True)
+        await asyncio.sleep(TEXT_SETTLE_S)
+
+        # (5) Re-verify immediately before the commit. From here on ANY failure
+        # is DRAFT_WRITTEN: the text sits in the input box and the Enter is
+        # withheld. No automatic cleanup is attempted (Esc / Ctrl-U have
+        # surface-specific semantics — Esc on folder-trust KILLS Claude).
+        #
+        # ORDER IS LOAD-BEARING (r2 F4): the command probe runs FIRST and the
+        # pane CAPTURE is the LAST observation before the stamp + Enter. The
+        # previous order captured the pane, then awaited an UNBOUNDED
+        # ``pane_current_command`` — a probe that stalled while a blocking prompt
+        # was drawn let a STALE input-box frame authorize the Enter (which
+        # commits option 1). Both probes are bounded, and the deadline is
+        # re-checked after every await.
+        allow_slash = delivery.is_bare_slash_payload(text)
+        if time.monotonic() > deadline:
+            return delivery.refuse(delivery.REASON_DEADLINE, written=True)
+        cmd2 = await self._pane_command_for_gate(window_id)
+        if cmd2 is delivery_CMD_TIMEOUT:
+            return delivery.refuse(delivery.REASON_CMD_PROBE_TIMEOUT, written=True)
+        assert cmd2 is None or isinstance(cmd2, str)
+        if not pane_command_is_claude(cmd2):
+            return delivery.refuse(delivery.REASON_NOT_CLAUDE, written=True)
+        if time.monotonic() > deadline:
+            return delivery.refuse(delivery.REASON_DEADLINE, written=True)
+        pane = await self._capture_for_gate(window_id)
+        if not (pane is None or isinstance(pane, str)):
+            return delivery.refuse(delivery.REASON_CAPTURE_TIMEOUT, written=True)
+        reason = self._input_box_reason(
+            pane, allow_slash_completion=allow_slash, expected_draft=text
+        )
+        if reason is not None:
+            return delivery.refuse(
+                delivery.REASON_REVERIFY_FAILED,
+                written=True,
+                message=delivery.DRAFT_WRITTEN_MSG,
+            )
+
+        # (6) The pre-commit user-turn stamp — the ONE synchronous route_runtime
+        # mutation the lock contract permits (documented exception). A raise
+        # fails CLOSED: draft_written, no Enter, no stamp.
+        if user_turn is not None:
+            try:
+                _stamp_user_turn(user_turn)
+            except Exception:
+                logger.exception(
+                    "deliver_to_window: pre-commit user-turn stamp raised for "
+                    "window %s — withholding Enter",
+                    window_id,
+                )
+                return delivery.refuse(delivery.REASON_STAMP_FAILED, written=True)
+
+        # (7) Enter — the commit. A False here does NOT prove the key never
+        # reached the pty (r2 F3), so the result is COMMIT_UNKNOWN, never
+        # "draft_written" (which asserts a deliberate withhold). The user-turn
+        # stamp above STANDS — a possibly-committed turn must move the turn
+        # boundary — and the honest copy tells the user to check the window.
+        if not await tmux_manager.send_keys(
+            window.window_id, "", enter=True, literal=False
+        ):
+            return delivery.commit_unknown(delivery.REASON_ENTER_FAILED)
+        return delivery.delivered(f"Sent to {display}")
+
+    async def _stranded_draft_gate(
+        self, window_id: str, *, deadline: float
+    ) -> DeliveryResult | None:
+        """The stranded-draft brake. ``None`` ⇒ no draft (or it is provably gone).
+
+        Zero cost for the overwhelming majority of sends (one set lookup). For a
+        BRAKED window it takes ONE extra capture and releases the brake only on
+        positive proof (``pane_input_row_empty`` True); an INDETERMINATE frame —
+        a capture failure, a mid-redraw, or a live blocking prompt (no input box
+        at all) — keeps it, which is the fail-closed direction.
+        """
+        if not window_has_stranded_draft(window_id):
+            return None
+        if time.monotonic() > deadline:
+            return delivery.refuse(delivery.REASON_DEADLINE, written=False)
+        pane = await self._capture_for_gate(window_id)
+        empty = (
+            terminal_parser.pane_input_row_empty(pane)
+            if (pane is None or isinstance(pane, str))
+            else None
+        )
+        if empty is True:
+            clear_stranded_draft(window_id, reason="input row observed EMPTY")
+            return None
+        return delivery.refuse(delivery.REASON_STRANDED_DRAFT, written=False)
+
+    async def _pane_command_for_gate(self, window_id: str) -> str | None | object:
+        """One BOUNDED ``pane_current_command`` probe for the delivery gate (r2 F4).
+
+        Returns the command string, ``None`` when tmux reported none, or the
+        ``delivery_CMD_TIMEOUT`` sentinel when the bounded wait expired. A genuine
+        caller/shutdown cancellation PROPAGATES — only ``asyncio.TimeoutError``
+        classifies (the /cost r1 P2 rule, shared with ``_capture_for_gate``).
+        """
+        try:
+            return await asyncio.wait_for(
+                tmux_manager.pane_current_command(window_id),
+                timeout=CMD_PROBE_DEADLINE_S,
+            )
+        except asyncio.TimeoutError:
+            return delivery_CMD_TIMEOUT
+
+    async def _capture_for_gate(self, window_id: str) -> str | None | object:
+        """One bounded, cancellation-safe pane capture for the delivery gate.
+
+        Returns the pane text, ``None`` on a tmux capture failure, or the
+        ``delivery_CAPTURE_TIMEOUT`` sentinel when the bounded wait expired. A
+        genuine caller/shutdown cancellation PROPAGATES (never swallowed into a
+        refusal) — only ``asyncio.TimeoutError`` classifies (the /cost r1 P2
+        rule).
+        """
+        try:
+            return await asyncio.wait_for(
+                tmux_manager.capture_pane_cancellation_safe(window_id, with_ansi=True),
+                timeout=GATE_CAPTURE_DEADLINE_S,
+            )
+        except asyncio.TimeoutError:
+            return delivery_CAPTURE_TIMEOUT
+
+    @staticmethod
+    def _input_box_reason(
+        pane: str | None,
+        *,
+        allow_slash_completion: bool = False,
+        expected_draft: str | None = None,
+    ) -> str | None:
+        """The gate verdict for one captured frame — ``None`` iff it may receive text.
+
+        The POSITIVE input-box proof is the SOLE AUTHORITY, and it is consulted
+        FIRST. The pane recognizers (``is_interactive_ui`` /
+        ``parse_unknown_blocking_prompt`` / ``pane_blocking_prompt_shape``) are
+        strictly a LABELLING aid: they run ONLY after the proof has already
+        FAILED, and only to upgrade an INDETERMINATE reason to the actionable
+        ``prompt_present`` copy ("answer the card first") instead of burning the
+        retry budget on the generic "couldn't confirm the input box".
+
+        They must NEVER pre-empt the proof (r1 P1, probe-reproduced). A
+        recognizer that fires while the input box is demonstrably LIVE is a FALSE
+        REFUSAL of a legitimate message, and this gate sits in front of EVERY
+        inbound message. The concrete case: an ANSWERED AUQ picker / ExitPlanMode
+        prompt whose rendering is still on-screen ABOVE the restored input box
+        still matches ``is_interactive_ui`` (the AUQ/EPM ``UIPattern``s carry no
+        strict validator, so unlike Permission/Workflow/Decision they have no
+        ``_only_chrome_below`` guard) — pre-empting there refused every message
+        in the topic until the picker scrolled off. The recognizers also buy NO
+        safety here: across all 25 real 2.1.207 pane fixtures the positive proof
+        ALONE refuses every blocking surface (all six gate families, the bare
+        shell, the /cost overlay, both completion overlays, the tasks mode) and
+        passes every deliverable shape — which is exactly the flag-independence
+        claim (the recognizers are filtered by the display kill-switches; the
+        input-box proof never is). ``pane_blocking_prompt_shape`` already
+        documented this discipline; the other two now follow it.
+
+        ``expected_draft`` is passed ONLY at the post-write re-verify (never by
+        the pre-write gate, which has no payload in the box yet). It is evidence
+        of AUTHORSHIP — see ``terminal_parser.classify_input_box_failure``.
+        """
+        if not pane:
+            return "capture_empty"
+        reason = terminal_parser.classify_input_box_failure(
+            pane,
+            allow_slash_completion=allow_slash_completion,
+            expected_draft=expected_draft,
+        )
+        if reason is None:
+            return None
+        if reason in terminal_parser.INPUT_BOX_INDETERMINATE_REASONS and (
+            terminal_parser.is_interactive_ui(pane)
+            or terminal_parser.parse_unknown_blocking_prompt(pane)
+            or terminal_parser.pane_blocking_prompt_shape(pane)
+        ):
+            # LABELLING ONLY (never a decision): the proof has already failed and
+            # the frame is INDETERMINATE, so upgrade the generic "couldn't confirm
+            # the input box" to the actionable "answer the card first" — and stop
+            # burning retries on a frame that will not become writable.
+            return delivery.REASON_PROMPT_PRESENT
+        return reason
+
+    async def _gate_input_box(
+        self, window_id: str, *, deadline: float
+    ) -> DeliveryResult | None:
+        """Run the pre-write gate. ``None`` ⇒ the pane may receive the payload."""
+        attempts = GATE_CAPTURE_RETRIES + 1
+        reason = delivery.REASON_CAPTURE_FAILED
+        for attempt in range(attempts):
+            if time.monotonic() > deadline:
+                return delivery.refuse(delivery.REASON_DEADLINE, written=False)
+            pane = await self._capture_for_gate(window_id)
+            if pane is delivery_CAPTURE_TIMEOUT:
+                return delivery.refuse(delivery.REASON_CAPTURE_TIMEOUT, written=False)
+            assert pane is None or isinstance(pane, str)
+            reason = self._input_box_reason(pane) or ""
+            if not reason:
+                return None
+            if reason not in terminal_parser.INPUT_BOX_INDETERMINATE_REASONS:
+                # A POSITIVE hazard — refuse on the FIRST capture, never retry.
+                return delivery.refuse(reason, written=False)
+            if attempt + 1 < attempts:
+                await asyncio.sleep(GATE_RETRY_DELAY_S)
+        return delivery.refuse(reason or delivery.REASON_CAPTURE_FAILED, written=False)
 
     # --- Message history ---
 

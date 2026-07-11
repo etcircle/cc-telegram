@@ -29,7 +29,7 @@ async def test_text_typing_timeout_still_delivers_to_tmux(
         await bot_module.text_handler(update, scenario.context)
         delivered = await aggregator_flush_route(route)
 
-    assert delivered is True
+    assert delivered.ok
     assert any(
         sent_wid == wid and "text survives typing timeout" in keys
         for sent_wid, keys, _, _ in scenario.tmux.sent_keys

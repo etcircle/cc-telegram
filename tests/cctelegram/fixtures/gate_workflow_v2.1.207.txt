@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.207 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│               Welcome back Emiliyan!               │ Run /init to create a CLAUDE.md file with instructions for Claude                                       │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                              │
+│                      ▝▜█████▛▘                     │ Auto mode is now available without `CLAUDE_CODE_ENABLE_AUTO_MODE` opt-in on Bedrock, Vertex AI, and Fo… │
+│                        ▘▘ ▝▝                       │ Fixed the terminal freezing and keystrokes lagging while streaming responses containing very long list… │
+│      Fable 5 with high effort · Claude Max ·       │ Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… │
+│      em.tanev@gmail.com's Organization             │ /release-notes for more                                                                                 │
+│              /private/tmp/rig-s5-perm              │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 3 MCP servers need authentication · run /mcp
+
+❯ Use the Workflow tool right now to run a dynamic workflow that lists files here and summarizes them. Launch it immediately.
+
+⏺ Launching a workflow now: one agent discovers the files in /private/tmp/rig-s5-perm, then summarizer agents fan out over them in a pipeline, and the results
+  get merged into a single report.
+
+⏺ Workflow(List files in /private/tmp/rig-s5-perm and summarize each)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Run a dynamic workflow?
+
+  List files in /private/tmp/rig-s5-perm and summarize each
+
+  This dynamic workflow will spin up multiple subagents across the following phases:
+    1. Discover — enumerate files in the directory
+       · "List the contents of the directory /private/tmp/rig-s5-perm…"  · "Read the file at ${…} (it is about ${…} bytes, likely ${…})…"
+    2. Summarize — one agent per file (or batch)
+
+  Dynamic workflows can use a lot of tokens quickly by running many subagents in parallel — which counts against your usage limit. Stop a running workflow at
+  any time with /workflows, or disable dynamic workflows in /config.
+
+  ❯ 1. Yes, run it
+    2. View raw script
+    3. No
+
+  Esc to cancel · Tab to amend
+  ctrl+g to edit script in $EDITOR
+
+
+
+
+
+
+
+
+

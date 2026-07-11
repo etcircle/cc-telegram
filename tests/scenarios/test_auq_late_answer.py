@@ -163,7 +163,15 @@ def _answer_texts(update: Any) -> list[str]:
 
 
 def _sent_texts(scenario: ScenarioHarness, wid: str) -> list[str]:
-    return [keys for w, keys, _e, _l in scenario.tmux.sent_keys if w == wid]
+    # GH #50: the delivery transaction writes the payload with the Enter
+    # WITHHELD (``literal=True, enter=False``) and commits with a bare Enter
+    # (``keys="" , enter=True, literal=False``) — the payload writes are the
+    # literal, non-empty segments.
+    return [
+        keys
+        for w, keys, _e, _l in scenario.tmux.sent_keys
+        if w == wid and keys and _l and not _e
+    ]
 
 
 # ── AFK conversion (the bot.py tool_result seam) ─────────────────────────

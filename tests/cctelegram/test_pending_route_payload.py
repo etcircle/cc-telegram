@@ -15,6 +15,8 @@ from typing import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from cctelegram import delivery
 from telegram import CallbackQuery, User
 
 from cctelegram import bot as bot_module
@@ -1677,8 +1679,15 @@ async def test_flush_pending_route_payload_owner_mismatch_preserves_new_payload(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "flush_failure",
-    [False, RuntimeError("tmux send exploded")],
-    ids=["flush-false", "flush-exception"],
+    [
+        # GH #50: the replay now returns a STRUCTURED DeliveryResult so the
+        # bind reply can name the REAL reason (this is the fresh-session
+        # folder-trust case: the very first turn into a brand-new window lands
+        # on "Do you trust the files in this folder?").
+        delivery.refuse(delivery.REASON_PROMPT_PRESENT, written=False),
+        RuntimeError("tmux send exploded"),
+    ],
+    ids=["flush-refused", "flush-exception"],
 )
 async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_cleans_up(
     tmp_path: Path, flush_failure: object
@@ -1737,11 +1746,11 @@ async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_clea
     )
     mock_clear_route.assert_called_once_with((1, 10, "@0"))
     edit_text = mock_edit.await_args.args[1]
-    assert "Created, but the first message failed to send" in edit_text
+    assert "Created, but the first message was not delivered" in edit_text
     assert "pending payload was cleared" in edit_text
     assert "please resend" in edit_text
     query.answer.assert_awaited_once_with(
-        "Created; first message failed", show_alert=True
+        "Created; first message not delivered", show_alert=True
     )
     assert "_pending_thread_text" not in context.user_data
     assert "_pending_thread_attachments" not in context.user_data
@@ -1752,8 +1761,15 @@ async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_clea
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "flush_failure",
-    [False, RuntimeError("tmux send exploded")],
-    ids=["flush-false", "flush-exception"],
+    [
+        # GH #50: the replay now returns a STRUCTURED DeliveryResult so the
+        # bind reply can name the REAL reason (this is the fresh-session
+        # folder-trust case: the very first turn into a brand-new window lands
+        # on "Do you trust the files in this folder?").
+        delivery.refuse(delivery.REASON_PROMPT_PRESENT, written=False),
+        RuntimeError("tmux send exploded"),
+    ],
+    ids=["flush-refused", "flush-exception"],
 )
 async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans_up(
     tmp_path: Path, flush_failure: object
@@ -1801,11 +1817,11 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
     mock_clear_route.assert_called_once_with((1, 10, "@0"))
     edit_text = mock_edit.await_args.args[1]
     assert "Bound to window `existing-window`" in edit_text
-    assert "First message failed to send" in edit_text
+    assert "not delivered" in edit_text.lower()
     assert "pending payload was cleared" in edit_text
     assert "please resend" in edit_text
     update.callback_query.answer.assert_awaited_once_with(
-        "Bound; first message failed", show_alert=True
+        "Bound; first message not delivered", show_alert=True
     )
     assert "_pending_thread_text" not in context.user_data
     assert "_pending_thread_attachments" not in context.user_data
@@ -1847,7 +1863,7 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
         _patch_both(
             "aggregator_replay_payload",
             new_callable=AsyncMock,
-            return_value=True,
+            return_value=delivery.delivered("ok"),
         ) as mock_replay,
     ):
         await bot_module.callback_handler(update, context)
@@ -1873,12 +1889,20 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
         ("attachment-cap", 2, ["g1", "g1", "g1"]),
     ],
 )
-async def test_pending_replay_observes_all_split_send_failures(
+async def test_pending_replay_STOPS_at_the_first_refused_split(
     tmp_path: Path,
     case: str,
     max_attachments: int,
     media_groups: list[str],
 ):
+    """GH #50 r2 F2(i): the replay must ABORT on the first refusal, not keep
+    sending the remaining splits.
+
+    Two reasons. (1) A refusal means the pane would not take the payload, so the
+    later splits are refused too — one notice per split. (2) A ``draft_written``
+    refusal leaves the FIRST split sitting UNSENT in the input box, so the next
+    split would be typed ONTO it and its Enter would commit BOTH — including the
+    text the user was just told was not delivered."""
     paths = [tmp_path / f"{case}-{idx}.bin" for idx in range(3)]
     for path in paths:
         path.write_bytes(b"data")
@@ -1898,24 +1922,28 @@ async def test_pending_replay_observes_all_split_send_failures(
         patch.object(bot_module.config, "aggregator_max_attachments", max_attachments),
         patch.object(
             bot_module.session_manager,
-            "send_to_window",
+            "deliver_to_window",
             new_callable=AsyncMock,
-            side_effect=[(False, "first split failed"), (True, "ok")],
+            side_effect=[
+                delivery.refuse(delivery.REASON_PROMPT_PRESENT, written=False),
+                delivery.delivered("ok"),
+            ],
         ) as mock_send,
     ):
         delivered = await bot_module._flush_pending_route_payload(
             route, context.user_data
         )
 
-    assert delivered is False
-    assert mock_send.await_count == 2
+    # The FIRST refusal wins AND ends the replay — the second split is dropped
+    # with the notice, never typed onto the stranded first one.
+    assert delivered is not None and delivered.refused
+    assert delivered.reason == delivery.REASON_PROMPT_PRESENT
+    assert mock_send.await_count == 1
     first_send = mock_send.await_args_list[0].args[1]
-    second_send = mock_send.await_args_list[1].args[1]
     assert "hello" in first_send
     assert str(paths[0]) in first_send
     assert str(paths[1]) in first_send
     assert str(paths[2]) not in first_send
-    assert str(paths[2]) in second_send
     assert "_pending_thread_text" not in context.user_data
     assert "_pending_thread_attachments" not in context.user_data
     assert "_pending_thread_id" not in context.user_data

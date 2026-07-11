@@ -121,6 +121,40 @@ The file boundary is deliberately strict. cc-telegram only offers files that res
 - Replies include the quoted message with role-aware context.
 - Unknown slash commands go straight to Claude Code, so `/clear`, `/compact`, `/model`, and `/effort` work from your phone.
 
+### Messages are never typed into a live prompt
+
+Every message, voice note, caption, attachment, and forwarded slash command goes
+through one gate before it reaches the terminal. The bot delivers only on
+positive proof that Claude Code is at its ready input box: the pane must show the
+input row bracketed by its rule separators, the ready status chrome below it, no
+autocomplete overlay, and Claude itself must be the process running in the pane.
+
+That inversion matters because a blocking prompt *replaces* the input box. When
+Claude is waiting on a question, a plan approval, a folder-trust prompt, a model
+switch, or any prompt the bot has never seen before, the proof simply fails — and
+your message is refused with an explanation instead of having its Enter key
+commit the highlighted option for you.
+
+Queueing while Claude is busy still works, and so do drafts you already typed in
+the terminal — the gate checks for the input box, not for idleness. Messages that
+are just a bare number are refused: the terminal reads a lone digit as a
+keypress, not as text. `/esc`, the card buttons, and the arrow-key controls are
+deliberately *not* gated — those exist to act on a live prompt.
+
+If a message is refused, it is dropped with a notice naming the reason. Nothing
+is ever replayed silently.
+
+Because the bot types the text first and only then presses Enter, a prompt that
+appears in between leaves your message sitting *unsent* in the terminal's input
+box. When that happens you are told so, and the topic is braked: further messages
+are refused until you clear the input box in the terminal (`Esc`, or `Ctrl+U`),
+so the next message can never be appended to the stranded one and submit both at
+once. `/esc` sends that Escape for you — but if Claude is mid-run it will also
+interrupt the run. The brake lifts by itself as soon as the bot sees an empty
+input box again. In the rarer case where the final Enter itself fails, the bot
+says plainly that the message *may or may not* have been submitted — check the
+window with `/screenshot` before resending.
+
 ### Sessions survive the boring failures
 
 Claude runs in tmux, so closing Telegram, losing mobile signal, or restarting the bot does not kill the session. Routing and read positions are saved on disk and reconciled at startup.
@@ -252,7 +286,7 @@ The reason is structural. Claude Code's tool-permission prompts are a terminal U
 
 What that means for your security boundary: it is no longer Claude Code's per-tool approval. It is **`ALLOWED_USERS` plus the machine you run on**. Anyone who can post in your forum can make Claude read, edit, and execute anything your user account can. Lock `ALLOWED_USERS` to your own Telegram user ID, run on a machine you trust, and consider `IS_SANDBOX=1`.
 
-> **Known hazard while a prompt is on screen (GH #50).** If Claude does raise an interactive prompt — a question card, a plan approval, a folder-trust dialog — do **not** send a plain text message in that topic. The bridge currently types it into the terminal, where the text is discarded and the trailing Enter commits the highlighted option (on a plan approval, that means approving the plan). Answer the card first, then send your message. A fix is planned.
+> **Sending while a prompt is on screen (GH #50).** This used to be a live hazard: a plain text message sent while Claude was waiting on a question card, a plan approval, or a folder-trust dialog was typed into the terminal, where the text was discarded and the trailing Enter committed the highlighted option (on a plan approval, that meant approving the plan). The delivery gate now refuses those sends with an explanation instead — see [Messages are never typed into a live prompt](#messages-are-never-typed-into-a-live-prompt). Answer the card first, then send your message.
 
 ### Suggested daily-driver config
 
@@ -298,7 +332,7 @@ A typical `/update all` result looks like:
 ♻️ Restarted 4 idle · deferred 2 busy · skipped 0
 ```
 
-`CLAUDE_COMMAND` must exec the Claude binary directly. A non-exec shell wrapper can make the update safety checks mistake a live Claude process for an idle shell.
+`CLAUDE_COMMAND` must exec the Claude binary directly. A non-exec shell wrapper keeps the wrapper shell as the pane's foreground process, so the bot cannot tell a live Claude apart from a bare shell. That breaks the `/update` safety checks in the dangerous direction, and it makes the message-delivery gate refuse every message ("Claude isn't running in this window"). The bot logs a loud warning at startup when it detects this shape.
 
 ## State files
 
@@ -384,7 +418,7 @@ This lets Telegram show the full descriptions before you choose.
 
 For a single-choice question, cc-telegram navigates the live terminal with arrow keys and commits with Enter. It verifies the cursor position and checks that the form advanced. If the move fails before Enter, the tap remains retryable. If Enter was sent but the result cannot be confirmed, the action is marked `commit_unconfirmed` and will not be submitted again automatically.
 
-Multi-select questions use digit toggles, followed by the review screen's Submit or Cancel action. Their pending side file stays alive until the final tool result resolves the question.
+Multi-select questions use digit toggles, followed by the review screen's Submit or Cancel action. Their pending side file stays alive until the final tool result resolves the question. On current Claude Code versions a digit *toggles* a checkbox on a multi-select screen but *commits* on a single-select one, which is exactly why single-choice picks never send a bare digit — and why a Telegram message that is nothing but a number is refused rather than typed.
 
 The action ledger survives bot restarts, so duplicated Telegram callbacks do not repeat a committed choice.
 
@@ -543,6 +577,7 @@ src/cctelegram/handlers/                Telegram interaction layer
   directory_browser.py                  project and session picker
   history.py                            /history paginator
   cleanup.py                            topic teardown
+src/cctelegram/delivery.py              delivery result, refusal copy, payload shaping
 src/cctelegram/message_refs.py          SQLite message provenance
 src/cctelegram/session_monitor.py       Claude JSONL tailer
 src/cctelegram/transcript_parser.py     JSONL event parser

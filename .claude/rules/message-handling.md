@@ -1459,10 +1459,20 @@ fingerprint basis would re-break it; the fingerprint-EQUALITY-across-cursor-move
 tests (for BOTH the review screen and non-review pickers) guard the coupling.
 
 **AUQ pick dispatch NAVIGATES the cursor to the target, VERIFIES, then Enter
-(v2.1.168 model — single-select `aqp:` + review Submit/Cancel ONLY).** On Claude
-Code v2.1.168 a richer "notes side-panel" picker variant makes a bare digit only
-MOVE the cursor (no select), so the form sticks and the bot would wrongly record
-`dispatched` → an "Action already received" hard lock. Fix: `_dispatch_pick`
+(single-select `aqp:` + review Submit/Cancel ONLY).** DIGIT MODEL — CORRECTED on
+CC 2.1.207 (GH #50 rig, 2026-07-11): the v2.1.168-era claim "a bare digit only
+MOVES the cursor" is DEAD. On 2.1.207 a bare digit is a live HOTKEY on every
+single-select-SHAPED surface — it COMMITS the option with NO Enter (rig-confirmed
+on AUQ single-select, ExitPlanMode, folder-trust, `Switch model?`); the 17 tested
+non-digit single characters are inert, so the in-range digit set IS the complete
+hotkey alphabet. AUQ MULTI-select digits still TOGGLE (rig-cleared ⇒ the shipped
+`aqt:` lane is SAFE, the historical fast-follow is CLOSED). The
+navigate→verify→Enter model stays correct, but its RATIONALE inverts: the digit is
+not too WEAK, it is too STRONG — an unverified digit would commit the WRONG option
+(and, under the original .168 reading, the form would stick and the bot would
+wrongly record `dispatched` → an "Action already received" hard lock). It is also
+why the GH #50 delivery gate refuses any payload whose emitted literal segments
+carry a bare-digit LINE. Mechanism: `_dispatch_pick`
 (shared by the live `aqp:` pick path AND D2 recovery) finds the live `❯` cursor in
 `current_form`, computes `delta = target − cursor.number`, sends `Down`/`Up` ×
 |delta| (`send_keys(enter=False, literal=False)`, MONOTONIC — never a wrap
@@ -1487,8 +1497,449 @@ for on-disk compat). The nav `⏎ Enter` button (`CB_ASK_ENTER`) + arrow nav sti
 send Enter — the orthogonal navigation path, unchanged, AND the user's manual
 escape if a future variant defeats the auto-dispatch. **Scoped to single-select
 `aqp:` + review Submit/Cancel; the multi-select `aqt:` toggle still dispatches a
-bare digit — a filed fast-follow (AUQ is NOT globally fixed).** Validated against
-Claude Code v2.1.168 terminal behavior.
+bare digit — rig-CLEARED as safe on 2.1.207 (multi-select digits TOGGLE).**
+Validated against Claude Code v2.1.168 and re-characterized on 2.1.207 (GH #50).
+
+## Inbound delivery gate — text on a live interactive surface (GH #50 PR-1)
+
+`SessionManager.deliver_to_window` (and its legacy `(ok, message)` wrapper
+`send_to_window`) is the **single choke point** every user payload crosses on its
+way into a pane: typed text, a voice transcription, a photo/document caption, an
+attachment-only bundle, a forwarded slash command, `/effort`, the `aql:` late
+answer, and the pending-bind replay. Before GH #50 `text_handler` DETECTED a live
+surface and sent anyway; the voice / photo / document handlers had **no check at
+all**; and the aggregator flushes from a background debounce task, so any
+offer-time check is TOCTOU. And the AUQ card literally invited the failure
+(`(Type something — send a regular message to free-text)`).
+
+**The four failure modes (CC 2.1.207 rig, `temp/rig-20260711-*`).**
+`send_keys(literal=True, enter=True)` types the payload and appends Enter.
+
+- **M1 — the Enter COMMITS option 1** (the default cursor row) on every blocking
+  surface. Rig-verified worst cases: **ExitPlanMode** ⇒ the plan is APPROVED
+  (option 1 is `Yes, and bypass permissions`; the plan file was actually
+  written); **folder-trust** ⇒ trust GRANTED and persisted to `~/.claude.json`
+  (live-reproduced); **`Switch model?`** ⇒ the model is switched and saved as the
+  default.
+- **M2 — a bare digit is a live HOTKEY** on a single-select-SHAPED surface (it
+  commits with NO Enter). The v2.1.168 model recorded in CLAUDE.md ("a digit only
+  MOVES the cursor") is **DEAD on 2.1.207**. *Rig-cleared:* AUQ **multi**-select
+  digits still TOGGLE ⇒ the shipped `aqt:` lane is SAFE and needs no fix.
+- **M3 — a bare-shell pane EXECUTES the payload.** `/esc` on a folder-trust prompt
+  EXITS Claude, leaving a shell in a still-bound window — and `/esc` bypasses
+  `send_to_window`, so only `/update` failures used to quarantine.
+- **M4 — the bot is BLIND to `Switch model?`** (footer-less ⇒
+  `parse_generic_decision` returns None). A live blocking prompt the parser cannot
+  see. **This is why the gate must not be "no known prompt matched".**
+
+**The gate is POSITIVE structural evidence** (`terminal_parser.pane_input_box_present`,
+five legs, fixture-pinned on 2.1.207 — a TUI-drift audit surface beside
+`clean_ghost_input_text` and `pane_command_is_claude`):
+
+1. the BOTTOM pair of `──` rule separators is present;
+2. a genuine prompt row sits inside that pair — the glyph is **`❯` OR `!`** (in
+   bash mode it is `!`; a `❯`-only leg would refuse EVERY `!command`) — and the
+   **FIRST** such row must NOT match `^\d+\.\s` after its glyph (**the picker
+   trap**: a live AUQ picker's bottom rule-pair CONTAINS its `❯ 1. Red` option row,
+   so legs 1+2 would otherwise BOTH pass on a live picker). **The trap is
+   FIRST-ROW-ONLY and PAYLOAD-AWARE (r2 F1).** Unqualified it FALSE-REFUSED any
+   message starting with `1. ` — the gate writes the payload and re-verifies
+   AFTER, so an ordinary `1. buy milk` renders the box as `❯ 1. buy milk`, the trap
+   fired at the re-verify, the Enter was withheld, and the message was NEVER SENT
+   (it just sat as a draft; reproduced directly). Fix: `pane_input_box_present` /
+   `classify_input_box_failure` take an optional `expected_draft`, passed ONLY at
+   the re-verify; when the first prompt row IS that draft (glyph-stripped, exact or
+   the wrapped-prefix shape) the trap is SKIPPED — POSITIVE PROOF of authorship,
+   since a picker that stole the keystrokes would show ITS OWN label, never our
+   text. The PRE-write gate passes no `expected_draft` and keeps the trap
+   unconditional (no payload is in the box yet; a `❯ 1. …` row there is a live
+   picker or a HUMAN's own numbered draft — refusing is fail-closed, the disclosed
+   residual). **The trap is DEFENCE IN DEPTH, not the load-bearing leg — MEASURED:**
+   with it disabled ENTIRELY, every blocking pane in the 2.1.207 corpus is still
+   refused by another leg (the AUQ single picker by leg 3 `no_ready_chrome` — a
+   live picker replaces the ready status bar with its own `Enter to select` footer;
+   every other family by leg 1 `no_input_box`) and every deliverable pane still
+   passes (pinned by `test_option_row_trap_is_redundant_on_the_real_corpus`). It is
+   kept only for a hypothetical picker variant that renders ready-chrome below its
+   own footer;
+3. ready-for-input status chrome is present BELOW the box, from the observed
+   alphabet (`⏵⏵ … (shift+tab to cycle)`, `esc to interrupt`, `← for agents`,
+   `· N shell`, `↓ to manage`, `? for shortcuts`, and **`! for shell mode`** in bash
+   mode);
+4. the status bar must NOT carry **`Enter to view tasks`** — one `Down` at an empty
+   box while a background shell exists arms a mode where legs 1-3 ALL still pass but
+   **Enter is STOLEN** (typed text is swallowed entirely; Enter opens the
+   Shell-details modal). Reachable in production — the bot's own ungated nav
+   keyboard sends `Down`. (Esc reverts it.)
+5. no input-capturing completion overlay: the overlay fires ONLY when the cursor
+   token is an active trigger — a trailing **`@prefix`** (`please ask @se` ⇒ Enter
+   selected `seed.txt` and the message was NEVER sent — **live today**: any Telegram
+   message ending in `@word` strands unsent) or a bare **`/prefix`** (`/co`). A
+   mid-text `@alice`, an email address, and `tell me about / division` do NOT
+   trigger it, and a slash command WITH an argument (`/effort high`) raises no
+   overlay at all.
+
+Note: the empty input row is `❯\xa0` — a **non-breaking space**, not ASCII. Past
+user turns also render with `❯`, so the bottom-rule-pair anchoring is load-bearing.
+
+**The rule separator may be LABELLED (CC 2.1.207, fixture-pinned).** A few seconds
+after a plan is approved, CC pins the plan slug into the input box's TOP rule
+(`──────… add-ok-to-note ──`) and it PERSISTS for the rest of the session (only
+`/clear` drops it). `_RE_RULE_SEPARATOR` matched pure dashes only, so
+`_input_box_rows` could not find the bracket at all — which broke
+`pane_input_box_present` (the gate would have refused EVERY message in that topic)
+**and, PRE-EXISTING and shipped long before GH #50, `pane_looks_idle`: `/update`
+silently deferred and `/cost` refused in any topic where a plan had been
+approved.** The regex now tolerates a labelled rule; both predicates are pinned on
+the real post-resolution rig captures (`epm_after_approve_*`, `epm_plan_label_*`,
+`auq_after_answer_*`, `trust_after_accept_*`, `control_gitrepo_branch_no_label`,
+plus the live-prompt positive controls `*_before_*`).
+
+**Deliberately NOT asserted:** no-active-run, background-shell absence, and
+input-row emptiness. **Queueing a message while Claude is BUSY is a first-class
+flow** and MUST keep working (rig design-killer A2: the rule-pair + prompt row +
+ready chrome persist through EVERY busy shape), and a pre-existing / soft-wrapped /
+multi-line draft must still deliver (rig D10: continuation rows carry NO glyph). So
+this is **not** `pane_looks_idle` and `clean_ghost_input_text` is NOT needed here
+(it only matters for emptiness — dropped as cargo-cult).
+
+**Why the inversion works** (rig-confirmed on all six blocking families — AUQ
+single + multi, ExitPlanMode, folder-trust, `Switch model?`, Permission, Workflow):
+a live blocking prompt **REPLACES** the input box + status chrome. The positive
+proof therefore fails on *every* prompt — known, unknown, unparsed, half-drawn —
+without the parser recognizing it. The gate never consults `_active_ui_patterns`,
+so it is **flag-independent by construction**: `CC_TELEGRAM_PERMISSION_PROMPTS` /
+`CC_TELEGRAM_DECISION_CARDS` cannot reopen the hole. The recognizer probes
+(`is_interactive_ui`, `parse_unknown_blocking_prompt`, and the recognizer-free
+`pane_blocking_prompt_shape` bottom-cursor-row check) are **purely a LABELLING
+aid, and the ordering ENFORCES it (r1 P1, probe-reproduced)**: `_input_box_reason`
+consults the positive proof FIRST and returns immediately when it passes; the
+recognizers run ONLY on an already-FAILED, INDETERMINATE reason, and only to
+upgrade it to the actionable `prompt_present` copy ("answer the card first")
+instead of burning the retry budget on generic "couldn't confirm the input box".
+They may **never pre-empt the proof**. Two independent reasons: (a) they buy NO
+safety — across all 25 real 2.1.207 pane fixtures the positive proof ALONE refuses
+every blocking surface (all six gate families, the bare shell, the /cost overlay,
+both completion overlays, the tasks mode) and passes every deliverable shape; and
+(b) pre-empting is a FALSE REFUSAL of legitimate messages, in front of EVERY
+inbound message. The concrete case: an **ANSWERED** AUQ / ExitPlanMode prompt whose
+rendering is still on-screen ABOVE the restored input box still matches
+`is_interactive_ui` — the AUQ/EPM `UIPattern`s carry no strict validator, so unlike
+Permission/Workflow/Decision they have no `_only_chrome_below` guard — and
+pre-empting there refused EVERY message in the topic until the picker scrolled off.
+`pane_blocking_prompt_shape` already documented this discipline ("Only consulted
+when the input-box proof has ALREADY failed"); the other two now follow it. Pinned
+by `test_answered_prompt_above_a_live_input_box_still_delivers` +
+`test_positive_proof_alone_refuses_every_blocking_surface`.
+
+**The transaction** (inside the EXISTING `window_send_lock`, beside the `/update`
+quarantine re-check — every step fail-closed):
+
+0. **The SEGMENT-aware, PER-LINE lone-hotkey refusal** (`delivery.lone_hotkey_line`):
+   refuse if ANY LINE of ANY literal segment the writer will actually emit is an
+   ASCII `[0-9]` fullmatch (**ASCII, not Python `\d`** — Unicode digits are not
+   terminal hotkeys). SEGMENT-aware because the `!` writer emits `"!"` and the
+   remainder as SEPARATE literal writes, so `!1` passes a payload-level test yet
+   emits `"1"` as its own write (rig C7: CONFIRMED FIRES). PER-LINE because a
+   bare-digit LINE inside a multi-line single write ALSO fires (rig §5 finding 3:
+   `first line\n2\nthird line` written as ONE `send-keys -l` **COMMITTED option 2**
+   on a live picker). Fires BEFORE any capture — never written, even onto an idle
+   pane (the gate→write window is exactly what makes a digit dangerous). `"12"` and a
+   digit embedded WITHIN a longer line are delivered — an empirically narrowed,
+   **NON-proof** case (pty chunking could still split a write), disclosed rather
+   than closed. Rig C8 RESOLVED the alphabet: 17 single non-digit characters
+   (`a y n q z Y N space - ? . ,` …) fire nothing and move nothing; out-of-range
+   digits are inert; digit `4` (the `Type something.` row) selects the free-text row
+   ⇒ it stays in the refusal set.
+1. **A bounded, cancellation-safe capture** (`capture_pane_cancellation_safe` under
+   `asyncio.wait_for`; ONLY `asyncio.TimeoutError` classifies — a genuine
+   caller/shutdown cancellation PROPAGATES, never swallowed into a refusal), plus an
+   overall transaction budget checked at the phase boundaries (**never** a `wait_for`
+   around the WRITE — cancelling mid-write would strand a half-typed payload;
+   exhaustion before the write ⇒ `not_written`, after ⇒ `draft_written`).
+2. **`pane_command_is_claude`** — the strict version-string fullmatch, now on EVERY
+   send (not just quarantined windows), on a **BOUNDED** probe (r2 F4:
+   `pane_current_command` shells out to tmux with no timeout of its own; only
+   `asyncio.TimeoutError` classifies → `cmd_probe_timeout`, a genuine cancellation
+   PROPAGATES). Closes M3. A quarantined window keeps its EXACT
+   `QUARANTINE_SEND_REFUSED_MSG` contract string.
+2b. **The stranded-draft brake** (r2 F2, below) — zero cost (one set lookup) unless
+   the window is braked.
+3. **`pane_input_box_present`** — with a bounded RETRY on an INDETERMINATE frame
+   (`capture_empty` / `no_input_box` / `no_prompt_row` / `no_ready_chrome` — a
+   mid-redraw), and an IMMEDIATE refusal on a POSITIVE hazard
+   (`prompt_row_is_option` / `tasks_mode` / `completion_overlay` / `prompt_present`),
+   exactly one capture. The /cost preflight precedent.
+4. **The write with the Enter WITHHELD.** A **mode-aware writer** reproduces the `!`
+   bash-mode two-step explicitly (send `!` → settle → send the remainder), because
+   `send_keys` performs its own two-step ONLY when `literal and enter` are BOTH true
+   (`tmux_manager.py:782`) — calling it with `enter=False` would silently take the
+   generic path and change bash-mode behavior. **EVERY post-write-attempt failure is
+   classified WRITTEN (r2 F5)** — a `False` from `send_keys` does NOT prove zero
+   bytes reached the pane (tmux may have failed after writing; and a later segment's
+   failure certainly leaves the earlier ones there), so the old `written = i > 0`
+   was an unproven claim. Fail-closed: it arms the brake, whose empty-input-row
+   self-heal releases it if nothing actually landed.
+5. **The RE-VERIFY** immediately before the commit: `pane_command_is_claude` AND
+   `pane_input_box_present` still hold. This is the window the re-verify genuinely
+   closes. **ORDER IS LOAD-BEARING (r2 F4):** the bounded command probe runs FIRST
+   and the pane CAPTURE is the **LAST** observation before the stamp + Enter. The
+   old order captured the pane, then awaited an UNBOUNDED `pane_current_command` —
+   a probe stalling while a blocking prompt was drawn let a STALE input-box frame
+   authorize the Enter (which commits option 1). The overall deadline is re-checked
+   after every await. From here on ANY failure is **`draft_written`** — the text
+   sits in the input box and the Enter is withheld — with **NEUTRAL** copy ("the
+   terminal changed while your message was being typed; your text was NOT
+   submitted"), because a post-write structural failure does NOT prove a prompt
+   appeared (it may be a `/`-command overlay, bash-mode rendering, wrap drift, a
+   capture failure, or an ordinary redraw). **NO automatic cleanup is attempted** —
+   Esc / Ctrl-U have surface-specific semantics and **Esc on folder-trust KILLS
+   Claude**. The re-verify is PAYLOAD-AWARE (`expected_draft=text`, leg 2 above), so
+   an ordinary `1. buy milk` is not mistaken for a picker cursor. A bare `/command`
+   payload legitimately arms the `/` completion overlay once written and Enter runs
+   the sorted-first entry (the mechanism `forward_command_handler` has ALWAYS relied
+   on), so the re-verify exempts the `/` arm for exactly that shape
+   (`delivery.is_bare_slash_payload`) **AND ONLY when the input row's content IS
+   that exact payload (r2 F6)** — keyed on the payload SHAPE alone the exemption
+   also covered a PRE-EXISTING `/co` draft a human left in the box, so Enter would
+   have run `/copy` on text the bot never authored. The exemption demands the EXACT
+   first line, never a prefix (a prefix is precisely the hazard). The `@` arm is
+   NEVER exempt — it is pure data loss. The bare-ambiguous-prefix misfire itself
+   (`/co` + Enter ran `/copy`, live-reproduced) is **GH #53, filed separately and
+   explicitly out of scope**; the narrowing only refuses to WIDEN it.
+6. **The pre-commit user-turn stamp** (see below).
+7. **Enter.** A `False` from the Enter `send_keys` does NOT prove the key never
+   reached the pty, so it is **`COMMIT_UNKNOWN`** (r2 F3), never "draft_written"
+   (which asserts a deliberate withhold). Honest copy: "Your message may or may not
+   have been submitted — check the window (`/screenshot`) before resending." The
+   turn stamp STANDS for it (see the invariant below), and it arms the brake: if the
+   Enter did not land the draft IS stranded, and if it did the empty-input-row
+   self-heal releases the brake on the next send.
+
+**The stranded-draft brake (r2 F2) — the commit chain the gate itself created.**
+A `draft_written` / `commit_unknown` transaction leaves the payload sitting in the
+input box with its Enter withheld, and the user is TOLD it was not delivered. But a
+live input box holding a pre-existing draft is legitimately DELIVERABLE (rig D10, a
+hard non-regression) — so the NEXT message passed the gate, was APPENDED to the
+stranded text, and its Enter committed BOTH: silently submitting a message the bot
+had already disclaimed, concatenated with the new one. Two coupled fixes:
+
+  - **(i) Callers STOP on the first non-OK result.** `aggregator_replay_payload`
+    used to keep sending the remaining split bundles after a refusal (so split 2
+    would be typed onto split 1's stranded text); it now aborts and returns the
+    first refusal. The four FORCED-flush callers ignored the returned
+    `DeliveryResult` entirely — `bot.forward_command_handler` (the §2.8 pre-flush),
+    `callback_dispatcher/effort.py`, `callback_dispatcher/late_answer.py`, and the
+    replay's own split loop — and each now ABORTS its own subsequent send when that
+    flush refused, surfacing the real reason (the `aql:` card is re-armed with its
+    original keyboard for the retry). **Refusal OWNERSHIP is therefore explicit and
+    single (`report_refusal`, peer-review P2):** a caller that inspects the result
+    and posts its own ❌ would otherwise get a SECOND ❌ from the aggregator for the
+    same event (buffered message + an immediate slash command while Claude is
+    blocked ⇒ the forced flush refuses, and BOTH disclose). The FIRE-AND-FORGET
+    flushes (the debounce timer, the media-group boundary, the attachment cap)
+    keep reporting inside `_send_bundle` — nobody is awaiting their result and the
+    photo/document handlers already acked "sent"; the SYNCHRONOUS forced-flush
+    callers (the three above) and the pending-bind replay (whose own callers
+    surface the reason in their bind edit) pass `report_refusal=False` and own the
+    single response. No path drops a refusal silently — it is reported either by
+    the aggregator or by the caller that suppressed it, never by both.
+  - **(i-b) A RAISED delivery is a refusal too (peer-review P2).** THE INVARIANT:
+    **every refusal — from a RETURNED `DeliveryResult` OR from a RAISED exception —
+    reaches the user EXACTLY ONCE, on every flush path.** The `report_refusal` fold
+    itself broke the RAISE half: `_send_bundle`'s `except Exception` arm built its
+    result and **`return`ed immediately, jumping over the reporting block**. The
+    debounced / media-group-boundary / attachment-cap flushes are FIRE-AND-FORGET —
+    nobody awaits that result — so the popped payload vanished with only a log line
+    and the user was never told: the exact OPPOSITE failure of the double-report the
+    fold was introduced to fix. It matters doubly now, because a raise PAST a write
+    attempt also arms the stranded-draft brake (`session._WriteAttempt`), so the
+    user must be told why their NEXT message will be refused too. The arm now
+    ASSIGNS `result` and FALLS THROUGH to the single reporting seam (the NEUTRAL
+    written-state copy: the raise may have landed before or after the payload was
+    typed, and "if you see it in the input box, clear it" is the right advice for
+    both). `report_refusal=False` still transfers ownership on the raise path — the
+    synchronous caller receives the structured result and posts the single ❌.
+    `CancelledError` is a `BaseException`: it is NOT caught, must never be swallowed
+    into a `DeliveryResult`, and must never be posted as an ordinary refusal.
+  - **(ii) A per-window brake** (`mark_window_stranded_draft` /
+    `window_has_stranded_draft` / `clear_window_stranded_draft`, the registry living
+    in `tmux_manager` beside the post-/exit quarantine it mirrors — see (ii-b) for
+    WHY; `session.py` keeps the four names as the delivery-path vocabulary): a
+    `draft_stranded` outcome MARKS the window; while marked, `deliver_to_window`
+    REFUSES with the
+    `stranded_draft` reason + actionable copy ("an earlier message is still sitting
+    UNSENT in this window's input box … clear it (Esc, or Ctrl+U), then resend. /esc
+    sends that Escape for you — but if Claude is mid-run it will ALSO interrupt the
+    run"). **NOTHING is auto-cleared** (Esc on folder-trust KILLS Claude; mid-run it
+    interrupts) — the cost is stated, not hidden. The brake is released ONLY on
+    POSITIVE proof: one extra capture whose `terminal_parser.pane_input_row_empty`
+    is True (ANSI-cleaned via `clean_ghost_input_text`, so a CC ≥2.1.206 DIM ghost
+    suggestion never strands it forever); an INDETERMINATE frame — a capture
+    failure, a mid-redraw, a live prompt, or a picker-shaped prompt row — KEEPS it.
+    Zero cost for an unbraked window (one dict lookup).
+  - **(ii-b) BINDING-LEVEL TEARDOWN MUST NOT CLEAR IT — the brake is a property of
+    the PANE, and its only other release proof is WINDOW DEATH (peer-review P1).**
+    Round 1 dropped the brake at `cleanup.clear_topic_state` + the four
+    `inbound_telegram` stale-window unbinds, beside the tmux quarantine those seams
+    already drop. That re-opened the exact commit chain the brake exists to break:
+    delivery A writes its payload, fails the re-verify and arms the brake INSIDE
+    the send lock; concurrently `/unbind` — which **deliberately leaves the tmux
+    window RUNNING** — runs `clear_topic_state`, which cleared the brake with **no
+    synchronization against `window_send_lock`**; send B (an already-popped boundary
+    flush, or a slash command), BLOCKED on that same lock the whole time, then
+    acquires it, finds a structurally valid input box that still holds A's draft,
+    appends its own payload and presses Enter — committing BOTH, including the one
+    the user was told was NOT delivered. Unbinding a topic says nothing about
+    whether the draft is still in the box. So the registry **moved into
+    `tmux_manager`** (beside the post-/exit quarantine it mirrors:
+    `mark_window_stranded_draft` / `window_has_stranded_draft` /
+    `clear_window_stranded_draft`; `session.py` keeps the four names as the
+    delivery-path vocabulary + the test seam) and is released by exactly two proofs:
+    the empty-input-row capture above, or **proof the WINDOW IS DEAD** — a
+    **CONFIRMED `kill_window`** (gated on the `True` return for the same reason the
+    send lock is: a FAILED kill can leave the window alive with the draft intact),
+    or **`create_window`** minting a brand-new window under that id (tmux ids RESET
+    to `@0` on a tmux-SERVER restart, which a launchd-kept bot process outlives, so
+    an entry armed on the old `@0` could otherwise meet a fresh `@0`). Topic close
+    and `/kill` DO kill the window, so the brake still drops there — at the kill,
+    under the right proof. **Disclosed residual:** a window that dies WITHOUT a
+    `kill_window` (an external `tmux kill-window`, the poller's stale-binding path)
+    leaks an entry. It is inert, not a wedge — `_deliver_locked` refuses
+    `window_gone` on `find_window_by_id` BEFORE it ever consults the brake, and the
+    empty-box self-heal reclaims any id later reused.
+  - **(iii) The brake is armed through ONE seam, and a CANCELLATION after a write
+    arms it too (peer-review P1).** Arming only from the RETURNED `DeliveryResult`
+    left the F2 hazard reachable through the cancellation door: a `CancelledError`
+    (or any unexpected raise) during the settle, the re-verify, the user-turn stamp,
+    or the ENTER await propagates out of `_deliver_locked` with NO result, so the
+    brake stayed UNARMED — and the next delivery passed the gate (a box holding a
+    draft IS a writable box), APPENDED its text and committed BOTH. That is
+    reachable in production: `cleanup.clear_topic_state` cancels per-topic tasks,
+    shutdown cancels in-flight work, and a cancelled `to_thread`/subprocess await
+    can still have COMPLETED its tmux write. The arming condition is **a WRITE was
+    ATTEMPTED** — a `_WriteAttempt` flag set immediately BEFORE the first
+    `send_keys` literal write (never after: a cancelled write may still have
+    landed), which is the SAME information the `DRAFT_WRITTEN` classification
+    already uses (r2 F5), so it adds no new imprecision. On any raise past that
+    flag `deliver_to_window` arms the brake **INSIDE the send lock** (a queued send
+    waiting on `window_send_lock` can never slip in first) and then **RE-RAISES —
+    `CancelledError` always propagates, never swallowed into a `DeliveryResult`.**
+    Cancellation during the Enter counts as potentially-stranded (the key may not
+    have landed); if it DID land, the empty-input-row self-heal releases the brake
+    on the next send — fail-closed and self-correcting. A raise BEFORE any write
+    attempt does NOT arm it: that is the hard non-regression (a raise proves nothing
+    about the pane, and arming on "any raise" would false-refuse a HUMAN's
+    pre-existing draft after an unrelated tmux error).
+  - **Disclosed residuals:** (a) a bot RESTART wipes the brake (in-memory, exactly
+    like the quarantine registry), so a draft stranded before the restart is no
+    longer braked and the next message can concatenate onto it; (b) a braked window
+    whose pane is ALSO showing a live prompt reports `stranded_draft` rather than
+    `prompt_present` — the copy is still the correct action (clear the box); (c) a
+    process KILL (SIGKILL — no exception, no unwind) between the write and the Enter
+    strands a draft unbraked, the same class as (a); (d) a window that dies WITHOUT a
+    `kill_window` (an external `tmux kill-window`, the poller's stale-binding path)
+    leaks its entry — inert, not a wedge (`_deliver_locked` refuses `window_gone`
+    before it consults the brake, and `create_window` / the empty-box self-heal
+    reclaim any id later reused); (e) a topic braked while the user is AWAY stays
+    braked (no auto-Esc — surface-specific semantics), and `/unbind` no longer
+    releases it because the pane, not the binding, owns the draft. The user-reachable
+    exits are always available and every refusal names them: clear the box in the
+    terminal (`Esc` / `Ctrl+U`, or `/esc` — which also interrupts a mid-run Claude),
+    or `/kill` the window.
+
+**The user-turn stamp is a CONSTRAINED seam, and ALL FOUR sites migrated.** Timing
+is right (immediately before the Enter preserves the live-prose turn boundary) but
+`window_send_lock`'s contract forbids holders from touching `route_runtime`. So
+`deliver_to_window` takes a **narrowly-typed internal pre-commit hook request**
+(`delivery.UserTurnStamp` — the route identity, nothing else), fires exactly one
+SYNCHRONOUS `message_queue.set_route_user_turn_at` after all gates pass and
+immediately before the Enter, and the **lock contract gains an EXPLICIT, NAMED
+exception** for that one stamp (`tmux_manager`'s module docstring). It may not
+await, may not schedule work, and may not mutate anything else; a hook exception ⇒
+`draft_written`, **no Enter, no stamp** (fail-closed). All four pre-existing stamp
+sites migrated — `inbound_aggregator._send_bundle`, `bot.forward_command_handler`,
+`callback_dispatcher/effort.py`, `callback_dispatcher/late_answer.py` — because the
+direct paths stamped BEFORE the gated send and would therefore stamp REFUSALS.
+
+**THE INVARIANT, stated so it is actually TRUE (r2 F3): _no PROVABLY-NOT-COMMITTED
+refusal is stamped._** The stronger form ("no refusal receives a turn stamp") was
+FALSE: the stamp fires immediately before the Enter, so a FAILED Enter left the
+stamp standing. That is not a bug to roll back — it is the fail-closed direction,
+and the outcome is now typed honestly. `NOT_WRITTEN` and `DRAFT_WRITTEN` are BOTH
+decided BEFORE the Enter (a stamp that RAISES is one of them — it never committed),
+so neither can carry a stamp; the ONE outcome that can is `COMMIT_UNKNOWN`, and it
+KEEPS the stamp deliberately: a possibly-committed turn must move the live-prose
+turn boundary, or a prose block from that turn would be posted as if it belonged to
+the previous one. The stamp is never rolled back —
+`message_queue.set_route_user_turn_at` mutates two stores, and a rollback is
+strictly worse than the honest disclosure the user already gets (pinned by
+`test_no_provably_uncommitted_outcome_can_carry_a_stamp` +
+`test_a_failed_enter_is_commit_unknown_and_keeps_its_stamp`).
+
+**Refusal reporting (§1.4).** `_report_quarantine_refusal` HARDCODED
+`QUARANTINE_SEND_REFUSED_MSG` and equality-matched it, so only that one refusal ever
+reached the topic. It is generalized to `_report_delivery_refusal`, carrying the
+ACTUAL reason. The structured **`delivery.DeliveryResult`** (outcome `delivered` /
+`not_written` / `draft_written` + a machine `reason` + per-reason ACTIONABLE copy) is
+threaded through `aggregator_replay_payload` and `_flush_pending_route_payload`
+(both previously bare bools) so **pending-bind replay** — which IS the fresh-session
+folder-trust case (a brand-new window's very first turn lands while Claude blocks on
+"Do you trust the files in this folder?") — surfaces the real reason instead of
+"failed to send". The photo/document handlers ack "sent" BEFORE the delayed flush can
+refuse, so the later notice must not contradict the ack — it names the reason.
+`REFUSAL_COPY` is exhaustive over `DELIVERY_REFUSAL_REASONS` (⊇
+`terminal_parser.INPUT_BOX_FAILURE_REASONS`), pinned by a STRICT key-set-equality
+test — the /cost busy-path precedent. Copy examples: prompt-present ⇒ "answer the
+card first (tap an option, or use the ↑/↓/⏎ keys), then resend"; not-Claude (M3) ⇒
+"Claude isn't running in this window … send /update to restart"; lone digit ⇒ "a
+message that is just a number can be read as a keypress by the terminal — send it
+with a word (e.g. `option 1`)". **Refused payloads are DROPPED with the notice,
+never auto-replayed.**
+
+**Observability (§1.6).** ONE INFO per refusal carrying the machine reason + the
+written-state outcome — **never pane text, never message content**. And a
+**non-exec `CLAUDE_COMMAND` wrapper** keeps the wrapper SHELL as the pane's
+foreground process, so `pane_current_command` reports the shell while Claude is
+alive ⇒ the gate would refuse EVERY message; `bot._warn_if_non_exec_claude_wrapper`
+detects the shape at startup (a `#!` script with no `exec` line) and logs a loud
+WARNING. CLAUDE.md already documents the same requirement for `/update`, where the
+failure mode is the DANGEROUS direction.
+
+**UNGATED by design:** `/esc`, the bash quick-keys, and the AUQ / Decision
+dispatchers key into a LIVE surface ON PURPOSE (they re-validate the pane form
+themselves and never send arbitrary text + Enter). They call `tmux_manager.send_keys`
+directly and must never route through this gate — it would refuse the very pane they
+target.
+
+**Disclosed residuals (bounded, NOT closed).** (1) **gate → write** (the M2 window):
+a prompt appearing between the gate capture and the first written byte can still take
+a keystroke. Mitigated by step 0 and empirically by the paste shape — a multi-char
+payload written in ONE `send-keys -l` is consumed paste-shaped and is **inert** (rig:
+`lets do 3 things first` left a live picker completely intact) — but the pty-chunking
+split of a multi-digit payload remains a NON-proof case. (2) **final capture → Enter**
+(the M1 window): one tmux round-trip. **No terminal protocol can make this atomic** —
+Claude redraws independently and a human attached to the session can act at any
+moment. This is the IDENTICAL residual the shipped `_dispatch_pick` /
+`_dispatch_decision` already accept and disclose. Transitional coexistence (a prompt
+drawn while stale bottom chrome is briefly still present) is part of the same
+disclosure — stable frames never coexist (rig), but redraws are not atomic. (3) At
+the PRE-write gate (no `expected_draft`) a HUMAN's own draft whose first visual row
+reads like a picker option (`❯ 1. buy milk`, typed in the terminal) fails leg 2 and
+the send is refused — fail-closed, and rare. The bot's OWN numbered payload is NOT
+affected (r2 F1). (4) A bot RESTART wipes the in-memory stranded-draft brake, so a
+draft stranded before the restart is no longer braked. (5) A stranded draft can only
+be cleared BY THE USER (no auto-Esc — surface-specific semantics), so a topic braked
+while the user is away stays braked; every refusal says exactly how to clear it.
+**What this honestly claims:** the
+danger window shrinks from *~500 ms + the full network/aggregator delay* (today the
+pane is checked, if at all, at *offer* time) to *one tmux round-trip*; every emitted
+literal segment that is a lone hotkey character is refused outright; and the remaining
+exposure is an acknowledged residual, not a proof of safety.
+
+PR-2 (the free-text lane — making an AUQ single-select / ExitPlanMode card actually
+answerable in prose, with the SGR-2 typed-state verifier and per-surface card copy)
+ships separately. Pull-only; no observer (c313657 stays forbidden).
 
 ## Tappable Decision dispatch (`dcp:` lane — Stage B2.3, flag `CC_TELEGRAM_DECISION_DISPATCH`)
 
@@ -1683,11 +2134,11 @@ None) → freshness guards (``has_interactive_surface`` OR
 answer that instead."; the PreToolUse hook writes the side file BEFORE a new
 picker renders, closing the JSONL-buffered-tool_use gap) → ``begin_send``
 single-use → sending-state edit with the keyboard REMOVED → the **effort.py
-route-ordering delivery subsequence ONLY** (aggregator flush → PRE-SEND
-``set_route_user_turn_at`` — the late answer is a genuine user turn, so
-live-prose turn-boundary + dashboard 🔔 semantics match a typed message →
-``send_to_window`` with the ``(bool, str)`` return honored →
-``mark_inbound_sent``). Success: "✅ Late answer sent: <label>"; failure:
+route-ordering delivery subsequence ONLY** (aggregator flush → the GH #50
+``UserTurnStamp`` pre-commit request — the late answer is a genuine user turn, so
+live-prose turn-boundary + dashboard 🔔 semantics match a typed message, but only
+when it is ACTUALLY delivered → ``send_to_window`` with the ``(bool, str)`` return
+honored → ``mark_inbound_sent``). Success: "✅ Late answer sent: <label>"; failure:
 single-use reset to live + the ORIGINAL keyboard re-attached for the retry
 tap (the reason effort.py is NOT copied line-for-line — it clears the
 keyboard pre-delivery). Delivery text (single line, ALL whitespace runs
@@ -2124,7 +2575,8 @@ cleanup alone would miss it; pre-C fix 3).
 `snapshot.last_assistant_turn_ended_at > snapshot.last_user_turn_at` — two
 WALL-CLOCK stamps on the same `time.time()` clock. `last_user_turn_at` is
 mirrored into route_runtime INSIDE `message_queue.set_route_user_turn_at`
-(single writer ⇒ same-ts by construction) at the PRE-SEND delivery seams;
+(single writer ⇒ same-ts by construction), fired inside the GH #50 gated
+delivery transaction immediately before the Enter — never on a refusal;
 `last_assistant_turn_ended_at` is written only by the authoritative
 end-of-turn branch from the event's JSONL timestamp, max-monotonic by event
 time (out-of-order resume/rewind events never regress it; `None` timestamp

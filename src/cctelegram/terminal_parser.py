@@ -3339,7 +3339,31 @@ def is_status_active(pane_text: str) -> bool:
 # The bottom-chrome ``──`` rule separator (≥20 dashes) — the SAME anchor
 # ``_find_chrome_separator`` trusts. Claude Code brackets its input box with a
 # PAIR of these (top + bottom); the input row lives strictly between them.
-_RE_RULE_SEPARATOR = re.compile(r"^─{20,}$")
+#
+# The TOP rule may carry a trailing LABEL (GH #50 rig, CC 2.1.207): a few seconds
+# after a plan is APPROVED, Claude pins the plan slug into it —
+#
+#     ───────────────────────────────────────────────── add-ok-to-note ──
+#     ❯
+#     ────────────────────────────────────────────────────────────────────
+#       ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+#
+# — and the label PERSISTS for the rest of the session (it survives later turns
+# and never decays; only ``/clear`` or a restart drops it). The pure-dash-only
+# ``^─{20,}$`` therefore stopped recognizing the input box in EVERY topic where
+# the owner approved a plan, which broke:
+#   - ``pane_looks_idle`` ⇒ ``/update`` never restarts that session and ``/cost``
+#     / ``/usage`` refuse their preflight (a PRE-EXISTING bug, rig-found here);
+#   - ``pane_input_box_present`` ⇒ the GH #50 delivery gate would refuse every
+#     message in that topic, permanently.
+# The label is plan-specific: a fresh session on a git branch renders a CLEAN
+# rule (rig ``control_gitrepo_branch_no_label.txt``), so this is not a branch
+# indicator. The BOTTOM rule stays pure — only the top one is labeled.
+#
+# The label segment is bounded to non-``─`` characters and must be re-closed by a
+# dash run, so an arbitrary body line can't pose as a rule. Fixture-pinned on
+# 2.1.207; a TUI-drift audit surface beside ``clean_ghost_input_text``.
+_RE_RULE_SEPARATOR = re.compile(r"^─{20,}(?:\s+[^─\s][^─]*\s+─+)?$")
 
 # Positive ready-for-input status-bar markers Claude Code renders BELOW the
 # input box when it is NOT running (the mode indicator, the shortcuts hint, the
@@ -3709,6 +3733,417 @@ def classify_pane_idle_failure(visible_pane: str | None) -> str | None:
     if jobs is not None and jobs >= 1:
         return "background_shells"
     return None
+
+
+# ── Ready-input-box proof (GH #50 — text on a live interactive surface) ──
+#
+# ``pane_input_box_present`` is the POSITIVE structural proof that Claude Code
+# is at its READY INPUT BOX — the one pane state where "type text, then press
+# Enter" is the correct action. It is the gate ``SessionManager.send_to_window``
+# runs before (and again after) writing a user payload.
+#
+# It is deliberately NOT ``pane_looks_idle``: that predicate additionally
+# requires the input row to be EMPTY and every non-blank row inside the box to
+# start with the prompt glyph — conditions we must NOT inherit here. Queueing a
+# message while Claude is BUSY is a first-class flow (rig A2: the rule-pair +
+# prompt row + ready chrome persist through every busy shape), and a
+# pre-existing / wrapped / multi-line draft must still deliver (rig D10:
+# continuation rows carry NO glyph).
+#
+# EMPIRICAL BASIS — CC 2.1.207 rig (2026-07-11, `temp/rig-20260711-s5/`,
+# fixture-pinned as ``inputbox_*_v2.1.207.txt`` / ``gate_*_v2.1.207.txt``). A
+# TUI-drift audit surface, like ``clean_ghost_input_text`` and
+# ``pane_command_is_claude``.
+
+# Leg 2 — the input-row prompt glyphs. ``❯`` in normal mode; ``!`` in Claude
+# Code's BASH mode (rig C9: ``!\xa0echo hi``). A ``❯``-only leg would refuse
+# EVERY ``!command`` payload. NOTE: the EMPTY input row is ``❯\xa0`` — a
+# NON-BREAKING space, not ASCII (``str.strip()`` removes it, ``\s`` matches it).
+_INPUT_PROMPT_GLYPHS: Final = ("❯", "!")
+
+# Leg 2 — the picker trap. A live AUQ picker's BOTTOM rule-pair CONTAINS its
+# option rows (``❯ 1. Red`` … ``4. Type something.``), so legs 1+2 would BOTH
+# pass on a live picker. A glyph row of this shape is a picker cursor, never a
+# ready prompt row.
+#
+# TWO NARROWINGS (r2 F1, both required — the unqualified trap FALSE-REFUSED any
+# message starting with ``1. ``, which the delivery gate then left as a stranded
+# draft, never sent):
+#
+#   (a) FIRST PROMPT ROW ONLY. The trap is a statement about the row the cursor
+#       is on, not about every glyph row in the box. (Continuation rows of a
+#       wrapped/multi-line draft carry no glyph, so in practice the first glyph
+#       row IS the only one — but scanning every row made a numbered line
+#       ANYWHERE in a multi-line draft trip it.)
+#   (b) PAYLOAD-AWARE. The delivery gate WRITES the payload and re-verifies
+#       AFTER, so an ordinary ``1. buy milk`` message legitimately renders the
+#       box as ``❯ 1. buy milk``. When the caller passes ``expected_draft`` and
+#       the first prompt row IS that draft (positive proof: a picker that stole
+#       the keystrokes would show ITS OWN label, never our text), the trap is
+#       SKIPPED. The PRE-write gate never passes ``expected_draft`` — there is
+#       no payload in the box yet, so a ``❯ 1. …`` row there is either a live
+#       picker or a human's own numbered draft, and refusing is fail-closed (the
+#       disclosed residual).
+#
+# SAFETY (measured, not asserted): with the trap disabled ENTIRELY, every
+# blocking pane in the 2.1.207 corpus is still refused by another leg (the AUQ
+# single picker by leg 3 ``no_ready_chrome`` — a live picker replaces the ready
+# status bar with its own ``Enter to select`` footer; every other blocking family
+# by leg 1 ``no_input_box``), and every deliverable pane still passes. The trap is
+# therefore kept as DEFENCE IN DEPTH for a hypothetical picker variant that
+# renders ready-chrome below its own footer — it is not the load-bearing leg, so
+# narrowing it costs no safety on the real corpus (pinned by
+# ``test_option_row_trap_is_redundant_on_the_real_corpus``).
+_RE_INPUT_OPTION_ROW: Final = re.compile(r"^[❯!]\s*\d+\.\s")
+# The same shape tested against a prompt row whose glyph has ALREADY been
+# stripped (``_prompt_row_content``). ``pane_blocking_prompt_shape`` keeps the
+# glyph-inclusive form above — it scans raw pane rows.
+_RE_OPTION_ROW_CONTENT: Final = re.compile(r"^\d+\.\s")
+
+# Leg 3 — the ready-for-input status chrome alphabet observed BELOW the box on
+# 2.1.207. A SUPERSET of ``_READY_STATUS_MARKERS``: ``esc to interrupt`` (a
+# BUSY-but-queueable pane) and ``! for shell mode`` (bash mode) are ready-input
+# chrome too — this gate never asserts idleness.
+_INPUT_READY_CHROME_MARKERS: Final = _READY_STATUS_MARKERS + (
+    "esc to interrupt",
+    "! for shell mode",
+)
+# ``· 1 shell ·`` — the background-shell status bar (rig D10).
+_RE_INPUT_READY_SHELL_TOKEN: Final = re.compile(r"·\s*\d+\s+shells?\b")
+
+# Leg 4 — the Enter-stealing background-tasks mode (rig §5 finding 1). One
+# ``Down`` at an empty box while a background shell exists arms a mode where
+# legs 1-3 ALL still pass but Enter is STOLEN: typed text is swallowed entirely
+# and Enter opens the Shell-details modal. Reachable in production — the bot's
+# own ungated nav keyboard sends ``Down``. (Esc reverts it.)
+_INPUT_TASKS_MODE_MARKER: Final = "Enter to view tasks"
+
+# The COMPLETE set of leg names ``classify_input_box_failure`` can return.
+# The refusal-copy map in ``session.py`` is exhaustiveness-tested against it.
+INPUT_BOX_FAILURE_REASONS: Final = frozenset(
+    {
+        "capture_empty",
+        "no_input_box",
+        "no_prompt_row",
+        "prompt_row_is_option",
+        "no_ready_chrome",
+        "tasks_mode",
+        "completion_overlay",
+    }
+)
+
+# The INDETERMINATE subset — a frame that may simply be mid-redraw. The delivery
+# gate RETRIES these; every other reason is a POSITIVE hazard and refuses on the
+# first capture (the /cost preflight precedent).
+INPUT_BOX_INDETERMINATE_REASONS: Final = frozenset(
+    {
+        "capture_empty",
+        "no_input_box",
+        "no_prompt_row",
+        "no_ready_chrome",
+    }
+)
+
+
+def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
+    """Locate the bottom rule-pair and return ``(top, bottom, non-blank rows)``.
+
+    ``None`` when fewer than two ``──`` rule separators are in the bottom scan
+    window (no rendered input-box bracket).
+    """
+    search_start = max(0, len(lines) - _CHROME_SCAN_LINES)
+    sep_idxs = [
+        i for i in range(search_start, len(lines)) if _is_rule_separator(lines[i])
+    ]
+    if len(sep_idxs) < 2:
+        return None
+    top, bottom = sep_idxs[-2], sep_idxs[-1]
+    rows = [lines[i].strip() for i in range(top + 1, bottom) if lines[i].strip()]
+    return top, bottom, rows
+
+
+def _prompt_row_content(rows: list[str]) -> str | None:
+    """The FIRST glyph row's text with the prompt glyph stripped, or ``None``.
+
+    ``None`` iff no row inside the input-box bracket starts with a prompt glyph.
+    Continuation rows of a wrapped / multi-line draft carry NO glyph (rig D10),
+    so the first glyph row is the row the cursor sits on.
+    """
+    for row in rows:
+        if row and row[0] in _INPUT_PROMPT_GLYPHS:
+            return row[1:].strip()
+    return None
+
+
+def _row_is_our_draft(
+    row: str | None, expected_draft: str | None, *, exact: bool
+) -> bool:
+    """True iff the input row's content is the payload WE just wrote.
+
+    Positive proof of authorship: a blocking prompt that stole our keystrokes
+    renders ITS OWN label in that row, never our text. Compared against the
+    FIRST LINE of the payload, because the terminal soft-wraps a long line across
+    continuation rows.
+
+    ``exact=False`` accepts the wrapped shape (the visual row is a PREFIX of our
+    first line) — used by the picker trap, where a prefix cannot be confused with
+    a picker label. ``exact=True`` demands the full first line and is used by the
+    ``/`` completion-overlay exemption, where a PREFIX is precisely the hazard
+    (a half-written ``/co`` arms the overlay and Enter would run ``/copy`` — GH
+    #53; the exemption must never be handed to a prefix).
+    """
+    if row is None or not expected_draft:
+        return False
+    first_line = expected_draft.split("\n", 1)[0].strip()
+    candidate = row.strip()
+    if not first_line or not candidate:
+        return False
+    if exact:
+        return candidate == first_line
+    return candidate == first_line or first_line.startswith(candidate)
+
+
+def _completion_overlay_armed(rows: list[str], *, allow_slash: bool) -> bool:
+    """True iff the input box's cursor token arms an Enter-STEALING overlay.
+
+    Rig §5 finding 2 (2.1.207): the completion overlay fires ONLY when the
+    cursor token is an active trigger —
+
+      - a trailing ``@prefix`` (``please ask @se`` ⇒ Enter selected ``seed.txt``
+        and the message was NEVER sent — this is live TODAY: any Telegram
+        message ending in ``@word`` strands unsent), or
+      - a bare ``/prefix`` (``/co`` ⇒ Enter executed ``/copy``).
+
+    A mid-text ``@alice``, an email address, and ``tell me about / division`` do
+    NOT trigger it, and a slash command WITH an argument (``/effort high``)
+    raises no overlay at all.
+
+    ``allow_slash`` exempts the ``/`` arm. It is set ONLY at the post-write
+    re-verify, and ONLY when the payload the bot just wrote IS itself a bare
+    ``/command`` **AND the input row's content IS that exact payload** (r2 F6 —
+    the caller AND-s ``allow_slash_completion`` with ``_row_is_our_draft(...,
+    exact=True)``): that overlay is the shipped slash-command mechanism
+    (``forward_command_handler`` has always relied on Enter running the
+    sorted-first entry, which for an EXACT command is the right one). Keying the
+    exemption on the payload SHAPE alone also exempted a PRE-EXISTING ``/co``
+    draft a human left in the box — Enter would then run ``/copy`` on text we
+    never authored. The bare-ambiguous-prefix misfire itself is GH #53, filed
+    separately and explicitly out of scope; this narrowing only refuses to WIDEN
+    it. The ``@`` arm is NEVER exempt — it is pure data loss.
+    """
+    if not rows:
+        return False
+    # The prompt row is the FIRST glyph row; continuation rows of a wrapped /
+    # multi-line draft carry no glyph (rig D10).
+    prompt_idx = next(
+        (i for i, s in enumerate(rows) if s and s[0] in _INPUT_PROMPT_GLYPHS),
+        None,
+    )
+    if prompt_idx is None:
+        return False
+    typed_rows = list(rows[prompt_idx:])
+    typed_rows[0] = typed_rows[0][1:].strip()  # drop the glyph
+
+    # ``/`` arm: a BARE ``/word`` — the whole input is one whitespace-free token.
+    if not allow_slash:
+        joined = " ".join(r for r in typed_rows if r)
+        if joined.startswith("/") and not any(c.isspace() for c in joined):
+            return True
+
+    # ``@`` arm: the LAST visual row's LAST token starts with ``@``.
+    last = next((r for r in reversed(typed_rows) if r), "")
+    tokens = last.split()
+    return bool(tokens) and tokens[-1].startswith("@")
+
+
+def classify_input_box_failure(
+    pane_text: str | None,
+    *,
+    allow_slash_completion: bool = False,
+    expected_draft: str | None = None,
+) -> str | None:
+    """Name the FIRST ``pane_input_box_present`` leg a pane fails, or ``None``.
+
+    ``None`` iff ``pane_input_box_present`` returns ``True`` (pinned by an
+    agreement test over every pane fixture — the ``classify_pane_idle_failure``
+    precedent). Never returns pane text — only a fixed leg name from
+    ``INPUT_BOX_FAILURE_REASONS``.
+
+    The five legs, in order:
+
+      1. the BOTTOM pair of ``──`` rule separators is present (``no_input_box``);
+      2. a genuine prompt row sits inside that pair — glyph ``❯`` or ``!`` — and
+         the FIRST such row is NOT a numbered picker-option row (``no_prompt_row``
+         / ``prompt_row_is_option``);
+      3. ready-for-input status chrome is present BELOW the box
+         (``no_ready_chrome``);
+      4. the status bar does NOT carry ``Enter to view tasks`` (``tasks_mode``);
+      5. no input-capturing completion overlay is armed (``completion_overlay``).
+
+    ``expected_draft`` is the payload the DELIVERY GATE just wrote into the box.
+    It is passed ONLY at the post-write re-verify and is PURE EVIDENCE of
+    authorship: when the first prompt row IS that draft, leg 2's picker trap is
+    skipped (an ordinary ``1. buy milk`` message must not be mistaken for a
+    picker cursor) and leg 5's ``/`` exemption is unlocked (only for the EXACT
+    payload — see ``_completion_overlay_armed``). It can never make a pane pass
+    that a picker owns: a picker that stole the keystrokes shows ITS label, not
+    our text, and legs 1/3 refuse it regardless.
+
+    Tolerates an ANSI capture (escapes are stripped locally) so the caller may
+    pass either form.
+    """
+    if not pane_text:
+        return "capture_empty"
+    lines = _strip_ansi(pane_text).split("\n")
+
+    # (1) The structural input-box bracket.
+    located = _input_box_rows(lines)
+    if located is None:
+        return "no_input_box"
+    _top, bottom, rows = located
+
+    # (2) A genuine prompt row inside the bracket — the FIRST glyph row is the
+    # row the cursor sits on.
+    prompt_row = _prompt_row_content(rows)
+    if prompt_row is None:
+        return "no_prompt_row"
+    if _RE_OPTION_ROW_CONTENT.match(prompt_row) and not _row_is_our_draft(
+        prompt_row, expected_draft, exact=False
+    ):
+        return "prompt_row_is_option"
+
+    # (3) Ready-for-input status chrome below the box.
+    below = "\n".join(lines[bottom + 1 :])
+    if not (
+        any(marker in below for marker in _INPUT_READY_CHROME_MARKERS)
+        or _RE_INPUT_READY_SHELL_TOKEN.search(below)
+    ):
+        return "no_ready_chrome"
+
+    # (4) The Enter-stealing background-tasks mode.
+    if _INPUT_TASKS_MODE_MARKER in below:
+        return "tasks_mode"
+
+    # (5) An input-capturing completion overlay. The ``/`` exemption needs BOTH
+    # a bare-slash payload (the caller's flag) AND positive proof the row holds
+    # exactly that payload (r2 F6) — a pre-existing human ``/co`` draft is never
+    # exempted.
+    allow_slash = allow_slash_completion and _row_is_our_draft(
+        prompt_row, expected_draft, exact=True
+    )
+    if _completion_overlay_armed(rows, allow_slash=allow_slash):
+        return "completion_overlay"
+
+    return None
+
+
+def pane_input_row_empty(pane_text: str | None) -> bool | None:
+    """Is Claude Code's input row EMPTY? ``None`` when it cannot be determined.
+
+    The self-heal probe for the delivery gate's stranded-draft brake (r2 F2): the
+    brake is released only on POSITIVE proof that the withheld draft is gone from
+    the box. ``None`` is INDETERMINATE and the caller must fail closed — an empty
+    capture, no rule-pair, no prompt row, or a prompt row of PICKER-OPTION shape
+    (a live picker's option rows sit inside a rule-pair too, so "the box exists"
+    cannot be concluded there — and the probe carries no payload evidence to tell
+    a picker cursor from a numbered draft).
+
+    Pre-cleans a CC ≥2.1.206 DIM ghost suggestion (``clean_ghost_input_text``,
+    the ``/update`` + ``/cost`` precedent) — a plain capture reads it as a typed
+    draft and would strand the brake forever. Continuation rows of a wrapped
+    draft carry no glyph, so every row from the prompt row down is inspected.
+    """
+    if not pane_text:
+        return None
+    lines = clean_ghost_input_text(pane_text).split("\n")
+    located = _input_box_rows(lines)
+    if located is None:
+        return None
+    _top, _bottom, rows = located
+    prompt_idx = next(
+        (i for i, s in enumerate(rows) if s and s[0] in _INPUT_PROMPT_GLYPHS), None
+    )
+    if prompt_idx is None:
+        return None
+    typed = list(rows[prompt_idx:])
+    typed[0] = typed[0][1:].strip()
+    if _RE_OPTION_ROW_CONTENT.match(typed[0]):
+        return None
+    return not any(t.strip() for t in typed)
+
+
+def pane_blocking_prompt_shape(pane_text: str | None) -> bool:
+    """True iff the pane's BOTTOM carries a live numbered-option cursor row.
+
+    A cheap, RECOGNIZER-FREE positive hazard signal (never authoritative — the
+    delivery gate's decision is always ``pane_input_box_present``). It exists so
+    a blocking surface the named recognizers miss — a folder-trust prompt with
+    the display kill-switches OFF, a Workflow gate, a never-shipped prompt — is
+    classified ``prompt_present`` (refuse IMMEDIATELY, with the actionable
+    "answer the card first" copy) instead of falling through the INDETERMINATE
+    retry path to generic "couldn't confirm the input box" copy.
+
+    Only consulted when the input-box proof has ALREADY failed, so a resolved
+    picker still sitting in scrollback ABOVE a live input box can never trip it.
+    """
+    if not pane_text:
+        return False
+    lines = [ln.strip() for ln in _strip_ansi(pane_text).split("\n")]
+    # A blocking prompt is drawn where the cursor is, so a full-height capture
+    # carries a run of TRAILING BLANK rows below it (rig: the folder-trust
+    # arrival pane has 22). Anchor on the last non-blank content, not on the raw
+    # bottom window (the input-box legs deliberately keep the raw window — a
+    # ready box always ends in its status bar).
+    while lines and not lines[-1]:
+        lines.pop()
+    tail = lines[max(0, len(lines) - _CHROME_SCAN_LINES) :]
+    return any(_RE_INPUT_OPTION_ROW.match(ln) for ln in tail if ln)
+
+
+def pane_input_box_present(
+    pane_text: str | None,
+    *,
+    allow_slash_completion: bool = False,
+    expected_draft: str | None = None,
+) -> bool:
+    """POSITIVE proof the pane is at Claude Code's READY INPUT BOX (GH #50).
+
+    The delivery gate for every user payload typed into a window. See
+    ``classify_input_box_failure`` for the five legs, ``expected_draft``'s
+    evidence role, and ``INPUT_BOX_FAILURE_REASONS`` for the leg names.
+
+    WHY THE INVERSION WORKS (rig-confirmed on all six blocking families —
+    AskUserQuestion single + multi, ExitPlanMode, folder-trust, ``Switch
+    model?``, Permission, Workflow): a live blocking prompt **REPLACES** the
+    input box + status chrome. The positive proof therefore fails on *every*
+    prompt — known, unknown, unparsed, half-drawn — WITHOUT the parser having to
+    recognize it. That matters: ``Switch model?`` is footer-less and
+    ``parse_generic_decision`` returns ``None`` for it, so a negative
+    formulation ("no known prompt matched") would deliver straight into it and
+    Enter would commit option 1.
+
+    The gate never consults ``_active_ui_patterns``, so it is
+    **flag-independent by construction** — the display kill-switches
+    (``CC_TELEGRAM_PERMISSION_PROMPTS`` / ``CC_TELEGRAM_DECISION_CARDS``) can
+    never reopen the hole.
+
+    Deliberately NOT asserted: no-active-run, background-shell absence, and
+    input-row emptiness (see the module comment above).
+
+    Accepted, disclosed residual: at the PRE-write gate (no ``expected_draft``),
+    a HUMAN's own draft whose first visual row reads like a picker option
+    (``❯ 1. buy milk``, typed in the terminal) fails leg 2 and the send is
+    refused — fail-closed, and rare. The bot's OWN numbered payload is NOT
+    affected: the re-verify passes ``expected_draft`` and skips the trap.
+    """
+    return (
+        classify_input_box_failure(
+            pane_text,
+            allow_slash_completion=allow_slash_completion,
+            expected_draft=expected_draft,
+        )
+        is None
+    )
 
 
 # ── Context-window indicator ─────────────────────────────────────────────
