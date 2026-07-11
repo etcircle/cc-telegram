@@ -119,6 +119,23 @@ def test_appender_keys_by_transcript_not_payload_session_id(cc_dir):
     ).exists()
 
 
+def test_appender_sidechain_transcript_isolated_from_parent_capture(cc_dir):
+    """An agent transcript stem gets its own capture file, never the parent."""
+    parent = _SID
+    agent = "agent-a1b2c3"
+    payload = _md_payload(
+        message_id="SIDECHAIN",
+        index=0,
+        final=True,
+        delta="agent prose",
+        transcript_path=f"/project/{agent}.jsonl",
+        session_id=parent,
+    )
+    assert _run_appender(payload, cc_dir).returncode == 0
+    assert (cc_dir / "msg_display" / f"{agent}.ndjson").exists()
+    assert not (cc_dir / "msg_display" / f"{parent}.ndjson").exists()
+
+
 def test_appender_appends_multiple_lines(cc_dir):
     _run_appender(_md_payload(message_id="M1", index=0, final=False, delta="a"), cc_dir)
     _run_appender(_md_payload(message_id="M1", index=1, final=True, delta="b"), cc_dir)

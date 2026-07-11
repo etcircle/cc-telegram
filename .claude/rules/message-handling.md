@@ -1872,6 +1872,39 @@ posts BEFORE the card. A prose-less picker (no streaming) bails at the base
 budget (zero added delay); a never-finalizing stream degrades to today's miss on
 expiry (card created, JSONL delivers) — never hangs, never churns, pull-only.
 
+**AUQ recap after a normal miss (GH #48, R2 only).** This path runs only for
+`AskUserQuestion`, only when normal finalized selection plus the existing
+stream-wait posted nothing, and before the 📋 question card; EPM and permission
+gates never enter it. The AUQ side file is read once atomically and supplies
+both `emitted_at` and the surface occurrence identity: non-empty `tool_use_id`
+is primary, otherwise `written_at!r` plus the FULL canonical content fingerprint
+forms the composite. No live side file means no guessed identity and a
+`no_anchor` miss. On first sight of surface S,
+`md_capture.get_or_create_surface_floor` appends a `surface_floor` marker with
+`render_at` and a frozen `floor_at` equal to the latest predecessor surface's
+render time; retries of S return the stored floor, while only S+1 uses S's
+render time. `effective_floor=max(not_before-or-0, floor_at-or-0)`.
+
+The freshest finalized record can recap only when `not_before` is non-None,
+`first_seen_at > effective_floor`, `final_at > not_before`, and
+`final_at < emitted_at - _EMIT_ANCHOR_LOOKBACK_S` (the normal anchor-reject
+class). Thus a record already considered at S cannot leak into a chained S+1,
+and a spanning record first seen before S but finalized after S is rejected at
+S+1. Restart loses the in-memory `not_before`, so recap deliberately fails
+closed; the card still renders and JSONL remains the delivery fallback.
+
+Delivery is best-effort, normally once. The source is headed
+`📌 Context (recap)` and divided by RENDERED MarkdownV2 cost using the same
+escape function as the expandable-quote renderer; every chunk has its own
+complete sentinel pair and uses `topic_send(plain=False)`, avoiding the
+renderer truncation path. After every chunk succeeds, a `recap_shown` marker
+keyed `(norm_hash, emitted_at)` is appended to the same session NDJSON. A send
+failure writes no marker and never blocks the card; retry may send again, and
+ambiguous Telegram completion can still duplicate cosmetically. Quiet
+(`digest_card=False`) suppresses recap. These `surface_floor` and `recap_shown`
+marker kinds do not participate in PR-D; `filter_live_prose_duplicates` and the
+finalized shown-live/consumed lane remain unchanged.
+
 **ExitPlanMode plan body BEFORE the card.** The EPM card carries no plan text
 (only "Claude has written up a plan … proceed?" + options + a `ctrl+g … ·
 ~/.claude/plans/<slug>.md` footer), and the plan BODY is the tool's `input.plan`
@@ -1912,9 +1945,11 @@ emit_anchor_lookback_s <= final_at <= emitted_at + emit_anchor_eps_s)`, all stil
 AND-ed with the `not_before` turn boundary below. The OR can only WIDEN over the
 TTL leg → provably non-regressive on the upper bound. The anchor SOURCE + its
 eps/lookback constants are selected by modality in `_maybe_post_live_prose`:
-**AUQ** → `auq_source.peek_side_file_written_at(session_id)` (the PreToolUse
-side-file `written_at` ≈ the tool_use invocation; read-TTL-free, future-skew
-guarded) with `_EMIT_ANCHOR_EPS_S` (2s) / `_EMIT_ANCHOR_LOOKBACK_S` (10s);
+**AUQ** → the `written_at` from one atomic
+`auq_source.read_side_file_for_recovery(session_id)` result (the PreToolUse
+side-file stamp ≈ the tool_use invocation; read-TTL-free, future-skew guarded;
+the same result also supplies recap surface identity) with
+`_EMIT_ANCHOR_EPS_S` (2s) / `_EMIT_ANCHOR_LOOKBACK_S` (10s);
 **ExitPlanMode** → `status_polling.peek_epm_surface_emitted_at(...)` (the poller's
 FIRST-DETECTION stamp — EPM has no side file) with `_EMIT_ANCHOR_EPS_EPM_S` (2s)
 / `_EMIT_ANCHOR_LOOKBACK_EPM_S` (30s). The EPM lookback is LARGER because its

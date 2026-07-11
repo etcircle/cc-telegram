@@ -1224,11 +1224,15 @@ class RecoverySideFile:
     ``source_fingerprint`` (NOT ``PreToolAskRecord.input_fingerprint``, a
     different 12-hex questions-content digest). ``payload`` is the side file's
     ``tool_input`` so recovery can reconstruct the FULL-options form (matching the
-    minted fingerprint even when the live pane is compressed).
+    minted fingerprint even when the live pane is compressed). ``tool_use_id``
+    and ``written_at`` come from that same validated file read, allowing callers
+    to derive an occurrence identity without a torn second read.
     """
 
     payload: dict
     source_fingerprint: str
+    tool_use_id: str
+    written_at: float
 
 
 def read_side_file_for_recovery(session_id: str) -> RecoverySideFile | None:
@@ -1251,6 +1255,8 @@ def read_side_file_for_recovery(session_id: str) -> RecoverySideFile | None:
     return RecoverySideFile(
         payload=record.tool_input,
         source_fingerprint=_canonical_dict_fingerprint(record.tool_input),
+        tool_use_id=record.tool_use_id,
+        written_at=record.written_at,
     )
 
 
@@ -1381,6 +1387,8 @@ def recover_consistent_side_file_for_ctx(window_id, pane_text):
     return RecoverySideFile(
         payload=record.tool_input,
         source_fingerprint=_canonical_dict_fingerprint(record.tool_input),
+        tool_use_id=record.tool_use_id,
+        written_at=record.written_at,
     )
 
 

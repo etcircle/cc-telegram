@@ -116,6 +116,12 @@ def _escape_mdv2(text: str) -> str:
     return _MDV2_ESCAPE_RE.sub(r"\\\1", text)
 
 
+def render_expandable_quote_untruncated(text: str) -> str:
+    """Render quote text exactly as the expandable-quote renderer, without cap."""
+    escaped = _escape_mdv2(text)
+    return "\n".join(f">{line}" for line in escaped.split("\n")) + "||"
+
+
 # Max rendered chars for a single expandable quote block.
 # Leaves room for surrounding text within Telegram's 4096 char message limit.
 _EXPQUOTE_MAX_RENDERED = 3800

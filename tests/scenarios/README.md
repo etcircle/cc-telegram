@@ -27,7 +27,7 @@ Run: `uv run pytest -m scenario -q`.
 | `test_tmux_restart.py` | Stale window IDs re-resolve via display names after tmux restart. **Includes one `xfail`** that surfaces a real ordering bug in `resolve_stale_ids()` (see "Wave A findings" below). |
 | `test_route_busy_lifecycle.py` | c313657 regression: a transcript event during the debounce window cancels the pending `route_runtime` pane-idle clear (re-arm). Inbound-sent and full-turn state walks too. |
 | `test_topic_close_cleanup.py` | Closing a topic kills the bound tmux window and unbinds. Idempotent against missing bindings / already-killed windows. |
-| `test_voice_upload_transcribe.py` | Voice → `transcribe_voice` substrate → `aggregator_offer_voice` with the transcription. Echo bubble sent. Missing API key surfaces a warning. |
+| `test_voice_upload_transcribe.py` | Voice duration → `transcribe_voice` substrate → `aggregator_offer_voice` with the transcription. Echo failure is cosmetic and cannot lose the delivered turn. Missing API key surfaces a warning. |
 | `test_document_upload.py` | Document → download → `aggregator_offer_document` (bound) or pending-attachment stash (unbound). Oversized files are rejected. |
 | `test_slash_command_flush.py` | `forward_command_handler` flushes the per-route aggregator bundle BEFORE forwarding the slash command, preserving arrival order at the pane. |
 | `test_kill_mid_tool_use.py` | `/kill` kills the window, unbinds, runs `clear_topic_state` (no leftover entries in `message_queue` topic-keyed maps), confirms with display name. |

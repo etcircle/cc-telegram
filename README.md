@@ -305,7 +305,7 @@ cc-telegram stores state under `$CC_TELEGRAM_DIR`, which defaults to `~/.cc-tele
 | `auq_action_ledger.jsonl` | Restart-safe action ledger that prevents duplicate option submissions. |
 | `pick_intent.jsonl` | Recovery data for the first tap on an AskUserQuestion card after a bot restart. |
 | `md_hook_settings.json` | Bot-managed MessageDisplay settings passed only to bot-created Claude sessions. |
-| `msg_display/<session_id>.ndjson` | Live prose captured by MessageDisplay before a prompt resolves. |
+| `msg_display/<session_id>.ndjson` | Live prose captured by MessageDisplay before a prompt resolves, plus same-lifecycle `shown_live`/`consumed`, `surface_floor`, and `recap_shown` marker lines. |
 | `images/` and `files/` | Downloaded Telegram attachments. Directories use mode `0700`; files use `0600`. |
 | `message_refs.db` | SQLite provenance index used for safe reply-context resolution. |
 | `log-archive/` | Compressed rotated launchd logs, when the rotation agent is installed. |
@@ -396,6 +396,15 @@ $CC_TELEGRAM_DIR/msg_display/<session_id>.ndjson
 
 The bot assembles and posts the explanation before the picker, then suppresses the duplicate copy when the resolved transcript arrives. Capture files are removed after resolution, session replacement, `/clear`, or topic closure, with startup garbage collection as a backstop.
 
+If an AskUserQuestion explanation is too old for the normal emission-anchor
+window but can still be proven to belong to the current delivered turn, the bot
+re-surfaces it immediately before the question as `📌 Context (recap)`. Each AUQ
+surface records a frozen predecessor floor in the same NDJSON file so findings
+from one question cannot leak into a chained question. Recaps are best-effort,
+normally once, and disabled by the quiet output preset. After a bot restart the
+in-memory turn boundary is unavailable, so recap fails closed; the question card
+still appears and the transcript remains the fallback delivery path.
+
 No global MessageDisplay hook is installed in `~/.claude/settings.json`.
 
 ## Voice transcription
@@ -408,6 +417,26 @@ Authorization: Bearer $OPENAI_API_KEY
 ```
 
 The transcription model is currently fixed to `gpt-4o-transcribe`. Your backend must expose that exact model name or translate it to one it supports.
+
+Each HTTP attempt has a real end-to-end deadline derived from Telegram's
+advisory voice duration: twice the note length, with a 120-second floor and a
+600-second ceiling. Missing, invalid, or implausible duration metadata uses the
+120-second floor. The same budget is also passed as the request timeout, so
+five-to-six-minute voice notes can finish without removing the overall bound.
+
+The bot retries at most once, and only when it can avoid blindly repeating a
+possibly completed paid request: a connection failure before upload, or an HTTP
+429 that explicitly declined the request. For 429 responses, integer
+`Retry-After` delays from 0 through 10 seconds are honored; a missing header uses
+1.5 seconds, while longer or malformed values are not retried. Read/write
+timeouts, other transport failures, other 4xx responses, 5xx responses, and
+empty transcriptions are never retried.
+
+At INFO level, voice processing logs receipt metadata (`duration_s`, byte count,
+and topic thread), successful latency plus transcription length, or a classified
+failure. Transcription text is never written to logs. If the optional Telegram
+echo fails after the turn has been offered to Claude, the failure is WARNING
+logged without dropping the turn.
 
 Examples of suitable backends include:
 
