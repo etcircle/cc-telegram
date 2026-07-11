@@ -250,11 +250,11 @@ def test_flag_off_no_detection(monkeypatch: pytest.MonkeyPatch, fixture: str) ->
     """Flag OFF with NO TELEGRAM_BOT_TOKEN in the environment →
     ``extract_interactive_content`` returns None for both gate panes. Proves
     the leaf reads a LOCAL env flag and never imports ``config`` (which would
-    raise without a token). The autouse reset leaves the flag OFF by default."""
+    raise without a token)."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("ALLOWED_USERS", raising=False)
-    monkeypatch.delenv("CC_TELEGRAM_PERMISSION_PROMPTS", raising=False)
-    tp.reset_for_tests()  # re-read env → OFF
+    monkeypatch.setenv("CC_TELEGRAM_PERMISSION_PROMPTS", "false")
+    tp.reset_for_tests()  # re-read explicit OFF
     assert tp.permission_prompts_enabled() is False
     assert extract_interactive_content(_load(fixture)) is None, fixture
 
@@ -510,8 +510,8 @@ def test_terminal_parser_imports_without_config_isolated() -> None:
         "leaf likely imports `config` at module load.\n"
         f"--- stderr ---\n{result.stderr}"
     )
-    # Flag OFF by default (no env var) — and the import had no config side effect.
-    assert result.stdout.strip() == "False", result.stdout
+    # Flag ON by default (no env var) — and the import had no config side effect.
+    assert result.stdout.strip() == "True", result.stdout
 
 
 # ── Round-2 Codex P1: a QUOTED gate + the input box / status bar REJECTS ───

@@ -89,7 +89,7 @@ When Claude asks a question or presents a plan, cc-telegram turns it into a Tele
 
 A tap does not blindly send a number and hope for the best. The bot moves the live terminal cursor, verifies that it reached the intended option, and only then presses Enter. If the screen changed before your tap arrived, the action is cancelled instead of risking the wrong choice.
 
-Permission and generic confirmation cards are available behind opt-in flags. They stay off by default until you explicitly enable them.
+Permission and generic confirmation cards are enabled by default. Either detector can be disabled explicitly through its environment flag.
 
 ### You can tell what the machine is doing
 
@@ -158,7 +158,7 @@ Every other slash command is forwarded to Claude Code. `/help` and `/memory` are
 - **Late answers.** Recent Claude Code versions may auto-resolve unanswered prompts after about 60 seconds. cc-telegram changes the card to explain what happened and lets you send your choice as a correction.
 - **Personal output settings.** `/settings` offers verbose, standard, compact, and quiet presets. Preferences are stored per user.
 - **Broken-topic fallback.** If Telegram reports that a topic was removed, closed, or forbidden, output falls back to DM instead of disappearing.
-- **Opt-in approval cards.** Permission prompts and generic decisions can be surfaced as cards. Verified one-tap dispatch is limited to prompt families and Claude Code versions that cc-telegram has explicitly characterised.
+- **Approval cards.** Permission prompts and generic decisions are surfaced as cards by default. Verified one-tap dispatch is limited to prompt families and Claude Code versions that cc-telegram has explicitly characterised.
 
 ## Single-user by design
 
@@ -223,8 +223,8 @@ Everything else has a default.
 - `CC_TELEGRAM_SHOW_HIDDEN_DIRS` shows dot-directories in the picker when true. Default: false.
 - `CC_TELEGRAM_HOOK_TIMEOUT` changes how long the bot waits for Claude's SessionStart hook. The built-in defaults are 5 seconds for fresh sessions and 15 seconds for resumed sessions. This is useful on slow WSL mounts or when several MCP servers delay startup.
 - `CC_TELEGRAM_WINDOW_GEOMETRY` sets the tmux geometry used by the parser. Default: `160x50`; accepted bounds are 20–500 columns and 5–300 rows.
-- `CC_TELEGRAM_PERMISSION_PROMPTS` surfaces tool permission prompts and Workflow launch gates as Telegram cards. Default: false.
-- `CC_TELEGRAM_DECISION_CARDS` surfaces otherwise unsupported numbered confirmation prompts as display-only cards. Default: false.
+- `CC_TELEGRAM_PERMISSION_PROMPTS` surfaces tool permission prompts and Workflow launch gates as Telegram cards. Default: true (set `CC_TELEGRAM_PERMISSION_PROMPTS=false` to disable).
+- `CC_TELEGRAM_DECISION_CARDS` surfaces otherwise unsupported numbered confirmation prompts as display-only cards. Default: true (set `CC_TELEGRAM_DECISION_CARDS=false` to disable).
 - `CC_TELEGRAM_DECISION_DISPATCH` enables verified one-tap dispatch for known-good decision families when decision cards are also enabled. Unknown prompts and uncharacterised Claude versions remain display-only.
 - `CC_TELEGRAM_ARTIFACT_MAX_MB` sets the maximum upload size for attachment cards and `/file`. Default: 45 MB; Telegram's bot limit is 50 MB.
 - `CC_TELEGRAM_ARTIFACT_ROOTS` adds comma-separated absolute directories that may serve files in addition to the active session directory.

@@ -182,7 +182,10 @@ class Config:
             )
             self.window_width, self.window_height = _geometry_default
 
-        # Interactive approval-gate cards (Permission / Workflow). Default OFF.
+        # Interactive approval-gate cards (Permission / Workflow). Default ON
+        # (since 2026-07-11 — the B2.4 owner canary PASS, GH #47); set
+        # ``=false`` to disable. NOTE an explicit UNRECOGNIZED value also parses
+        # false — only unset/empty inherits the ON default.
         # When ON, tool-permission prompts (bridged user-launched / resumed,
         # non-bypass sessions) and the Workflow tool's dynamic-workflow-launch
         # approval surface in Telegram as a card with the manual ↑/↓/⏎/Esc nav
@@ -196,10 +199,13 @@ class Config:
         # (``terminal_parser.set_permission_prompts_enabled``), making a
         # .env-only value reliable regardless of import order.
         self.permission_prompts_enabled = os.getenv(
-            "CC_TELEGRAM_PERMISSION_PROMPTS", ""
+            "CC_TELEGRAM_PERMISSION_PROMPTS", "true"
         ).strip().lower() in ("1", "true", "yes", "on")
 
-        # Generic decision-prompt cards (Stage B1). Default OFF. When ON, the
+        # Generic decision-prompt cards (Stage B1). Default ON (since
+        # 2026-07-11 — the B2.4 owner canary PASS, GH #47); set ``=false`` to
+        # disable. NOTE an explicit UNRECOGNIZED value also parses false — only
+        # unset/empty inherits the ON default. When ON, the
         # last-priority ``Decision`` pattern surfaces titled numbered-option
         # confirmation prompts that no NAMED interactive pattern covers (the
         # "Switch model?" confirmation / folder-trust family) as a display-only
@@ -214,7 +220,7 @@ class Config:
         # (``terminal_parser.set_decision_cards_enabled``), making a .env-only
         # value reliable regardless of import order.
         self.decision_cards_enabled = os.getenv(
-            "CC_TELEGRAM_DECISION_CARDS", ""
+            "CC_TELEGRAM_DECISION_CARDS", "true"
         ).strip().lower() in ("1", "true", "yes", "on")
 
         # Tappable Decision dispatch (Stage B2). Default OFF. When ON — AND the

@@ -21,6 +21,7 @@ preserves the kill-criterion signal: scenarios fail the bar only when the
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,14 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# B2.4 default flip (2026-07-11): production defaults for the two DETECTOR
+# flags are now ON; the suite floor pins them OFF so the existing scenario /
+# unit baseline stays today-shaped (the output_prefs verbose-pin precedent).
+# Tests that assert the NEW unset-env default delenv these and call
+# terminal_parser.reset_for_tests() locally.
+os.environ["CC_TELEGRAM_PERMISSION_PROMPTS"] = "false"
+os.environ["CC_TELEGRAM_DECISION_CARDS"] = "false"
 
 from cctelegram import bot as bot_module
 from cctelegram.handlers import inbound_telegram as inbound_module

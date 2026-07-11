@@ -207,7 +207,7 @@ def test_decision_pane_detected_flag_on(decision_on, fixture: str) -> None:
 
 @pytest.mark.parametrize("fixture", [_TRUST, _SWITCH])
 def test_decision_pane_no_detection_flag_off(fixture: str) -> None:
-    """Flag OFF (default) — the Decision pattern is filtered from the detector,
+    """Flag explicitly OFF — the Decision pattern is filtered from the detector,
     so a Decision pane produces NO detection (a provable no-op deploy)."""
     assert tp.decision_cards_enabled() is False
     assert extract_interactive_content(_load(fixture)) is None, fixture
@@ -558,23 +558,25 @@ def test_extract_title_none_decision_detected_flag_on(decision_on) -> None:
 # ── Flag seeding contract (Hermes P2-1) ───────────────────────────────────
 
 
-def test_reset_for_tests_resets_both_flags(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``reset_for_tests`` re-reads BOTH parser flags from the env (the reset
-    seam) so neither leaks between tests."""
+def test_reset_for_tests_re_reads_env_default_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset env is the production default, now ON, for both parser flags."""
     set_permission_prompts_enabled(True)
     set_decision_cards_enabled(True)
     monkeypatch.delenv("CC_TELEGRAM_PERMISSION_PROMPTS", raising=False)
     monkeypatch.delenv("CC_TELEGRAM_DECISION_CARDS", raising=False)
     tp.reset_for_tests()
-    assert tp.permission_prompts_enabled() is False
-    assert tp.decision_cards_enabled() is False
+    assert tp.permission_prompts_enabled() is True
+    assert tp.decision_cards_enabled() is True
 
 
 def test_decision_flag_env_re_read(monkeypatch: pytest.MonkeyPatch) -> None:
     """The Decision flag tracks ``CC_TELEGRAM_DECISION_CARDS`` on
     ``reset_for_tests`` (env truthiness), independent of the permission flag."""
     monkeypatch.setenv("CC_TELEGRAM_DECISION_CARDS", "on")
-    monkeypatch.delenv("CC_TELEGRAM_PERMISSION_PROMPTS", raising=False)
+    # Keep Permission explicitly OFF so this remains an independence test.
+    monkeypatch.setenv("CC_TELEGRAM_PERMISSION_PROMPTS", "0")
     tp.reset_for_tests()
     assert tp.decision_cards_enabled() is True
     assert tp.permission_prompts_enabled() is False
@@ -613,11 +615,18 @@ class TestConfigAndMainSeeding:
         assert Config().decision_cards_enabled is True
 
     @pytest.mark.usefixtures("_base_env")
-    def test_config_decision_cards_defaults_off(self, monkeypatch) -> None:
+    def test_config_decision_cards_defaults_on(self, monkeypatch) -> None:
         from cctelegram.config import Config
 
         monkeypatch.delenv("CC_TELEGRAM_DECISION_CARDS", raising=False)
-        assert Config().decision_cards_enabled is False
+        assert Config().decision_cards_enabled is True
+
+    @pytest.mark.usefixtures("_base_env")
+    def test_config_permission_prompts_defaults_on(self, monkeypatch) -> None:
+        from cctelegram.config import Config
+
+        monkeypatch.delenv("CC_TELEGRAM_PERMISSION_PROMPTS", raising=False)
+        assert Config().permission_prompts_enabled is True
 
     @pytest.mark.usefixtures("_base_env")
     def test_main_style_seed_overrides_import_time_read(self, monkeypatch) -> None:

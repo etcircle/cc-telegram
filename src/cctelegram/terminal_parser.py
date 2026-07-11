@@ -11,7 +11,8 @@ All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
 Permission / Workflow approval-gate detection is RE-ENABLED behind the
-``CC_TELEGRAM_PERMISSION_PROMPTS`` flag (default OFF). It was removed in
+``CC_TELEGRAM_PERMISSION_PROMPTS`` flag (default ON since 2026-07-11; explicit
+falsy value disables). It was removed in
 Wave 2 on the assumption the deployment always runs Claude Code with
 ``--dangerously-skip-permissions`` — but bridged user-launched (resumed,
 non-bypass) sessions DO render tool-permission prompts, and the ``Workflow``
@@ -24,12 +25,13 @@ remain detected unconditionally (they also appear in the JSONL stream as
 ``tool_use`` events and are detected via pane scrape as a redundant safety
 net).
 
-A SECOND, independent flag ``CC_TELEGRAM_DECISION_CARDS`` (default OFF) gates a
-last-priority generic ``Decision`` pattern (Stage B1) that surfaces titled
-numbered-option confirmation prompts no NAMED pattern covers (the "Switch
-model?" / folder-trust family) as a display-only card. It is strict-or-None
-with a Permission/Workflow veto so it never shadows a named pattern or
-re-surfaces a flag-OFF gate.
+A SECOND, independent flag ``CC_TELEGRAM_DECISION_CARDS`` (default ON since
+2026-07-11; explicit falsy value disables) gates a last-priority generic
+``Decision`` pattern (Stage B1) that surfaces titled numbered-option
+confirmation prompts no NAMED pattern covers (the "Switch model?" /
+folder-trust family) as a display-only card. It is strict-or-None with a
+Permission/Workflow veto so it never shadows a named pattern or re-surfaces a
+flag-OFF gate.
 
 Both flags are LOCAL ``os.getenv`` reads (``_PERMISSION_PROMPTS_ENABLED`` /
 ``_DECISION_CARDS_ENABLED``, re-readable via ``reset_for_tests`` /
@@ -75,8 +77,8 @@ logger = logging.getLogger(__name__)
 
 
 def _read_permission_prompts_env() -> bool:
-    """Truthiness of ``CC_TELEGRAM_PERMISSION_PROMPTS`` (default OFF)."""
-    return os.getenv("CC_TELEGRAM_PERMISSION_PROMPTS", "").strip().lower() in (
+    """Truthiness of the permission flag (default ON since 2026-07-11; falsy disables)."""
+    return os.getenv("CC_TELEGRAM_PERMISSION_PROMPTS", "true").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -105,16 +107,17 @@ def set_permission_prompts_enabled(value: bool) -> None:
 # ``config`` and calls ``set_decision_cards_enabled`` to dodge the import-order
 # race). When ON, the last-priority ``Decision`` ``UIPattern`` surfaces generic
 # titled numbered-option confirmation prompts (the "Switch model?" / folder-trust
-# family) that no NAMED pattern covers as a DISPLAY-ONLY card. Default OFF — a
-# flag-OFF deploy adds ZERO new detection (``_active_ui_patterns`` drops it).
+# family) that no NAMED pattern covers as a DISPLAY-ONLY card. Default ON since
+# 2026-07-11; an explicit falsy value disables it. A flag-OFF deploy adds ZERO
+# new detection (``_active_ui_patterns`` drops it).
 # ``config.py`` owns the canonical ``CC_TELEGRAM_DECISION_CARDS`` declaration for
 # docs / the README sync rule; the parser reads the same env var locally so it
 # stays a config-free stdlib leaf.
 
 
 def _read_decision_cards_env() -> bool:
-    """Truthiness of ``CC_TELEGRAM_DECISION_CARDS`` (default OFF)."""
-    return os.getenv("CC_TELEGRAM_DECISION_CARDS", "").strip().lower() in (
+    """Truthiness of Decision cards (default ON since 2026-07-11; falsy disables)."""
+    return os.getenv("CC_TELEGRAM_DECISION_CARDS", "true").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -436,9 +439,9 @@ _DECISION_PATTERN_NAME: Final[str] = "Decision"
 def _active_ui_patterns() -> list[UIPattern]:
     """``UI_PATTERNS`` with the flag-gated patterns filtered by their flags.
 
-    When ``CC_TELEGRAM_PERMISSION_PROMPTS`` is OFF (default) the ``Permission``
+    When ``CC_TELEGRAM_PERMISSION_PROMPTS`` is OFF the ``Permission``
     / ``Workflow`` patterns are excluded; when ``CC_TELEGRAM_DECISION_CARDS`` is
-    OFF (default) the ``Decision`` pattern is excluded. Each flag is
+    OFF the ``Decision`` pattern is excluded. Each flag is
     independent — a flag-OFF deploy adds NO detection, no card, no
     ``WAITING_ON_USER`` promotion for its patterns (gated at the DETECTOR).
     """
@@ -2467,7 +2470,8 @@ def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
     prompt (Stage B1 — the "Switch model?" confirmation, the folder-trust
     prompt, and peers that no NAMED pattern covers).
 
-    Behind the ``CC_TELEGRAM_DECISION_CARDS`` flag (default OFF) and ordered
+    Behind the ``CC_TELEGRAM_DECISION_CARDS`` flag (default ON since
+    2026-07-11; explicit falsy value disables) and ordered
     LAST in ``UI_PATTERNS`` (``extract_interactive_content`` reaches it only
     when every named pattern — AUQ / EPM / Settings / RestoreCheckpoint /
     Permission / Workflow — declined first-match-wins). All requirements
@@ -2506,8 +2510,8 @@ def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
     "Switch model?"); ``pane_excerpt`` spans that whole block → footer so the
     card body shows the heading + context + options (Hermes P3 / Codex).
 
-    ACCEPTED NARROW RESIDUAL (Codex P1 / Hermes P2, flag-OFF by default,
-    display-only): a QUOTED decision block that is the LITERAL last content in
+    ACCEPTED NARROW RESIDUAL (Codex P1 / Hermes P2, display-only): a QUOTED
+    decision block that is the LITERAL last content in
     the pane with NO ready-for-input chrome below it (no input box / status bar)
     passes ``_only_chrome_below`` and would surface + promote RUNNING→WAITING.
     In a REAL running pane the input box + status bar are ALWAYS below the prose

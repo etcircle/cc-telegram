@@ -240,7 +240,7 @@ async def test_decision_card_dismissed_once_gate_surface_publishes(
 
 @pytest.mark.asyncio
 async def test_flag_off_no_card_no_promotion(scenario: ScenarioHarness) -> None:
-    """With the gate flag OFF (default), a permission gate pane is NOT detected:
+    """With the suite-floor gate flag explicitly OFF, a gate pane is NOT detected:
     no card, and the route is NOT promoted to WAITING_ON_USER — a flag-OFF
     deploy adds zero new behavior (S-9, detector-level kill-switch)."""
     assert terminal_parser.permission_prompts_enabled() is False
