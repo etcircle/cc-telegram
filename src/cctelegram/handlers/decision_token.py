@@ -386,9 +386,10 @@ def invalidate_on_dispatch(window_id: str) -> None:
 # 2.1.204 (E1 digit-commits / E2 arrows-move-only / E3 Enter-commits — the
 # plan's 2.1.201 is SUPERSEDED); the committed shape fixtures are
 # ``decision_trust_folder_v2.1.200.txt`` + ``folder_trust_arrival_plain_v2.1.206.txt``
-# (the folder-trust prompt shape is version-stable, so the signature holds
-# across 2.1.20x — 2.1.206 is licensed in ``_DECISION_DISPATCH_TABLE`` below,
-# the B2.4 canary precondition).
+# + ``folder_trust_arrival_plain_v2.1.207.txt`` (the folder-trust prompt shape
+# is version-stable, so the signature holds across 2.1.20x — 2.1.206 and
+# 2.1.207 are licensed in ``_DECISION_DISPATCH_TABLE`` below, the B2.4 canary
+# precondition; the 2.1.207 rig re-run re-confirmed E2/E3).
 _FamilySignature = tuple[tuple[str, ...], "re.Pattern[str]"]
 
 _FAMILY_SIGNATURES: Final[dict[str, _FamilySignature]] = {
@@ -409,7 +410,15 @@ _DECISION_DISPATCH_TABLE: Final[dict[str, frozenset[str]]] = {
     # options ["Yes, I trust this folder", "No, exit"], footer
     # "Enter to confirm · Esc to cancel" — identical shape to 2.1.204, so the
     # existing family signature holds; B2.4 canary precondition).
-    "folder-trust": frozenset({"2.1.204", "2.1.206"}),
+    # 2.1.207 licensed from the real rig fixture
+    # ``folder_trust_arrival_plain_v2.1.207.txt`` (byte-identical folder-trust UI
+    # to 2.1.206 — same title/security-prose/options/footer). Live rig keystroke
+    # re-characterization on 2.1.207: arrows MOVE the ❯ cursor between option 1/2
+    # WITHOUT committing (the prompt stays painted), and Enter COMMITS on the
+    # highlighted option (the prompt disappears and Claude proceeds) — the E2/E3
+    # invariant holds, so the family signature + navigate→verify→Enter dispatch
+    # discipline carry; B2.4 canary precondition.
+    "folder-trust": frozenset({"2.1.204", "2.1.206", "2.1.207"}),
 }
 
 
