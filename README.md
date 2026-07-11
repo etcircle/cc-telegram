@@ -305,7 +305,7 @@ cc-telegram stores state under `$CC_TELEGRAM_DIR`, which defaults to `~/.cc-tele
 | `auq_action_ledger.jsonl` | Restart-safe action ledger that prevents duplicate option submissions. |
 | `pick_intent.jsonl` | Recovery data for the first tap on an AskUserQuestion card after a bot restart. |
 | `md_hook_settings.json` | Bot-managed MessageDisplay settings passed only to bot-created Claude sessions. |
-| `msg_display/<session_id>.ndjson` | Live prose captured by MessageDisplay before a prompt resolves. |
+| `msg_display/<session_id>.ndjson` | Live prose captured by MessageDisplay before a prompt resolves, plus same-lifecycle `shown_live`/`consumed`, `surface_floor`, and `recap_shown` marker lines. |
 | `images/` and `files/` | Downloaded Telegram attachments. Directories use mode `0700`; files use `0600`. |
 | `message_refs.db` | SQLite provenance index used for safe reply-context resolution. |
 | `log-archive/` | Compressed rotated launchd logs, when the rotation agent is installed. |
@@ -395,6 +395,15 @@ $CC_TELEGRAM_DIR/msg_display/<session_id>.ndjson
 ```
 
 The bot assembles and posts the explanation before the picker, then suppresses the duplicate copy when the resolved transcript arrives. Capture files are removed after resolution, session replacement, `/clear`, or topic closure, with startup garbage collection as a backstop.
+
+If an AskUserQuestion explanation is too old for the normal emission-anchor
+window but can still be proven to belong to the current delivered turn, the bot
+re-surfaces it immediately before the question as `📌 Context (recap)`. Each AUQ
+surface records a frozen predecessor floor in the same NDJSON file so findings
+from one question cannot leak into a chained question. Recaps are best-effort,
+normally once, and disabled by the quiet output preset. After a bot restart the
+in-memory turn boundary is unavailable, so recap fails closed; the question card
+still appears and the transcript remains the fallback delivery path.
 
 No global MessageDisplay hook is installed in `~/.claude/settings.json`.
 

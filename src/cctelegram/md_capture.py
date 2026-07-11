@@ -524,6 +524,144 @@ def select_fresh_prose(
     return fresh[-1] if fresh else None
 
 
+# ── AUQ recap surface markers + selection ───────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SurfaceFloor:
+    """Frozen predecessor floor for one AUQ surface occurrence."""
+
+    surface_id: str
+    render_at: float
+    floor_at: float | None
+
+
+def _read_marker_dicts(session_id: str, *, base_dir: Path | None = None) -> list[dict]:
+    """Read valid marker-shaped dicts from a capture file, best-effort."""
+    try:
+        raw = _resolve_session_path(session_id, base_dir).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return []
+    records: list[dict] = []
+    for line in raw.splitlines():
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("marker"), str):
+            records.append(rec)
+    return records
+
+
+def get_or_create_surface_floor(
+    session_id: str,
+    surface_id: str,
+    now: float,
+    *,
+    base_dir: Path | None = None,
+) -> SurfaceFloor:
+    """Return the frozen predecessor floor for ``surface_id``.
+
+    The first observation stores the latest *prior* surface's render instant.
+    Later observations of the same surface return that stored value, so neither
+    a failed picker retry nor a restart turns the current surface into its own
+    floor.
+    """
+    markers = _read_marker_dicts(session_id, base_dir=base_dir)
+    prior_render_ats: list[float] = []
+    for rec in markers:
+        if rec.get("marker") != "surface_floor":
+            continue
+        sid = rec.get("surface_id")
+        render_at = rec.get("render_at")
+        floor_at = rec.get("floor_at")
+        if not isinstance(sid, str) or not isinstance(render_at, (int, float)):
+            continue
+        if floor_at is not None and not isinstance(floor_at, (int, float)):
+            continue
+        if sid == surface_id:
+            return SurfaceFloor(
+                surface_id=sid,
+                render_at=float(render_at),
+                floor_at=None if floor_at is None else float(floor_at),
+            )
+        prior_render_ats.append(float(render_at))
+
+    floor_at = max(prior_render_ats) if prior_render_ats else None
+    marker = SurfaceFloor(surface_id=surface_id, render_at=now, floor_at=floor_at)
+    _append_json_line(
+        _resolve_session_path(session_id, base_dir),
+        {
+            "marker": "surface_floor",
+            "surface_id": surface_id,
+            "render_at": now,
+            "floor_at": floor_at,
+        },
+    )
+    return marker
+
+
+def select_recap_prose(
+    session_id: str,
+    *,
+    not_before: float | None,
+    effective_floor: float,
+    emitted_at: float,
+    emit_anchor_lookback_s: float,
+    base_dir: Path | None = None,
+) -> ProseRecord | None:
+    """Select the freshest finalized record eligible for an AUQ recap."""
+    if not_before is None:
+        return None
+    records = read_prose_records(session_id, base_dir=base_dir)
+    if not records:
+        return None
+    record = records[-1]
+    if (
+        record.first_seen_at <= effective_floor
+        or record.final_at <= not_before
+        or record.final_at >= emitted_at - emit_anchor_lookback_s
+    ):
+        return None
+    return record
+
+
+def record_recap_shown(
+    session_id: str,
+    *,
+    norm_hash: str,
+    emitted_at: float,
+    shown_at: float,
+    base_dir: Path | None = None,
+) -> None:
+    """Record a successfully delivered recap, keyed by prose + AUQ anchor."""
+    _append_json_line(
+        _resolve_session_path(session_id, base_dir),
+        {
+            "marker": "recap_shown",
+            "norm_hash": norm_hash,
+            "emitted_at": emitted_at,
+            "shown_at": shown_at,
+        },
+    )
+
+
+def was_recap_shown(
+    session_id: str,
+    *,
+    norm_hash: str,
+    emitted_at: float,
+    base_dir: Path | None = None,
+) -> bool:
+    """Whether this prose was already recapped for this exact AUQ anchor."""
+    return any(
+        rec.get("marker") == "recap_shown"
+        and rec.get("norm_hash") == norm_hash
+        and rec.get("emitted_at") == emitted_at
+        for rec in _read_marker_dicts(session_id, base_dir=base_dir)
+    )
+
+
 # ── Shown-live markers (the dedup bridge to the post-resolution JSONL copy) ──
 #
 # When the render path posts a captured prose live (before the picker card), it

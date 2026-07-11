@@ -41,9 +41,14 @@ def spies(monkeypatch):
     """Spy the two anchor sources + select_fresh_prose; return the recorders."""
     rec = {"auq": [], "epm": [], "sfp_kwargs": None}
 
-    def fake_written_at(session_id):
+    def fake_side_file(session_id):
         rec["auq"].append(session_id)
-        return 11111.0
+        return auq_source.RecoverySideFile(
+            payload={},
+            source_fingerprint="f" * 64,
+            tool_use_id="toolu_modality",
+            written_at=11111.0,
+        )
 
     def fake_epm(user_id, thread_id, window_id):
         rec["epm"].append((user_id, thread_id, window_id))
@@ -53,7 +58,7 @@ def spies(monkeypatch):
         rec["sfp_kwargs"] = kwargs
         return None  # no candidate → no posting; the retry loop is bounded
 
-    monkeypatch.setattr(auq_source, "peek_side_file_written_at", fake_written_at)
+    monkeypatch.setattr(auq_source, "read_side_file_for_recovery", fake_side_file)
     monkeypatch.setattr(status_polling, "peek_epm_surface_emitted_at", fake_epm)
     monkeypatch.setattr(md_capture, "select_fresh_prose", fake_sfp)
     monkeypatch.setattr(interactive_ui, "session_id_for_window", lambda _wid: _SID)

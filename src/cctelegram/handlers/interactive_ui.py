@@ -40,6 +40,7 @@ from typing import Any
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
 from ..config import config
+from ..markdown_v2 import convert_markdown, render_expandable_quote_untruncated
 from ..session import (
     peek_session_id_for_window,
     session_id_for_window,
@@ -57,6 +58,7 @@ from ..terminal_parser import (
     parse_generic_decision,
     visible_pane_liveness,
 )
+from ..transcript_parser import TranscriptParser
 from .. import md_capture
 from ..tmux_manager import tmux_manager
 from ..utils import atomic_write_json
@@ -2948,6 +2950,139 @@ _LIVE_PROSE_STREAM_WAIT_BUDGET_S = 3.0
 # requested maximum, including auto-closed fenced code blocks.
 _LIVE_PROSE_CHUNK_MAX = 4000
 
+_RECAP_HEADER = "📌 Context (recap)\n\n"
+# Stay below the expandable-quote renderer's 3800 cap with explicit headroom.
+_RECAP_RENDERED_MAX = 3750
+
+
+def _recap_message_source(text: str) -> str:
+    """Wrap one recap chunk in its own complete expandable-quote pair."""
+    return (
+        _RECAP_HEADER
+        + TranscriptParser.EXPANDABLE_QUOTE_START
+        + text
+        + TranscriptParser.EXPANDABLE_QUOTE_END
+    )
+
+
+def _recap_rendered_cost(text: str) -> int:
+    """Exact untruncated MarkdownV2 cost for one wrapped recap chunk."""
+    return len(convert_markdown(_RECAP_HEADER)) + len(
+        render_expandable_quote_untruncated(text)
+    )
+
+
+def _max_recap_prefix(text: str) -> int:
+    """Largest non-empty prefix fitting the rendered recap budget."""
+    lo, hi = 1, len(text)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _recap_rendered_cost(text[:mid]) <= _RECAP_RENDERED_MAX:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _split_recap_source(text: str) -> list[str]:
+    """Split source text by rendered MarkdownV2 cost without losing bytes."""
+    chunks: list[str] = []
+    current = ""
+    for source_line in text.splitlines(keepends=True):
+        if _recap_rendered_cost(current + source_line) <= _RECAP_RENDERED_MAX:
+            current += source_line
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        remainder = source_line
+        while remainder and _recap_rendered_cost(remainder) > _RECAP_RENDERED_MAX:
+            cut = _max_recap_prefix(remainder)
+            if cut <= 0:  # defensive: the header + one source char always fits
+                cut = 1
+            chunks.append(remainder[:cut])
+            remainder = remainder[cut:]
+        current = remainder
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+async def _maybe_post_auq_recap(
+    bot: Bot,
+    *,
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int,
+    window_id: str,
+    session_id: str,
+    not_before: float | None,
+    emitted_at: float | None,
+    surface_floor: md_capture.SurfaceFloor | None,
+) -> None:
+    """Best-effort AUQ-only recap after the normal live-prose path misses."""
+    from . import output_prefs
+
+    if emitted_at is None or surface_floor is None:
+        logger.debug("Bug2 recap miss window=%s reason=no_anchor", window_id)
+        return
+    if not output_prefs.resolve(user_id).digest_card:
+        logger.debug("Bug2 recap skip window=%s reason=quiet", window_id)
+        return
+    if not_before is None:
+        logger.debug("Bug2 recap miss window=%s reason=no_not_before", window_id)
+        return
+    effective_floor = max(not_before, surface_floor.floor_at or 0.0)
+    candidate = md_capture.select_recap_prose(
+        session_id,
+        not_before=not_before,
+        effective_floor=effective_floor,
+        emitted_at=emitted_at,
+        emit_anchor_lookback_s=md_capture._EMIT_ANCHOR_LOOKBACK_S,
+    )
+    if candidate is None or not candidate.text.strip():
+        logger.debug("Bug2 recap miss window=%s reason=provenance_reject", window_id)
+        return
+    if md_capture.was_recap_shown(
+        session_id, norm_hash=candidate.norm_hash, emitted_at=emitted_at
+    ):
+        logger.debug("Bug2 recap skip window=%s reason=already_shown", window_id)
+        return
+
+    chunks = _split_recap_source(candidate.text)
+    for chunk in chunks:
+        sent, _outcome = await topic_send(
+            bot,
+            op="content",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            text=_recap_message_source(chunk),
+            plain=False,
+            role="assistant",
+            content_type="text",
+            session_id=session_id,
+        )
+        if sent is None:
+            logger.debug("Bug2 recap miss window=%s reason=send_failed", window_id)
+            return
+    md_capture.record_recap_shown(
+        session_id,
+        norm_hash=candidate.norm_hash,
+        emitted_at=emitted_at,
+        shown_at=time.time(),
+    )
+    logger.info(
+        "Bug2 recap posted before AUQ card: window=%s session=%s len=%d chunks=%d",
+        window_id,
+        session_id[:8],
+        len(candidate.text),
+        len(chunks),
+    )
+
 
 async def _read_epm_plan_file(footer_path: str | None) -> str | None:
     """Read the ExitPlanMode plan file referenced in the pane footer.
@@ -3118,6 +3253,7 @@ async def _maybe_post_live_prose(
     #   * ExitPlanMode → the poller's first-detect stamp (EPM has no side file).
     # The poller stamp import is function-local: ``status_polling`` imports this
     # module at top, so the reverse edge must stay function-local.
+    surface_floor: md_capture.SurfaceFloor | None = None
     if ui_name == "ExitPlanMode":
         from .status_polling import peek_epm_surface_emitted_at
 
@@ -3127,7 +3263,23 @@ async def _maybe_post_live_prose(
         emit_lookback = md_capture._EMIT_ANCHOR_LOOKBACK_EPM_S
     else:
         ttl = md_capture.AUQ_PROSE_TTL_S
-        emitted_at = auq_source.peek_side_file_written_at(session_id)
+        # One validated side-file read supplies BOTH the anchor and occurrence
+        # identity, so a chained overwrite cannot mint a torn surface.
+        side_file = auq_source.read_side_file_for_recovery(session_id)
+        if (
+            side_file is not None
+            and time.time() - side_file.written_at
+            >= -auq_source._PRETOOL_FUTURE_SKEW_SECONDS
+        ):
+            emitted_at = side_file.written_at
+            surface_id = side_file.tool_use_id.strip() or (
+                f"{side_file.written_at!r}:{side_file.source_fingerprint}"
+            )
+            surface_floor = md_capture.get_or_create_surface_floor(
+                session_id, surface_id, time.time()
+            )
+        else:
+            emitted_at = None
         emit_eps = md_capture._EMIT_ANCHOR_EPS_S
         emit_lookback = md_capture._EMIT_ANCHOR_LOOKBACK_S
     # Item 3 / P2-1: the turn-boundary anchor — the wall-clock instant the bot
@@ -3206,6 +3358,18 @@ async def _maybe_post_live_prose(
                 ttl,
                 emitted_at,
                 nb,
+            )
+        if ui_name == "AskUserQuestion":
+            await _maybe_post_auq_recap(
+                bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                window_id=window_id,
+                session_id=session_id,
+                not_before=nb,
+                emitted_at=emitted_at,
+                surface_floor=surface_floor,
             )
         return
     # Already delivered live (re-render / poll re-detect / post-kickstart /
