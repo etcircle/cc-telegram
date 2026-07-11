@@ -116,6 +116,21 @@ async def clear_topic_state(
         # window reusing the id must not inherit it (kill_window also pops it;
         # this covers the close-without-kill path).
         tmux_manager.clear_window_quarantine(route[2], reason="topic teardown")
+        # GH #50 peer-review P1: the stranded-draft brake is DELIBERATELY NOT
+        # cleared here. Unlike everything else in this loop it is a property of
+        # the PANE'S CONTENTS, not of the topic binding — and this function does
+        # NOT imply the window is dead: ``/unbind`` routes through here and
+        # EXPLICITLY leaves the window running. Worse, this runs with no
+        # synchronization against ``window_send_lock``, so clearing the brake
+        # here let a send that had been BLOCKED on that lock the whole time (an
+        # already-popped boundary flush, a slash command) acquire it, find a
+        # structurally valid input box that still held the previous payload's
+        # unsent draft, append its own text and press Enter — committing BOTH,
+        # including the one the user was told was NOT delivered. The brake is
+        # released only on positive empty-box proof, or by tmux itself on a
+        # CONFIRMED kill_window / create_window (see the brake-lifecycle comment
+        # in ``tmux_manager``). Topic close / /kill DO kill the window, so the
+        # brake is dropped there — at the kill, under the right proof.
         await teardown_route(route, drop_pending=drop_pending)
 
     # Clear status message tracking

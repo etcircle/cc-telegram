@@ -27,6 +27,9 @@ import asyncio
 import io
 import json
 import logging
+import re
+import shlex
+import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -55,6 +58,7 @@ from telegram.ext import (
 )
 
 from .config import config
+from .delivery import UserTurnStamp
 from .rate_limiter import TypingAwareRateLimiter
 from .callback_dispatcher import DispatcherAdapters, dispatch_callback
 from .callback_dispatcher.effort import build_effort_keyboard as _build_effort_keyboard
@@ -138,7 +142,6 @@ from .handlers.message_queue import (
     enqueue_subagent_collapse,
     get_content_queue,
     probe_topic_liveness,
-    set_route_user_turn_at,
     shutdown_workers,
 )
 from . import message_refs
@@ -1282,13 +1285,39 @@ async def forward_command_handler(
     # Without this, the text+photo bundle would still be debouncing while
     # the slash command lands first in the tmux pane.
     route = (user.id, thread_id or 0, wid)
-    await aggregator_flush_route(route)
+    # ``report_refusal=False``: this handler INSPECTS the result and posts its own
+    # ❌ below, so it owns the SINGLE user-facing message (the aggregator would
+    # otherwise post a second one for the same event).
+    flushed = await aggregator_flush_route(route, report_refusal=False)
+    if not flushed.ok:
+        # GH #50 r2 F2(i): the forced flush was REFUSED, so the user's earlier
+        # message never reached the pane — and on a ``draft_written`` refusal it
+        # is still sitting in the input box with its Enter withheld. Sending the
+        # slash command now would either jump the queue (out of order) or be
+        # typed ONTO that stranded draft and commit both. Abort with the real
+        # reason — this reply IS the refusal's single disclosure.
+        logger.warning(
+            "forward_command: pre-flush refused for route %s (reason=%s) — "
+            "NOT forwarding %s",
+            route,
+            flushed.reason,
+            cc_slash,
+        )
+        await safe_reply(update.message, f"❌ {cc_slash} NOT sent — {flushed.message}")
+        return
 
-    # Item 3 / P2-1: stamp the user-turn delivery instant PRE-SEND — a forwarded
-    # slash command is a user turn that can make Claude produce prose + a picker,
-    # so the live-prose freshness gate needs this turn boundary.
-    set_route_user_turn_at(user.id, thread_id or 0, wid)
-    success, message = await session_manager.send_to_window(wid, cc_slash)
+    # GH #50 §1.5: the user-turn stamp now rides INSIDE the delivery transaction
+    # (fired after every gate passes, immediately before the Enter) so a REFUSED
+    # slash command is never stamped. A forwarded slash command is a user turn
+    # that can make Claude produce prose + a picker, so the live-prose freshness
+    # gate needs this turn boundary — but only on an ACTUAL delivery.
+    success, message = await session_manager.send_to_window(
+        wid,
+        cc_slash,
+        user_turn=UserTurnStamp(
+            user_id=user.id, thread_id=thread_id or 0, window_id=wid
+        ),
+    )
     if success:
         await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
         # Mark route busy so the typing loop has something to refresh while
@@ -1968,6 +1997,50 @@ async def _reconcile_window_geometry() -> None:
         logger.warning("Startup geometry reconcile failed: %s", e)
 
 
+def _warn_if_non_exec_claude_wrapper() -> None:
+    """Loudly warn when ``CLAUDE_COMMAND`` looks like a NON-EXEC shell wrapper.
+
+    GH #50 §1.6 compatibility contract. Every delivery now requires POSITIVE
+    proof of life (``pane_command_is_claude`` — the strict version-string
+    fullmatch), because a bare-shell pane would EXECUTE the payload. A shell
+    wrapper that launches Claude WITHOUT ``exec`` keeps the wrapper shell as the
+    pane's foreground process, so ``pane_current_command`` reports the SHELL
+    while Claude is alive — under which EVERY message would be refused.
+    ``CLAUDE_COMMAND`` must exec the binary directly (or via an exec-ing
+    wrapper); CLAUDE.md already documents the same requirement for ``/update``,
+    where the failure mode is the DANGEROUS direction (relaunching into a live
+    TUI).
+
+    Best-effort + fail-open: an unresolvable command, a real binary, or an
+    unreadable file all stay silent. Never raises.
+    """
+    try:
+        parts = shlex.split(config.claude_command)
+        if not parts:
+            return
+        resolved = shutil.which(parts[0])
+        if not resolved:
+            return
+        with open(resolved, "rb") as fh:
+            head = fh.read(2)
+            if head != b"#!":
+                return  # a real binary → pane_current_command reports Claude
+            fh.seek(0)
+            body = fh.read(64 * 1024).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return
+    if re.search(r"^\s*exec\s", body, re.MULTILINE):
+        return  # an exec-ing wrapper is fine — the shell is REPLACED
+    logger.warning(
+        "CLAUDE_COMMAND (%s) resolves to a shell script with no `exec` line. "
+        "A non-exec wrapper keeps the SHELL as the pane's foreground process, "
+        "so pane_current_command reports the shell while Claude is alive — the "
+        "delivery gate would then REFUSE every message ('Claude isn't running "
+        "in this window'). Make the wrapper `exec` the claude binary.",
+        config.claude_command,
+    )
+
+
 def _build_startup_gc_liveness_predicate(
     monitor: SessionMonitor,
 ) -> Callable[[str], bool]:
@@ -2136,6 +2209,10 @@ async def post_init(application: Application) -> None:
     # window to config.window_width x window_height. AFTER resolve_stale_ids
     # (window ids re-mapped), BEFORE the monitor/poller start.
     await _reconcile_window_geometry()
+
+    # GH #50 §1.6: a non-exec CLAUDE_COMMAND wrapper defeats the delivery gate's
+    # proof-of-life check and would refuse every message — warn loudly at startup.
+    _warn_if_non_exec_claude_wrapper()
 
     # Wave A (Bug A — duplicate picker on restart) requires the
     # SessionManager.window_states[wid].session_id field to be populated

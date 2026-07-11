@@ -5,6 +5,13 @@ is that two concurrent ``SessionManager.send_to_window`` calls on the SAME
 window serialize their whole text→settle→Enter transactions (strict
 textA, EnterA, textB, EnterB), while sends to DIFFERENT windows do not
 serialize against each other.
+
+GH #50: the transaction is now GATED — every send captures the pane, requires
+``pane_command_is_claude`` (proof of life on EVERY send, not just quarantined
+windows) plus ``pane_input_box_present``, writes the payload with the Enter
+WITHHELD, re-verifies, and only then sends the bare Enter. So the recording fake
+below sees TWO ``send_keys`` calls per delivery (the literal text, then the
+commit Enter), and every test must serve an idle-input-box pane.
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ import pytest
 from cctelegram import session as session_mod
 from cctelegram.session import session_manager
 from cctelegram.tmux_manager import TmuxManager, tmux_manager as real_tmux
+from tests.conftest import IDLE_PANE_V2_1_207
 
 Event = tuple[str, str, str]  # (phase, window_id, text)
 
@@ -28,22 +36,34 @@ def _recording_send(
     settle: float = 0.01,
     block_until: dict[str, asyncio.Event] | None = None,
 ):
-    """Fake ``tmux_manager.send_keys`` that records the text→Enter transaction.
+    """Fake ``tmux_manager.send_keys`` recording the GH #50 write→Enter phases.
 
-    Models the production literal+enter path (text, 500ms settle, Enter) with a
-    small await between the two phases so concurrent unserialized callers
-    provably interleave pre-fix.
+    The delivery transaction writes the payload literally with the Enter
+    WITHHELD, then commits with a bare Enter — two calls. The blocking await
+    sits on the TEXT phase so concurrent unserialized callers would provably
+    interleave pre-fix.
     """
 
     async def fake_send_keys(
         window_id: str, text: str, enter: bool = True, literal: bool = True
     ) -> bool:
-        events.append(("text", window_id, text))
-        if block_until is not None and window_id in block_until:
-            await block_until[window_id].wait()
-        else:
-            await asyncio.sleep(settle)
-        events.append(("enter", window_id, text))
+        if literal and not enter:
+            events.append(("text", window_id, text))
+            if block_until is not None and window_id in block_until:
+                await block_until[window_id].wait()
+            else:
+                await asyncio.sleep(settle)
+            return True
+        # The bare commit Enter — attribute it to the last text on this window.
+        last = next(
+            (
+                t
+                for phase, w, t in reversed(events)
+                if phase == "text" and w == window_id
+            ),
+            "",
+        )
+        events.append(("enter", window_id, last))
         return True
 
     return fake_send_keys
@@ -52,6 +72,25 @@ def _recording_send(
 async def _fake_find(window_id: str):
     await asyncio.sleep(0)  # a real lookup always yields at least once
     return SimpleNamespace(window_id=window_id)
+
+
+async def _idle_pane(
+    window_id: str, with_ansi: bool = False, scrollback_lines: int = 0
+):
+    return IDLE_PANE_V2_1_207
+
+
+@pytest.fixture(autouse=True)
+def _gate_passes(monkeypatch: pytest.MonkeyPatch):
+    """GH #50: serve an idle input-box pane + a live Claude so the gate passes.
+
+    Individual tests override ``pane_current_command`` where proof-of-life IS
+    the subject.
+    """
+    monkeypatch.setattr(real_tmux, "capture_pane_cancellation_safe", _idle_pane)
+    monkeypatch.setattr(
+        real_tmux, "pane_current_command", AsyncMock(return_value="2.1.207")
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -268,12 +307,15 @@ async def test_quarantined_window_query_failure_refuses(
 
 
 @pytest.mark.asyncio
-async def test_unquarantined_send_never_queries_pane(
+async def test_every_send_verifies_claude_is_running(
     monkeypatch: pytest.MonkeyPatch, _fresh_quarantine
 ) -> None:
-    """Zero overhead for normal windows: no pane_current_command subprocess."""
+    """GH #50 §1.2 step 2 (M3): proof of life is now checked on EVERY send, not
+    only on quarantined windows — ``/esc`` on a folder-trust prompt EXITS Claude
+    WITHOUT going through /update, so an unquarantined window can silently become
+    a bare shell that would EXECUTE the payload."""
     events: list[Event] = []
-    pcc = AsyncMock()
+    pcc = AsyncMock(return_value="2.1.207")
     monkeypatch.setattr(real_tmux, "find_window_by_id", _fake_find)
     monkeypatch.setattr(real_tmux, "send_keys", _recording_send(events))
     monkeypatch.setattr(real_tmux, "pane_current_command", pcc)
@@ -281,7 +323,30 @@ async def test_unquarantined_send_never_queries_pane(
     ok, _ = await session_manager.send_to_window("@1", "hello")
 
     assert ok is True
-    pcc.assert_not_awaited()
+    pcc.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unquarantined_shell_pane_refuses_send(
+    monkeypatch: pytest.MonkeyPatch, _fresh_quarantine
+) -> None:
+    """M3, the /esc-into-shell case: an UNQUARANTINED window whose pane is a bare
+    shell REFUSES — nothing is typed, and the copy names the fix."""
+    events: list[Event] = []
+    monkeypatch.setattr(real_tmux, "find_window_by_id", _fake_find)
+    monkeypatch.setattr(real_tmux, "send_keys", _recording_send(events))
+    monkeypatch.setattr(
+        real_tmux, "pane_current_command", AsyncMock(return_value="zsh")
+    )
+    assert real_tmux.window_quarantined("@1") is False
+
+    result = await session_manager.deliver_to_window("@1", "rm -rf ./scratch")
+
+    assert result.refused
+    assert result.reason == "not_claude"
+    assert result.outcome.value == "not_written"
+    assert "/update" in result.message
+    assert events == []  # nothing typed into the bare shell
 
 
 @pytest.mark.asyncio

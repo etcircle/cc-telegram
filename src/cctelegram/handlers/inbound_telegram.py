@@ -55,9 +55,10 @@ from telegram.constants import ChatAction
 from telegram.error import NetworkError
 from telegram.ext import ContextTypes
 
-from .. import route_runtime
+from .. import delivery, route_runtime
 from . import artifacts, decision_token, pane_signals, usage_cache
 from ..config import config
+from ..delivery import DeliveryResult
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import extract_bash_output, is_interactive_ui
@@ -287,15 +288,20 @@ def _delete_pending_attachment_files(attachments: list[PendingAttachment]) -> No
 async def _flush_pending_route_payload(
     route: tuple[int, int, str],
     user_data: dict | None,
-) -> bool | None:
+) -> DeliveryResult | None:
     """Synchronously replay the pending first-turn payload for a new binding.
 
-    Returns ``True`` when a pending payload was delivered, ``False`` when it
-    failed, and ``None`` when there was no pending payload. Pending picker state
-    is cleared before sending to make callback double-clicks idempotent; on
-    failure, route buffers are cleared and downloaded pending files are deleted
-    so the user gets an explicit resend prompt instead of a hidden retry that
-    could duplicate a manual resend.
+    Returns the STRUCTURED delivery result when a pending payload was attempted,
+    and ``None`` when there was no pending payload. GH #50 §1.4: the bare
+    ``bool`` discarded the reason, and this IS the fresh-session folder-trust
+    case — the very first message into a brand-new window lands while Claude is
+    blocked on "Do you trust the files in this folder?", so the refusal must
+    name it.
+
+    Pending picker state is cleared before sending to make callback
+    double-clicks idempotent; on failure, route buffers are cleared and
+    downloaded pending files are deleted so the user gets an explicit resend
+    prompt instead of a hidden retry that could duplicate a manual resend.
     """
     if user_data is not None and not _pending_owner_matches(user_data, route[1]):
         logger.warning(
@@ -325,19 +331,19 @@ async def _flush_pending_route_payload(
     ]
 
     try:
-        delivered = await aggregator_replay_payload(
+        result = await aggregator_replay_payload(
             route,
             text=pending_text if isinstance(pending_text, str) else None,
             attachments=replay_attachments,
         )
     except Exception as e:
         logger.error("pending route payload replay raised for route %s: %s", route, e)
-        delivered = False
+        result = delivery.refuse(delivery.REASON_SEND_FAILED, written=False)
 
-    if not delivered:
+    if not result.ok:
         aggregator_clear_route(route)
         _delete_pending_attachment_files(pending_attachments)
-    return delivered
+    return result
 
 
 def _get_thread_id(update: Update) -> int | None:
@@ -594,6 +600,15 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
+        # GH #50 peer-review P1: the stranded-draft brake is DELIBERATELY NOT
+        # cleared here. ``find_window_by_id`` reads the 1s ``list_windows``
+        # cache, so a transient tmux failure reports "gone" for a LIVE window —
+        # and this unbind holds no ``window_send_lock``, so dropping the brake
+        # would let a send already queued on that lock append to the leftover
+        # draft and commit both. A brake entry for a genuinely dead window is
+        # inert (``_deliver_locked`` refuses ``window_gone`` before it consults
+        # the brake) and is reaped by the real proofs: an empty-box capture, or
+        # tmux's own kill_window / create_window seams.
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -694,6 +709,15 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
+        # GH #50 peer-review P1: the stranded-draft brake is DELIBERATELY NOT
+        # cleared here. ``find_window_by_id`` reads the 1s ``list_windows``
+        # cache, so a transient tmux failure reports "gone" for a LIVE window —
+        # and this unbind holds no ``window_send_lock``, so dropping the brake
+        # would let a send already queued on that lock append to the leftover
+        # draft and commit both. A brake entry for a genuinely dead window is
+        # inert (``_deliver_locked`` refuses ``window_gone`` before it consults
+        # the brake) and is reaped by the real proofs: an empty-box capture, or
+        # tmux's own kill_window / create_window seams.
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -972,6 +996,15 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
+        # GH #50 peer-review P1: the stranded-draft brake is DELIBERATELY NOT
+        # cleared here. ``find_window_by_id`` reads the 1s ``list_windows``
+        # cache, so a transient tmux failure reports "gone" for a LIVE window —
+        # and this unbind holds no ``window_send_lock``, so dropping the brake
+        # would let a send already queued on that lock append to the leftover
+        # draft and commit both. A brake entry for a genuinely dead window is
+        # inert (``_deliver_locked`` refuses ``window_gone`` before it consults
+        # the brake) and is reaped by the real proofs: an empty-box capture, or
+        # tmux's own kill_window / create_window seams.
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -1261,6 +1294,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # P1: the vanished window's post-/exit quarantine dies with the
         # binding — a later window reusing the id must not inherit it.
         tmux_manager.clear_window_quarantine(wid, reason="stale-window unbind")
+        # GH #50 peer-review P1: the stranded-draft brake is DELIBERATELY NOT
+        # cleared here. ``find_window_by_id`` reads the 1s ``list_windows``
+        # cache, so a transient tmux failure reports "gone" for a LIVE window —
+        # and this unbind holds no ``window_send_lock``, so dropping the brake
+        # would let a send already queued on that lock append to the leftover
+        # draft and commit both. A brake entry for a genuinely dead window is
+        # inert (``_deliver_locked`` refuses ``window_gone`` before it consults
+        # the brake) and is reaped by the real proofs: an empty-box capture, or
+        # tmux's own kill_window / create_window seams.
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -1681,19 +1723,24 @@ async def _create_and_bind_window(
             pending_delivered = await _flush_pending_route_payload(
                 route, context.user_data
             )
-            if pending_delivered is False:
+            if pending_delivered is not None and not pending_delivered.ok:
+                # GH #50 §1.4: surface the REAL refusal reason — a brand-new
+                # window's very first turn lands on the folder-trust prompt.
                 await safe_edit(
                     query,
-                    f"✅ {message}\n\n{status}, but the first message failed to send. "
+                    f"✅ {message}\n\n{status}, but the first message was not "
+                    f"delivered.\n\n⚠️ {pending_delivered.message}\n\n"
                     "The pending payload was cleared; please resend it here.",
                 )
                 await safe_answer(
-                    query, f"{status}; first message failed", show_alert=True
+                    query, f"{status}; first message not delivered", show_alert=True
                 )
                 return
 
             first_turn_note = (
-                " First message sent." if pending_delivered is True else ""
+                " First message sent."
+                if pending_delivered is not None and pending_delivered.ok
+                else ""
             )
             await safe_edit(
                 query,

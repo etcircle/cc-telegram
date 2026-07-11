@@ -11,13 +11,32 @@ max-attachment cap. The flushed string follows the §2.8.2 shape: the user's
 typed text once, then a single ``(attachments: …)`` block with all paths in
 arrival order. The caption is never repeated per attachment.
 
+GH #50: every flush goes through the GATED ``session_manager.deliver_to_window``
+and returns a structured ``delivery.DeliveryResult`` (outcome + reason + copy),
+not a bare bool — so a refusal (a live blocking prompt, a non-Claude pane, a
+lone-digit payload, a withheld Enter) reaches the topic with its ACTUAL reason.
+The debounced flush is fire-and-forget and the photo/document handlers already
+acked "sent", so ``_report_delivery_refusal`` is the only thing standing between
+the user and a silently-dropped message. The user-turn stamp moved INSIDE the
+delivery transaction (``delivery.UserTurnStamp``) so a refusal is never stamped.
+
+REFUSAL OWNERSHIP is explicit and single (``report_refusal``). A FIRE-AND-FORGET
+flush (the debounce timer, the media-group boundary, the attachment cap) reports
+INSIDE the aggregator — nobody is awaiting its result. A SYNCHRONOUS caller that
+inspects the returned ``DeliveryResult`` and posts its own message — the three
+forced-flush callers (``bot.forward_command_handler``, ``callback_dispatcher/
+effort``, ``callback_dispatcher/late_answer``) and the pending-bind replay —
+passes ``report_refusal=False`` and owns the single response. Otherwise one
+refusal produced TWO ❌ messages. No path drops a refusal silently.
+
 Public surface:
   - ``aggregator_offer_text(route, text)``
   - ``aggregator_offer_voice(route, transcribed_text)``
   - ``aggregator_offer_photo(route, path, caption, media_group_id)``
   - ``aggregator_offer_document(route, path, caption, media_group_id)``
   - ``aggregator_replay_payload(route, text, attachments)`` — sync replay
-  - ``aggregator_flush_route(route)`` — public force-flush, returns delivery ok
+  - ``aggregator_flush_route(route, *, report_refusal=True)`` — public
+    force-flush → ``DeliveryResult``
   - ``aggregator_clear_route(route)`` — teardown hook (cancels pending flush)
 """
 
@@ -30,9 +49,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import delivery
 from ..config import config
-from ..session import QUARANTINE_SEND_REFUSED_MSG, session_manager
-from .message_queue import set_route_user_turn_at
+from ..delivery import DeliveryResult, UserTurnStamp
+from ..session import session_manager
 from .message_sender import safe_send
 
 logger = logging.getLogger(__name__)
@@ -163,8 +183,17 @@ def _pop_bundle_locked(route: Route) -> _PendingBundle | None:
     return bundle
 
 
-async def _report_quarantine_refusal(route: Route, bundle: _PendingBundle) -> None:
-    """Best-effort in-topic disclosure of a quarantine-refused delivery.
+async def _report_delivery_refusal(
+    route: Route, bundle: _PendingBundle, result: DeliveryResult
+) -> None:
+    """Best-effort in-topic disclosure of a REFUSED delivery (GH #50 §1.4).
+
+    Generalized from the quarantine-only notice: the debounced flush is
+    fire-and-forget (the Telegram handler returned long ago, and the photo /
+    document handlers have already acked "sent"), so ANY refusal — a live
+    blocking prompt, a non-Claude pane, a lone-digit payload, a withheld Enter —
+    must reach the topic with its ACTUAL, actionable reason. A refused payload
+    is DROPPED with the notice, never auto-replayed.
 
     Reuses the normal in-topic send path (``safe_send``) with the bundle's
     captured bot; the fail-closed lookups (no captured bot / unresolvable
@@ -180,48 +209,87 @@ async def _report_quarantine_refusal(route: Route, bundle: _PendingBundle) -> No
         await safe_send(
             bundle.bot,
             chat_id,
-            f"❌ {QUARANTINE_SEND_REFUSED_MSG}",
+            f"❌ {result.message}",
             message_thread_id=route[1] or None,
         )
     except Exception:
-        logger.exception("quarantine refusal notice failed for route %s", route)
+        logger.exception("delivery refusal notice failed for route %s", route)
 
 
-async def _send_bundle(route: Route, bundle: _PendingBundle) -> bool:
-    """Render and send a popped bundle. Caller must NOT hold the route lock."""
+async def _send_bundle(
+    route: Route, bundle: _PendingBundle, *, report_refusal: bool = True
+) -> DeliveryResult:
+    """Render and send a popped bundle. Caller must NOT hold the route lock.
+
+    Returns the STRUCTURED delivery result (outcome + reason + copy) so the
+    split replay and the pending-bind replay can surface the real reason instead
+    of a bare ``False`` (plan §2.3 / r4 P2-2).
+
+    ``report_refusal`` names the OWNER of the user-facing refusal message, so a
+    refusal reaches the user EXACTLY ONCE. ``True`` (the default) is the
+    FIRE-AND-FORGET flush — the debounce timer, the media-group boundary flush,
+    the attachment-cap flush: nobody is awaiting the result, the photo/document
+    handlers already acked "sent", so the aggregator itself must disclose. A
+    SYNCHRONOUS caller that INSPECTS the returned result and posts its own
+    message (``bot.forward_command_handler``, ``callback_dispatcher/effort``,
+    ``callback_dispatcher/late_answer``, and the pending-bind replay's callers)
+    passes ``False`` and owns the single response — otherwise the user gets TWO
+    ❌ messages for one event.
+
+    THE INVARIANT (peer-review P2): **every refusal — whether the transaction
+    RETURNED a refused ``DeliveryResult`` or RAISED — reaches the user exactly
+    once, on every flush path.** The raise arm used to build its result and
+    ``return`` it immediately, jumping over the reporting block below; on a
+    FIRE-AND-FORGET flush nobody awaits that result, so the popped payload
+    vanished with only a log line and the user was never told — the precise
+    opposite of the double-report ``report_refusal`` was introduced to fix, and
+    it now matters more, because a raise PAST a write attempt also arms the
+    stranded-draft brake (``session._WriteAttempt``): the user must be told why
+    their NEXT message will be refused too. So the raise arm assigns ``result``
+    and FALLS THROUGH to the one reporting seam. ``CancelledError`` is a
+    ``BaseException`` — it is not caught, and must never be reported as an
+    ordinary refusal.
+    """
     text_to_send = _format_bundle(bundle)
     if not text_to_send:
-        return True
+        return delivery.delivered("empty bundle")
 
     window_id = route[2]
-    # Item 3 / P2-1: stamp the user-turn delivery instant PRE-SEND (before
-    # send_to_window) so the turn boundary precedes any prose this turn streams —
-    # a fast prose→AUQ turn must not finalize its prose before the stamp lands,
-    # or the live-prose freshness gate would treat it as a prior turn's leftover.
-    set_route_user_turn_at(route[0], route[1], window_id)
+    # GH #50 §1.5: the user-turn stamp moved INSIDE the delivery transaction —
+    # it now fires after every gate passes and immediately before the Enter, so
+    # a REFUSED send is never stamped (the pre-send stamp here used to stamp
+    # every refusal). Timing is preserved: the boundary still precedes any prose
+    # this turn streams, so a fast prose→AUQ turn can't finalize its prose
+    # before the stamp lands.
+    stamp = UserTurnStamp(user_id=route[0], thread_id=route[1], window_id=window_id)
     try:
-        success, message = await session_manager.send_to_window(window_id, text_to_send)
-        if not success:
-            logger.warning(
-                "aggregator flush send_to_window failed for route %s: %s",
-                route,
-                message,
-            )
-            # P1 quarantine refusal: this flush is fire-and-forget (the
-            # Telegram handler returned long ago), so without an explicit
-            # notice the user would believe the message reached Claude.
-            # Scoped to the quarantine refusal — other failures keep the
-            # pre-existing log-only shape.
-            if message == QUARANTINE_SEND_REFUSED_MSG:
-                await _report_quarantine_refusal(route, bundle)
-            return False
+        result = await session_manager.deliver_to_window(
+            window_id, text_to_send, user_turn=stamp
+        )
     except Exception as exc:
         logger.error(
             "aggregator flush raised for route %s: %s",
             route,
             exc,
         )
-        return False
+        # NOT a bare return — fall through to the single reporting seam below.
+        # The NEUTRAL written-state copy is the right disclosure here: the raise
+        # may have landed before OR after the payload was typed, and if it landed
+        # after, the brake is now up and the user needs to know to clear the box.
+        result = delivery.refuse(delivery.REASON_SEND_FAILED, written=False)
+
+    if not result.ok:
+        logger.warning(
+            "aggregator flush delivery refused for route %s: reason=%s outcome=%s "
+            "reported_here=%s",
+            route,
+            result.reason,
+            result.outcome.value,
+            report_refusal,
+        )
+        if report_refusal:
+            await _report_delivery_refusal(route, bundle, result)
+        return result
 
     # Closes the gap between "prompt accepted" and "first transcript event":
     # the typing loop only refreshes RUNNING / RUNNING_TOOL routes, so
@@ -229,18 +297,18 @@ async def _send_bundle(route: Route, bundle: _PendingBundle) -> bool:
     from .. import route_runtime
 
     await route_runtime.mark_inbound_sent(route)
-    return True
+    return result
 
 
-async def _flush(route: Route) -> bool:
+async def _flush(route: Route, *, report_refusal: bool = True) -> DeliveryResult:
     """Send the buffered bundle to the bound tmux window and clear it."""
     async with _get_lock(route):
         bundle = _pop_bundle_locked(route)
 
     if bundle is None:
-        return True
+        return delivery.delivered("nothing pending")
 
-    return await _send_bundle(route, bundle)
+    return await _send_bundle(route, bundle, report_refusal=report_refusal)
 
 
 async def aggregator_offer_text(
@@ -360,7 +428,7 @@ async def aggregator_replay_payload(
     *,
     text: str | None,
     attachments: Sequence[AggregatorReplayAttachment],
-) -> bool:
+) -> DeliveryResult:
     """Synchronously send a pending first-turn payload and aggregate status.
 
     This is the safe replay path for unbound-topic payloads held while the user
@@ -374,21 +442,46 @@ async def aggregator_replay_payload(
     practical: pending text is included once at the front, captions are deduped
     per bundle, media-group boundaries split bundles, and the max-attachment cap
     still prevents unbounded bundle growth. Every split is sent via
-    ``_send_bundle`` sequentially and contributes to the returned boolean.
+    ``_send_bundle`` sequentially.
+
+    GH #50 §1.4: the return is the STRUCTURED result — the FIRST refusal wins
+    (so the pending-bind replay, which IS the fresh-session folder-trust case,
+    can surface the real reason instead of a bare ``False``); an all-delivered
+    replay returns the last success.
+
+    r2 F2(i): the replay STOPS at the first refusal. It used to keep sending the
+    remaining split bundles, which is wrong twice over — a refusal means the pane
+    would not take the payload (so the later splits are refused too, spamming the
+    topic with notices), and a ``draft_written`` refusal leaves the FIRST split
+    sitting unsent in the input box, so the NEXT split would be typed onto it and
+    its Enter would commit BOTH. (The per-window stranded-draft brake is the
+    backstop; this is the caller-side rule that keeps the ordering honest.)
     """
-    delivered = True
+    outcome: DeliveryResult = delivery.delivered("nothing to replay")
     bundle = _PendingBundle()
     max_attachments = max(1, config.aggregator_max_attachments)
 
     if text:
         bundle.text_parts.append(text)
 
-    async def send_current_bundle() -> None:
-        nonlocal bundle, delivered
+    async def send_current_bundle() -> bool:
+        """Send the in-progress bundle. False ⇒ REFUSED, the caller must stop."""
+        nonlocal bundle, outcome
         if not (bundle.text_parts or bundle.attachment_paths):
-            return
-        delivered = bool(await _send_bundle(route, bundle)) and delivered
+            return True
+        # The replay is SYNCHRONOUS and its callers (``_flush_pending_route_payload``
+        # → the two directory/session-picker bind seams) surface the returned
+        # reason in their own "first message not delivered" edit — so the
+        # aggregator must not also post one. Byte-neutral today (the replay's
+        # fresh ``_PendingBundle`` carries no ``bot``, which already suppressed
+        # the notice), but now the OWNERSHIP is explicit rather than accidental.
+        result = await _send_bundle(route, bundle, report_refusal=False)
         bundle = _PendingBundle()
+        if not result.ok:
+            outcome = result  # First refusal wins and ends the replay.
+            return False
+        outcome = result
+        return True
 
     for attachment in attachments:
         media_group_id = attachment.media_group_id
@@ -398,7 +491,8 @@ async def aggregator_replay_payload(
             and media_group_id != bundle.current_media_group_id
             and (bundle.attachment_paths or bundle.text_parts)
         ):
-            await send_current_bundle()
+            if not await send_current_bundle():
+                return outcome
 
         if attachment.caption and attachment.caption not in bundle.seen_captions:
             bundle.text_parts.append(attachment.caption)
@@ -408,21 +502,33 @@ async def aggregator_replay_payload(
             bundle.current_media_group_id = media_group_id
 
         if len(bundle.attachment_paths) >= max_attachments:
-            await send_current_bundle()
+            if not await send_current_bundle():
+                return outcome
 
     await send_current_bundle()
-    return delivered
+    return outcome
 
 
-async def aggregator_flush_route(route: Route) -> bool:
+async def aggregator_flush_route(
+    route: Route, *, report_refusal: bool = True
+) -> DeliveryResult:
     """Force-flush a route's bundle. Used by slash-command forwarders.
 
     Delegates straight to ``_flush`` so the pop and the cancel happen under
     a single lock acquisition — no reentrancy hazard, no race window where a
     concurrent offer can resurrect the bundle between cancel and send. Returns
-    ``False`` when the forced send was attempted but delivery failed.
+    the STRUCTURED delivery result (``ok`` False when the forced send was
+    attempted but refused/failed).
+
+    ``report_refusal=False`` transfers ownership of the user-facing refusal
+    message to the caller (see ``_send_bundle``). The three SYNCHRONOUS
+    forced-flush callers — ``bot.forward_command_handler``,
+    ``callback_dispatcher/effort``, ``callback_dispatcher/late_answer`` — all
+    inspect the returned result, ABORT their own send (the r2 F2(i) caller-abort
+    chain), and post their own ❌ with the real reason; without this they got a
+    SECOND ❌ from the aggregator for the same event.
     """
-    return await _flush(route)
+    return await _flush(route, report_refusal=report_refusal)
 
 
 def aggregator_clear_route(route: Route) -> None:

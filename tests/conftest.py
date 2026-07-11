@@ -42,6 +42,7 @@ os.environ["CC_TELEGRAM_DECISION_CARDS"] = "false"
 from cctelegram import bot as bot_module
 from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram import route_runtime, terminal_parser, transcript_event_adapter
+from cctelegram import session as session_module
 from cctelegram.session import session_manager as _real_sm
 from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
 from cctelegram.utils import app_dir
@@ -67,6 +68,29 @@ from cctelegram.handlers import (
 # ──────────────────────────────────────────────────────────────────────────
 
 
+# GH #50: every payload delivery is now GATED on POSITIVE structural proof that
+# the pane is at Claude Code's ready input box (``pane_input_box_present``) AND
+# on ``pane_command_is_claude`` (the strict version-string fullmatch). The fake
+# substrate must therefore model a REALISTIC pane by default, or every scenario
+# send would (correctly) refuse. These are the real CC 2.1.207 rig captures.
+_FIXTURES_DIR = Path(__file__).parent / "cctelegram" / "fixtures"
+
+
+def pane_fixture(name: str) -> str:
+    """Read one real captured tmux pane from ``tests/cctelegram/fixtures/``."""
+    return (_FIXTURES_DIR / name).read_text()
+
+
+IDLE_PANE_V2_1_207 = pane_fixture("inputbox_idle_v2.1.207.txt")
+# The version-string shape ``pane_current_command`` reports while the TUI runs.
+CLAUDE_PANE_COMMAND = "2.1.207"
+
+
+def auq_single_picker_pane() -> str:
+    """A LIVE AskUserQuestion single-select picker (CC 2.1.207 rig)."""
+    return pane_fixture("auq_single_picker_v2.1.207.txt")
+
+
 @dataclass
 class _PaneWindow:
     """In-memory representation of one fake tmux window."""
@@ -76,7 +100,7 @@ class _PaneWindow:
     cwd: str = "/tmp/test"
     pane_text: str = ""
     pane_text_ansi: str = ""
-    pane_current_command: str = "claude"
+    pane_current_command: str = CLAUDE_PANE_COMMAND
 
 
 @dataclass
@@ -95,6 +119,11 @@ class FakeTmux:
     create_calls: list[dict[str, Any]] = field(default_factory=list)
     create_response: tuple[bool, str] | None = None  # override for failure injection
     send_keys_response: bool | None = None  # override for failure injection
+    # GH #50: fired right AFTER a LITERAL (Enter-withheld) write, so a scenario
+    # can script the WRITE → RE-VERIFY race — the one window the delivery
+    # transaction genuinely closes, and the only way to reach ``draft_written``
+    # from the public Telegram seam.
+    on_write: Any | None = None
     _next_id: int = 0
 
     # ── seeding helpers ────────────────────────────────────────────────
@@ -104,9 +133,13 @@ class FakeTmux:
         window_id: str | None = None,
         window_name: str,
         cwd: str = "/tmp/test",
-        pane_text: str = "",
+        pane_text: str | None = None,
         pane_text_ansi: str = "",
     ) -> str:
+        # GH #50: default to the REAL idle input-box pane so the delivery gate
+        # passes. A test that wants a blocking surface passes it explicitly.
+        if pane_text is None:
+            pane_text = IDLE_PANE_V2_1_207
         if window_id is None:
             window_id = f"@{self._next_id}"
             self._next_id += 1
@@ -129,6 +162,34 @@ class FakeTmux:
         if w:
             w.pane_text = text
             w.pane_text_ansi = ansi if ansi is not None else text
+
+    def set_pane_command(self, window_id: str, cmd: str) -> None:
+        """Override the window's ``pane_current_command`` (GH #50 proof of life)."""
+        w = self.windows.get(window_id)
+        if w:
+            w.pane_current_command = cmd
+
+    # ── GH #50 delivery-transaction views ──────────────────────────────
+    @property
+    def written_texts(self) -> list[str]:
+        """Literal payload segments actually TYPED into a pane (Enter withheld)."""
+        return [
+            keys
+            for _wid, keys, enter, literal in self.sent_keys
+            if literal and not enter and keys
+        ]
+
+    @property
+    def committed(self) -> bool:
+        """True iff a bare Enter (the delivery commit key) was ever sent."""
+        return any(
+            keys == "" and enter and not literal
+            for _wid, keys, enter, literal in self.sent_keys
+        )
+
+    def delivered(self, text: str) -> bool:
+        """True iff ``text`` was typed AND committed with the Enter."""
+        return text in self.written_texts and self.committed
 
     def _to_tmux_window(self, w: _PaneWindow) -> TmuxWindow:
         return TmuxWindow(
@@ -172,6 +233,8 @@ class FakeTmux:
         literal: bool = True,
     ) -> bool:
         self.sent_keys.append((window_id, keys, enter, literal))
+        if literal and not enter and self.on_write is not None:
+            self.on_write()
         if self.send_keys_response is not None:
             return self.send_keys_response
         return window_id in self.windows
@@ -187,6 +250,11 @@ class FakeTmux:
         if not w:
             return ""
         return w.pane_text_ansi if with_ansi else w.pane_text
+
+    async def pane_current_command(self, window_id: str) -> str | None:
+        """GH #50: the delivery gate's proof-of-life query (every send)."""
+        w = self.windows.get(window_id)
+        return w.pane_current_command if w else None
 
     async def capture_pane_cancellation_safe(
         self,
@@ -749,6 +817,9 @@ def _reset_session_manager() -> None:
     _real_sm.group_chat_ids.clear()
     _real_sm.dashboards.clear()
     _real_sm.user_settings.clear()
+    # GH #50 r2 F2: the module-level stranded-draft brake (the delivery-gate
+    # sibling of the tmux quarantine registry) must not leak across tests.
+    session_module.reset_stranded_drafts_for_tests()
 
 
 def _reset_aggregator() -> None:
@@ -859,6 +930,7 @@ def fake_tmux(monkeypatch: pytest.MonkeyPatch) -> FakeTmux:
         "send_keys",
         "capture_pane",
         "capture_pane_cancellation_safe",
+        "pane_current_command",
         "create_window",
         "get_or_create_session",
         "get_session",
@@ -867,6 +939,22 @@ def fake_tmux(monkeypatch: pytest.MonkeyPatch) -> FakeTmux:
         if hasattr(fake, name):
             monkeypatch.setattr(_real_tmux, name, getattr(fake, name), raising=False)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _fast_delivery_settles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero the GH #50 delivery-transaction settles for the whole suite.
+
+    ``deliver_to_window`` reproduces ``send_keys``'s real timing (a 500 ms
+    text→Enter settle, a 1 s ``!`` bash-mode settle) plus a 300 ms retry gap on
+    an indeterminate frame. Real seconds in unit tests buy nothing; the timing
+    ITSELF is pinned by ``test_delivery_gate.py`` against the module constants.
+    """
+    from cctelegram import session as session_module
+
+    monkeypatch.setattr(session_module, "TEXT_SETTLE_S", 0.0)
+    monkeypatch.setattr(session_module, "BASH_MODE_SETTLE_S", 0.0)
+    monkeypatch.setattr(session_module, "GATE_RETRY_DELAY_S", 0.0)
 
 
 @pytest.fixture
@@ -931,7 +1019,7 @@ class ScenarioHarness:
         window_id: str | None = None,
         window_name: str,
         cwd: str = "/tmp/test",
-        pane_text: str = "",
+        pane_text: str | None = None,
         pane_text_ansi: str = "",
     ) -> str:
         return self.tmux.add_window(

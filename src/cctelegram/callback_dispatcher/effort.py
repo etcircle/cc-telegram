@@ -20,7 +20,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from cctelegram.handlers.callback_data import CB_EFFORT
 from cctelegram.handlers.inbound_aggregator import aggregator_flush_route
-from cctelegram.handlers.message_queue import set_route_user_turn_at
+from cctelegram.delivery import UserTurnStamp
 from cctelegram.handlers.message_sender import safe_edit
 
 from . import safe_answer, window_lease
@@ -104,14 +104,25 @@ async def execute_effort_callback(authorized: Any, adapters: Any) -> None:
         # Mirror forward_command_handler's send sequence so /effort follows
         # the same per-route ordering as a regular slash command.
         route = (user.id, cb_thread_id or 0, window_id)
-        await aggregator_flush_route(route)
-        # Item 3 / P2-1: stamp the user-turn delivery instant PRE-SEND, mirroring
-        # forward_command_handler. /effort itself is a config toggle that rarely
-        # streams prose + a picker, but stamping here keeps the turn boundary
-        # uniform across both slash-command delivery seams (zero-cost).
-        set_route_user_turn_at(user.id, cb_thread_id or 0, window_id)
+        # ``report_refusal=False``: the edit below IS the single user-facing
+        # disclosure for this refusal (the aggregator must not post a second ❌).
+        flushed = await aggregator_flush_route(route, report_refusal=False)
+        if not flushed.ok:
+            # GH #50 r2 F2(i): the forced flush was refused — the user's earlier
+            # message never landed (and may be stranded, unsent, in the input
+            # box). Sending /effort now would be typed onto it and commit both.
+            await safe_edit(query, f"❌ Effort NOT set — {flushed.message}")
+            return
+        # GH #50 §1.5: the user-turn stamp rides INSIDE the gated delivery
+        # transaction (immediately before the Enter), so a refused /effort is
+        # never stamped. Keeps the turn boundary uniform across the delivery
+        # seams (zero-cost).
         success, send_msg = await session_manager.send_to_window(
-            window_id, f"/effort {level}"
+            window_id,
+            f"/effort {level}",
+            user_turn=UserTurnStamp(
+                user_id=user.id, thread_id=cb_thread_id or 0, window_id=window_id
+            ),
         )
         if success:
             await route_runtime.mark_inbound_sent(route)

@@ -17,7 +17,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from cctelegram.delivery import UserTurnStamp
+
 from cctelegram import route_runtime
+from cctelegram import delivery
 from cctelegram.callback_dispatcher import late_answer as late_answer_exec
 from cctelegram.handlers import late_answer, message_queue
 from cctelegram.handlers.callback_data import CB_ASK_LATE
@@ -55,7 +58,7 @@ def _authorized(query: _FakeQuery, user_id: int, thread_id: int) -> SimpleNamesp
 
 
 @pytest.mark.asyncio
-async def test_aql_executor_stamps_user_turn_pre_send():
+async def test_aql_executor_passes_the_pre_commit_turn_stamp():
     user_id, thread_id, window_id = 1, 10, "@5"
     token = late_answer.mint_card(
         owner_id=user_id,
@@ -65,16 +68,14 @@ async def test_aql_executor_stamps_user_turn_pre_send():
         question="Which lane?",
         labels={1: "Lane A"},
     )
-    stamp_at_send: dict[str, float | None] = {}
+    seen: list[object] = []
 
-    async def send_to_window(_wid: str, _text: str):
-        # Capture the stamp AT the send instant — must already be there.
-        stamp_at_send["mq"] = message_queue.peek_route_user_turn_at(
-            user_id, thread_id, window_id
-        )
-        stamp_at_send["rr"] = route_runtime.snapshot(
-            (user_id, thread_id, window_id)
-        ).last_user_turn_at
+    async def send_to_window(_wid: str, _text: str, *, user_turn=None):
+        # GH #50 §1.5: the aql: seam no longer stamps PRE-SEND — it hands the
+        # gated delivery transaction a narrowly-typed stamp request, which the
+        # transaction fires immediately before the Enter (so a REFUSED late
+        # answer is never stamped).
+        seen.append(user_turn)
         return True, "ok"
 
     mark_inbound_sent = AsyncMock()
@@ -97,9 +98,8 @@ async def test_aql_executor_stamps_user_turn_pre_send():
         _authorized(query, user_id, thread_id), adapters
     )
 
-    assert stamp_at_send["mq"] is not None, "stamp missing at send time (post-send?)"
-    assert stamp_at_send["mq"] >= before
-    assert stamp_at_send["rr"] == stamp_at_send["mq"]
+    del before
+    assert seen == [UserTurnStamp(user_id, thread_id, window_id)]
     mark_inbound_sent.assert_awaited_once_with((user_id, thread_id, window_id))
     row = late_answer.lookup(token)
     assert row is not None and row.state == "consumed"
@@ -120,7 +120,7 @@ async def test_aql_executor_send_failure_no_mark_inbound_sent():
         labels={1: "Lane A"},
     )
 
-    async def send_to_window(_wid: str, _text: str):
+    async def send_to_window(_wid: str, _text: str, *, user_turn=None):
         return False, "Failed to send keys"
 
     mark_inbound_sent = AsyncMock()
@@ -198,7 +198,9 @@ async def test_aql_late_recheck_side_file_blocks_before_send(monkeypatch, tmp_pa
     token = _mint()
     side_file = app_dir() / "auq_pending" / f"{session_id}.json"
 
-    async def flush_writes_side_file(_route):
+    async def flush_writes_side_file(_route, *, report_refusal=True):
+        # The executor OWNS the single refusal message (GH #50 F2 fold).
+        assert report_refusal is False
         # A new AUQ's PreToolUse hook fires while the flush awaits.
         side_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         side_file.write_text(
@@ -220,7 +222,7 @@ async def test_aql_late_recheck_side_file_blocks_before_send(monkeypatch, tmp_pa
                 }
             )
         )
-        return True
+        return delivery.delivered("ok")
 
     monkeypatch.setattr(
         late_answer_exec, "aggregator_flush_route", flush_writes_side_file
@@ -259,9 +261,10 @@ async def test_aql_late_recheck_new_surface_blocks_before_send(monkeypatch):
     user_id, thread_id, window_id = 1, 10, "@5"
     token = _mint()
 
-    async def flush_creates_surface(_route):
+    async def flush_creates_surface(_route, *, report_refusal=True):
+        assert report_refusal is False
         interactive_ui._interactive_msgs[(user_id, thread_id)] = 999
-        return True
+        return delivery.delivered("ok")
 
     monkeypatch.setattr(
         late_answer_exec, "aggregator_flush_route", flush_creates_surface
@@ -330,7 +333,7 @@ async def test_aql_send_raise_leaves_row_in_flight(caplog):
     user_id, thread_id, window_id = 1, 10, "@5"
     token = _mint()
 
-    async def send_raises(_wid, _text):
+    async def send_raises(_wid, _text, *, user_turn=None):
         raise RuntimeError("tmux exploded mid-send")
 
     adapters = _adapters_with(send_raises)
@@ -387,3 +390,39 @@ async def test_aql_post_success_raise_keeps_row_consumed(caplog):
         "a delivered answer must stay consumed — resetting would double-send"
     )
     assert any("aql" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_aql_refused_pre_flush_blocks_the_late_answer(monkeypatch):
+    """GH #50 r2 F2(i): the forced aggregator flush was refused — the user's
+    earlier message never landed and may be sitting UNSENT in the input box.
+    The late answer must NOT be typed onto it (Enter would commit both); the card
+    is re-armed with its original keyboard so the user can retry after clearing.
+    """
+    user_id, thread_id, window_id = 1, 10, "@5"
+    token = _mint()
+    refusal = delivery.refuse(delivery.REASON_STRANDED_DRAFT, written=False)
+
+    async def refused_flush(_route, *, report_refusal=True):
+        # The aggregator must NOT also post a ❌ — the card edit below is the
+        # single disclosure (peer-review P2: one refusal, one message).
+        assert report_refusal is False
+        return refusal
+
+    monkeypatch.setattr(late_answer_exec, "aggregator_flush_route", refused_flush)
+    send = AsyncMock()
+    adapters = _adapters_with(send)
+    query = _FakeQuery(f"{CB_ASK_LATE}{window_id}:1:{token}")
+
+    await late_answer_exec.execute_late_answer_callback(
+        _authorized(query, user_id, thread_id), adapters
+    )
+
+    send.assert_not_called()
+    row = late_answer.lookup(token)
+    assert row is not None and row.state == "live"  # re-armed for a retry
+    # The card carries the REAL reason (MarkdownV2-escaped by safe_edit).
+    edited = "".join(
+        str(c.args) + str(c.kwargs) for c in query.edit_message_text.await_args_list
+    )
+    assert "still sitting UNSENT" in edited

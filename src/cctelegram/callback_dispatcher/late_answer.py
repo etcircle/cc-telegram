@@ -48,7 +48,7 @@ from cctelegram.handlers import auq_source, late_answer
 from cctelegram.handlers.callback_data import CB_ASK_LATE
 from cctelegram.handlers.inbound_aggregator import aggregator_flush_route
 from cctelegram.handlers.interactive_ui import has_interactive_surface
-from cctelegram.handlers.message_queue import set_route_user_turn_at
+from cctelegram.delivery import UserTurnStamp
 from cctelegram.handlers.message_sender import safe_edit
 
 from . import STALE_CALLBACK_TEXT, WRONG_USER_PICK_TEXT, safe_answer, window_lease
@@ -180,7 +180,22 @@ async def execute_late_answer_callback(authorized: Any, adapters: Any) -> None:
         # semantics identical to a typed message), send, then
         # mark_inbound_sent on success.
         route = (user.id, cb_thread_id or 0, window_id)
-        await aggregator_flush_route(route)
+        # ``report_refusal=False``: the card edit below carries the refusal to the
+        # user (single disclosure — the aggregator would otherwise post a second).
+        flushed = await aggregator_flush_route(route, report_refusal=False)
+        if not flushed.ok:
+            # GH #50 r2 F2(i): the forced flush was refused — the user's earlier
+            # message never landed (and may be stranded, unsent, in the input
+            # box). The late answer must not be typed onto it (Enter would commit
+            # both). Re-arm the card so the user can retry after clearing.
+            late_answer.finish_send(token, False)
+            await safe_answer(query)
+            await safe_edit(
+                query,
+                f"{base_text}\n❌ {flushed.message}",
+                reply_markup=_keyboard(window_id, row.labels, token),
+            )
+            return
 
         # [Codex P1 fold] LATE freshness re-check: the step-5 guards ran
         # before several awaits (the sending edit, the flush), so a new AUQ
@@ -203,10 +218,18 @@ async def execute_late_answer_callback(authorized: Any, adapters: Any) -> None:
             await safe_answer(query, NEWER_PROMPT_LIVE_TEXT, show_alert=True)
             return
 
-        set_route_user_turn_at(user.id, cb_thread_id or 0, window_id)
+        # GH #50 §1.5: the user-turn stamp rides INSIDE the gated delivery
+        # transaction (immediately before the Enter) — a late answer IS a genuine
+        # user turn, but only when it is actually delivered.
         text = late_answer.correction_message(row.question, label)
         send_attempted = True
-        success, send_msg = await session_manager.send_to_window(window_id, text)
+        success, send_msg = await session_manager.send_to_window(
+            window_id,
+            text,
+            user_turn=UserTurnStamp(
+                user_id=user.id, thread_id=cb_thread_id or 0, window_id=window_id
+            ),
+        )
         if success:
             # Commit the consumption FIRST (sync) — the answer WAS delivered;
             # a later raise (mark_inbound_sent / the ✅ edit) must never

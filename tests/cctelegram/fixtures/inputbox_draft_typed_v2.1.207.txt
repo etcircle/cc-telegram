@@ -1,0 +1,50 @@
+
+
+  Ran 1 shell command
+
+⏺ The command is running in the background (ID b0gdmnvo6). I'll report the output when it completes in ~25 seconds.
+
+✻ Cooked for 20s · 1 shell still running
+
+⏺ Background command "Sleep 25 seconds then echo done (background)" completed (exit code 0)
+
+  Read 1 file
+
+⏺ The command completed successfully with output: done (exit code 0).
+
+✻ Worked for 10s
+
+❯ Run this in the FOREGROUND (do NOT use run_in_background, do NOT background it): the exact bash command `sleep 30; echo finished`. Just run it and wait.
+
+  Ran 1 shell command
+
+⏺ The harness hard-blocked that call — foreground sleep chains are disallowed at the tool layer, and this is a system-level block I can't override or work
+  around (the block message explicitly forbids evading it, e.g. by chaining shorter sleeps, and swapping in a disguised sleep would be the same evasion).
+
+  So I can't run sleep 30; echo finished in the foreground as requested. The two harness-sanctioned alternatives are:
+
+  1. Background: run_in_background: true (what we did for the previous command) — you've ruled this out.
+  2. Monitor with an until-loop — but that's for waiting on a real condition, not a bare timed sleep.
+
+  If your goal is specifically to test/probe the foreground-sleep block, the result is: blocked, deterministically, with the same error both times. If you
+  actually need the 30-second wait to happen, let me know which alternative is acceptable.
+
+✻ Cogitated for 26s
+
+❯ Run this exact bash command in the foreground, verbatim, nothing else: awk "BEGIN{for(i=0;i<900000000;i++)x+=i;print x}"
+
+  Read 1 file
+
+⏺ The command ran in the foreground and completed. Output:
+
+  404999999167108992
+
+  That's awk's floating-point approximation of the sum 0+1+…+899,999,999 (the exact value is 404,999,999,550,000,000, but awk's 64-bit doubles lose precision at
+  that magnitude).
+
+✻ Churned for 1m 48s
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ hello this is a plain draft
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

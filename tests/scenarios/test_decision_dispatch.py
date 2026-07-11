@@ -379,6 +379,13 @@ async def test_clear_invalidates_decision_tokens_same_fp_reraise_refuses(
     assert decision_token.current_nav_generation(wid) is not None
 
     # Drive /clear through the public command seam (bot.forward_command_handler).
+    # GH #50: a slash command is REFUSED while a blocking prompt owns the pane
+    # (typing "/clear" + Enter into a live gate would COMMIT option 1), so the
+    # realistic sequence is: the user answers the prompt in the terminal, the
+    # pane returns to its input box, and THEN /clear rotates the session.
+    from tests.conftest import IDLE_PANE_V2_1_207
+
+    scenario.tmux.set_pane(wid, IDLE_PANE_V2_1_207)
     update = make_update_command("clear", thread_id=42)
     await bot_module.forward_command_handler(update, scenario.context)
 

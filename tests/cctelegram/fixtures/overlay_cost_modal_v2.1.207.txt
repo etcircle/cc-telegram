@@ -1,0 +1,50 @@
+
+⏺ The harness blocked the foreground sleep 25 && echo done (chained sleeps aren't allowed in the foreground). I'll run the same exact command in the background
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.92
+   Total duration (API):  1m 23s
+   Total duration (wall): 12m 59s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage by model:
+       claude-haiku-4-5:  531 input, 14 output, 0 cache read, 0 cache write ($0.0006)
+         claude-fable-5:  18 input, 2.5k output, 332.3k cache read, 23.2k cache write ($0.92)
+
+   Current session
+   ███████████▌                                       23% used
+   Resets 6:20pm (Europe/London)
+
+   Current week (all models)
+   ██████████████████████████████████▌                69% used
+   Resets Jul 13 at 7pm (Europe/London)
+
+   Current week (Fable)
+   ███████████████████████████████████████████        86% used
+   Resets Jul 13 at 7pm (Europe/London)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+   Last 24h · these are independent characteristics of your usage, not a breakdown
+
+   95% of your usage came from subagent-heavy sessions
+    Each subagent runs its own requests. Be deliberate about spawning them — and
+    consider configuring a cheaper model for simpler subagents.
+
+   84% of your usage was at >150k context
+    Longer sessions are more expensive even when cached. /compact mid-task, /clear
+    when switching to new tasks.
+
+   31% of your usage came from sessions active for 8+ hours
+    These are often background/loop sessions. Continuous usage can add up quickly
+    so make sure it is intentional.
+
+   21% of your usage came from subagents under "implementer"
+    If this runs frequently, consider configuring its subagents with a cheaper
+    model or tightening their prompts.
+
+   Skills                  % of usage
+   /self-curate                    4%                                                                                                                         ↓
