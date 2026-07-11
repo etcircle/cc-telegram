@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from cctelegram import route_runtime
+from cctelegram import route_runtime, terminal_parser
 from cctelegram.handlers import updater
 from cctelegram.monitor_state import TrackedSession
 from cctelegram.session_monitor import SessionMonitor
@@ -781,6 +781,41 @@ class TestRunUpdateEndToEnd:
         summary = reports[-1]
         assert "Restarted 0 idle" in summary
         assert "Deferred 1 busy: @1" in summary
+
+    @pytest.mark.asyncio
+    async def test_real_bgshell_fixture_still_defers(self, monkeypatch):
+        # The REAL 2.1.207 capture (idle, empty input box, ONE background
+        # shell). /cost now proceeds on this pane (it restarts nothing), but
+        # ``/update`` MUST keep deferring — the restart would ``/exit`` Claude
+        # and silently kill the user's backgrounded shell. This is the entire
+        # reason ``pane_looks_idle``'s leg 5 exists; the /cost carve-out
+        # (``allow_background_shells``) must never leak into this path.
+        pane = (FIX / "inputbox_bgshell_v2.1.207.txt").read_text(encoding="utf-8")
+        _patch_snapshot(monkeypatch, {})  # IDLE_CLEARED
+        sm = FakeSessionMgr([(1, 10, "@1")], window_states={"@1": _WS(session_id="s1")})
+        tmux = FakeTmux(windows={"@1"}, invoke_closures=True, pane=pane)
+        reports: list[str] = []
+
+        async def report(t):
+            reports.append(t)
+
+        await updater.run_update(
+            report=report,
+            session_mgr=sm,
+            tmux=tmux,
+            monitor=None,
+            claude_command="claude",
+            md_settings="",
+        )
+        summary = reports[-1]
+        assert "Restarted 0 idle" in summary
+        assert "Deferred 1 busy: @1" in summary
+        # And the ground-truth predicate itself still rejects that pane in the
+        # DEFAULT (/update) mode — the /cost carve-out is opt-in only.
+        assert terminal_parser.pane_looks_idle(pane) is False
+        assert (
+            terminal_parser.pane_looks_idle(pane, allow_background_shells=True) is True
+        )
 
     @pytest.mark.asyncio
     async def test_mid_loop_window_error_still_summarizes_remaining(self, monkeypatch):

@@ -23,13 +23,20 @@ class TestExhaustiveness:
         )
 
     def test_every_classifier_reason_maps_to_copy(self):
-        # Tie the canonical set to the CLASSIFIER's reason values: every leg
-        # name classify_pane_idle_failure can emit must land on a copy-mapped
-        # fallback reason — directly (positive hazards) or via the bot's
-        # indeterminate normalization (mid-redraw legs → chrome_indeterminate).
-        # A NEW classifier reason without copy fails here.
+        # Tie the canonical set to the CLASSIFIER's reason values FOR THIS
+        # LANE'S MODE: the /cost + /usage interceptor calls the classifier with
+        # allow_background_shells=True (leg 5 is /update-specific — it protects
+        # backgrounded shells from a session RESTART, which this read-only
+        # overlay never performs), so ``background_shells`` is UNREACHABLE here.
+        # Every leg the classifier CAN emit in that mode must land on a
+        # copy-mapped fallback reason — directly (positive hazards) or via the
+        # bot's indeterminate normalization (mid-redraw legs →
+        # chrome_indeterminate). A NEW classifier reason without copy fails here.
+        reachable = terminal_parser.pane_idle_failure_reasons(
+            allow_background_shells=bot_module._USAGE_ALLOW_BG_SHELLS
+        )
         checked = 0
-        for leg in terminal_parser.PANE_IDLE_FAILURE_REASONS:
+        for leg in reachable:
             normalized = (
                 "chrome_indeterminate" if leg in bot_module._INDETERMINATE_LEGS else leg
             )
@@ -38,7 +45,22 @@ class TestExhaustiveness:
                 "which has no mapped action copy"
             )
             checked += 1
-        assert checked >= 7  # guard against a vacuous pass
+        assert checked >= 6  # guard against a vacuous pass
+
+    def test_unreachable_background_shells_reason_carries_no_dead_copy(self):
+        # The map is NARROWED to the reasons this lane can actually produce, so
+        # the exhaustiveness guarantee above stays meaningful rather than
+        # carrying copy that can never render (and whose text — "the safety gate
+        # defers this until they finish" — would be a lie for a lane with no
+        # such gate). /update keeps the leg; it does not use this map.
+        assert bot_module._USAGE_ALLOW_BG_SHELLS is True
+        assert "background_shells" not in bot_module._USAGE_FALLBACK_ACTION
+        assert "background_shells" not in bot_module.USAGE_FALLBACK_REASONS
+        assert "background_shells" not in terminal_parser.pane_idle_failure_reasons(
+            allow_background_shells=True
+        )
+        # ...but it IS still a leg in the default (/update) mode.
+        assert "background_shells" in terminal_parser.pane_idle_failure_reasons()
 
     def test_classifier_reason_constant_matches_observed_legs(self):
         # The constant must cover every leg the classifier actually returns on
@@ -93,10 +115,6 @@ class TestReasonSpecificWording:
             line = bot_module.usage_fallback_action_line(reason).lower()
             assert "prompt" in line
             assert "answer" in line
-
-    def test_background_shells_says_defer(self):
-        line = bot_module.usage_fallback_action_line("background_shells").lower()
-        assert "background shell" in line
 
     def test_transient_reasons_say_try_again(self):
         for reason in ("lock_busy", "capture_failed", "capture_timeout"):

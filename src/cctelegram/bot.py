@@ -567,9 +567,10 @@ POST_SEND_CAPTURE_DEADLINE_S = 2.5
 
 # INDETERMINATE-frame preflight retry: up to this many EXTRA captures, spaced by
 # ``_PREFLIGHT_RETRY_SLEEP_S``, when the frame is a mid-redraw / empty capture
-# (no verdict yet). A POSITIVE hazard (active generation / live picker / draft /
-# background shells) refuses IMMEDIATELY with exactly ONE capture — retrying it
-# only wastes lock-held time and cannot change the verdict.
+# (no verdict yet). A POSITIVE hazard (active generation / live picker / draft)
+# refuses IMMEDIATELY with exactly ONE capture — retrying it only wastes
+# lock-held time and cannot change the verdict. A live background shell is
+# NEITHER: this lane opts the leg out entirely (see ``_USAGE_ALLOW_BG_SHELLS``).
 _PREFLIGHT_MAX_RETRIES = 2
 _PREFLIGHT_RETRY_SLEEP_S = 0.3
 
@@ -578,9 +579,23 @@ _PREFLIGHT_RETRY_SLEEP_S = 0.3
 # ``terminal_parser.classify_pane_idle_failure``.
 _INDETERMINATE_LEGS = frozenset({"capture_empty", "no_input_box", "no_ready_chrome"})
 
+# The /cost + /usage lane OPTS OUT of ``pane_looks_idle``'s background-shells leg
+# (leg 5). That leg is /update-SPECIFIC: /update sends ``/exit`` and RESTARTS the
+# session, which would silently kill the user's backgrounded shells, so it must
+# defer while any are live. The overlay interceptor restarts nothing — it types a
+# slash command into an idle input box, captures the modal, and presses Escape —
+# so a running background shell is irrelevant to the transaction. Passed to BOTH
+# the authority (``pane_looks_idle``) and the labelling call
+# (``classify_pane_idle_failure``) so the two stay in lockstep.
+_USAGE_ALLOW_BG_SHELLS = True
+
 # The canonical fallback-reason set — every reason a non-overlay exit can carry.
-# EXHAUSTIVE over the classifier's positive hazards + the transient/indeterminate
-# reasons. Pinned by an exhaustiveness test (a reason with no mapped copy fails).
+# EXHAUSTIVE over the classifier's positive hazards FOR THIS LANE'S MODE (see
+# ``terminal_parser.pane_idle_failure_reasons(allow_background_shells=True)`` —
+# ``background_shells`` is UNREACHABLE here and is deliberately NOT mapped, so
+# the exhaustiveness guarantee stays meaningful rather than carrying dead copy)
+# plus the transient/indeterminate reasons. Pinned by an exhaustiveness test (a
+# reason with no mapped copy — or copy for an unreachable reason — fails).
 USAGE_FALLBACK_REASONS = frozenset(
     {
         "lock_busy",
@@ -590,7 +605,6 @@ USAGE_FALLBACK_REASONS = frozenset(
         "input_not_empty",
         "interactive",
         "interactive_surface",
-        "background_shells",
         "chrome_indeterminate",
         "send_failed",
         "post_send_capture_failed",
@@ -620,9 +634,6 @@ _USAGE_FALLBACK_ACTION: dict[str, str] = {
     "interactive_surface": (
         "Answer the live prompt first (use the Telegram card if one is up, or "
         "the terminal), then retry."
-    ),
-    "background_shells": (
-        "Background shells are running — the safety gate defers this until they finish."
     ),
     "chrome_indeterminate": ("Couldn't read the terminal cleanly — try again."),
     "send_failed": "Couldn't send into the window — try again in a moment.",
@@ -714,6 +725,12 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
        Typing "/cost" + Enter into a live AUQ picker would COMMIT the highlighted
        option (round-1 converged P1). An INDETERMINATE mid-redraw frame retries
        (bounded); a POSITIVE hazard refuses IMMEDIATELY with one capture.
+       This lane passes ``allow_background_shells=True``: leg 5 of the idle proof
+       (the GH #43 ``· N shell`` token) is /update-SPECIFIC — it protects the
+       user's backgrounded shells from the session RESTART ``/update`` performs.
+       The overlay transaction restarts nothing, so a live background shell is
+       not a hazard for it (and the owner's constant background agents otherwise
+       made ``/cost`` refuse permanently). Every other leg still refuses.
     2. Send ``slash_command``, settle, capture (bounded by
        ``POST_SEND_CAPTURE_DEADLINE_S``).
     3. CONDITIONAL DISMISS — send Escape ONLY when the capture shows the
@@ -848,12 +865,19 @@ async def _run_usage_overlay(update: Update, slash_command: str, label: str) -> 
                         # decides whether a keystroke may be injected — the
                         # classifier is replay-only and must never authorize
                         # (classifier drift must stay a labeling bug, never a
-                        # wrong-keystroke risk).
-                        if pane_looks_idle(pane):
+                        # wrong-keystroke risk). This lane opts OUT of the
+                        # /update-specific background-shells leg (it restarts
+                        # nothing) — passed to BOTH calls so authority and
+                        # label stay in lockstep.
+                        if pane_looks_idle(
+                            pane, allow_background_shells=_USAGE_ALLOW_BG_SHELLS
+                        ):
                             return None  # idle → proceed
                         # Not idle. The classifier only NAMES the failing leg
                         # for the log + fallback copy.
-                        leg = classify_pane_idle_failure(pane)
+                        leg = classify_pane_idle_failure(
+                            pane, allow_background_shells=_USAGE_ALLOW_BG_SHELLS
+                        )
                         if leg is not None and leg not in _INDETERMINATE_LEGS:
                             return leg  # positive hazard → refuse immediately
                         # Indeterminate frame — or an authority/replay drift

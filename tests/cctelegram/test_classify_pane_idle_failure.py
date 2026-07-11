@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from cctelegram.terminal_parser import (
     classify_pane_idle_failure,
     pane_looks_idle,
@@ -101,6 +103,65 @@ class TestLegNaming:
         assert classify_pane_idle_failure(IDLE_PANE_AGENTS_BAR_NO_SHELLS) is None
 
 
+class TestBackgroundShellsOptOut:
+    """``allow_background_shells=True`` skips leg 5 ONLY (the /cost lane)."""
+
+    def test_bg_shells_pane_is_idle_when_leg_allowed(self):
+        assert (
+            pane_looks_idle(IDLE_PANE_BG_SHELLS, allow_background_shells=True) is True
+        )
+        assert (
+            classify_pane_idle_failure(
+                IDLE_PANE_BG_SHELLS, allow_background_shells=True
+            )
+            is None
+        )
+
+    def test_single_bg_shell_pane_is_idle_when_leg_allowed(self):
+        assert (
+            pane_looks_idle(IDLE_PANE_BG_SHELL_SINGULAR, allow_background_shells=True)
+            is True
+        )
+
+    def test_real_2_1_207_bgshell_fixture_is_idle_when_leg_allowed(self):
+        # The exact fixture that made /cost refuse ~100% of the time for the
+        # owner: an idle pane at an EMPTY input box with one background shell.
+        txt = (FIX / "inputbox_bgshell_v2.1.207.txt").read_text(encoding="utf-8")
+        assert pane_looks_idle(txt) is False  # /update still defers
+        assert classify_pane_idle_failure(txt) == "background_shells"
+        assert pane_looks_idle(txt, allow_background_shells=True) is True
+        assert classify_pane_idle_failure(txt, allow_background_shells=True) is None
+
+    def test_other_legs_still_refuse_when_bg_shells_allowed(self):
+        # Only leg 5 is skipped — every genuine hazard still refuses.
+        for pane, leg in (
+            (None, "capture_empty"),
+            ("", "capture_empty"),
+            (BUSY_PANE, "active_status"),
+            (IDLE_PANE_TYPED, "input_not_empty"),
+            (MIDREDRAW_NO_STATUS, "no_ready_chrome"),
+            (BODY_BLOCKQUOTE_MIDREDRAW, "no_input_box"),
+            (BLOCKQUOTE_BETWEEN_SEPARATORS, "input_not_empty"),
+        ):
+            assert pane_looks_idle(pane, allow_background_shells=True) is False
+            assert classify_pane_idle_failure(pane, allow_background_shells=True) == leg
+        picker = (FIX / "auq_4option_160x50_v2.1.198.txt").read_text(encoding="utf-8")
+        assert pane_looks_idle(picker, allow_background_shells=True) is False
+        assert (
+            classify_pane_idle_failure(picker, allow_background_shells=True)
+            == "interactive"
+        )
+
+    def test_classifier_never_names_background_shells_when_allowed(self):
+        # The reason is UNREACHABLE in that mode — the anchor for the /cost
+        # fallback copy map dropping the key.
+        for text in TestAgreementWithAuthority()._all_pane_fixtures():
+            assert (
+                classify_pane_idle_failure(text, allow_background_shells=True)
+                != "background_shells"
+            )
+
+
 class TestAgreementWithAuthority:
     """The classifier's None/non-None must NEVER disagree with pane_looks_idle."""
 
@@ -130,20 +191,29 @@ class TestAgreementWithAuthority:
         )
         return texts
 
-    def test_none_iff_pane_looks_idle_true(self):
+    @pytest.mark.parametrize("allow_bg", [False, True])
+    def test_none_iff_pane_looks_idle_true(self, allow_bg: bool):
+        # PARAMETRIZED over BOTH modes: the classifier and the authority must
+        # agree in lockstep whichever value of ``allow_background_shells`` the
+        # caller passes (/update = False, /cost + /usage = True).
         checked = 0
         for text in self._all_pane_fixtures():
-            authority = pane_looks_idle(text)
-            reason = classify_pane_idle_failure(text)
+            authority = pane_looks_idle(text, allow_background_shells=allow_bg)
+            reason = classify_pane_idle_failure(text, allow_background_shells=allow_bg)
             assert (reason is None) is authority, (
-                f"disagreement: pane_looks_idle={authority} but reason={reason!r} "
+                f"disagreement (allow_background_shells={allow_bg}): "
+                f"pane_looks_idle={authority} but reason={reason!r} "
                 f"for pane starting {text[:60]!r}"
             )
             checked += 1
         # Guard against a vacuous pass (no fixtures iterated).
         assert checked >= 12
 
-    def test_none_input_agreement(self):
+    @pytest.mark.parametrize("allow_bg", [False, True])
+    def test_none_input_agreement(self, allow_bg: bool):
         # None is not a str fixture but the authority accepts it.
-        assert pane_looks_idle(None) is False
-        assert classify_pane_idle_failure(None) is not None
+        assert pane_looks_idle(None, allow_background_shells=allow_bg) is False
+        assert (
+            classify_pane_idle_failure(None, allow_background_shells=allow_bg)
+            is not None
+        )

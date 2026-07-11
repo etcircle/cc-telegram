@@ -3572,7 +3572,9 @@ def _clean_ghost_input_line(raw_line: str) -> str:
     return prefix + " "
 
 
-def pane_looks_idle(visible_pane: str | None) -> bool:
+def pane_looks_idle(
+    visible_pane: str | None, *, allow_background_shells: bool = False
+) -> bool:
     """Ground-truth cross-check that a pane is idle at an EMPTY input box.
 
     The ``/update`` command's REQUIRED second gate beside
@@ -3606,6 +3608,18 @@ def pane_looks_idle(visible_pane: str | None) -> bool:
 
     Anything else returns False so ``/update`` DEFERS the window rather than risk
     ``/exit``-ing into live work.
+
+    ``allow_background_shells`` (default False — ``/update``'s behavior is
+    BYTE-IDENTICAL) SKIPS leg 5 ONLY. Leg 5 is a RESTART-specific guard: it
+    exists because ``/update`` sends ``/exit``, which would silently kill the
+    user's backgrounded shells. A caller that restarts NOTHING — the read-only
+    ``/cost`` + ``/usage`` overlay interceptor, which types a slash command into
+    an idle input box, captures the modal, and presses Escape — has no such
+    hazard, and a running background shell is simply irrelevant to it (the
+    owner's background agents kept ``· N shell`` on the status bar permanently,
+    so ``/cost`` refused ~100% of the time). Every OTHER leg is unchanged: an
+    active generation, a live interactive surface, a typed draft, and missing
+    ready chrome still refuse in BOTH modes.
     """
     if not visible_pane:
         return False
@@ -3643,17 +3657,21 @@ def pane_looks_idle(visible_pane: str | None) -> bool:
     if not any(marker in below for marker in _READY_STATUS_MARKERS):
         return False
     # (5) Live background shells (GH #43 `· N shell` chrome token) → a restart
-    # would silently kill them. None/0 never block (see the docstring).
-    jobs = parse_background_jobs(visible_pane)
-    if jobs is not None and jobs >= 1:
-        return False
+    # would silently kill them. None/0 never block (see the docstring). SKIPPED
+    # for a caller that restarts nothing (``allow_background_shells``).
+    if not allow_background_shells:
+        jobs = parse_background_jobs(visible_pane)
+        if jobs is not None and jobs >= 1:
+            return False
     return True
 
 
 # The COMPLETE set of leg names ``classify_pane_idle_failure`` can return
-# (non-None). The /cost fallback copy map is exhaustiveness-tested against this
-# set — adding a new leg name to the classifier without mapped action copy in
-# ``bot._USAGE_FALLBACK_ACTION`` (directly or via the bot's indeterminate
+# (non-None) with the background-shells guard ENGAGED (the default /update
+# mode). The /cost fallback copy map is exhaustiveness-tested against the
+# reason set for ITS mode (``pane_idle_failure_reasons(allow_background_shells=
+# True)``) — adding a new leg name to the classifier without mapped action copy
+# in ``bot._USAGE_FALLBACK_ACTION`` (directly or via the bot's indeterminate
 # normalization) fails that test.
 PANE_IDLE_FAILURE_REASONS = frozenset(
     {
@@ -3667,8 +3685,30 @@ PANE_IDLE_FAILURE_REASONS = frozenset(
     }
 )
 
+# The leg names that can ONLY fire while the background-shells guard is engaged.
+# A caller opting out (``allow_background_shells=True`` — the read-only /cost +
+# /usage overlay lane) can never observe them.
+PANE_IDLE_BACKGROUND_SHELL_REASONS = frozenset({"background_shells"})
 
-def classify_pane_idle_failure(visible_pane: str | None) -> str | None:
+
+def pane_idle_failure_reasons(
+    *, allow_background_shells: bool = False
+) -> frozenset[str]:
+    """The COMPLETE reason set ``classify_pane_idle_failure`` can return in a mode.
+
+    The exhaustiveness anchor for a caller's fallback-copy map: a lane that opts
+    OUT of the background-shells leg can never produce ``"background_shells"``,
+    so mapping copy for it would be dead (and the copy — "the safety gate defers
+    this until they finish" — would be a lie for a lane with no such gate).
+    """
+    if allow_background_shells:
+        return PANE_IDLE_FAILURE_REASONS - PANE_IDLE_BACKGROUND_SHELL_REASONS
+    return PANE_IDLE_FAILURE_REASONS
+
+
+def classify_pane_idle_failure(
+    visible_pane: str | None, *, allow_background_shells: bool = False
+) -> str | None:
     """Name the FIRST ``pane_looks_idle`` leg that a non-idle pane fails.
 
     Diagnostic-only, REPLAY-only, NEVER authoritative — ``pane_looks_idle`` is
@@ -3677,8 +3717,14 @@ def classify_pane_idle_failure(visible_pane: str | None) -> str | None:
     SAME order purely to LABEL the first failure for logging + reason-specific
     fallback copy. Its body mirrors ``pane_looks_idle`` line-for-line so the
     invariant holds: it returns ``None`` iff ``pane_looks_idle`` returns ``True``
-    (pinned by an agreement test across every pane fixture). Never returns pane
-    text — only a fixed leg name.
+    (pinned by an agreement test across every pane fixture, PARAMETRIZED over
+    BOTH values of ``allow_background_shells``). Never returns pane text — only a
+    fixed leg name.
+
+    ``allow_background_shells`` MUST be passed the SAME value the authority was
+    called with — the classifier and the authority stay in agreement only in
+    lockstep (a caller that opts the leg out of the authority but not out of the
+    classifier would LABEL a refusal that never happened).
 
     Reason names:
 
@@ -3692,7 +3738,7 @@ def classify_pane_idle_failure(visible_pane: str | None) -> str | None:
       - ``"no_ready_chrome"`` — leg 4, no ready-for-input status marker below the
         box (a dropped-footer mid-redraw — indeterminate).
       - ``"background_shells"`` — leg 5, a live ``· N shell`` background-jobs
-        token.
+        token (never returned when ``allow_background_shells`` is True).
       - ``None`` — all legs pass (the pane is idle).
     """
     if not visible_pane:
@@ -3728,10 +3774,11 @@ def classify_pane_idle_failure(visible_pane: str | None) -> str | None:
     below = "\n".join(lines[bottom + 1 :])
     if not any(marker in below for marker in _READY_STATUS_MARKERS):
         return "no_ready_chrome"
-    # (5) Live background shells.
-    jobs = parse_background_jobs(visible_pane)
-    if jobs is not None and jobs >= 1:
-        return "background_shells"
+    # (5) Live background shells (skipped in lockstep with the authority).
+    if not allow_background_shells:
+        jobs = parse_background_jobs(visible_pane)
+        if jobs is not None and jobs >= 1:
+            return "background_shells"
     return None
 
 

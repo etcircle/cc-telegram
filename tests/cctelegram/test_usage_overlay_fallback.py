@@ -298,13 +298,98 @@ class TestImmediateRefusals:
         assert tmux.capture_pane_cancellation_safe.await_count == 1
         tmux.send_keys.assert_not_called()
 
+
+# ── Background shells are NOT a hazard for this lane (the /update-only guard) ──
+
+
+class TestBackgroundShellsProceed:
+    """``/cost`` restarts nothing, so a live ``· N shell`` token is irrelevant.
+
+    The background-shells leg of ``pane_looks_idle`` exists ONLY to keep
+    ``/update`` from ``/exit``-ing a session and silently killing the user's
+    backgrounded shells. The overlay interceptor types a slash command into an
+    idle input box, captures the modal and presses Escape — it inherited a guard
+    that never applied to it, and the owner's constant background agents made it
+    refuse ~100% of the time.
+    """
+
     @pytest.mark.asyncio
-    async def test_background_shells_one_capture(self):
-        tmux = _make_tmux(pane_text=[BG_SHELLS_PANE])
+    async def test_bg_shells_pane_proceeds_to_overlay(self):
+        tmux = _make_tmux(pane_text=[BG_SHELLS_PANE, _overlay_fixture()])
         reply = await _run("cost_command", tmux)
-        assert tmux.capture_pane_cancellation_safe.await_count == 1
+        # The overlay opened and was dismissed — no refusal.
+        calls = tmux.send_keys.await_args_list
+        assert calls[0].args[1] == "/cost"
+        assert calls[1].args[1] == "Escape"
+        assert "Total cost:" in reply.call_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_real_2_1_207_bgshell_fixture_proceeds(self):
+        # The exact live-reported shape: an idle 2.1.207 pane at an empty input
+        # box with one background shell running.
+        pane = (_FIXTURES / "inputbox_bgshell_v2.1.207.txt").read_text()
+        tmux = _make_tmux(pane_text=[pane, _overlay_fixture()])
+        reply = await _run("usage_command", tmux)
+        calls = tmux.send_keys.await_args_list
+        assert calls[0].args[1] == "/usage"
+        assert "Total cost:" in reply.call_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_bg_shells_plus_busy_still_refuses(self):
+        # The carve-out is leg 5 ONLY — a background shell on a BUSY pane still
+        # refuses on the active-generation leg, zero keystrokes.
+        busy_with_shells = f"""\
+✻ Cooking… (esc to interrupt)
+
+{_SEP}
+❯
+{_SEP}
+  ⏵⏵ bypass permissions on · 2 shells · esc to interrupt
+"""
+        tmux = _make_tmux(pane_text=[busy_with_shells])
+        reply = await _run("cost_command", tmux)
         tmux.send_keys.assert_not_called()
-        assert "background shell" in reply.call_args.args[1].lower()
+        body = reply.call_args.args[1].lower()
+        assert "working" in body or "turn ends" in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("fixture", "expect"),
+        [
+            ("inputbox_busy_thinking_v2.1.207.txt", ("working", "turn ends")),
+            ("inputbox_busy_tool_v2.1.207.txt", ("working", "turn ends")),
+            ("auq_single_picker_v2.1.207.txt", ("answer",)),
+            ("inputbox_draft_typed_v2.1.207.txt", ("draft",)),
+            ("inputbox_multiline_draft_v2.1.207.txt", ("draft",)),
+        ],
+    )
+    async def test_real_fixture_hazards_still_refuse(self, fixture: str, expect: tuple):
+        # Every GENUINE hazard still refuses with ZERO keystrokes on real
+        # 2.1.207 captures — the carve-out is leg 5 (background shells) ONLY.
+        pane = (_FIXTURES / fixture).read_text()
+        tmux = _make_tmux(pane_text=[pane, pane, pane])
+        reply = await _run("cost_command", tmux)
+        tmux.send_keys.assert_not_called()
+        body = reply.call_args.args[1].lower()
+        assert any(token in body for token in expect), body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("detector_on", [True, False])
+    async def test_real_permission_gate_refuses_either_flag(self, detector_on: bool):
+        # A live approval gate refuses with ZERO keystrokes whether the gate
+        # DETECTOR is on (leg 2, "interactive") or off (leg 3, no input box →
+        # fail-closed indeterminate). Never a keystroke into a live gate.
+        from cctelegram import terminal_parser as tp
+
+        pane = (_FIXTURES / "gate_permission_v2.1.207.txt").read_text()
+        tp.set_permission_prompts_enabled(detector_on)
+        try:
+            tmux = _make_tmux(pane_text=[pane, pane, pane])
+            reply = await _run("cost_command", tmux)
+        finally:
+            tp.reset_for_tests()
+        tmux.send_keys.assert_not_called()
+        reply.assert_awaited_once()
 
 
 # ── Test 6: retry on indeterminate frame ───────────────────────────────────
