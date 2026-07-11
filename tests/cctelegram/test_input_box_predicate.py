@@ -57,6 +57,15 @@ DELIVERABLE = [
     "idle_frame_plain_v2.1.206.txt",
     "idle_ghost_input_row_v2.1.206.txt",
     "idle_real_draft_input_row_v2.1.206.txt",
+    # THE PASTE-COLLAPSE (the GH #50 PR-1 regression). A large multi-line payload
+    # is consumed as a PASTE: CC collapses the row to `❯\xa0[Pasted text #1 +12
+    # lines]` and REPLACES the status bar with `paste again to expand`. The box is
+    # right there, holding the text, and Enter submits it — but leg 3 saw none of
+    # the old chrome markers and the delivery gate's re-verify refused EVERY long
+    # / multi-line message (the owner's 809-char voice note).
+    "inputbox_paste_collapsed_v2.1.207.txt",
+    # ~2s later the status bar REVERTS while the collapsed draft remains.
+    "inputbox_paste_collapsed_reverted_v2.1.207.txt",
 ]
 
 
@@ -395,6 +404,166 @@ def test_the_live_prompt_controls_still_refuse(name: str) -> None:
     pane = _pane(name)
     assert tp.pane_input_box_present(pane) is False
     assert tp.pane_looks_idle(tp.clean_ghost_input_text(pane)) is False
+
+
+# ── THE PASTE-COLLAPSE (the GH #50 PR-1 regression) ──────────────────────
+#
+# Rig-reproduced on CC 2.1.207: a payload written in ONE `tmux send-keys -l` past
+# ~800 chars / ~13 lines is consumed as a PASTE. CC collapses the input row to
+# `❯\xa0[Pasted text #1 +12 lines]` AND **REPLACES THE STATUS BAR** with the
+# single line `  paste again to expand` for ~2s — squarely across the delivery
+# gate's post-write re-verify (`TEXT_SETTLE_S` = 0.5s).
+#
+# None of leg 3's old markers survives that, so `no_ready_chrome` fired and every
+# long / multi-line message (a voice note with a reply-context quote — the
+# owner's 809-char report) was refused, left as a stranded draft, and braked the
+# topic. It is a fully READY input box: Enter submits.
+
+_PASTE_COLLAPSED = "inputbox_paste_collapsed_v2.1.207.txt"
+_PASTE_REVERTED = "inputbox_paste_collapsed_reverted_v2.1.207.txt"
+
+
+@pytest.mark.parametrize("name", [_PASTE_COLLAPSED, _PASTE_REVERTED])
+def test_the_paste_collapsed_box_is_a_READY_input_box(name: str) -> None:
+    pane = _pane(name)
+    # The fixture genuinely carries the collapsed placeholder — otherwise the pin
+    # is vacuous.
+    assert "[Pasted text #1" in pane, name
+    assert tp.pane_input_box_present(pane) is True
+    assert tp.classify_input_box_failure(pane) is None
+
+
+def test_the_collapsed_fixture_carries_the_paste_hint_status_bar() -> None:
+    """The distinguishing chrome: `paste again to expand` REPLACES the mode line,
+    and NONE of the pre-existing ready markers is on the pane below the box."""
+    pane = _pane(_PASTE_COLLAPSED)
+    assert "paste again to expand" in pane
+    # The status bar is genuinely GONE (this is what broke leg 3).
+    assert "shift+tab to cycle" not in pane
+    assert "? for shortcuts" not in pane
+    # And the reverted twin proves CC restores it (the owner's live shape).
+    assert "shift+tab to cycle" in _pane(_PASTE_REVERTED)
+
+
+def test_a_collapsed_paste_draft_is_NOT_an_empty_input_row() -> None:
+    """The stranded-draft brake must not self-release on a collapsed draft — the
+    payload IS in the box, it is just rendered as a placeholder."""
+    assert tp.pane_input_row_empty(_pane(_PASTE_COLLAPSED)) is False
+    assert tp.pane_input_row_empty(_pane(_PASTE_REVERTED)) is False
+
+
+def test_a_paste_collapsed_pane_is_NOT_idle() -> None:
+    """`paste again to expand` is deliberately NOT in `_READY_STATUS_MARKERS`: a
+    collapsed paste holds an UNCOMMITTED draft, so `/update` must still defer
+    (a restart would discard it) and `/cost` must still refuse."""
+    for name in (_PASTE_COLLAPSED, _PASTE_REVERTED):
+        assert tp.pane_looks_idle(tp.clean_ghost_input_text(_pane(name))) is False, name
+
+
+@pytest.mark.parametrize("name,_reason", REFUSED)
+def test_paste_hint_below_a_blocking_pane_still_refuses(
+    name: str, _reason: str | None
+) -> None:
+    """The SAFETY ARGUMENT, MEASURED not asserted (the shared-constant question).
+
+    Widening leg 3's alphabet cannot let a blocking prompt through, because a
+    blocking prompt REPLACES the input box: it fails leg 1 (`no_input_box`) or
+    leg 2 (`prompt_row_is_option`) no matter what leg 3 says. Here the paste hint
+    is adversarially APPENDED below every blocking pane in the corpus — each one
+    still refuses.
+    """
+    poisoned = _pane(name).rstrip("\n") + "\n  paste again to expand\n"
+    assert tp.pane_input_box_present(poisoned) is False, name
+    assert tp.classify_input_box_failure(poisoned) in tp.INPUT_BOX_FAILURE_REASONS
+
+
+@pytest.mark.parametrize(
+    "name", ["gate_permission_v2.1.207.txt", "gate_workflow_v2.1.207.txt"]
+)
+def test_the_paste_hint_rejects_a_QUOTED_gate(name: str) -> None:
+    """The gate-rejection lane needed NO change and is already correct.
+
+    `_only_chrome_below` consumes no marker set at all — it is a structural
+    ALLOW-LIST (blank / bare separator / the gate's own `ctrl+<x>` hints). The
+    paste hint is none of those, so a "gate" rendered ABOVE a live
+    paste-collapsed box is correctly rejected as quoted scrollback: the hint
+    PROVES the input box is live, so the gate is not the active bottom prompt.
+    """
+    # The suite pins both detector kill-switches OFF; turn them on so the gate
+    # patterns are actually in `_active_ui_patterns` and the pin is not vacuous.
+    tp.set_permission_prompts_enabled(True)
+    tp.set_decision_cards_enabled(True)
+    try:
+        pane = _pane(name)
+        assert tp.extract_interactive_content(pane) is not None  # live ⇒ surfaced
+        quoted = pane.rstrip("\n") + "\n  paste again to expand\n"
+        assert tp.extract_interactive_content(quoted) is None  # quoted ⇒ dropped
+    finally:
+        tp.reset_for_tests()
+
+
+# ── The NON-BREAKING SPACE in the input row (load-bearing, now pinned) ───
+#
+# CC renders `❯\xa0` (U+00A0), never `❯ `. Today's code copes only INCIDENTALLY
+# (`str.strip()` drops NBSP), and that incidental behavior decides whether the row
+# reads EMPTY — the stranded-draft brake's ONLY release condition.
+
+_NBSP = "\xa0"
+
+
+def _box(row: str) -> str:
+    """A minimal ready input box whose input row is exactly ``row``."""
+    rule = "─" * 40
+    return f"  some prose\n{rule}\n{row}\n{rule}\n  ? for shortcuts\n"
+
+
+def test_the_real_captured_rows_carry_a_NON_BREAKING_space() -> None:
+    """Not a synthetic claim — both rig fixtures really do."""
+    assert f"❯{_NBSP}[Pasted text #1" in _pane(_PASTE_COLLAPSED)
+    assert f"❯{_NBSP}[Pasted text #1" in _pane(_PASTE_REVERTED)
+
+
+@pytest.mark.parametrize(
+    "row,empty",
+    [
+        (f"❯{_NBSP}", True),  # the REAL empty input row
+        ("❯ ", True),  # the ASCII twin
+        ("❯", True),  # bare glyph
+        (f"❯{_NBSP}[Pasted text #1 +12 lines]", False),  # the REAL collapsed row
+        (f"❯{_NBSP}hello there", False),
+        (f"!{_NBSP}echo hi", False),  # bash mode (rig C9)
+    ],
+)
+def test_nbsp_input_rows_are_normalized(row: str, empty: bool) -> None:
+    pane = _box(row)
+    assert tp.pane_input_row_empty(pane) is empty, row
+    assert tp.pane_input_box_present(pane) is True, row
+
+
+def test_an_nbsp_numbered_row_still_trips_the_picker_trap() -> None:
+    """The normalization must not hide a picker cursor behind an NBSP."""
+    assert (
+        tp.classify_input_box_failure(_box(f"❯{_NBSP}1. Red")) == "prompt_row_is_option"
+    )
+
+
+def test_nbsp_normalization_does_not_leak_outside_the_input_box_lane() -> None:
+    """Scoped to `_input_box_rows`. The chrome region below the box, the rule
+    scan, and every other parser see the pane VERBATIM — a global NBSP fold would
+    change unrelated matching (option labels, gate footers, prose)."""
+    assert tp._normalize_input_row(f"a{_NBSP}b") == "a b"
+    # The gate/idle parsers are untouched by it — a live gate still surfaces
+    # (the gate lane is a structural allow-list, not a space-fold).
+    tp.set_permission_prompts_enabled(True)
+    try:
+        assert (
+            tp.extract_interactive_content(_pane("gate_permission_v2.1.207.txt"))
+            is not None
+        )
+    finally:
+        tp.reset_for_tests()
+    # And a body line carrying an NBSP is NOT folded outside the input-box rows.
+    assert f"a{_NBSP}b" in _box(f"❯{_NBSP}x").replace("some prose", f"a{_NBSP}b")
 
 
 def test_agreement_predicate_and_classifier_never_disagree() -> None:

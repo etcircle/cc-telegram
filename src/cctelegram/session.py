@@ -57,6 +57,14 @@ GATE_CAPTURE_DEADLINE_S = 2.5
 CMD_PROBE_DEADLINE_S = 2.5
 # An INDETERMINATE frame (a mid-redraw capture) is retried; a POSITIVE hazard
 # refuses on the FIRST capture. The /cost preflight precedent.
+#
+# BOTH the pre-write gate AND the post-write RE-VERIFY use this discipline. The
+# re-verify originally had NO retry: it refused on the FIRST non-None reason, so
+# any genuine mid-redraw frame false-refused, stranded the draft, AND braked the
+# topic — the worst possible outcome for a transient. The asymmetry is preserved
+# where it matters: a POSITIVE hazard (a real prompt drawn in the gate→write
+# window) still refuses IMMEDIATELY, with zero further keystrokes. That is the
+# safety property; the retry only ever covers frames that carry NO evidence.
 GATE_CAPTURE_RETRIES = 2
 GATE_RETRY_DELAY_S = 0.3
 # Overall transaction budget, checked at the phase boundaries (never as a
@@ -1273,10 +1281,14 @@ class SessionManager:
           4. Write the text with the Enter WITHHELD (mode-aware: the ``!``
              bash-mode two-step is reproduced explicitly — ``send_keys`` performs
              it ONLY when ``literal and enter`` are BOTH true).
-          5. Re-verify: the BOUNDED ``pane_command_is_claude`` probe FIRST, then
-             the pane capture LAST (r2 F4 — the capture must be the final
-             observation before the Enter, or a stalled probe lets a stale frame
-             authorize a commit into a freshly-drawn prompt). The re-verify is
+          5. Re-verify (``_reverify_input_box``): the BOUNDED
+             ``pane_command_is_claude`` probe FIRST, then the pane capture LAST
+             (r2 F4 — the capture must be the final observation before the Enter,
+             or a stalled probe lets a stale frame authorize a commit into a
+             freshly-drawn prompt). Carries the SAME bounded INDETERMINATE retry
+             as the pre-write gate — a refusal here strands the draft AND brakes
+             the topic, so an evidence-free frame must never cause one; a POSITIVE
+             hazard still refuses on the first capture. The re-verify is
              payload-aware (``expected_draft``), so an ordinary ``1. buy milk``
              is not mistaken for a picker cursor.
           6. The pre-commit user-turn stamp (the ONE documented ``route_runtime``
@@ -1478,29 +1490,14 @@ class SessionManager:
         # was drawn let a STALE input-box frame authorize the Enter (which
         # commits option 1). Both probes are bounded, and the deadline is
         # re-checked after every await.
-        allow_slash = delivery.is_bare_slash_payload(text)
-        if time.monotonic() > deadline:
-            return delivery.refuse(delivery.REASON_DEADLINE, written=True)
-        cmd2 = await self._pane_command_for_gate(window_id)
-        if cmd2 is delivery_CMD_TIMEOUT:
-            return delivery.refuse(delivery.REASON_CMD_PROBE_TIMEOUT, written=True)
-        assert cmd2 is None or isinstance(cmd2, str)
-        if not pane_command_is_claude(cmd2):
-            return delivery.refuse(delivery.REASON_NOT_CLAUDE, written=True)
-        if time.monotonic() > deadline:
-            return delivery.refuse(delivery.REASON_DEADLINE, written=True)
-        pane = await self._capture_for_gate(window_id)
-        if not (pane is None or isinstance(pane, str)):
-            return delivery.refuse(delivery.REASON_CAPTURE_TIMEOUT, written=True)
-        reason = self._input_box_reason(
-            pane, allow_slash_completion=allow_slash, expected_draft=text
+        reverify = await self._reverify_input_box(
+            window_id,
+            deadline=deadline,
+            allow_slash=delivery.is_bare_slash_payload(text),
+            expected_draft=text,
         )
-        if reason is not None:
-            return delivery.refuse(
-                delivery.REASON_REVERIFY_FAILED,
-                written=True,
-                message=delivery.DRAFT_WRITTEN_MSG,
-            )
+        if reverify is not None:
+            return reverify
 
         # (6) The pre-commit user-turn stamp — the ONE synchronous route_runtime
         # mutation the lock contract permits (documented exception). A raise
@@ -1667,6 +1664,88 @@ class SessionManager:
             if attempt + 1 < attempts:
                 await asyncio.sleep(GATE_RETRY_DELAY_S)
         return delivery.refuse(reason or delivery.REASON_CAPTURE_FAILED, written=False)
+
+    async def _reverify_input_box(
+        self,
+        window_id: str,
+        *,
+        deadline: float,
+        allow_slash: bool,
+        expected_draft: str,
+    ) -> DeliveryResult | None:
+        """Step (5): the post-write re-verify. ``None`` ⇒ the Enter may be sent.
+
+        The payload is ALREADY in the box with its Enter withheld, so EVERY
+        refusal from here is ``written=True`` (``DRAFT_WRITTEN``): the text sits
+        in the input row, the topic is braked, and the user is told it was not
+        delivered. That makes a FALSE refusal here the most expensive failure in
+        the whole transaction — worse than at the pre-write gate, which simply
+        declines.
+
+        So it carries the SAME bounded INDETERMINATE-retry discipline as
+        ``_gate_input_box`` (``GATE_CAPTURE_RETRIES`` × ``GATE_RETRY_DELAY_S``): a
+        frame that carries NO evidence — a capture failure, a mid-redraw that
+        dropped the rule-pair / prompt row / status chrome — is RETRIED rather
+        than turned into a stranded draft.
+
+        A POSITIVE hazard is UNCHANGED and refuses on the FIRST capture, with
+        zero further keystrokes: a real prompt drawn in the gate→write window
+        (``prompt_present``), a picker cursor in the prompt row
+        (``prompt_row_is_option``), the Enter-stealing tasks mode
+        (``tasks_mode``), an armed completion overlay (``completion_overlay``), a
+        pane that is no longer Claude (``not_claude``). THAT is the safety
+        property of the gate and the retry never weakens it.
+
+        ORDER IS LOAD-BEARING (r2 F4) and is re-established on EVERY attempt: the
+        bounded ``pane_current_command`` probe runs FIRST and the pane CAPTURE is
+        the LAST observation before the caller's stamp + Enter. A retry that
+        re-captured WITHOUT re-probing would let a 0.3s-stale liveness proof
+        authorize the commit. The overall ``DELIVERY_DEADLINE_S`` is re-checked
+        after every await.
+        """
+        attempts = GATE_CAPTURE_RETRIES + 1
+        reason: str = delivery.REASON_CAPTURE_FAILED
+        for attempt in range(attempts):
+            if time.monotonic() > deadline:
+                return delivery.refuse(delivery.REASON_DEADLINE, written=True)
+            cmd2 = await self._pane_command_for_gate(window_id)
+            if cmd2 is delivery_CMD_TIMEOUT:
+                return delivery.refuse(delivery.REASON_CMD_PROBE_TIMEOUT, written=True)
+            assert cmd2 is None or isinstance(cmd2, str)
+            if not pane_command_is_claude(cmd2):
+                # A POSITIVE hazard — the pane is no longer Claude. Never retried.
+                return delivery.refuse(delivery.REASON_NOT_CLAUDE, written=True)
+
+            if time.monotonic() > deadline:
+                return delivery.refuse(delivery.REASON_DEADLINE, written=True)
+            pane = await self._capture_for_gate(window_id)
+            if not (pane is None or isinstance(pane, str)):
+                return delivery.refuse(delivery.REASON_CAPTURE_TIMEOUT, written=True)
+
+            verdict = self._input_box_reason(
+                pane, allow_slash_completion=allow_slash, expected_draft=expected_draft
+            )
+            if verdict is None:
+                return None  # the box holds our draft and Enter will submit it
+            reason = verdict
+            if reason not in terminal_parser.INPUT_BOX_INDETERMINATE_REASONS:
+                break  # POSITIVE hazard — refuse NOW, no further captures
+            if attempt + 1 < attempts:
+                await asyncio.sleep(GATE_RETRY_DELAY_S)
+
+        # §1.6 observability: the LEG that refused is logged here (the caller's
+        # DELIVERY REFUSED line carries only the coarse ``reverify_failed``).
+        logger.warning(
+            "deliver_to_window: re-verify FAILED on window %s (leg=%s) — the "
+            "payload is written and its Enter is WITHHELD",
+            window_id,
+            reason,
+        )
+        return delivery.refuse(
+            delivery.REASON_REVERIFY_FAILED,
+            written=True,
+            message=delivery.DRAFT_WRITTEN_MSG,
+        )
 
     # --- Message history ---
 

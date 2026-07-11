@@ -1564,8 +1564,8 @@ five legs, fixture-pinned on 2.1.207 — a TUI-drift audit surface beside
    own footer;
 3. ready-for-input status chrome is present BELOW the box, from the observed
    alphabet (`⏵⏵ … (shift+tab to cycle)`, `esc to interrupt`, `← for agents`,
-   `· N shell`, `↓ to manage`, `? for shortcuts`, and **`! for shell mode`** in bash
-   mode);
+   `· N shell`, `↓ to manage`, `? for shortcuts`, **`! for shell mode`** in bash
+   mode, and — **the PASTE-COLLAPSE, see below** — **`paste again to expand`**);
 4. the status bar must NOT carry **`Enter to view tasks`** — one `Down` at an empty
    box while a background shell exists arms a mode where legs 1-3 ALL still pass but
    **Enter is STOLEN** (typed text is swallowed entirely; Enter opens the
@@ -1579,8 +1579,60 @@ five legs, fixture-pinned on 2.1.207 — a TUI-drift audit surface beside
    trigger it, and a slash command WITH an argument (`/effort high`) raises no
    overlay at all.
 
-Note: the empty input row is `❯\xa0` — a **non-breaking space**, not ASCII. Past
-user turns also render with `❯`, so the bottom-rule-pair anchoring is load-bearing.
+**THE PASTE-COLLAPSE — a paste-collapsed box is a READY box (the PR-1 regression,
+rig-reproduced 2026-07-11, fixtures `inputbox_paste_collapsed_v2.1.207.txt` +
+`inputbox_paste_collapsed_reverted_v2.1.207.txt`).** A payload written in ONE
+`tmux send-keys -l` past **~800 chars / ~13 lines** is consumed by CC as a **PASTE**,
+and CC then does TWO things: (a) it collapses the input row to a placeholder
+`❯\xa0[Pasted text #1 +12 lines]`, and (b) it **REPLACES THE STATUS BAR** with the
+single line `  paste again to expand`. For ~2s NONE of leg 3's other markers is on
+the pane, so leg 3 returned `no_ready_chrome` and the post-write **re-verify** —
+which fires at `TEXT_SETTLE_S` = 0.5s, squarely inside that window — concluded
+there was no input box. Every long / multi-line message (a voice note carrying a
+reply-context quote; the owner's live report was 809 chars) was REFUSED, left as a
+**stranded draft**, and **braked the topic** — even though the box was right there
+holding the text with Enter ready to submit it. It IS ready-for-input chrome (box
+present, cursor in it, Enter submits), so `paste again to expand` joins leg 3's
+alphabet. ~2s later CC restores the normal mode line while the collapsed draft
+remains (the `_reverted` fixture — the shape the owner's pane was left in); that
+one already passed and is pinned as a non-regression.
+
+*Why widening leg 3 cannot let a blocking prompt through (MEASURED, not asserted).*
+A blocking prompt **REPLACES** the input box, so it fails **leg 1** (`no_input_box`)
+or **leg 2** (`prompt_row_is_option`) regardless of what leg 3's alphabet says — leg
+3 is not the leg that refuses gates. `test_paste_hint_below_a_blocking_pane_still_refuses`
+adversarially APPENDS the paste hint below every blocking fixture in the corpus and
+every one still refuses.
+
+*The shared-constant question (answered, no split needed).* The marker goes in
+`_INPUT_READY_CHROME_MARKERS` (the input-box lane's extension tuple) and
+**deliberately NOT** in `_READY_STATUS_MARKERS` (the IDLE-status-bar alphabet
+`pane_looks_idle` / `classify_pane_idle_failure` consume): a paste-collapsed pane is
+**not idle** — it holds an uncommitted draft, so `/update` must still defer (a
+restart would discard it) and `/cost` must still refuse. (`pane_looks_idle`'s
+empty-input-row leg already rejects it, so this is the semantically correct split,
+not a behavior change; pinned by `test_a_paste_collapsed_pane_is_NOT_idle`.) The
+interactive-**GATE**-rejection lane (`_only_chrome_below`) consumes **no marker set
+at all** — it is a structural ALLOW-LIST (blank / bare separator / the gate's own
+`ctrl+<x>` hints) — so the paste hint ALREADY rejects a quoted gate rendered above a
+live paste-collapsed box, which is exactly right: the hint PROVES the input box is
+live, so the "gate" above it is not the active bottom prompt (pinned by
+`test_the_paste_hint_rejects_a_QUOTED_gate`). The two lanes were already
+structurally independent; nothing was coupled and nothing had to be split.
+
+**The NON-BREAKING SPACE (load-bearing, now normalized + pinned).** The empty input
+row is `❯\xa0` and the paste-collapsed row is `❯\xa0[Pasted text #1 +12 lines]` —
+**U+00A0**, not ASCII U+0020. The code coped only *incidentally* (`str.strip()`
+drops NBSP; Python's Unicode-aware `\s` matches it), and that incidental behavior
+decides whether the input row reads EMPTY — the stranded-draft brake's ONLY release
+condition. It is now folded explicitly by `_normalize_input_row`, applied at the
+SINGLE seam `_input_box_rows` — the one path every input-box-lane reader goes
+through (`_prompt_row_content` / `_completion_overlay_armed` /
+`classify_input_box_failure` / `pane_input_row_empty`). It deliberately does **not**
+touch the rule-separator scan, the chrome region below the box, or any other parser:
+a global NBSP fold would change unrelated matching (option labels, gate footers,
+prose). Pinned on the real captured rows. Past user turns also render with `❯`, so
+the bottom-rule-pair anchoring stays load-bearing.
 
 **The rule separator may be LABELLED (CC 2.1.207, fixture-pinned).** A few seconds
 after a plan is approved, CC pins the plan slug into the input box's TOP rule
@@ -1680,13 +1732,26 @@ quarantine re-check — every step fail-closed):
    failure certainly leaves the earlier ones there), so the old `written = i > 0`
    was an unproven claim. Fail-closed: it arms the brake, whose empty-input-row
    self-heal releases it if nothing actually landed.
-5. **The RE-VERIFY** immediately before the commit: `pane_command_is_claude` AND
-   `pane_input_box_present` still hold. This is the window the re-verify genuinely
-   closes. **ORDER IS LOAD-BEARING (r2 F4):** the bounded command probe runs FIRST
-   and the pane CAPTURE is the **LAST** observation before the stamp + Enter. The
-   old order captured the pane, then awaited an UNBOUNDED `pane_current_command` —
-   a probe stalling while a blocking prompt was drawn let a STALE input-box frame
-   authorize the Enter (which commits option 1). The overall deadline is re-checked
+5. **The RE-VERIFY** (`session._reverify_input_box`) immediately before the commit:
+   `pane_command_is_claude` AND `pane_input_box_present` still hold. This is the
+   window the re-verify genuinely closes. **ORDER IS LOAD-BEARING (r2 F4):** the
+   bounded command probe runs FIRST and the pane CAPTURE is the **LAST** observation
+   before the stamp + Enter. The old order captured the pane, then awaited an
+   UNBOUNDED `pane_current_command` — a probe stalling while a blocking prompt was
+   drawn let a STALE input-box frame authorize the Enter (which commits option 1).
+   **It carries the SAME bounded INDETERMINATE retry as the pre-write gate**
+   (`GATE_CAPTURE_RETRIES` × `GATE_RETRY_DELAY_S`; the order above is
+   RE-ESTABLISHED on every attempt — a retry that re-captured WITHOUT re-probing
+   would let a 0.3s-stale liveness proof authorize the commit). It originally had
+   **no retry at all** and refused on the FIRST non-None reason, so a single
+   mid-redraw frame false-refused **and** stranded the draft **and** braked the
+   topic — the most expensive failure in the transaction (the pre-write gate merely
+   declines; this one leaves state behind). **A POSITIVE hazard STILL refuses
+   immediately, on exactly one capture, with zero further keystrokes** — a real
+   prompt drawn in the gate→write window (`prompt_present` / `prompt_row_is_option`),
+   the Enter-stealing `tasks_mode`, an armed `completion_overlay`, or a pane that is
+   no longer Claude (`not_claude`). That is the safety property and the retry never
+   weakens it. The overall deadline is re-checked
    after every await. From here on ANY failure is **`draft_written`** — the text
    sits in the input box and the Enter is withheld — with **NEUTRAL** copy ("the
    terminal changed while your message was being typed; your text was NOT

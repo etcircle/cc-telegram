@@ -458,6 +458,72 @@ async def test_esc_command_stays_ungated_on_a_live_surface(
     ), scenario.tmux.sent_keys
 
 
+# ── THE PASTE-COLLAPSE: the owner's exact failing case (GH #50 PR-1 regression) ──
+#
+# The owner sent a VOICE NOTE as a reply. With the reply-context quote it was an
+# 809-char, multi-line payload. CC consumed the single literal write as a PASTE:
+# it collapsed the input row to `❯\xa0[Pasted text #1 +12 lines]` and REPLACED the
+# status bar with `paste again to expand`. The re-verify (TEXT_SETTLE_S = 0.5s,
+# squarely inside that ~2s window) saw none of the ready-chrome markers, concluded
+# there was no input box, refused, stranded the draft and BRAKED the topic — even
+# though Enter would have submitted the message correctly.
+#
+#   session - DEBUG - deliver_to_window: window_id=@36, text_len=809
+#   tmux_manager - WARNING - stranded-draft brake ARMED for window @36
+#   session - INFO - DELIVERY REFUSED reason=reverify_failed outcome=draft_written
+#
+# This hit essentially EVERY long or multi-line message (long voice notes, replies
+# carrying quoted context, long text) — a large fraction of real usage.
+
+_LONG_REPLY_PAYLOAD = "\n".join(
+    ["> Voice note reply to: the deployment plan and the follow-up items."]
+    + [
+        f"line {i}: a sentence of reply context long enough to push the single "
+        f"literal write past the threshold at which CC treats it as a paste."
+        for i in range(1, 8)
+    ]
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "collapsed_pane",
+    [
+        # The `paste again to expand` chrome — the frame that broke the gate.
+        "inputbox_paste_collapsed_v2.1.207.txt",
+        # ~2s later CC restores the mode line while the collapsed draft remains
+        # (the shape the owner's live pane was left in).
+        "inputbox_paste_collapsed_reverted_v2.1.207.txt",
+    ],
+)
+async def test_a_long_multiline_reply_delivers_through_the_paste_collapse(
+    scenario: ScenarioHarness, collapsed_pane: str
+) -> None:
+    assert len(_LONG_REPLY_PAYLOAD) > 800, "must exceed CC's paste threshold"
+    wid = _bind(scenario, pane=IDLE_PANE_V2_1_207)
+    route = (scenario.user_id, 42, wid)
+
+    # The write is consumed as a PASTE and the pane collapses under us.
+    scenario.tmux.on_write = lambda: scenario.tmux.set_pane(
+        wid, pane_fixture(collapsed_pane)
+    )
+
+    await bot_module.text_handler(
+        make_update_text(_LONG_REPLY_PAYLOAD, thread_id=42), scenario.context
+    )
+    result = await aggregator_flush_route(route)
+
+    assert result.ok, result.reason
+    assert _typed(scenario) == [_LONG_REPLY_PAYLOAD]
+    assert scenario.tmux.committed, "the Enter PR-1 was withholding"
+    # …and the topic is NOT braked: the next message must still go through.
+    scenario.tmux.on_write = None
+    await bot_module.text_handler(
+        make_update_text("and one more thing", thread_id=42), scenario.context
+    )
+    assert (await aggregator_flush_route(route)).ok
+
+
 # ── r2 F2: the stranded-draft commit chain (the P1 the gate itself created) ──
 
 

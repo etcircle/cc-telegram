@@ -3849,11 +3849,50 @@ _RE_OPTION_ROW_CONTENT: Final = re.compile(r"^\d+\.\s")
 
 # Leg 3 — the ready-for-input status chrome alphabet observed BELOW the box on
 # 2.1.207. A SUPERSET of ``_READY_STATUS_MARKERS``: ``esc to interrupt`` (a
-# BUSY-but-queueable pane) and ``! for shell mode`` (bash mode) are ready-input
-# chrome too — this gate never asserts idleness.
+# BUSY-but-queueable pane), ``! for shell mode`` (bash mode) and the
+# PASTE-COLLAPSED hint (below) are ready-input chrome too — this gate never
+# asserts idleness.
+#
+# THE PASTE-COLLAPSE (the GH #50 PR-1 regression, rig-reproduced 2026-07-11 —
+# ``inputbox_paste_collapsed_v2.1.207.txt``). A payload written in ONE
+# ``tmux send-keys -l`` past ~800 chars / ~13 lines is consumed by CC as a PASTE,
+# and CC then does TWO things:
+#
+#   1. collapses the input row to a placeholder — ``❯\xa0[Pasted text #1 +12 lines]``
+#      (NON-BREAKING space after the glyph; see ``_normalize_input_row``); and
+#   2. **REPLACES THE STATUS BAR** with the single line ``  paste again to expand``.
+#
+# For ~2s NONE of the other ready markers is on the pane, so leg 3 returned
+# ``no_ready_chrome`` and the delivery gate's post-write RE-VERIFY (which fires at
+# ``TEXT_SETTLE_S`` = 0.5s, squarely inside that window) concluded there was no
+# input box — even though the box is right there, holding the user's text, with
+# Enter ready to submit it. Every long / multi-line message (a voice note with a
+# reply-context quote — the owner's 809-char report) was refused AND left as a
+# stranded draft AND braked the topic.
+#
+# It IS ready-for-input chrome: box present, cursor in it, Enter submits. And
+# accepting it CANNOT let a blocking prompt through — a blocking prompt REPLACES
+# the box, so it fails leg 1 (``no_input_box``) or leg 2
+# (``prompt_row_is_option``) regardless of what leg 3's alphabet says. That is
+# MEASURED, not asserted: ``test_paste_hint_below_a_blocking_pane_still_refuses``
+# appends this very line to every blocking fixture and every one still refuses.
+#
+# Deliberately NOT added to ``_READY_STATUS_MARKERS`` (the IDLE-status-bar
+# alphabet ``pane_looks_idle`` / ``classify_pane_idle_failure`` consume): a
+# paste-collapsed pane is NOT idle — it holds an uncommitted draft, and
+# ``/update`` restarting there would discard it. (``pane_looks_idle``'s
+# empty-input-row leg already rejects it, so this is the semantically correct
+# split, not a behavior change.) The interactive-GATE rejection lane
+# (``_only_chrome_below``) consumes NO marker set at all — it is a structural
+# ALLOW-LIST (blank / bare separator / the gate's own ``ctrl+<x>`` hints), so this
+# line ALREADY rejects a quoted gate rendered above a live paste-collapsed box,
+# which is exactly right: the hint proves the input box is live, so the "gate"
+# above it is not the active bottom prompt. No coupling, no split needed.
+_INPUT_PASTE_COLLAPSED_MARKER: Final = "paste again to expand"
 _INPUT_READY_CHROME_MARKERS: Final = _READY_STATUS_MARKERS + (
     "esc to interrupt",
     "! for shell mode",
+    _INPUT_PASTE_COLLAPSED_MARKER,
 )
 # ``· 1 shell ·`` — the background-shell status bar (rig D10).
 _RE_INPUT_READY_SHELL_TOKEN: Final = re.compile(r"·\s*\d+\s+shells?\b")
@@ -3892,11 +3931,50 @@ INPUT_BOX_INDETERMINATE_REASONS: Final = frozenset(
 )
 
 
+# The Unicode spaces CC renders INSIDE the input box. The empty input row is
+# ``❯\xa0`` and the paste-collapsed row is ``❯\xa0[Pasted text #1 +12 lines]`` —
+# a NON-BREAKING space (U+00A0) after the prompt glyph, not ASCII U+0020.
+#
+# Today's code happens to cope (``str.strip()`` drops NBSP, and ``\s`` matches it
+# under Python's Unicode-aware ``re``), but that is INCIDENTAL and load-bearing:
+# it decides whether the input row reads EMPTY (the stranded-draft brake's only
+# release) and where the prompt-row content starts. So it is normalized
+# EXPLICITLY and pinned on the real captured rows.
+#
+# SCOPE: applied ONLY to the rows INSIDE the input-box bracket, in
+# ``_input_box_rows`` — the single seam every input-box-lane reader goes through
+# (``_prompt_row_content`` / ``_completion_overlay_armed`` /
+# ``classify_input_box_failure`` / ``pane_input_row_empty``). It deliberately does
+# NOT touch the rule-separator scan, the chrome region below the box, or any
+# other parser: normalizing NBSP→space globally would change unrelated matching
+# (option labels, gate footers, prose).
+_INPUT_ROW_UNICODE_SPACES: Final = (
+    "\xa0",  # NO-BREAK SPACE — the one CC actually emits (rig 2.1.207)
+    " ",  # FIGURE SPACE
+    " ",  # NARROW NO-BREAK SPACE
+    "﻿",  # ZERO WIDTH NO-BREAK SPACE (BOM) — width-0, but strips like space
+)
+
+
+def _normalize_input_row(row: str) -> str:
+    """Fold CC's Unicode spaces in an input-box row to plain ASCII spaces.
+
+    See ``_INPUT_ROW_UNICODE_SPACES`` — scoped to the input-box lane only.
+    """
+    for ch in _INPUT_ROW_UNICODE_SPACES:
+        if ch in row:
+            row = row.replace(ch, " ")
+    return row
+
+
 def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
     """Locate the bottom rule-pair and return ``(top, bottom, non-blank rows)``.
 
     ``None`` when fewer than two ``──`` rule separators are in the bottom scan
     window (no rendered input-box bracket).
+
+    The returned rows are NBSP-normalized (``_normalize_input_row``) — this is the
+    single seam every input-box-lane reader goes through.
     """
     search_start = max(0, len(lines) - _CHROME_SCAN_LINES)
     sep_idxs = [
@@ -3905,7 +3983,11 @@ def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
     if len(sep_idxs) < 2:
         return None
     top, bottom = sep_idxs[-2], sep_idxs[-1]
-    rows = [lines[i].strip() for i in range(top + 1, bottom) if lines[i].strip()]
+    rows = [
+        stripped
+        for i in range(top + 1, bottom)
+        if (stripped := _normalize_input_row(lines[i]).strip())
+    ]
     return top, bottom, rows
 
 

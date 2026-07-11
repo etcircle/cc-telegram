@@ -499,14 +499,155 @@ async def test_a_picker_appearing_in_the_gate_to_write_window_still_refuses(
     assert not pane.committed
 
 
-# ── r2 F2: the stranded-draft brake ──────────────────────────────────────
-
-
 def _reverify_race_pane(hazard: str) -> _Pane:
     """A pane that passes the pre-write gate then shows ``hazard`` at re-verify."""
     pane = _Pane([IDLE_PANE_V2_1_207])
     pane.on_write = lambda: setattr(pane, "captures", [hazard])
     return pane
+
+
+# ── THE PASTE-COLLAPSE (the GH #50 PR-1 regression) ──────────────────────
+#
+# CC consumes a large multi-line `send-keys -l` as a PASTE: it collapses the input
+# row to `❯\xa0[Pasted text #1 +12 lines]` and REPLACES the status bar with
+# `paste again to expand` for ~2s — right across the re-verify (TEXT_SETTLE_S =
+# 0.5s). The gate read that as "no input box" and refused, stranding the draft and
+# braking the topic. It hit essentially every long / multi-line message.
+
+_PASTE_COLLAPSED = "inputbox_paste_collapsed_v2.1.207.txt"
+_PASTE_REVERTED = "inputbox_paste_collapsed_reverted_v2.1.207.txt"
+
+# The owner's real failing payload shape: a voice note delivered as a reply, so the
+# reply-context quote pushes it past CC's paste threshold (live log: text_len=809).
+_LONG_MULTILINE_PAYLOAD = "\n".join(
+    ["> Voice note reply to: the deployment plan and the follow-up items."]
+    + [
+        f"line {i}: a sentence of reply context long enough to reach the paste "
+        f"threshold that CC applies to a single literal write."
+        for i in range(1, 8)
+    ]
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("collapsed", [_PASTE_COLLAPSED, _PASTE_REVERTED])
+async def test_a_long_multiline_payload_delivers_through_the_paste_collapse(
+    monkeypatch, collapsed: str
+) -> None:
+    """THE REPORTED BUG. The gate sees the idle box; the write is consumed as a
+    PASTE and the pane collapses; the re-verify must still commit the Enter."""
+    assert len(_LONG_MULTILINE_PAYLOAD) > 800
+    pane = _Pane([IDLE_PANE_V2_1_207])
+    pane.on_write = lambda: setattr(pane, "captures", [pane_fixture(collapsed)])
+    _wire(monkeypatch, pane)
+
+    result = await session_manager.deliver_to_window("@1", _LONG_MULTILINE_PAYLOAD)
+
+    assert result.ok, result.reason
+    assert pane.written == [_LONG_MULTILINE_PAYLOAD]
+    assert pane.committed  # the Enter that PR-1 was withholding
+    assert not session_mod.window_has_stranded_draft("@1")  # and no brake
+
+
+@pytest.mark.asyncio
+async def test_the_paste_collapsed_pane_is_also_deliverable_at_the_PRE_write_gate(
+    monkeypatch,
+) -> None:
+    """A collapsed draft left over from a previous turn must not block the next
+    send (it is a pre-existing draft, which the gate has always allowed)."""
+    pane = _wire(monkeypatch, _Pane([pane_fixture(_PASTE_COLLAPSED)]))
+
+    assert (await session_manager.deliver_to_window("@1", "hello")).ok
+    assert pane.committed
+
+
+# ── §3: the re-verify's bounded INDETERMINATE retry (defence in depth) ───
+#
+# A refusal at the re-verify is the most expensive failure in the transaction: the
+# payload is already in the box, so it strands the draft AND brakes the topic. It
+# had NO retry — it refused on the FIRST non-None reason, so a single mid-redraw
+# frame was enough. It now carries the pre-write gate's discipline. The asymmetry
+# is preserved: a POSITIVE hazard still refuses on the first capture.
+
+
+@pytest.mark.asyncio
+async def test_the_reverify_retries_an_indeterminate_frame_then_commits(
+    monkeypatch,
+) -> None:
+    pane = _Pane([IDLE_PANE_V2_1_207])
+    # A mid-redraw frame at the first re-verify capture; the box on the retry.
+    pane.on_write = lambda: setattr(
+        pane, "captures", ["", "\n\n(mid-redraw)\n", _pane_with_draft("hello")]
+    )
+    _wire(monkeypatch, pane)
+
+    result = await session_manager.deliver_to_window("@1", "hello")
+
+    assert result.ok
+    assert pane.committed
+    # 1 pre-write gate capture + 3 re-verify captures (2 indeterminate + the box).
+    assert pane.capture_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_the_reverify_still_strands_when_every_frame_is_indeterminate(
+    monkeypatch,
+) -> None:
+    """The retry BOUNDS the uncertainty — it never converts it into an Enter."""
+    pane = _reverify_race_pane("")
+    _wire(monkeypatch, pane)
+
+    result = await session_manager.deliver_to_window("@1", "hello")
+
+    assert result.outcome is delivery.DeliveryOutcome.DRAFT_WRITTEN
+    assert result.reason == delivery.REASON_REVERIFY_FAILED
+    assert not pane.committed
+    assert session_mod.window_has_stranded_draft("@1")
+    assert pane.capture_calls == 1 + session_mod.GATE_CAPTURE_RETRIES + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hazard_fixture",
+    [
+        "auq_single_picker_v2.1.207.txt",  # prompt_row_is_option
+        "inputbox_tasks_mode_v2.1.207.txt",  # tasks_mode (Enter is STOLEN)
+        "inputbox_at_overlay_v2.1.207.txt",  # completion_overlay
+    ],
+)
+async def test_a_positive_hazard_at_the_reverify_STILL_refuses_on_one_capture(
+    monkeypatch, hazard_fixture: str
+) -> None:
+    """THE SAFETY PROPERTY the retry must not weaken: a real prompt drawn in the
+    gate→write window refuses IMMEDIATELY — one capture, no Enter, brake armed."""
+    pane = _reverify_race_pane(pane_fixture(hazard_fixture))
+    _wire(monkeypatch, pane)
+
+    result = await session_manager.deliver_to_window("@1", "some prose payload")
+
+    assert result.outcome is delivery.DeliveryOutcome.DRAFT_WRITTEN
+    assert not pane.committed
+    assert session_mod.window_has_stranded_draft("@1")
+    # The pre-write gate's 1 capture + EXACTLY 1 at the re-verify. No retries.
+    assert pane.capture_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_claude_exiting_at_the_reverify_is_never_retried(monkeypatch) -> None:
+    """A non-Claude pane is a POSITIVE hazard too — one probe, no retry."""
+    pane = _Pane([IDLE_PANE_V2_1_207])
+    pane.on_write = lambda: setattr(pane, "cmd", "zsh")
+    _wire(monkeypatch, pane)
+
+    result = await session_manager.deliver_to_window("@1", "hello")
+
+    assert result.reason == delivery.REASON_NOT_CLAUDE
+    assert result.outcome is delivery.DeliveryOutcome.DRAFT_WRITTEN
+    assert not pane.committed
+    assert pane.capture_calls == 1  # the re-verify never even reached its capture
+
+
+# ── r2 F2: the stranded-draft brake ──────────────────────────────────────
 
 
 @pytest.mark.asyncio
