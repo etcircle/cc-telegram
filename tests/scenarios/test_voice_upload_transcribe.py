@@ -78,6 +78,143 @@ async def test_voice_message_transcribes_and_offers_to_aggregator(
 
 
 @pytest.mark.asyncio
+async def test_voice_download_retries_then_transcribes(
+    scenario: ScenarioHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
+    monkeypatch.setattr(bot_module.config, "openai_api_key", "sk-fake")
+    transcribe = AsyncMock(return_value="hello after retry")
+    monkeypatch.setattr(inbound_module, "transcribe_voice", transcribe)
+    monkeypatch.setattr(inbound_module, "aggregator_offer_voice", AsyncMock())
+    sleep = AsyncMock()
+    monkeypatch.setattr(inbound_module.asyncio, "sleep", sleep)
+
+    update = _make_voice_update(thread_id=42)
+    voice_file = await update.message.voice.get_file()
+    update.message.voice.get_file.reset_mock()
+    update.message.voice.get_file.side_effect = [
+        httpx.ConnectError(
+            "temporary failure",
+            request=httpx.Request("GET", "https://api.telegram.org/file"),
+        ),
+        voice_file,
+    ]
+
+    await bot_module.voice_handler(update, scenario.context)
+
+    transcribe.assert_awaited_once_with(b"\x00\x01", duration_s=37)
+    sleep.assert_awaited_once_with(inbound_module._VOICE_DOWNLOAD_BACKOFFS_S[0])
+    assert update.message.voice.get_file.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_voice_download_exhaustion_replies_without_transcribing(
+    scenario: ScenarioHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
+    monkeypatch.setattr(bot_module.config, "openai_api_key", "sk-fake")
+    transcribe = AsyncMock()
+    monkeypatch.setattr(inbound_module, "transcribe_voice", transcribe)
+    sleep = AsyncMock()
+    monkeypatch.setattr(inbound_module.asyncio, "sleep", sleep)
+    reply = AsyncMock()
+    monkeypatch.setattr(inbound_module, "safe_reply", reply)
+
+    update = _make_voice_update(thread_id=42)
+    update.message.voice.get_file.side_effect = httpx.ConnectError(
+        "telegram unavailable",
+        request=httpx.Request("GET", "https://api.telegram.org/file"),
+    )
+
+    with caplog.at_level("INFO", logger=inbound_module.logger.name):
+        await bot_module.voice_handler(update, scenario.context)
+
+    reply.assert_awaited_once_with(
+        update.message,
+        "⚠ Couldn't download your voice note from Telegram (network error) "
+        "— please resend.",
+    )
+    transcribe.assert_not_awaited()
+    assert (
+        update.message.voice.get_file.await_count
+        == inbound_module._VOICE_DOWNLOAD_ATTEMPTS
+    )
+    assert sleep.await_args_list == [
+        ((backoff,), {}) for backoff in inbound_module._VOICE_DOWNLOAD_BACKOFFS_S
+    ]
+    assert any(
+        "voice download failed" in record.getMessage()
+        and "attempts=3" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_voice_download_non_retryable_failure_replies_once(
+    scenario: ScenarioHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
+    monkeypatch.setattr(bot_module.config, "openai_api_key", "sk-fake")
+    transcribe = AsyncMock()
+    monkeypatch.setattr(inbound_module, "transcribe_voice", transcribe)
+    sleep = AsyncMock()
+    monkeypatch.setattr(inbound_module.asyncio, "sleep", sleep)
+    reply = AsyncMock()
+    monkeypatch.setattr(inbound_module, "safe_reply", reply)
+
+    update = _make_voice_update(thread_id=42)
+    update.message.voice.get_file.side_effect = ValueError("bad Telegram file")
+
+    await bot_module.voice_handler(update, scenario.context)
+
+    reply.assert_awaited_once_with(
+        update.message,
+        "⚠ Couldn't download your voice note from Telegram (network error) "
+        "— please resend.",
+    )
+    transcribe.assert_not_awaited()
+    update.message.voice.get_file.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_voice_entry_log_precedes_download_success_log(
+    scenario: ScenarioHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
+    monkeypatch.setattr(bot_module.config, "openai_api_key", "sk-fake")
+    monkeypatch.setattr(
+        inbound_module, "transcribe_voice", AsyncMock(return_value="logged voice")
+    )
+    monkeypatch.setattr(inbound_module, "aggregator_offer_voice", AsyncMock())
+    update = _make_voice_update(thread_id=42)
+
+    with caplog.at_level("INFO", logger=inbound_module.logger.name):
+        await bot_module.voice_handler(update, scenario.context)
+
+    messages = [record.getMessage() for record in caplog.records]
+    entry_index = next(
+        i for i, message in enumerate(messages) if "voice note received" in message
+    )
+    success_index = next(
+        i
+        for i, message in enumerate(messages)
+        if "voice transcription received" in message
+    )
+    assert entry_index < success_index
+
+
+@pytest.mark.asyncio
 async def test_voice_echo_failure_does_not_lose_delivered_turn(
     scenario: ScenarioHarness,
     monkeypatch: pytest.MonkeyPatch,

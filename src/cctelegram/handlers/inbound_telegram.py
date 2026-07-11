@@ -52,6 +52,7 @@ from telegram import (
     User,
 )
 from telegram.constants import ChatAction
+from telegram.error import NetworkError
 from telegram.ext import ContextTypes
 
 from .. import route_runtime
@@ -107,6 +108,9 @@ from .message_sender import (
 from .reply_context import extract_reply_context, render_for_claude
 
 logger = logging.getLogger(__name__)
+
+_VOICE_DOWNLOAD_ATTEMPTS = 3
+_VOICE_DOWNLOAD_BACKOFFS_S = (1.0, 3.0)
 
 
 def _voice_failure_classification(error: Exception) -> str:
@@ -684,11 +688,58 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # Download voice as in-memory bytes
-    voice_file = await update.message.voice.get_file()
-    ogg_data = bytes(await voice_file.download_as_bytearray())
     raw_duration = update.message.voice.duration
     duration_s = raw_duration if isinstance(raw_duration, int) else None
+    logger.info("voice note received duration_s=%r thread=%s", duration_s, thread_id)
+
+    # Download voice as in-memory bytes
+    ogg_data: bytes | None = None
+    download_error: Exception | None = None
+    attempts_made = 0
+    for attempt in range(1, _VOICE_DOWNLOAD_ATTEMPTS + 1):
+        attempts_made = attempt
+        try:
+            voice_file = await update.message.voice.get_file()
+            ogg_data = bytes(await voice_file.download_as_bytearray())
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            NetworkError,
+        ) as e:
+            if attempt == _VOICE_DOWNLOAD_ATTEMPTS:
+                download_error = e
+                break
+            await asyncio.sleep(_VOICE_DOWNLOAD_BACKOFFS_S[attempt - 1])
+        except Exception as e:
+            download_error = e
+            break
+        else:
+            break
+
+    if download_error is not None:
+        logger.info(
+            "voice download failed classification=%s attempts=%d thread=%s",
+            _voice_failure_classification(download_error),
+            attempts_made,
+            thread_id,
+        )
+        try:
+            await safe_reply(
+                update.message,
+                "⚠ Couldn't download your voice note from Telegram (network error) "
+                "— please resend.",
+            )
+        except Exception:
+            logger.warning(
+                "voice download failure reply failed user=%d thread=%s",
+                user.id,
+                thread_id,
+            )
+        return
+
+    assert ogg_data is not None
     logger.info(
         "voice transcription received duration_s=%r bytes=%d thread=%s",
         duration_s,
