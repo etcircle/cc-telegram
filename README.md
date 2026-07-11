@@ -89,7 +89,7 @@ When Claude asks a question or presents a plan, cc-telegram turns it into a Tele
 
 A tap does not blindly send a number and hope for the best. The bot moves the live terminal cursor, verifies that it reached the intended option, and only then presses Enter. If the screen changed before your tap arrived, the action is cancelled instead of risking the wrong choice.
 
-Permission and generic confirmation cards are enabled by default. Either detector can be disabled explicitly through its environment flag.
+Permission and generic confirmation cards are enabled by default. Either detector can be disabled explicitly through its environment flag. Note that permission prompts are only *shown* — driving them from Telegram is impractical enough that Claude Code is normally run with permissions bypassed; see [Permissions](#permissions-in-practice-this-is-a-bypass-permissions-tool).
 
 ### You can tell what the machine is doing
 
@@ -158,7 +158,7 @@ Every other slash command is forwarded to Claude Code. `/help` and `/memory` are
 - **Late answers.** Recent Claude Code versions may auto-resolve unanswered prompts after about 60 seconds. cc-telegram changes the card to explain what happened and lets you send your choice as a correction.
 - **Personal output settings.** `/settings` offers verbose, standard, compact, and quiet presets. Preferences are stored per user.
 - **Broken-topic fallback.** If Telegram reports that a topic was removed, closed, or forbidden, output falls back to DM instead of disappearing.
-- **Approval cards.** Permission prompts and generic decisions are surfaced as cards by default. Verified one-tap dispatch is limited to prompt families and Claude Code versions that cc-telegram has explicitly characterised.
+- **Approval cards.** Permission prompts and generic decisions are surfaced as cards by default. Verified one-tap dispatch is limited to prompt families and Claude Code versions that cc-telegram has explicitly characterised; everything else is display-only with raw keystroke controls. See [Permissions: in practice this is a bypass-permissions tool](#permissions-in-practice-this-is-a-bypass-permissions-tool).
 
 ## Single-user by design
 
@@ -243,6 +243,16 @@ Everything else has a default.
 - `CC_TELEGRAM_MESSAGE_REF_TEXT_MAX_CHARS` caps stored message bodies. Default: 4000.
 
 Per-user `/settings` choices take precedence over environment defaults.
+
+### Permissions: in practice this is a bypass-permissions tool
+
+cc-telegram is realistically run with `--dangerously-skip-permissions`, and you should decide up front whether that trade is acceptable to you.
+
+The reason is structural. Claude Code's tool-permission prompts are a terminal UI, and the bridge can only reproduce them as a card with raw keystroke controls — there is no verified one-tap dispatch for them, so approving a `Bash` or `Edit` call from your phone means sending un-cursor-verified arrow keys into a live terminal. In day-to-day use that is slow enough that a permission-prompting session is impractical to drive over Telegram at all. Running Claude Code with permissions bypassed is therefore the normal configuration, not an optimisation.
+
+What that means for your security boundary: it is no longer Claude Code's per-tool approval. It is **`ALLOWED_USERS` plus the machine you run on**. Anyone who can post in your forum can make Claude read, edit, and execute anything your user account can. Lock `ALLOWED_USERS` to your own Telegram user ID, run on a machine you trust, and consider `IS_SANDBOX=1`.
+
+> **Known hazard while a prompt is on screen (GH #50).** If Claude does raise an interactive prompt — a question card, a plan approval, a folder-trust dialog — do **not** send a plain text message in that topic. The bridge currently types it into the terminal, where the text is discarded and the trailing Enter commits the highlighted option (on a plan approval, that means approving the plan). Answer the card first, then send your message. A fix is planned.
 
 ### Suggested daily-driver config
 
