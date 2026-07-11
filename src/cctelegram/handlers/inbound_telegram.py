@@ -1,4 +1,4 @@
-"""Telegram inbound message handlers (text, photo, voice, document, media-group).
+"""Telegram inbound handlers for reliable text, media, and voice delivery.
 
 Extracts the inbound-side of bot.py: every code path that runs when a user
 sends content into a Telegram topic. Each handler resolves the topic → tmux
@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import httpx
 from telegram import (
     Bot,
     CallbackQuery,
@@ -106,6 +107,21 @@ from .message_sender import (
 from .reply_context import extract_reply_context, render_for_claude
 
 logger = logging.getLogger(__name__)
+
+
+def _voice_failure_classification(error: Exception) -> str:
+    """Classify a transcription failure without exposing user content."""
+    if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return "connect"
+    if isinstance(error, (TimeoutError, httpx.TimeoutException)):
+        return "timeout"
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"http_{error.response.status_code}"
+    if isinstance(error, ValueError):
+        return "empty"
+    if isinstance(error, httpx.TransportError):
+        return "transport"
+    return "other"
 
 
 def is_user_allowed(user_id: int | None) -> bool:
@@ -671,17 +687,53 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Download voice as in-memory bytes
     voice_file = await update.message.voice.get_file()
     ogg_data = bytes(await voice_file.download_as_bytearray())
+    raw_duration = update.message.voice.duration
+    duration_s = raw_duration if isinstance(raw_duration, int) else None
+    logger.info(
+        "voice transcription received duration_s=%r bytes=%d thread=%s",
+        duration_s,
+        len(ogg_data),
+        thread_id,
+    )
 
     # Transcribe
+    transcribe_started = time.monotonic()
     try:
-        text = await transcribe_voice(ogg_data)
+        text = await transcribe_voice(ogg_data, duration_s=duration_s)
+    except TimeoutError as e:
+        logger.info(
+            "voice transcription failed classification=%s thread=%s",
+            _voice_failure_classification(e),
+            thread_id,
+        )
+        await safe_reply(
+            update.message,
+            "⚠ Voice transcription timed out — it may not have completed; "
+            "please resend or send shorter segments",
+        )
+        return
     except ValueError as e:
+        logger.info(
+            "voice transcription failed classification=%s thread=%s",
+            _voice_failure_classification(e),
+            thread_id,
+        )
         await safe_reply(update.message, f"⚠ {e}")
         return
     except Exception as e:
-        logger.error("Voice transcription failed: %s", e)
+        logger.info(
+            "voice transcription failed classification=%s thread=%s",
+            _voice_failure_classification(e),
+            thread_id,
+        )
         await safe_reply(update.message, f"⚠ Transcription failed: {e}")
         return
+    logger.info(
+        "voice transcription succeeded latency_ms=%d text_len=%d thread=%s",
+        round((time.monotonic() - transcribe_started) * 1000),
+        len(text),
+        thread_id,
+    )
 
     await update.message.chat.send_action(ChatAction.TYPING)
     clear_status_msg_info(user.id, thread_id)
@@ -709,7 +761,14 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     rendered = await _apply_reply_context(update.message, user.id, thread_id, text)
     await aggregator_offer_voice(route, rendered, bot=context.bot)
 
-    await safe_reply(update.message, f'🎤 "{echo}"')
+    try:
+        await safe_reply(update.message, f'🎤 "{echo}"')
+    except Exception:
+        logger.warning(
+            "voice transcription echo failed user=%d thread=%s",
+            user.id,
+            thread_id,
+        )
 
 
 def _sanitize_filename_part(part: str, max_len: int) -> str:
