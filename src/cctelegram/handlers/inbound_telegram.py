@@ -113,6 +113,19 @@ _VOICE_DOWNLOAD_ATTEMPTS = 3
 _VOICE_DOWNLOAD_BACKOFFS_S = (1.0, 3.0)
 
 
+async def _typing_action_best_effort(message: Message, thread_id: int | None) -> None:
+    """Send the cosmetic TYPING chat action; never let it kill the handler.
+
+    The typing hint is pure decoration ahead of payload delivery — a transient
+    Telegram network error here must not drop the inbound message (GH #51: a
+    TimedOut on this call silently ate a successfully transcribed voice note).
+    """
+    try:
+        await message.chat.send_action(ChatAction.TYPING)
+    except Exception:
+        logger.warning("inbound typing action failed (non-fatal) thread=%s", thread_id)
+
+
 def _voice_failure_classification(error: Exception) -> str:
     """Classify a transcription failure without exposing user content."""
     if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
@@ -588,7 +601,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    await update.message.chat.send_action(ChatAction.TYPING)
+    await _typing_action_best_effort(update.message, thread_id)
     clear_status_msg_info(user.id, thread_id)
 
     # §2.5.2: anchor the next assistant-text response to the LATEST inbound
@@ -786,7 +799,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         thread_id,
     )
 
-    await update.message.chat.send_action(ChatAction.TYPING)
+    await _typing_action_best_effort(update.message, thread_id)
     clear_status_msg_info(user.id, thread_id)
 
     # §2.5.2 + §2.8: voice messages take the same path as text — anchor the
@@ -966,7 +979,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    await update.message.chat.send_action(ChatAction.TYPING)
+    await _typing_action_best_effort(update.message, thread_id)
     clear_status_msg_info(user.id, thread_id)
 
     set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
@@ -1255,7 +1268,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    await update.message.chat.send_action(ChatAction.TYPING)
+    await _typing_action_best_effort(update.message, thread_id)
     await enqueue_status_update(context.bot, user.id, wid, None, thread_id=thread_id)
 
     # Cancel any running bash capture — new message pushes pane content down

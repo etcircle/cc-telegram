@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from telegram.error import TimedOut
 
 from cctelegram import bot as bot_module
 from cctelegram.handlers import inbound_telegram as inbound_module
@@ -75,6 +76,39 @@ async def test_voice_message_transcribes_and_offers_to_aggregator(
     update.message.reply_text.assert_awaited()
     echo_text = update.message.reply_text.await_args.args[0]
     assert "hello voice" in echo_text
+
+
+@pytest.mark.asyncio
+async def test_voice_typing_timeout_still_delivers_transcription(
+    scenario: ScenarioHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
+    transcribe = AsyncMock(return_value="voice survives typing timeout")
+    monkeypatch.setattr(inbound_module, "transcribe_voice", transcribe)
+    offered: list[tuple[tuple[int, int, str], str]] = []
+
+    async def fake_offer(
+        route: tuple[int, int, str], text: str, *, bot: object | None = None
+    ) -> None:
+        offered.append((route, text))
+
+    monkeypatch.setattr(inbound_module, "aggregator_offer_voice", fake_offer)
+    monkeypatch.setattr(bot_module.config, "openai_api_key", "sk-fake")
+    update = _make_voice_update(thread_id=42)
+    update.message.chat.send_action.side_effect = TimedOut("typing timed out")
+
+    with caplog.at_level("WARNING", logger=inbound_module.logger.name):
+        await bot_module.voice_handler(update, scenario.context)
+
+    transcribe.assert_awaited_once_with(b"\x00\x01", duration_s=37)
+    assert offered == [((scenario.user_id, 42, wid), "voice survives typing timeout")]
+    assert any(
+        "inbound typing action failed (non-fatal) thread=42" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
