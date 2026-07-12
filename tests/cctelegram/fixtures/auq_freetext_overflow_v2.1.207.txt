@@ -1,0 +1,50 @@
+
+     Paragraph two. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the constraints
+     than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to keep a
+     contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+
+     Paragraph three. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the
+     constraints than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to
+     keep a contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+
+     Paragraph four. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the
+     constraints than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to
+     keep a contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+
+     Paragraph five. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the
+     constraints than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to
+     keep a contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+
+     Paragraph six. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the constraints
+     than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to keep a
+     contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.> Re: "the earlier card"
+     >
+     > Claude asked: What is your favorite color?
+
+     Paragraph one. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the constraints
+     than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to keep a
+     contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+
+     Paragraph two. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the constraints
+     than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to keep a
+     contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+
+     Paragraph three. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the
+     constraints than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to
+     keep a contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+
+     Paragraph four. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the
+     constraints than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to
+     keep a contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+
+     Paragraph five. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the
+     constraints than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to
+     keep a contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+
+     Paragraph six. I want to walk you through the reasoning in detail because the short answer is misleading and I would rather you understand the constraints
+     than guess at them from a single word. The palette has to work on light and dark, it has to survive being printed in greyscale, and it has to keep a
+     contrast ratio above four point five to one for body text everywhere it is used, including the small print in the footer.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel

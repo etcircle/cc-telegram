@@ -41,6 +41,7 @@ Key components:
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -49,9 +50,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
-from ..session import peek_session_id_for_window
+from ..session import peek_session_id_for_window, read_session_id_for_window_fresh
 from ..utils import app_dir
 
 if TYPE_CHECKING:
@@ -1213,6 +1214,217 @@ def peek_side_file_tool_use_id_and_written_at(
     if time.time() - rec.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
         return None
     return rec.tool_use_id, rec.written_at
+
+
+@dataclass(frozen=True)
+class SurfaceAnchor:
+    """The AUQ occurrence anchor: its KEY **and the record's own content**.
+
+    The key alone is not enough. It is read OUT-OF-BAND, so nothing tied it to
+    the pane the caller then captured — and the argument that made that safe ("a
+    live prompt means Claude is BLOCKED on it, so the side file must be its")
+    silently assumed that a RESOLVED prompt is no longer live-LOOKING on the
+    pane. Carrying the record's ``tool_input`` lets the caller BIND the anchor to
+    the pane it captured (:func:`anchor_pane_agreement` — the OPTION LABELS)
+    instead of betting on read order.
+
+    Both fields come from ONE atomic side-file read, so the key and the content
+    can never describe two different records.
+    """
+
+    key: str
+    tool_input: dict[str, Any]
+
+
+ANCHOR_MATCH: Final = "match"
+ANCHOR_MISMATCH: Final = "mismatch"
+ANCHOR_INDETERMINATE: Final = "indeterminate"
+
+
+def anchor_pane_agreement(
+    tool_input: dict[str, Any],
+    pane_text: str,
+    *,
+    target_row: int,
+) -> str:
+    """Does the hook RECORD describe the card the PANE is showing?
+
+    ``ANCHOR_MATCH`` / ``ANCHOR_MISMATCH`` / ``ANCHOR_INDETERMINATE``.
+
+    WHAT THIS BUYS. The free-text executor reads the anchor out-of-band and
+    captures the pane separately, so it can mint a CHIMERA — ``(card A's pane,
+    card B's anchor)`` — whenever the side file has already moved to B while the
+    pane still renders A (``PreToolUse`` writes B's record BEFORE B draws, so a
+    just-answered A can still be on screen). Read order alone cannot close that,
+    so the record's CONTENT is bound to the pane it is paired with: a record whose
+    OPTION LABELS are not the pane's labels is REFUSED, whatever the read order
+    was.
+
+    TARGET-ROW-BLIND, for the same reason the pane identity is: the executor
+    types into row ``target_row``, and a typed affordance row parses as a FOURTH
+    REAL OPTION. Only the real prefix ``1..target_row-1`` — the part the
+    transaction never touches — is compared, so the agreement is stable across
+    the executor's own mutations.
+
+    ``INDETERMINATE`` = the pane carries no complete real-option prefix (the
+    overflow shape: a long answer scrolls the block off the top of an alternate
+    screen). The caller then has no pane component either, and the anchor stands
+    alone — the documented, rig-measured AUQ overflow case. It is NOT a licence:
+    the caller still requires the anchor KEY to be unchanged.
+
+    **THE LABEL COMPARISON IS THE WHOLE CONTENT BINDING, AND ITS LIMIT IS AN
+    ACCEPTED RESIDUAL (owner decision 2026-07-12).** ``_record_consistent_with_pane``
+    rejects a record whose option labels differ from the pane (``label_mismatch``)
+    and does NOT reject one whose labels are IDENTICAL but whose QUESTION differs
+    — a pure-pane parse yields ``current_question_title is None`` and empty option
+    descriptions, so the labels are the only pane-observable content it has. An
+    earlier revision therefore grew a question-text binding (a pane
+    question-REGION extractor, a measured wrap column, and a row-consumption
+    walk). **It was DELETED.** It failed three straight review rounds on its own
+    injectivity, and the hazard it defended against was over-scoped: a wrong card
+    CANNOT receive an OPTION COMMIT, because the free-text lane's PRE-TYPE LANDING
+    PROOF (``free_text``: cursor + SGR-2 dim + the exact ``Type something.``
+    label) is satisfied by exactly one shape — the selected, UNTYPED placeholder —
+    and a real option row is never dim. The worst reachable outcome is that the
+    prose answer reaches a DIFFERENT QUESTION (a same-labelled successor's
+    free-text row): a recoverable annoyance the user sees immediately, not a
+    security event. Disclosed in ``handlers/free_text``'s module docstring and in
+    ``.claude/rules/message-handling.md``.
+    """
+    from ..terminal_parser import resolve_ask_form
+
+    if not pane_text or target_row < 2:
+        return ANCHOR_INDETERMINATE
+    pane_form = resolve_ask_form(None, pane_text)
+    if pane_form is None or not pane_form.options:
+        return ANCHOR_INDETERMINATE
+    real = tuple(
+        o for o in pane_form.options if o.number is not None and o.number < target_row
+    )
+    if [o.number for o in real] != list(range(1, target_row)):
+        # No complete real-option prefix on this pane ⇒ nothing to bind against.
+        return ANCHOR_INDETERMINATE
+
+    truncated = dataclasses.replace(pane_form, options=real)
+    probe = PreToolAskRecord(
+        tool_input=tool_input,
+        session_id="",
+        tool_use_id="",
+        written_at=0.0,
+        input_fingerprint="",
+    )
+    consistent, reason = _record_consistent_with_pane(probe, truncated)
+    if not consistent:
+        logger.info(
+            "AUQ anchor/pane DISAGREE reason=%s — the PreToolUse record does not "
+            "describe the card on the pane",
+            reason,
+        )
+        return ANCHOR_MISMATCH
+    return ANCHOR_MATCH
+
+
+def peek_surface_anchor_for_window(window_id: str) -> SurfaceAnchor | None:
+    """The AUQ occurrence anchor — key **and content** — from ONE atomic read.
+
+    The KEY is exactly what :func:`peek_surface_identity_for_window` returns (all
+    of the round-3 / round-4 contract documented there — the freshly-resolved
+    session generation, the mandatory ``tool_use_id``, the future-skew guard, no
+    read-TTL). The CONTENT is the SAME record's ``tool_input``, so the caller can
+    bind it to the pane it captures (:func:`anchor_pane_agreement`) instead of
+    trusting read order alone (round-5 P1-B).
+
+    One read, so the key and the content can never name two different cards.
+    """
+    session_id = read_session_id_for_window_fresh(window_id)
+    if not session_id:
+        return None
+    record = _read_pretool_side_file(session_id)
+    if record is None:
+        return None
+    if time.time() - record.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
+        return None
+    if not record.tool_use_id:
+        logger.warning(
+            "AUQ anchor read window=%s reason=no_tool_use_id — the PreToolUse "
+            "record carries no occurrence witness; the free-text lane DECLINES",
+            window_id,
+        )
+        return None
+    if not isinstance(record.tool_input, dict):
+        return None
+    return SurfaceAnchor(
+        key=f"auq:sid:{session_id}:tu:{record.tool_use_id}",
+        tool_input=record.tool_input,
+    )
+
+
+def peek_surface_identity_for_window(window_id: str) -> str | None:
+    """The AUQ SURFACE-OCCURRENCE identity for a window's live side file.
+
+    The OUT-OF-BAND anchor the GH #50 PR-2 free-text executor re-checks after its
+    navigation and again immediately before the Enter (peer-review P1). It is
+    independent of the pane, so it survives the one shape where the pane-derived
+    identity cannot: a long answer that scrolls the picker's whole option block
+    off the top (the AUQ picker is bottom-anchored, and a TUI has no scrollback).
+
+    Identity, NOT liveness — but the two coincide where it matters: the side file
+    is written by the ``PreToolUse`` hook BEFORE each AUQ renders and unlinked at
+    its ``tool_result``, so a card that resolved-and-was-replaced yields a
+    DIFFERENT id (the successor's) or ``None`` (resolved, nothing live) — both of
+    which the executor refuses on.
+
+    **THE SESSION GENERATION IS PART OF THE ANCHOR (round-4 P1).** The window's
+    session is resolved through ``session.read_session_id_for_window_fresh`` —
+    the hook-written ``session_map.json``, never the CACHED
+    ``WindowState.session_id``, which only mirrors that map as often as the
+    monitor's poll loop reloads it. A ``/clear`` (or any session replacement) in
+    the SAME tmux window rotates the session while the cache still names the old
+    one, so every anchor read resolved the PREDECESSOR's side file while the pane
+    being captured was the SUCCESSOR's card: three observations in perfect
+    agreement with each other and with nothing real, and the Enter commits onto
+    the wrong card. Embedding the freshly-resolved session id in the key means a
+    rotation between two observation points CHANGES the anchor and
+    ``SurfaceIdentity.still_holds`` refuses. (This lane's record carries no
+    ``window_key``, so the double-``--resume`` sibling residual documented
+    elsewhere is unchanged — the fix here is the session GENERATION, not the
+    window.)
+
+    **AN EMPTY ``tool_use_id`` DECLINES (round-4 P2).** ``hook.py`` writes ``""``
+    when the payload carries no id, and the old ``(written_at, canonical
+    fingerprint)`` composite silently upgraded that absence into an ALLOW-capable
+    anchor. A wall-clock stamp plus a content hash is not an occurrence witness:
+    same-session siblings can share a clock quantum, and (there being no
+    read-TTL) a stale record stays "valid" forever. On the only licensed CC
+    version the rig confirms the id is always present. **Scoped to the free-text
+    ANCHOR path only** — the GH #48 recap surface-identity lane builds its own
+    composite from ``read_side_file_for_recovery`` and is untouched, because a
+    guessy identity there costs a duplicate recap, not a wrong keystroke.
+
+    Same future-skew guard as :func:`side_file_live_for_session`; deliberately NO
+    read-TTL (a card left open for hours is still that card). Read-only — never
+    mutates the record cache.
+
+    ``None`` when the window has no session in the fresh map, no side file, a
+    clock-skewed one, or one with no occurrence witness — the caller FAILS CLOSED
+    on ``None`` wherever it had an id before.
+    """
+    session_id = read_session_id_for_window_fresh(window_id)
+    if not session_id:
+        return None
+    record = _read_pretool_side_file(session_id)
+    if record is None:
+        return None
+    if time.time() - record.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
+        return None
+    if not record.tool_use_id:
+        logger.warning(
+            "AUQ anchor read window=%s reason=no_tool_use_id — the PreToolUse "
+            "record carries no occurrence witness; the free-text lane DECLINES",
+            window_id,
+        )
+        return None
+    return f"auq:sid:{session_id}:tu:{record.tool_use_id}"
 
 
 @dataclass(frozen=True)

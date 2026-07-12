@@ -21,6 +21,7 @@ preserves the kill-criterion signal: scenarios fail the bar only when the
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -868,6 +869,10 @@ def _reset_all_handler_state() -> None:
     if notify_dir.is_dir():
         for path in notify_dir.glob("*.json"):
             path.unlink(missing_ok=True)
+    # The hook-written session map is real substrate too (the free-text anchor
+    # resolves the window's session generation through it), so a leaked entry
+    # would let one test's window resolve another's session.
+    (app_dir() / "session_map.json").unlink(missing_ok=True)
     auq_ledger.reset_for_tests()
     route_runtime.reset_for_tests()
     transcript_event_adapter.reset_for_tests()
@@ -1055,6 +1060,37 @@ class ScenarioHarness:
         self.session_manager.group_chat_ids[f"{self.user_id}:{thread_id}"] = (
             self.chat_id
         )
+        if session_id:
+            # …and the hook-written map, which is the AUTHORITY the GH #50 PR-2
+            # free-text anchor reads (round-4 P1: the in-memory WindowState above
+            # is only a MIRROR of it, refreshed on the monitor's poll cycle, so a
+            # scenario that seeded only the mirror would let the reader resolve a
+            # session the map never named). In production ``SessionStart`` writes
+            # this BEFORE the session can render anything — so writing it here,
+            # beside the binding, is the substrate behaving like the substrate.
+            self._write_session_map_entry(window_id, session_id, cwd)
+
+    def _write_session_map_entry(
+        self, window_id: str, session_id: str, cwd: str
+    ) -> None:
+        from cctelegram.config import config
+        from cctelegram.utils import app_dir, atomic_write_json
+
+        path = app_dir() / "session_map.json"
+        current: dict = {}
+        if path.exists():
+            try:
+                current = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                current = {}
+        if not isinstance(current, dict):
+            current = {}
+        current[f"{config.tmux_session_name}:{window_id}"] = {
+            "session_id": session_id,
+            "cwd": cwd,
+            "window_name": self.session_manager.window_display_names.get(window_id, ""),
+        }
+        atomic_write_json(path, current)
 
 
 @pytest.fixture

@@ -56,7 +56,7 @@ async def test_same_session_quote_renders_normally() -> None:
         patch.object(bot_module.config, "reply_context_enabled", True),
         patch.object(bot_module.config, "reply_context_cross_session_enabled", True),
     ):
-        rendered = await bot_module._apply_reply_context(message, 7, 99, "ask")
+        rendered, applied = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
     assert "Cross-session reply" not in rendered
     assert "[User message]\nask" in rendered
@@ -98,7 +98,7 @@ async def test_cross_session_quote_renders_with_marker_by_default() -> None:
         patch.object(bot_module.config, "reply_context_enabled", True),
         patch.object(bot_module.config, "reply_context_cross_session_enabled", True),
     ):
-        rendered = await bot_module._apply_reply_context(message, 7, 99, "ask")
+        rendered, applied = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
     assert "Cross-session reply" in rendered
     assert "from old session" in rendered  # quoted body still present
@@ -141,7 +141,7 @@ async def test_kill_switch_restores_silent_drop() -> None:
         patch.object(bot_module.config, "reply_context_enabled", True),
         patch.object(bot_module.config, "reply_context_cross_session_enabled", False),
     ):
-        rendered = await bot_module._apply_reply_context(message, 7, 99, "ask")
+        rendered, applied = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
     # Silent drop: user_text returned verbatim, no quote block, no marker.
     assert rendered == "ask"
@@ -157,7 +157,7 @@ async def test_master_kill_switch_off_skips_entire_path() -> None:
         patch.object(bot_module.config, "reply_context_enabled", False),
         patch.object(inbound_module, "extract_reply_context") as mock_extract,
     ):
-        rendered = await bot_module._apply_reply_context(message, 7, 99, "ask")
+        rendered, applied = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
     assert rendered == "ask"
     # Never even tried to extract — fast path on master kill switch.
@@ -172,7 +172,7 @@ async def test_no_reply_returns_text_unchanged() -> None:
         patch.object(bot_module.config, "reply_context_enabled", True),
         patch.object(inbound_module, "extract_reply_context", return_value=None),
     ):
-        rendered = await bot_module._apply_reply_context(message, 7, 99, "ask")
+        rendered, applied = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
     assert rendered == "ask"
 
@@ -216,7 +216,7 @@ async def test_unknown_session_treats_as_non_stale() -> None:
         patch.object(bot_module.config, "reply_context_enabled", True),
         patch.object(bot_module.config, "reply_context_cross_session_enabled", True),
     ):
-        rendered = await bot_module._apply_reply_context(message, 7, 99, "ask")
+        rendered, applied = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
     # Normal render, no cross-session marker.
     assert "Cross-session reply" not in rendered

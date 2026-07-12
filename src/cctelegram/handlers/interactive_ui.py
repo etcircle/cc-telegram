@@ -67,6 +67,7 @@ from . import (
     auq_ledger,
     auq_source,
     decision_token,
+    free_text,
     late_answer,
     pick_intent,
     pick_token,
@@ -2281,8 +2282,18 @@ def _clip_card_title(title: str | None) -> str:
     return head.rstrip() + "…"
 
 
-def _render_ask_user_question(form: AskUserQuestionForm) -> str:
+def _render_ask_user_question(
+    form: AskUserQuestionForm, *, free_text_hint: str | None = None
+) -> str:
     """Render a structured AskUserQuestion form into Telegram-friendly text.
+
+    ``free_text_hint`` (GH #50 PR-2 §2.5) is the per-surface truth about what a
+    plain Telegram message will do at THIS card, resolved by the caller (which
+    holds the live CC version for the license check). Pre-PR-2 the card carried
+    a hardcoded "(Type something — send a regular message to free-text)" on every
+    picker with a free-text affordance — including the multi-select and
+    unlicensed-version cases, where PR-1 REFUSES such a message. The card now
+    only makes the promise the free-text lane will actually keep.
 
     The body produced here replaces the raw pane excerpt for picker variants
     that ``parse_ask_user_question`` understands. Two layout modes:
@@ -2371,7 +2382,10 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
                 # were long or numerous. Single-select renders labels only too.
             if form.is_free_text:
                 lines.append("")
-                lines.append("  (Type something — send a regular message to free-text)")
+                # MULTI-select is explicitly OUT of the free-text lane (plan
+                # §2.2: its answer is a THREE-Enter transaction whose first Enter
+                # already mutates the form), so the card must not invite prose.
+                lines.append(f"  {free_text.HINT_MULTI_SELECT}")
             lines.append("")
             if form.options_complete:
                 lines.append(
@@ -2393,7 +2407,7 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
             lines.append(f"{cursor}{opt.number}. {opt.label}{rec}")
         if form.is_free_text:
             lines.append("")
-            lines.append("  (Type something — send a regular message to free-text)")
+            lines.append(f"  {free_text_hint or free_text.HINT_NO_FREE_TEXT}")
         lines.append("")
         lines.append("Enter to select · Tab/Arrow keys to navigate · Esc to cancel")
         return _clip_card_body("\n".join(lines).rstrip())
@@ -3683,7 +3697,20 @@ async def handle_interactive_ui(
                             "Tap-to-select is off on a scrolled screen — "
                             "use ↑/↓/Tab below or send your answer."
                         )
-            structured = _render_ask_user_question(display_form)
+            # §2.5: the card's free-text line must state the CURRENT truth for
+            # THIS surface. Only a single-select, licensed, flag-ON AUQ can
+            # actually take a plain message as its answer (see
+            # ``free_text.card_hint``); everything else points at the buttons.
+            structured = _render_ask_user_question(
+                display_form,
+                free_text_hint=free_text.card_hint(
+                    free_text.SURFACE_AUQ,
+                    version=w.pane_current_command,
+                    has_affordance=display_form.is_free_text
+                    and display_form.select_mode == "single"
+                    and not display_form.is_review_screen,
+                ),
+            )
             if structured:
                 text = structured
             if partial_options_notice:

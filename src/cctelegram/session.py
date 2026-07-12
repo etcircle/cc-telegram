@@ -40,7 +40,7 @@ from .config import config
 from .delivery import DeliveryOutcome, DeliveryResult, UserTurnStamp
 from .tmux_manager import pane_command_is_claude, tmux_manager
 from .transcript_parser import TranscriptParser
-from .utils import atomic_write_json
+from .utils import app_dir, atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +235,25 @@ def _track_bot_sent_text(session_id: str, text: str) -> None:
     now = time.monotonic()
     _prune_expired_sends(buf, now)
     buf.append((now, normalized))
+
+
+def record_bot_sent_text(window_id: str, text: str) -> None:
+    """Record a bot-originated payload for the 👤-echo dedup, keyed by WINDOW.
+
+    The public seam for a delivery path that commits OUTSIDE
+    ``deliver_to_window`` — today just the GH #50 PR-2 free-text lane
+    (``handlers/free_text``), which types its payload into a live card's
+    affordance row and presses Enter itself. Belt-and-braces against a "👤 …"
+    duplicate of the message the user just sent, should a committed answer ever
+    surface as a genuine user entry in the transcript.
+
+    Resolves the window's CURRENT session id (the same lookup
+    ``deliver_to_window`` does) and no-ops when the window is unknown or has no
+    session — a missed dedup is a cosmetic duplicate, never a correctness bug.
+    """
+    state = session_manager.window_states.get(window_id)
+    if state and state.session_id:
+        _track_bot_sent_text(state.session_id, text)
 
 
 def consume_bot_sent_text(session_id: str, text: str) -> bool:
@@ -1873,3 +1892,68 @@ def peek_session_id_for_window(window_id: str | None) -> str | None:
     if state is None:
         return None
     return state.session_id or None
+
+
+def read_session_id_for_window_fresh(window_id: str | None) -> str | None:
+    """The window's CURRENT session id, read FRESH from ``session_map.json``.
+
+    **NOT a cache read.** ``peek_session_id_for_window`` (above) returns
+    ``WindowState.session_id``, which is a *mirror* of the hook-written map,
+    refreshed only when the monitor's poll loop calls ``load_session_map()``. It
+    therefore LAGS — by up to a poll cycle, and longer when the monitor is busy —
+    and that lag is a WRONG-CARD COMMIT on the GH #50 PR-2 free-text lane
+    (peer-review round-4 P1):
+
+        AUQ card A is live in window @N (session A) → the user ``/clear``s (or
+        the session is otherwise replaced) → ``SessionStart`` writes session B
+        into the map → session B renders its OWN AskUserQuestion card → but the
+        bot's CACHED ``WindowState.session_id`` still says A, so every
+        occurrence-anchor read resolves session A and returns A's side-file id
+        while the pane being captured is B's. The three observations AGREE WITH
+        EACH OTHER — a self-consistent fiction — and since the pane component is
+        degenerate across same-shaped occurrences (a re-asked question renders
+        byte-identical option rows), nothing refuses and Enter commits the user's
+        answer onto card B: THE WRONG QUESTION. A per-window predicate would not
+        save it either: both sessions occupy the SAME tmux window, so any
+        ``window_key`` check matches.
+
+    So the identity transaction must obtain a FRESH proof of the window's session
+    GENERATION, not a cached one. The ordering that makes this sound is the same
+    one ``free_text.derive_identity`` documents for the anchor: ``SessionStart``
+    writes the map BEFORE the new session can render anything, and ``PreToolUse``
+    writes its side file BEFORE the prompt renders — so "card X is live on the
+    pane" implies "the map names X's session and X's side file exists". A fresh
+    read that finds no entry (or whose session has no side file) DECLINES; it
+    never falls back to the cached/older session.
+
+    Path via ``app_dir()`` rather than the import-time ``config.session_map_file``
+    — the convention every side-file reader in the package follows
+    (``auq_source`` / ``notify_source`` / ``md_capture``), so the
+    read honours ``CC_TELEGRAM_DIR`` at CALL time. The key format
+    (``"<tmux_session>:<window_id>"``) is the writer's, mirrored from
+    ``SessionManager.load_session_map``.
+
+    Read-only: never mutates ``window_states``, never writes state. ``None`` on
+    an empty window id, a missing/unreadable/malformed map, a window absent from
+    the map, or an empty session id — every one of those is fail-closed for the
+    caller.
+    """
+    if not window_id:
+        return None
+    try:
+        raw = (app_dir() / "session_map.json").read_text()
+    except OSError:
+        return None
+    try:
+        session_map = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(session_map, dict):
+        return None
+    info = session_map.get(f"{config.tmux_session_name}:{window_id}")
+    if not isinstance(info, dict):
+        return None
+    session_id = info.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return session_id

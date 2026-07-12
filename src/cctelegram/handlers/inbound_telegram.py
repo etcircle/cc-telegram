@@ -83,6 +83,7 @@ from .directory_browser import (
 )
 from .inbound_aggregator import (
     AggregatorReplayAttachment,
+    Provenance,
     aggregator_clear_route,
     aggregator_offer_document,
     aggregator_offer_photo,
@@ -151,6 +152,16 @@ class PendingAttachment:
     path: str
     caption: str
     media_group_id: str | None
+    # GH #50 PR-2 (plan §2.3 [r4 P2-1]): the provenance fact must survive the
+    # unbound-topic stash, or the pending-bind replay would have to GUESS whether
+    # the caption carries a reply-context quote. Defaulted so an older
+    # in-flight/persisted tuple keeps working.
+    has_reply_context: bool = False
+
+
+# The provenance facts of a stashed pending TEXT payload (the same reason). Kept
+# in ``user_data`` beside ``_pending_thread_text``.
+_PENDING_TEXT_FACTS_KEY = "_pending_thread_text_facts"
 
 
 _IGNORED_STALE_THREAD_IDS_KEY = "_ignored_stale_thread_ids"
@@ -223,6 +234,7 @@ def _clear_pending_route_payload(
     )
     user_data.pop("_pending_thread_id", None)
     user_data.pop("_pending_thread_text", None)
+    user_data.pop(_PENDING_TEXT_FACTS_KEY, None)
     user_data.pop("_selected_path", None)
     if clear_ignored_stale_threads:
         user_data.pop(_IGNORED_STALE_THREAD_IDS_KEY, None)
@@ -312,6 +324,7 @@ async def _flush_pending_route_payload(
         return None
 
     pending_text = user_data.get("_pending_thread_text") if user_data else None
+    pending_facts = user_data.get(_PENDING_TEXT_FACTS_KEY) if user_data else None
     pending_attachments: list[PendingAttachment] = (
         list(user_data.get("_pending_thread_attachments") or []) if user_data else []
     )
@@ -326,15 +339,25 @@ async def _flush_pending_route_payload(
             path=Path(attachment.path),
             caption=attachment.caption,
             media_group_id=attachment.media_group_id,
+            has_reply_context=attachment.has_reply_context,
         )
         for attachment in pending_attachments
     ]
+    text_provenance = (
+        Provenance(
+            typed_text=bool(pending_facts.get("typed_text")),
+            reply_context=bool(pending_facts.get("reply_context")),
+        )
+        if isinstance(pending_facts, dict)
+        else None
+    )
 
     try:
         result = await aggregator_replay_payload(
             route,
             text=pending_text if isinstance(pending_text, str) else None,
             attachments=replay_attachments,
+            text_provenance=text_provenance,
         )
     except Exception as e:
         logger.error("pending route payload replay raised for route %s: %s", route, e)
@@ -414,20 +437,35 @@ async def _apply_reply_context(
     user_id: int,
     thread_id: int | None,
     text: str,
-) -> str:
+) -> tuple[str, bool]:
     """Render the §2.5 quote block onto ``text`` for a reply-aware message.
 
-    Returns ``text`` unchanged when the kill switch is off, when there is
-    no quoted referent, or when the quote points at a stale (e.g. /clear-ed)
-    session — the same stale-quote guard the text_handler had inline. Used
-    by text/voice/photo/document handlers so a reply made via voice or
-    photo+caption carries the same quote-injection block as a text reply.
+    Returns ``(rendered_text, applied)``. ``applied`` is True IFF a quote block
+    was actually rendered into the text — GH #50 PR-2 (plan §2.3 [r4 P2-1]) needs
+    the provenance fact OBSERVED, not guessed: by the time the aggregator sees
+    the string, a rendered quote is indistinguishable from prose the user typed.
+
+    A reply-context payload **IS** free-text-eligible (OWNER DECISION 2026-07-12,
+    superseding plan §2.3, which made it ineligible): the owner's dominant gesture
+    at a card is a VOICE NOTE sent as a REPLY to it, so the as-planned rule refused
+    their most natural way of answering. Claude receives the FULL rendered payload
+    — the quoted context AND the user's words — exactly as it would for any other
+    send. The FACT is still observed and carried through merges and pending-bind
+    replay; only its effect on eligibility changed (see
+    ``inbound_aggregator.Provenance.free_text_eligible``).
+
+    ``(text, False)`` when the kill switch is off, when there is no quoted
+    referent, or when the quote points at a stale (e.g. /clear-ed) session and
+    the cross-session switch drops it — the same stale-quote guard the
+    text_handler had inline. Used by text/voice/photo/document handlers so a
+    reply made via voice or photo+caption carries the same quote-injection block
+    as a text reply.
     """
     if not config.reply_context_enabled:
-        return text
+        return text, False
     reply_ctx = extract_reply_context(message)
     if reply_ctx is None:
-        return text
+        return text, False
     reply_ctx = await reply_context_mod.resolve(reply_ctx, message.chat.id)
     current_sid = None
     bound_wid = session_manager.resolve_window_for_thread(user_id, thread_id)
@@ -457,7 +495,7 @@ async def _apply_reply_context(
                 bound_wid,
                 thread_id,
             )
-            return text
+            return text, False
         logger.info(
             "Rendering cross-session reply context: quoted session %s != "
             "current %s (window=%s, thread=%s)",
@@ -466,8 +504,8 @@ async def _apply_reply_context(
             bound_wid,
             thread_id,
         )
-        return render_for_claude(text, reply_ctx, cross_session=True)
-    return render_for_claude(text, reply_ctx)
+        return render_for_claude(text, reply_ctx, cross_session=True), True
+    return render_for_claude(text, reply_ctx), True
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -525,8 +563,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # same quote block as the bound aggregator path below. Keep the same
         # media-group guard as the bound path: non-caption-bearing album items
         # must not each synthesize their own quote block.
+        has_reply_ctx = False
         if caption or media_group_id is None:
-            caption = await _apply_reply_context(
+            caption, has_reply_ctx = await _apply_reply_context(
                 update.message, user.id, thread_id, caption
             )
         # §2.8.3 photo-in-unbound-topic: stash the path so the directory
@@ -538,7 +577,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "_pending_thread_attachments", []
             )
             pending_attachments.append(
-                PendingAttachment(str(file_path), caption, media_group_id)
+                PendingAttachment(
+                    str(file_path), caption, media_group_id, has_reply_ctx
+                )
             )
             context.user_data["_pending_thread_id"] = thread_id
             _forget_ignored_stale_thread_id(context.user_data, thread_id)
@@ -629,8 +670,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # caption on item 1 only, and rendering with empty caption on items 2-N
     # would re-emit the quote block multiple times (the random nonce in
     # ``render_for_claude`` defeats the aggregator's exact-string dedup).
+    has_reply_ctx = False
     if caption or media_group_id is None:
-        caption = await _apply_reply_context(
+        caption, has_reply_ctx = await _apply_reply_context(
             update.message, user.id, thread_id, caption
         )
 
@@ -640,7 +682,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # N Claude turns.
     route = (user.id, thread_id, wid)
     await aggregator_offer_photo(
-        route, file_path, caption, media_group_id, bot=context.bot
+        route,
+        file_path,
+        caption,
+        media_group_id,
+        bot=context.bot,
+        has_reply_context=has_reply_ctx,
     )
 
     # Confirm to user
@@ -846,8 +893,12 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # the prompt with §2.5 reply context — the echo is for the human, the
     # rendered text is what Claude actually sees.
     echo = text
-    rendered = await _apply_reply_context(update.message, user.id, thread_id, text)
-    await aggregator_offer_voice(route, rendered, bot=context.bot)
+    rendered, has_reply_ctx = await _apply_reply_context(
+        update.message, user.id, thread_id, text
+    )
+    await aggregator_offer_voice(
+        route, rendered, bot=context.bot, has_reply_context=has_reply_ctx
+    )
 
     try:
         await safe_reply(update.message, f'🎤 "{echo}"')
@@ -936,15 +987,18 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             # as the bound aggregator path below. Keep the same media-group
             # guard as the bound path to avoid duplicate quote blocks for
             # non-caption-bearing album items.
+            has_reply_ctx = False
             if caption or media_group_id is None:
-                caption = await _apply_reply_context(
+                caption, has_reply_ctx = await _apply_reply_context(
                     update.message, user.id, thread_id, caption
                 )
             pending_attachments = context.user_data.setdefault(
                 "_pending_thread_attachments", []
             )
             pending_attachments.append(
-                PendingAttachment(str(file_path), caption, media_group_id)
+                PendingAttachment(
+                    str(file_path), caption, media_group_id, has_reply_ctx
+                )
             )
             context.user_data["_pending_thread_id"] = thread_id
             _forget_ignored_stale_thread_id(context.user_data, thread_id)
@@ -1018,14 +1072,20 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
 
     # §2.5: see photo_handler for the media-group caption-skip rationale.
+    has_reply_ctx = False
     if caption or media_group_id is None:
-        caption = await _apply_reply_context(
+        caption, has_reply_ctx = await _apply_reply_context(
             update.message, user.id, thread_id, caption
         )
 
     route = (user.id, thread_id, wid)
     await aggregator_offer_document(
-        route, file_path, caption, media_group_id, bot=context.bot
+        route,
+        file_path,
+        caption,
+        media_group_id,
+        bot=context.bot,
+        has_reply_context=has_reply_ctx,
     )
 
     await safe_reply(update.message, "📎 File sent to Claude Code.")
@@ -1170,7 +1230,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # paths below — otherwise a brand-new-topic flow (where the directory
     # browser holds the text while the user picks a directory) would lose
     # the quote when it eventually flushes via _create_and_bind_window.
-    text = await _apply_reply_context(update.message, user.id, thread_id, text)
+    text, has_reply_ctx = await _apply_reply_context(
+        update.message, user.id, thread_id, text
+    )
 
     # Ignore text in window picker mode (only for the same thread)
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
@@ -1260,6 +1322,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
             context.user_data["_pending_thread_id"] = thread_id
             context.user_data["_pending_thread_text"] = text
+            # Carry the OBSERVED provenance across the stash so the pending-bind
+            # replay is classified the same way a live offer would be
+            # (plan §2.3 [r4 P2-1]).
+            context.user_data[_PENDING_TEXT_FACTS_KEY] = {
+                "typed_text": True,
+                "reply_context": has_reply_ctx,
+            }
             _forget_ignored_stale_thread_id(context.user_data, thread_id)
         await safe_reply(update.message, msg_text, reply_markup=keyboard)
         return
@@ -1348,7 +1417,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # and lands in Claude as one coherent turn alongside any caption /
     # photo / fast-follow text within the debounce window.
     route = (user.id, thread_id, wid)
-    await aggregator_offer_text(route, text, bot=context.bot)
+    await aggregator_offer_text(
+        route, text, bot=context.bot, has_reply_context=has_reply_ctx
+    )
 
     # User just replied → Claude is no longer waiting. Flip the topic-first
     # attention card back to idle so the next idle→waiting transition fires

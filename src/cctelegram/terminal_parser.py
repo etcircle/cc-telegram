@@ -464,24 +464,44 @@ def _active_ui_patterns() -> list[UIPattern]:
 _RE_EPM_FOOTER = re.compile(r"ctrl[+-]g to edit")
 _RE_EPM_PLAN_PATH = re.compile(r"(~/\.claude/plans/\S+\.md)")
 
+# How far BELOW the live footer line its wrapped continuation may land. tmux
+# wraps a long line onto the IMMEDIATELY following row(s), so 2 is generous.
+_EPM_FOOTER_WRAP_LINES: Final = 2
+
 
 def extract_epm_plan_file_path(pane_text: str) -> str | None:
-    """Extract the ``~/.claude/plans/<slug>.md`` path from an ExitPlanMode
-    footer. Anchors on the ``ctrl[+-]g to edit`` footer line FIRST (the sole
-    bottom anchor on v2.1.170) so a stray plan-path mention elsewhere in
-    scrollback can't win. If no footer line carries the path (e.g. tmux wrapped
-    the footer onto two lines), falls back to the LAST plan path in the pane —
-    the footer is at the bottom, so the bottom-most mention beats a stale
-    scrollback mention above it. Returns the path string or None."""
-    fallback: str | None = None
-    for line in pane_text.split("\n"):
-        m = _RE_EPM_PLAN_PATH.search(line)
-        if not m:
-            continue
+    """The ``~/.claude/plans/<slug>.md`` path of the **LIVE** ExitPlanMode footer.
+
+    STRICTLY SCOPED TO THAT FOOTER (GH #50 PR-2 peer-review round-2 P1). The
+    earlier version fell back to "the LAST plan path anywhere in the pane"
+    whenever no footer line carried one — so a pane with NO live footer at all,
+    but a stale ``~/.claude/plans/…`` mention in scrollback (an earlier prompt, a
+    quoted transcript, the bot's own posted plan), returned that UNRELATED path.
+    ``interactive_ui._maybe_post_epm_plan`` — the one caller — would then have
+    posted the WRONG plan body above the picker.
+
+    So: find the BOTTOM-MOST ``ctrl[+-]g to edit`` line (a TUI renders the live
+    prompt at the bottom; everything above is frozen scrollback). No footer ⇒
+    ``None``, never a scrollback path. If that footer line carries the path,
+    return it. Otherwise consult only its WRAPPED CONTINUATION — the next
+    ``_EPM_FOOTER_WRAP_LINES`` rows, where tmux puts the overflow of a long
+    footer. Nothing there ⇒ ``None`` (fail closed), never a path from above.
+    """
+    lines = pane_text.split("\n")
+    footer_idx: int | None = None
+    for i, line in enumerate(lines):
         if _RE_EPM_FOOTER.search(line):
+            footer_idx = i  # bottom-most is the LIVE one
+    if footer_idx is None:
+        return None
+    m = _RE_EPM_PLAN_PATH.search(lines[footer_idx])
+    if m:
+        return m.group(1)
+    for line in lines[footer_idx + 1 : footer_idx + 1 + _EPM_FOOTER_WRAP_LINES]:
+        m = _RE_EPM_PLAN_PATH.search(line)
+        if m:
             return m.group(1)
-        fallback = m.group(1)  # keep the LAST (bottom-most) match
-    return fallback
+    return None
 
 
 # ── Post-processing ──────────────────────────────────────────────────────
@@ -1623,6 +1643,81 @@ def _footer_block_contiguous_with_header(
     return True
 
 
+def _walk_back_from_picker_footer(
+    lines: list[str], footer_idx: int
+) -> tuple[int, int | None, int]:
+    """Walk UP from the picker footer to the live option block's top.
+
+    Returns ``(block_top, stop_idx, blank_gap)``:
+
+      * ``block_top``  — the topmost line still belonging to the live option
+        block (numbered options, their indented descriptions, the separators and
+        blanks between them);
+      * ``stop_idx``   — the first NON-block line above it, when it is a
+        column-0 candidate for the question text (``None`` when the walk fell off
+        the top of the buffer, or the line was indented — Claude Code renders the
+        question at column 0, and indented lines above the topmost option are
+        invariably scrollback noise);
+      * ``blank_gap``  — how many blank lines separate ``stop_idx`` from the
+        topmost option (the caller bounds it, so pre-picker scrollback can't be
+        pulled in).
+
+    Extracted from :func:`parse_ask_user_question` (its only caller, which owns
+    the two display fields it feeds) — one walk, one definition of "the block".
+    """
+    start_idx = footer_idx
+    stop_idx: int | None = None
+    blank_gap = 0
+    for j in range(footer_idx - 1, -1, -1):
+        line = lines[j]
+        stripped = line.strip()
+        if not stripped:
+            start_idx = j
+            blank_gap += 1
+            continue
+        if _RE_NUMBERED_OPTION.match(line):
+            start_idx = j
+            blank_gap = 0
+            continue
+        # Separator line (only ─ chars).
+        if all(c == "─" for c in stripped):
+            start_idx = j
+            blank_gap = 0
+            continue
+        # Description continuation — non-empty indented text within
+        # ~7 lines (in either direction) of a numbered option. The
+        # symmetric scan handles the LAST option's descriptions,
+        # which only have a numbered option ABOVE them in file
+        # order (the footer is below). Without the upward arm the
+        # walk-back terminated at the last desc line, leaving
+        # ``pane_opts=0`` and forcing ``_build_pick_button_rows``'s
+        # ``fa5_guard`` to suppress option buttons on multi-Q AUQs
+        # that Claude Code renders without a multi-tab header.
+        # Bounded distance still rejects stale indented scrollback
+        # that has no nearby option.
+        if line.startswith(("  ", "\t")) and (
+            any(
+                _RE_NUMBERED_OPTION.match(lines[k])
+                for k in range(j + 1, min(j + 8, footer_idx + 1))
+            )
+            or any(_RE_NUMBERED_OPTION.match(lines[k]) for k in range(max(0, j - 7), j))
+        ):
+            start_idx = j
+            blank_gap = 0
+            continue
+        # Non-pattern line — title-display candidate. Only set ``stop_idx``
+        # here so the for-loop falling off the top of the buffer (no break)
+        # keeps it at None: a buffer that is entirely pattern lines has no
+        # title to capture. Also reject indented lines as title candidates
+        # — Claude Code's question text is rendered at column 0, and indented
+        # lines above the topmost option are invariably scrollback noise
+        # (hermes review, 2026-05-21).
+        if not line.startswith(("  ", "\t")):
+            stop_idx = j
+        break
+    return start_idx, stop_idx, blank_gap
+
+
 def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     """Structured parse of the AskUserQuestion picker in ``pane_text``.
 
@@ -1704,58 +1799,9 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     # enough to push it well above the last 25 lines.
     footer_block_top: int | None = None
     if footer_idx is not None:
-        start_idx = footer_idx
-        for j in range(footer_idx - 1, -1, -1):
-            line = lines[j]
-            stripped = line.strip()
-            if not stripped:
-                start_idx = j
-                walkback_blank_gap += 1
-                continue
-            if _RE_NUMBERED_OPTION.match(line):
-                start_idx = j
-                walkback_blank_gap = 0
-                continue
-            # Separator line (only ─ chars).
-            if all(c == "─" for c in stripped):
-                start_idx = j
-                walkback_blank_gap = 0
-                continue
-            # Description continuation — non-empty indented text within
-            # ~7 lines (in either direction) of a numbered option. The
-            # symmetric scan handles the LAST option's descriptions,
-            # which only have a numbered option ABOVE them in file
-            # order (the footer is below). Without the upward arm the
-            # walk-back terminated at the last desc line, leaving
-            # ``pane_opts=0`` and forcing ``_build_pick_button_rows``'s
-            # ``fa5_guard`` to suppress option buttons on multi-Q AUQs
-            # that Claude Code renders without a multi-tab header.
-            # Bounded distance still rejects stale indented scrollback
-            # that has no nearby option.
-            if line.startswith(("  ", "\t")) and (
-                any(
-                    _RE_NUMBERED_OPTION.match(lines[k])
-                    for k in range(j + 1, min(j + 8, footer_idx + 1))
-                )
-                or any(
-                    _RE_NUMBERED_OPTION.match(lines[k]) for k in range(max(0, j - 7), j)
-                )
-            ):
-                start_idx = j
-                walkback_blank_gap = 0
-                continue
-            # Non-pattern line — title-display candidate. Only set
-            # ``walkback_stop_idx`` here so the for-loop falling off
-            # the top of the buffer (no break) keeps it at None: a
-            # buffer that is entirely pattern lines has no title to
-            # capture. Also reject indented lines as title candidates
-            # — Claude Code's question text is rendered at column 0,
-            # and indented lines above the topmost option are
-            # invariably scrollback noise (hermes review, 2026-05-21).
-            if not line.startswith(("  ", "\t")):
-                walkback_stop_idx = j
-            break
-        footer_block_top = start_idx
+        footer_block_top, walkback_stop_idx, walkback_blank_gap = (
+            _walk_back_from_picker_footer(lines, footer_idx)
+        )
 
     # Governance decision (PR-3 PR-A). The bare "any ←…→ header wins" rule
     # let a STALE tab header in deep scrollback hijack the parse whenever a
@@ -3529,27 +3575,9 @@ def _clean_ghost_input_line(raw_line: str) -> str:
         return raw_line
 
     # Walk the raw line, tracking dim state, and classify each VISIBLE char.
-    dim = False
-    pos = 0
-    visible: list[tuple[str, bool]] = []  # (char, is_dim)
-    n = len(raw_line)
-    while pos < n:
-        if raw_line[pos] == "\x1b":
-            m = _RE_CSI.match(raw_line, pos)
-            if m is not None:
-                if m.group(2) == "m":  # SGR
-                    dim = _sgr_updates_dim(m.group(1), dim)
-                pos = m.end()
-                continue
-            m2 = _RE_ANSI_ANY.match(raw_line, pos)
-            if m2 is not None:
-                pos = m2.end()
-                continue
-            # A lone ESC with no recognized sequence — drop it, advance one.
-            pos += 1
-            continue
-        visible.append((raw_line[pos], dim))
-        pos += 1
+    # The SAME walker the PR-2 typed-state discriminator uses
+    # (``_visible_chars_with_dim``) — one SGR state machine, two consumers.
+    visible = _visible_chars_with_dim(raw_line)
 
     plain = "".join(c for c, _ in visible)
     stripped = plain.strip()
@@ -4273,6 +4301,296 @@ def pane_input_box_present(
         )
         is None
     )
+
+
+# ── The free-text affordance row (GH #50 PR-2) ───────────────────────────
+#
+# Claude Code auto-appends a free-text affordance row to a picker:
+#
+#   AskUserQuestion  row N+1  ``Type something.``
+#
+# Selecting that row and typing turns the user's prose INTO the answer — the lane
+# PR-2 drives, so a Telegram message sent at a live card actually answers it.
+#
+# SCOPE: **AskUserQuestion ONLY** (owner decision 2026-07-12). ExitPlanMode has an
+# affordance row too (row 4, ``Tell Claude what to change``) and an earlier PR-2
+# revision drove it, but the lane was DROPPED: naming a plan prompt would have
+# required a whole new ``PreToolUse(ExitPlanMode)`` hook + side file, and the owner
+# runs ``--dangerously-skip-permissions`` anyway. An EPM card now takes PR-1's
+# refusal. The helpers below are AUQ-only; nothing here parses an EPM row.
+#
+# SGR-2 IS THE *PRE-TYPE* DISCRIMINATOR, AND THAT IS THE ONLY CLAIM IT SUPPORTS
+# (rig, 2026-07-12 — the earlier "typed-state proof" framing OVERCLAIMED and is
+# CORRECTED here). While the affordance row is SELECTED but UNTYPED its label is
+# the placeholder and renders DIM (``ESC[2m``); typing replaces the label with
+# the user's text at normal intensity. ``dim=True`` therefore holds for EXACTLY
+# ONE shape: **the selected, untyped placeholder.** A real option row is never
+# dim — not even when it is the selected row.
+#
+# What that does and does NOT buy:
+#
+#   * It is the LOAD-BEARING guard of the free-text lane, consumed BEFORE the
+#     first byte is typed: the executor requires the row under the cursor to be
+#     ``cursor and dim and label == AUQ_FREE_TEXT_LABEL``. Nothing else on a
+#     picker satisfies all three, so an overshoot / undershoot / stale-frame nav
+#     that parked the cursor on a REAL option cannot pass it, and the payload is
+#     never typed there (rig-verified: typing while parked on a real option row
+#     is SWALLOWED entirely — the pane stays byte-identical).
+#   * It is NOT a post-type identity proof. ``dim=False`` on a cursored row is
+#     satisfied by any selected REAL option row, and the executor's own
+#     "is this label a prefix of our payload?" check is satisfied by an option
+#     labelled ``Yes`` under a payload ``Yes, but use postgres``. The post-write
+#     legs are corroboration, not a guard — see ``handlers/free_text``.
+#
+# Fixtures: ``auq_freetext_row_selected_pretype_v2.1.207.ansi.txt`` (dim),
+# ``auq_freetext_row_typed_v2.1.207.ansi.txt`` (plain),
+# ``auq_freetext_typed_identical_label_v2.1.207.ansi.txt`` (typing the literal
+# placeholder text still renders PLAIN),
+# ``auq_freetext_row_typed_large_v2.1.207.ansi.txt`` (a 947-char multi-line
+# voice-note-shaped payload), ``auq_freetext_overflow_v2.1.207.txt`` (the ~5.3 k
+# answer that scrolls the option block away).
+#
+# A TUI-DRIFT AUDIT SURFACE, like ``clean_ghost_input_text`` (the other SGR-2
+# consumer) and ``pane_command_is_claude``. It is why the lane is
+# VERSION-LICENSED (``handlers/free_text``): a CC release that renders the
+# placeholder at normal intensity would defeat the pre-type landing proof, so an
+# unlicensed version degrades to PR-1's refusal rather than trusting a stale
+# empiric.
+
+# The affordance placeholder. EXACT (post-strip) match — the label is half of the
+# pre-type landing proof, so a drifted label must NOT be silently accepted.
+AUQ_FREE_TEXT_LABEL: Final = "Type something."
+
+# ``ctrl+g to edit in <editor>`` — Claude Code's "you are in a text field" hint.
+#
+# **NOT AN EXACT ROW PROOF (rig, 2026-07-12 — this CORRECTS an earlier claim that
+# it "tracks the cursor exactly").** It is absent on the real option rows 1/2/3
+# and present on the affordance row N+1 — but it is ALSO present on the
+# ``N+2. Chat about this`` row, which is a text field too. So it proves "the
+# cursor is on SOME text-field row", never WHICH row and never WHICH card. It is
+# used only as post-write CORROBORATION in the overflow shape (the option block
+# has scrolled off, so the row itself is unobservable); the load-bearing guard is
+# the PRE-TYPE landing proof above, which runs before any byte is typed.
+_RE_FREE_TEXT_EDIT_HINT: Final = re.compile(r"ctrl[+-]g to edit")
+
+
+@dataclass(frozen=True)
+class FreeTextRow:
+    """One parse of a free-text affordance row from an ANSI pane capture."""
+
+    number: int
+    label: str
+    cursor: bool
+    # True iff EVERY visible non-whitespace char of the label falls inside an
+    # ACTIVE SGR-2 (dim) region ⇒ the row still holds its UNTYPED placeholder.
+    # False ⇒ the label is typed text (or a mixed/plain render — fail-closed for
+    # the pre-type landing proof, which REQUIRES dim).
+    dim: bool
+
+
+def parse_free_text_row(ansi_pane: str | None, *, number: int) -> FreeTextRow | None:
+    """Parse the numbered row ``number`` out of an ANSI pane capture.
+
+    Returns ``None`` when the row is not on the pane (it can legitimately scroll
+    off — see the overflow note in ``handlers/free_text``). The BOTTOM-most match
+    wins: a scrolled TUI capture can retain a stale copy of the row above the
+    live one, and the live render is always the lower (the same bottom-most rule
+    ``_parse_numbered_options`` uses for the cursor).
+
+    Requires an ANSI capture (``capture_pane(with_ansi=True)``) — ``dim`` is the
+    whole point and a plain capture has thrown the styling away.
+    """
+    if not ansi_pane:
+        return None
+    found: FreeTextRow | None = None
+    for raw_line in ansi_pane.split("\n"):
+        visible = _visible_chars_with_dim(raw_line)
+        plain = "".join(c for c, _ in visible)
+        m = _RE_NUMBERED_OPTION.match(plain)
+        if m is None:
+            continue
+        try:
+            if int(m.group("num")) != number:
+                continue
+        except ValueError:
+            continue
+        label = m.group("label").strip()
+        if not label:
+            continue
+        # Map the label back onto the dim-annotated visible chars via the
+        # regex span — ``visible`` is exactly ``plain`` char-for-char.
+        start, end = m.span("label")
+        label_chars = [(c, d) for c, d in visible[start:end] if not c.isspace()]
+        dim = bool(label_chars) and all(d for _, d in label_chars)
+        found = FreeTextRow(
+            number=number,
+            label=label,
+            cursor=m.group("cursor").strip() in ("❯", "›", "▶", "*"),
+            dim=dim,
+        )
+    return found
+
+
+def _visible_chars_with_dim(raw_line: str) -> list[tuple[str, bool]]:
+    """Walk one ANSI line → ``[(visible_char, is_dim), …]`` (the SGR-2 state).
+
+    The shared SGR machine behind ``clean_ghost_input_text``'s ghost detector and
+    the PR-2 typed-state discriminator: combined forms (``ESC[1;2m`` /
+    ``ESC[0;2m`` / ``ESC[38;5;244;2m``) carry dim without a literal ``ESC[2m``
+    byte shape, so a substring probe would be WRONG — the state machine is the
+    only correct reader.
+    """
+    dim = False
+    pos = 0
+    out: list[tuple[str, bool]] = []
+    n = len(raw_line)
+    while pos < n:
+        if raw_line[pos] == "\x1b":
+            m = _RE_CSI.match(raw_line, pos)
+            if m is not None:
+                if m.group(2) == "m":
+                    dim = _sgr_updates_dim(m.group(1), dim)
+                pos = m.end()
+                continue
+            m2 = _RE_ANSI_ANY.match(raw_line, pos)
+            if m2 is not None:
+                pos = m2.end()
+                continue
+            pos += 1
+            continue
+        out.append((raw_line[pos], dim))
+        pos += 1
+    return out
+
+
+def auq_free_text_row_active(pane_text: str | None) -> bool:
+    """True iff a LIVE AUQ picker has a TEXT-FIELD row as the active row.
+
+    The signal is the bottom-most picker footer carrying BOTH ``Enter to select``
+    (the picker is live and Enter commits the cursor row) AND ``ctrl+g to edit``
+    (the cursor row is a TEXT FIELD).
+
+    **WHAT IT IS NOT (rig, 2026-07-12 — this CORRECTS the original docstring,
+    which claimed the hint "tracks the cursor exactly" and was therefore an exact
+    row proof).** The hint is absent on the real option rows 1/2/3 and present on
+    the affordance row N+1 — but it is ALSO present on the ``N+2. Chat about
+    this`` row, which is a text field too. So this predicate proves "the cursor is
+    on SOME text-field row of this live picker". It does NOT prove WHICH row, and
+    it certainly does not prove WHICH CARD.
+
+    It is therefore used for exactly one thing: post-write CORROBORATION in the
+    OVERFLOW shape, where a long answer scrolls the whole option block — the
+    ``❯ N+1.`` cursor row included — off the top of an alternate screen and the
+    row itself is genuinely unobservable (rig: ``capture-pane -S`` recovers
+    nothing). By then the payload has already been typed into the row the PRE-TYPE
+    landing proof positively identified (cursor + SGR-2 dim + the exact
+    placeholder label), which is the guard that decides where the bytes go. This
+    predicate never authorizes a keystroke.
+
+    SCOPED TO THE LIVE PICKER (peer-review P1): the pane must extract as a live
+    ``AskUserQuestion`` and the footer consulted is the BOTTOM-MOST one (this
+    repo's bottom-most-is-live rule) — otherwise a STALE footer in scrollback, or
+    a transcript the user pasted, could mint the signal from arbitrary pane text.
+    """
+    if not pane_text:
+        return False
+    content = extract_interactive_content(pane_text)
+    if content is None or content.name != "AskUserQuestion":
+        return False
+    footer: str | None = None
+    for line in pane_text.split("\n"):
+        if _RE_PICKER_FOOTER.search(line):
+            footer = line  # bottom-most on the pane is the LIVE one
+    if footer is None:
+        return False
+    return bool(_RE_FREE_TEXT_EDIT_HINT.search(footer))
+
+
+# ── The STABLE surface-generation identity (peer-review P1) ──────────────
+#
+# THE DRIFT TRAP. A free-text transaction MUTATES the very pane it must
+# re-identify: it moves the cursor onto the affordance row, and then it REPLACES
+# that row's label with the user's prose. Both mutations move the naive form
+# fingerprint:
+#
+#   * the cursor — ``AskUserQuestionForm._canonical_repr`` is ALREADY
+#     cursor-blind (the AUQ pick-dispatch lane needs that property for exactly
+#     the same reason), so this one is free; but
+#   * the TYPED LABEL is not. ``_parse_numbered_options`` DROPS a row whose label
+#     ``is_affordance_label`` ("Type something." / "Chat about this"), so a
+#     pristine AUQ parses 3 options — and the instant the user's text lands in row
+#     4 it stops being an affordance and parses as a FOURTH REAL OPTION, so
+#     ``OPTS:`` moves and a form fingerprint captured pre-type can NEVER match
+#     post-type.
+#
+# So the identity is made stable BY CONSTRUCTION: it is cursor-blind (inherited)
+# and TARGET-ROW-BLIND — every option at or below the affordance row is dropped
+# before the canonical is taken. What survives is exactly the part of the surface
+# the transaction never touches: the REAL options 1..target_row-1. Requiring that
+# prefix to be COMPLETE and contiguous is what makes a missing block fail CLOSED
+# (``None``) instead of silently degrading to a shorter, weaker identity.
+#
+# The canonical itself is the repo's EXISTING one — ``AskUserQuestionForm.
+# fingerprint()`` — never a new hash: mint/validate parity is the house rule.
+
+_FREE_TEXT_IDENTITY_VERSION: Final = "ft1"
+
+
+def free_text_surface_identity(pane_text: str | None, *, target_row: int) -> str | None:
+    """The pane-derived surface-generation identity of a free-text-capable AUQ.
+
+    STABLE across the two mutations the executor itself performs (see the block
+    comment above): the cursor move onto the affordance row, and the typing that
+    replaces its label. DISCRIMINATING across a genuinely different card, because
+    the real options carry the question.
+
+    ``None`` ⇒ **not recoverable from this pane** — a scrolled / partial /
+    mid-redraw frame, or a pane that is no longer an AskUserQuestion. Callers
+    MUST fail closed on ``None``; they must NEVER fall back to a weaker identity.
+
+    ``target_row`` is the affordance row's number (N+1: affordance rows are
+    DROPPED from ``options``, so a 3-option picker's ``Type something.`` is 4).
+    """
+    if not pane_text or target_row < 2:
+        return None
+
+    form = parse_ask_user_question(pane_text)
+    if form is None:
+        return None
+    options = form.options
+    # ``current_question_title`` only when JSONL overlaid it — NEVER
+    # ``pane_walkback_title``, which is scraped from the churning scrollback
+    # above the block and is explicitly barred from identity checks.
+    title = form.current_question_title
+
+    real = tuple(o for o in options if o.number is not None and o.number < target_row)
+    if [o.number for o in real] != list(range(1, target_row)):
+        # The real-option prefix is incomplete (scrolled off / mid-redraw /
+        # renumbered) ⇒ the identity is UNRECOVERABLE. Fail closed.
+        return None
+
+    ident = AskUserQuestionForm(
+        # ``tabs`` are deliberately dropped: a single-question form has at most
+        # one, it adds no discrimination, and its answered/current flags are one
+        # more thing that could drift mid-transaction into a FALSE refusal (which
+        # post-type costs a stranded draft).
+        tabs=(),
+        current_question_title=title,
+        options=tuple(
+            AskOption(
+                label=o.label,
+                recommended=o.recommended,
+                cursor=False,
+                number=o.number,
+            )
+            for o in real
+        ),
+        # Pinned so a mid-transaction re-render can't move them.
+        select_mode="single",
+        is_free_text=True,
+        is_review_screen=False,
+    )
+    return f"{_FREE_TEXT_IDENTITY_VERSION}:AskUserQuestion:{ident.fingerprint()}"
 
 
 # ── Context-window indicator ─────────────────────────────────────────────

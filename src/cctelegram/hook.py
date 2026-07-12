@@ -25,7 +25,7 @@ The hook is a pure observer for PreToolUse / Notification — exit 0 with
 no stdout, no permission decision. Exceptions are swallowed and logged;
 the tool call must NEVER be blocked by hook bugs.
 
-`--install` installs (or refreshes) all three hook entries in
+`--install` installs (or refreshes) all three managed hook entries in
 ~/.claude/settings.json idempotently. SessionStart keeps a 5s timeout
 (existing); PreToolUse and Notification use 2s (write is sub-ms;
 observer hooks should not delay execution beyond a hard ceiling).
@@ -333,6 +333,45 @@ def _handle_session_start(payload: dict) -> int:
     return 0
 
 
+def _prepare_pending_dir(dirname: str, label: str) -> Path | None:
+    """Create + tighten a side-file directory to 0700, or ``None`` to refuse.
+
+    Used by the AUQ PreToolUse writer (the Notification writer keeps its own
+    inline copy). FAIL-CLOSED on both legs:
+
+      - a SYMLINK at the directory path is refused outright (defense against
+        redirecting our writes to an arbitrary file via a hostile symlink in
+        ~/.cc-telegram/ — we OWN this directory);
+      - if the mode cannot be tightened to 0700 we MUST NOT write. The side file
+        carries the AUQ ``tool_input``, whose questions can reference infra and
+        internal decisions; a world-readable side file is a privacy regression,
+        and every consumer degrades gracefully when the file is absent.
+
+    ``mkdir(mode=…)`` only applies to NEWLY created dirs, so the chmod runs
+    unconditionally to recover a pre-existing loose-mode dir from an older
+    install.
+    """
+    from .utils import app_dir
+
+    pending_dir = app_dir() / dirname
+    if pending_dir.exists() and pending_dir.is_symlink():
+        logger.error("%s: %s is a symlink; refusing to write", label, pending_dir)
+        return None
+    try:
+        pending_dir.mkdir(mode=0o700, exist_ok=True)
+    except OSError as e:
+        logger.error("%s: mkdir %s failed: %s", label, pending_dir, e)
+        return None
+    try:
+        os.chmod(pending_dir, 0o700)
+    except OSError as e:
+        logger.error(
+            "%s: chmod 0700 on %s failed; refusing to write: %s", label, pending_dir, e
+        )
+        return None
+    return pending_dir
+
+
 def _handle_pre_tool_use(payload: dict) -> int:
     """Capture AskUserQuestion tool_input to a per-session side file.
 
@@ -342,9 +381,7 @@ def _handle_pre_tool_use(payload: dict) -> int:
     block Claude Code's tool execution.
 
     Side file path: <CC_TELEGRAM_DIR>/auq_pending/<session_id>.json
-    Schema version 1. The reader is in handlers/interactive_ui.py
-    (next chunk in the wave; not present yet — this commit writes the
-    file even though nobody reads it, which is intentional staging).
+    Schema version 1. The reader / trust boundary is handlers/auq_source.py.
     """
     tool_name = payload.get("tool_name", "")
     if tool_name != _AUQ_MATCHER:
@@ -366,7 +403,7 @@ def _handle_pre_tool_use(payload: dict) -> int:
         questions_content_digest,
         questions_content_pairs_from_tool_input,
     )
-    from .utils import app_dir, atomic_write_json
+    from .utils import atomic_write_json
 
     pairs = questions_content_pairs_from_tool_input(tool_input)
     if pairs is None:
@@ -375,38 +412,9 @@ def _handle_pre_tool_use(payload: dict) -> int:
     fingerprint = questions_content_digest(pairs)
 
     session_id = payload["session_id"]  # validated by caller
-    pending_dir = app_dir() / "auq_pending"
 
-    # Reject symlinks anywhere on the path — defensive against attempts
-    # to redirect writes to arbitrary files via a hostile symlink in
-    # ~/.cc-telegram/. We OWN this directory and never want it pointing
-    # anywhere unexpected.
-    if pending_dir.exists() and pending_dir.is_symlink():
-        logger.error("PreToolUse AUQ: %s is a symlink; refusing to write", pending_dir)
-        return 0
-
-    try:
-        pending_dir.mkdir(mode=0o700, exist_ok=True)
-    except OSError as e:
-        logger.error("PreToolUse AUQ: mkdir %s failed: %s", pending_dir, e)
-        return 0
-
-    # mkdir(mode=...) only applies to newly created dirs; chmod
-    # unconditionally to recover from a pre-existing loose-mode dir.
-    # Fail-closed (codex P2 round 2 — chunk 2): if we can't tighten the
-    # dir to 0o700, we MUST NOT write the side file. AUQ tool_input can
-    # carry sensitive context (skill prompts that mention infra, plan
-    # decisions, etc.); a world-readable side file is a privacy
-    # regression, and the existing post-hoc form-source fallback gives
-    # the user a working — if less rich — experience either way.
-    try:
-        os.chmod(pending_dir, 0o700)
-    except OSError as e:
-        logger.error(
-            "PreToolUse AUQ: chmod 0700 on %s failed; refusing to write: %s",
-            pending_dir,
-            e,
-        )
+    pending_dir = _prepare_pending_dir("auq_pending", "PreToolUse AUQ")
+    if pending_dir is None:
         return 0
 
     target = pending_dir / f"{session_id}.json"

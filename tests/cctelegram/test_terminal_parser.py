@@ -3614,14 +3614,51 @@ class TestExtractEpmPlanFilePath:
 
     def test_wrapped_footer_falls_back_to_bottom_most_path(self):
         # If tmux wraps the footer so the path lands on its OWN line (no ctrl+g
-        # on it), the bottom-most plan path beats a stale scrollback mention
-        # above — the footer is at the bottom (review P3).
+        # on it), the WRAPPED CONTINUATION — the row(s) immediately BELOW the
+        # footer — carries it (review P3).
         pane = (
             "earlier ~/.claude/plans/STALE.md was edited\n"
             " ctrl+g to edit in  Vim  ·\n"
             "~/.claude/plans/REAL.md\n"
         )
         assert extract_epm_plan_file_path(pane) == "~/.claude/plans/REAL.md"
+
+    # ── GH #50 PR-2 peer-review round-2 P1: NEVER borrow a stale path ──────
+    #
+    # The old fallback was "the LAST plan path ANYWHERE in the pane", so a pane
+    # with no live footer path returned an UNRELATED scrollback mention, and
+    # ``interactive_ui`` posted the WRONG plan body.
+    #
+    # (This was ALSO the ExitPlanMode free-text lane's surface anchor through
+    # peer-review round 3. That lane is GONE — the owner dropped EPM on
+    # 2026-07-12 — so the plan path is once again a DISPLAY input only, and the
+    # strict footer scoping stays because a wrong plan body is a real bug in its
+    # own right.)
+
+    def test_a_footer_with_no_path_never_borrows_a_scrollback_path(self):
+        pane = (
+            "earlier I edited ~/.claude/plans/STALE.md by hand\n"
+            "some prose\n"
+            "and more prose\n"
+            " ctrl+g to edit in  Vim\n"
+        )
+        assert extract_epm_plan_file_path(pane) is None
+
+    def test_no_footer_at_all_never_returns_a_scrollback_path(self):
+        pane = (
+            "I wrote the plan to ~/.claude/plans/STALE.md earlier\n"
+            "❯ 1. Yes, and bypass permissions\n"
+        )
+        assert extract_epm_plan_file_path(pane) is None
+
+    def test_a_path_far_below_the_footer_is_not_its_continuation(self):
+        pane = (
+            " ctrl+g to edit in  Vim  ·\n"
+            "\n"
+            "\n"
+            "unrelated prose about ~/.claude/plans/STALE.md\n"
+        )
+        assert extract_epm_plan_file_path(pane) is None
 
 
 # ── Wave B geometry parser pins (160x50 machine-surface default) ─────────

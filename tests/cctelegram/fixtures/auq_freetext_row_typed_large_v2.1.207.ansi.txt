@@ -1,0 +1,50 @@
+
+[38;5;174m╭───[39m [38;5;174mClaude Code[39m [38;5;246mv2.1.207[39m [38;5;174m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[39m                                                    [2m[38;5;174m│[0m [1m[38;5;174mTips for getting started[0m                                                                                [38;5;174m│
+│[39m               [1mWelcome back Emiliyan![0m               [2m[38;5;174m│[0m Run /init to create a CLAUDE.md file with instructions for Claude                                       [38;5;174m│
+│[39m                                                    [2m[38;5;174m│[0m [38;5;174m───────────────────────────────────────────────────────────────────────────────────────────────────────[39m [38;5;174m│
+│[39m                      [38;5;174m ▐[48;5;16m▛███▜[49m▌[39m                      [2m[38;5;174m│[0m [1m[38;5;174mWhat's new[0m                                                                                              [38;5;174m│
+│[39m                      [38;5;174m▝▜[48;5;16m█████[49m▛▘[39m                     [2m[38;5;174m│[0m Auto mode is now available without `CLAUDE_CODE_ENABLE_AUTO_MODE` opt-in on Bedrock, Vertex AI, and Fo… [38;5;174m│
+│[39m                      [38;5;174m  ▘▘ ▝▝  [39m                     [2m[38;5;174m│[0m Fixed the terminal freezing and keystrokes lagging while streaming responses containing very long list… [38;5;174m│
+│[39m   [38;5;246mOpus 4.8 (1M context) with me… · Claude Max · [39m   [2m[38;5;174m│[0m Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… [38;5;174m│
+│[39m   [38;5;246mem.tanev@gmail.com's Organization[39m                [2m[38;5;174m│[0m [3m[38;5;246m/release-notes for more[0m                                                                                 [38;5;174m│
+│[39m          [38;5;246m/private/tmp/rig-pr2-004713/cwd[39m           [2m[38;5;174m│[0m                                                                                                         [38;5;174m│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+[39m [38;5;220m⚠[39m [38;5;220m3 MCP servers need authentication[38;5;246m · run /mcp[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the AskUserQuestion tool to ask me a single-select question with 3 options about my favorite color. Do it now, nothing else.[39m
+[38;5;246m[49m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;16m[48;5;153m ☐ Color [39m[49m
+
+[1m[38;5;231mWhat's your favorite color?[0m
+
+  [38;5;246m1.[39m Blue
+     [38;5;246mCalm, cool, and the most commonly cited favorite color worldwide.[39m
+  [38;5;246m2.[39m Green
+     [38;5;246mNatural and restful — the color of growth and the outdoors.[39m
+  [38;5;246m3.[39m Red
+     [38;5;246mBold, warm, and high-energy.[39m
+[38;5;153m❯[39m [38;5;246m4. [39m> Re: "the picker card you posted a moment ago"
+     >
+     > Claude asked: What's your favorite color?
+
+     OK so about the colour question, I have been thinking about this for a while and I want to give you the full reasoning rather than just picking one of the
+     three options you offered, because none of them is quite right on its own.
+
+     I would actually prefer a deep teal, somewhere between blue and green, because it reads well on both light and dark backgrounds and it does not fight with
+     the orange accent we already use in the header. Blue on its own is too corporate and cold, green on its own reads too much like a success state, and red
+     is completely out of the question for anything that is not an error.
+
+     So please go with teal as the primary, keep the existing orange as the accent, and make sure the contrast ratio stays above four point five to one for
+     body text. If teal is impossible for some reason, fall back to blue, but tell me why first.
+[38;5;246m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  5. Chat about this
+
+[38;5;246mEnter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel[39m
+
+
+
+
+
+
