@@ -4407,26 +4407,182 @@ def auq_free_text_row_active(pane_text: str | None) -> bool:
     2.1.207: the hint is absent with the cursor on options 1/2/3 and present on
     row N+1, tracking the cursor exactly.
 
+    **SCOPED TO THE LIVE PICKER (peer-review P1).** The first cut asked only
+    "does SOME line carry ``Enter to select`` and, on that line, ``ctrl+g``?" —
+    an OR over the whole pane. Two ways that lies:
+
+      1. it never checked the pane was an AskUserQuestion at all, and
+      2. a STALE footer in scrollback — an EARLIER picker, or a transcript the
+         user pasted — could carry the hint while the LIVE picker's footer does
+         not, so a cursor sitting on option 1 read as "the free-text row is
+         active". A positive proof that arbitrary pane text can mint is not a
+         proof.
+
+    So now the pane must extract as a LIVE ``AskUserQuestion``, and the footer
+    consulted is the **BOTTOM-MOST** picker footer on the pane — the repo's
+    bottom-most-is-live rule (Claude Code renders the live picker at the bottom;
+    everything above it is scrollback, and a TUI's scrollback is frozen).
+
     This is the OVERFLOW proof. A long answer (~4-5 k chars on a 160x50 pane)
     wraps to more rows than the pane has, and the picker — which is BOTTOM-
     anchored — scrolls its whole option block, INCLUDING the ``❯ N+1.`` cursor
     row, off the top. A TUI runs on the alternate screen, so ``capture-pane -S``
     recovers nothing (rig-measured: 51 lines). The row is then genuinely
-    unobservable, yet the footer still proves the free-text row is where Enter
-    will commit — which, with "no input box" and the payload-tail probe, is a
-    complete positive proof. ExitPlanMode has NO equivalent (its ``ctrl+g``
-    footer is unconditional), so the EPM lane requires the row itself.
+    unobservable, yet the live footer still proves the free-text row is where
+    Enter will commit. It is NOT a surface-identity proof, though — it says WHICH
+    ROW, never WHICH CARD — so ``handlers/free_text`` pairs it with the mandatory
+    surface-identity re-check (which, when the option block has scrolled off,
+    falls to the out-of-band anchor). ExitPlanMode has NO equivalent (its
+    ``ctrl+g`` footer is unconditional), so the EPM lane requires the row itself.
     """
     if not pane_text:
         return False
-    has_picker_footer = False
-    has_edit_hint = False
+    content = extract_interactive_content(pane_text)
+    if content is None or content.name != "AskUserQuestion":
+        return False
+    footer: str | None = None
     for line in pane_text.split("\n"):
         if _RE_PICKER_FOOTER.search(line):
-            has_picker_footer = True
-            if _RE_FREE_TEXT_EDIT_HINT.search(line):
-                has_edit_hint = True
-    return has_picker_footer and has_edit_hint
+            footer = line  # bottom-most on the pane is the LIVE one
+    if footer is None:
+        return False
+    return bool(_RE_FREE_TEXT_EDIT_HINT.search(footer))
+
+
+# ── The STABLE surface-generation identity (peer-review P1) ──────────────
+#
+# THE DRIFT TRAP. A free-text transaction MUTATES the very pane it must
+# re-identify: it moves the cursor onto the affordance row, and then it REPLACES
+# that row's label with the user's prose. Both mutations move the naive form
+# fingerprint:
+#
+#   * the cursor — ``AskUserQuestionForm._canonical_repr`` is ALREADY
+#     cursor-blind (the AUQ pick-dispatch lane needs that property for exactly
+#     the same reason), so this one is free; but
+#   * the TYPED LABEL is not. ``_parse_numbered_options`` DROPS a row whose label
+#     ``is_affordance_label`` ("Type something." / "Chat about this"), so a
+#     pristine AUQ parses 3 options — and the instant the user's text lands in row
+#     4 it stops being an affordance and parses as a FOURTH REAL OPTION. On
+#     ExitPlanMode the affordance row is a real option from the start, and typing
+#     rewrites its label in place. Either way ``OPTS:`` moves, so a form
+#     fingerprint captured pre-type can NEVER match post-type.
+#
+# So the identity is made stable BY CONSTRUCTION: it is cursor-blind (inherited)
+# and TARGET-ROW-BLIND — every option at or below the affordance row is dropped
+# before the canonical is taken. What survives is exactly the part of the surface
+# the transaction never touches: the REAL options 1..target_row-1. Requiring that
+# prefix to be COMPLETE and contiguous is what makes a missing block fail CLOSED
+# (``None``) instead of silently degrading to a shorter, weaker identity.
+#
+# The canonical itself is the repo's EXISTING one — ``AskUserQuestionForm.
+# fingerprint()`` — never a new hash: mint/validate parity is the house rule.
+
+_FREE_TEXT_IDENTITY_VERSION: Final = "ft1"
+
+
+# The ExitPlanMode prompt's own top line — the SAME anchors its ``UIPattern``
+# uses, so the option block is delimited by the pattern's own boundaries.
+_RE_EPM_TOP: Final = re.compile(
+    r"^\s*(?:Would you like to proceed\?|Claude has written up a plan)"
+)
+
+
+def _exit_plan_option_block(pane_text: str) -> tuple[AskOption, ...]:
+    """The ExitPlanMode prompt's numbered rows — TYPED-TOLERANT.
+
+    Shared by :func:`parse_exit_plan_form` (which additionally requires the last
+    row to still BE the pristine affordance) and :func:`free_text_surface_identity`
+    (which must keep working AFTER the row has been typed into, and therefore
+    cannot require that).
+
+    Delimited by the prompt's OWN ``UIPattern`` boundaries — the bottom-most
+    ``Would you like to proceed?`` / ``Claude has written up a plan`` line above
+    the ``ctrl+g`` footer. Anchoring at the pane top instead was a real bug: a
+    plan whose rendered BODY contains a numbered list (``1. Create the file / 2.
+    Verify it``) — which is what most plans look like — hijacked
+    ``_parse_numbered_options``' top-down walk, so the option block was never
+    reached and the whole ExitPlanMode free-text lane silently declined on the
+    common shape (fixture ``epm_freetext_row_typed_v2.1.207``, whose plan body IS
+    numbered). Fail-closed, so it was never dangerous — just dead.
+    """
+    lines = pane_text.split("\n")
+    footer_idx: int | None = None
+    for i, line in enumerate(lines):
+        if _RE_EPM_FOOTER.search(line):
+            footer_idx = i
+    if footer_idx is None:
+        # The footer can scroll off under a very long draft; fall back to the
+        # whole pane (each caller's own shape proof is what makes this strict).
+        footer_idx = len(lines)
+    top_idx = 0
+    for i in range(footer_idx):
+        if _RE_EPM_TOP.match(lines[i]):
+            top_idx = i  # bottom-most prompt line above the footer wins
+    return _parse_numbered_options(lines[top_idx:footer_idx])
+
+
+def free_text_surface_identity(
+    pane_text: str | None, *, surface: str, target_row: int
+) -> str | None:
+    """The pane-derived surface-generation identity of a free-text-capable card.
+
+    STABLE across the two mutations the executor itself performs (see the block
+    comment above): the cursor move onto the affordance row, and the typing that
+    replaces its label. DISCRIMINATING across a genuinely different card, because
+    the real options carry the question.
+
+    ``None`` ⇒ **not recoverable from this pane** — a scrolled / partial /
+    mid-redraw frame, or a pane that is no longer this surface. Callers MUST fail
+    closed on ``None``; they must NEVER fall back to a weaker identity.
+
+    ``target_row`` is the affordance row's number (AUQ: N+1; EPM: the last row).
+    """
+    if not pane_text or target_row < 2:
+        return None
+
+    title: str | None = None
+    if surface == "AskUserQuestion":
+        form = parse_ask_user_question(pane_text)
+        if form is None:
+            return None
+        options = form.options
+        # ``current_question_title`` only when JSONL overlaid it — NEVER
+        # ``pane_walkback_title``, which is scraped from the churning scrollback
+        # above the block and is explicitly barred from identity checks.
+        title = form.current_question_title
+    elif surface == "ExitPlanMode":
+        options = _exit_plan_option_block(pane_text)
+    else:
+        return None
+
+    real = tuple(o for o in options if o.number is not None and o.number < target_row)
+    if [o.number for o in real] != list(range(1, target_row)):
+        # The real-option prefix is incomplete (scrolled off / mid-redraw /
+        # renumbered) ⇒ the identity is UNRECOVERABLE. Fail closed.
+        return None
+
+    ident = AskUserQuestionForm(
+        # ``tabs`` are deliberately dropped: a single-question form has at most
+        # one, it adds no discrimination, and its answered/current flags are one
+        # more thing that could drift mid-transaction into a FALSE refusal (which
+        # post-type costs a stranded draft).
+        tabs=(),
+        current_question_title=title,
+        options=tuple(
+            AskOption(
+                label=o.label,
+                recommended=o.recommended,
+                cursor=False,
+                number=o.number,
+            )
+            for o in real
+        ),
+        # Pinned so a mid-transaction re-render can't move them.
+        select_mode="single",
+        is_free_text=True,
+        is_review_screen=False,
+    )
+    return f"{_FREE_TEXT_IDENTITY_VERSION}:{surface}:{ident.fingerprint()}"
 
 
 def parse_exit_plan_form(pane_text: str | None) -> AskUserQuestionForm | None:
@@ -4451,16 +4607,7 @@ def parse_exit_plan_form(pane_text: str | None) -> AskUserQuestionForm | None:
     """
     if not pane_text:
         return None
-    lines = pane_text.split("\n")
-    footer_idx: int | None = None
-    for i, line in enumerate(lines):
-        if _RE_EPM_FOOTER.search(line):
-            footer_idx = i
-    if footer_idx is None:
-        # The footer can scroll off under a very long draft; fall back to the
-        # whole pane (the option-shape proof below is what makes this strict).
-        footer_idx = len(lines)
-    options = _parse_numbered_options(lines[:footer_idx])
+    options = _exit_plan_option_block(pane_text)
     if len(options) < 2:
         return None
     if options[0].number != 1:

@@ -9,11 +9,21 @@ two surfaces Claude Code gives a free-text affordance:
     AskUserQuestion (single-select)   row N+1  ``Type something.``
     ExitPlanMode                      row 4    ``Tell Claude what to change``
 
-The executor NAVIGATES to that row, VERIFIES it landed, TYPES the payload with
-the Enter withheld, VERIFIES the typed state, fires the pre-commit user-turn
-stamp, and only then presses Enter. On AUQ the prose becomes the ANSWER; on EPM
-the plan is REJECTED with the prose as feedback and **plan mode is preserved**
-(rig-verified on 2.1.207).
+The executor NAVIGATES to that row, VERIFIES it landed **on the same card it
+planned against**, TYPES the payload with the Enter withheld, VERIFIES the typed
+state **and the card identity again**, fires the pre-commit user-turn stamp, and
+only then presses Enter. On AUQ the prose becomes the ANSWER; on EPM the plan is
+REJECTED with the prose as feedback and **plan mode is preserved** (rig-verified
+on 2.1.207).
+
+TWO THINGS MUST BE PROVEN, NOT ONE. "The pane is in the right STATE" (a dim
+placeholder under the cursor; our text in the row; no input box) is necessary and
+NOT sufficient — every one of those legs is equally satisfied by a DIFFERENT card
+that another controller rendered while we were navigating or typing, holding our
+text in ITS free-text row. So ``SurfaceIdentity`` (WHICH CARD) is captured before
+the first key and RE-CHECKED at both observation points that bracket a keystroke.
+See that class for the drift trap the identity is designed around — the executor
+MUTATES the pane it must re-identify.
 
 It reuses the shipped dispatch discipline (``_dispatch_pick`` /
 ``_dispatch_decision_pane_locked``) verbatim: per-window send lock, bounded
@@ -144,6 +154,115 @@ _VERIFY_FAILED_MSG: Final = delivery.FREE_TEXT_VERIFY_FAILED_MSG
 _COMMIT_UNCONFIRMED_MSG: Final = delivery.FREE_TEXT_COMMIT_UNCONFIRMED_MSG
 
 
+# ── THE SURFACE IDENTITY (peer-review P1 — the wrong-card close) ─────────
+
+
+@dataclass(frozen=True)
+class SurfaceIdentity:
+    """WHICH CARD this transaction is answering. Two independent components.
+
+    The whole transaction is a race against Claude Code: another controller (the
+    poller, an AFK auto-resolve, a button tap, or Claude itself) can resolve card
+    A and render card B *while* the executor navigates or types. Nothing else in
+    the proof set catches that — the landing proof, the SGR-2 typed-state proof,
+    the payload-tail probe and the row-active footer proof are ALL satisfied by
+    card B holding our text. So identity must be captured pre-key and RE-CHECKED
+    after the nav and again in the final pre-Enter capture. On ExitPlanMode option
+    1 is "Yes, and bypass permissions", so this is the most dangerous hole in the
+    lane, and it fails CLOSED.
+
+    ``pane`` — ``terminal_parser.free_text_surface_identity``: the real options
+    1..target_row-1, cursor-blind AND target-row-blind, so it is stable across
+    the cursor move and the typing the executor itself performs. It is the
+    strong, self-contained discriminator whenever the option block is on screen.
+    It goes ``None`` (never weaker — never a shorter prefix) when the block
+    scrolls off under a long draft, which is exactly the AUQ overflow shape.
+
+    ``anchor`` — the OUT-OF-BAND, scroll-independent surface-generation id:
+
+        AskUserQuestion → the PreToolUse side file's occurrence identity
+                          (``auq_source.peek_surface_identity_for_window``): a
+                          new AUQ rewrites the file, a resolved one unlinks it.
+        ExitPlanMode    → the ``~/.claude/plans/<slug>.md`` path in the footer:
+                          per-PLAN, and the ONLY thing that distinguishes two
+                          EPM prompts — every EPM renders the SAME three real
+                          options, so ``pane`` alone cannot tell plan A from plan
+                          B. The EPM anchor is therefore MANDATORY (a plan whose
+                          footer isn't visible declines rather than guessing).
+
+    The two are checked INDEPENDENTLY and both must hold where available; the
+    match rule is deliberately conservative (see :meth:`still_holds`).
+    """
+
+    surface: str
+    pane: str | None
+    anchor: str | None
+
+    def still_holds(self, live: SurfaceIdentity | None) -> bool:
+        """True iff ``live`` is PROVABLY the same card. Fail-closed by default.
+
+        Rules, in order:
+
+        1. No live identity at all ⇒ False (unrecoverable ⇒ refuse, never guess).
+        2. The surface must be the same (AUQ↛EPM, EPM↛AUQ).
+        3. An anchor we HAD must still be there and be EQUAL. Gone (the AUQ side
+           file was unlinked at its tool_result) or changed (a successor card) are
+           both proof this is no longer our card.
+        4. A pane identity we HAD must either still be EQUAL, or be genuinely
+           unrecoverable — and unrecoverable is only forgiven when a matching
+           ANCHOR carries the proof instead. That single exception is what keeps
+           the AUQ overflow shape (a ~5 k-char answer scrolls the option block
+           away) working; with no anchor it is a refusal, which is correct: we
+           would have nothing left to identify the card with.
+        5. Something must actually have been PROVEN. An identity with neither
+           component was never an identity.
+        """
+        if live is None:
+            return False
+        if self.surface != live.surface:
+            return False
+        if self.anchor is not None and live.anchor != self.anchor:
+            return False
+        if self.pane is not None:
+            if live.pane is not None:
+                if live.pane != self.pane:
+                    return False
+            elif self.anchor is None:
+                return False  # pane gone, no anchor ⇒ nothing identifies the card
+        return self.anchor is not None or self.pane is not None
+
+
+def _anchor_for(surface: str, pane_text: str, window_id: str) -> str | None:
+    """The out-of-band surface-generation anchor (see :class:`SurfaceIdentity`)."""
+    if surface == SURFACE_EPM:
+        return terminal_parser.extract_epm_plan_file_path(pane_text)
+    # Deferred: ``auq_source`` reaches into ``session``; this module is a
+    # delivery-path leaf and the repo pins the import direction with a
+    # subprocess cycle test.
+    from . import auq_source
+
+    try:
+        return auq_source.peek_surface_identity_for_window(window_id)
+    except Exception:  # pragma: no cover — a side-file read must never wedge a send
+        logger.exception(
+            "free_text: AUQ surface-anchor read failed for window %s", window_id
+        )
+        return None
+
+
+def derive_identity(
+    pane_text: str, *, surface: str, target_row: int, window_id: str
+) -> SurfaceIdentity:
+    """Derive both identity components from one pane observation."""
+    return SurfaceIdentity(
+        surface=surface,
+        pane=terminal_parser.free_text_surface_identity(
+            pane_text, surface=surface, target_row=target_row
+        ),
+        anchor=_anchor_for(surface, pane_text, window_id),
+    )
+
+
 # ── The pre-type plan ────────────────────────────────────────────────────
 
 
@@ -155,10 +274,10 @@ class FreeTextPlan:
     target_row: int  # the free-text affordance row number
     cursor_row: int  # where the live ❯ is now
     placeholder: str  # the expected (dim) label of the target row
-    fingerprint: str  # the surface identity, captured before any key
+    identity: SurfaceIdentity  # WHICH CARD — re-checked post-nav and pre-Enter
 
 
-def _auq_plan(pane_text: str) -> FreeTextPlan | None:
+def _auq_plan(pane_text: str, ansi_pane: str, window_id: str) -> FreeTextPlan | None:
     """Resolve the AUQ single-select free-text lane, or ``None`` to decline."""
     form = terminal_parser.parse_ask_user_question(pane_text)
     if form is None:
@@ -179,40 +298,74 @@ def _auq_plan(pane_text: str) -> FreeTextPlan | None:
     # block — i.e. we are looking at the WHOLE list, so N is trustworthy.
     if not form.options_complete or not form.options:
         return None
+    target_row = len(form.options) + 1  # affordances are dropped from ``options``
     cursor = next((o.number for o in form.options if o.cursor and o.number), None)
     if cursor is None:
-        return None
-    n_real = len(form.options)
+        # THE CURSOR IS ALREADY ON THE AFFORDANCE ROW (peer-review P2).
+        # ``_parse_numbered_options`` DROPS the affordance row and — because an
+        # affordance ❯ is the bottom-most, hence live, cursor — deliberately
+        # CLEARS every real option's cursor, so no real option reports one. That
+        # is not "no cursor", it is "the cursor is exactly where we want it": the
+        # user landed there with the card's own ↑/↓ nav buttons, which is what
+        # the card invites them to do, and then sent prose. Pre-fix that DECLINED
+        # into a PR-1 refusal — the most natural path was the one that didn't work.
+        # Read the affordance row directly and take the ZERO-NAV plan.
+        row = terminal_parser.parse_free_text_row(ansi_pane, number=target_row)
+        if row is None or not row.cursor:
+            return None
+        cursor = target_row
     return FreeTextPlan(
         surface=SURFACE_AUQ,
-        target_row=n_real + 1,  # affordances are dropped from ``options`` (N+1)
+        target_row=target_row,
         cursor_row=cursor,
         placeholder=terminal_parser.AUQ_FREE_TEXT_LABEL,
-        fingerprint=form.fingerprint(),
+        identity=derive_identity(
+            pane_text,
+            surface=SURFACE_AUQ,
+            target_row=target_row,
+            window_id=window_id,
+        ),
     )
 
 
-def _epm_plan(pane_text: str) -> FreeTextPlan | None:
+def _epm_plan(pane_text: str, window_id: str) -> FreeTextPlan | None:
     """Resolve the ExitPlanMode free-text lane, or ``None`` to decline."""
     form = terminal_parser.parse_exit_plan_form(pane_text)
     if form is None:
         return None
+    # EPM's affordance IS a parsed option (its label is not an ``is_affordance_label``
+    # one), so a cursor already parked on it reports normally — the AUQ zero-nav
+    # special case above has no EPM twin.
     cursor = next((o.number for o in form.options if o.cursor and o.number), None)
     if cursor is None:
         return None
     last = form.options[-1]
     if last.number is None:
         return None
+    identity = derive_identity(
+        pane_text,
+        surface=SURFACE_EPM,
+        target_row=last.number,
+        window_id=window_id,
+    )
+    if identity.anchor is None:
+        # EVERY ExitPlanMode prompt renders the SAME three real options, so the
+        # pane identity cannot tell plan A from plan B — the plan-file slug in the
+        # footer is the only discriminator, and it is therefore MANDATORY. No
+        # footer (it scrolled off under a very long draft) ⇒ decline, never guess.
+        return None
     return FreeTextPlan(
         surface=SURFACE_EPM,
         target_row=last.number,  # the affordance IS a parsed option here (row 4)
         cursor_row=cursor,
         placeholder=terminal_parser.EPM_FREE_TEXT_LABEL,
-        fingerprint=form.fingerprint(),
+        identity=identity,
     )
 
 
-def plan_from_pane(pane_text: str | None) -> FreeTextPlan | None:
+def plan_from_pane(
+    pane_text: str | None, ansi_pane: str, window_id: str
+) -> FreeTextPlan | None:
     """Resolve the free-text lane for a live pane, or ``None`` to decline.
 
     ``None`` means "this lane does not apply" — the caller falls through to the
@@ -225,10 +378,19 @@ def plan_from_pane(pane_text: str | None) -> FreeTextPlan | None:
     if content is None:
         return None
     if content.name == SURFACE_AUQ:
-        return _auq_plan(pane_text)
-    if content.name == SURFACE_EPM:
-        return _epm_plan(pane_text)
-    return None
+        plan = _auq_plan(pane_text, ansi_pane, window_id)
+    elif content.name == SURFACE_EPM:
+        plan = _epm_plan(pane_text, window_id)
+    else:
+        return None
+    if plan is None:
+        return None
+    if plan.identity.pane is None and plan.identity.anchor is None:
+        # Nothing identifies this card ⇒ we could never prove, after the nav or
+        # before the Enter, that we are still on it. Decline (fall through to
+        # PR-1's refusal) rather than commit blind.
+        return None
+    return plan
 
 
 # ── The bytes-landed probe ───────────────────────────────────────────────
@@ -349,7 +511,9 @@ async def try_answer(
     would have handled correctly come out worse, and it never invents its own
     refusal for a payload it has not touched. (Plan §2.4 [r4 P1-4]: "every bail
     BEFORE Enter is ``not_advanced`` — nothing committed ⇒ falls through to the
-    PR-1 refusal notice".)
+    PR-1 refusal notice".) A BRAKED window (PR-1's stranded-draft registry) is one
+    of those bails: the lane declines and PR-1 emits the one refusal, so the lane
+    can never be a way AROUND the brake.
 
     Once the payload has been TYPED the lane owns the outcome and must NOT fall
     through: the text is sitting in the affordance row, so a second delivery
@@ -464,6 +628,20 @@ async def _answer_locked(
     if not window:
         return _decline("window_gone")
 
+    # (0) THE STRANDED-DRAFT BRAKE (peer-review P1). PR-1 raises it whenever a
+    # payload may still be sitting UNSENT in this window — including one this
+    # very lane left in a card's affordance row (DRAFT_WRITTEN), and including a
+    # COMMIT_UNKNOWN whose Enter may in fact have landed and advanced Claude to
+    # ANOTHER live card. While it is up, PR-1 refuses every send until the pane is
+    # PROVEN clear. The free-text lane must not be a way around that: navigating
+    # and typing into whatever is on the pane now is exactly the append-and-commit
+    # chain the brake exists to break. DECLINE, so PR-1 owns the single refusal and
+    # the single user-facing notice — and never clear the brake from here (its
+    # release rules — an empty-input-row capture or confirmed window death — are
+    # PR-1's, and they are the only proofs that mean anything).
+    if tmux_manager.window_has_stranded_draft(window_id):
+        return _decline("stranded_draft")
+
     # (1) FRESH proof of life + the version license, INSIDE the lock and
     # immediately before the first key (the AUQ round-2 P1-1 rule): a
     # /update-swapped TUI inside the window-list cache TTL must never be
@@ -482,7 +660,7 @@ async def _answer_locked(
         return _decline("capture_failed")
     pane = _plain(ansi)
 
-    plan = plan_from_pane(pane)
+    plan = plan_from_pane(pane, ansi, window_id)
     if plan is None:
         return _decline("no_free_text_surface")
     if not licensed(plan.surface, cmd):
@@ -513,17 +691,26 @@ async def _answer_locked(
             return _decline(REASON_NAV_FAILED)
     await asyncio.sleep(NAV_SETTLE_S)
 
-    # (3) LANDING PROOF (pre-type): the cursor is on the affordance row, the row
-    # still carries its placeholder, and the placeholder is SGR-2 DIM. The dim
-    # bit is what makes this a proof rather than a guess — it is applied only
-    # while the row is selected AND untyped, which is exactly the state we
-    # require before typing. A failure here has typed NOTHING, so it falls
-    # through to PR-1 (which re-captures and refuses with the accurate reason).
+    # (3) LANDING PROOF (pre-type): we are STILL ON THE SAME CARD, the cursor is
+    # on its affordance row, the row still carries its placeholder, and the
+    # placeholder is SGR-2 DIM. The dim bit is what makes the row state a proof
+    # rather than a guess — it is applied only while the row is selected AND
+    # untyped, which is exactly the state we require before typing. A failure here
+    # has typed NOTHING, so it falls through to PR-1 (which re-captures and
+    # refuses with the accurate reason).
     if time.monotonic() > deadline:
         return _decline("deadline")
     ansi2 = await _capture(window_id)
     if not isinstance(ansi2, str):
         return _decline("capture_failed")
+    pane2 = _plain(ansi2)
+    # IDENTITY FIRST (peer-review P1): a card that resolved during the nav and was
+    # replaced by a same-geometry successor would satisfy every other leg below —
+    # the successor's row N+1 is a dim placeholder under our freshly-moved cursor.
+    # Checking WHICH CARD before we type is what stops that.
+    ident_reason = _identity_reason(pane2, plan, window_id)
+    if ident_reason is not None:
+        return _decline(ident_reason)
     landed = terminal_parser.parse_free_text_row(ansi2, number=plan.target_row)
     if landed is None or not landed.cursor or not landed.dim:
         return _decline(REASON_LANDING_FAILED)
@@ -551,7 +738,7 @@ async def _answer_locked(
         return delivery.refuse(delivery.REASON_SEND_FAILED, written=True)
     await asyncio.sleep(TEXT_SETTLE_S)
 
-    # (5) TYPED-STATE VERIFY. From here every failure is DRAFT_WRITTEN.
+    # (5) IDENTITY + TYPED-STATE VERIFY. From here every failure is DRAFT_WRITTEN.
     verify = await _verify_typed(window_id, plan, payload, deadline=deadline)
     if verify is not None:
         return verify
@@ -617,26 +804,39 @@ async def _verify_typed(
          box is back and Enter would submit a half-typed message; refuse.
          Deliberately called WITHOUT ``expected_draft``: the picker trap
          (``prompt_row_is_option``) is exactly what must fire here.
-      C. THE ROW, or — on AUQ only — THE FOOTER:
-           C1 the affordance row is on the pane: it carries the cursor, its label
+      C. **IDENTITY — WHICH CARD (peer-review P1).** The extracted surface is
+         still ``plan.surface`` AND ``SurfaceIdentity.still_holds``. Without this
+         leg, a card that resolved mid-transaction and was replaced by ANOTHER
+         card satisfies every remaining leg — B (a card owns the pane), D (our
+         text IS on it, because we typed it into the successor's row), and C1 (the
+         successor's row N+1 carries our cursor, our text, at normal intensity) —
+         and the Enter commits the user's answer to the WRONG QUESTION. On
+         ExitPlanMode that is a plan-approval surface. THIS is the leg that says
+         no.
+      D. THE ROW, or — on AUQ only — THE FOOTER:
+           D1 the affordance row is on the pane: it carries the cursor, its label
               is NOT SGR-2 dim (⇒ TYPED, not the placeholder) and the label is a
               prefix of what we typed (⇒ WE typed it);
-           C2 (AUQ only) the row scrolled off under a long draft, but the picker
-              footer carries ``ctrl+g to edit`` — which on 2.1.207 appears IFF the
-              free-text row is the ACTIVE row. ExitPlanMode has no such proof (its
-              ``ctrl+g`` footer is unconditional), so an EPM row that scrolled off
-              REFUSES — fail-closed, because EPM's option 1 is "Yes, and bypass
-              permissions".
-      D. the payload TAIL is visibly on the pane (our bytes landed).
+           D2 (AUQ only) the row scrolled off under a long draft, but the picker
+              footer — scoped to the LIVE extracted AUQ region — carries
+              ``ctrl+g to edit``, which on 2.1.207 appears IFF the free-text row
+              is the ACTIVE row. It proves WHICH ROW, never WHICH CARD; leg C is
+              what supplies the latter (via the out-of-band anchor, since the
+              pane component is exactly what scrolled away).
+      E. the payload TAIL is visibly on the pane (our bytes landed).
 
-    The two overflow shapes are BOTH covered, and they differ (rig-measured):
+    The two overflow shapes differ (rig-measured), and identity closes both:
     the AUQ picker is BOTTOM-anchored, so a long draft scrolls the option block —
-    row included — off the TOP (C2 carries it); the EPM prompt grows DOWNWARD, so
-    a long draft pushes its FOOTER off the bottom while the row stays (C1 carries
-    it). A TUI has no scrollback (alternate screen), so a lost row is genuinely
-    unobservable — hence the two independent proofs.
+    row included — off the TOP (D2 carries the row, the side-file ANCHOR carries
+    the card); the EPM prompt grows DOWNWARD, so a long draft pushes its FOOTER
+    off the bottom (D1 still carries the row — but the footer IS the EPM anchor
+    and the whole surface stops extracting, so leg C refuses; an EPM feedback long
+    enough to overflow is DRAFT_WRITTEN, fail-closed, because EPM's option 1 is
+    "Yes, and bypass permissions"). A TUI has no scrollback (alternate screen), so
+    what scrolls off is genuinely unobservable.
     """
     attempts = 2
+    reason: str | None = None
     for attempt in range(attempts):
         if time.monotonic() > deadline:
             return delivery.refuse(delivery.REASON_DEADLINE, written=True)
@@ -653,7 +853,7 @@ async def _verify_typed(
             return delivery.refuse(delivery.REASON_CAPTURE_TIMEOUT, written=True)
         pane = _plain(ansi)
 
-        reason = _typed_state_reason(ansi, pane, plan, payload)
+        reason = _typed_state_reason(ansi, pane, plan, payload, window_id)
         if reason is None:
             return None
         if attempt + 1 < attempts:
@@ -662,37 +862,82 @@ async def _verify_typed(
             # IN a live card and brakes the topic.
             await asyncio.sleep(NAV_SETTLE_S)
 
+    # The failing LEG is the whole diagnostic value of this refusal (a wrong-card
+    # ``surface_identity_changed`` and a mid-redraw ``row_not_found`` are very
+    # different events). Leg names only — never pane text, never the payload.
     logger.warning(
-        "free_text: typed-state verify FAILED on window %s (surface=%s) — the "
-        "payload is in the affordance row and its Enter is WITHHELD",
+        "free_text: typed-state verify FAILED on window %s (surface=%s reason=%s) "
+        "— the payload is in the affordance row and its Enter is WITHHELD",
         window_id,
         plan.surface,
+        reason,
     )
     return delivery.refuse(
         REASON_VERIFY_FAILED, written=True, message=_VERIFY_FAILED_MSG
     )
 
 
+def _identity_reason(pane: str, plan: FreeTextPlan, window_id: str) -> str | None:
+    """``None`` iff the pane is PROVABLY still ``plan``'s card. Fail-closed.
+
+    Two independent gates, and the ORDER matters only for the log reason:
+
+      1. the extracted surface is still ``plan.surface`` — a first-match-wins
+         ``extract_interactive_content``, so AUQ→EPM, EPM→AUQ, and
+         card→gate/decision/settings/no-surface all refuse here; and
+      2. ``SurfaceIdentity.still_holds`` — the SAME-surface, SAME-geometry
+         successor (a re-asked AUQ, the next plan) that gate 1 cannot see.
+
+    Called at BOTH observation points that bracket a keystroke: after the nav
+    (pre-write ⇒ the caller DECLINES and PR-1 owns the refusal) and in the final
+    pre-Enter capture (post-write ⇒ the caller returns DRAFT_WRITTEN and arms the
+    stranded-draft brake).
+    """
+    content = terminal_parser.extract_interactive_content(pane)
+    if content is None or content.name != plan.surface:
+        return "surface_gone"
+    live = derive_identity(
+        pane,
+        surface=plan.surface,
+        target_row=plan.target_row,
+        window_id=window_id,
+    )
+    if not plan.identity.still_holds(live):
+        logger.warning(
+            "FREE_TEXT surface identity CHANGED on window %s (surface=%s) — "
+            "the card this message was answering is no longer the live one; "
+            "refusing to commit",
+            window_id,
+            plan.surface,
+        )
+        return "surface_identity_changed"
+    return None
+
+
 def _typed_state_reason(
-    ansi: str, pane: str, plan: FreeTextPlan, payload: str
+    ansi: str, pane: str, plan: FreeTextPlan, payload: str, window_id: str
 ) -> str | None:
     """``None`` iff the typed state is PROVEN (see ``_verify_typed``'s legs)."""
     # (B) the blocking surface still owns the pane
     if terminal_parser.pane_input_box_present(pane):
         return "input_box_returned"
-    # (D) our bytes landed
+    # (C) WHICH CARD — before anything that merely proves WHICH ROW or WHOSE TEXT
+    ident_reason = _identity_reason(pane, plan, window_id)
+    if ident_reason is not None:
+        return ident_reason
+    # (E) our bytes landed
     if not payload_tail_landed(pane, payload):
         return "payload_absent"
-    # (C) the row, or the AUQ footer
+    # (D) the row, or the AUQ footer
     row = terminal_parser.parse_free_text_row(ansi, number=plan.target_row)
     if row is not None and row.cursor:
         if row.dim:
             return "row_still_placeholder"  # nothing landed in the row
         if not _label_is_our_draft(row.label, payload):
             return "row_not_our_draft"
-        return None  # C1 ✓
+        return None  # D1 ✓
     if plan.surface == SURFACE_AUQ and terminal_parser.auq_free_text_row_active(pane):
-        return None  # C2 ✓ — the row scrolled off, the footer proves it is active
+        return None  # D2 ✓ — the row scrolled off; leg C already proved the CARD
     return "row_not_found"
 
 

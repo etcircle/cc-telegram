@@ -1215,6 +1215,43 @@ def peek_side_file_tool_use_id_and_written_at(
     return rec.tool_use_id, rec.written_at
 
 
+def peek_surface_identity_for_window(window_id: str) -> str | None:
+    """The AUQ SURFACE-OCCURRENCE identity for a window's live side file.
+
+    The OUT-OF-BAND anchor the GH #50 PR-2 free-text executor re-checks after its
+    navigation and again immediately before the Enter (peer-review P1). It is
+    independent of the pane, so it survives the one shape where the pane-derived
+    identity cannot: a long answer that scrolls the picker's whole option block
+    off the top (the AUQ picker is bottom-anchored, and a TUI has no scrollback).
+
+    Identity, NOT liveness — but the two coincide where it matters: the side file
+    is written by the ``PreToolUse`` hook BEFORE each AUQ renders and unlinked at
+    its ``tool_result``, so a card that resolved-and-was-replaced yields a
+    DIFFERENT id (the successor's) or ``None`` (resolved, nothing live) — both of
+    which the executor refuses on.
+
+    The occurrence key is the GH #48 composite, reused verbatim rather than
+    reinvented: the non-empty ``tool_use_id`` when the hook captured one, else
+    ``(written_at, canonical tool-input fingerprint)``. Same future-skew guard as
+    :func:`side_file_live_for_session`; deliberately NO read-TTL (a card left open
+    for hours is still that card). Read-only — never mutates the record cache.
+
+    ``None`` when the window has no session, no side file, or a clock-skewed one
+    — the caller FAILS CLOSED on ``None`` wherever it had an id before.
+    """
+    session_id = peek_session_id_for_window(window_id)
+    if not session_id:
+        return None
+    record = _read_pretool_side_file(session_id)
+    if record is None:
+        return None
+    if time.time() - record.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
+        return None
+    if record.tool_use_id:
+        return f"tu:{record.tool_use_id}"
+    return f"wf:{record.written_at!r}:{_canonical_dict_fingerprint(record.tool_input)}"
+
+
 @dataclass(frozen=True)
 class RecoverySideFile:
     """The read-TTL-free side-file payload + its canonical source fingerprint.

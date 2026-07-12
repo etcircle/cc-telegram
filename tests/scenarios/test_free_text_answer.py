@@ -38,22 +38,39 @@ from tests.conftest import (
     make_update_text,
     pane_fixture,
 )
+from tests.free_text_frames import (
+    AUQ_RESOLVED,
+    AUQ_X_ANSWER,
+    AUQ_X_LANDED,
+    AUQ_X_LIVE,
+    AUQ_X_TYPED,
+    AUQ_X_TYPED_BIG,
+    AUQ_Y_TYPED,
+    BIG_ANSWER,
+    EPM_P_ANSWER,
+    EPM_P_LANDED,
+    EPM_P_LIVE,
+    EPM_P_TYPED,
+    EPM_RESOLVED,
+    plain,
+)
 
 pytestmark = pytest.mark.scenario
 
 V = "v2.1.207"
 
-# The rig captures, in the order the transaction walks them.
-AUQ_LIVE = pane_fixture(f"auq_single_picker_{V}.txt")  # cursor row 1
-AUQ_LANDED = pane_fixture(f"auq_freetext_row_selected_pretype_{V}.ansi.txt")
-AUQ_TYPED = pane_fixture(f"auq_freetext_row_typed_{V}.ansi.txt")
-AUQ_TYPED_BIG = pane_fixture(f"auq_freetext_row_typed_large_{V}.ansi.txt")
-AUQ_RESOLVED = pane_fixture(f"auq_after_answer_t5_{V}.txt")
+# The rig captures, chained by CARD GENERATION (see ``tests/free_text_frames``):
+# a happy path must walk ONE card end-to-end, and the wrong-card test hands the
+# verifier a DIFFERENT real card mid-transaction.
+AUQ_LIVE = AUQ_X_LIVE  # card X, cursor row 1
+AUQ_LANDED = AUQ_X_LANDED  # card X, cursor row 4, DIM
+AUQ_TYPED = AUQ_X_TYPED  # card X, cursor row 4, PLAIN
+AUQ_TYPED_BIG = AUQ_X_TYPED_BIG  # card X, the 947-char answer
+AUQ_OTHER_CARD_TYPED = AUQ_Y_TYPED  # card Y — a DIFFERENT question, same geometry
 
-EPM_LIVE = pane_fixture(f"gate_epm_{V}.txt")
-EPM_LANDED = pane_fixture(f"epm_freetext_row_selected_pretype_{V}.ansi.txt")
-EPM_TYPED = pane_fixture(f"epm_freetext_row_typed_{V}.ansi.txt")
-EPM_RESOLVED = pane_fixture(f"epm_after_approve_t5_{V}.txt")
+EPM_LIVE = EPM_P_LIVE  # plan P, cursor row 1
+EPM_LANDED = EPM_P_LANDED
+EPM_TYPED = EPM_P_TYPED
 
 OUT_OF_SCOPE = {
     "auq_multi_select": pane_fixture(f"auq_multi_picker_{V}.txt"),
@@ -63,29 +80,8 @@ OUT_OF_SCOPE = {
 
 # The exact answers the typed fixtures render (so the authorship + tail proofs
 # see the truth on the pane).
-AUQ_ANSWER = "teal, actually"
-EPM_ANSWER = "please name it farewell.txt instead"
-
-# The owner's real shape: a 947-char, 9-line voice note (rig-captured; Enter
-# committed all 947 chars, JSONL-verified).
-BIG_ANSWER = (
-    '> Re: "the picker card you posted a moment ago"\n>\n'
-    "> Claude asked: What's your favorite color?\n\n"
-    "OK so about the colour question, I have been thinking about this for a "
-    "while and I want to give you the full reasoning rather than just picking "
-    "one of the three options you offered, because none of them is quite right "
-    "on its own.\n\n"
-    "I would actually prefer a deep teal, somewhere between blue and green, "
-    "because it reads well on both light and dark backgrounds and it does not "
-    "fight with the orange accent we already use in the header. Blue on its own "
-    "is too corporate and cold, green on its own reads too much like a success "
-    "state, and red is completely out of the question for anything that is not "
-    "an error.\n\n"
-    "So please go with teal as the primary, keep the existing orange as the "
-    "accent, and make sure the contrast ratio stays above four point five to "
-    "one for body text. If teal is impossible for some reason, fall back to "
-    "blue, but tell me why first.\n"
-)
+AUQ_ANSWER = AUQ_X_ANSWER
+EPM_ANSWER = EPM_P_ANSWER
 
 
 @pytest.fixture(autouse=True)
@@ -119,12 +115,14 @@ def _script_pane(
 
     async def send(window_id, keys, enter=True, literal=True):
         ok = await real_send(window_id, keys, enter=enter, literal=literal)
+        # The frames are ANSI captures (SGR-2 IS the typed-state proof), so the
+        # fake terminal must expose both views exactly as a real one does.
         if not literal and not enter and keys in ("Down", "Up"):
-            h.tmux.set_pane(window_id, landed, ansi=landed)
+            h.tmux.set_pane(window_id, plain(landed), ansi=landed)
         elif literal and not enter and keys:
-            h.tmux.set_pane(window_id, typed, ansi=typed)
+            h.tmux.set_pane(window_id, plain(typed), ansi=typed)
         elif enter and not keys:
-            h.tmux.set_pane(window_id, done, ansi=done)
+            h.tmux.set_pane(window_id, plain(done), ansi=done)
         return ok
 
     monkeypatch.setattr(_real_tmux, "send_keys", send)
@@ -132,7 +130,7 @@ def _script_pane(
 
 async def _bind(h: ScenarioHarness, pane: str, *, card: bool = True) -> str:
     wid = h.add_window(
-        window_name="repo", cwd="/repo", pane_text=pane, pane_text_ansi=pane
+        window_name="repo", cwd="/repo", pane_text=plain(pane), pane_text_ansi=pane
     )
     h.bind_thread(42, wid, display_name="repo", cwd="/repo", session_id="sess-1")
     if card:
@@ -261,9 +259,146 @@ class TestOutOfScopeSurfacesKeepThePr1Refusal:
         assert any("Not delivered" in n for n in _notices(scenario)), name
 
 
+class TestReplyQuotedPayloadsAreEligible:
+    """OWNER DECISION (2026-07-12) — supersedes plan §2.3, which made a
+    reply-context payload INELIGIBLE.
+
+    The owner's dominant gesture at a card is a VOICE NOTE sent as a REPLY to it
+    (both live test messages were), so the as-planned rule refused their most
+    natural way of answering — the exact friction this lane exists to remove.
+    Claude receives the FULL rendered payload: the quoted context AND the user's
+    words, exactly as the bot renders it for any other send.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_reply_quoted_voice_note_answers_the_card(
+        self, scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The owner's real shape, end to end: a 947-char voice note carrying the
+        reply-context quote of the card it is answering. Its typed render IS the
+        rig capture, so the tail + authorship proofs see the truth."""
+        wid = await _bind(scenario, AUQ_LIVE)
+        _script_pane(
+            scenario,
+            monkeypatch,
+            landed=AUQ_LANDED,
+            typed=AUQ_TYPED_BIG,
+            done=AUQ_RESOLVED,
+        )
+
+        await aggregator_offer_voice(
+            (scenario.user_id, 42, wid),
+            BIG_ANSWER,
+            bot=scenario.bot,
+            has_reply_context=True,
+        )
+        await aggregator_flush_route((scenario.user_id, 42, wid))
+
+        assert scenario.tmux.delivered(BIG_ANSWER), scenario.tmux.written_texts
+        # THE QUOTE IS INCLUDED — Claude gets the context, not just the words.
+        assert BIG_ANSWER.startswith('> Re: "')
+        assert scenario.tmux.written_texts == [BIG_ANSWER]
+        assert not any("Not delivered" in n for n in _notices(scenario))
+
+    @pytest.mark.asyncio
+    async def test_a_reply_quoted_typed_message_answers_the_card(
+        self, scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+    ):
+        wid = await _bind(scenario, AUQ_LIVE)
+        _script_pane(
+            scenario, monkeypatch, landed=AUQ_LANDED, typed=AUQ_TYPED, done=AUQ_RESOLVED
+        )
+
+        await aggregator_offer_text(
+            (scenario.user_id, 42, wid),
+            AUQ_ANSWER,
+            bot=scenario.bot,
+            has_reply_context=True,
+        )
+        await aggregator_flush_route((scenario.user_id, 42, wid))
+
+        assert scenario.tmux.delivered(AUQ_ANSWER)
+        assert _arrows(scenario) == ["Down", "Down", "Down"]
+
+
+class TestTheCursorIsAlreadyOnTheFreeTextRow:
+    """The card's own ↑/↓ buttons put it there — which is what the card invites.
+
+    Pre-fix, the parser drops the affordance row and clears every real option's
+    cursor when the ❯ is parked on it, so the executor found no cursor and
+    DECLINED into a PR-1 refusal. The most natural gesture was the broken one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_zero_nav_keystrokes_and_the_answer_still_lands(
+        self, scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+    ):
+        wid = await _bind(scenario, AUQ_LANDED)  # ❯ already on "Type something."
+        _script_pane(
+            scenario, monkeypatch, landed=AUQ_LANDED, typed=AUQ_TYPED, done=AUQ_RESOLVED
+        )
+
+        await _send_text(scenario, wid, AUQ_ANSWER)
+
+        assert _arrows(scenario) == [], "the cursor is already there"
+        assert scenario.tmux.delivered(AUQ_ANSWER)
+        assert not any("Not delivered" in n for n in _notices(scenario))
+
+
+class TestTheWrongCard:
+    @pytest.mark.asyncio
+    async def test_a_card_swapped_mid_transaction_never_receives_the_answer(
+        self, scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Card X is on the pane when the message is planned; by the pre-Enter
+        capture a DIFFERENT question (card Y — same 3-option geometry, real rig
+        bytes) is live and holds our text in ITS free-text row. Every other proof
+        passes. Identity refuses, the Enter is withheld, and the user is told."""
+        wid = await _bind(scenario, AUQ_LIVE)
+        _script_pane(
+            scenario,
+            monkeypatch,
+            landed=AUQ_LANDED,
+            typed=AUQ_OTHER_CARD_TYPED,  # the card RESOLVED and a new one rendered
+            done=AUQ_RESOLVED,
+        )
+
+        await _send_text(scenario, wid, AUQ_ANSWER)
+
+        assert scenario.tmux.committed is False, "the wrong card must not be answered"
+        assert any("NOT" in n or "not" in n for n in _notices(scenario))
+
+
+class TestTheStrandedDraftBrake:
+    @pytest.mark.asyncio
+    async def test_a_braked_window_gets_pr1s_single_refusal(
+        self, scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+    ):
+        """PR-1 raised the brake because a payload may still be sitting unsent in
+        this pane. The free-text lane must not be a way around it — it DECLINES,
+        so PR-1 owns the one refusal and the one notice."""
+        wid = await _bind(scenario, AUQ_LIVE)
+        _script_pane(
+            scenario, monkeypatch, landed=AUQ_LANDED, typed=AUQ_TYPED, done=AUQ_RESOLVED
+        )
+        _real_tmux.mark_window_stranded_draft(wid)
+
+        await _send_text(scenario, wid, AUQ_ANSWER)
+
+        assert scenario.tmux.sent_keys == [], "not one keystroke may reach the pane"
+        assert scenario.tmux.committed is False
+        notices = [n for n in _notices(scenario) if "Not delivered" in n]
+        assert len(notices) == 1, f"exactly ONE refusal, got {notices}"
+        assert "input box" in notices[0] or "UNSENT" in notices[0], notices[0]
+        # The lane never clears the brake — its release rules are PR-1's.
+        assert _real_tmux.window_has_stranded_draft(wid) is True
+
+
 class TestIneligibleProvenanceKeepsThePr1Refusal:
-    """Plan §2.3 — eligible = typed prose OR voice, AND none of
-    caption / attachment / reply-context / command."""
+    """Eligible = typed prose OR voice, AND none of caption / attachment / command.
+
+    (Reply-context WAS on this list; the owner moved it — see
+    ``TestReplyQuotedPayloadsAreEligible``.)"""
 
     @pytest.mark.asyncio
     async def test_a_slash_command_never_rides_the_lane(
@@ -310,30 +445,6 @@ class TestIneligibleProvenanceKeepsThePr1Refusal:
         await aggregator_flush_route((scenario.user_id, 42, wid))
 
         # A caption + an attachment is a message ABOUT files, not an answer.
-        assert scenario.tmux.written_texts == []
-        assert scenario.tmux.committed is False
-        assert _arrows(scenario) == []
-
-    @pytest.mark.asyncio
-    async def test_a_reply_context_message_never_rides_the_lane(
-        self, scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
-    ):
-        """A reply-context quote renders a block ADDRESSED to Claude — a message,
-        not the card's answer (a deliberate plan §2.3 decision). The fact is
-        OBSERVED by ``_apply_reply_context`` and carried on the bundle."""
-        wid = await _bind(scenario, AUQ_LIVE)
-        _script_pane(
-            scenario, monkeypatch, landed=AUQ_LANDED, typed=AUQ_TYPED, done=AUQ_RESOLVED
-        )
-
-        await aggregator_offer_text(
-            (scenario.user_id, 42, wid),
-            "> quoted\n\nplease use teal",
-            bot=scenario.bot,
-            has_reply_context=True,
-        )
-        await aggregator_flush_route((scenario.user_id, 42, wid))
-
         assert scenario.tmux.written_texts == []
         assert scenario.tmux.committed is False
         assert _arrows(scenario) == []

@@ -360,11 +360,34 @@ Additional modules:
                                 pane_command_is_claude + version-license re-read
                                 before the first key, monotonic arrow nav,
                                 settle→re-parse→verify, Enter as the ONLY commit
-                                key). TYPED-STATE PROOF = SGR-2: the affordance
-                                placeholder renders DIM while the row is SELECTED
-                                and UNTYPED; typed text does not (rig-verified on
-                                BOTH lanes, and on the adversarial payload that is
-                                byte-identical to the placeholder). VERSION-LICENSED
+                                key). TWO THINGS MUST BE PROVEN, NOT ONE:
+                                  * the pane STATE — TYPED-STATE PROOF = SGR-2: the
+                                    affordance placeholder renders DIM while the row
+                                    is SELECTED and UNTYPED; typed text does not
+                                    (rig-verified on BOTH lanes, and on the
+                                    adversarial payload byte-identical to the
+                                    placeholder); and
+                                  * WHICH CARD — SurfaceIdentity, captured before the
+                                    first key and RE-CHECKED after the nav and again
+                                    in the final pre-Enter capture. Every other leg
+                                    is equally satisfied by a SUCCESSOR card holding
+                                    our text (another controller can resolve card A
+                                    and render card B mid-transaction), and on EPM
+                                    that is a plan-approval surface. Two components:
+                                    `pane` (terminal_parser.free_text_surface_identity
+                                    — the REAL options 1..target_row-1, CURSOR-blind
+                                    AND TARGET-ROW-blind, so it survives the two
+                                    mutations the executor ITSELF performs; None ⇒
+                                    unrecoverable, never a weaker prefix) and
+                                    `anchor` (out-of-band, scroll-independent: the
+                                    AUQ PreToolUse side-file occurrence id via
+                                    auq_source.peek_surface_identity_for_window, or
+                                    the EPM ~/.claude/plans/<slug>.md footer path —
+                                    MANDATORY on EPM, whose three real options are
+                                    identical across every plan).
+                                A braked window (PR-1's stranded-draft registry) is
+                                checked FIRST and DECLINES — the lane is never a way
+                                around the brake, and never clears it. VERSION-LICENSED
                                 per (surface × CC-version) — the decision_token
                                 precedent; an un-characterized release degrades to
                                 PR-1's refusal. THE ADDITIVE INVARIANT: every bail
@@ -385,8 +408,12 @@ Additional modules:
                                 AGGREGATOR FLUSH (the only place that knows the
                                 bundle's provenance), gated first on the cheap
                                 in-memory has_interactive_surface so an ordinary
-                                send pays nothing. Config-free leaf (the flag is
-                                seeded by main._run_bot); pull-only, no observer.
+                                send pays nothing. Eligible = (typed prose OR voice)
+                                AND none of caption / attachment — a REPLY-QUOTED
+                                payload IS eligible (owner decision 2026-07-12) and
+                                Claude receives the full rendered payload, quote
+                                included. Config-free leaf (the flag is seeded by
+                                main._run_bot); pull-only, no observer.
   transcript_event_adapter.py ─ Translates session_monitor.TranscriptEvent →
                                 route_runtime.TranscriptLifecycleEvent and fans out
                                 per-route. 150-250 LoC budget (kill signal at 250 —

@@ -2040,58 +2040,176 @@ payload it has not touched. That covers: flag off, an unlicensed CC version, a
 non-Claude pane, a capture failure, a non-free-text surface (multi-select, review
 screen, multi-question, folder-trust, `Switch model?`, Permission, Workflow), an
 incomplete/scrolled option list (the `options_complete` proof — a partial pane BAILS
-rather than guessing N), a nav send failure, and an unproven landing. A LONE DIGIT
+rather than guessing N), an unidentifiable card (below), a nav send failure, an
+unproven landing, and **a window under PR-1's STRANDED-DRAFT BRAKE**. A LONE DIGIT
 payload also falls through: `deliver_to_window`'s step 0 applies the SAME
 `delivery.lone_hotkey_line` rule and refuses it — ONE rule, ONE owner, never two ❌.
 Once the payload has been TYPED the lane OWNS the outcome and must not fall through
 (a second delivery attempt would APPEND to the text sitting in the row).
 
+**THE STRANDED-DRAFT BRAKE IS CHECKED FIRST (peer-review P1).** PR-1 raises the
+brake whenever a payload may still be sitting UNSENT in a window — including one
+THIS lane left in a card's affordance row (`DRAFT_WRITTEN`), and including a
+`COMMIT_UNKNOWN` whose Enter may in fact have landed and advanced Claude to
+ANOTHER live card. While it is up, PR-1 refuses every send until the pane is
+PROVEN clear. The free-text lane must not be a way around that: navigating and
+typing into whatever is on the pane NOW is exactly the append-and-commit chain the
+brake exists to break. `try_answer` therefore checks
+`tmux_manager.window_has_stranded_draft` INSIDE the send lock, BEFORE any
+navigation or keystroke, and DECLINES — so PR-1 owns the single refusal and the
+single user-facing notice (never a second ❌). The lane NEVER clears the brake: its
+release rules (an empty-input-row capture, or confirmed window death) are PR-1's,
+and they are the only proofs that mean anything.
+
+**SURFACE IDENTITY — WHICH CARD (peer-review P1, the wrong-card close).** The pane
+being in the right STATE is necessary and NOT sufficient. Another controller — the
+poller, an AFK auto-resolve, a button tap, or Claude itself — can resolve card A
+and render card B *while* the executor navigates or types, and card B then
+satisfies EVERY other leg: it owns the pane (no input box), our bytes ARE on it
+(we typed them into B's row), its row N+1 carries our cursor and our text at normal
+intensity, and its footer says the free-text row is active. The Enter would commit
+the user's answer to the WRONG QUESTION — and on ExitPlanMode that is a
+plan-approval surface whose option 1 is "Yes, and bypass permissions". So
+`free_text.SurfaceIdentity` is captured BEFORE the first key and RE-CHECKED at both
+observation points that bracket a keystroke: **after the navigation** (a failure
+there has typed nothing ⇒ DECLINE, PR-1 owns the refusal) and **in the final
+pre-Enter capture** (⇒ `DRAFT_WRITTEN`, the brake goes up, honest notice). Both
+points also require `extract_interactive_content(pane).name == plan.surface`
+(first-match-wins, so AUQ→EPM, EPM→AUQ and card→gate/no-surface all refuse there).
+
+*The DRIFT TRAP, and how the identity is made stable across it.* The executor
+MUTATES the very pane it must re-identify — it moves the cursor onto the affordance
+row, then REPLACES that row's label with the user's prose. A naive form fingerprint
+moves under it and every commit would refuse (a self-inflicted denial of service,
+not a safety property). Two properties make it stable BY CONSTRUCTION:
+
+  - **cursor-blind** — `AskUserQuestionForm._canonical_repr` already is (the AUQ
+    pick-dispatch lane needs exactly that property, for exactly this reason); and
+  - **target-row-blind** — `terminal_parser.free_text_surface_identity` drops every
+    option at or below the affordance row BEFORE taking the canonical. This is the
+    load-bearing half: `_parse_numbered_options` DROPS a row whose label
+    `is_affordance_label` ("Type something."), so a pristine AUQ parses 3 options
+    and the instant our text lands in row 4 it stops being an affordance and parses
+    as a FOURTH REAL OPTION. On EPM the affordance is a real option from the start
+    and typing rewrites its label in place. Either way `OPTS:` moves.
+
+What survives is exactly the part of the surface the transaction never touches: the
+REAL options `1..target_row-1`. Requiring that prefix to be COMPLETE and contiguous
+is what makes a missing block fail CLOSED (`None`) instead of degrading to a
+shorter, weaker identity. The canonical is the repo's EXISTING
+`AskUserQuestionForm.fingerprint()` — never a new hash (mint/validate parity).
+
+*Two components, and the anchor is the authority.* `SurfaceIdentity.pane` (above)
+is the strong self-contained discriminator whenever the option block is on screen.
+`SurfaceIdentity.anchor` is the OUT-OF-BAND, scroll-independent surface-generation
+id: for **AUQ** the PreToolUse side file's occurrence identity
+(`auq_source.peek_surface_identity_for_window` — the GH #48 composite: a non-empty
+`tool_use_id`, else `(written_at, canonical tool-input fingerprint)`; a new AUQ
+rewrites the file, a resolved one unlinks it); for **EPM** the
+`~/.claude/plans/<slug>.md` path in the footer. `still_holds` is conservative: an
+anchor we HAD must still be there and be EQUAL (gone ⇒ the card resolved; changed ⇒
+a successor), a pane identity we HAD must still be EQUAL **or** be genuinely
+unrecoverable *with a matching anchor carrying the proof*, and something must
+actually have been proven.
+
+*The EPM anchor is MANDATORY.* Every ExitPlanMode prompt renders the SAME three real
+options ("Yes, and bypass permissions" / "Yes, manually approve edits" / "No,
+refine…"), so the pane identity is IDENTICAL across plans and cannot tell plan A
+from plan B — the plan-file slug is the only discriminator. An EPM whose footer is
+not visible therefore DECLINES at plan time and REFUSES at verify time, never
+guesses (pinned: `test_every_epm_plan_shares_one_pane_identity`).
+
+*A numbered plan BODY no longer kills the EPM lane.* `_exit_plan_option_block` is
+now delimited by the prompt's OWN `UIPattern` anchors (the bottom-most `Would you
+like to proceed?` / `Claude has written up a plan` above the `ctrl+g` footer).
+Anchoring at the pane top meant a plan whose rendered body contains a numbered list
+of steps — which is what most plans look like — hijacked `_parse_numbered_options`'
+top-down walk, so the option block was never reached and the ENTIRE EPM free-text
+lane silently declined on the common shape. Fail-closed, so it was never dangerous
+— just dead.
+
 **The transaction** (under `window_send_lock`, mirroring `_dispatch_pick` /
-`_dispatch_decision_pane_locked`): (1) a FRESH in-lock `pane_command_is_claude` +
+`_dispatch_decision_pane_locked`): (0) the STRANDED-DRAFT BRAKE check (above) —
+before any capture or key; (1) a FRESH in-lock `pane_command_is_claude` +
 `(surface × CC-version)` license re-read immediately before the first key (the AUQ
 round-2 P1-1 rule — a `/update`-swapped TUI inside the window-list cache TTL can
 never be arrow-keyed); (2) the strict surface parse
-(`parse_ask_user_question` / the new `parse_exit_plan_form`) → the target row
+(`parse_ask_user_question` / `parse_exit_plan_form`) → the target row
 (AUQ: N+1, since affordances are DROPPED from `options`; EPM: the last parsed
-option, whose label must be exactly the affordance); (3) MONOTONIC arrow nav, never
-a wrap shortcut (over-counting wraps to row 1, and on EPM row 1 is "Yes, and bypass
-permissions"); (4) the LANDING PROOF — cursor on the target row + the label is still
-the placeholder + the placeholder is SGR-2 **DIM**; (5) ONE literal write with the
-Enter WITHHELD (the `!` two-step is deliberately NOT reproduced: bash mode is a
-property of the INPUT BOX, and a live card owns the keyboard); (6) the TYPED-STATE
-VERIFY (below); (7) the pre-commit `UserTurnStamp` — **PR-2 is the FIFTH Enter-commit
-path and a free-text answer IS a user turn** [r5 P1-1]; a hook raise ⇒ DRAFT_WRITTEN,
-no Enter, no stamp; (8) Enter; (9) a bounded advance confirmation — a committed answer
-TEARS THE SURFACE DOWN, so its continued presence is the honest `commit_unconfirmed`
-signal, NEVER auto-retried.
+option, whose label must be exactly the affordance) **+ the SURFACE IDENTITY**
+(declines if the card cannot be identified at all — and, on EPM, if the plan-file
+anchor is not visible); (3) MONOTONIC arrow nav, never a wrap shortcut
+(over-counting wraps to row 1, and on EPM row 1 is "Yes, and bypass permissions");
+**a cursor already parked on the affordance row is a ZERO-KEYSTROKE nav, not a
+decline** — see below; (4) the LANDING PROOF — **the identity still holds** + cursor
+on the target row + the label is still the placeholder + the placeholder is SGR-2
+**DIM**; (5) ONE literal write with the Enter WITHHELD (the `!` two-step is
+deliberately NOT reproduced: bash mode is a property of the INPUT BOX, and a live
+card owns the keyboard); (6) the IDENTITY + TYPED-STATE VERIFY (below); (7) the
+pre-commit `UserTurnStamp` — **PR-2 is the FIFTH Enter-commit path and a free-text
+answer IS a user turn** [r5 P1-1]; a hook raise ⇒ DRAFT_WRITTEN, no Enter, no stamp;
+(8) Enter; (9) a bounded advance confirmation — a committed answer TEARS THE SURFACE
+DOWN, so its continued presence is the honest `commit_unconfirmed` signal, NEVER
+auto-retried.
 
-**The TYPED-STATE VERIFY** (`_typed_state_reason`; every leg AND-ed, a failure
-WITHHOLDS the Enter): (A) a bounded `pane_command_is_claude` re-probe FIRST so the
-pane CAPTURE is the LAST observation before the Enter (the r2-F4 ordering); (B)
-`pane_input_box_present` is **FALSE** — the blocking surface still owns the pane (if
-the card AFK-resolved mid-type, the input box is back and Enter would submit a
+**THE CURSOR MAY ALREADY BE ON THE FREE-TEXT ROW (peer-review P2).** The card's own
+↑/↓ nav buttons let the user land on `Type something.` — which is exactly what the
+card invites them to do — and then send prose. `_parse_numbered_options` DROPS the
+affordance row and, because an affordance `❯` is the bottom-most (hence live)
+cursor, deliberately CLEARS every real option's cursor, so the form reports NO
+cursor at all. Reading that as "we can't find the cursor" and DECLINING meant the
+most natural gesture the card invites was the one gesture that got REFUSED. `_auq_plan`
+now reads the affordance row directly (`parse_free_text_row(ansi, number=N+1).cursor`)
+and takes a ZERO-NAV plan — while STILL requiring the SGR-2 DIM landing proof before
+a single byte is typed. (EPM has no twin: its affordance IS a parsed option, so a
+cursor parked on it reports normally.)
+
+**The IDENTITY + TYPED-STATE VERIFY** (`_typed_state_reason`; every leg AND-ed, a
+failure WITHHOLDS the Enter): (A) a bounded `pane_command_is_claude` re-probe FIRST
+so the pane CAPTURE is the LAST observation before the Enter (the r2-F4 ordering);
+(B) `pane_input_box_present` is **FALSE** — the blocking surface still owns the pane
+(if the card AFK-resolved mid-type, the input box is back and Enter would submit a
 half-typed message); called WITHOUT `expected_draft`, because the picker trap is
-exactly what must fire; (C) **the row, or — on AUQ only — the footer**: (C1) the
-affordance row is on the pane, carries the cursor, its label is NOT SGR-2 dim (⇒
-TYPED) and is a prefix of what we typed (⇒ WE typed it); or (C2) **AUQ-only**: the
-row scrolled off, but the picker footer carries `ctrl+g to edit`, which on 2.1.207
-appears **IFF the free-text row is the ACTIVE row** (rig: it tracks the cursor
-exactly — absent at rows 1/2/3, present at N+1). ExitPlanMode has NO equivalent, so
-an EPM row that scrolled off **REFUSES** — fail-closed, because EPM's option 1 is
-"Yes, and bypass permissions"; (D) the payload TAIL is visibly on the pane (the
-"our bytes landed" probe, compared whitespace-STRIPPED — CC's soft wrap only ever
-INSERTS whitespace, so the probe is immune to every wrap shape including a mid-token
-hard break).
+exactly what must fire; (C) **IDENTITY — WHICH CARD** (see above): the extracted
+surface is still `plan.surface` AND `SurfaceIdentity.still_holds`. This leg runs
+BEFORE anything that merely proves WHICH ROW or WHOSE TEXT, because those are all
+satisfied by a successor card holding our prose; (D) **the row, or — on AUQ only —
+the footer**: (D1) the affordance row is on the pane, carries the cursor, its label
+is NOT SGR-2 dim (⇒ TYPED) and is a prefix of what we typed (⇒ WE typed it); or (D2)
+**AUQ-only**: the row scrolled off, but the picker footer carries `ctrl+g to edit`,
+which on 2.1.207 appears **IFF the free-text row is the ACTIVE row** (rig: it tracks
+the cursor exactly — absent at rows 1/2/3, present at N+1). D2 proves WHICH ROW,
+never WHICH CARD — leg C supplies the latter, via the out-of-band anchor, since the
+pane component is precisely what scrolled away; (E) the payload TAIL is visibly on
+the pane (the "our bytes landed" probe, compared whitespace-STRIPPED — CC's soft wrap
+only ever INSERTS whitespace, so the probe is immune to every wrap shape including a
+mid-token hard break).
+
+**`auq_free_text_row_active` is SCOPED to the LIVE picker (peer-review P1).** The
+first cut was an OR over the WHOLE pane ("does SOME line carry `Enter to select`
+and, on that line, `ctrl+g`?"), so a footer left in SCROLLBACK by an EARLIER picker
+— or a transcript the user pasted into the conversation — satisfied it while the
+LIVE picker's own footer, with the cursor parked on option 1, said the opposite. A
+positive proof that arbitrary pane text can mint is not a proof. The pane must now
+extract as a live `AskUserQuestion`, and the footer consulted is the **BOTTOM-MOST**
+picker footer on the pane (the repo's bottom-most-is-live rule — a TUI renders the
+live picker at the bottom and its scrollback above is frozen).
 
 **THE TWO OVERFLOW SHAPES (rig-measured, and they DIFFER).** A long answer wraps to
 more rows than the pane has, and a TUI runs on the ALTERNATE SCREEN — `capture-pane -S`
 recovers nothing (measured: 51 lines), so what scrolls off is genuinely unobservable.
 The AUQ picker is **BOTTOM-anchored**: its option block — the `❯ N+1.` cursor row
-INCLUDED — scrolls off the TOP while the footer stays (C2 carries it). The EPM prompt
-grows **DOWNWARD**: its FOOTER is pushed off the bottom while the row stays (C1 carries
-it). Hence the two independent proofs. Measured boundary on a 160x50 pane: ~947 chars
-and ~2.6 k chars both keep the whole block visible; ~5.3 k triggers overflow (and
-Enter still committed all 5 274 chars — JSONL-verified).
+INCLUDED — scrolls off the TOP while the footer stays, so D2 carries the ROW and the
+side-file ANCHOR carries the CARD (with no PreToolUse hook installed there is no
+anchor, nothing identifies the card, and an overflowing AUQ answer REFUSES —
+fail-closed, disclosed). The EPM prompt grows **DOWNWARD**: its FOOTER is pushed off
+the bottom while the row stays, so D1 still carries the ROW — but the footer IS the
+EPM anchor (the plan-file slug), and without it the surface no longer even extracts,
+so leg C refuses: **an EPM feedback long enough to overflow is DRAFT_WRITTEN**,
+because EPM's option 1 is "Yes, and bypass permissions" and there is no acceptable
+guess. Measured boundary on a 160x50 pane: ~947 chars and ~2.6 k chars both keep the
+whole block visible; ~5.3 k triggers overflow (and Enter still committed all 5 274
+chars — JSONL-verified).
 
 **NO PASTE-COLLAPSE ON AN AFFORDANCE ROW (the question PR-1's regression forced).**
 A payload written in ONE `send-keys -l` past ~800 chars collapses the INPUT BOX to
@@ -2109,15 +2227,26 @@ quote into indistinguishable `text_parts`, so "is this pure user prose?" is NOT
 recoverable from the string — it must be OBSERVED at the offer site. The bundle
 carries an `inbound_aggregator.Provenance` (`typed_text` / `voice` / `caption` /
 `reply_context` / `attachment`), OR-composed across every merge. **Eligible = (typed
-prose OR voice) AND NONE of caption / attachment / reply-context.** Voice IS eligible
-(it is the user speaking — the flow PR-2 exists for). `_apply_reply_context` now
-returns `(rendered_text, applied: bool)` so the fact is OBSERVED, not guessed [r4
-P2-1]; `PendingAttachment` + the pending-text store carry the facts so **pending-bind
-replay preserves them**; a bundle created AFTER a media-group boundary / cap flush
-starts EMPTY and takes its facts from the NEW item (it must never inherit the popped
-bundle's). Slash commands never reach the lane at all —
-`forward_command_handler` force-flushes and then sends the command through
-`send_to_window` directly.
+prose OR voice) AND NONE of caption / attachment.** Voice IS eligible (it is the user
+speaking — the flow PR-2 exists for). `_apply_reply_context` returns
+`(rendered_text, applied: bool)` so the fact is OBSERVED, not guessed [r4 P2-1];
+`PendingAttachment` + the pending-text store carry the facts so **pending-bind replay
+preserves them**; a bundle created AFTER a media-group boundary / cap flush starts
+EMPTY and takes its facts from the NEW item (it must never inherit the popped
+bundle's). Slash commands never reach the lane at all — `forward_command_handler`
+force-flushes and then sends the command through `send_to_window` directly.
+
+**REPLY-CONTEXT IS ELIGIBLE (OWNER DECISION 2026-07-12 — supersedes plan §2.3,
+which made it INELIGIBLE).** The owner's dominant gesture at a card is a VOICE NOTE
+sent as a REPLY to it (both live test messages were), so the as-planned rule refused
+their most natural way of answering — precisely the friction this lane exists to
+remove. **Claude receives the FULL rendered payload — the quoted context AND the
+user's words — exactly as the bot renders it for any other send**: the quote is
+CONTEXT for the answer, not a competing intent, and the affordance row is rig-proven
+to take 5 k+ chars of multi-line text and commit it whole (the 947-char rig capture
+IS a reply-quoted voice note). `has_caption`, `has_attachment` and command payloads
+remain INELIGIBLE, unchanged. The `reply_context` FACT is still observed and carried
+— only its effect on eligibility changed, so the decision is one line and reversible.
 
 **Integration seam = the AGGREGATOR FLUSH** (`_send_bundle` → `_try_free_text_answer`)
 — the only place that knows the provenance [r2 P1-5]. NOT `send_to_window` (provenance
@@ -2143,13 +2272,32 @@ the option buttons, then Submit."; unlicensed / flag-off / no affordance ⇒ "An
 with the buttons or the ↑/↓/⏎ keys." ExitPlanMode gains the line for the FIRST time
 (its card never mentioned free-text at all).
 
-**Other disclosed residuals.** An EPM feedback long enough to scroll its option block
-off the pane (~3 k+ chars on 160x50) is REFUSED after being typed — `draft_written`,
-the brake goes up, the user is told the text is in the card's row and to clear it
-(Esc). Fail-closed by design. The verify→Enter TOCTOU is the SAME residual
-`_dispatch_pick` / `_dispatch_decision` already accept and disclose. A reply-context
-voice note is NOT free-text-eligible (a deliberate plan §2.3 decision, not an
-oversight) and keeps PR-1's refusal. Pull-only; no observer (c313657 stays forbidden).
+**Other disclosed residuals.**
+
+  - **The verify→Enter TOCTOU** is the SAME residual `_dispatch_pick` /
+    `_dispatch_decision` already accept and disclose: one tmux round-trip, which no
+    terminal protocol can make atomic. The identity re-check SHRINKS the wrong-card
+    window to that round-trip; it does not eliminate it. Bounded by the fail-closed
+    `commit_unconfirmed`.
+  - **An EPM feedback long enough to push the plan-file footer off the pane** (~3 k+
+    chars on 160x50) is REFUSED after being typed — `draft_written`, the brake goes
+    up, the user is told the text is in the card's row and to clear it (Esc). The
+    footer is the ONLY thing that distinguishes one plan from another, so this is
+    fail-closed by design, not a gap.
+  - **An AUQ answer long enough to scroll the option block off, on an install with
+    no PreToolUse hook**, has neither identity component and REFUSES the same way.
+    With the hook (the documented configuration, and what `cc-telegram hook --install`
+    guarantees) the side-file anchor carries it and the answer commits.
+  - **Two AUQs with identical option labels asked back-to-back** are indistinguishable
+    by the PANE component alone — the side-file anchor discriminates them, so this
+    only degrades to a residual on a hook-less install. It is the same class of
+    residual the shipped AUQ pick-dispatch lane accepts (its `_canonical_repr` is
+    likewise title-less on a pure-pane parse).
+  - **An ExitPlanMode prompt whose plan body cannot be separated from its option
+    block** would decline (fail-closed). The `UIPattern`-anchored
+    `_exit_plan_option_block` closes the common numbered-plan-body case.
+
+Pull-only; no observer (c313657 stays forbidden).
 
 ## Tappable Decision dispatch (`dcp:` lane — Stage B2.3, flag `CC_TELEGRAM_DECISION_DISPATCH`)
 

@@ -93,23 +93,31 @@ class Provenance:
 
     @property
     def free_text_eligible(self) -> bool:
-        """Plan §2.3: typed prose OR voice, AND none of caption / attachment /
-        reply-context.
+        """Typed prose OR voice, AND none of caption / attachment.
 
         Voice IS eligible — it is the user speaking, and answering a card by
-        voice is the flow PR-2 exists for. Captions and attachments are not: an
-        ``(attachments: …)`` block is a message ABOUT files, not an answer to the
-        question. A reply-context quote renders a block addressed to Claude as a
-        MESSAGE, not as the card's answer, so it is excluded too (a deliberate
-        plan decision, not an oversight).
+        voice is the flow PR-2 exists for.
+
+        **REPLY-CONTEXT IS ELIGIBLE (owner decision, 2026-07-12 — supersedes plan
+        §2.3, which excluded it).** The owner's dominant gesture at a card is a
+        VOICE NOTE sent as a REPLY to it, so the as-planned rule refused their most
+        natural way of answering — precisely the friction this lane exists to
+        remove. Claude receives the FULL rendered payload, quote and all, exactly
+        as the bot renders it for an ordinary send: the quote is CONTEXT for the
+        answer, not a competing intent, and the affordance row is rig-proven to
+        take 5 k+ chars of multi-line text and commit it whole. The FACT is still
+        observed and carried (``_apply_reply_context`` returns whether it rendered
+        a quote) — only its effect on eligibility changed, so the decision is one
+        line and reversible.
+
+        Captions and attachments stay INELIGIBLE: an ``(attachments: …)`` block is
+        a message ABOUT files, not an answer to the question.
 
         Slash commands never reach here: ``forward_command_handler`` force-flushes
         the bundle and then sends the command through ``send_to_window``
         directly, so a command payload can never ride this lane.
         """
-        return (self.typed_text or self.voice) and not (
-            self.caption or self.reply_context or self.attachment
-        )
+        return (self.typed_text or self.voice) and not (self.caption or self.attachment)
 
 
 @dataclass

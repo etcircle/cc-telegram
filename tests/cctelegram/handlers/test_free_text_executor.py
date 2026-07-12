@@ -3,7 +3,7 @@
 Driven against a FAKE tmux whose captures are the REAL 2.1.207 rig fixtures, so
 the state machine is exercised on the exact bytes Claude Code renders.
 
-The two invariants every test here defends:
+The THREE invariants every test here defends:
 
   1. **The lane is purely ADDITIVE.** Every bail BEFORE the first keystroke
      returns ``None`` and the caller falls through to PR-1's gate — so the lane
@@ -11,17 +11,45 @@ The two invariants every test here defends:
   2. **The commit boundary is strict.** Nothing typed ⇒ ``None``. Typed but not
      committed ⇒ ``DRAFT_WRITTEN`` + the stranded-draft brake. Enter sent but
      unproven ⇒ ``COMMIT_UNKNOWN``, reported honestly, NEVER auto-retried.
+  3. **The Enter never lands on the WRONG CARD.** The pane can be in exactly the
+     right STATE and still be the wrong SURFACE — another controller resolves
+     card A and renders card B while we navigate or type, and B holds our text in
+     ITS free-text row. Identity is captured pre-key and re-checked after the nav
+     and again in the final pre-Enter capture. See ``tests/free_text_frames.py``
+     for the real card generations these tests cross.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from cctelegram import delivery, terminal_parser, tmux_manager as tmux_mod
 from cctelegram.delivery import DeliveryOutcome, UserTurnStamp
-from cctelegram.handlers import free_text
+from cctelegram.handlers import auq_source, free_text
+from tests.free_text_frames import (
+    AUQ_RESOLVED,
+    AUQ_X_ANSWER,
+    AUQ_X_LANDED,
+    AUQ_X_LIVE,
+    AUQ_X_OVERFLOW,
+    AUQ_X_TYPED,
+    AUQ_X_TYPED_BIG,
+    AUQ_Y_LIVE,
+    AUQ_Y_TYPED,
+    BIG_ANSWER,
+    EPM_OVERFLOW,
+    EPM_P_ANSWER,
+    EPM_P_LANDED,
+    EPM_P_LIVE,
+    EPM_P_TYPED,
+    EPM_Q_TYPED,
+    EPM_RESOLVED,
+    OVERFLOW_ANSWER,
+    plain,
+)
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
 V = "v2.1.207"
@@ -34,7 +62,6 @@ def _fx(name: str) -> str:
 WINDOW = "@0"
 STAMP = UserTurnStamp(user_id=1, thread_id=42, window_id=WINDOW)
 PAYLOAD = "I would prefer a deep teal, actually"
-BIG_PAYLOAD = _fx(f"auq_freetext_row_typed_large_{V}.ansi.txt")  # only for a tail
 
 
 class FakePane:
@@ -110,6 +137,21 @@ def stamped(monkeypatch):
     return seen
 
 
+@pytest.fixture
+def auq_anchor(monkeypatch):
+    """Stub the AUQ out-of-band anchor (the PreToolUse side file's occurrence id).
+
+    Returns a mutable one-element list so a test can ROTATE the anchor mid-flight
+    — which is what a genuinely new AUQ does (its hook rewrites the side file) —
+    or drop it to ``None`` (the card resolved and its file was unlinked).
+    """
+    box: list[str | None] = ["tu:toolu_CARD_X"]
+    monkeypatch.setattr(
+        auq_source, "peek_surface_identity_for_window", lambda _w: box[0]
+    )
+    return box
+
+
 def _wire(monkeypatch, pane: FakePane) -> None:
     tm = tmux_mod.tmux_manager
     monkeypatch.setattr(tm, "capture_pane_cancellation_safe", pane.capture)
@@ -123,40 +165,21 @@ def _wire(monkeypatch, pane: FakePane) -> None:
     monkeypatch.setattr(free_text, "_record_bot_sent", lambda w, p: None)
 
 
-# The four rig captures the AUQ happy path walks through, in order.
-AUQ_LIVE = _fx(f"auq_single_picker_{V}.txt")  # cursor row 1
-AUQ_LANDED = _fx(f"auq_freetext_row_selected_pretype_{V}.ansi.txt")  # cursor row 4, DIM
-AUQ_TYPED = _fx(f"auq_freetext_row_typed_{V}.ansi.txt")  # PLAIN
-AUQ_TYPED_BIG = _fx(f"auq_freetext_row_typed_large_{V}.ansi.txt")
-AUQ_OVERFLOW = _fx(f"auq_freetext_overflow_{V}.txt")
-AUQ_RESOLVED = _fx("auq_after_answer_t5_v2.1.207.txt")  # the surface is GONE
-
-EPM_LIVE = _fx(f"gate_epm_{V}.txt")
-EPM_LANDED = _fx(f"epm_freetext_row_selected_pretype_{V}.ansi.txt")
-EPM_TYPED = _fx(f"epm_freetext_row_typed_{V}.ansi.txt")
-EPM_RESOLVED = _fx("epm_after_approve_t5_v2.1.207.txt")
-
-# The payloads whose text is actually IN those fixtures (so the tail probe and
-# the authorship prefix check see the truth).
-AUQ_TYPED_TEXT = "teal, actually"
-EPM_TYPED_TEXT = "please name it farewell.txt instead"
-
-
 class TestAuqHappyPath:
     @pytest.mark.asyncio
     async def test_navigates_types_verifies_and_commits(self, monkeypatch, stamped):
-        pane = FakePane([AUQ_LIVE, AUQ_LANDED, AUQ_TYPED, AUQ_RESOLVED])
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
         _wire(monkeypatch, pane)
 
         result = await free_text.try_answer(
-            WINDOW, AUQ_TYPED_TEXT, user_turn=STAMP, display="proj"
+            WINDOW, AUQ_X_ANSWER, user_turn=STAMP, display="proj"
         )
 
-        assert result is not None and result.ok
+        assert result is not None and result.ok, result
         assert result.outcome is DeliveryOutcome.DELIVERED
         # N = 3 real options ⇒ the free-text row is 4 ⇒ 3 Downs (cursor starts at 1).
         assert pane.arrows == ["Down", "Down", "Down"]
-        assert pane.literal_writes == [AUQ_TYPED_TEXT]
+        assert pane.literal_writes == [AUQ_X_ANSWER]
         assert pane.enter_sent is True
         # The Enter carried the user-turn stamp — PR-2 is the FIFTH commit path.
         assert stamped == [(1, 42, WINDOW)]
@@ -169,10 +192,10 @@ class TestAuqHappyPath:
     ):
         """If the row is STILL the dim placeholder after the write, nothing landed
         — so the Enter must be withheld (it would commit the free-text row EMPTY)."""
-        pane = FakePane([AUQ_LIVE, AUQ_LANDED, AUQ_LANDED, AUQ_LANDED])
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_LANDED, AUQ_X_LANDED])
         _wire(monkeypatch, pane)
 
-        result = await free_text.try_answer(WINDOW, AUQ_TYPED_TEXT, user_turn=STAMP)
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
 
         assert result is not None
         assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
@@ -182,101 +205,304 @@ class TestAuqHappyPath:
         assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is True
 
 
+class TestTheCursorIsAlreadyOnTheFreeTextRow:
+    """peer-review P2 — the card's OWN ↑/↓ buttons put it there.
+
+    ``_parse_numbered_options`` DROPS the affordance row and clears every real
+    option's cursor when the ❯ is parked on it, so the form reports NO cursor at
+    all. Reading that as "we can't find the cursor" and declining meant the most
+    natural gesture the card invites — nav to ``Type something.``, then send
+    prose — was the one gesture that got REFUSED.
+    """
+
+    @pytest.mark.asyncio
+    async def test_zero_nav_keystrokes_and_still_commits(self, monkeypatch, stamped):
+        # AUQ_X_LANDED IS the "cursor already on row 4" capture, straight from the rig.
+        pane = FakePane([AUQ_X_LANDED, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is not None and result.ok, result
+        assert pane.arrows == [], "the cursor is already there — nav must be a no-op"
+        assert pane.literal_writes == [AUQ_X_ANSWER]
+        assert pane.enter_sent is True
+        assert stamped == [(1, 42, WINDOW)]
+
+    @pytest.mark.asyncio
+    async def test_the_landing_proof_still_runs(self, monkeypatch):
+        """Zero nav does NOT mean zero proof: the row must still be SGR-2 dim
+        before a single byte is typed into it."""
+        # A pane whose row 4 carries the cursor but is ALREADY typed (a leftover
+        # draft) — no dim ⇒ the landing proof fails ⇒ decline, nothing typed.
+        pane = FakePane([AUQ_X_TYPED, AUQ_X_TYPED, AUQ_X_TYPED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, "something else", user_turn=STAMP)
+
+        assert result is None  # pre-write bail ⇒ PR-1 owns it
+        assert pane.literal_writes == []
+
+    @pytest.mark.asyncio
+    async def test_a_cursor_on_the_chat_about_this_row_is_not_the_target(
+        self, monkeypatch
+    ):
+        """Row 5 (``Chat about this``) is ALSO an affordance, so it too clears the
+        real-option cursors — but it is not row 4, and we must not silently treat
+        it as if it were."""
+        from tests.free_text_frames import move_cursor_to_row
+
+        pane = FakePane([move_cursor_to_row(AUQ_X_LANDED, 5)])
+        _wire(monkeypatch, pane)
+
+        assert await free_text.try_answer(WINDOW, PAYLOAD, user_turn=STAMP) is None
+        assert pane.keys == []
+
+
+class TestTheWrongCard:
+    """peer-review P1 — the pane can be in the right STATE and be the wrong CARD.
+
+    Every OTHER leg of the proof set is satisfied by a successor card holding our
+    text: it owns the pane (no input box), our bytes ARE on it, its row N+1 carries
+    our cursor and our text at normal intensity, and its footer says the free-text
+    row is active. Only IDENTITY says no.
+    """
+
+    @pytest.mark.asyncio
+    async def test_auq_replaced_by_a_same_geometry_auq_before_the_enter(
+        self, monkeypatch, stamped
+    ):
+        """Card X is planned; card Y — a DIFFERENT question with the SAME 3-option
+        geometry and the SAME typed row — is live by the final capture. REAL rig
+        bytes for both."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_Y_TYPED, AUQ_Y_TYPED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is not None
+        assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
+        assert result.reason == delivery.REASON_FREE_TEXT_VERIFY_FAILED
+        assert pane.enter_sent is False, "the answer must NOT be submitted to card Y"
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is True
+
+    @pytest.mark.asyncio
+    async def test_auq_replaced_by_an_epm_before_the_enter(self, monkeypatch, stamped):
+        """AUQ → ExitPlanMode. The worst available outcome: EPM's option 1 is
+        "Yes, and bypass permissions"."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, EPM_P_TYPED, EPM_P_TYPED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is not None
+        assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
+        assert pane.enter_sent is False
+        assert stamped == []
+
+    @pytest.mark.asyncio
+    async def test_epm_replaced_by_an_auq_before_the_enter(self, monkeypatch, stamped):
+        pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, AUQ_X_TYPED, AUQ_X_TYPED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
+
+        assert result is not None
+        assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
+        assert pane.enter_sent is False
+        assert stamped == []
+
+    @pytest.mark.asyncio
+    async def test_epm_replaced_by_a_DIFFERENT_PLAN_before_the_enter(
+        self, monkeypatch, stamped
+    ):
+        """The hardest one. EVERY ExitPlanMode prompt renders the SAME three real
+        options, so the pane-derived identity CANNOT tell plan P from plan Q — the
+        ``~/.claude/plans/<slug>.md`` footer is the only discriminator, which is
+        precisely why the EPM anchor is mandatory. Both frames are real rig bytes.
+        """
+        assert terminal_parser.free_text_surface_identity(
+            plain(EPM_P_TYPED), surface="ExitPlanMode", target_row=4
+        ) == terminal_parser.free_text_surface_identity(
+            plain(EPM_Q_TYPED), surface="ExitPlanMode", target_row=4
+        ), "premise: two EPM plans are INDISTINGUISHABLE by their option rows"
+
+        pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_Q_TYPED, EPM_Q_TYPED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
+
+        assert result is not None
+        assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
+        assert pane.enter_sent is False, "plan Q must not receive plan P's feedback"
+        assert stamped == []
+
+    @pytest.mark.asyncio
+    async def test_the_swap_is_caught_AFTER_THE_NAV_TOO_with_nothing_typed(
+        self, monkeypatch
+    ):
+        """The identity is re-checked at BOTH points that bracket a keystroke. A
+        swap during the NAV is caught before a single byte is written, so it is a
+        clean pre-write bail: fall through to PR-1, no draft, no brake."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_Y_LIVE, AUQ_Y_LIVE])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is None
+        assert pane.literal_writes == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
+
+    @pytest.mark.asyncio
+    async def test_a_ROTATED_auq_side_file_refuses_even_when_the_pane_agrees(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """The out-of-band anchor is an INDEPENDENT gate. Even if the successor
+        card were byte-identical on the pane (a re-asked question), its PreToolUse
+        hook rewrote the side file with a new ``tool_use_id`` — and that alone is
+        enough to refuse."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_X_TYPED])
+        _wire(monkeypatch, pane)
+
+        calls = {"n": 0}
+        real_capture = pane.capture
+
+        async def capture_and_rotate(window_id, *, with_ansi=False):
+            out = await real_capture(window_id, with_ansi=with_ansi)
+            calls["n"] += 1
+            if calls["n"] >= 3:  # capture 1 = plan, 2 = landing, 3 = pre-Enter
+                auq_anchor[0] = "tu:toolu_CARD_X_REASKED"  # a NEW AUQ, same content
+            return out
+
+        monkeypatch.setattr(
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_rotate
+        )
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is not None and not result.ok
+        assert pane.enter_sent is False
+        assert stamped == []
+
+    @pytest.mark.asyncio
+    async def test_a_VANISHED_auq_side_file_refuses(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """The side file is unlinked at the AUQ's ``tool_result``. Its absence is
+        proof the card we planned against RESOLVED — never a licence to proceed."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_X_TYPED])
+        _wire(monkeypatch, pane)
+
+        calls = {"n": 0}
+        real_capture = pane.capture
+
+        async def capture_and_drop(window_id, *, with_ansi=False):
+            out = await real_capture(window_id, with_ansi=with_ansi)
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                auq_anchor[0] = None
+            return out
+
+        monkeypatch.setattr(
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_drop
+        )
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is None or not result.ok
+        assert pane.enter_sent is False
+        assert stamped == []
+
+
+class TestTheStrandedDraftBrake:
+    """peer-review P1 — the free-text lane must not be a way AROUND PR-1's brake."""
+
+    @pytest.mark.asyncio
+    async def test_a_braked_window_declines_with_zero_keystrokes(self, monkeypatch):
+        """An earlier delivery may have left a payload UNSENT in this pane — or a
+        COMMIT_UNKNOWN whose Enter actually landed and advanced Claude to another
+        live card. Navigating and typing into whatever is on the pane NOW is exactly
+        the append-and-commit chain the brake exists to break."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+        tmux_mod.tmux_manager.mark_window_stranded_draft(WINDOW)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is None, "DECLINE — PR-1 owns the single refusal + notice"
+        assert pane.keys == []
+
+    @pytest.mark.asyncio
+    async def test_the_lane_never_clears_the_brake(self, monkeypatch):
+        """Its release rules (an empty-input-row capture, or confirmed window
+        death) are PR-1's, and they are the only proofs that mean anything."""
+        pane = FakePane([AUQ_X_LIVE])
+        _wire(monkeypatch, pane)
+        tmux_mod.tmux_manager.mark_window_stranded_draft(WINDOW)
+
+        await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is True
+
+
 class TestTheOwnersActualUseCase:
-    """A LARGE (voice-note-shaped) free-text answer — the primary path."""
+    """A LARGE (voice-note-shaped, reply-quoted) free-text answer — the primary path."""
 
     @pytest.mark.asyncio
     async def test_947_char_multiline_payload_commits(self, monkeypatch, stamped):
         # The real 947-char, 9-line payload whose typed render IS the fixture.
-        payload = (
-            '> Re: "the picker card you posted a moment ago"\n>\n'
-            "> Claude asked: What's your favorite color?\n\n"
-            "OK so about the colour question, I have been thinking about this for "
-            "a while and I want to give you the full reasoning rather than just "
-            "picking one of the three options you offered, because none of them is "
-            "quite right on its own.\n\n"
-            "I would actually prefer a deep teal, somewhere between blue and green, "
-            "because it reads well on both light and dark backgrounds and it does "
-            "not fight with the orange accent we already use in the header. Blue on "
-            "its own is too corporate and cold, green on its own reads too much "
-            "like a success state, and red is completely out of the question for "
-            "anything that is not an error.\n\n"
-            "So please go with teal as the primary, keep the existing orange as the "
-            "accent, and make sure the contrast ratio stays above four point five "
-            "to one for body text. If teal is impossible for some reason, fall back "
-            "to blue, but tell me why first.\n"
-        )
-        assert len(payload) > 800
-        pane = FakePane([AUQ_LIVE, AUQ_LANDED, AUQ_TYPED_BIG, AUQ_RESOLVED])
+        assert len(BIG_ANSWER) > 800
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED_BIG, AUQ_RESOLVED])
         _wire(monkeypatch, pane)
 
-        result = await free_text.try_answer(WINDOW, payload, user_turn=STAMP)
+        result = await free_text.try_answer(WINDOW, BIG_ANSWER, user_turn=STAMP)
 
         assert result is not None and result.ok, result
         # ONE literal write — exactly what the bot's send_keys does, and what the
         # rig proved does NOT paste-collapse on an affordance row.
-        assert pane.literal_writes == [payload]
+        assert pane.literal_writes == [BIG_ANSWER]
         assert pane.enter_sent is True
         assert stamped == [(1, 42, WINDOW)]
 
     @pytest.mark.asyncio
-    async def test_overflow_commits_on_the_footer_proof(self, monkeypatch, stamped):
-        """A ~5.3 k answer scrolls the ``❯ 4.`` row off the pane entirely (a TUI
-        has no scrollback). The footer's ``ctrl+g to edit`` still proves the
-        free-text row is the ACTIVE row, so the answer commits instead of being
-        stranded inside a live card."""
-        # The overflow fixture's draft tail — the "our bytes landed" probe.
-        payload = (
-            "Paragraph six. I want to walk you through the reasoning in detail "
-            "because the short answer is misleading and I would rather you "
-            "understand the constraints than guess at them from a single word. The "
-            "palette has to work on light and dark, it has to survive being printed "
-            "in greyscale, and it has to keep a contrast ratio above four point five "
-            "to one for body text everywhere it is used, including the small print "
-            "in the footer."
-        )
-        pane = FakePane([AUQ_LIVE, AUQ_LANDED, AUQ_OVERFLOW, AUQ_RESOLVED])
+    async def test_overflow_commits_on_the_footer_proof_PLUS_the_anchor(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """A ~5.3 k answer scrolls the whole option block — the ``❯ 4.`` row
+        INCLUDED — off the pane (a TUI has no scrollback), so the pane-derived
+        identity is gone. The footer's ``ctrl+g to edit`` still proves WHICH ROW,
+        and the side-file anchor still proves WHICH CARD. Both, or nothing."""
+        assert (
+            terminal_parser.free_text_surface_identity(
+                plain(AUQ_X_OVERFLOW), surface="AskUserQuestion", target_row=4
+            )
+            is None
+        ), "premise: the option block is genuinely unrecoverable from this pane"
+
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_OVERFLOW, AUQ_RESOLVED])
         _wire(monkeypatch, pane)
 
-        result = await free_text.try_answer(WINDOW, payload, user_turn=STAMP)
+        result = await free_text.try_answer(WINDOW, OVERFLOW_ANSWER, user_turn=STAMP)
 
         assert result is not None and result.ok, result
         assert pane.enter_sent is True
-        assert terminal_parser.parse_free_text_row(AUQ_OVERFLOW, number=4) is None
+        assert terminal_parser.parse_free_text_row(AUQ_X_OVERFLOW, number=4) is None
 
-
-class TestEpm:
     @pytest.mark.asyncio
-    async def test_feedback_commits_and_reports_as_plan_feedback(
+    async def test_overflow_with_NO_anchor_REFUSES_rather_than_guess(
         self, monkeypatch, stamped
     ):
-        pane = FakePane([EPM_LIVE, EPM_LANDED, EPM_TYPED, EPM_RESOLVED])
+        """No ``PreToolUse`` side file (the hook isn't installed) ⇒ the option block
+        scrolling away leaves NOTHING that identifies the card. Fail closed: the
+        draft is stranded and honestly reported, never committed on a guess."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_OVERFLOW, AUQ_RESOLVED])
         _wire(monkeypatch, pane)
-
-        result = await free_text.try_answer(
-            WINDOW, EPM_TYPED_TEXT, user_turn=STAMP, display="proj"
+        monkeypatch.setattr(
+            auq_source, "peek_surface_identity_for_window", lambda _w: None
         )
 
-        assert result is not None and result.ok
-        assert "plan feedback" in result.message
-        assert pane.arrows == ["Down", "Down", "Down"]  # row 1 → row 4
-        assert pane.enter_sent is True
-        assert stamped == [(1, 42, WINDOW)]
-
-    @pytest.mark.asyncio
-    async def test_epm_overflow_REFUSES_rather_than_guess(self, monkeypatch, stamped):
-        """EPM has NO row-active footer proof (its ``ctrl+g`` is unconditional), so
-        an EPM pane whose free-text row is not observable must NOT be committed —
-        option 1 is "Yes, and bypass permissions". Fail-closed: the draft is
-        stranded and honestly reported, never committed on a guess."""
-        # A live EPM whose row-4 is simply absent from the post-type capture.
-        stripped = "\n".join(
-            ln for ln in EPM_TYPED.split("\n") if "4." not in ln and "❯" not in ln
-        )
-        pane = FakePane([EPM_LIVE, EPM_LANDED, stripped, stripped])
-        _wire(monkeypatch, pane)
-
-        result = await free_text.try_answer(WINDOW, EPM_TYPED_TEXT, user_turn=STAMP)
+        result = await free_text.try_answer(WINDOW, OVERFLOW_ANSWER, user_turn=STAMP)
 
         assert result is not None
         assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
@@ -285,20 +511,82 @@ class TestEpm:
         assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is True
 
 
+class TestEpm:
+    @pytest.mark.asyncio
+    async def test_feedback_commits_and_reports_as_plan_feedback(
+        self, monkeypatch, stamped
+    ):
+        pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_P_TYPED, EPM_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(
+            WINDOW, EPM_P_ANSWER, user_turn=STAMP, display="proj"
+        )
+
+        assert result is not None and result.ok, result
+        assert "plan feedback" in result.message
+        assert pane.arrows == ["Down", "Down", "Down"]  # row 1 → row 4
+        assert pane.enter_sent is True
+        assert stamped == [(1, 42, WINDOW)]
+
+    @pytest.mark.asyncio
+    async def test_a_numbered_plan_BODY_no_longer_kills_the_lane(self):
+        """Most plans render a numbered list of steps, and that list used to hijack
+        the top-down option walk so the option block was never reached — the EPM
+        lane silently declined on the common shape. The block is now delimited by
+        the prompt's own ``UIPattern`` anchors."""
+        assert "1. Create goodbye.txt" in plain(EPM_Q_TYPED)  # a numbered plan body
+        assert (
+            terminal_parser.free_text_surface_identity(
+                plain(EPM_Q_TYPED), surface="ExitPlanMode", target_row=4
+            )
+            is not None
+        )
+
+    @pytest.mark.asyncio
+    async def test_epm_overflow_REFUSES_rather_than_guess(self, monkeypatch, stamped):
+        """The EPM prompt grows DOWNWARD, so a long draft pushes its FOOTER off the
+        bottom — and the footer carries the ``~/.claude/plans/<slug>.md`` path that
+        is the ONLY thing distinguishing one plan from another. With it gone the
+        card is unidentifiable, so the feedback is NOT committed. Option 1 is "Yes,
+        and bypass permissions"; there is no acceptable guess here."""
+        assert terminal_parser.extract_epm_plan_file_path(plain(EPM_OVERFLOW)) is None
+        pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_OVERFLOW, EPM_OVERFLOW])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
+
+        assert result is not None
+        assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
+        assert pane.enter_sent is False
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is True
+
+    @pytest.mark.asyncio
+    async def test_an_epm_with_no_visible_plan_footer_never_starts(self, monkeypatch):
+        """The anchor is MANDATORY at plan time too — no footer, no lane. A clean
+        pre-write decline (PR-1 refuses), never a typed draft."""
+        pane = FakePane([EPM_OVERFLOW])
+        _wire(monkeypatch, pane)
+
+        assert await free_text.try_answer(WINDOW, PAYLOAD, user_turn=STAMP) is None
+        assert pane.keys == []
+
+
 class TestTheAdditiveInvariant:
     """Every pre-write bail returns None ⇒ the caller falls through to PR-1."""
 
     @pytest.mark.asyncio
     async def test_flag_off_declines(self, monkeypatch):
         free_text.set_enabled(False)
-        pane = FakePane([AUQ_LIVE])
+        pane = FakePane([AUQ_X_LIVE])
         _wire(monkeypatch, pane)
         assert await free_text.try_answer(WINDOW, PAYLOAD, user_turn=STAMP) is None
         assert pane.keys == []
 
     @pytest.mark.asyncio
     async def test_unlicensed_cc_version_declines(self, monkeypatch):
-        pane = FakePane([AUQ_LIVE, AUQ_LANDED], cc_version="2.1.208")
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED], cc_version="2.1.208")
         _wire(monkeypatch, pane)
         assert await free_text.try_answer(WINDOW, PAYLOAD, user_turn=STAMP) is None
         assert pane.keys == [], "an unlicensed version must never send a keystroke"
@@ -308,7 +596,7 @@ class TestTheAdditiveInvariant:
         """A bare digit is a live HOTKEY on these surfaces — it must never be
         typed. Falling through is correct AND sufficient: PR-1's step 0 applies
         the SAME rule and owns the refusal, so the user gets exactly one message."""
-        pane = FakePane([AUQ_LIVE])
+        pane = FakePane([AUQ_X_LIVE])
         _wire(monkeypatch, pane)
         assert await free_text.try_answer(WINDOW, "3", user_turn=STAMP) is None
         assert pane.keys == []
@@ -344,7 +632,7 @@ class TestTheAdditiveInvariant:
 
     @pytest.mark.asyncio
     async def test_not_claude_declines(self, monkeypatch):
-        pane = FakePane([AUQ_LIVE], cc_version="zsh")
+        pane = FakePane([AUQ_X_LIVE], cc_version="zsh")
         _wire(monkeypatch, pane)
         assert await free_text.try_answer(WINDOW, PAYLOAD, user_turn=STAMP) is None
         assert pane.keys == []
@@ -353,7 +641,7 @@ class TestTheAdditiveInvariant:
     async def test_landing_unproven_declines_with_NOTHING_typed(self, monkeypatch):
         """The nav didn't land (the post-nav capture still shows the cursor on
         option 1). Nothing was typed ⇒ fall through, clean."""
-        pane = FakePane([AUQ_LIVE, AUQ_LIVE, AUQ_LIVE])
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LIVE, AUQ_X_LIVE])
         _wire(monkeypatch, pane)
         result = await free_text.try_answer(WINDOW, PAYLOAD, user_turn=STAMP)
         assert result is None
@@ -366,11 +654,11 @@ class TestTheCommitBoundary:
     async def test_a_failed_enter_is_commit_unknown_and_KEEPS_its_stamp(
         self, monkeypatch, stamped
     ):
-        pane = FakePane([AUQ_LIVE, AUQ_LANDED, AUQ_TYPED, AUQ_TYPED])
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_X_TYPED])
         pane.enter_ok = False
         _wire(monkeypatch, pane)
 
-        result = await free_text.try_answer(WINDOW, AUQ_TYPED_TEXT, user_turn=STAMP)
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
 
         assert result is not None
         assert result.outcome is DeliveryOutcome.COMMIT_UNKNOWN
@@ -384,10 +672,10 @@ class TestTheCommitBoundary:
         self, monkeypatch, stamped
     ):
         """Never auto-retried — the Enter cannot be un-sent."""
-        pane = FakePane([AUQ_LIVE, AUQ_LANDED, AUQ_TYPED, AUQ_TYPED])
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_X_TYPED])
         _wire(monkeypatch, pane)
 
-        result = await free_text.try_answer(WINDOW, AUQ_TYPED_TEXT, user_turn=STAMP)
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
 
         assert result is not None
         assert result.outcome is DeliveryOutcome.COMMIT_UNKNOWN
@@ -396,7 +684,7 @@ class TestTheCommitBoundary:
 
     @pytest.mark.asyncio
     async def test_stamp_exception_withholds_the_enter(self, monkeypatch):
-        pane = FakePane([AUQ_LIVE, AUQ_LANDED, AUQ_TYPED, AUQ_RESOLVED])
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
         _wire(monkeypatch, pane)
 
         def boom(*_a):
@@ -404,7 +692,7 @@ class TestTheCommitBoundary:
 
         monkeypatch.setattr(free_text, "_stamp", boom)
 
-        result = await free_text.try_answer(WINDOW, AUQ_TYPED_TEXT, user_turn=STAMP)
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
 
         assert result is not None
         assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
@@ -415,22 +703,70 @@ class TestTheCommitBoundary:
     async def test_a_cancellation_after_the_write_arms_the_brake_and_reraises(
         self, monkeypatch
     ):
-        pane = FakePane([AUQ_LIVE, AUQ_LANDED, AUQ_TYPED, AUQ_RESOLVED])
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
         _wire(monkeypatch, pane)
 
         real_verify = free_text._verify_typed
 
         async def cancel_mid_verify(*a, **k):
-            raise __import__("asyncio").CancelledError()
+            raise asyncio.CancelledError()
 
         monkeypatch.setattr(free_text, "_verify_typed", cancel_mid_verify)
 
-        import asyncio
-
         with pytest.raises(asyncio.CancelledError):
-            await free_text.try_answer(WINDOW, AUQ_TYPED_TEXT, user_turn=STAMP)
+            await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
 
         # The payload may be sitting in the affordance row ⇒ the brake goes up,
         # and the cancellation PROPAGATES (never swallowed into a DeliveryResult).
         assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is True
         assert real_verify is not None
+
+
+class TestTheIdentityIsStableAcrossOurOWNMutations:
+    """The drift trap: the executor MUTATES the pane it must re-identify.
+
+    If the identity moved when the cursor moved, or when the payload replaced the
+    affordance label, EVERY commit would refuse — the check would be a
+    self-inflicted denial of service rather than a safety property.
+    """
+
+    def test_the_cursor_move_does_not_move_the_identity(self):
+        pre = terminal_parser.free_text_surface_identity(
+            plain(AUQ_X_LIVE), surface="AskUserQuestion", target_row=4
+        )
+        post = terminal_parser.free_text_surface_identity(
+            plain(AUQ_X_LANDED), surface="AskUserQuestion", target_row=4
+        )
+        assert pre is not None and pre == post
+
+    def test_typing_into_the_row_does_not_move_the_identity(self):
+        """The load-bearing one. ``_parse_numbered_options`` DROPS an affordance
+        row, so the instant our text lands in row 4 it stops being an affordance
+        and parses as a FOURTH REAL OPTION — a naive form fingerprint moves. The
+        identity is TARGET-ROW-BLIND, so it does not."""
+        base = terminal_parser.free_text_surface_identity(
+            plain(AUQ_X_LANDED), surface="AskUserQuestion", target_row=4
+        )
+        for typed in (AUQ_X_TYPED, AUQ_X_TYPED_BIG):
+            assert (
+                terminal_parser.free_text_surface_identity(
+                    plain(typed), surface="AskUserQuestion", target_row=4
+                )
+                == base
+            )
+
+    def test_a_different_question_has_a_different_identity(self):
+        assert terminal_parser.free_text_surface_identity(
+            plain(AUQ_X_LANDED), surface="AskUserQuestion", target_row=4
+        ) != terminal_parser.free_text_surface_identity(
+            plain(AUQ_Y_LIVE), surface="AskUserQuestion", target_row=4
+        )
+
+    def test_an_incomplete_option_block_is_UNRECOVERABLE_not_weaker(self):
+        """It must never silently degrade to a shorter, weaker prefix."""
+        assert (
+            terminal_parser.free_text_surface_identity(
+                plain(AUQ_X_OVERFLOW), surface="AskUserQuestion", target_row=4
+            )
+            is None
+        )

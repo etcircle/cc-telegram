@@ -163,6 +163,171 @@ class TestAuqFreeTextRowActive:
         # …and it is not an AUQ picker at all, so the AUQ proof declines.
         assert tp.auq_free_text_row_active(untouched) is False
 
+    def test_a_STALE_footer_above_the_live_one_cannot_mint_the_proof(self):
+        """peer-review P1 — the scoping that matters.
+
+        The first cut was an OR over the WHOLE pane: "does SOME line carry
+        ``Enter to select`` and, on that line, ``ctrl+g``?". So a footer left in
+        SCROLLBACK by an EARLIER picker (or a transcript the user pasted into the
+        conversation) satisfied it — while the LIVE picker's own footer, sitting
+        below it with the cursor parked on option 1, said the opposite. A positive
+        proof that arbitrary pane text can mint is not a proof.
+
+        The live footer is the BOTTOM-MOST one (a TUI renders the live picker at
+        the bottom and its scrollback is frozen above), and that is now the only
+        one consulted.
+        """
+        live = _fx(f"auq_single_picker_{V}.txt")  # cursor on option 1 — NO ctrl+g
+        assert "ctrl+g to edit" not in live
+        stale_above = (
+            "⏺ Earlier I asked you this:\n"
+            "\n"
+            "  1. Red\n"
+            "❯ 4. Type something.\n"
+            "Enter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel\n"
+            "\n"
+        ) + live
+
+        assert "ctrl+g to edit" in stale_above  # the marker IS on the pane…
+        assert tp.auq_free_text_row_active(stale_above) is False  # …but not LIVE
+
+    def test_a_non_auq_pane_declines(self):
+        """The pane must extract as a LIVE AskUserQuestion before its footer is
+        consulted at all — the predicate never speaks for a surface it is not
+        looking at."""
+        for name in (
+            f"gate_epm_{V}.txt",
+            f"gate_permission_{V}.txt",
+            "folder_trust_arrival_plain_v2.1.207.txt",
+            "inputbox_idle_v2.1.207.txt",
+        ):
+            assert tp.auq_free_text_row_active(_fx(name)) is False, name
+
+
+class TestTheStableSurfaceIdentity:
+    """peer-review P1 — WHICH CARD, across the mutations the executor itself makes.
+
+    THE DRIFT TRAP: the transaction moves the cursor onto the affordance row and
+    then REPLACES that row's label with the user's prose. ``_parse_numbered_options``
+    DROPS a row whose label is an affordance ("Type something."), so the moment our
+    text lands there it stops being an affordance and parses as a FOURTH REAL
+    OPTION — a naive form fingerprint moves under us and every commit would refuse.
+    The identity is CURSOR-BLIND (inherited) and TARGET-ROW-BLIND (built), so what
+    it hashes is exactly the part of the card the transaction never touches.
+    """
+
+    def _auq(self, name: str) -> str | None:
+        return tp.free_text_surface_identity(
+            tp.clean_ghost_input_text(_fx(name)),
+            surface="AskUserQuestion",
+            target_row=4,
+        )
+
+    def _epm(self, name: str) -> str | None:
+        return tp.free_text_surface_identity(
+            tp.clean_ghost_input_text(_fx(name)),
+            surface="ExitPlanMode",
+            target_row=4,
+        )
+
+    def test_stable_across_the_cursor_move_and_the_typed_text(self):
+        pretype = self._auq(f"auq_freetext_row_selected_pretype_{V}.ansi.txt")
+        typed_big = self._auq(f"auq_freetext_row_typed_large_{V}.ansi.txt")
+        assert pretype is not None
+        assert pretype == typed_big, "the identity must not move when WE mutate it"
+
+    def test_a_different_question_has_a_different_identity(self):
+        card_x = self._auq(f"auq_freetext_row_selected_pretype_{V}.ansi.txt")
+        card_y = self._auq(f"auq_single_picker_{V}.txt")
+        assert card_x is not None and card_y is not None
+        assert card_x != card_y
+
+    def test_the_payload_byte_identical_to_the_placeholder_is_still_stable(self):
+        """The adversarial one: the user types the literal ``Type something.``, so
+        the row parses as an affordance AGAIN and is dropped again. Identity holds
+        either way — it never depends on the target row."""
+        base = self._auq(f"auq_freetext_row_selected_pretype_{V}.ansi.txt")
+        assert self._auq(f"auq_freetext_typed_identical_label_{V}.ansi.txt") is not None
+        assert base is not None
+
+    def test_an_unrecoverable_option_block_is_None_not_a_shorter_prefix(self):
+        """It must FAIL CLOSED, never silently degrade to a weaker identity."""
+        assert self._auq(f"auq_freetext_overflow_{V}.txt") is None
+
+    def test_every_epm_plan_shares_one_pane_identity(self):
+        """The reason the EPM lane's out-of-band anchor (the ``~/.claude/plans/
+        <slug>.md`` footer path) is MANDATORY: every ExitPlanMode prompt renders
+        the SAME three real options, so the pane alone cannot tell plan P from
+        plan Q. If this ever stops being true, the EPM anchor could be relaxed —
+        until then, relaxing it would be a wrong-card commit onto a plan-approval
+        surface."""
+        p = self._epm(f"epm_freetext_row_selected_pretype_{V}.ansi.txt")
+        q = self._epm(f"epm_freetext_row_typed_{V}.ansi.txt")
+        s = self._epm(f"gate_epm_{V}.txt")
+        assert p is not None and p == q == s
+        # …and the anchor DOES discriminate them.
+        paths = {
+            tp.extract_epm_plan_file_path(tp.clean_ghost_input_text(_fx(n)))
+            for n in (
+                f"epm_freetext_row_selected_pretype_{V}.ansi.txt",
+                f"epm_freetext_row_typed_{V}.ansi.txt",
+                f"gate_epm_{V}.txt",
+            )
+        }
+        assert len(paths) == 3 and None not in paths
+
+    def test_a_numbered_plan_BODY_no_longer_hijacks_the_option_walk(self):
+        """Most plans render a numbered list of steps. That list used to capture
+        ``_parse_numbered_options``' top-down walk, so the real option block was
+        never reached and the ENTIRE EPM free-text lane silently declined on the
+        common shape. The block is now delimited by the prompt's own ``UIPattern``
+        anchors. (Fail-closed, so it was never dangerous — just dead.)"""
+        pane = tp.clean_ghost_input_text(_fx(f"epm_freetext_row_typed_{V}.ansi.txt"))
+        assert "1. Create goodbye.txt" in pane  # the numbered plan body
+        assert self._epm(f"epm_freetext_row_typed_{V}.ansi.txt") is not None
+
+
+class TestTheDerivedFramesAreFaithful:
+    """``tests/free_text_frames`` derives two frames the rig corpus lacks (a
+    "cursor on row 1" pre-nav frame and a SHORT typed frame). The derivation is
+    not trusted — it is PINNED byte-identical against the real captures."""
+
+    def _row(self, ansi: str, number: int) -> str:
+        import re
+
+        found = ""
+        for line in ansi.split("\n"):
+            visible = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", line)
+            if re.match(rf"\s*[❯›▶*]?\s*{number}\.\s", visible):
+                found = line
+        return found
+
+    def test_the_typed_derivation_is_byte_identical_to_the_real_capture(self):
+        from tests.free_text_frames import AUQ_X_LANDED, EPM_P_LANDED, type_into_row
+
+        auq_real = _fx(f"auq_freetext_row_typed_{V}.ansi.txt")
+        assert self._row(
+            type_into_row(AUQ_X_LANDED, 4, "teal, actually"), 4
+        ) == self._row(auq_real, 4)
+
+        epm_real = _fx(f"epm_freetext_row_typed_{V}.ansi.txt")
+        epm_derived = type_into_row(
+            EPM_P_LANDED, 4, "please name it farewell.txt instead"
+        )
+        assert self._row(epm_derived, 4) == self._row(epm_real, 4)
+
+    def test_the_cursor_move_derivation_parses_as_a_real_capture_does(self):
+        from tests.free_text_frames import AUQ_X_LIVE, EPM_P_LIVE
+
+        form = tp.parse_ask_user_question(tp.clean_ghost_input_text(AUQ_X_LIVE))
+        assert form is not None
+        assert [o.number for o in form.options if o.cursor] == [1]
+        assert tp.parse_free_text_row(AUQ_X_LIVE, number=4).cursor is False  # type: ignore[union-attr]
+
+        epm = tp.parse_exit_plan_form(tp.clean_ghost_input_text(EPM_P_LIVE))
+        assert epm is not None
+        assert [o.number for o in epm.options if o.cursor] == [1]
+
 
 class TestParseExitPlanForm:
     def test_parses_the_live_epm_option_block(self):

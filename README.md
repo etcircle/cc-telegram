@@ -167,17 +167,26 @@ while one of these is on screen and it becomes your answer:
   feedback, and plan mode is preserved — so you can talk Claude out of a plan
   from your phone instead of approving it blind.
 
+**Replying to the card works too.** Swipe-reply to the question card and send a
+voice note, and the quote goes along with your words — Claude gets the context
+you were answering *and* the answer.
+
 The bot does this by driving the terminal the same way the option buttons do: it
 moves the cursor onto the prompt's free-text row, *proves* it landed there, types
-your message with the Enter withheld, *proves* your text is in that row, and only
-then commits. Any failure before the Enter falls back to the ordinary refusal.
-Long messages are fine — a multi-paragraph voice note is submitted whole.
+your message with the Enter withheld, *proves* your text is in that row, *proves
+the card is still the one you were answering*, and only then commits. That last
+check matters: a card can resolve on its own while your message is being typed
+(Claude Code gives up on an unanswered question after about a minute), and the
+next card would otherwise receive an answer meant for the previous one. If
+anything cannot be proven, the Enter is withheld and you are told. Any failure
+before the first keystroke falls back to the ordinary refusal. Long messages are
+fine — a multi-paragraph voice note is submitted whole.
 
 Everything else keeps the refusal, on purpose: multi-select questions (their
 answer takes several steps), folder-trust and model-switch prompts (no free-text
-option exists), and anything carrying an attachment, a caption, a reply-quote, or
-a slash command — those are messages *about* something, not answers to the
-question. Cards say which of the two you are looking at, so you are never guessing.
+option exists), and anything carrying an attachment, a caption, or a slash
+command — those are messages *about* something, not answers to the question.
+Cards say which of the two you are looking at, so you are never guessing.
 
 This is characterised per Claude Code version. On a version cc-telegram has not
 verified, the free-text lane switches itself off and the prompt goes back to
@@ -289,7 +298,7 @@ Everything else has a default.
 - `CC_TELEGRAM_PERMISSION_PROMPTS` surfaces tool permission prompts and Workflow launch gates as Telegram cards. Default: true (set `CC_TELEGRAM_PERMISSION_PROMPTS=false` to disable).
 - `CC_TELEGRAM_DECISION_CARDS` surfaces otherwise unsupported numbered confirmation prompts as display-only cards. Default: true (set `CC_TELEGRAM_DECISION_CARDS=false` to disable).
 - `CC_TELEGRAM_DECISION_DISPATCH` enables verified one-tap dispatch for known-good decision families when decision cards are also enabled. Unknown prompts and uncharacterised Claude versions remain display-only.
-- `CC_TELEGRAM_FREE_TEXT_ANSWERS` lets a plain message (typed or voice) answer a live question card or a plan approval in your own words, by driving that prompt's free-text row. Default: true (set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to fall back to refusing those messages). Limited to Claude Code versions cc-telegram has characterised; an uncharacterised version disables the lane by itself. See [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words).
+- `CC_TELEGRAM_FREE_TEXT_ANSWERS` lets a plain message (typed or voice, including a swipe-reply that quotes the card) answer a live question card or a plan approval in your own words, by driving that prompt's free-text row. Default: true (set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to fall back to refusing those messages). Limited to Claude Code versions cc-telegram has characterised; an uncharacterised version disables the lane by itself. See [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words).
 - `CC_TELEGRAM_ARTIFACT_MAX_MB` sets the maximum upload size for attachment cards and `/file`. Default: 45 MB; Telegram's bot limit is 50 MB.
 - `CC_TELEGRAM_ARTIFACT_ROOTS` adds comma-separated absolute directories that may serve files in addition to the active session directory.
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` limits the input preview shown in tool lines. Default: 40.
