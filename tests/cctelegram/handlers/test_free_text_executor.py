@@ -489,8 +489,20 @@ class TestTheOwnersActualUseCase:
     ):
         """A ~5.3 k answer scrolls the whole option block — the ``❯ 4.`` row
         INCLUDED — off the pane (a TUI has no scrollback), so the pane-derived
-        identity is gone. The footer's ``ctrl+g to edit`` still proves WHICH ROW,
-        and the side-file anchor still proves WHICH CARD. Both, or nothing."""
+        identity is gone.
+
+        We commit anyway, and the honest reason is NOT that the post-write legs
+        prove anything: the rig showed the ``ctrl+g`` footer also renders on the
+        ``N+2. Chat about this`` row (so it proves SOME text-field row, never
+        WHICH), and the SGR-2 flip passes on a real option row. They are WEAK
+        corroboration.
+
+        What licenses the commit is that the PRE-TYPE LANDING PROOF already ran,
+        BEFORE any byte was written, on an identity-matched card: the cursor was
+        on a genuine DIM ``Type something.`` placeholder — the one shape a real
+        option row can never take. Refusing here instead would strand a typed
+        draft INSIDE a live card and brake the topic, which is the regression a
+        long voice answer would hit every time."""
         assert (
             terminal_parser.free_text_surface_identity(
                 plain(AUQ_X_OVERFLOW), target_row=4

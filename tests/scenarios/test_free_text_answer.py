@@ -160,8 +160,10 @@ def _script_pane(
 
     async def send(window_id, keys, enter=True, literal=True):
         ok = await real_send(window_id, keys, enter=enter, literal=literal)
-        # The frames are ANSI captures (SGR-2 IS the typed-state proof), so the
-        # fake terminal must expose both views exactly as a real one does.
+        # The frames are ANSI captures (the SGR-2 dim bit carries the PRE-TYPE
+        # landing proof — the guard; its POST-write flip is only weak
+        # corroboration, since it passes on a real option row), so the fake
+        # terminal must expose both views exactly as a real one does.
         if not literal and not enter and keys in ("Down", "Up"):
             h.tmux.set_pane(window_id, plain(landed), ansi=landed)
         elif literal and not enter and keys:

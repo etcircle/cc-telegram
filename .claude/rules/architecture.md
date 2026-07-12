@@ -75,7 +75,7 @@
 │    (topic → window)    │         │      write auq_pending │
 │  - Message history     │────────►│      side file         │
 │    retrieval           │  reads  │    Notification →      │
-                                   │      write notify_     │
+└────────────────────────┘  JSONL  │      write notify_     │
                                    │      pending side file │
                                    │  - Receive hook stdin  │
                                    └────────────────────────┘

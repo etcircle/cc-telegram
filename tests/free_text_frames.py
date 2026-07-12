@@ -63,9 +63,11 @@ def fx(name: str) -> str:
 def plain(ansi: str) -> str:
     """The plain-text view the executor parses — the SAME seam it uses.
 
-    The frames are ANSI captures (SGR-2 is the typed-state proof), so any test
-    that calls a PARSER directly must clean them exactly as ``free_text._plain``
-    does; the executor itself is handed the raw ANSI and cleans internally.
+    The frames are ANSI captures (the SGR-2 dim bit carries the PRE-TYPE landing
+    proof — THE guard; its POST-write flip is weak corroboration only, since it
+    passes on a real option row), so any test that calls a PARSER directly must
+    clean them exactly as ``free_text._plain`` does; the executor itself is
+    handed the raw ANSI and cleans internally.
     """
     from cctelegram import terminal_parser
 
