@@ -29,11 +29,31 @@ AND THE IDENTITY MUST BE OCCURRENCE-UNIQUE, on BOTH surfaces (peer-review
 round-2, two P1s). The PANE component alone cannot distinguish two cards that
 render the same rows — two AUQs with identical option labels, or two ExitPlanMode
 prompts (which ALWAYS render the same three real options). So each surface
-carries a MANDATORY out-of-band anchor that names the OCCURRENCE, not the shape:
-the AUQ PreToolUse side file's ``tool_use_id`` composite, and — for EPM — a hash
-of the plan FILE'S CONTENT (a path is a NAME: a revised plan commonly keeps the
-same slug, so the path matched across two different plans). No anchor ⇒ the lane
-DECLINES before any keystroke; a changed anchor ⇒ it refuses.
+carries a MANDATORY out-of-band anchor that names the OCCURRENCE, not the shape,
+and BOTH are now the same kind of thing: a ``PreToolUse`` side file minted by the
+process that is about to block, BEFORE it renders, carrying the prompt's
+per-invocation ``tool_use_id`` (``auq_source`` / ``epm_source``). No anchor ⇒ the
+lane DECLINES before any keystroke; a changed anchor ⇒ it refuses.
+
+EPM's anchor was, until round-3, a hash of the plan FILE'S CONTENT — an ARTIFACT
+digest masquerading as an occurrence witness, and a TOCTOU with a
+bypass-permissions payoff (see ``read_surface_anchor``'s rejected-alternatives
+note and ``handlers/epm_source``). The plan path is a per-session SLUG that Claude
+reuses across different plans, and the file is rewritten in place, so NOTHING
+derived from the plan artifact can name the prompt. The hook can, and
+rig-verification on 2.1.207 confirmed it fires for ``ExitPlanMode`` with a
+distinct ``tool_use_id`` per invocation.
+
+**AND THE ANCHOR IS READ BEFORE THE PANE — the other half of that fix.** Changing
+WHICH VALUE the anchor holds would not, by itself, have closed the round-3 P1: the
+identity was minted from a pane captured at t1 and an anchor read at t2 > t1, so a
+card turning over inside that gap yields `(OLD pane, NEW anchor)` — and since both
+surfaces' pane components are degenerate across occurrences, that chimera MATCHES
+every later observation and commits onto the successor. Reading the anchor STRICTLY
+FIRST makes the only reachable chimera `(NEWER pane, OLDER anchor)`, which fails
+closed. ``derive_identity`` therefore TAKES the anchor and never reads one; the
+proof is in its docstring. Same "probe FIRST, capture LAST" discipline the delivery
+gate's re-verify already applies to its liveness probe (r2 F4).
 
 It reuses the shipped dispatch discipline (``_dispatch_pick`` /
 ``_dispatch_decision_pane_locked``) verbatim: per-window send lock, bounded
@@ -64,12 +84,10 @@ Pull-only; no observer (c313657 stays forbidden).
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import re
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Final
 
 from .. import delivery, terminal_parser
@@ -191,9 +209,10 @@ class SurfaceIdentity:
                           GH #48 composite: a non-empty ``tool_use_id``, else
                           ``(written_at, canonical tool-input fingerprint)``). A
                           new AUQ rewrites the file; a resolved one unlinks it.
-        ExitPlanMode    → the plan-CONTENT generation ``_epm_plan_generation``:
-                          the live footer's ``~/.claude/plans/<slug>.md`` path
-                          PLUS a hash of that file's CONTENT.
+        ExitPlanMode    → the PreToolUse side file's occurrence identity
+                          (``epm_source.peek_surface_identity_for_window`` — the
+                          prompt's per-invocation ``tool_use_id``, additionally
+                          HARD-predicated on the hook-captured ``window_key``).
 
     Why it had to become mandatory, per surface:
 
@@ -205,14 +224,18 @@ class SurfaceIdentity:
         PR-1's refusal). There is no second occurrence-unique source: the AUQ
         ``tool_use`` is buffered in JSONL until resolution, so the PreToolUse
         side file is the ONLY pre-resolution witness of "which AUQ is this".
-      * **EPM** — the anchor used to be the plan-file PATH. Re-entering
-        ExitPlanMode after REVISING the same plan commonly keeps the SAME slug,
-        so plan P and plan Q carried an IDENTICAL anchor — and every EPM renders
-        the SAME three real options, so the pane component matched too. BOTH
-        components matched across two DIFFERENT prompts. The path is a NAME, not
-        an OCCURRENCE; the plan's CONTENT is what the prompt is asking about, so
-        the content hash is the generation. A revised plan ⇒ different bytes ⇒
-        different anchor ⇒ REFUSE.
+      * **EPM** — the anchor was the plan-file PATH (round-1), then a hash of the
+        plan file's CONTENT (round-2). BOTH were properties of the plan ARTIFACT,
+        and neither could name the prompt OCCURRENCE. The path is a per-session
+        SLUG that Claude reuses across different plans; the content is REWRITTEN
+        IN PLACE by the successor prompt, so a read taken after the swap returns
+        the SUCCESSOR's hash while we still hold the PREDECESSOR's pane — and
+        since every EPM renders the same three real options, both components then
+        agree on the WRONG card (round-3 P1; option 1 is "Yes, and bypass
+        permissions"). The fix is the same shape that made the AUQ leg sound: an
+        out-of-band ``PreToolUse`` witness minted BEFORE the prompt renders —
+        PLUS the ordering rule in ``derive_identity``, without which the *same*
+        chimera is reachable through ANY anchor, this one included.
 
     ``pane`` — ``terminal_parser.free_text_surface_identity``: the real options
     1..target_row-1, cursor-blind AND target-row-blind, so it is stable across
@@ -257,81 +280,64 @@ class SurfaceIdentity:
         return True
 
 
-# ── The ExitPlanMode plan-CONTENT generation (peer-review round-2 P1) ─────
+# ── The occurrence anchors: BOTH surfaces read a PreToolUse side file ─────
 #
-# The plan file is written by Claude BEFORE the prompt renders (the same file
-# ``interactive_ui._maybe_post_epm_plan`` reads to post the plan body), so its
-# bytes ARE the question the prompt is asking. A REVISION rewrites them; the
-# hash therefore changes even when the slug does not.
+# Each surface's anchor is written by Claude Code's ``PreToolUse`` hook BEFORE
+# the prompt renders, and unlinked when it resolves. That ordering is the whole
+# reason an anchor can be an OCCURRENCE witness at all: it is minted out-of-band,
+# by the process that is about to block, and it is a NAME for the prompt rather
+# than a description of what the prompt is showing.
 #
 # Considered and REJECTED as the EPM occurrence token:
 #
-#   * ``os.stat`` (mtime_ns + size) — cheaper, and it does catch a rewrite, but
-#     it is a METADATA generation: it flips on a no-op touch (a false refusal
-#     that costs a stranded draft) and says nothing about what the prompt is
-#     actually asking. The content IS the question; hash the question.
+#   * A hash of the plan FILE'S CONTENT (what round-2 shipped, and what round-3
+#     found to be a TOCTOU). It is an ARTIFACT digest, not an occurrence witness:
+#     capture card A's pane → A resolves → Claude REWRITES THE SAME PATH with
+#     plan B → B renders → the anchor read now returns B's hash. The captured
+#     identity is ``(A's pane, B's hash)``; every later observation sees
+#     ``(B's pane, B's hash)`` — and since every EPM renders the same three real
+#     options, the pane component matches too. Both components agree and Enter
+#     commits A's feedback onto B, whose option 1 bypasses permissions. Reading
+#     the file N times detects LATER changes; it can never bind the FIRST read
+#     atomically to the pane that was captured.
+#   * The plan file's PATH. Rig-verified on 2.1.207: the slug is a per-SESSION
+#     name, reused verbatim across three substantively different plans.
+#   * ``os.stat`` (mtime_ns + size) — a metadata generation; same TOCTOU, plus it
+#     flips on a no-op touch.
 #   * ``status_polling._epm_surface_first_seen_at`` — a per-route FIRST-DETECT
-#     stamp, and it LOOKS like an occurrence token, but it is ``setdefault``-ed
-#     and only POPPED on an observed EPM *absence* (behind the poller's
-#     absent-streak hysteresis). A plan-P→plan-Q transition with no observed gap
-#     therefore CARRIES THE SAME STAMP across two different prompts — exactly the
-#     case this P1 is about — so it detects nothing here while adding a
-#     cross-module lifecycle whose pop/re-stamp could false-refuse a live
-#     transaction. Not sound as a safety-critical discriminator.
+#     stamp that LOOKS like an occurrence token, but it is ``setdefault``-ed and
+#     only POPPED on an observed EPM *absence* (behind the poller's absent-streak
+#     hysteresis). A plan-P→plan-Q transition with no observed gap CARRIES THE
+#     SAME STAMP across two different prompts — exactly the case this is about.
 #
-# UNRECOVERABLE (no live footer, path outside ``~/.claude/plans/``, missing /
-# unreadable / oversized file) ⇒ ``None`` ⇒ the lane declines (pre-key) or
-# refuses (post-key). Fail-closed: on a plan-approval surface there is no
+# UNRECOVERABLE (hook not installed, side file GC'd/unlinked, window-key
+# mismatch, clock skew) ⇒ ``None`` ⇒ the lane DECLINES pre-keystroke and PR-1
+# owns the refusal. Fail-closed: on a plan-approval surface there is no
 # acceptable guess.
 
-_EPM_PLAN_BASE_PARTS: Final = (".claude", "plans")
-_EPM_PLAN_MAX_BYTES: Final = 512 * 1024
 
+def read_surface_anchor(surface: str, window_id: str) -> str | None:
+    """The OCCURRENCE-unique surface anchor (see :class:`SurfaceIdentity`).
 
-def _epm_plan_generation(pane_text: str) -> str | None:
-    """``epm:<footer path>:<sha256 of its CONTENT>``, or ``None`` if unrecoverable.
-
-    The read is small (a plan is a few KB) and hits the page cache — the same
-    class of bounded, synchronous side-file read
-    ``auq_source.peek_surface_identity_for_window`` already performs on the AUQ
-    leg of this very function.
+    **MUST be called BEFORE the pane capture it will be paired with** — see
+    :func:`derive_identity` for why the order is the load-bearing half of the
+    round-3 P1 fix. It takes no pane text: BOTH surfaces derive their anchor
+    out-of-band, which is precisely what makes it an occurrence witness.
     """
-    footer_path = terminal_parser.extract_epm_plan_file_path(pane_text)
-    if not footer_path:
-        return None
-    try:
-        base = Path.home().joinpath(*_EPM_PLAN_BASE_PARTS).resolve()
-        path = Path(footer_path).expanduser().resolve()
-        if not path.is_relative_to(base):
-            logger.warning(
-                "free_text: EPM plan path outside ~/.claude/plans/: %r — no anchor",
-                footer_path,
-            )
-            return None
-        with open(path, "rb") as fh:
-            data = fh.read(_EPM_PLAN_MAX_BYTES + 1)
-    except OSError as exc:
-        logger.info(
-            "free_text: EPM plan file unreadable (%r): %s — no anchor",
-            footer_path,
-            exc,
-        )
-        return None
-    except Exception:  # pragma: no cover — an anchor read must never wedge a send
-        logger.exception("free_text: EPM plan-generation read failed (%r)", footer_path)
-        return None
-    if not data or len(data) > _EPM_PLAN_MAX_BYTES:
-        return None
-    return f"epm:{footer_path}:{hashlib.sha256(data).hexdigest()[:16]}"
-
-
-def _anchor_for(surface: str, pane_text: str, window_id: str) -> str | None:
-    """The OCCURRENCE-unique surface anchor (see :class:`SurfaceIdentity`)."""
-    if surface == SURFACE_EPM:
-        return _epm_plan_generation(pane_text)
-    # Deferred: ``auq_source`` reaches into ``session``; this module is a
+    # Deferred: both source modules reach into ``session``; this module is a
     # delivery-path leaf and the repo pins the import direction with a
     # subprocess cycle test.
+    if surface == SURFACE_EPM:
+        from . import epm_source
+
+        try:
+            return epm_source.peek_surface_identity_for_window(window_id)
+        except Exception:  # pragma: no cover — a read must never wedge a send
+            logger.exception(
+                "free_text: EPM surface-anchor read failed for window %s", window_id
+            )
+            return None
+
     from . import auq_source
 
     try:
@@ -343,16 +349,80 @@ def _anchor_for(surface: str, pane_text: str, window_id: str) -> str | None:
         return None
 
 
+@dataclass(frozen=True)
+class SurfaceAnchors:
+    """Both surfaces' anchors, read in ONE pass BEFORE a pane capture.
+
+    The planning observation cannot know which surface it is looking at until it
+    has parsed the pane — but by then the pane is already captured, and reading
+    the anchor afterwards is exactly the ordering bug (below). So the planner
+    reads BOTH (two small, usually-missing side files) up front and selects by
+    surface once the parse tells it which one it has.
+    """
+
+    auq: str | None
+    epm: str | None
+
+    def for_surface(self, surface: str) -> str | None:
+        return self.epm if surface == SURFACE_EPM else self.auq
+
+
+def read_surface_anchors(window_id: str) -> SurfaceAnchors:
+    """Read both surfaces' occurrence anchors — BEFORE the pane capture."""
+    return SurfaceAnchors(
+        auq=read_surface_anchor(SURFACE_AUQ, window_id),
+        epm=read_surface_anchor(SURFACE_EPM, window_id),
+    )
+
+
 def derive_identity(
-    pane_text: str, *, surface: str, target_row: int, window_id: str
+    pane_text: str, *, surface: str, target_row: int, anchor: str | None
 ) -> SurfaceIdentity | None:
-    """One pane observation → the card's identity, or ``None`` if UNIDENTIFIABLE.
+    """One pane observation + a PRE-READ anchor → the card's identity.
 
     ``None`` ⇔ no occurrence anchor. That is the whole point of returning an
     Optional: a caller can never accidentally construct an anchor-less identity
     and have it compare equal to another anchor-less one.
+
+    **THE ANCHOR IS AN ARGUMENT, NOT A READ — and that is the second half of the
+    round-3 P1 fix (the half a mere change of anchor SOURCE would not have
+    closed).** This function used to take a ``window_id`` and read the anchor
+    ITSELF, i.e. AFTER the caller had already captured the pane. That ordering
+    mints a CHIMERA whenever the card turns over inside the gap:
+
+        pane captured at t1 (card A)  →  anchor read at t2 > t1 (card B)
+        ⇒ identity = (A's pane shape, B's anchor)
+
+    and because BOTH surfaces' pane components are degenerate across occurrences
+    — every ExitPlanMode renders the same three real options; two AUQs can carry
+    identical option labels — every LATER observation `(B's pane, B's anchor)`
+    MATCHES that chimera. The transaction then types into B and commits, which on
+    ExitPlanMode means committing onto a prompt whose option 1 is "Yes, and
+    bypass permissions". Swapping WHICH value the anchor holds (a plan-content
+    hash → the hook's ``tool_use_id``) does not touch this: a `tool_use_id` read
+    after the pane is chimeric in exactly the same way.
+
+    Reading the anchor STRICTLY BEFORE the pane makes the dangerous direction
+    unreachable. Suppose the anchor is read at t0 and the pane at t1 > t0, and
+    the pane shows a LIVE prompt P:
+
+      * a live, unresolved prompt means Claude is BLOCKED on it, so it cannot be
+        invoking the next ExitPlanMode/AskUserQuestion — and each hook fires
+        BEFORE its prompt renders. Therefore "P is live on the pane at t1" implies
+        "the side file at t1 is P's";
+      * so if the anchor read at t0 is X ≠ P, the side file went X → P during
+        (t0, t1] — a FORWARD move (a new occurrence), never backward.
+
+    The only chimera we can build is therefore `(NEWER pane, OLDER anchor)`, and
+    that one FAILS CLOSED: the next observation reads P's anchor, `still_holds`
+    compares X ≠ P, and the transaction refuses. The dangerous
+    `(OLDER pane, NEWER anchor)` requires the side file to move BACKWARDS, which
+    it never does.
+
+    This is the SAME "probe FIRST, capture LAST" discipline `_reverify_input_box`
+    already applies to its liveness probe (r2 F4) — a stale-frame authorization is
+    the identical bug class.
     """
-    anchor = _anchor_for(surface, pane_text, window_id)
     if anchor is None:
         return None
     return SurfaceIdentity(
@@ -453,13 +523,17 @@ def _epm_shape(pane_text: str) -> _Shape | None:
 
 
 def plan_from_pane(
-    pane_text: str | None, ansi_pane: str, window_id: str
+    pane_text: str | None, ansi_pane: str, anchors: SurfaceAnchors
 ) -> FreeTextPlan | None:
     """Resolve the free-text lane for a live pane, or ``None`` to decline.
 
     ``None`` means "this lane does not apply" — the caller falls through to the
     normal gated ``deliver_to_window``, which refuses if a prompt is live (PR-1)
     or delivers if the pane is at its input box.
+
+    ``anchors`` were read BEFORE ``pane_text`` was captured (see
+    :func:`derive_identity`) — the caller owns that ordering, and it is the
+    load-bearing half of the wrong-card close.
 
     THE IDENTITY GATE LIVES HERE, ONCE, FOR BOTH SURFACES (peer-review round-2):
     a card we cannot identify by an OCCURRENCE-unique anchor is a card we will
@@ -485,11 +559,13 @@ def plan_from_pane(
         pane_text,
         surface=content.name,
         target_row=shape.target_row,
-        window_id=window_id,
+        anchor=anchors.for_surface(content.name),
     )
     if identity is None:
-        # No occurrence anchor — an AUQ with no PreToolUse side file, or an EPM
-        # whose plan file is not readable from its live footer.
+        # No occurrence anchor — no PreToolUse side file for this surface (the
+        # hook is not installed, the record was GC'd, or its window_key names a
+        # `--resume` sibling). An unidentifiable card is a card we will not type
+        # into.
         return None
     if identity.pane is None:
         # The option block is not fully on the pane at CAPTURE time. It may
@@ -767,12 +843,20 @@ async def _answer_locked(
         # correct ``not_claude`` refusal + copy — one owner per refusal reason.
         return _decline("not_claude")
 
+    # THE ANCHORS ARE READ BEFORE THE PANE (derive_identity's ordering rule): an
+    # anchor read AFTER the capture can name a SUCCESSOR card while we still hold
+    # the predecessor's pane, and both surfaces' pane components are degenerate
+    # across occurrences, so that chimera matches every later observation and
+    # commits onto the wrong card. Reading first makes the only reachable chimera
+    # `(newer pane, older anchor)`, which fails closed.
+    anchors = read_surface_anchors(window_id)
+
     ansi = await _capture(window_id)
     if not isinstance(ansi, str) or not ansi:
         return _decline("capture_failed")
     pane = _plain(ansi)
 
-    plan = plan_from_pane(pane, ansi, window_id)
+    plan = plan_from_pane(pane, ansi, anchors)
     if plan is None:
         return _decline("no_free_text_surface")
     if not licensed(plan.surface, cmd):
@@ -812,6 +896,8 @@ async def _answer_locked(
     # refuses with the accurate reason).
     if time.monotonic() > deadline:
         return _decline("deadline")
+    # ANCHOR BEFORE PANE, again (derive_identity's ordering rule).
+    anchor2 = read_surface_anchor(plan.surface, window_id)
     ansi2 = await _capture(window_id)
     if not isinstance(ansi2, str):
         return _decline("capture_failed")
@@ -820,7 +906,7 @@ async def _answer_locked(
     # replaced by a same-geometry successor would satisfy every other leg below —
     # the successor's row N+1 is a dim placeholder under our freshly-moved cursor.
     # Checking WHICH CARD before we type is what stops that.
-    ident_reason = _identity_reason(pane2, plan, window_id)
+    ident_reason = _identity_reason(pane2, plan, window_id, anchor2)
     if ident_reason is not None:
         return _decline(ident_reason)
     landed = terminal_parser.parse_free_text_row(ansi2, number=plan.target_row)
@@ -961,12 +1047,17 @@ async def _verify_typed(
         if not pane_command_is_claude(cmd):
             return delivery.refuse(delivery.REASON_NOT_CLAUDE, written=True)
 
+        # ANCHOR BEFORE PANE (derive_identity's ordering rule) — and, like the
+        # command probe above it, BEFORE the capture that is the LAST observation
+        # preceding the Enter (the r2-F4 discipline).
+        anchor = read_surface_anchor(plan.surface, window_id)
+
         ansi = await _capture(window_id)
         if not isinstance(ansi, str):
             return delivery.refuse(delivery.REASON_CAPTURE_TIMEOUT, written=True)
         pane = _plain(ansi)
 
-        reason = _typed_state_reason(ansi, pane, plan, payload, window_id)
+        reason = _typed_state_reason(ansi, pane, plan, payload, window_id, anchor)
         if reason is None:
             return None
         if attempt + 1 < attempts:
@@ -990,8 +1081,14 @@ async def _verify_typed(
     )
 
 
-def _identity_reason(pane: str, plan: FreeTextPlan, window_id: str) -> str | None:
+def _identity_reason(
+    pane: str, plan: FreeTextPlan, window_id: str, anchor: str | None
+) -> str | None:
     """``None`` iff the pane is PROVABLY still ``plan``'s card. Fail-closed.
+
+    ``anchor`` was read BEFORE ``pane`` was captured (:func:`derive_identity`) —
+    so the only chimera reachable here is `(newer pane, older anchor)`, which
+    fails closed on the anchor comparison.
 
     Two independent gates, and the ORDER matters only for the log reason:
 
@@ -1013,13 +1110,13 @@ def _identity_reason(pane: str, plan: FreeTextPlan, window_id: str) -> str | Non
         pane,
         surface=plan.surface,
         target_row=plan.target_row,
-        window_id=window_id,
+        anchor=anchor,
     )
     if live is None:
-        # The OCCURRENCE anchor is gone: the AUQ's side file was unlinked (its
-        # tool_result fired ⇒ the card RESOLVED), or the EPM's plan file no
-        # longer reads. Absence is never a licence to proceed — it is positive
-        # evidence the card we planned against is no longer the one on the pane.
+        # The OCCURRENCE anchor is gone: the PreToolUse side file was unlinked
+        # (the tool_result fired ⇒ the card RESOLVED). Absence is never a licence
+        # to proceed — it is positive evidence the card we planned against is no
+        # longer the one on the pane.
         logger.warning(
             "FREE_TEXT surface anchor UNRECOVERABLE on window %s (surface=%s) — "
             "the card this message was answering can no longer be identified; "
@@ -1041,14 +1138,23 @@ def _identity_reason(pane: str, plan: FreeTextPlan, window_id: str) -> str | Non
 
 
 def _typed_state_reason(
-    ansi: str, pane: str, plan: FreeTextPlan, payload: str, window_id: str
+    ansi: str,
+    pane: str,
+    plan: FreeTextPlan,
+    payload: str,
+    window_id: str,
+    anchor: str | None,
 ) -> str | None:
-    """``None`` iff the typed state is PROVEN (see ``_verify_typed``'s legs)."""
+    """``None`` iff the typed state is PROVEN (see ``_verify_typed``'s legs).
+
+    ``anchor`` was read by the caller BEFORE ``pane`` was captured — the
+    :func:`derive_identity` ordering rule.
+    """
     # (B) the blocking surface still owns the pane
     if terminal_parser.pane_input_box_present(pane):
         return "input_box_returned"
     # (C) WHICH CARD — before anything that merely proves WHICH ROW or WHOSE TEXT
-    ident_reason = _identity_reason(pane, plan, window_id)
+    ident_reason = _identity_reason(pane, plan, window_id, anchor)
     if ident_reason is not None:
         return ident_reason
     # (E) our bytes landed

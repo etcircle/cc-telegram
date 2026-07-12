@@ -179,9 +179,15 @@ class TestNotificationInstaller:
         assert _install_hook(settings_file) == 0
         settings = json.loads(settings_file.read_text())
         assert len(settings["hooks"]["Notification"]) == 1
-        # SessionStart / PreToolUse untouched (still single entries).
+        # SessionStart / PreToolUse untouched — re-install NEVER duplicates. Two
+        # PreToolUse entries since GH #50 PR-2 r3 (AskUserQuestion + the
+        # ExitPlanMode occurrence witness), each managed independently.
         assert len(settings["hooks"]["SessionStart"]) == 1
-        assert len(settings["hooks"]["PreToolUse"]) == 1
+        assert len(settings["hooks"]["PreToolUse"]) == 2
+        assert [e["matcher"] for e in settings["hooks"]["PreToolUse"]] == [
+            "AskUserQuestion",
+            "ExitPlanMode",
+        ]
 
 
 class TestNotificationStartupWarning:

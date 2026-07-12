@@ -68,6 +68,7 @@ from . import (
     auq_ledger,
     auq_source,
     decision_token,
+    epm_source,
     free_text,
     late_answer,
     pick_intent,
@@ -442,6 +443,14 @@ def forget_ask_tool_input(window_id: str) -> None:
     _last_completed_ask_tool_input.pop(window_id, None)
     _last_auq_tool_use_id.pop(window_id, None)
     auq_source.forget_for_window(window_id)
+    # GH #50 PR-2 r3: the ExitPlanMode occurrence witness dies with the surface
+    # too. This helper is the shared AUQ/EPM resolution + generic surface-clear
+    # seam (bot.handle_new_message calls it for both), so the EPM side file is
+    # unlinked exactly where the AUQ one is. The `/clear` race — where
+    # session_monitor swaps the session_id out from under us — is handled by the
+    # monitor calling epm_source.unlink_for_session with the OLD id, mirroring
+    # auq_source.
+    epm_source.forget_for_window(window_id)
     # Wave A: drop any aql: late-answer card for this window — the primary
     # invalidation seam (covers the next AUQ's tool_result, /clear / session
     # replacement via the monitor's old-window call, and the generic surface
@@ -527,6 +536,55 @@ def warn_if_pre_tool_use_hook_missing(
         logger.warning(
             "PreToolUse(AskUserQuestion) hook not registered in %s; "
             "AUQ descriptions will fall back to labels-only. "
+            "Run 'cc-telegram hook --install' to enable.",
+            settings_file,
+        )
+        return True
+    return False
+
+
+def warn_if_epm_pre_tool_use_hook_missing(
+    settings_file: Path = _CLAUDE_SETTINGS_FILE_FOR_WARN,
+) -> bool:
+    """Warn (via log) if the PreToolUse(ExitPlanMode) hook entry is missing.
+
+    GH #50 PR-2 r3. Without it the bot has no OCCURRENCE witness for a plan
+    prompt — nothing else can say WHICH ExitPlanMode this is (the plan file's
+    path is a per-session slug Claude reuses, and its content is rewritten in
+    place by the successor). So the free-text lane DECLINES on ExitPlanMode and
+    every message sent at a plan card takes PR-1's refusal instead: a
+    degradation, never a hazard (the option buttons and the ↑/↓/⏎ keys are
+    unaffected).
+
+    Returns True if a warning was emitted, False if the hook is current.
+    """
+    if not settings_file.exists():
+        logger.warning(
+            "Claude Code settings file not found at %s — run "
+            "'cc-telegram hook --install' to enable free-text answers on "
+            "ExitPlanMode plan prompts",
+            settings_file,
+        )
+        return True
+    try:
+        settings = json.loads(settings_file.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(
+            "Claude Code settings file unreadable (%s); ExitPlanMode free-text "
+            "answers may be disabled: %s",
+            settings_file,
+            e,
+        )
+        return True
+    # Reuse the hook module's own check — single source of truth for "what
+    # counts as installed".
+    from ..hook import _EPM_MATCHER, _is_pre_tool_use_installed
+
+    if _is_pre_tool_use_installed(settings, _EPM_MATCHER) == "missing":
+        logger.warning(
+            "PreToolUse(ExitPlanMode) hook not registered in %s; free-text "
+            "answers at a plan card will fall back to a refusal (the bot cannot "
+            "prove WHICH plan prompt it would be answering). "
             "Run 'cc-telegram hook --install' to enable.",
             settings_file,
         )

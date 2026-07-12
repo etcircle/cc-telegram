@@ -868,6 +868,15 @@ def _reset_all_handler_state() -> None:
     if notify_dir.is_dir():
         for path in notify_dir.glob("*.json"):
             path.unlink(missing_ok=True)
+    # GH #50 PR-2 r3: the ExitPlanMode PreToolUse side files too. Same shared
+    # CC_TELEGRAM_DIR leak surface — and a leaked one is worse than a stale row:
+    # it hands the free-text lane an OCCURRENCE ANCHOR for a card the current test
+    # never rendered, so a "no hook ⇒ the lane must decline" assertion would pass
+    # for the wrong reason (or, in-file, fail loudly — which is how this was found).
+    epm_dir = app_dir() / "epm_pending"
+    if epm_dir.is_dir():
+        for path in epm_dir.glob("*.json"):
+            path.unlink(missing_ok=True)
     auq_ledger.reset_for_tests()
     route_runtime.reset_for_tests()
     transcript_event_adapter.reset_for_tests()

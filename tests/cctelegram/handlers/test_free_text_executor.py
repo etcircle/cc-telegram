@@ -28,7 +28,7 @@ import pytest
 
 from cctelegram import delivery, terminal_parser, tmux_manager as tmux_mod
 from cctelegram.delivery import DeliveryOutcome, UserTurnStamp
-from cctelegram.handlers import auq_source, free_text
+from cctelegram.handlers import auq_source, epm_source, free_text
 from tests.free_text_frames import (
     AUQ_RESOLVED,
     AUQ_X_ANSWER,
@@ -46,11 +46,9 @@ from tests.free_text_frames import (
     EPM_P_LIVE,
     EPM_P_PLAN_PATH,
     EPM_P_TYPED,
-    EPM_Q_PLAN_PATH,
     EPM_Q_TYPED,
     EPM_Q_TYPED_AT_P_PATH,
     EPM_RESOLVED,
-    EPM_S_PLAN_PATH,
     OVERFLOW_ANSWER,
     plain,
 )
@@ -160,33 +158,28 @@ def auq_anchor(monkeypatch):
     return box
 
 
-# The plan bodies behind the corpus's real EPM footers. The EPM anchor is the
-# plan file's CONTENT (hashed), not its path, so these files must EXIST — and a
-# test that revises a plan simply rewrites one of them.
-EPM_PLAN_BODIES = {
-    EPM_P_PLAN_PATH: "# Plan P\n\nWrite goodbye.txt with one paragraph.\n",
-    EPM_Q_PLAN_PATH: "# Plan Q\n\n1. Create goodbye.txt\n2. Verify it\n",
-    EPM_S_PLAN_PATH: "# Plan S\n\nA very short warm plan.\n",
-}
-
-
 @pytest.fixture(autouse=True)
-def epm_plans(monkeypatch, tmp_path):
-    """The real filesystem substrate the EPM anchor reads: ``~/.claude/plans/``.
+def epm_anchor(monkeypatch):
+    """The EPM out-of-band anchor (the PreToolUse side file's occurrence id).
 
-    HOME is redirected, so ``Path.home()`` and ``Path("~/…").expanduser()`` — the
-    exact seams ``free_text._epm_plan_generation`` uses, traversal guard included
-    — resolve here. No handler internals are stubbed.
+    The round-3 P1 fold: the EPM anchor used to be a hash of the plan FILE's
+    CONTENT, which identifies the ARTIFACT and not the OCCURRENCE — and the two
+    diverge exactly when it matters, because the successor prompt REWRITES THE
+    SAME PATH (rig-verified: three consecutive prompts, one slug, file rewritten
+    in place each time). It is now the ``PreToolUse(ExitPlanMode)`` hook's
+    per-invocation ``tool_use_id`` (``handlers/epm_source``), which is exactly
+    the shape that made the AUQ leg sound.
 
-    Returns the plans DIRECTORY so a test can REVISE a plan in place (the same
-    slug, new bytes: the round-2 P1 shape).
+    AUTOUSE + a mutable box, mirroring ``auq_anchor``: a test ROTATES it to
+    simulate a genuinely NEW plan prompt (its hook re-fires with a new id), or
+    drops it to ``None`` (the prompt resolved and its file was unlinked, or the
+    hook is not installed).
     """
-    monkeypatch.setenv("HOME", str(tmp_path))
-    plans = tmp_path / ".claude" / "plans"
-    plans.mkdir(parents=True)
-    for path, body in EPM_PLAN_BODIES.items():
-        (plans / Path(path).name).write_text(body)
-    return plans
+    box: list[str | None] = ["epm:tu:toolu_PLAN_P"]
+    monkeypatch.setattr(
+        epm_source, "peek_surface_identity_for_window", lambda _w: box[0]
+    )
+    return box
 
 
 def _wire(monkeypatch, pane: FakePane) -> None:
@@ -352,12 +345,13 @@ class TestTheWrongCard:
 
     @pytest.mark.asyncio
     async def test_epm_replaced_by_a_DIFFERENT_PLAN_before_the_enter(
-        self, monkeypatch, stamped
+        self, monkeypatch, epm_anchor, stamped
     ):
         """The hardest one. EVERY ExitPlanMode prompt renders the SAME three real
-        options, so the pane-derived identity CANNOT tell plan P from plan Q — the
-        ``~/.claude/plans/<slug>.md`` footer is the only discriminator, which is
-        precisely why the EPM anchor is mandatory. Both frames are real rig bytes.
+        options, so the pane-derived identity CANNOT tell plan P from plan Q —
+        only the OCCURRENCE anchor (the hook's per-invocation ``tool_use_id``)
+        can. Plan Q is a different prompt, so its hook fired with a new id. Both
+        pane frames are real rig bytes.
         """
         assert terminal_parser.free_text_surface_identity(
             plain(EPM_P_TYPED), surface="ExitPlanMode", target_row=4
@@ -367,6 +361,20 @@ class TestTheWrongCard:
 
         pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_Q_TYPED, EPM_Q_TYPED])
         _wire(monkeypatch, pane)
+
+        calls = {"n": 0}
+        real_capture = pane.capture
+
+        async def capture_and_replan(window_id, *, with_ansi=False):
+            out = await real_capture(window_id, with_ansi=with_ansi)
+            calls["n"] += 1
+            if calls["n"] >= 2:  # plan Q's hook fires before plan Q's prompt renders
+                epm_anchor[0] = "epm:tu:toolu_PLAN_Q"
+            return out
+
+        monkeypatch.setattr(
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_replan
+        )
 
         result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
 
@@ -408,7 +416,11 @@ class TestTheWrongCard:
         async def capture_and_rotate(window_id, *, with_ansi=False):
             out = await real_capture(window_id, with_ansi=with_ansi)
             calls["n"] += 1
-            if calls["n"] >= 3:  # capture 1 = plan, 2 = landing, 3 = pre-Enter
+            # Rotate after capture 2 (the landing), so the PRE-ENTER observation
+            # reads the successor's id — the anchor is read BEFORE its own pane
+            # capture, and in reality the successor's PreToolUse hook fires before
+            # its prompt renders, so that is the true ordering.
+            if calls["n"] >= 2:
                 auq_anchor[0] = "tu:toolu_CARD_X_REASKED"  # a NEW AUQ, same content
             return out
 
@@ -580,7 +592,10 @@ class TestTheAuqAnchorIsMANDATORY:
         async def capture_and_reask(window_id, *, with_ansi=False):
             out = await real_capture(window_id, with_ansi=with_ansi)
             calls["n"] += 1
-            if calls["n"] >= 3:  # 1 = plan, 2 = landing, 3 = the pre-Enter capture
+            # After capture 2 (the landing): the pre-Enter observation reads its
+            # anchor BEFORE its own capture, and the successor's hook fires before
+            # the successor's prompt renders.
+            if calls["n"] >= 2:
                 auq_anchor[0] = "tu:toolu_CARD_X_REASKED"
             return out
 
@@ -713,12 +728,13 @@ class TestEpm:
         assert pane.keys == []
 
     @pytest.mark.asyncio
-    async def test_an_epm_whose_plan_FILE_is_gone_never_starts(
-        self, monkeypatch, epm_plans
-    ):
-        """The anchor is the plan's CONTENT. An unreadable plan file is not a
-        licence to proceed on the pane alone — every EPM pane looks the same."""
-        (epm_plans / Path(EPM_P_PLAN_PATH).name).unlink()
+    async def test_an_epm_with_no_side_file_never_starts(self, monkeypatch, epm_anchor):
+        """No PreToolUse(ExitPlanMode) hook ⇒ no occurrence witness ⇒ the lane
+        DECLINES pre-keystroke. Nothing else can name a plan prompt: every EPM
+        pane renders the same three real options, and the plan file's path is a
+        per-session slug Claude reuses. An unidentifiable plan-approval card is
+        never typed into."""
+        epm_anchor[0] = None
         pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_P_TYPED, EPM_RESOLVED])
         _wire(monkeypatch, pane)
 
@@ -727,16 +743,26 @@ class TestEpm:
 
 
 class TestARevisedPlanKeepsTheSameSlug:
-    """peer-review round-2 P1 — the EPM anchor was a PATH, not an OCCURRENCE.
+    """peer-review round-3 P1 — the EPM anchor named the ARTIFACT, not the
+    OCCURRENCE.
 
-    Re-entering ExitPlanMode after REVISING a plan commonly keeps the SAME slug
-    (Claude rewrites the file in place), and every EPM prompt renders the SAME
-    three real options. So plan P and its revision matched on BOTH identity
-    components, and a mid-transaction successor received the previous plan's
-    feedback — on the surface whose option 1 is "Yes, and bypass permissions".
+    Re-entering ExitPlanMode after revising a plan keeps the SAME slug and
+    REWRITES THE FILE IN PLACE (rig-verified on 2.1.207: three consecutive
+    prompts — including one for a substantively different task — all shared one
+    ``planFilePath``, rewritten each time). And every EPM prompt renders the SAME
+    three real options, so the pane component is degenerate across occurrences.
 
-    The anchor is now the plan-file's CONTENT. Different plan ⇒ different bytes ⇒
-    different anchor ⇒ refuse.
+    So the round-1 anchor (the PATH) and the round-2 anchor (a hash of that
+    file's CONTENT) were BOTH satisfiable by a DIFFERENT prompt: the content read
+    happens AFTER the pane capture, so a successor that rewrites the file inside
+    that gap yields `(A's pane, B's hash)` — which matches every later
+    observation of B, and the Enter commits A's feedback onto B, whose option 1
+    is "Yes, and bypass permissions".
+
+    The anchor is now the hook's per-invocation ``tool_use_id``, and it is READ
+    BEFORE THE PANE (``free_text.derive_identity``) — both halves are required,
+    since a ``tool_use_id`` read after the pane is chimeric in exactly the same
+    way.
     """
 
     @pytest.mark.asyncio
@@ -755,13 +781,12 @@ class TestARevisedPlanKeepsTheSameSlug:
 
     @pytest.mark.asyncio
     async def test_the_revised_plan_does_NOT_receive_the_previous_plans_feedback(
-        self, monkeypatch, epm_plans, stamped
+        self, monkeypatch, epm_anchor, stamped
     ):
-        """Plan P is live; we navigate and type. Claude revises the plan IN PLACE
-        (same file, new bytes) and re-presents it. By the pre-Enter capture the
-        pane is the revision — same options, same footer path — and only the
-        CONTENT generation refuses."""
-        plan_file = epm_plans / Path(EPM_P_PLAN_PATH).name
+        """Plan P is live; we navigate and type. Claude re-plans: the hook fires
+        again (a NEW tool_use_id, the SAME plan path) and the successor prompt
+        renders. By the pre-Enter capture the pane is the successor — same three
+        options, same footer path — and ONLY the occurrence anchor refuses."""
         pane = FakePane(
             [EPM_P_LIVE, EPM_P_LANDED, EPM_Q_TYPED_AT_P_PATH, EPM_Q_TYPED_AT_P_PATH]
         )
@@ -770,17 +795,18 @@ class TestARevisedPlanKeepsTheSameSlug:
         calls = {"n": 0}
         real_capture = pane.capture
 
-        async def capture_and_revise(window_id, *, with_ansi=False):
+        async def capture_and_replan(window_id, *, with_ansi=False):
             out = await real_capture(window_id, with_ansi=with_ansi)
             calls["n"] += 1
-            if calls["n"] >= 3:  # 1 = plan, 2 = landing, 3 = the pre-Enter capture
-                plan_file.write_text(
-                    "# Plan P, REVISED\n\nA different plan entirely.\n"
-                )
+            if calls["n"] >= 2:
+                # The successor's hook has fired by the time the pre-Enter
+                # observation reads the anchor (which it does BEFORE its own
+                # capture — hence rotating after capture #2).
+                epm_anchor[0] = "epm:tu:toolu_PLAN_Q"
             return out
 
         monkeypatch.setattr(
-            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_revise
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_replan
         )
 
         result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
@@ -788,35 +814,32 @@ class TestARevisedPlanKeepsTheSameSlug:
         assert result is not None
         assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
         assert result.reason == delivery.REASON_FREE_TEXT_VERIFY_FAILED
-        assert pane.enter_sent is False, "the REVISED plan must not get P's feedback"
+        assert pane.enter_sent is False, "the SUCCESSOR plan must not get P's feedback"
         assert stamped == []
         assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is True
 
     @pytest.mark.asyncio
-    async def test_a_revision_during_the_NAV_is_caught_with_nothing_typed(
-        self, monkeypatch, epm_plans, stamped
+    async def test_a_replan_during_the_NAV_is_caught_with_nothing_typed(
+        self, monkeypatch, epm_anchor, stamped
     ):
         """The identity is re-checked at BOTH points bracketing a keystroke, so a
-        revision that lands during the NAV is a clean pre-write bail: fall through
-        to PR-1, no draft, no brake."""
-        plan_file = epm_plans / Path(EPM_P_PLAN_PATH).name
+        successor that lands during the NAV is a clean pre-write bail: fall
+        through to PR-1, no draft, no brake."""
         pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_P_TYPED, EPM_RESOLVED])
         _wire(monkeypatch, pane)
 
         calls = {"n": 0}
         real_capture = pane.capture
 
-        async def capture_and_revise(window_id, *, with_ansi=False):
+        async def capture_and_replan(window_id, *, with_ansi=False):
             out = await real_capture(window_id, with_ansi=with_ansi)
             calls["n"] += 1
-            if calls["n"] >= 2:  # revised before the post-nav landing check
-                plan_file.write_text(
-                    "# Plan P, REVISED\n\nA different plan entirely.\n"
-                )
+            if calls["n"] >= 1:  # the successor's hook fires during the nav
+                epm_anchor[0] = "epm:tu:toolu_PLAN_Q"
             return out
 
         monkeypatch.setattr(
-            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_revise
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_replan
         )
 
         result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
@@ -828,9 +851,9 @@ class TestARevisedPlanKeepsTheSameSlug:
 
     @pytest.mark.asyncio
     async def test_an_UNCHANGED_plan_still_commits(self, monkeypatch, stamped):
-        """The non-regression the content generation must not break: the ordinary
-        flow re-reads the SAME unchanged plan file at every observation point, so
-        the anchor is stable and the feedback commits."""
+        """The non-regression the occurrence anchor must not break: the ordinary
+        flow reads the SAME tool_use_id at every observation point, so the anchor
+        is stable and the feedback commits."""
         pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_P_TYPED, EPM_RESOLVED])
         _wire(monkeypatch, pane)
 
@@ -839,6 +862,145 @@ class TestARevisedPlanKeepsTheSameSlug:
         assert result is not None and result.ok, result
         assert pane.enter_sent is True
         assert stamped == [(1, 42, WINDOW)]
+
+
+class TestTheAnchorIsReadBeforeThePane:
+    """peer-review round-3 P1, the OTHER half — the ordering.
+
+    Swapping the anchor's SOURCE (plan-content hash → the hook's tool_use_id)
+    does NOT by itself close the finding, because the finding is a TOCTOU: the
+    identity was minted from a pane captured at t1 and an anchor read at t2 > t1.
+    A card turning over inside that gap yields `(OLD pane, NEW anchor)` — and
+    since the EPM pane component is degenerate (all three real options identical
+    across every plan prompt), that chimera MATCHES every later observation and
+    the Enter commits onto the successor.
+
+    Reading the anchor STRICTLY BEFORE the pane makes the only reachable chimera
+    `(NEWER pane, OLDER anchor)`, which fails closed on the anchor comparison.
+    """
+
+    def test_derive_identity_does_not_read_an_anchor_itself(self):
+        """The structural pin: the anchor is an ARGUMENT. A `derive_identity`
+        that reads its own anchor is reading it AFTER its caller captured the
+        pane — the ordering bug, reintroduced."""
+        ident = free_text.derive_identity(
+            plain(EPM_P_LIVE),
+            surface="ExitPlanMode",
+            target_row=4,
+            anchor="epm:tu:toolu_PLAN_P",
+        )
+        assert ident is not None
+        assert ident.anchor == "epm:tu:toolu_PLAN_P"
+
+        assert (
+            free_text.derive_identity(
+                plain(EPM_P_LIVE),
+                surface="ExitPlanMode",
+                target_row=4,
+                anchor=None,
+            )
+            is None
+        ), "no occurrence anchor ⇒ no identity, ever"
+
+    @pytest.mark.asyncio
+    async def test_a_card_that_turns_over_INSIDE_the_capture_never_mints_a_chimera(
+        self, monkeypatch, epm_anchor, stamped
+    ):
+        """THE ROUND-3 P1, reduced to its mechanism.
+
+        Plan P's prompt is what we capture; the successor's hook fires DURING that
+        capture (the pane bytes we hold are P's, the side file is already Q's).
+
+        Under the OLD ordering — pane captured first, anchor read after — the
+        identity minted here is the CHIMERA ``(P's pane, Q's anchor)``. Every
+        later observation sees ``(Q's pane, Q's anchor)``, and because all three
+        of EPM's real options are identical across plans, the pane halves match
+        too. Both components agree, the transaction types into Q and presses
+        Enter — committing plan P's feedback onto plan Q, whose option 1 is "Yes,
+        and bypass permissions". (Verified RED by restoring the old order.)
+
+        Reading the anchor FIRST mints ``(P's pane, P's anchor)`` instead, so the
+        very next observation compares P's anchor against Q's and refuses.
+
+        The frames are the ORDINARY happy-path sequence on purpose: every other
+        leg (landing, SGR-2 dim, typed-state, payload tail) PASSES, so identity is
+        the only thing that can refuse — which is precisely the point. The pane
+        component is blind to the P→Q difference (all three real options are
+        identical), so a chimeric identity is INTERNALLY CONSISTENT with every
+        later observation and nothing stops the Enter.
+        """
+        pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_P_TYPED, EPM_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        calls = {"n": 0}
+        real_capture = pane.capture
+
+        async def rotate_during_the_first_capture(window_id, *, with_ansi=False):
+            out = await real_capture(window_id, with_ansi=with_ansi)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # The successor's PreToolUse hook fires while our capture is in
+                # flight: the bytes we just took are P's, the side file is now Q's.
+                epm_anchor[0] = "epm:tu:toolu_PLAN_Q"
+            return out
+
+        monkeypatch.setattr(
+            tmux_mod.tmux_manager,
+            "capture_pane_cancellation_safe",
+            rotate_during_the_first_capture,
+        )
+
+        result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
+
+        assert pane.enter_sent is False, (
+            "plan P's feedback was committed onto plan Q — the chimera is back"
+        )
+        assert stamped == []
+        # Caught BEFORE a byte is typed (the post-nav identity check), so the lane
+        # declines and PR-1 owns the single refusal.
+        assert result is None
+        assert pane.literal_writes == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
+
+    @pytest.mark.asyncio
+    async def test_every_pane_capture_is_preceded_by_an_anchor_read(
+        self, monkeypatch, epm_anchor
+    ):
+        """The ordering, observed on the real transaction: every capture has an
+        anchor read strictly before it."""
+        events: list[str] = []
+        pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_P_TYPED, EPM_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        real_capture = pane.capture
+
+        async def traced_capture(window_id, *, with_ansi=False):
+            events.append("capture")
+            return await real_capture(window_id, with_ansi=with_ansi)
+
+        monkeypatch.setattr(
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", traced_capture
+        )
+        monkeypatch.setattr(
+            epm_source,
+            "peek_surface_identity_for_window",
+            lambda _w: (events.append("anchor"), epm_anchor[0])[1],
+        )
+
+        await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
+
+        # Drop the confirm-advance captures that trail the Enter (no identity is
+        # derived from those) by pairing from the front.
+        assert events[0] == "anchor", "the FIRST observation reads the anchor first"
+        for i, ev in enumerate(events):
+            if ev == "capture":
+                assert "anchor" in events[:i], (
+                    "a pane capture with no anchor read before it — the chimera "
+                    "window is open"
+                )
+                break
+        # Each of the three identity observations is anchor-then-capture.
+        assert events[:2] == ["anchor", "capture"]
 
 
 class TestTheAdditiveInvariant:

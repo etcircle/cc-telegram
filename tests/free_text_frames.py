@@ -132,10 +132,17 @@ AUQ_RESOLVED = fx(f"auq_after_answer_t5_{V}.txt")  # the surface is GONE
 
 # ── EPM plan P / plan Q / plan S ─────────────────────────────────────────────
 
-# The plan-file slugs the real footers carry. They are the path half of the EPM
-# surface anchor; the CONTENT of the file at that path is the other half (see
-# ``free_text._epm_plan_generation``), which is what makes the anchor an
-# OCCURRENCE token rather than a mere name.
+# The plan-file slugs the real footers carry.
+#
+# NOTE (round-3 P1): these are NO LONGER any part of the EPM surface anchor. The
+# path was tried as the anchor (round-1) and a hash of the file's CONTENT was
+# tried next (round-2); BOTH describe the plan ARTIFACT and neither can name the
+# prompt OCCURRENCE — rig-verified on 2.1.207, three consecutive ExitPlanMode
+# prompts shared ONE slug and the file was rewritten in place each time. The
+# anchor is now the ``PreToolUse(ExitPlanMode)`` hook's per-invocation
+# ``tool_use_id`` (``handlers/epm_source``). The slugs survive here only because
+# ``retarget_plan_path`` uses them to build the adversarial same-path successor
+# frame that pins the pane component's degeneracy.
 EPM_P_PLAN_PATH = "~/.claude/plans/write-a-one-paragraph-plan-idempotent-pond.md"
 EPM_Q_PLAN_PATH = "~/.claude/plans/fancy-wibbling-quasar.md"
 EPM_S_PLAN_PATH = "~/.claude/plans/make-a-very-short-warm-sedgewick.md"
@@ -159,13 +166,18 @@ _RE_PLAN_PATH = re.compile(r"~/\.claude/plans/\S+\.md")
 def retarget_plan_path(ansi: str, new_path: str) -> str:
     """Rewrite the ``~/.claude/plans/<slug>.md`` path in an EPM footer.
 
-    THE ROUND-2 P1's REAL SHAPE. Re-entering ExitPlanMode after REVISING the same
-    plan commonly keeps the SAME slug — Claude rewrites the file in place — so
-    plan P and its revision render an IDENTICAL footer path. Every EPM also
-    renders the SAME three real options, so the pane identity is identical too.
+    THE ROUND-2/3 P1's REAL SHAPE — and RIG-CONFIRMED on 2.1.207: three
+    consecutive ExitPlanMode prompts (including one for a substantively different
+    task) all carried ONE ``planFilePath``, and the file was rewritten in place
+    each time. The slug is a per-SESSION name, so plan P and its successor render
+    an IDENTICAL footer path. Every EPM also renders the SAME three real options,
+    so the pane identity is identical too — BOTH pre-fix identity components are
+    therefore satisfied by a DIFFERENT prompt.
+
     The corpus's plan Q is a genuinely different real capture (different body,
     different slug); pointing its footer at plan P's path reproduces exactly the
-    successor a revision produces, byte-for-byte real everywhere else.
+    successor a re-plan produces, byte-for-byte real everywhere else. It is what
+    pins "nothing derived from the plan artifact can name the occurrence".
     """
     return _RE_PLAN_PATH.sub(new_path, ansi, count=1)
 

@@ -11,6 +11,16 @@ Called by Claude Code's hook system to:
      pretool reader (handlers/interactive_ui.py) can post the AUQ
      context message with descriptions at first render instead of
      just labels.
+  2b. PreToolUse (matcher=ExitPlanMode): capture the plan prompt's
+     OCCURRENCE identity (its per-invocation tool_use_id) BEFORE the
+     TUI renders the approval prompt, to
+     <CC_TELEGRAM_DIR>/epm_pending/<session_id>.json. The free-text
+     executor (GH #50 PR-2) re-checks it around every keystroke to
+     prove it is still committing onto the SAME plan prompt it planned
+     against — ExitPlanMode option 1 is "Yes, and bypass permissions",
+     and the plan FILE PATH is a per-session slug that Claude reuses
+     across different plans, so nothing derived from the plan artifact
+     can name the occurrence. Reader: handlers/epm_source.py.
   3. Notification (Wave B busy-signal): write a window-keyed
      "Claude is waiting on you" marker to
      <CC_TELEGRAM_DIR>/notify_pending/<session_id>.json. The bot's
@@ -25,10 +35,13 @@ The hook is a pure observer for PreToolUse / Notification — exit 0 with
 no stdout, no permission decision. Exceptions are swallowed and logged;
 the tool call must NEVER be blocked by hook bugs.
 
-`--install` installs (or refreshes) all three hook entries in
+`--install` installs (or refreshes) all four managed hook entries in
 ~/.claude/settings.json idempotently. SessionStart keeps a 5s timeout
-(existing); PreToolUse and Notification use 2s (write is sub-ms;
-observer hooks should not delay execution beyond a hard ceiling).
+(existing); the two PreToolUse entries and Notification use 2s (write is
+sub-ms; observer hooks should not delay execution beyond a hard ceiling).
+The two PreToolUse matchers get SEPARATE entries rather than one combined
+regex, so an install that already carries the AUQ-only entry can add the
+ExitPlanMode one without rewriting it.
 
 This module must not import config.py: hooks run inside tmux panes where
 bot env vars are not guaranteed to exist. Config directory resolution
@@ -37,6 +50,7 @@ uses utils.app_dir(), which only needs CC_TELEGRAM_DIR.
 
 import argparse
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -56,6 +70,7 @@ _CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 _CURRENT_HOOK_COMMAND_SUFFIX = "cc-telegram hook"
 _HOOK_PATH_PREFIX_RE = re.compile(r"^[A-Za-z0-9_./~@+-]+$")
 _AUQ_MATCHER = "AskUserQuestion"
+_EPM_MATCHER = "ExitPlanMode"
 _SESSION_START_TIMEOUT_S = 5
 _PRE_TOOL_USE_TIMEOUT_S = 2
 _NOTIFICATION_TIMEOUT_S = 2
@@ -121,24 +136,34 @@ def _is_session_start_installed(settings: dict) -> HookStatus:
     return "missing"
 
 
-def _is_pre_tool_use_installed(settings: dict) -> HookStatus:
-    """Return whether PreToolUse contains a managed entry matching
-    ``AskUserQuestion``.
+def _is_pre_tool_use_installed(
+    settings: dict, matcher: str = _AUQ_MATCHER
+) -> HookStatus:
+    """Return whether PreToolUse contains a managed entry for ``matcher``.
 
-    The check is intentionally loose: any managed-command entry under
-    matcher ``AskUserQuestion`` counts as ``current``, regardless of
-    ``type`` / ``timeout``. This preserves idempotency — install never
-    duplicates an existing managed entry — at the cost of NOT
-    auto-refreshing a stale timeout config. Codex P2 round 2 flagged
-    this; the trade-off favors idempotency since the install command is
-    append-only and an in-place replacement would risk clobbering
-    user-edited entries. Users who need a config refresh can edit
-    ~/.claude/settings.json directly.
+    Two matchers are managed, each in its OWN entry (a combined regex matcher
+    would be neater in settings.json but could not be added idempotently to an
+    installation that already carries the AUQ-only entry):
+
+      - ``AskUserQuestion`` — the AUQ description capture (the original).
+      - ``ExitPlanMode``    — the GH #50 PR-2 r3 plan-prompt OCCURRENCE witness
+        (``handlers/epm_source``); without it the free-text lane cannot name
+        WHICH plan prompt it is answering and declines rather than risk
+        committing onto a successor card whose option 1 bypasses permissions.
+
+    The check is intentionally loose: any managed-command entry under the given
+    matcher counts as ``current``, regardless of ``type`` / ``timeout``. This
+    preserves idempotency — install never duplicates an existing managed entry —
+    at the cost of NOT auto-refreshing a stale timeout config. Codex P2 round 2
+    flagged this; the trade-off favors idempotency since the install command is
+    append-only and an in-place replacement would risk clobbering user-edited
+    entries. Users who need a config refresh can edit ~/.claude/settings.json
+    directly.
     """
     for entry in settings.get("hooks", {}).get("PreToolUse", []) or []:
         if not isinstance(entry, dict):
             continue
-        if entry.get("matcher") != _AUQ_MATCHER:
+        if entry.get("matcher") != matcher:
             continue
         if _entry_has_managed_command(entry):
             return "current"
@@ -161,13 +186,16 @@ def _is_notification_installed(settings: dict) -> HookStatus:
 def _install_hook(settings_file: Path = _CLAUDE_SETTINGS_FILE) -> int:
     """Install or refresh the CC Telegram hooks in Claude settings.json.
 
-    Three events are managed:
+    Four managed entries:
       - SessionStart with timeout 5 (window↔session map)
       - PreToolUse with matcher AskUserQuestion and timeout 2 (AUQ
         descriptions capture)
+      - PreToolUse with matcher ExitPlanMode and timeout 2 (the plan-prompt
+        occurrence witness for the GH #50 free-text lane)
       - Notification with timeout 2 (waiting-on-you side file, matcher-less)
 
-    Idempotent: missing entries are added, current ones left alone.
+    Idempotent: missing entries are added, current ones left alone. An
+    install that predates the ExitPlanMode entry gains ONLY that entry.
     """
     settings_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -199,11 +227,17 @@ def _install_hook(settings_file: Path = _CLAUDE_SETTINGS_FILE) -> int:
         )
         installed.append("SessionStart")
 
-    if _is_pre_tool_use_installed(settings) == "missing":
+    if _is_pre_tool_use_installed(settings, _AUQ_MATCHER) == "missing":
         settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append(
             {"matcher": _AUQ_MATCHER, "hooks": [pre_tool_use_cfg]}
         )
         installed.append(f"PreToolUse({_AUQ_MATCHER})")
+
+    if _is_pre_tool_use_installed(settings, _EPM_MATCHER) == "missing":
+        settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append(
+            {"matcher": _EPM_MATCHER, "hooks": [dict(pre_tool_use_cfg)]}
+        )
+        installed.append(f"PreToolUse({_EPM_MATCHER})")
 
     if _is_notification_installed(settings) == "missing":
         notification_cfg = {
@@ -333,24 +367,160 @@ def _handle_session_start(payload: dict) -> int:
     return 0
 
 
+def _prepare_pending_dir(dirname: str, label: str) -> Path | None:
+    """Create + tighten a side-file directory to 0700, or ``None`` to refuse.
+
+    Shared by the AUQ and ExitPlanMode PreToolUse writers (the Notification
+    writer keeps its own inline copy). FAIL-CLOSED on both legs:
+
+      - a SYMLINK at the directory path is refused outright (defense against
+        redirecting our writes to an arbitrary file via a hostile symlink in
+        ~/.cc-telegram/ — we OWN this directory);
+      - if the mode cannot be tightened to 0700 we MUST NOT write. Side files
+        carry tool_input (AUQ questions, EPM plan metadata) which can reference
+        infra and plan decisions; a world-readable side file is a privacy
+        regression, and every consumer degrades gracefully when the file is
+        absent.
+
+    ``mkdir(mode=…)`` only applies to NEWLY created dirs, so the chmod runs
+    unconditionally to recover a pre-existing loose-mode dir from an older
+    install.
+    """
+    from .utils import app_dir
+
+    pending_dir = app_dir() / dirname
+    if pending_dir.exists() and pending_dir.is_symlink():
+        logger.error("%s: %s is a symlink; refusing to write", label, pending_dir)
+        return None
+    try:
+        pending_dir.mkdir(mode=0o700, exist_ok=True)
+    except OSError as e:
+        logger.error("%s: mkdir %s failed: %s", label, pending_dir, e)
+        return None
+    try:
+        os.chmod(pending_dir, 0o700)
+    except OSError as e:
+        logger.error(
+            "%s: chmod 0700 on %s failed; refusing to write: %s", label, pending_dir, e
+        )
+        return None
+    return pending_dir
+
+
 def _handle_pre_tool_use(payload: dict) -> int:
-    """Capture AskUserQuestion tool_input to a per-session side file.
+    """Dispatch a PreToolUse event to the per-tool side-file writer.
 
-    Fires BEFORE Claude Code renders the picker UI (PreToolUse semantics).
-    The hook is purely observational — exit 0 with no stdout, no
-    permission decision, no exceptions propagated. Hook bugs MUST NEVER
-    block Claude Code's tool execution.
+    Two tools are captured, each BEFORE Claude Code renders its blocking prompt
+    (PreToolUse semantics) and each into its own per-session side file:
 
-    Side file path: <CC_TELEGRAM_DIR>/auq_pending/<session_id>.json
-    Schema version 1. The reader is in handlers/interactive_ui.py
-    (next chunk in the wave; not present yet — this commit writes the
-    file even though nobody reads it, which is intentional staging).
+      - ``AskUserQuestion`` → ``auq_pending/`` — the structured questions +
+        per-option descriptions, so the bot can render them at first paint.
+      - ``ExitPlanMode``    → ``epm_pending/`` — the plan prompt's OCCURRENCE
+        identity (``tool_use_id``), so the free-text executor can prove WHICH
+        plan prompt it is committing onto (GH #50 PR-2 r3).
+
+    Purely observational — exit 0, no stdout, no permission decision, no
+    exceptions propagated. Hook bugs MUST NEVER block Claude Code's tool
+    execution.
     """
     tool_name = payload.get("tool_name", "")
+    if tool_name == _EPM_MATCHER:
+        return _handle_epm_pre_tool_use(payload)
     if tool_name != _AUQ_MATCHER:
         # Matcher should have filtered already; defensive check.
         return 0
+    return _handle_auq_pre_tool_use(payload)
 
+
+def _handle_epm_pre_tool_use(payload: dict) -> int:
+    """Capture the ExitPlanMode OCCURRENCE witness to a per-session side file.
+
+    Side file: <CC_TELEGRAM_DIR>/epm_pending/<session_id>.json (schema 1).
+    Reader / trust boundary: handlers/epm_source.py — see that module for the
+    round-3 P1 this exists to close (the plan-file path is a per-session SLUG,
+    rig-verified reused across three DIFFERENT plans, so neither the path nor a
+    hash of its rewritten content can name the prompt OCCURRENCE; the
+    per-invocation ``tool_use_id`` can).
+
+    The record is deliberately MINIMAL — NO plan BODY. The consumer needs a NAME
+    for the prompt, not its contents, and the plan text already reaches the user
+    through the bot's own plan-body post. We store the plan's fingerprint (a
+    digest of the authoritative ``tool_input.plan``) and its path for
+    observability + the defensive composite fallback.
+
+    ``window_key`` is MANDATORY here (unlike the AUQ lane, whose session-keyed
+    record cannot tell two ``--resume`` siblings apart): ExitPlanMode option 1 is
+    "Yes, and bypass permissions", so its reader HARD-predicates on the window.
+    TMUX_PANE is rig-verified present for this hook; if it cannot be resolved we
+    write NOTHING and the free-text lane declines (fail-closed).
+    """
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        logger.warning(
+            "PreToolUse EPM: invalid tool_input shape (%s)", type(tool_input).__name__
+        )
+        return 0
+
+    pane_id = os.environ.get("TMUX_PANE", "")
+    if not pane_id:
+        logger.warning("PreToolUse EPM: TMUX_PANE not set, cannot key the window")
+        return 0
+    resolved = _resolve_tmux_window_key(pane_id)
+    if resolved is None:
+        return 0
+    tmux_session_name, window_id, _window_name = resolved
+    window_key = f"{tmux_session_name}:{window_id}"
+
+    from .utils import atomic_write_json
+
+    pending_dir = _prepare_pending_dir("epm_pending", "PreToolUse EPM")
+    if pending_dir is None:
+        return 0
+
+    plan = tool_input.get("plan")
+    plan_text = plan if isinstance(plan, str) else ""
+    plan_file_path = tool_input.get("planFilePath")
+
+    session_id = payload["session_id"]  # validated by caller
+    target = pending_dir / f"{session_id}.json"
+    record = {
+        "schema_version": 1,
+        "session_id": session_id,
+        # The OCCURRENCE witness. Rig-verified present + distinct per invocation
+        # on CC 2.1.207.
+        "tool_use_id": payload.get("tool_use_id", "") or "",
+        "window_key": window_key,
+        "written_at": time.time(),
+        "plan_file_path": str(plan_file_path or ""),
+        "plan_fingerprint": hashlib.sha256(plan_text.encode("utf-8")).hexdigest()[:16],
+    }
+
+    try:
+        atomic_write_json(target, record)
+    except OSError as e:
+        logger.error("PreToolUse EPM: write %s failed: %s", target, e)
+        return 0
+
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+
+    logger.info(
+        "PreToolUse EPM side file: %s tool_use_id=%s window_key=%s",
+        target.name,
+        record["tool_use_id"] or "<none>",
+        window_key,
+    )
+    return 0
+
+
+def _handle_auq_pre_tool_use(payload: dict) -> int:
+    """Capture AskUserQuestion tool_input to a per-session side file.
+
+    Side file path: <CC_TELEGRAM_DIR>/auq_pending/<session_id>.json
+    Schema version 1. The reader / trust boundary is handlers/auq_source.py.
+    """
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         logger.warning(
@@ -366,7 +536,7 @@ def _handle_pre_tool_use(payload: dict) -> int:
         questions_content_digest,
         questions_content_pairs_from_tool_input,
     )
-    from .utils import app_dir, atomic_write_json
+    from .utils import atomic_write_json
 
     pairs = questions_content_pairs_from_tool_input(tool_input)
     if pairs is None:
@@ -375,38 +545,9 @@ def _handle_pre_tool_use(payload: dict) -> int:
     fingerprint = questions_content_digest(pairs)
 
     session_id = payload["session_id"]  # validated by caller
-    pending_dir = app_dir() / "auq_pending"
 
-    # Reject symlinks anywhere on the path — defensive against attempts
-    # to redirect writes to arbitrary files via a hostile symlink in
-    # ~/.cc-telegram/. We OWN this directory and never want it pointing
-    # anywhere unexpected.
-    if pending_dir.exists() and pending_dir.is_symlink():
-        logger.error("PreToolUse AUQ: %s is a symlink; refusing to write", pending_dir)
-        return 0
-
-    try:
-        pending_dir.mkdir(mode=0o700, exist_ok=True)
-    except OSError as e:
-        logger.error("PreToolUse AUQ: mkdir %s failed: %s", pending_dir, e)
-        return 0
-
-    # mkdir(mode=...) only applies to newly created dirs; chmod
-    # unconditionally to recover from a pre-existing loose-mode dir.
-    # Fail-closed (codex P2 round 2 — chunk 2): if we can't tighten the
-    # dir to 0o700, we MUST NOT write the side file. AUQ tool_input can
-    # carry sensitive context (skill prompts that mention infra, plan
-    # decisions, etc.); a world-readable side file is a privacy
-    # regression, and the existing post-hoc form-source fallback gives
-    # the user a working — if less rich — experience either way.
-    try:
-        os.chmod(pending_dir, 0o700)
-    except OSError as e:
-        logger.error(
-            "PreToolUse AUQ: chmod 0700 on %s failed; refusing to write: %s",
-            pending_dir,
-            e,
-        )
+    pending_dir = _prepare_pending_dir("auq_pending", "PreToolUse AUQ")
+    if pending_dir is None:
         return 0
 
     target = pending_dir / f"{session_id}.json"

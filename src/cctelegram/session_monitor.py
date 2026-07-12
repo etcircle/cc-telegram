@@ -3880,6 +3880,9 @@ class SessionMonitor:
             # captured the old session_id in ``changed_old_sessions`` above
             # for exactly this purpose.
             from .handlers.auq_source import unlink_for_session
+            from .handlers.epm_source import (
+                unlink_for_session as epm_unlink_for_session,
+            )
             from .handlers.notify_source import (
                 unlink_for_session as notify_unlink_for_session,
             )
@@ -3896,6 +3899,9 @@ class SessionMonitor:
                     # Wave B: the OLD session's notification marker dies with
                     # it (same old-session-id parity as above).
                     notify_unlink_for_session(old_sid)
+                    # GH #50 PR-2 r3: and the OLD session's ExitPlanMode
+                    # occurrence witness (same old-session-id parity).
+                    epm_unlink_for_session(old_sid)
                 forget_ask_tool_input(wid)
 
         # Codex P2 (chunk 5): unlink side files for deleted windows
@@ -3903,6 +3909,9 @@ class SessionMonitor:
         # cycle with only deletes (no changes) still needs cleanup.
         if deleted_session_ids:
             from .handlers.auq_source import unlink_for_session
+            from .handlers.epm_source import (
+                unlink_for_session as epm_unlink_for_session,
+            )
             from .handlers.notify_source import (
                 unlink_for_session as notify_unlink_for_session,
             )
@@ -3912,6 +3921,8 @@ class SessionMonitor:
                 md_capture.teardown_session(sid)
                 # Wave B: deleted window → its notification marker is dead.
                 notify_unlink_for_session(sid)
+                # GH #50 PR-2 r3: … and its ExitPlanMode occurrence witness.
+                epm_unlink_for_session(sid)
 
         # Update last known map
         self._last_session_map = current_map

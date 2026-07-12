@@ -2123,20 +2123,24 @@ read, so an anchor-less pane never yields an identity at all:
   pre-resolution witness of *which* AUQ this is. **This makes `PreToolUse` a
   REQUIREMENT of the AUQ free-text lane (user-visible → README);** the bot already
   warns at startup when it is missing, and `cc-telegram hook --install` installs it.
-- **EPM** → the plan-CONTENT generation (`free_text._epm_plan_generation`): the live
-  footer's `~/.claude/plans/<slug>.md` path **PLUS a hash of that file's CONTENT**.
-  **It used to be the PATH alone** — but re-entering ExitPlanMode after REVISING a
-  plan commonly keeps the SAME slug (Claude rewrites the file in place), so plan P
-  and its revision carried an IDENTICAL anchor; and every EPM renders the SAME three
-  real options, so the pane component matched too. BOTH components were satisfied by
-  a DIFFERENT prompt, and a mid-transaction successor received the previous plan's
-  feedback — on the surface whose option 1 is "Yes, and bypass permissions". A path
-  is a NAME; the plan's CONTENT is what the prompt is ASKING about, so the content
-  is the generation. Read at every observation point (a bounded ≤512 KiB read of a
-  file that is normally a few KB and page-cached — the same class of synchronous
-  side-file read the AUQ leg already performs); traversal-guarded to
-  `~/.claude/plans/`; unreadable / missing / oversize / no live footer ⇒ `None` ⇒
-  decline (pre-key) or refuse (post-key).
+- **EPM** → the PreToolUse side file's occurrence identity
+  (`epm_source.peek_surface_identity_for_window` — the `PreToolUse(ExitPlanMode)`
+  hook's per-invocation `tool_use_id`, additionally HARD-predicated on the
+  hook-captured `window_key`, which makes it STRICTER than the AUQ lane: EPM is the
+  surface whose option 1 bypasses permissions, so a session-keyed match alone — which
+  cannot tell two `--resume` siblings apart — is forbidden). **It used to be the plan
+  file's PATH (round-1), then a hash of that file's CONTENT (round-2).** Both describe
+  the plan ARTIFACT; neither can name the prompt OCCURRENCE. **RIG-VERIFIED on 2.1.207**
+  (three consecutive ExitPlanMode prompts in a scratch session): `PreToolUse` DOES fire
+  for `ExitPlanMode` with a DISTINCT `tool_use_id` per invocation, `TMUX_PANE` IS
+  exported to it — and all three prompts, including one for a substantively different
+  task, shared ONE `planFilePath`, whose file was REWRITTEN IN PLACE each time. So a
+  content read taken AFTER the pane capture returns the SUCCESSOR's hash while the
+  executor still holds the PREDECESSOR's pane; every EPM renders the same three real
+  options, so the pane halves match too; BOTH components then agree on the WRONG card
+  and the Enter commits plan P's feedback onto plan Q (round-3 P1). No side file ⇒ the
+  EPM lane DECLINES (pre-keystroke; PR-1 owns the single refusal) — a DEGRADATION, never
+  a hazard, and `cc-telegram hook --install` / `cc-telegram doctor` cover it.
 
   *Rejected alternatives, for the record.* **`os.stat` (mtime_ns + size)** is
   cheaper and does catch a rewrite, but it is a METADATA generation: it flips on a
@@ -2149,6 +2153,31 @@ read, so an anchor-less pane never yields an identity at all:
   different prompts, exactly the case this P1 is about. It would detect nothing
   while adding a cross-module lifecycle whose pop/re-stamp could false-refuse a live
   transaction.
+
+**THE ANCHOR IS READ BEFORE THE PANE — the OTHER half of the round-3 fix, and the
+half a change of anchor SOURCE alone would NOT have closed.** `derive_identity` used
+to READ the anchor itself, i.e. AFTER its caller had already captured the pane. That
+mints a CHIMERA whenever the card turns over inside the gap — `(pane@t1, anchor@t2)`
+with `t2 > t1` ⇒ `(OLD pane, NEW anchor)` — and because BOTH surfaces' pane components
+are degenerate across occurrences (all EPMs render the same three real options; two
+AUQs can carry identical option labels), that chimera MATCHES every later observation:
+the transaction types into the successor and presses Enter. A `tool_use_id` read after
+the pane is chimeric in exactly the same way. **REPRO-CONFIRMED:** restoring the old
+order turns `test_a_card_that_turns_over_INSIDE_the_capture_never_mints_a_chimera` RED
+with "plan P's feedback was committed onto plan Q".
+
+`derive_identity` therefore **TAKES** the anchor (`anchor: str | None`) and never reads
+one; `read_surface_anchor` / `read_surface_anchors` run STRICTLY BEFORE every pane
+capture, at all three observation points (plan / post-nav / final pre-Enter — the
+planner reads BOTH surfaces' anchors up front, since it cannot know the surface until
+it has parsed the pane). The safety argument: a LIVE, unresolved prompt means Claude is
+BLOCKED on it, so it cannot be invoking the next prompt — and each hook fires BEFORE its
+prompt renders. Therefore "prompt P is live on the pane at t1" implies "the side file at
+t1 is P's", and the side file only ever moves FORWARD. With the anchor read at t0 < t1,
+the only constructible chimera is `(NEWER pane, OLDER anchor)`, which FAILS CLOSED on the
+next `still_holds` comparison. This is the SAME "probe FIRST, capture LAST" discipline
+`_reverify_input_box` already applies to its liveness probe (r2 F4) — a stale-frame
+authorization is the identical bug class.
 
 `still_holds` is therefore: the surface must match; **the anchors must be EQUAL**
 (both sides always have one — a live derivation without one is `None` and dies on
@@ -2331,23 +2360,29 @@ with the buttons or the ↑/↓/⏎ keys." ExitPlanMode gains the line for the F
     up, the user is told the text is in the card's row and to clear it (Esc). The
     footer is the ONLY thing that distinguishes one plan from another, so this is
     fail-closed by design, not a gap.
-  - **On an install with NO PreToolUse hook the AUQ free-text lane is OFF** — every
-    message at a question card takes PR-1's refusal, pre-keystroke. That is the
-    round-2 P1 fold: the alternative was trusting a pane identity that cannot tell
-    two same-shaped questions apart. It is a DEGRADATION, not a hazard (the card's
-    option buttons are unaffected), it is user-visible and documented in the README,
-    the bot warns at startup, and `cc-telegram hook --install` fixes it.
-  - **An ExitPlanMode prompt whose plan file is unreadable** (deleted, outside
-    `~/.claude/plans/`, >512 KiB) has no anchor and declines the same way. In the
-    documented configuration Claude writes that file before the prompt renders — it
-    is the same file `_maybe_post_epm_plan` reads to post the plan body.
-  - **A plan RE-PRESENTED byte-identically** (same slug, same bytes) yields the same
-    anchor, so feedback typed for it commits. That is coherent, not a wrong-card
-    commit: EPM asks "proceed with THIS plan?", and the plan is unchanged, so it is
-    literally the same question about the same artifact. Disclosed rather than
-    closed — an occurrence token that distinguishes it would have to come from
-    outside the transaction, and the only candidate (the poller's first-seen stamp)
-    is unsound (see above).
+  - **On an install with NO PreToolUse hook the free-text lane is OFF for that
+    surface** — `AskUserQuestion` needs `PreToolUse(AskUserQuestion)`, `ExitPlanMode`
+    needs `PreToolUse(ExitPlanMode)`; without it, every message at that prompt takes
+    PR-1's refusal, pre-keystroke. That is the round-2/3 P1 fold: the alternative was
+    trusting a pane identity that cannot tell two same-shaped prompts apart. It is a
+    DEGRADATION, not a hazard (the option buttons and the ↑/↓/⏎ keys are unaffected),
+    it is user-visible and documented in the README, the bot warns at startup,
+    `cc-telegram doctor` reports it, and `cc-telegram hook --install` fixes it.
+  - **The EPM overflow shape is now carried by the anchor, not the footer.** The
+    plan-file footer used to BE the EPM anchor, so a feedback long enough to push it
+    off the bottom refused (DRAFT_WRITTEN). The anchor is now out-of-band, so the
+    footer's disappearance no longer costs the identity — but the surface still stops
+    EXTRACTING when its footer scrolls away, so leg C's `extract_interactive_content`
+    check refuses anyway. Unchanged behavior, different (and now honest) reason.
+  - **A plan RE-PRESENTED as a genuinely NEW ExitPlanMode call always gets a NEW
+    `tool_use_id`**, even when the plan text is byte-identical — so the round-2
+    residual ("a byte-identical re-present is indistinguishable") is CLOSED by
+    construction: the occurrence id changes, and feedback typed for the old prompt
+    refuses. The converse (Claude re-RENDERING the same live prompt without a new
+    tool call) keeps the same id, which is correct — it IS the same prompt.
+  - **A double-`--resume` sibling cannot borrow the EPM anchor**: the record carries
+    the hook-resolved `window_key` and the read hard-predicates on it. (The AUQ lane
+    still documents that residual; EPM does not have it.)
   - **An ExitPlanMode prompt whose plan body cannot be separated from its option
     block** would decline (fail-closed). The `UIPattern`-anchored
     `_exit_plan_option_block` closes the common numbered-plan-body case.

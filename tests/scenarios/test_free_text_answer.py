@@ -53,10 +53,8 @@ from tests.free_text_frames import (
     EPM_P_LIVE,
     EPM_P_PLAN_PATH,
     EPM_P_TYPED,
-    EPM_Q_PLAN_PATH,
     EPM_Q_TYPED_AT_P_PATH,
     EPM_RESOLVED,
-    EPM_S_PLAN_PATH,
     plain,
 )
 
@@ -102,12 +100,18 @@ def _fast(monkeypatch: pytest.MonkeyPatch):
 # ── The OCCURRENCE anchors, as REAL files on the REAL substrate ───────────
 #
 # The free-text lane refuses to touch a card it cannot identify by an
-# occurrence-unique anchor (peer-review round-2, both P1s). Both anchors are
-# files, and the scenario floor drives the real readers over real bytes — no
-# handler internal is stubbed:
+# occurrence-unique anchor. BOTH anchors are now the same kind of thing — a
+# ``PreToolUse`` side file minted by the process that is about to block, BEFORE
+# it renders, carrying the prompt's per-invocation ``tool_use_id`` — and the
+# scenario floor drives the real readers over real bytes, stubbing nothing:
 #
 #   AskUserQuestion → the PreToolUse hook's ``auq_pending/<session>.json``
-#   ExitPlanMode    → the plan file the footer names, whose CONTENT is hashed
+#   ExitPlanMode    → the PreToolUse hook's ``epm_pending/<session>.json``
+#
+# EPM's anchor was a plan-file PATH (round-1) and then a hash of that file's
+# CONTENT (round-2). Both describe the plan ARTIFACT, and neither can name the
+# prompt OCCURRENCE: rig-verified on 2.1.207, three consecutive ExitPlanMode
+# prompts shared ONE slug and the file was rewritten in place each time.
 
 SESSION_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"  # the reader validates UUIDs
 
@@ -121,28 +125,6 @@ AUQ_TOOL_INPUT = {
         }
     ]
 }
-
-EPM_PLAN_BODIES = {
-    EPM_P_PLAN_PATH: "# Plan P\n\nWrite goodbye.txt with one paragraph.\n",
-    EPM_Q_PLAN_PATH: "# Plan Q\n\n1. Create goodbye.txt\n2. Verify it\n",
-    EPM_S_PLAN_PATH: "# Plan S\n\nA very short warm plan.\n",
-}
-
-
-@pytest.fixture(autouse=True)
-def _anchors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Redirect HOME and write the EPM plan files the plan-CONTENT anchor hashes.
-
-    The AUQ side file is written by ``_bind`` instead — the ``scenario`` fixture
-    sweeps ``auq_pending/`` when it resets state, and it is instantiated AFTER
-    every autouse fixture.
-    """
-    monkeypatch.setenv("HOME", str(tmp_path))
-    plans = tmp_path / ".claude" / "plans"
-    plans.mkdir(parents=True)
-    for path, body in EPM_PLAN_BODIES.items():
-        (plans / Path(path).name).write_text(body)
-    return plans
 
 
 def _write_auq_side_file() -> None:
@@ -162,6 +144,35 @@ def _write_auq_side_file() -> None:
             "input_fingerprint": "",  # RECOMPUTED by the reader; never trusted
             "transcript_path": "",
             "cwd": "/repo",
+        },
+    )
+
+
+def _write_epm_side_file(window_id: str, *, tool_use_id: str = "toolu_PLAN_P") -> None:
+    """What the ``PreToolUse(ExitPlanMode)`` hook writes before a plan prompt
+    renders (rig-verified shape, 2.1.207).
+
+    ``window_key`` is MANDATORY in this lane — it is the double-``--resume``
+    sibling predicate, and this is the surface whose option 1 is "Yes, and bypass
+    permissions". It is built exactly as ``epm_source._expected_window_key`` does,
+    so mint and validate share one source.
+    """
+    from cctelegram.utils import app_dir, atomic_write_json
+
+    pending = app_dir() / "epm_pending"
+    pending.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        pending / f"{SESSION_ID}.json",
+        {
+            "schema_version": 1,
+            "session_id": SESSION_ID,
+            "tool_use_id": tool_use_id,
+            "window_key": f"{_real_tmux.session_name}:{window_id}",
+            "written_at": time.time(),
+            # The slug Claude REUSES across plans — carried for observability
+            # only; it is NOT the identity (that is the whole point).
+            "plan_file_path": EPM_P_PLAN_PATH,
+            "plan_fingerprint": "0a1620b6f022f898",
         },
     )
 
@@ -208,9 +219,11 @@ async def _bind(
     )
     h.bind_thread(42, wid, display_name="repo", cwd="/repo", session_id=SESSION_ID)
     if side_file:
-        # The AUQ occurrence anchor. ``side_file=False`` is the hook-less install:
-        # the AUQ lane then has no way to identify the card and must decline.
+        # The occurrence anchors, both surfaces. ``side_file=False`` is the
+        # hook-less install: the lane then has no way to identify the card and
+        # must DECLINE (PR-1 owns the refusal, nothing is typed).
         _write_auq_side_file()
+        _write_epm_side_file(wid)
     if card:
         # The REAL render seam the 1 Hz poller drives — this is what publishes
         # the interactive surface the free-text lane is gated on.
@@ -451,18 +464,21 @@ class TestTheWrongCard:
         self,
         scenario: ScenarioHarness,
         monkeypatch: pytest.MonkeyPatch,
-        _anchors: Path,
     ):
-        """peer-review round-2 P1 — the ExitPlanMode anchor was a PATH.
+        """peer-review round-3 P1 — the ExitPlanMode anchor named the ARTIFACT.
 
-        A revision commonly rewrites the SAME plan file, so plan P and its
-        revision render the SAME footer path — and every EPM renders the SAME
-        three real options, so the pane component matches too. BOTH pre-fix
-        identity components were satisfied by a DIFFERENT prompt. The anchor is
-        now the plan's CONTENT, and this is the plan-approval surface whose
+        Re-planning rewrites the SAME plan file, so plan P and its successor
+        render the SAME footer path — and every EPM renders the SAME three real
+        options, so the pane component matches too. The round-1 anchor (the PATH)
+        and the round-2 anchor (a hash of that file's CONTENT) were therefore BOTH
+        satisfiable by a DIFFERENT prompt. This is the plan-approval surface whose
         option 1 is "Yes, and bypass permissions".
+
+        The anchor is now the hook's per-invocation ``tool_use_id``: re-planning
+        re-fires ``PreToolUse(ExitPlanMode)``, which rewrites the side file with a
+        NEW id while the slug and the options stay identical. Driven end to end
+        over the REAL side file and the REAL reader.
         """
-        plan_file = _anchors / Path(EPM_P_PLAN_PATH).name
         wid = await _bind(scenario, EPM_LIVE)
 
         real_send = scenario.tmux.send_keys
@@ -472,9 +488,10 @@ class TestTheWrongCard:
             if not literal and not enter and keys in ("Down", "Up"):
                 scenario.tmux.set_pane(window_id, plain(EPM_LANDED), ansi=EPM_LANDED)
             elif literal and not enter and keys:
-                # Claude REVISED the plan in place while we typed, and re-presented
-                # it: same slug, same options, different plan.
-                plan_file.write_text("# Plan P, REVISED\n\nSomething else entirely.\n")
+                # Claude RE-PLANNED while we typed and re-presented: same slug,
+                # same options, different plan — so its PreToolUse hook re-fired
+                # with a NEW tool_use_id (the ONLY thing that can tell them apart).
+                _write_epm_side_file(window_id, tool_use_id="toolu_PLAN_Q")
                 scenario.tmux.set_pane(
                     window_id,
                     plain(EPM_Q_TYPED_AT_P_PATH),
@@ -490,8 +507,32 @@ class TestTheWrongCard:
 
         await _send_text(scenario, wid, EPM_ANSWER)
 
-        assert scenario.tmux.committed is False, "the REVISED plan must not be approved"
+        assert scenario.tmux.committed is False, (
+            "the SUCCESSOR plan must not be approved"
+        )
         assert any("NOT" in n or "not" in n for n in _notices(scenario))
+
+    @pytest.mark.asyncio
+    async def test_an_epm_with_no_PreToolUse_side_file_falls_back_to_the_pr1_refusal(
+        self, scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+    ):
+        """peer-review round-3 P1 — with no ``PreToolUse(ExitPlanMode)`` hook the
+        bot cannot name WHICH plan prompt it would be committing onto, and nothing
+        else can: the pane is degenerate across plans and the plan file's path is a
+        reused per-session slug. So the lane DECLINES pre-keystroke and PR-1 owns
+        the refusal — a degradation, never a hazard."""
+        wid = await _bind(scenario, EPM_LIVE, side_file=False)
+        _script_pane(
+            scenario, monkeypatch, landed=EPM_LANDED, typed=EPM_TYPED, done=EPM_RESOLVED
+        )
+
+        await _send_text(scenario, wid, EPM_ANSWER)
+
+        assert scenario.tmux.committed is False
+        assert scenario.tmux.written_texts == [], "nothing may be typed into the card"
+        assert _arrows(scenario) == [], "not a single keystroke"
+        # PR-1 owns the single refusal — the lane never invents its own.
+        assert any("Not delivered" in n for n in _notices(scenario))
 
     @pytest.mark.asyncio
     async def test_an_auq_with_no_PreToolUse_side_file_falls_back_to_the_pr1_refusal(
