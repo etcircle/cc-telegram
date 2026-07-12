@@ -280,3 +280,100 @@ class TestTheInputBoxIsNeverPresentOnThese:
     def test_no_input_box(self, name: str):
         pane = tp.clean_ghost_input_text(_fx(name))
         assert tp.pane_input_box_present(pane) is False
+
+
+class TestTheQuestionRegion:
+    """``auq_question_region`` — the block ADJACENT to the live option block.
+
+    The free-text lane binds the PreToolUse record's question to the pane it
+    captured. Round-6 P1: that binding was a substring search over the WHOLE
+    pane, so an option label satisfied it and the answer went to the WRONG CARD.
+    The region is what the comparison must target instead — so it must contain
+    the question, and NOTHING else the pane happens to be carrying.
+    """
+
+    def test_it_is_exactly_the_question_on_the_real_capture(self):
+        pane = tp.clean_ghost_input_text(
+            _fx(f"auq_freetext_row_selected_pretype_{V}.ansi.txt")
+        )
+        assert tp.auq_question_region(pane) == "What's your favorite color?"
+
+    def test_it_carries_no_option_row_no_description_and_no_footer(self):
+        pane = tp.clean_ghost_input_text(
+            _fx(f"auq_freetext_row_selected_pretype_{V}.ansi.txt")
+        )
+        region = tp.auq_question_region(pane)
+        assert region is not None
+        for foreign in (
+            "Blue",  # an option LABEL — Codex's exact wrong-card case
+            "Green",
+            "Type something.",  # the affordance row
+            "Calm, cool",  # an option DESCRIPTION
+            "Enter to select",  # the picker footer
+            "AskUserQuestion tool",  # the user's own prompt, in the scrollback
+        ):
+            assert foreign not in region, foreign
+
+    def test_a_wrapped_question_keeps_every_row_and_their_boundaries(self):
+        """Rows are returned SEPARATE, so the caller decides how to rejoin them —
+        the parser never destroys the line boundary the round-6 P1 turned on."""
+        pane = "\n".join(
+            [
+                " ☐ Color ",
+                "",
+                "Which of these three colors would you pick for the primary accent",
+                "of the new dashboard theme? It has to stay legible on both",
+                "backgrounds.",
+                "",
+                "  1. Blue",
+                "  2. Green",
+                "❯ 3. Type something.",
+                "Enter to select · ↑/↓ to navigate · Esc to cancel",
+            ]
+        )
+        assert tp.auq_question_region(pane) == (
+            "Which of these three colors would you pick for the primary accent\n"
+            "of the new dashboard theme? It has to stay legible on both\n"
+            "backgrounds."
+        )
+
+    def test_no_live_picker_no_region(self):
+        assert tp.auq_question_region("") is None
+        assert tp.auq_question_region("just some prose\nand more prose") is None
+
+    def test_a_question_severed_from_the_block_by_blank_rows_is_not_adjacent(self):
+        """More than a couple of blank rows between the text and the topmost option
+        means the two are not adjacent, and whatever is up there is not this
+        picker's question — the same bound the walk-back title uses."""
+        pane = "\n".join(
+            [
+                "stale scrollback prose",
+                "",
+                "",
+                "",
+                "  1. Blue",
+                "❯ 2. Type something.",
+                "Enter to select · Esc to cancel",
+            ]
+        )
+        assert tp.auq_question_region(pane) is None
+
+    def test_the_region_tracks_the_BOTTOM_MOST_picker(self):
+        """A frozen picker in the scrollback must never supply the region — the
+        live one renders at the bottom (this repo's bottom-most-is-live rule)."""
+        pane = "\n".join(
+            [
+                "An older, already-answered question?",
+                "",
+                "  1. Yes",
+                "❯ 2. No",
+                "Enter to select · Esc to cancel",
+                "",
+                "What's your favorite color?",
+                "",
+                "  1. Blue",
+                "❯ 2. Type something.",
+                "Enter to select · Esc to cancel",
+            ]
+        )
+        assert tp.auq_question_region(pane) == "What's your favorite color?"

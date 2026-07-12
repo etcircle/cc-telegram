@@ -2306,13 +2306,54 @@ identical but whose QUESTION differs — a pure-pane parse yields
 `current_question_title is None` (so its title check skips) and empty option
 descriptions, so the labels are the only pane-observable content it has. That is
 exactly the shape the interleaving needs, so agreement also requires — **at
-PRE-KEYSTROKE observations only** — the record's question text to be visibly on the
-pane (whitespace-squashed substring; the live picker renders its question directly
-above the options). It is NOT applied post-write, because a long answer typed into a
+PRE-KEYSTROKE observations only** — the record's question to BE THE QUESTION THE LIVE
+PICKER IS ASKING. It is NOT applied post-write, because a long answer typed into a
 bottom-anchored picker can legitimately scroll the question off, and a false refusal
 *there* strands a draft inside a live card — the most expensive failure in the
 transaction. After the first keystroke the anchor KEY (unchanged across the sandwich,
 and equal to the planned one) carries the occurrence proof.
+
+**AND THE QUESTION BINDING TARGETS THE PANE'S QUESTION, NOT ITS CONTENTS (round-6 P1 —
+a whole-pane substring search committed onto the WRONG CARD).** The binding was
+`_squash_ws(question) in _squash_ws(pane_text)`: the record's question only had to
+occur SOMEWHERE. Codex's reproduced interleaving: card A asks *"What's your favorite
+color?"* with options `Blue / Green / Red`; A resolves; successor B's hook writes an
+anchor whose question is **`"Blue"`** with the SAME option labels; B has not drawn, so
+the pane still holds A. The ownership leg passes (A owns the pane), the sandwich passes
+(the anchor is stable), the LABEL comparison passes (same labels) — and the question
+binding passes too, **because the string `Blue` occurs in A's option row.** B renders,
+every later observation matches, and the Enter commits the user's answer onto B.
+Squashing made it strictly worse: with every line and token boundary destroyed, a
+"question" could even SPAN A's real question and its first option row.
+
+A card is named by the question it ASKS, so the comparison now targets the pane's
+**QUESTION REGION** — the column-0 block Claude Code renders directly above the live
+option block (`terminal_parser.auq_question_region`, anchored on the BOTTOM-MOST picker
+footer and on the SAME block walk `parse_ask_user_question` uses, so the two can never
+disagree about which picker is live) — and it is an **EQUALITY against that region,
+never a substring of the pane**. An option label, an option description, prose in the
+scrollback, the picker's own footer: none of them is evidence about which card is live,
+and none of them counts as any. **Wrap tolerance, without giving the boundaries back:**
+a long question soft-wraps across physical rows and a false refusal there would kill the
+lane for every long question, so the region's rows are REJOINED — first on a single
+space (a WORD wrap breaks at a space, so this reconstructs the question exactly;
+boundary-preserving, and the comparison that decides the ordinary case), and failing
+that with all whitespace removed (the tolerance for a token LONGER than the wrap column,
+which CC hard-breaks MID-token so no space-join can reconstruct it). Both are
+EQUALITIES against the region alone, so neither can re-open the substring hole. A region
+that cannot be derived (the question scrolled off; the picker glued straight to chrome)
+is `None` and REFUSES — fail-closed, and identical to the pre-fix behavior for that
+shape (the question was not on the pane to be found either).
+
+**SCOPING (deliberate).** The tightening lives in the FREE-TEXT ANCHOR path ONLY. The
+shared `_record_consistent_with_pane` — consumed by the picker RENDER path, the `aqp:`
+dispatch's `validate_and_consume`, `status_polling`'s source-drift re-mint and the
+GH #48 recap identity — never had a question leg and is **byte-untouched**: tightening
+it would flip render decisions (`side_file_ok` → `bail`/`rescue`), dropping the AUQ
+context card or suppressing pick buttons on real cards, and none of those consumers has
+a wrong-card COMMIT hazard to justify it. Pinned by
+`test_the_SHARED_predicate_is_byte_untouched` (the same card-BLUE record the anchor lane
+now refuses is still ACCEPTED by the shared predicate, exactly as before).
 
 **The residual, disclosed and NOT closed:** two AUQs with the **same option labels AND
 the same question text** are identical in every pane-observable respect, so no content

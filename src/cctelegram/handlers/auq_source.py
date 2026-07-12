@@ -1241,8 +1241,62 @@ ANCHOR_MISMATCH: Final = "mismatch"
 ANCHOR_INDETERMINATE: Final = "indeterminate"
 
 
+def _collapse_ws(text: str) -> str:
+    """Whitespace runs → ONE space; edges stripped. BOUNDARY-PRESERVING."""
+    return " ".join(text.split())
+
+
 def _squash_ws(text: str) -> str:
+    """Every whitespace character removed. Destroys line and token boundaries."""
     return re.sub(r"\s+", "", text)
+
+
+def _question_binds_to_pane(question: str, pane_text: str) -> bool:
+    """Is ``question`` the question THIS pane's live picker is ASKING?
+
+    **Round-6 P1 — this used to be ``_squash_ws(question) in _squash_ws(pane)``,
+    a substring search over the WHOLE pane.** A card is named by the question it
+    asks, but that test only asked whether the text occurred SOMEWHERE — so a
+    successor record whose question was merely one of the pane's OPTION LABELS
+    ("Blue"), or an option description, or prose the user typed in the
+    scrollback, or the picker's own footer, satisfied it. Squashing made it
+    strictly worse: with every line and token boundary destroyed, a "question"
+    could even SPAN the real question's tail and the first option row. The
+    executor then typed the user's answer into the pane it had just proved and
+    committed it onto the WRONG CARD (Codex's reproduced interleaving).
+
+    So the comparison targets the pane's QUESTION REGION — the block Claude Code
+    renders directly above the live option block
+    (:func:`terminal_parser.auq_question_region`) — and it is an EQUALITY against
+    that region, never a substring of the pane. A match anywhere else on the pane
+    is not evidence about which card is live, and no longer counts as any.
+
+    **Wrap tolerance, without giving the boundaries back.** A long question is
+    soft-wrapped across several physical rows, and a false refusal here would kill
+    the lane for every long question — so the region's rows are REJOINED before
+    the comparison. Two shapes, in order:
+
+      1. the rows rejoined on a single space (a WORD wrap breaks at a space, so
+         this reconstructs the question exactly) — boundary-preserving, and the
+         comparison that decides the ordinary case;
+      2. failing that, both sides with all whitespace removed — the tolerance for
+         a token LONGER than the wrap column, which Claude Code hard-breaks
+         MID-token so no space-join can reconstruct it. Still an EQUALITY, and
+         still against the region alone, so it cannot re-open the substring hole:
+         the most it can do is call two strings equal that differ only in where
+         their spaces fall, which is not a thing the pane can render.
+
+    ``False`` is FAIL-CLOSED: the caller reports MISMATCH and, pre-keystroke, the
+    lane declines to PR-1.
+    """
+    from ..terminal_parser import auq_question_region
+
+    region = auq_question_region(pane_text)
+    if not region:
+        return False
+    if _collapse_ws(region) == _collapse_ws(question):
+        return True
+    return _squash_ws(region) == _squash_ws(question)
 
 
 def anchor_pane_agreement(
@@ -1278,10 +1332,14 @@ def anchor_pane_agreement(
     alone — the documented, rig-measured AUQ overflow case. It is NOT a licence:
     the caller still requires the anchor KEY to be unchanged.
 
-    ``bind_question_text`` additionally requires the record's question text to be
-    VISIBLY ON THE PANE. That is the leg that separates two cards with IDENTICAL
-    option labels — which the label comparison provably cannot (verified: see
-    below) — and it is the leg that closes the reviewer's exact interleaving.
+    ``bind_question_text`` additionally requires the record's question to BE THE
+    QUESTION THE LIVE PICKER IS ASKING — an EQUALITY against the pane's question
+    REGION (``_question_binds_to_pane``), never a substring of the pane. That is
+    the leg that separates two cards with IDENTICAL option labels — which the
+    label comparison provably cannot (verified: see below) — and it is the leg
+    that closes the reviewer's exact interleaving. **Round-6 P1: it was a
+    whole-pane substring search, so a record whose question was merely an option
+    LABEL passed it and the answer was committed onto the WRONG CARD.**
     Callers pass it ONLY at PRE-KEYSTROKE observations, because the question sits
     ABOVE the option block and a long typed answer can legitimately scroll it off
     a bottom-anchored picker; a false refusal there would strand a draft inside a
@@ -1341,10 +1399,10 @@ def anchor_pane_agreement(
         question = (questions[0].get("question") or "").strip()
         if not question:
             return ANCHOR_MISMATCH
-        if _squash_ws(question) not in _squash_ws(pane_text):
+        if not _question_binds_to_pane(question, pane_text):
             logger.info(
-                "AUQ anchor/pane DISAGREE reason=question_absent — the record's "
-                "question text is not on the pane"
+                "AUQ anchor/pane DISAGREE reason=question_mismatch — the record's "
+                "question is not the one the live picker is asking"
             )
             return ANCHOR_MISMATCH
     return ANCHOR_MATCH

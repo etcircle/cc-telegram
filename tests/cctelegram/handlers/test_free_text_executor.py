@@ -1570,3 +1570,266 @@ class TestArrowKeysAreNotADraft:
         # is the AUTHORITY ``deliver_to_window`` consults, so the next message
         # cannot be typed onto the pane the arrows touched.
         assert terminal_parser.classify_input_box_failure(plain(AUQ_X_LIVE)) is not None
+
+
+# ── peer-review round 6 ───────────────────────────────────────────────────
+
+# THE ROUND-6 P1. The question binding used to be a WHOLE-PANE substring search
+# over the whitespace-SQUASHED pane, so the record's question only had to occur
+# SOMEWHERE — inside an option label, an option description, the user's own
+# prompt in the scrollback, even the picker's footer. Whitespace removal made it
+# worse: it destroys line and token boundaries, so the match was far wider than
+# equality.
+#
+# Card BLUE is the reviewer's reduction: its question IS one of card X's option
+# labels, and its option labels are card X's labels. Every leg of the agreement
+# then passed on card X's pane, so the executor typed the user's answer to
+# "What's your favorite color?" and committed it onto card BLUE.
+CARD_BLUE_TOOL_INPUT = {
+    "questions": [
+        {
+            "question": "Blue",
+            "header": "Color",
+            "options": [{"label": "Blue"}, {"label": "Green"}, {"label": "Red"}],
+            "multiSelect": False,
+        }
+    ]
+}
+
+# The question row as Claude Code renders it on card X (bold, column 0).
+_Q_ROW = "\x1b[1m\x1b[38;5;231mWhat's your favorite color?\x1b[0m"
+
+# A LONG question, and the physical rows CC soft-wraps it into. Joining the rows
+# with a single space reproduces the record's question EXACTLY — which is what a
+# word-wrap does, and what the binding must tolerate.
+WRAPPED_Q = (
+    "Which of these three colors would you pick for the primary accent of the "
+    "new dashboard theme, given that it has to stay legible on both the light "
+    "and the dark background?"
+)
+WRAPPED_ROWS = [
+    "Which of these three colors would you pick for the primary accent of the",
+    "new dashboard theme, given that it has to stay legible on both the light",
+    "and the dark background?",
+]
+
+# A question carrying a token longer than the wrap column: CC HARD-BREAKS it, so
+# the rows do NOT rejoin on a space boundary. The binding tolerates that too.
+HARD_BROKEN_Q = (
+    "Which color suits https://example.com/a/deliberately/long/path/segment best?"
+)
+HARD_BROKEN_ROWS = [
+    "Which color suits https://example.com/a/deliberately/lo",
+    "ng/path/segment best?",
+]
+
+
+def _rewrap_question(ansi: str, rows: list[str]) -> str:
+    """Re-render card X's question as the physical ROWS CC would wrap it into.
+
+    Mechanical and byte-level, exactly like ``free_text_frames``' derivations: CC
+    renders the question at column 0 and soft-wraps it across physical rows, and
+    tmux's capture emits one line per row (it does not re-indent continuations).
+    Nothing else on the frame is touched.
+    """
+    assert _Q_ROW in ansi
+    return ansi.replace(
+        _Q_ROW, "\n".join(f"\x1b[1m\x1b[38;5;231m{r}\x1b[0m" for r in rows)
+    )
+
+
+def _tool_input(question: str) -> dict:
+    return {
+        "questions": [
+            {
+                "question": question,
+                "header": "Color",
+                "options": [{"label": "Blue"}, {"label": "Green"}, {"label": "Red"}],
+                "multiSelect": False,
+            }
+        ]
+    }
+
+
+class TestTheQuestionBindingTargetsThePanesQUESTION:
+    """round-6 P1 — the binding must name the pane's QUESTION, not its CONTENTS.
+
+    The pane's question is the block ADJACENT to the live option block. A match
+    anywhere else — an option label, an option description, prose in the
+    scrollback, the picker footer — is not evidence that the record describes
+    this card, and card BLUE proves it: its question is card X's option label, so
+    the whole-pane substring search accepted it and the answer was committed onto
+    the WRONG CARD.
+
+    SCOPE: this tightening lives in the FREE-TEXT ANCHOR path only. The shared
+    ``_record_consistent_with_pane`` (render decisions, ``aqp:`` dispatch, the
+    source-drift re-mint, the GH #48 recap) never had a question leg and is
+    byte-untouched — see ``test_the_SHARED_predicate_is_byte_untouched``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_successor_whose_question_is_an_OPTION_LABEL_never_gets_the_answer(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """RED before the fix: ``pane.enter_sent`` is True and the result is
+        DELIVERED — the user's answer to "What's your favorite color?" is committed
+        as the answer to the card whose question is "Blue"."""
+        auq_anchor[0] = _anchor(
+            "auq:sid:SESSION_A:tu:toolu_CARD_BLUE", CARD_BLUE_TOOL_INPUT
+        )
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert pane.enter_sent is False, (
+            "the answer was committed onto the WRONG CARD — the record's question "
+            "only occurred inside an OPTION LABEL"
+        )
+        assert result is None, "declines BEFORE a keystroke; PR-1 owns the refusal"
+        assert pane.keys == []
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            pytest.param("Blue", id="an_option_label"),
+            pytest.param(
+                "Calm, cool, and the most commonly cited favorite color worldwide.",
+                id="an_option_description",
+            ),
+            pytest.param(
+                "ask me a single-select question with 3 options about my favorite "
+                "color",
+                id="the_users_own_prompt_in_the_scrollback",
+            ),
+            pytest.param("Enter to select", id="the_picker_footer"),
+            pytest.param("Color", id="the_tab_header"),
+            pytest.param(
+                # ONLY the whitespace squash could ever have matched this: it
+                # spans the question's TAIL and the first OPTION ROW, so it
+                # exists only once the LINE boundary between them is destroyed.
+                "favorite color? 1. Blue",
+                id="a_span_across_a_destroyed_line_boundary",
+            ),
+        ],
+    )
+    def test_incidental_pane_text_never_satisfies_the_binding(self, question):
+        assert (
+            auq_source.anchor_pane_agreement(
+                _tool_input(question),
+                plain(AUQ_X_LIVE),
+                target_row=4,
+                bind_question_text=True,
+            )
+            == auq_source.ANCHOR_MISMATCH
+        )
+
+    def test_the_GENUINE_question_still_matches(self):
+        assert (
+            auq_source.anchor_pane_agreement(
+                CARD_X_TOOL_INPUT,
+                plain(AUQ_X_LIVE),
+                target_row=4,
+                bind_question_text=True,
+            )
+            == auq_source.ANCHOR_MATCH
+        )
+
+    def test_a_SOFT_WRAPPED_question_still_matches(self):
+        """The non-regression that keeps the feature alive: a long question wraps
+        across physical rows, and the binding must rejoin them."""
+        pane = plain(_rewrap_question(AUQ_X_LIVE, WRAPPED_ROWS))
+        assert (
+            auq_source.anchor_pane_agreement(
+                _tool_input(WRAPPED_Q), pane, target_row=4, bind_question_text=True
+            )
+            == auq_source.ANCHOR_MATCH
+        )
+
+    def test_a_HARD_BROKEN_token_still_matches(self):
+        """A token longer than the wrap column is broken MID-TOKEN, so the rows do
+        not rejoin on a space. The binding tolerates it — as an EQUALITY against
+        the question region, never a substring of the pane."""
+        pane = plain(_rewrap_question(AUQ_X_LIVE, HARD_BROKEN_ROWS))
+        assert (
+            auq_source.anchor_pane_agreement(
+                _tool_input(HARD_BROKEN_Q), pane, target_row=4, bind_question_text=True
+            )
+            == auq_source.ANCHOR_MATCH
+        )
+
+    def test_a_wrapped_question_that_disagrees_still_REFUSES(self):
+        """Wrap tolerance is not a licence: the region must still BE the question."""
+        pane = plain(_rewrap_question(AUQ_X_LIVE, WRAPPED_ROWS))
+        assert (
+            auq_source.anchor_pane_agreement(
+                _tool_input("Which color do you HATE?"),
+                pane,
+                target_row=4,
+                bind_question_text=True,
+            )
+            == auq_source.ANCHOR_MISMATCH
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_wrapped_question_still_COMMITS_end_to_end(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """The false-refusal guard on the live call path: a long, wrapped question
+        is the common case, and it must still deliver."""
+        auq_anchor[0] = _anchor(
+            "auq:sid:SESSION_A:tu:toolu_CARD_WRAPPED", _tool_input(WRAPPED_Q)
+        )
+        pane = FakePane(
+            [
+                _rewrap_question(AUQ_X_LIVE, WRAPPED_ROWS),
+                _rewrap_question(AUQ_X_LANDED, WRAPPED_ROWS),
+                _rewrap_question(AUQ_X_TYPED, WRAPPED_ROWS),
+                AUQ_RESOLVED,
+            ]
+        )
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is not None and result.ok, result
+        assert result.outcome is DeliveryOutcome.DELIVERED
+        assert pane.enter_sent is True
+        assert stamped == [(1, 42, WINDOW)]
+
+    def test_the_SHARED_predicate_is_byte_untouched(self):
+        """The scoping choice, pinned. ``_record_consistent_with_pane`` is consumed
+        by the picker RENDER path, the ``aqp:`` dispatch's ``validate_and_consume``,
+        the source-drift re-mint and the GH #48 recap identity — none of which has
+        a wrong-card COMMIT hazard. It never had a question leg, and tightening it
+        would flip render decisions (``side_file_ok`` → ``bail``/``rescue``),
+        dropping the AUQ context card or suppressing pick buttons on real cards. So
+        the question binding stays in the ANCHOR path, where the hazard lives.
+        """
+        pane_form = terminal_parser.parse_ask_user_question(plain(AUQ_X_LIVE))
+        assert pane_form is not None
+        record = auq_source.PreToolAskRecord(
+            tool_input=CARD_BLUE_TOOL_INPUT,
+            session_id="",
+            tool_use_id="",
+            written_at=0.0,
+            input_fingerprint="",
+        )
+        assert auq_source._record_consistent_with_pane(record, pane_form) == (
+            True,
+            "ok",
+        ), "the SHARED predicate accepts it exactly as before — labels agree"
+
+        # …and the anchor lane, which is the one that can commit a keystroke,
+        # refuses the very same record.
+        assert (
+            auq_source.anchor_pane_agreement(
+                CARD_BLUE_TOOL_INPUT,
+                plain(AUQ_X_LIVE),
+                target_row=4,
+                bind_question_text=True,
+            )
+            == auq_source.ANCHOR_MISMATCH
+        )

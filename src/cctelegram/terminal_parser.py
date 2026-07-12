@@ -1643,6 +1643,159 @@ def _footer_block_contiguous_with_header(
     return True
 
 
+def _walk_back_from_picker_footer(
+    lines: list[str], footer_idx: int
+) -> tuple[int, int | None, int]:
+    """Walk UP from the picker footer to the live option block's top.
+
+    Returns ``(block_top, stop_idx, blank_gap)``:
+
+      * ``block_top``  — the topmost line still belonging to the live option
+        block (numbered options, their indented descriptions, the separators and
+        blanks between them);
+      * ``stop_idx``   — the first NON-block line above it, when it is a
+        column-0 candidate for the question text (``None`` when the walk fell off
+        the top of the buffer, or the line was indented — Claude Code renders the
+        question at column 0, and indented lines above the topmost option are
+        invariably scrollback noise);
+      * ``blank_gap``  — how many blank lines separate ``stop_idx`` from the
+        topmost option (the caller bounds it, so pre-picker scrollback can't be
+        pulled in).
+
+    EXTRACTED VERBATIM from ``parse_ask_user_question`` (which still owns the two
+    display fields it feeds) so the GH #50 PR-2 question-region extractor
+    (:func:`auq_question_region`) anchors on the SAME live block the parse does —
+    one walk, one definition of "the block", no drift between them.
+    """
+    start_idx = footer_idx
+    stop_idx: int | None = None
+    blank_gap = 0
+    for j in range(footer_idx - 1, -1, -1):
+        line = lines[j]
+        stripped = line.strip()
+        if not stripped:
+            start_idx = j
+            blank_gap += 1
+            continue
+        if _RE_NUMBERED_OPTION.match(line):
+            start_idx = j
+            blank_gap = 0
+            continue
+        # Separator line (only ─ chars).
+        if all(c == "─" for c in stripped):
+            start_idx = j
+            blank_gap = 0
+            continue
+        # Description continuation — non-empty indented text within
+        # ~7 lines (in either direction) of a numbered option. The
+        # symmetric scan handles the LAST option's descriptions,
+        # which only have a numbered option ABOVE them in file
+        # order (the footer is below). Without the upward arm the
+        # walk-back terminated at the last desc line, leaving
+        # ``pane_opts=0`` and forcing ``_build_pick_button_rows``'s
+        # ``fa5_guard`` to suppress option buttons on multi-Q AUQs
+        # that Claude Code renders without a multi-tab header.
+        # Bounded distance still rejects stale indented scrollback
+        # that has no nearby option.
+        if line.startswith(("  ", "\t")) and (
+            any(
+                _RE_NUMBERED_OPTION.match(lines[k])
+                for k in range(j + 1, min(j + 8, footer_idx + 1))
+            )
+            or any(_RE_NUMBERED_OPTION.match(lines[k]) for k in range(max(0, j - 7), j))
+        ):
+            start_idx = j
+            blank_gap = 0
+            continue
+        # Non-pattern line — title-display candidate. Only set ``stop_idx``
+        # here so the for-loop falling off the top of the buffer (no break)
+        # keeps it at None: a buffer that is entirely pattern lines has no
+        # title to capture. Also reject indented lines as title candidates
+        # — Claude Code's question text is rendered at column 0, and indented
+        # lines above the topmost option are invariably scrollback noise
+        # (hermes review, 2026-05-21).
+        if not line.startswith(("  ", "\t")):
+            stop_idx = j
+        break
+    return start_idx, stop_idx, blank_gap
+
+
+# How many PHYSICAL rows a question may occupy before ``auq_question_region``
+# stops collecting. Claude Code renders the question at column 0 and soft-wraps
+# it, so a long question is several rows; the bound keeps an unbroken run of
+# assistant prose above a blank-less picker from being glued in wholesale. At
+# the bot's 160-column geometry this is ~1.9 kB of question — far past anything
+# a picker heading realistically carries, so the truncation it fails closed on
+# is not a shape we expect to meet.
+_QUESTION_REGION_MAX_ROWS: Final = 12
+
+
+def auq_question_region(pane_text: str) -> str | None:
+    """The pane's QUESTION REGION: the text block ADJACENT to the live options.
+
+    ``None`` when the pane carries no live picker, or when the block above it is
+    not a column-0 text block (the question scrolled off, or the picker is glued
+    straight to chrome). Callers must fail CLOSED on ``None``.
+
+    **WHY THIS EXISTS (peer-review round-6 P1).** The free-text lane binds the
+    PreToolUse record's question to the pane it captured, and that binding used to
+    be a substring search over the WHOLE pane — so a record whose question was
+    merely an option LABEL ("Blue"), an option description, prose in the
+    scrollback, or even the picker's own footer satisfied it, and the executor
+    committed the user's answer onto the WRONG CARD. A card is named by the
+    question it ASKS, so the comparison must target the region that carries it —
+    the block Claude Code renders directly above the option block — and nothing
+    else on the pane.
+
+    The rows are returned SEPARATE (joined by ``\\n``), boundaries intact: a
+    caller that wants wrap tolerance must rejoin them explicitly, and one that
+    wants token boundaries still has them. Anchored on the BOTTOM-MOST picker
+    footer (this repo's bottom-most-is-live rule — the live picker renders at the
+    bottom and its scrollback above is frozen) and on the SAME block walk
+    ``parse_ask_user_question`` uses, so the two can never disagree about which
+    picker is live.
+    """
+    if not pane_text:
+        return None
+    lines = pane_text.split("\n")
+
+    footer_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _RE_PICKER_FOOTER.search(lines[i]):
+            footer_idx = i
+            break
+    if footer_idx is None:
+        return None
+
+    _block_top, stop_idx, blank_gap = _walk_back_from_picker_footer(lines, footer_idx)
+    # ``blank_gap`` bounded exactly as the walk-back title's is: more than a
+    # couple of blank rows between the text and the topmost option means the two
+    # are not adjacent, and whatever is up there is not this picker's question.
+    if stop_idx is None or blank_gap > 2:
+        return None
+
+    rows: list[str] = [lines[stop_idx].strip()]
+    for k in range(stop_idx - 1, -1, -1):
+        if len(rows) >= _QUESTION_REGION_MAX_ROWS:
+            break
+        prev = lines[k]
+        prev_stripped = prev.strip()
+        if not prev_stripped:
+            break
+        if _RE_NUMBERED_OPTION.match(prev):
+            break
+        if all(c == "─" for c in prev_stripped):
+            break
+        if prev.startswith(("  ", "\t")):
+            # Indented prior content is an option-description continuation or
+            # unrelated bullet text — not part of the question. (tmux's pane
+            # capture does not re-indent soft-wrapped lines, so a wrapped
+            # question's continuation rows start at column 0.)
+            break
+        rows.append(prev_stripped)
+    return "\n".join(reversed(rows))
+
+
 def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     """Structured parse of the AskUserQuestion picker in ``pane_text``.
 
@@ -1724,58 +1877,9 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     # enough to push it well above the last 25 lines.
     footer_block_top: int | None = None
     if footer_idx is not None:
-        start_idx = footer_idx
-        for j in range(footer_idx - 1, -1, -1):
-            line = lines[j]
-            stripped = line.strip()
-            if not stripped:
-                start_idx = j
-                walkback_blank_gap += 1
-                continue
-            if _RE_NUMBERED_OPTION.match(line):
-                start_idx = j
-                walkback_blank_gap = 0
-                continue
-            # Separator line (only ─ chars).
-            if all(c == "─" for c in stripped):
-                start_idx = j
-                walkback_blank_gap = 0
-                continue
-            # Description continuation — non-empty indented text within
-            # ~7 lines (in either direction) of a numbered option. The
-            # symmetric scan handles the LAST option's descriptions,
-            # which only have a numbered option ABOVE them in file
-            # order (the footer is below). Without the upward arm the
-            # walk-back terminated at the last desc line, leaving
-            # ``pane_opts=0`` and forcing ``_build_pick_button_rows``'s
-            # ``fa5_guard`` to suppress option buttons on multi-Q AUQs
-            # that Claude Code renders without a multi-tab header.
-            # Bounded distance still rejects stale indented scrollback
-            # that has no nearby option.
-            if line.startswith(("  ", "\t")) and (
-                any(
-                    _RE_NUMBERED_OPTION.match(lines[k])
-                    for k in range(j + 1, min(j + 8, footer_idx + 1))
-                )
-                or any(
-                    _RE_NUMBERED_OPTION.match(lines[k]) for k in range(max(0, j - 7), j)
-                )
-            ):
-                start_idx = j
-                walkback_blank_gap = 0
-                continue
-            # Non-pattern line — title-display candidate. Only set
-            # ``walkback_stop_idx`` here so the for-loop falling off
-            # the top of the buffer (no break) keeps it at None: a
-            # buffer that is entirely pattern lines has no title to
-            # capture. Also reject indented lines as title candidates
-            # — Claude Code's question text is rendered at column 0,
-            # and indented lines above the topmost option are
-            # invariably scrollback noise (hermes review, 2026-05-21).
-            if not line.startswith(("  ", "\t")):
-                walkback_stop_idx = j
-            break
-        footer_block_top = start_idx
+        footer_block_top, walkback_stop_idx, walkback_blank_gap = (
+            _walk_back_from_picker_footer(lines, footer_idx)
+        )
 
     # Governance decision (PR-3 PR-A). The bare "any ←…→ header wins" rule
     # let a STALE tab header in deep scrollback hijack the parse whenever a

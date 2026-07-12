@@ -497,7 +497,28 @@ Additional modules:
                                     PRE-KEYSTROKE observations ONLY (post-write a
                                     long answer can legitimately scroll the question
                                     off a bottom-anchored picker, and a false refusal
-                                    there strands a draft inside a LIVE CARD).
+                                    there strands a draft inside a LIVE CARD). AND
+                                    THAT BINDING TARGETS THE PANE'S QUESTION, NOT ITS
+                                    CONTENTS (round-6 P1): it was a whole-pane
+                                    whitespace-squashed SUBSTRING search, so a
+                                    successor record whose question was merely one of
+                                    the pane's OPTION LABELS ("Blue", same labels)
+                                    passed every leg and the Enter committed onto the
+                                    WRONG CARD (Codex-reproduced). It is now an
+                                    EQUALITY against the pane's QUESTION REGION
+                                    (terminal_parser.auq_question_region — the
+                                    column-0 block directly above the live option
+                                    block, anchored on the BOTTOM-MOST picker footer
+                                    and the SAME block walk parse_ask_user_question
+                                    uses), never a substring of the pane; wrap
+                                    tolerance comes from REJOINING the region's rows
+                                    (space-join, then all-whitespace-removed for a
+                                    hard-broken token), both still equalities against
+                                    the region alone. An underivable region REFUSES.
+                                    SCOPED to the anchor path — the shared
+                                    _record_consistent_with_pane (render, aqp:
+                                    dispatch, source-drift re-mint, GH #48 recap)
+                                    never had a question leg and is byte-untouched.
                                     Disclosed residual, WIDER than the reviewer
                                     assumed: two AUQs with the same labels AND the
                                     same question text are pane-indistinguishable.
