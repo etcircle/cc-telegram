@@ -385,180 +385,84 @@ Additional modules:
                                 captures, a FRESH in-lock pane_command_is_claude
                                 + version-license re-read before the first key,
                                 monotonic arrow nav, settle→re-parse→verify,
-                                Enter as the ONLY commit key). TWO THINGS MUST BE
-                                PROVEN, NOT ONE:
-                                  * the pane STATE — TYPED-STATE PROOF = SGR-2: the
-                                    affordance placeholder renders DIM while the row
-                                    is SELECTED and UNTYPED; typed text does not
-                                    (rig-verified, and on the adversarial payload
-                                    byte-identical to the placeholder); and
-                                  * WHICH CARD — SurfaceIdentity, captured before the
-                                    first key and RE-CHECKED after the nav and again
-                                    in the final pre-Enter capture. Every other leg
-                                    is equally satisfied by a SUCCESSOR card holding
-                                    our text (another controller can resolve card A
-                                    and render card B mid-transaction). Two
-                                    components: `pane`
-                                    (terminal_parser.free_text_surface_identity —
-                                    the REAL options 1..target_row-1, CURSOR-blind
-                                    AND TARGET-ROW-blind, so it survives the two
-                                    mutations the executor ITSELF performs; None ⇒
-                                    unrecoverable, never a weaker prefix) and
-                                    `anchor` — the OCCURRENCE-unique, out-of-band,
-                                    scroll-independent generation id, MANDATORY
-                                    (peer-review round-2 P1; derive_identity returns
-                                    None without one, so an anchor-less pane never
-                                    yields an identity and "None matches None" is
-                                    dead by construction): the PreToolUse side-file
-                                    occurrence id
-                                    (auq_source.peek_surface_identity_for_window —
-                                    the hook's per-invocation tool_use_id, minted
-                                    BEFORE the picker renders). The pane cannot tell
-                                    two identically-optioned AUQs apart, so NO side
-                                    file ⇒ the lane DECLINES; PreToolUse is thus a
-                                    REQUIREMENT of the lane, README-documented +
-                                    doctor-checked.
-                                    **THE ANCHOR IS READ BEFORE THE PANE** (round-3
-                                    P1, which a change of anchor SOURCE alone would
-                                    NOT have closed): derive_identity used to read
-                                    the anchor itself, AFTER its caller captured the
-                                    pane, minting the chimera (OLD pane, NEW anchor)
-                                    — and since the pane component is degenerate
-                                    across same-shaped occurrences, that chimera
-                                    MATCHES every later observation and commits onto
-                                    the successor. derive_identity now TAKES the
-                                    anchor; read_surface_anchor runs strictly BEFORE
-                                    every capture at all three observation points, so
-                                    the only reachable chimera is (NEWER pane, OLDER
-                                    anchor), which fails closed. Same "probe FIRST,
-                                    capture LAST" discipline as the PR-1 re-verify
-                                    (r2 F4).
-                                    **THE ANCHOR CARRIES THE SESSION GENERATION**
-                                    (round-4 P1 — the stale session cache defeated
-                                    the anchor ENTIRELY). It used to resolve the
-                                    window's session via the CACHED
-                                    WindowState.session_id — a MIRROR of the
-                                    hook-written session_map.json, refreshed only on
-                                    the monitor's poll cycle. A /clear in the SAME
-                                    tmux window rotates the session while the cache
-                                    still names the old one, so all three
-                                    observations read the PREDECESSOR session's side
-                                    file while capturing the SUCCESSOR's pane: they
-                                    agree with each OTHER, nothing refuses, and the
-                                    Enter commits the answer onto the WRONG QUESTION
-                                    (a per-window predicate cannot see it — both
-                                    sessions occupy the same window). auq_source now
-                                    resolves through
-                                    session.read_session_id_for_window_fresh and
-                                    EMBEDS the id in the anchor
-                                    (auq:sid:<session>:tu:<tool_use_id>), so a
-                                    rotation between any two observation points
-                                    changes the anchor and refuses; a successor with
-                                    no side file yields None, which refuses too. An
-                                    EMPTY hook-captured tool_use_id also yields None
-                                    (round-4 P2 — a (written_at, content-hash)
-                                    composite is a guessable stand-in for an
-                                    occurrence witness, not one; scoped to the ANCHOR
-                                    path, the GH #48 recap lane keeps its composite).
-                                    **AND THE ANCHOR IS BOUND TO THE PANE, NOT TO
-                                    THE READ ORDER** (round-5 P1-B — "anchor before
-                                    pane" was BACKWARDS). Round 3's ordering
-                                    argument silently assumes that a card the user
-                                    ALREADY ANSWERED stops looking LIVE on the pane.
-                                    PreToolUse writes card B's record BEFORE B
-                                    renders, so a pane still holding the answered
-                                    card A pairs with B's anchor — (OLD pane, NEW
-                                    anchor) — and two AUQs with identical option
-                                    labels cannot tell that chimera apart, so the
-                                    Enter commits onto B (REPRO-CONFIRMED: with the
-                                    guards reverted the executor sends it). THREE
-                                    folds, none a bet on ordering: (a) the card must
-                                    OWN the pane (plan_from_pane requires
-                                    pane_input_box_present is False — a live prompt
-                                    REPLACES the input box, a resolved one RESTORES
-                                    it; defence in depth, since today's parser
-                                    declines that shape independently); (b) each
-                                    capture is SANDWICHED between two EQUAL anchor
-                                    reads (_observe — the side file only moves
-                                    FORWARD, so equality at t0/t2 proves it did not
-                                    move at t1, when the pane was captured); (c) the
-                                    anchor RECORD's CONTENT must AGREE with the pane
-                                    (auq_source.anchor_pane_agreement,
-                                    TARGET-ROW-BLIND; match / mismatch /
-                                    indeterminate — the last being the overflow
-                                    shape, where the anchor stands alone). The
-                                    reused _record_consistent_with_pane was VERIFIED
-                                    on the live call path (the recorded reuse-claim
-                                    rule): it DOES reject differing labels and does
-                                    NOT reject a same-labels different-QUESTION
-                                    record (a pure-pane parse carries no title and
-                                    no option descriptions), so agreement also binds
-                                    the record's QUESTION TEXT to the pane — at
-                                    PRE-KEYSTROKE observations ONLY (post-write a
-                                    long answer can legitimately scroll the question
-                                    off a bottom-anchored picker, and a false refusal
-                                    there strands a draft inside a LIVE CARD). AND
-                                    THAT BINDING TARGETS THE PANE'S QUESTION, NOT ITS
-                                    CONTENTS (round-6 P1): it was a whole-pane
-                                    whitespace-squashed SUBSTRING search, so a
-                                    successor record whose question was merely one of
-                                    the pane's OPTION LABELS ("Blue", same labels)
-                                    passed every leg and the Enter committed onto the
-                                    WRONG CARD (Codex-reproduced). It is now an
-                                    EQUALITY against the pane's QUESTION REGION
-                                    (terminal_parser.auq_question_region — the
-                                    column-0 block directly above the live option
-                                    block, anchored on the BOTTOM-MOST picker footer
-                                    and the SAME block walk parse_ask_user_question
-                                    uses), never a substring of the pane. AND THE
-                                    REJOIN IS DECIDED BY THE PANE'S GEOMETRY, NEVER
-                                    BY DELETING THE WHITESPACE (round-7 P1-1): the
-                                    round-6 all-whitespace-REMOVED fallback (the
-                                    hard-broken-token tolerance) equated DIFFERENT
-                                    questions — a pane asking "Is nowhere safe?" and
-                                    a successor asking "Is now here safe?" squash
-                                    EQUAL, so the successor bound and committed onto
-                                    the WRONG CARD (Codex-reproduced). DELETED. The
-                                    rejoin is a CONSUMPTION WALK: each region row
-                                    must be an exact PREFIX of what is left of the
-                                    question, and a boundary with NO space in the
-                                    question is accepted ONLY when the row reaches
-                                    the pane's WRAP COLUMN
-                                    (terminal_parser.pane_wrap_column — the widest
-                                    physical row on the capture; capture-pane is not
-                                    given -J, so no line can exceed the terminal
-                                    width and over-estimation is impossible), because
-                                    a break mid-token only happens on a FULL row. The
-                                    premise "a row AT the wrap column was hard-broken"
-                                    is FALSE (fixture-pinned: the real
-                                    auq_longlabel_160x50_v2.1.198 capture's 160-column
-                                    rows end at WORD boundaries), so the geometry only
-                                    VETOES the hard-break reading, never forces it.
-                                    AND THE REGION CAP FAILS CLOSED (round-7 P1-2):
-                                    the 12-row cap used to RETURN the partial region,
-                                    a strictly WEAKER SUFFIX identity a successor's
-                                    whole question can equal (Codex-reproduced with a
-                                    13-row question) — it now returns None and the
-                                    binding REFUSES (an over-long question declines to
-                                    PR-1; the largest REAL capture is 9 rows).
-                                    SCOPED to the anchor path — the shared
-                                    _record_consistent_with_pane (render, aqp:
-                                    dispatch, source-drift re-mint, GH #48 recap)
-                                    never had a question leg and is byte-untouched
-                                    (round-7 P3: those consumers CAN reach a keystroke
-                                    — validate_and_consume → the aqp: navigate→Enter
-                                    dispatch — but that lane re-validates its exact
-                                    minted form + source fingerprint against the live
-                                    pane, so it is protected INDEPENDENTLY; the
-                                    scoping stands, the old "cannot commit a
-                                    keystroke" rationale was false).
-                                    Disclosed residuals: two AUQs with the same labels
-                                    AND the same question text are
-                                    pane-indistinguishable; and a row ending EXACTLY
-                                    at the wrap column renders identically whether the
-                                    original carried a space there or the token was
-                                    hard-broken (intrinsic — re-wrapping produces the
-                                    same rows — so the walk accepts both).
+                                Enter as the ONLY commit key).
+                                **THE GUARD IS THE PRE-TYPE LANDING PROOF, and the
+                                docs say so plainly (2026-07-12 — the earlier "two
+                                things must be proven" framing OVERCLAIMED the
+                                post-write legs).** Before a byte is typed, the row
+                                under the cursor must be: cursored, labelled EXACTLY
+                                "Type something.", and SGR-2 DIM. `dim` holds for
+                                EXACTLY ONE shape — the selected, UNTYPED
+                                placeholder — and a real option row is NEVER dim,
+                                not even when selected. So an overshoot / undershoot
+                                / stale frame / turned-over card can never put the
+                                payload onto an option row (rig-MEASURED declines,
+                                incl. a payload "Yes, but use postgres" against a
+                                card whose option 1 is literally "Yes"). `Down`
+                                CLAMPS on 2.1.207 and the nav is Down-ONLY by
+                                construction (the affordance row is last, so
+                                delta >= 0), so the wrap-to-option-1 hazard is
+                                unreachable; typing while parked on a real option row
+                                is SWALLOWED (the pane stays byte-identical).
+                                THE POST-WRITE LEGS ARE CORROBORATION, and three are
+                                MEASURABLY WEAK: auq_free_text_row_active (the ctrl+g
+                                hint) is ALSO present on the "N+2. Chat about this"
+                                row, so it proves "SOME text-field row", never which;
+                                payload_tail_landed is a WHOLE-PANE substring check
+                                that passes spuriously on scrollback echoing a
+                                previous answer; and the post-write dim=False +
+                                label-prefix pair PASSES on a selected real option
+                                row. They decide only whether the Enter may be sent,
+                                and they fail closed.
+                                WHICH CARD — SurfaceIdentity, captured before the
+                                first key and RE-CHECKED after the nav and again in
+                                the final pre-Enter capture, so a card that TURNS OVER
+                                mid-transaction (its hook rewrites the side file ⇒ the
+                                anchor moves) refuses. Two components: `pane`
+                                (terminal_parser.free_text_surface_identity — the REAL
+                                options 1..target_row-1, CURSOR-blind AND
+                                TARGET-ROW-blind, so it survives the two mutations the
+                                executor ITSELF performs; None ⇒ unrecoverable, never a
+                                weaker prefix) and `anchor` — the OCCURRENCE-unique,
+                                out-of-band, scroll-independent generation id, MANDATORY
+                                (derive_identity returns None without one, so an
+                                anchor-less pane never yields an identity): the
+                                PreToolUse side-file occurrence id
+                                (auq_source.peek_surface_anchor_for_window — the hook's
+                                per-invocation tool_use_id, minted BEFORE the picker
+                                renders, with the FRESHLY-resolved session id embedded
+                                so a /clear rotation is itself an anchor change). NO
+                                side file ⇒ the lane DECLINES; PreToolUse is thus a
+                                REQUIREMENT of the lane, README-documented +
+                                doctor-checked. The anchor is read STRICTLY BEFORE
+                                every capture, each capture is SANDWICHED between two
+                                EQUAL anchor reads (_observe), and the record's OPTION
+                                LABELS must AGREE with the pane
+                                (auq_source.anchor_pane_agreement, TARGET-ROW-BLIND;
+                                match / mismatch / indeterminate — the last being the
+                                overflow shape, where the anchor stands alone).
+                                **THE ACCEPTED RESIDUAL (owner decision 2026-07-12):**
+                                labels are the ONLY pane-observable content, so a
+                                SUCCESSOR card with the SAME option labels — whose
+                                PreToolUse record was written BEFORE our first
+                                observation but which had not yet DRAWN — can receive
+                                the prose intended for its predecessor. Consequence:
+                                the answer reaches a DIFFERENT QUESTION, seen
+                                immediately and correctable. NOT an option commit (the
+                                landing proof owns that). The machinery that tried to
+                                close it — a pane QUESTION-REGION extractor, a measured
+                                wrap column, and a row-consumption walk
+                                (terminal_parser.auq_question_region /
+                                pane_wrap_column, auq_source._question_binds_to_pane,
+                                the bind_question_text parameter) — is DELETED: it
+                                failed three straight review rounds on its own
+                                injectivity, and two AUQs sharing labels AND question
+                                were never separable on a pane anyway. The shared
+                                _record_consistent_with_pane stays byte-untouched (its
+                                consumers re-validate their own minted fingerprints).
+                                ALSO carried forward: the GH #50 M2 residual (a pty
+                                split of one send-keys -l could land a digit as a lone
+                                HOTKEY — empirically inert paste-shaped, NOT a proof).
                                 A braked window (PR-1's stranded-draft registry) is
                                 checked FIRST and DECLINES — the lane is never a way
                                 around the brake, and never clears it. VERSION-LICENSED

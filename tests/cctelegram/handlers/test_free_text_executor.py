@@ -51,6 +51,7 @@ from tests.free_text_frames import (
     EPM_LIVE,
     OVERFLOW_ANSWER,
     plain,
+    type_into_row,
 )
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -1284,51 +1285,57 @@ CARD_B_TOOL_INPUT = {
 
 
 class TestTheAnchorIsBoundToThePane:
-    """peer-review round-5 P1-B — "anchor BEFORE pane" is not enough.
+    """ "Anchor BEFORE pane" is not enough, so the anchor is BOUND to the pane.
 
-    Round 3 argued the dangerous chimera ``(OLD pane, NEW anchor)`` was
-    unreachable, because "a live prompt means Claude is BLOCKED on it, so the side
-    file must be its own". The unstated premise is that a card the user ALREADY
-    ANSWERED stops looking live on the pane — and ``PreToolUse`` writes card B's
+    The tempting argument — "a live prompt means Claude is BLOCKED on it, so the
+    side file must be its own" — has an unstated premise: that a card the user has
+    ALREADY ANSWERED stops looking live on the pane. ``PreToolUse`` writes card B's
     record BEFORE B renders, so there is a window in which the side file names B
-    while the pane still renders A. Two AUQs can carry identical option labels, so
-    that chimera then matches every later observation and the Enter commits onto
-    B: THE WRONG CARD.
+    while the pane still renders A: the ``(OLD pane, NEW anchor)`` chimera.
 
     Three folds, none of them a bet on read order:
 
       * the card must OWN the pane (no input box — a resolved AUQ restores it);
       * each capture is SANDWICHED between two equal anchor reads (``_observe``);
-      * the anchor RECORD's CONTENT must AGREE with the pane it is paired with.
+      * the anchor RECORD's OPTION LABELS must AGREE with the pane it is paired
+        with.
+
+    LABELS ARE THE ONLY PANE-OBSERVABLE CONTENT, so a SAME-LABELLED successor
+    survives all three. That is the ACCEPTED RESIDUAL, pinned below: it costs the
+    user a misrouted answer — never an option commit.
     """
 
     @pytest.mark.asyncio
-    async def test_the_reviewers_interleaving_never_answers_the_SUCCESSOR_card(
+    async def test_a_same_label_successor_CAN_get_the_answer_DISCLOSED_RESIDUAL(
         self, monkeypatch, auq_anchor, stamped
     ):
-        """THE ROUND-5 P1-B, reduced to its mechanism — RED before the fix.
+        """THE ACCEPTED RESIDUAL, pinned so it can never be believed closed.
 
-        The reviewer's exact interleaving: card A is on the pane; another
-        controller resolves it; B's ``PreToolUse`` hook writes B's record; B has
-        not drawn yet, so the pane still holds A's complete picker; the initial
-        observation therefore mints ``(pane A, anchor B)``; and B then renders with
-        IDENTICAL option geometry, so every later observation agrees with the
-        chimera and the Enter lands on B.
+        The interleaving: card A is on the pane; another controller resolves it;
+        successor B's ``PreToolUse`` hook writes B's record; B has not DRAWN yet,
+        so the pane still holds A's complete picker; the first observation mints
+        ``(pane A, anchor B)``; B then renders with IDENTICAL option geometry, so
+        every later observation agrees with that chimera.
 
-        Card B differs from card X ONLY in its question text — which is precisely
-        why the pane-identity component (option rows) cannot refuse it, and why
-        binding the record's QUESTION to the pane is the leg that must.
+        B differs from the live card ONLY in its question text, and a pure-pane
+        parse carries no question — so nothing pane-observable separates them. An
+        earlier revision grew a question-text binding (a pane question-REGION
+        extractor, a measured wrap column, a row-consumption walk) to refuse this.
+        It failed three straight review rounds on its own injectivity and was
+        DELETED (owner decision 2026-07-12).
 
-        RED before the fix (verified by removing the question binding from
-        ``plan_from_pane``): the transaction runs to completion and returns
-        DELIVERED — the user's answer to "What's your favorite color?" is committed
-        as the answer to "Which color do you HATE?".
+        WHAT THE USER ACTUALLY GETS: their prose reaches a DIFFERENT QUESTION.
+        They see it immediately and answer again. **It is NOT an option commit** —
+        the pre-type landing proof (cursor + SGR-2 DIM + the exact placeholder
+        label) makes that unreachable on ANY card, which is what
+        ``TestThePreTypeLandingProofIsTheGuard`` pins.
         """
         auq_anchor[0] = _anchor("auq:sid:SESSION_A:tu:toolu_CARD_B", CARD_B_TOOL_INPUT)
         pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
         _wire(monkeypatch, pane)
 
-        # The premise the pane component CANNOT see: B's rows are card X's rows.
+        # The premise: B's rows ARE the live card's rows, so the pane component of
+        # the identity cannot tell them apart.
         assert terminal_parser.free_text_surface_identity(
             plain(AUQ_X_LIVE), target_row=4
         ) == terminal_parser.free_text_surface_identity(
@@ -1337,15 +1344,14 @@ class TestTheAnchorIsBoundToThePane:
 
         result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
 
-        assert pane.enter_sent is False, (
-            "the answer was committed onto the SUCCESSOR card — the chimera is back"
-        )
-        assert result is None, "declines BEFORE a keystroke; PR-1 owns the refusal"
-        assert pane.keys == []
-        assert stamped == []
-        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
+        assert result is not None and result.ok, result
+        assert pane.enter_sent is True
+        # …and what got committed is PROSE in the free-text row, never an option:
+        # the payload was typed only AFTER the row proved dim + placeholder.
+        assert pane.literal_writes == [AUQ_X_ANSWER]
+        assert stamped == [(1, 42, WINDOW)]
 
-    def test_the_LABEL_comparison_alone_cannot_tell_those_two_cards_apart(self):
+    def test_the_LABEL_comparison_is_the_WHOLE_content_binding(self):
         """The measured limit of the reused helper — NOT assumed (this repo's
         "verify the reuse claim on the live call path" rule).
 
@@ -1353,23 +1359,14 @@ class TestTheAnchorIsBoundToThePane:
         differ from the pane, and DOES NOT reject one whose labels are identical
         but whose QUESTION differs: a pure-pane parse yields
         ``current_question_title is None`` (so the title check is skipped) and
-        empty option descriptions. Hence the question-text leg above — and hence
-        the honest residual: two AUQs with the same labels AND the same question
-        are the same card in every pane-observable respect.
+        empty option descriptions. That IS the residual above — stated as a fact
+        about the predicate, not papered over.
         """
         pane = plain(AUQ_X_LIVE)
         assert (
-            auq_source.anchor_pane_agreement(
-                CARD_B_TOOL_INPUT, pane, target_row=4, bind_question_text=False
-            )
+            auq_source.anchor_pane_agreement(CARD_B_TOOL_INPUT, pane, target_row=4)
             == auq_source.ANCHOR_MATCH
-        ), "labels alone ACCEPT the successor — this is the hole"
-        assert (
-            auq_source.anchor_pane_agreement(
-                CARD_B_TOOL_INPUT, pane, target_row=4, bind_question_text=True
-            )
-            == auq_source.ANCHOR_MISMATCH
-        ), "the question text is what separates them"
+        ), "labels alone accept a same-labelled successor — the disclosed residual"
 
     @pytest.mark.asyncio
     async def test_an_anchor_whose_LABELS_disagree_with_the_pane_declines(
@@ -1572,427 +1569,63 @@ class TestArrowKeysAreNotADraft:
         assert terminal_parser.classify_input_box_failure(plain(AUQ_X_LIVE)) is not None
 
 
-# ── peer-review round 6 ───────────────────────────────────────────────────
+class TestThePreTypeLandingProofIsTheGuard:
+    """**THE GUARD OF THE WHOLE LANE — named, and pinned as such.**
 
-# THE ROUND-6 P1. The question binding used to be a WHOLE-PANE substring search
-# over the whitespace-SQUASHED pane, so the record's question only had to occur
-# SOMEWHERE — inside an option label, an option description, the user's own
-# prompt in the scrollback, even the picker's footer. Whitespace removal made it
-# worse: it destroys line and token boundaries, so the match was far wider than
-# equality.
-#
-# Card BLUE is the reviewer's reduction: its question IS one of card X's option
-# labels, and its option labels are card X's labels. Every leg of the agreement
-# then passed on card X's pane, so the executor typed the user's answer to
-# "What's your favorite color?" and committed it onto card BLUE.
-CARD_BLUE_TOOL_INPUT = {
-    "questions": [
-        {
-            "question": "Blue",
-            "header": "Color",
-            "options": [{"label": "Blue"}, {"label": "Green"}, {"label": "Red"}],
-            "multiSelect": False,
-        }
-    ]
-}
+    Everything else in the transaction is corroboration. What makes an OPTION
+    COMMIT unreachable is the PRE-TYPE landing proof: before a byte is written the
+    row under the cursor must be cursored, labelled EXACTLY ``Type something.``,
+    and SGR-2 **DIM**. ``dim`` holds for exactly ONE shape — the SELECTED, UNTYPED
+    placeholder — and a real option row is NEVER dim, not even when selected.
 
-# The question row as Claude Code renders it on card X (bold, column 0).
-_Q_ROW = "\x1b[1m\x1b[38;5;231mWhat's your favorite color?\x1b[0m"
-
-# A LONG question, and the physical rows CC soft-wraps it into. Joining the rows
-# with a single space reproduces the record's question EXACTLY — which is what a
-# word-wrap does, and what the binding must tolerate.
-WRAPPED_Q = (
-    "Which of these three colors would you pick for the primary accent of the "
-    "new dashboard theme, given that it has to stay legible on both the light "
-    "and the dark background?"
-)
-WRAPPED_ROWS = [
-    "Which of these three colors would you pick for the primary accent of the",
-    "new dashboard theme, given that it has to stay legible on both the light",
-    "and the dark background?",
-]
-
-# The frame's WRAP COLUMN, measured from the frame itself (160 — the picker's own
-# full-width ``────`` box rules), exactly as ``pane_wrap_column`` measures it.
-WRAP = max(len(line) for line in plain(AUQ_X_LIVE).split("\n"))
-
-# A question carrying a token LONGER than the wrap column: CC HARD-BREAKS it, so
-# the rows do NOT rejoin on a space boundary. The binding tolerates that — but
-# only because the broken row is FULL, which is the geometry that proves a break
-# is even possible. (Round 7: the rows used to be 55 chars wide, i.e. a hard
-# break the pane could never have rendered; the old whitespace-SQUASH matched
-# them anyway, which is exactly the hole that got closed.)
-_HB_HEAD = "Which color suits the URL https://example.com/"
-HARD_BROKEN_Q = f"{_HB_HEAD}{'a' * 200} best?"
-HARD_BROKEN_ROWS = [HARD_BROKEN_Q[:WRAP], HARD_BROKEN_Q[WRAP:]]
-
-
-def _rewrap_question(ansi: str, rows: list[str]) -> str:
-    """Re-render card X's question as the physical ROWS CC would wrap it into.
-
-    Mechanical and byte-level, exactly like ``free_text_frames``' derivations: CC
-    renders the question at column 0 and soft-wraps it across physical rows, and
-    tmux's capture emits one line per row (it does not re-indent continuations).
-    Nothing else on the frame is touched.
-    """
-    assert _Q_ROW in ansi
-    return ansi.replace(
-        _Q_ROW, "\n".join(f"\x1b[1m\x1b[38;5;231m{r}\x1b[0m" for r in rows)
-    )
-
-
-def _tool_input(question: str) -> dict:
-    return {
-        "questions": [
-            {
-                "question": question,
-                "header": "Color",
-                "options": [{"label": "Blue"}, {"label": "Green"}, {"label": "Red"}],
-                "multiSelect": False,
-            }
-        ]
-    }
-
-
-class TestTheQuestionBindingTargetsThePanesQUESTION:
-    """round-6 P1 — the binding must name the pane's QUESTION, not its CONTENTS.
-
-    The pane's question is the block ADJACENT to the live option block. A match
-    anywhere else — an option label, an option description, prose in the
-    scrollback, the picker footer — is not evidence that the record describes
-    this card, and card BLUE proves it: its question is card X's option label, so
-    the whole-pane substring search accepted it and the answer was committed onto
-    the WRONG CARD.
-
-    SCOPE: this tightening lives in the FREE-TEXT ANCHOR path only. The shared
-    ``_record_consistent_with_pane`` (render decisions, ``aqp:`` dispatch, the
-    source-drift re-mint, the GH #48 recap) never had a question leg and is
-    byte-untouched — see ``test_the_SHARED_predicate_is_byte_untouched``.
+    So an overshoot, an undershoot, a stale frame, or a card that turned over
+    mid-nav can never put the payload onto an option row. Rig-verified (2026-07-12)
+    and pinned here on the real 2.1.207 bytes, including the adversarial shape: a
+    payload whose FIRST WORD IS an option's label.
     """
 
-    @pytest.mark.asyncio
-    async def test_a_successor_whose_question_is_an_OPTION_LABEL_never_gets_the_answer(
-        self, monkeypatch, auq_anchor, stamped
-    ):
-        """RED before the fix: ``pane.enter_sent`` is True and the result is
-        DELIVERED — the user's answer to "What's your favorite color?" is committed
-        as the answer to the card whose question is "Blue"."""
-        auq_anchor[0] = _anchor(
-            "auq:sid:SESSION_A:tu:toolu_CARD_BLUE", CARD_BLUE_TOOL_INPUT
-        )
-        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
-        _wire(monkeypatch, pane)
+    def test_a_real_option_row_is_NEVER_dim_even_when_it_is_the_selected_row(self):
+        selected_option = terminal_parser.parse_free_text_row(AUQ_X_LIVE, number=1)
+        assert selected_option is not None
+        assert selected_option.cursor is True, "row 1 IS the selected row here"
+        assert selected_option.dim is False, "…and a real option is never dim"
 
-        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
-
-        assert pane.enter_sent is False, (
-            "the answer was committed onto the WRONG CARD — the record's question "
-            "only occurred inside an OPTION LABEL"
-        )
-        assert result is None, "declines BEFORE a keystroke; PR-1 owns the refusal"
-        assert pane.keys == []
-        assert stamped == []
-        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
-
-    @pytest.mark.parametrize(
-        "question",
-        [
-            pytest.param("Blue", id="an_option_label"),
-            pytest.param(
-                "Calm, cool, and the most commonly cited favorite color worldwide.",
-                id="an_option_description",
-            ),
-            pytest.param(
-                "ask me a single-select question with 3 options about my favorite "
-                "color",
-                id="the_users_own_prompt_in_the_scrollback",
-            ),
-            pytest.param("Enter to select", id="the_picker_footer"),
-            pytest.param("Color", id="the_tab_header"),
-            pytest.param(
-                # ONLY the whitespace squash could ever have matched this: it
-                # spans the question's TAIL and the first OPTION ROW, so it
-                # exists only once the LINE boundary between them is destroyed.
-                "favorite color? 1. Blue",
-                id="a_span_across_a_destroyed_line_boundary",
-            ),
-        ],
-    )
-    def test_incidental_pane_text_never_satisfies_the_binding(self, question):
-        assert (
-            auq_source.anchor_pane_agreement(
-                _tool_input(question),
-                plain(AUQ_X_LIVE),
-                target_row=4,
-                bind_question_text=True,
-            )
-            == auq_source.ANCHOR_MISMATCH
-        )
-
-    def test_the_GENUINE_question_still_matches(self):
-        assert (
-            auq_source.anchor_pane_agreement(
-                CARD_X_TOOL_INPUT,
-                plain(AUQ_X_LIVE),
-                target_row=4,
-                bind_question_text=True,
-            )
-            == auq_source.ANCHOR_MATCH
-        )
-
-    def test_a_SOFT_WRAPPED_question_still_matches(self):
-        """The non-regression that keeps the feature alive: a long question wraps
-        across physical rows, and the binding must rejoin them."""
-        pane = plain(_rewrap_question(AUQ_X_LIVE, WRAPPED_ROWS))
-        assert (
-            auq_source.anchor_pane_agreement(
-                _tool_input(WRAPPED_Q), pane, target_row=4, bind_question_text=True
-            )
-            == auq_source.ANCHOR_MATCH
-        )
-
-    def test_a_HARD_BROKEN_token_still_matches(self):
-        """A token longer than the wrap column is broken MID-TOKEN, so the rows do
-        not rejoin on a space. The binding tolerates it — as an EQUALITY against
-        the question region, never a substring of the pane."""
-        pane = plain(_rewrap_question(AUQ_X_LIVE, HARD_BROKEN_ROWS))
-        assert (
-            auq_source.anchor_pane_agreement(
-                _tool_input(HARD_BROKEN_Q), pane, target_row=4, bind_question_text=True
-            )
-            == auq_source.ANCHOR_MATCH
-        )
-
-    def test_a_wrapped_question_that_disagrees_still_REFUSES(self):
-        """Wrap tolerance is not a licence: the region must still BE the question."""
-        pane = plain(_rewrap_question(AUQ_X_LIVE, WRAPPED_ROWS))
-        assert (
-            auq_source.anchor_pane_agreement(
-                _tool_input("Which color do you HATE?"),
-                pane,
-                target_row=4,
-                bind_question_text=True,
-            )
-            == auq_source.ANCHOR_MISMATCH
-        )
+        affordance = terminal_parser.parse_free_text_row(AUQ_X_LANDED, number=4)
+        assert affordance is not None
+        assert affordance.cursor is True
+        assert affordance.dim is True, "the untyped placeholder is the ONLY dim row"
+        assert affordance.label.strip() == terminal_parser.AUQ_FREE_TEXT_LABEL
 
     @pytest.mark.asyncio
-    async def test_a_wrapped_question_still_COMMITS_end_to_end(
-        self, monkeypatch, auq_anchor, stamped
+    async def test_a_cursor_parked_on_a_REAL_OPTION_declines_before_any_byte(
+        self, monkeypatch, stamped
     ):
-        """The false-refusal guard on the live call path: a long, wrapped question
-        is the common case, and it must still deliver."""
-        auq_anchor[0] = _anchor(
-            "auq:sid:SESSION_A:tu:toolu_CARD_WRAPPED", _tool_input(WRAPPED_Q)
-        )
-        pane = FakePane(
-            [
-                _rewrap_question(AUQ_X_LIVE, WRAPPED_ROWS),
-                _rewrap_question(AUQ_X_LANDED, WRAPPED_ROWS),
-                _rewrap_question(AUQ_X_TYPED, WRAPPED_ROWS),
-                AUQ_RESOLVED,
-            ]
-        )
+        """The adversarial shape: the nav ends on a REAL option at ``target_row``
+        whose label is a PREFIX of the payload (option ``Yes`` vs the payload
+        ``Yes, but use postgres``). Every post-write leg would accept that — the
+        landing proof does not."""
+        parked_on_a_real_option = type_into_row(AUQ_X_LANDED, 4, "Yes")
+        pane = FakePane([AUQ_X_LIVE, parked_on_a_real_option, parked_on_a_real_option])
         _wire(monkeypatch, pane)
 
-        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
-
-        assert result is not None and result.ok, result
-        assert result.outcome is DeliveryOutcome.DELIVERED
-        assert pane.enter_sent is True
-        assert stamped == [(1, 42, WINDOW)]
-
-    def test_the_SHARED_predicate_is_byte_untouched(self):
-        """The scoping choice, pinned — with the RATIONALE CORRECTED (round-7 P3).
-
-        ``_record_consistent_with_pane`` is consumed by the picker RENDER path, the
-        ``aqp:`` dispatch's ``validate_and_consume``, the source-drift re-mint and
-        the GH #48 recap identity. The round-6 text claimed those consumers "cannot
-        commit a keystroke". **That is FALSE**: ``validate_and_consume`` calls
-        ``resolve_auq_source`` and its caller goes on to the ``aqp:``
-        navigate→Enter dispatch. What actually makes the scoping safe is that the
-        ``aqp:`` lane is protected INDEPENDENTLY — it re-validates the EXACT minted
-        form fingerprint and the minted SOURCE fingerprint against the live pane
-        before any key, so a successor card whose question differs cannot be
-        dispatched into regardless of this predicate (Codex looked for an exploit
-        there and found none).
-
-        So the decision STANDS on its own merits: the predicate never had a
-        question leg, and tightening it would flip render decisions
-        (``side_file_ok`` → ``bail``/``rescue``), dropping the AUQ context card or
-        suppressing pick buttons on real cards — a real cost, bought for a lane
-        that already has its own proof. The question binding therefore stays in the
-        ANCHOR path, where the wrong-card COMMIT hazard actually lives.
-        """
-        pane_form = terminal_parser.parse_ask_user_question(plain(AUQ_X_LIVE))
-        assert pane_form is not None
-        record = auq_source.PreToolAskRecord(
-            tool_input=CARD_BLUE_TOOL_INPUT,
-            session_id="",
-            tool_use_id="",
-            written_at=0.0,
-            input_fingerprint="",
-        )
-        assert auq_source._record_consistent_with_pane(record, pane_form) == (
-            True,
-            "ok",
-        ), "the SHARED predicate accepts it exactly as before — labels agree"
-
-        # …and the anchor lane, which is the one that can commit a keystroke,
-        # refuses the very same record.
-        assert (
-            auq_source.anchor_pane_agreement(
-                CARD_BLUE_TOOL_INPUT,
-                plain(AUQ_X_LIVE),
-                target_row=4,
-                bind_question_text=True,
-            )
-            == auq_source.ANCHOR_MISMATCH
+        result = await free_text.try_answer(
+            WINDOW, "Yes, but use postgres", user_turn=STAMP
         )
 
-
-# ── peer-review round 7 ───────────────────────────────────────────────────
-
-# THE ROUND-7 P1-1. Round 6 targeted the question binding at the pane's QUESTION
-# REGION — but kept a fallback: "if the space-join fails, compare both sides with
-# ALL whitespace removed", justified as safe "because it is an equality against a
-# tight region". Equality does not make a lossy transformation injective, and
-# Codex demolished it in one counterexample: the pane asks "Is nowhere safe?",
-# the successor record asks "Is now here safe?" — two DIFFERENT questions, and
-# with the SAME option labels the squash makes them EQUAL, so the successor's
-# anchor binds to the live card and the answer commits onto the WRONG CARD.
-NOWHERE_ROWS = ["Is nowhere safe?"]
-NOWHERE_Q = "Is nowhere safe?"
-NOW_HERE_Q = "Is now here safe?"
-
-# The FALSIFIED PREMISE, pinned. "A row that ends exactly at the wrap column was
-# hard-broken mid-token" is FALSE for Claude Code: in the real 160-column capture
-# ``auq_longlabel_160x50_v2.1.198`` the question's rows 2 and 4 are EXACTLY 160
-# characters and both end at a WORD boundary ("…peer reviewers," / "…choice
-# trades"). So the geometry may only VETO the hard-break reading of a boundary —
-# never force it. A join rule that assumed otherwise would glue "reviewers,"
-# onto "but" and false-refuse every long question in the corpus.
-_EXACT_LEAD = "Which colour should the primary accent be"
-EXACT_COL_ROWS = [
-    f"{_EXACT_LEAD} {'x' * (WRAP - len(_EXACT_LEAD) - 1)}",
-    "and nothing?",
-]
-EXACT_COL_Q = " ".join(EXACT_COL_ROWS)
-# Its pane-indistinguishable twin: the pane renders these two questions
-# IDENTICALLY (a word wrap consumes the space; a hard break has none), so the
-# walk accepts both. Disclosed residual, not a hole the walk introduces.
-EXACT_COL_TWIN_Q = "".join(EXACT_COL_ROWS)
-
-# THE ROUND-7 P1-2. ``auq_question_region`` stopped collecting at 12 rows and
-# RETURNED the partial region — a strictly WEAKER, SUFFIX identity — while its
-# comment claimed truncation failed closed. Codex reproduced the consequence with
-# a parseable 13-row question: the region came back as rows 2..13, and a
-# successor record whose ENTIRE question equals that 12-row suffix bound to the
-# pane and committed onto the WRONG CARD.
-THIRTEEN_ROWS = [
-    f"Row {i} of a question that will not fit inside the cap" for i in range(1, 14)
-]
-THIRTEEN_Q = " ".join(THIRTEEN_ROWS)
-TWELVE_ROW_SUFFIX_Q = " ".join(THIRTEEN_ROWS[1:])
-
-
-def _agreement(question: str, rows: list[str]) -> str:
-    return auq_source.anchor_pane_agreement(
-        _tool_input(question),
-        plain(_rewrap_question(AUQ_X_LIVE, rows)),
-        target_row=4,
-        bind_question_text=True,
-    )
-
-
-class TestTheQuestionBindingIsInjective:
-    """Round-7 P1-1: the whitespace-removed fallback equated DIFFERENT questions."""
-
-    def test_a_space_moved_INSIDE_a_word_never_binds(self):
-        """Codex's exact case — RED before the fix.
-
-        ``_squash_ws("Is nowhere safe?") == _squash_ws("Is now here safe?")``, so
-        the round-6 fallback returned MATCH and the free-text executor committed
-        the user's answer onto the successor card.
-        """
-        assert _agreement(NOW_HERE_Q, NOWHERE_ROWS) == auq_source.ANCHOR_MISMATCH
-        # …and the pane's OWN question still binds, so this is not a blanket
-        # refusal of everything that region can hold.
-        assert _agreement(NOWHERE_Q, NOWHERE_ROWS) == auq_source.ANCHOR_MATCH
-
-    @pytest.mark.asyncio
-    async def test_the_successor_card_is_never_ANSWERED(
-        self, monkeypatch, auq_anchor, stamped
-    ):
-        """The same case on the LIVE call path: nothing is typed, nothing commits."""
-        auq_anchor[0] = _anchor(
-            "auq:sid:SESSION_A:tu:toolu_CARD_NOW_HERE", _tool_input(NOW_HERE_Q)
-        )
-        live = _rewrap_question(AUQ_X_LIVE, NOWHERE_ROWS)
-        pane = FakePane([live, live, live, live])
-        _wire(monkeypatch, pane)
-
-        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
-
-        assert result is None, "the lane must DECLINE and fall through to PR-1"
+        assert result is None, "declines pre-keystroke; PR-1 owns the refusal"
+        assert pane.literal_writes == [], "NOT ONE BYTE was typed onto an option row"
         assert pane.enter_sent is False
-        assert pane.literal_writes == []
         assert stamped == []
         assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
 
-    def test_a_row_AT_the_wrap_column_may_still_be_a_WORD_wrap(self):
-        """The falsified premise. Fixture-pinned on the real 160-column capture.
-
-        A join rule that read "row length == wrap column" as "hard-broken
-        mid-token" would reconstruct ``…xxand nothing?`` and refuse the genuine
-        question — killing the lane for the most common long-question shape.
-        """
-        assert len(EXACT_COL_ROWS[0]) == WRAP
-        assert _agreement(EXACT_COL_Q, EXACT_COL_ROWS) == auq_source.ANCHOR_MATCH
-
-    def test_the_exact_column_boundary_is_a_DISCLOSED_residual(self):
-        """The pane renders both of these questions with the SAME rows, so no
-        reading of the pane can separate them (re-wrapping the record's question
-        to the same width produces the same rows too). Accepted and documented —
-        the same class as "same question + same labels"."""
-        assert _agreement(EXACT_COL_TWIN_Q, EXACT_COL_ROWS) == auq_source.ANCHOR_MATCH
-
-    def test_a_hard_break_is_only_credible_on_a_FULL_row(self):
-        """The geometry VETO. A missing space at a SHORT row boundary is not a
-        wrap artefact — it is a different question, and it refuses."""
-        short = ["Which colour", "should we use?"]
-        assert len(short[0]) < WRAP
-        assert _agreement("Which colourshould we use?", short) == (
-            auq_source.ANCHOR_MISMATCH
+    def test_the_POST_WRITE_legs_would_NOT_have_caught_it(self):
+        """Why the landing proof has to be the guard: the two post-write legs that
+        look like a typed-state proof BOTH pass on that same real option row."""
+        row = terminal_parser.parse_free_text_row(
+            type_into_row(AUQ_X_LANDED, 4, "Yes"), number=4
         )
-        assert _agreement("Which colour should we use?", short) == (
-            auq_source.ANCHOR_MATCH
-        )
-
-
-class TestTheRegionCapFailsClosed:
-    """Round-7 P1-2: the cap returned a truncated SUFFIX, a weaker identity."""
-
-    def test_an_over_long_region_is_None_not_a_suffix(self):
-        pane = plain(_rewrap_question(AUQ_X_LIVE, THIRTEEN_ROWS))
-        assert terminal_parser.auq_question_region(pane) is None
-
-    def test_the_twelve_row_SUFFIX_never_binds(self):
-        """RED before the fix: the region came back as the 12-row suffix, a
-        successor record whose whole question IS that suffix compared EQUAL, and
-        the answer committed onto the wrong card."""
-        assert _agreement(TWELVE_ROW_SUFFIX_Q, THIRTEEN_ROWS) == (
-            auq_source.ANCHOR_MISMATCH
-        )
-
-    def test_the_GENUINE_over_long_question_also_refuses(self):
-        """Fail-closed, and disclosed: a question past the cap cannot be bound at
-        all, so the lane declines and PR-1 refuses the message (a false refusal,
-        never a wrong-card commit). The largest REAL capture is 9 rows."""
-        assert _agreement(THIRTEEN_Q, THIRTEEN_ROWS) == auq_source.ANCHOR_MISMATCH
-
-    def test_a_region_that_ENDS_at_the_cap_is_complete(self):
-        """The cap is a boundary, not an off-by-one: exactly 12 rows still bind."""
-        rows = THIRTEEN_ROWS[:12]
-        assert _agreement(" ".join(rows), rows) == auq_source.ANCHOR_MATCH
+        assert row is not None and row.cursor is True
+        assert row.dim is False, "the post-write 'it is typed' leg PASSES"
+        assert (
+            free_text._label_is_our_draft(row.label, "Yes, but use postgres") is True
+        ), "…and the post-write 'we typed it' leg PASSES too"

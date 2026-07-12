@@ -2082,16 +2082,33 @@ degradation, and it is pinned by an explicit scenario (`OUT_OF_SCOPE`
 `extract_epm_plan_file_path` (still strictly footer-scoped), the EPM interactive
 card — is untouched.
 
-**THE TYPED-STATE PROOF IS SGR-2** (`terminal_parser.parse_free_text_row`). While
-the affordance row is SELECTED but UNTYPED its label is the placeholder and renders
-**DIM** (`ESC[2m`); the moment the user types, the label is their text and renders
-at normal intensity. Verified on the real captures and — decisively — on the
-adversarial payload byte-identical to the placeholder (typing the literal
-`Type something.` renders PLAIN), so the plan's contemplated "identical-label
-payload" scope cut is genuinely unnecessary. The dim styling is applied ONLY when
-the cursor is on the row, which is exactly the state the executor verifies in. A
-TUI-DRIFT AUDIT SURFACE beside `clean_ghost_input_text` (the other SGR-2 consumer)
-and `pane_command_is_claude`.
+**THE GUARD IS THE PRE-TYPE LANDING PROOF (SGR-2), AND NOTHING ELSE IS.** Before a
+single byte is written, the row under the cursor must satisfy ALL THREE of:
+`cursor` is on it, its label is EXACTLY `Type something.`, and that label is SGR-2
+**DIM** (`terminal_parser.parse_free_text_row`). `dim == True` holds for exactly ONE
+shape on a picker — the SELECTED, UNTYPED placeholder — and **a real option row is
+NEVER dim, not even when it is the selected row**. That is what makes an OPTION
+COMMIT unreachable from this lane, and it is rig-MEASURED (2026-07-12), not argued:
+an overshoot onto a real option DECLINES; an undershoot parking on a real option at
+`target_row` DECLINES; a payload `Yes, but use postgres` against a card whose option 1
+is literally `Yes` DECLINES. `Down` CLAMPS on 2.1.207 (it never wraps) and the nav is
+`Down`-only by construction (the affordance row is the LAST row, so `delta >= 0`), so
+the wrap-to-option-1 hazard is unreachable; and typing while parked on a real option
+row is SWALLOWED entirely (the pane stays byte-identical — no auto-jump, no
+insertion). A TUI-DRIFT AUDIT SURFACE beside `clean_ghost_input_text` (the other SGR-2
+consumer) and `pane_command_is_claude`; it is why the lane is version-licensed.
+
+**THE POST-WRITE LEGS ARE CORROBORATION, NOT DEFENCE IN DEPTH — three of them are
+MEASURABLY WEAK, and the docs no longer claim otherwise (2026-07-12).** (i)
+`terminal_parser.auq_free_text_row_active` (the `ctrl+g` footer hint) is NOT an exact
+row proof: the hint is ALSO present on the `N+2. Chat about this` row, so it proves
+"the cursor is on SOME text-field row", never which. (ii) `free_text.payload_tail_landed`
+is a WHOLE-PANE substring check and passes SPURIOUSLY (rig: it matched prose echoed in
+the transcript scrollback from a previous answer, on a card that had received nothing).
+(iii) the SGR-2 flip read POST-write (`dim is False`) PASSES on a real option row, and
+`_label_is_our_draft("Yes", "Yes, but use postgres")` is True — so that pair is a
+consistency check, not a guard. They decide only whether the Enter may be sent, and
+they fail closed; they do not decide where the bytes went.
 
 **THE ADDITIVE INVARIANT (the property that makes default-ON safe).** EVERY bail
 BEFORE the first keystroke returns `None`, and the caller falls through to the
@@ -2125,18 +2142,22 @@ single user-facing notice (never a second ❌). The lane NEVER clears the brake:
 release rules (an empty-input-row capture, or confirmed window death) are PR-1's,
 and they are the only proofs that mean anything.
 
-**SURFACE IDENTITY — WHICH CARD (peer-review P1, the wrong-card close).** The pane
-being in the right STATE is necessary and NOT sufficient. Another controller — the
-poller, an AFK auto-resolve, a button tap, or Claude itself — can resolve card A
-and render card B *while* the executor navigates or types, and card B then
-satisfies EVERY other leg: it owns the pane (no input box), our bytes ARE on it
-(we typed them into B's row), its row N+1 carries our cursor and our text at normal
-intensity, and its footer says the free-text row is active. The Enter would commit
-the user's answer to the WRONG QUESTION. So `free_text.SurfaceIdentity` is captured
-BEFORE the first key and RE-CHECKED at both observation points that bracket a
-keystroke: **after the navigation** (a failure there has typed nothing ⇒ DECLINE,
-PR-1 owns the refusal) and **in the final pre-Enter capture** (⇒ `DRAFT_WRITTEN`,
-the brake goes up, honest notice). Both points also require
+**SURFACE IDENTITY — WHICH CARD (the wrong-QUESTION narrowing, NOT a wrong-option
+guard).** Another controller — the poller, an AFK auto-resolve, a button tap, or
+Claude itself — can resolve card A and render card B *while* the executor navigates
+or types, and card B then satisfies every POST-WRITE leg: it owns the pane (no input
+box), our bytes ARE on it (we typed them into B's row), its row N+1 carries our
+cursor and our text at normal intensity, and its footer says a text-field row is
+active. The Enter would then commit the user's answer to the WRONG QUESTION — an
+annoyance, never an option selection (the pre-type landing proof owns that). So
+`free_text.SurfaceIdentity` is captured BEFORE the first key and RE-CHECKED at both
+observation points that bracket a keystroke: **after the navigation** (a failure
+there has typed nothing ⇒ DECLINE, PR-1 owns the refusal) and **in the final
+pre-Enter capture** (⇒ `DRAFT_WRITTEN`, the brake goes up, honest notice). It
+catches a card that TURNS OVER mid-transaction (the side file moves ⇒ the anchor
+moves); it does NOT catch a same-labelled successor whose record was already written
+before our first observation — the disclosed residual below. Both points also
+require
 `extract_interactive_content(pane).name == "AskUserQuestion"` (first-match-wins, so
 AUQ→ExitPlanMode and card→gate/no-surface all refuse there — and AUQ→EPM is the
 most dangerous swap available, since EPM's option 1 is "Yes, and bypass
@@ -2306,119 +2327,50 @@ path: `_record_consistent_with_pane` **DOES** reject a record whose option label
 differ from the pane (`label_mismatch`), and **DOES NOT** reject one whose labels are
 identical but whose QUESTION differs — a pure-pane parse yields
 `current_question_title is None` (so its title check skips) and empty option
-descriptions, so the labels are the only pane-observable content it has. That is
-exactly the shape the interleaving needs, so agreement also requires — **at
-PRE-KEYSTROKE observations only** — the record's question to BE THE QUESTION THE LIVE
-PICKER IS ASKING. It is NOT applied post-write, because a long answer typed into a
-bottom-anchored picker can legitimately scroll the question off, and a false refusal
-*there* strands a draft inside a live card — the most expensive failure in the
-transaction. After the first keystroke the anchor KEY (unchanged across the sandwich,
-and equal to the planned one) carries the occurrence proof.
+descriptions, so the labels are the only pane-observable content it has.
 
-**AND THE QUESTION BINDING TARGETS THE PANE'S QUESTION, NOT ITS CONTENTS (round-6 P1 —
-a whole-pane substring search committed onto the WRONG CARD).** The binding was
-`_squash_ws(question) in _squash_ws(pane_text)`: the record's question only had to
-occur SOMEWHERE. Codex's reproduced interleaving: card A asks *"What's your favorite
-color?"* with options `Blue / Green / Red`; A resolves; successor B's hook writes an
-anchor whose question is **`"Blue"`** with the SAME option labels; B has not drawn, so
-the pane still holds A. The ownership leg passes (A owns the pane), the sandwich passes
-(the anchor is stable), the LABEL comparison passes (same labels) — and the question
-binding passes too, **because the string `Blue` occurs in A's option row.** B renders,
-every later observation matches, and the Enter commits the user's answer onto B.
-Squashing made it strictly worse: with every line and token boundary destroyed, a
-"question" could even SPAN A's real question and its first option row.
+**THAT LIMIT IS THE ACCEPTED RESIDUAL (owner decision 2026-07-12), and the machinery
+that tried to close it has been DELETED.** Earlier revisions added a question-text
+binding to separate two same-labelled cards — a pane QUESTION-REGION extractor
+(`terminal_parser.auq_question_region`), a measured wrap column
+(`terminal_parser.pane_wrap_column`), and a row-CONSUMPTION WALK in
+`auq_source._question_binds_to_pane`. It failed three straight review rounds on its
+own injectivity (a whole-pane substring search matched an option LABEL; a
+whitespace-squash fallback equated `Is nowhere safe?` with `Is now here safe?`; the
+region cap returned a strictly weaker SUFFIX), and the hazard it was defending against
+was **over-scoped**. All of it is gone: `auq_question_region`, `pane_wrap_column`,
+`_question_binds_to_pane`, the `bind_question_text` parameter, and their tests +
+fixtures. `anchor_pane_agreement` now binds the record's OPTION LABELS to the pane and
+nothing else, at every observation.
 
-A card is named by the question it ASKS, so the comparison now targets the pane's
-**QUESTION REGION** — the column-0 block Claude Code renders directly above the live
-option block (`terminal_parser.auq_question_region`, anchored on the BOTTOM-MOST picker
-footer and on the SAME block walk `parse_ask_user_question` uses, so the two can never
-disagree about which picker is live) — and it is an **EQUALITY against that region,
-never a substring of the pane**. An option label, an option description, prose in the
-scrollback, the picker's own footer: none of them is evidence about which card is live,
-and none of them counts as any.
+**THE RESIDUAL, STATED HONESTLY.** A SUCCESSOR AUQ card with the **same option
+labels**, whose `PreToolUse` record was written BEFORE our first observation but which
+had not yet DRAWN, pairs card A's pane with card B's anchor — and every later
+observation then agrees with that chimera. **Consequence: the prose answer reaches a
+DIFFERENT QUESTION.** The user sees it land on the wrong card immediately and answers
+again. **It is NOT an option commit** — the PRE-TYPE LANDING PROOF above makes that
+unreachable whatever card is on the pane, because the dim placeholder is the only row
+shape that satisfies it. A recoverable annoyance, not a security event. (Two AUQs
+sharing the same labels AND the same question were never separable on a pane anyway —
+that was the disclosed residual even WITH the question binding.) Pinned by
+`test_a_same_label_successor_CAN_get_the_answer_DISCLOSED_RESIDUAL` and
+`TestThePreTypeLandingProofIsTheGuard`.
 
-**AND THE REJOIN IS DECIDED BY THE PANE'S GEOMETRY, NEVER BY DELETING THE WHITESPACE
-(round-7 P1-1 — the fallback equated DIFFERENT questions).** Round 6 kept a second
-comparison: "if the space-join fails, compare both sides with ALL whitespace removed",
-the tolerance for a token CC hard-breaks MID-token. It was justified as safe "because it
-is an equality against a tight region" — but **equality does not make a lossy
-transformation injective**, and Codex reproduced the consequence in one counterexample:
-the pane asks `Is nowhere safe?`, the successor record asks `Is now here safe?` — two
-DIFFERENT questions — and with the same option labels the squash makes them EQUAL, so
-the successor's anchor BINDS to the live card and the answer commits onto the WRONG
-CARD. The fallback is **DELETED**, and it is not replaced with another lossy rule.
+**SCOPING (unchanged, and the reason it now costs nothing):** the shared
+`_record_consistent_with_pane` — consumed by the picker RENDER path, the `aqp:`
+dispatch's `validate_and_consume`, `status_polling`'s source-drift re-mint and the
+GH #48 recap identity — never had a question leg and stays **byte-untouched**. Those
+consumers CAN reach a keystroke (`validate_and_consume` → the `aqp:` navigate→Enter
+dispatch), but that lane re-validates its EXACT minted form fingerprint and source
+fingerprint against the live pane before any key, so it is protected independently;
+tightening the shared predicate would have flipped render decisions (`side_file_ok` →
+`bail`/`rescue`) and dropped real cards' context / pick buttons.
 
-The rejoin is a **CONSUMPTION WALK** of the question against the region's rows, with the
-one genuinely ambiguous boundary decided by the pane's WRAP COLUMN
-(`terminal_parser.pane_wrap_column` — the widest physical row on the capture; a live
-picker always renders its full-width `────` box rules, and `capture-pane` is not given
-`-J`, so no line can exceed the terminal width and over-estimation is impossible):
-
-  * each row must be an exact PREFIX of what is left of the question, so no character of
-    either side is ever dropped, reordered or invented;
-  * at each row boundary the question either carries a SPACE — the word wrap consumed
-    it, the ordinary case — or it does not, which means CC HARD-BROKE a token there. A
-    break mid-token only happens when the row is FULL, so that reading is accepted
-    **only when the row reaches the wrap column**; a short row provably cannot have
-    hard-broken and MUST carry the space. That is the leg that keeps the walk injective;
-  * the question must be exactly CONSUMED — nothing left over.
-
-**The premise "a row ending exactly at the wrap column was hard-broken" is FALSE, and
-the code must not assume it** (fixture-pinned on the REAL `auq_longlabel_160x50_v2.1.198`
-capture, whose 160-column rows 2 and 4 end at WORD boundaries — `…peer reviewers,` /
-`…choice trades`). A word-wrapped row can land exactly on the column. So the geometry may
-only **VETO** the hard-break reading of a boundary, never force it — a rule that
-reconstructed by geometry alone would glue `reviewers,` onto `but` and false-refuse every
-long question in the corpus. Whitespace RUNS still collapse to one space (boundary-
-PRESERVING — it never merges two tokens; the tolerance round 6 already had). Equivalent
-to re-wrapping the record's question to the pane's width and comparing row by row, but
-without having to reproduce CC's greedy-fit rule.
-
-**The one residual, and it is the PANE's, not the walk's:** a row that ends exactly at
-the wrap column renders IDENTICALLY whether the original had a space there (a word wrap
-consumed it) or not (a token hard-broken). No reading of the pane can separate those two
-questions — re-wrapping produces the same rows too — so the walk accepts both. Same class
-as the disclosed "same question + same labels" residual.
-
-**AND THE REGION CAP FAILS CLOSED (round-7 P1-2).** `auq_question_region` collects at
-most `_QUESTION_REGION_MAX_ROWS` (12 — the largest REAL capture in the corpus is 9 rows,
-so 12 is the only bound the captures justify). It used to `break` at the cap and RETURN
-the rows it had — a partial region, missing its TOP — while its comment claimed the
-truncation failed closed. It did NOT: a SUFFIX is a strictly WEAKER identity, and Codex
-reproduced a 13-row question whose region came back as rows 2..13, so a successor record
-whose ENTIRE question equals that 12-row suffix BOUND to the pane and committed onto the
-WRONG CARD. An underivable region must never degrade into a weaker one, so the cap now
-returns `None` and the binding REFUSES. Disclosed cost: a question longer than 12
-physical rows cannot be bound at all, so the lane declines and PR-1 refuses the message —
-a false refusal, never a wrong-card commit. A region that cannot be derived at all (the
-question scrolled off; the picker glued straight to chrome) is `None` and REFUSES for the
-same reason.
-
-**SCOPING (deliberate) — with the RATIONALE CORRECTED (round-7 P3).** The tightening
-lives in the FREE-TEXT ANCHOR path ONLY. The shared `_record_consistent_with_pane` —
-consumed by the picker RENDER path, the `aqp:` dispatch's `validate_and_consume`,
-`status_polling`'s source-drift re-mint and the GH #48 recap identity — never had a
-question leg and is **byte-untouched**. The round-6 text justified that by claiming those
-consumers "cannot commit keystrokes"; **that is FALSE** — `validate_and_consume` calls
-`resolve_auq_source` and its caller goes on to the `aqp:` navigate→Enter dispatch. What
-actually makes the scoping safe is that the `aqp:` lane is protected INDEPENDENTLY: it
-re-validates the EXACT minted form fingerprint and the minted SOURCE fingerprint against
-the live pane before any key, so a successor card whose question differs cannot be
-dispatched into regardless of this predicate (Codex hunted for an exploit there and found
-none). The decision therefore stands on its own merits: tightening the shared predicate
-would flip render decisions (`side_file_ok` → `bail`/`rescue`), dropping the AUQ context
-card or suppressing pick buttons on real cards — a real cost, bought for a lane that
-already has its own proof. Pinned by `test_the_SHARED_predicate_is_byte_untouched` (the
-same card-BLUE record the anchor lane now refuses is still ACCEPTED by the shared
-predicate, exactly as before).
-
-**The residual, disclosed and NOT closed:** two AUQs with the **same option labels AND
-the same question text** are identical in every pane-observable respect, so no content
-binding can separate them. They are covered by the ownership leg + the sandwich + the
-forward-only ordering, and by the fact that a re-asked AUQ always gets a NEW
-`tool_use_id` (so the anchor KEY differs whenever the side file has actually moved).
-Note this residual is **WIDER than "byte-identical content"**: it is "byte-identical
-*question + labels*", since descriptions are not parsed from a pane.
+**ALSO CARRIED FORWARD — the pre-existing GH #50 M2 residual:** a pty-level split of a
+single `send-keys -l` could in principle land a digit as a lone HOTKEY with no Enter.
+Empirically a whole multi-char payload is consumed PASTE-shaped and is inert on a live
+picker, and `delivery.lone_hotkey_line` refuses any bare-digit LINE outright — an
+empirical narrowing, **not a proof**, and it stays on record.
 
 `still_holds` is therefore: the surface must match; **the anchors must be EQUAL**
 (both sides always have one — a live derivation without one is `None` and dies on
@@ -2474,35 +2426,36 @@ most natural gesture the card invites was the one gesture that got REFUSED.
 (`parse_free_text_row(ansi, number=N+1).cursor`) and takes a ZERO-NAV plan — while
 STILL requiring the SGR-2 DIM landing proof before a single byte is typed.
 
-**The IDENTITY + TYPED-STATE VERIFY** (`_typed_state_reason`; every leg AND-ed, a
-failure WITHHOLDS the Enter): (A) a bounded `pane_command_is_claude` re-probe FIRST
-so the pane CAPTURE is the LAST observation before the Enter (the r2-F4 ordering);
-(B) `pane_input_box_present` is **FALSE** — the blocking surface still owns the pane
-(if the card AFK-resolved mid-type, the input box is back and Enter would submit a
-half-typed message); called WITHOUT `expected_draft`, because the picker trap is
-exactly what must fire; (C) **IDENTITY — WHICH CARD** (see above): the extracted
-surface is still `AskUserQuestion` AND `SurfaceIdentity.still_holds`. This leg runs
-BEFORE anything that merely proves WHICH ROW or WHOSE TEXT, because those are all
-satisfied by a successor card holding our prose; (D) **the row, or the footer**: (D1)
-the affordance row is on the pane, carries the cursor, its label is NOT SGR-2 dim (⇒
-TYPED) and is a prefix of what we typed (⇒ WE typed it); or (D2) the row scrolled
-off, but the picker footer carries `ctrl+g to edit`, which on 2.1.207 appears **IFF
-the free-text row is the ACTIVE row** (rig: it tracks the cursor exactly — absent at
-rows 1/2/3, present at N+1). D2 proves WHICH ROW, never WHICH CARD — leg C supplies
-the latter, via the out-of-band anchor, since the pane component is precisely what
-scrolled away; (E) the payload TAIL is visibly on the pane (the "our bytes landed"
-probe, compared whitespace-STRIPPED — CC's soft wrap only ever INSERTS whitespace, so
-the probe is immune to every wrap shape including a mid-token hard break).
+**The POST-WRITE VERIFY** (`_typed_state_reason`; every leg AND-ed, a failure
+WITHHOLDS the Enter — but see the corrected framing above: this is CORROBORATION, and
+the decision that mattered was already made by the pre-type landing proof): (A) a
+bounded `pane_command_is_claude` re-probe FIRST so the pane CAPTURE is the LAST
+observation before the Enter (the r2-F4 ordering); (B) `pane_input_box_present` is
+**FALSE** — the blocking surface still owns the pane (if the card AFK-resolved
+mid-type, the input box is back and Enter would submit a half-typed message); called
+WITHOUT `expected_draft`, because the picker trap is exactly what must fire; (C)
+**IDENTITY — WHICH CARD**: the extracted surface is still `AskUserQuestion` AND
+`SurfaceIdentity.still_holds` — this catches a card that TURNED OVER mid-transaction
+(its hook rewrote the side file ⇒ the anchor moved), and does NOT catch the disclosed
+same-labels successor; (D) **the row, or — in the overflow shape — the footer**: (D1)
+the affordance row is on the pane, carries the cursor, is NOT SGR-2 dim and its label
+is a prefix of what we typed — **WEAK: both halves pass on a selected REAL option row
+whose label prefixes the payload**; or (D2) the row scrolled off, but the live picker's
+footer carries `ctrl+g to edit` — **WEAK: that hint is also present on the `N+2. Chat
+about this` row**, so it proves "the cursor is on SOME text-field row", never which row
+and never which card; (E) the payload TAIL occurs on the pane — **WEAK: a whole-pane
+substring test that passes spuriously on scrollback echoing a previous answer**.
 
-**`auq_free_text_row_active` is SCOPED to the LIVE picker (peer-review P1).** The
-first cut was an OR over the WHOLE pane ("does SOME line carry `Enter to select`
-and, on that line, `ctrl+g`?"), so a footer left in SCROLLBACK by an EARLIER picker
-— or a transcript the user pasted into the conversation — satisfied it while the
-LIVE picker's own footer, with the cursor parked on option 1, said the opposite. A
-positive proof that arbitrary pane text can mint is not a proof. The pane must now
-extract as a live `AskUserQuestion`, and the footer consulted is the **BOTTOM-MOST**
-picker footer on the pane (the repo's bottom-most-is-live rule — a TUI renders the
-live picker at the bottom and its scrollback above is frozen).
+**`auq_free_text_row_active` is SCOPED to the LIVE picker, and it is NOT an exact row
+proof (2026-07-12 — this CORRECTS the original claim that "it tracks the cursor
+exactly").** The hint is absent on rows 1/2/3 and present on row N+1 — but it is ALSO
+present on the `N+2. Chat about this` row, which is a text field too. So it proves
+"the cursor is on SOME text-field row of this live picker" and is used ONLY as
+post-write corroboration in the overflow shape. Scoping (kept): the first cut was an
+OR over the WHOLE pane, so a footer left in SCROLLBACK by an EARLIER picker — or a
+transcript the user pasted — satisfied it while the LIVE picker's own footer said the
+opposite. The pane must extract as a live `AskUserQuestion`, and the footer consulted
+is the **BOTTOM-MOST** picker footer on the pane (the repo's bottom-most-is-live rule).
 
 **THE OVERFLOW SHAPE (rig-measured).** A long answer wraps to more rows than the pane
 has, and a TUI runs on the ALTERNATE SCREEN — `capture-pane -S` recovers nothing
@@ -2578,11 +2531,23 @@ buttons or the ↑/↓/⏎ keys."
 
 **Other disclosed residuals.**
 
+  - **THE SAME-LABELS SUCCESSOR** (the headline one, owner-accepted — see above): a
+    successor AUQ card carrying the SAME option labels, whose `PreToolUse` record was
+    written BEFORE our first observation but which had not yet DRAWN, can receive the
+    prose intended for its predecessor. **Consequence: your answer reaches a different
+    QUESTION — you see it immediately and correct it. NOT an option commit** (the
+    pre-type landing proof makes that unreachable). Deliberately NOT closed; the
+    machinery that tried to (question region + wrap column + consumption walk) was
+    deleted for failing its own injectivity three rounds running.
+  - **The GH #50 M2 residual, carried forward:** a pty-level split of a single
+    `send-keys -l` could in principle land a digit as a lone HOTKEY with no Enter.
+    Empirically a whole multi-char payload is consumed PASTE-shaped and is inert on a
+    live picker, and `delivery.lone_hotkey_line` refuses any bare-digit LINE outright —
+    an empirical narrowing, not a proof.
   - **The verify→Enter TOCTOU** is the SAME residual `_dispatch_pick` /
     `_dispatch_decision` already accept and disclose: one tmux round-trip, which no
-    terminal protocol can make atomic. The identity re-check SHRINKS the wrong-card
-    window to that round-trip; it does not eliminate it. Bounded by the fail-closed
-    `commit_unconfirmed`.
+    terminal protocol can make atomic. Bounded by the fail-closed `commit_unconfirmed`
+    — and, again, bounded to WHICH QUESTION, never to which option.
   - **On an install with NO `PreToolUse(AskUserQuestion)` hook the free-text lane is
     OFF** — every message at a card takes PR-1's refusal, pre-keystroke. That is the
     round-2 P1 fold: the alternative was trusting a pane identity that cannot tell two

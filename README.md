@@ -173,25 +173,30 @@ voice note, and the quote goes along with your words — Claude gets the context
 you were answering *and* the answer.
 
 The bot does this by driving the terminal the same way the option buttons do: it
-moves the cursor onto the card's free-text row, *proves* it landed there, types
-your message with the Enter withheld, *proves* your text is in that row, *proves
-the card is still the one you were answering*, and only then commits. That last
-check matters: a card can resolve on its own while your message is being typed
-(Claude Code gives up on an unanswered question after about a minute), and the
-next card would otherwise receive an answer meant for the previous one. If
-anything cannot be proven, the Enter is withheld and you are told. Any failure
-before the first keystroke falls back to the ordinary refusal. Long messages are
-fine — a multi-paragraph voice note is submitted whole.
+moves the cursor onto the card's free-text row, **proves it is standing on that
+row and nowhere else**, types your message with the Enter withheld, re-checks the
+card, and only then commits. That first proof is the important one. The free-text
+row is the only row the terminal renders *dimmed* while it is selected and empty —
+a real option never is — so if the cursor ends up anywhere but there, nothing is
+typed at all and you get the ordinary refusal instead. **Your words can never
+become an option pick.** If anything cannot be confirmed after the text is typed,
+the Enter is withheld and you are told. Long messages are fine — a multi-paragraph
+voice note is submitted whole.
 
-**Proving *which* card is not something the screen alone can do**, which is why
-each question is identified by the `PreToolUse(AskUserQuestion)` hook — Claude
-Code runs it *before* it draws the picker, so the hook records which question is
-coming. Two different questions can offer the same options, and the terminal shows
-nothing that tells them apart. **Without that hook the lane simply declines**: a
-message at a question card gets the ordinary refusal ("answer the card first")
-instead of risking your words landing on a *different* question.
-`cc-telegram hook --install` installs it, `cc-telegram doctor` reports it as
-missing, and the bot warns at startup. Everything else about the card — the
+**Which *question* you are answering is identified by the
+`PreToolUse(AskUserQuestion)` hook** — Claude Code runs it *before* it draws the
+picker, so the hook records which question is coming. The screen alone cannot do
+this: two different questions can offer the same options, and the terminal shows
+nothing that tells them apart. **Without that hook the lane simply declines** and
+you get the ordinary refusal. `cc-telegram hook --install` installs it,
+`cc-telegram doctor` reports it as missing, and the bot warns at startup.
+
+**One honest limit.** If a question is answered elsewhere and Claude immediately
+asks a *new* question **with the same options**, in the split second before the new
+card is drawn, your message can land on the new question instead of the old one.
+You will see it happen and can simply answer again. It cannot pick an option for
+you — that is what the row proof above rules out — so the worst case is a misrouted
+answer, not a decision made on your behalf. Everything else about the card — the
 options, the buttons, the descriptions — works as usual.
 
 **A plan approval is deliberately not answerable this way.** Its first option

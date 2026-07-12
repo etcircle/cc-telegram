@@ -27,70 +27,83 @@ answered in prose.** That is the intended, safe degradation. (The pre-PR-2 EPM
 machinery — the 📋 plan-body post, ``extract_epm_plan_file_path``, the EPM
 interactive card — is untouched.)
 
-TWO THINGS MUST BE PROVEN, NOT ONE. "The pane is in the right STATE" (a dim
-placeholder under the cursor; our text in the row; no input box) is necessary and
-NOT sufficient — every one of those legs is equally satisfied by a DIFFERENT card
-that another controller rendered while we were navigating or typing, holding our
-text in ITS free-text row. So ``SurfaceIdentity`` (WHICH CARD) is captured before
-the first key and RE-CHECKED at both observation points that bracket a keystroke.
-See that class for the drift trap the identity is designed around — the executor
-MUTATES the pane it must re-identify.
+**THE GUARD IS THE PRE-TYPE LANDING PROOF, AND SAYING SO PLAINLY IS THE POINT.**
+Before a single byte is written, the row under the cursor must satisfy ALL THREE
+of: ``cursor`` is on it, its label is EXACTLY ``Type something.``, and that label
+is SGR-2 **DIM**. ``dim == True`` holds for exactly ONE shape on a picker — the
+SELECTED, UNTYPED placeholder — and a real option row is NEVER dim, not even when
+it is the selected row. That is what makes an option commit UNREACHABLE from this
+lane, and it is rig-measured, not argued (2026-07-12):
 
-AND THE IDENTITY MUST BE OCCURRENCE-UNIQUE (peer-review round-2 P1). The PANE
-component alone cannot distinguish two cards that render the same rows: a pure
-pane parse carries no title, so two DIFFERENT AUQs with identical option labels
-produce the IDENTICAL pane identity. So the identity carries a MANDATORY
+  * an OVERSHOOT that parks the cursor on a real option ⇒ DECLINED (not dim);
+  * an UNDERSHOOT that parks on a real option at ``target_row`` ⇒ DECLINED;
+  * a payload ``Yes, but use postgres`` against a card whose option 1 is literally
+    ``Yes`` ⇒ DECLINED (the label is not the placeholder, and it is not dim);
+  * ``Down`` CLAMPS on 2.1.207 (it never wraps), and the nav is ``Down``-only by
+    construction (the affordance row is the LAST row, so ``delta >= 0``), so the
+    wrap-to-option-1 hazard is unreachable from here;
+  * typing while parked on a real option row is SWALLOWED entirely — the pane is
+    byte-identical afterwards; there is no auto-jump and no insertion.
+
+THE POST-WRITE LEGS ARE CORROBORATION, NOT DEFENCE IN DEPTH — three of them are
+MEASURABLY WEAK, and the code must not pretend otherwise:
+
+  * ``terminal_parser.auq_free_text_row_active`` (the ``ctrl+g`` footer hint) is
+    NOT an exact row proof: the hint is ALSO present on the ``N+2. Chat about
+    this`` row. It proves "the cursor is on SOME text-field row", never which.
+  * :func:`payload_tail_landed` is a WHOLE-PANE substring check and can pass
+    SPURIOUSLY (rig: it matched prose echoed in the transcript scrollback from a
+    previous answer, on a card that had received nothing).
+  * the SGR-2 flip read POST-write (``dim is False``) PASSES on a real option row,
+    and ``_label_is_our_draft("Yes", "Yes, but use postgres")`` is True. It is a
+    consistency check, not a guard.
+
+WHICH CARD — the identity, and its ACCEPTED RESIDUAL. ``SurfaceIdentity`` is
+captured before the first key and RE-CHECKED after the nav and again in the final
+pre-Enter capture, so a card that turns over MID-transaction (the side file moves
+⇒ the anchor changes ⇒ ``still_holds`` refuses) is caught. It carries a MANDATORY
 out-of-band anchor that names the OCCURRENCE, not the shape — the
-``PreToolUse(AskUserQuestion)`` side file, minted by the process that is about to
-block, BEFORE it renders, carrying the prompt's per-invocation ``tool_use_id``
-(``auq_source``). No anchor ⇒ the lane DECLINES before any keystroke; a changed
-anchor ⇒ it refuses.
+``PreToolUse(AskUserQuestion)`` side file's per-invocation ``tool_use_id``,
+written by the process that is about to block, BEFORE it renders (``auq_source``).
+No anchor ⇒ the lane DECLINES before any keystroke. The anchor is read STRICTLY
+BEFORE every capture, each capture is SANDWICHED between two EQUAL anchor reads
+(``_observe``), the session generation is embedded in it (a ``/clear`` rotation is
+itself an anchor change), and the record's OPTION LABELS must AGREE with the pane
+it is paired with (``auq_source.anchor_pane_agreement``).
 
-**AND THE ANCHOR IS READ BEFORE THE PANE (round-3 P1).** The identity used to be
-minted from a pane captured at t1 and an anchor read at t2 > t1, so a card
-turning over inside that gap yields `(OLD pane, NEW anchor)` — and since the pane
-component is degenerate across same-shaped occurrences, that chimera MATCHES
-every later observation and commits onto the successor. Reading the anchor
-STRICTLY FIRST makes the only reachable chimera `(NEWER pane, OLDER anchor)`,
-which fails closed. ``derive_identity`` therefore TAKES the anchor and never
-reads one; the proof is in its docstring. Same "probe FIRST, capture LAST"
-discipline the delivery gate's re-verify already applies to its liveness probe
-(r2 F4).
+**THE RESIDUAL (owner-accepted, deliberately NOT closed):** a SUCCESSOR AUQ card
+with the SAME option labels, whose ``PreToolUse`` record was written BEFORE our
+first observation but which had not yet DRAWN, pairs card A's pane with card B's
+anchor — and every later observation then agrees with that chimera. The prose
+answer reaches a DIFFERENT QUESTION. It is a recoverable annoyance: the user sees
+the wrong answer land immediately and answers again. **It is NOT an option
+commit** — the landing proof above makes that unreachable, whatever card is on the
+pane. An earlier revision grew a question-text binding (a pane question-REGION
+extractor, a measured wrap column, a row-consumption walk) to close it; that
+machinery failed three straight review rounds on its own injectivity and has been
+DELETED. Two AUQs sharing the same labels AND the same question were never
+separable on the pane anyway.
 
-**AND THE ANCHOR CARRIES THE SESSION GENERATION (round-4 P1).** The anchor read
-resolves the window's session FRESH from the hook-written ``session_map.json``,
-never the cached ``WindowState.session_id`` — see :class:`SurfaceIdentity`.
+**RAW CONTROL BYTES ARE REFUSED.** ``tmux send-keys -l`` stops tmux interpreting
+KEY NAMES; it does NOT make ESC/C0 bytes inert to the TUI. An embedded ``ESC [ B``
++ digit is a cursor-move plus a HOTKEY commit, fired during the write itself —
+before any verification runs. ``delivery.unsafe_control_char`` is consulted here
+to DECLINE (``\\n`` stays allowed: paste-shaped multi-line payloads are this
+lane's primary flow); PR-1's gate owns the single refusal message.
 
-**AND THE ANCHOR IS BOUND TO THE PANE, NOT TO THE READ ORDER (round-5 P1-B).**
-Round 3's ordering argument ("a live prompt means Claude is BLOCKED on it, so the
-side file must be its") has an unstated premise: that a card the user ALREADY
-ANSWERED stops looking live on the pane. ``PreToolUse`` writes card B's record
-BEFORE B renders, so a pane still showing the answered card A pairs with B's
-anchor — ``(OLD pane, NEW anchor)``, the dangerous direction, which two AUQs with
-identical option labels cannot tell apart. Three folds, none of them a bet on
-ordering: the card must OWN the pane (no input box — a resolved AUQ restores it);
-each capture is SANDWICHED between two equal anchor reads (``_observe``); and the
-anchor RECORD's CONTENT must AGREE with the pane it is paired with
-(``auq_source.anchor_pane_agreement`` — labels always, question text before the
-first keystroke). See :func:`derive_identity`.
-
-**AND RAW CONTROL BYTES ARE REFUSED (round-5 P1-A).** ``tmux send-keys -l`` stops
-tmux interpreting KEY NAMES; it does NOT make ESC/C0 bytes inert to the TUI. An
-embedded ``ESC [ B`` + digit is a cursor-move plus a HOTKEY commit, fired during
-the write itself — before any verification runs. ``delivery.unsafe_control_char``
-refuses those payloads at BOTH gated seams (``\\n`` stays allowed: paste-shaped
-multi-line payloads are this lane's primary flow).
+**ALSO CARRIED FORWARD (the pre-existing GH #50 M2 residual):** a pty-level split
+of a single ``send-keys -l`` could in principle land a digit as a lone HOTKEY with
+no Enter. Empirically a whole multi-char payload is consumed PASTE-shaped and is
+inert on a live picker, and ``delivery.lone_hotkey_line`` refuses any bare-digit
+LINE outright — but this is an empirical narrowing, not a proof, and it stays on
+record as a residual.
 
 It reuses the shipped dispatch discipline (``_dispatch_pick`` /
 ``_dispatch_decision_pane_locked``) verbatim: per-window send lock, bounded
 cancellation-safe captures, a FRESH in-lock ``pane_command_is_claude`` +
-version-license re-read immediately before the first key, monotonic arrow nav,
-settle → re-parse → verify, Enter as the ONLY commit key, and a strict
+version-license re-read immediately before the first key, monotonic ``Down``-only
+nav, settle → re-parse → verify, Enter as the ONLY commit key, and a strict
 commit-boundary classification.
-
-THE TYPED-STATE PROOF IS SGR-2 (``terminal_parser.parse_free_text_row``): the
-placeholder renders DIM, typed text does not. See that module for the empirics
-and the TUI-drift note.
 
 VERSION-LICENSED (the ``decision_token`` precedent, MANDATORY per plan §2.4): the
 row index, the placeholder label, the SGR-2 styling and the ``ctrl+g`` footer
@@ -225,13 +238,20 @@ class SurfaceIdentity:
 
     The whole transaction is a race against Claude Code: another controller (the
     poller, an AFK auto-resolve, a button tap, or Claude itself) can resolve card
-    A and render card B *while* the executor navigates or types. Nothing else in
-    the proof set catches that — the landing proof, the SGR-2 typed-state proof,
-    the payload-tail probe and the row-active footer proof are ALL satisfied by
-    card B holding our text. So identity must be captured pre-key and RE-CHECKED
-    after the nav and again in the final pre-Enter capture. On ExitPlanMode option
-    1 is "Yes, and bypass permissions", so this is the most dangerous hole in the
-    lane, and it fails CLOSED.
+    A and render card B *while* the executor navigates or types, and card B then
+    holds our text in ITS free-text row. Nothing else in the proof set catches
+    that — the post-write SGR-2 flip, the payload-tail probe and the row-active
+    footer hint are ALL satisfied by card B. So identity is captured pre-key and
+    RE-CHECKED after the nav and again in the final pre-Enter capture: a card that
+    turns over MID-transaction moves the side file, which moves the anchor, which
+    refuses.
+
+    WHAT IT DOES NOT CATCH (the accepted residual — see the module docstring): a
+    successor whose ``PreToolUse`` record was already written BEFORE our first
+    observation, but which had not yet DRAWN. The prose then reaches a DIFFERENT
+    QUESTION. It can never become an OPTION COMMIT — the PRE-TYPE landing proof
+    (cursor + SGR-2 dim + the exact placeholder label) owns that, and it is
+    satisfied by exactly one shape on any card.
 
     ``anchor`` — **MANDATORY, and OCCURRENCE-UNIQUE** (peer-review round-2, BOTH
     P1s). It is the out-of-band, scroll-independent surface-GENERATION id, and it
@@ -365,7 +385,6 @@ def derive_identity(
     surface: str,
     target_row: int,
     anchor: SurfaceAnchor | None,
-    bind_question_text: bool = False,
 ) -> SurfaceIdentity | None:
     """One pane observation + an anchor → the card's identity, or ``None``.
 
@@ -373,41 +392,29 @@ def derive_identity(
     this pane. A caller can never accidentally construct an anchor-less identity
     and have it compare equal to another anchor-less one.
 
-    **THE ANCHOR IS BOUND TO THE PANE (peer-review round-5 P1-B).** The anchor is
-    read out-of-band and the pane is captured separately, so nothing but the READ
-    ORDER tied them together — and that was not enough. Round 3 made the executor
-    read the anchor FIRST and argued the only reachable chimera was ``(NEWER pane,
-    OLDER anchor)``, which fails closed. The argument runs:
+    **THE ANCHOR IS BOUND TO THE PANE, NOT TO THE READ ORDER.** The anchor is read
+    out-of-band and the pane is captured separately, so nothing but the READ ORDER
+    tied them together — and that is not enough. The tempting argument is: "a
+    live, unresolved prompt means Claude is BLOCKED on it, so it cannot be
+    invoking the next AskUserQuestion — and the hook fires BEFORE its prompt
+    renders; therefore 'P is live on the pane at t1' implies 'the side file at t1
+    is P's'." The step that is NOT justified is "P is live on the pane":
+    ``PreToolUse`` writes card B's record BEFORE B renders, so between B's
+    invocation and B's paint the side file already names B while the pane may
+    still be SHOWING the just-answered card A — the ``(OLD pane, NEW anchor)``
+    chimera.
 
-      * a live, unresolved prompt means Claude is BLOCKED on it, so it cannot be
-        invoking the next AskUserQuestion — and the hook fires BEFORE its prompt
-        renders. Therefore "P is live on the pane at t1" implies "the side file at
-        t1 is P's".
+    So the anchor is not taken on trust: its RECORD's CONTENT (the real OPTION
+    LABELS) must AGREE with the pane it is paired with
+    (``auq_source.anchor_pane_agreement``). A record that does not describe what
+    we are looking at yields ``None``, whatever the read order was.
 
-    The step that is NOT justified is "P is live on the pane". ``PreToolUse``
-    writes card B's record BEFORE B renders, so between B's invocation and B's
-    paint the side file already names B — and if the pane is still SHOWING card A
-    (which the user has just answered), the pane parses A while the anchor is B's:
-    ``(OLD pane, NEW anchor)``, the dangerous direction, and because two AUQs can
-    carry identical option labels that chimera MATCHES every later observation and
-    the Enter commits onto B. THE WRONG CARD.
-
-    Read order cannot fix that, so the anchor is no longer taken on trust: its
-    RECORD's CONTENT must AGREE with the pane it is paired with
-    (``auq_source.anchor_pane_agreement`` — the real option labels, and at every
-    PRE-KEYSTROKE observation the question text too). A record that does not
-    describe what we are looking at yields ``None``, whatever the read order was.
-
-    The read-first ordering is KEPT (it is free, and it makes the residual
-    direction the harmless one), and the executor additionally SANDWICHES each
-    capture between two anchor reads and requires them EQUAL — so a hook write
-    landing inside an observation is detected rather than reasoned about. See
-    ``_observe``.
-
-    ``bind_question_text`` is passed ONLY before the first keystroke: the question
-    sits ABOVE the option block, and a long answer typed into a bottom-anchored
-    picker can legitimately scroll it off, so requiring it post-write would
-    false-refuse and strand a draft inside a live card.
+    Labels are the ONLY pane-observable content, so two same-labelled cards remain
+    indistinguishable here — the accepted residual (module docstring). The
+    read-first ordering is KEPT (it is free, and it makes the OTHER direction the
+    harmless one), and the executor additionally SANDWICHES each capture between
+    two anchor reads and requires them EQUAL — so a hook write landing inside an
+    observation is DETECTED rather than reasoned about. See ``_observe``.
     """
     if anchor is None:
         return None
@@ -418,7 +425,6 @@ def derive_identity(
         anchor.tool_input,
         pane_text,
         target_row=target_row,
-        bind_question_text=bind_question_text,
     )
     if agreement == auq_source.ANCHOR_MISMATCH:
         # The record names a card the pane is not showing. Whatever the read
@@ -546,17 +552,13 @@ def plan_from_pane(
         surface=SURFACE_AUQ,
         target_row=shape.target_row,
         anchor=anchor,
-        # PRE-KEYSTROKE ⇒ bind the record's QUESTION TEXT to the pane too. This
-        # is the only leg that separates two cards with IDENTICAL option labels,
-        # and identical labels are exactly what makes the chimera commit.
-        bind_question_text=True,
     )
     if identity is None:
         # Either NO occurrence anchor (no PreToolUse side file for this window's
         # CURRENT session — the hook is not installed, the record was GC'd, the
         # card already resolved, or the hook captured no ``tool_use_id``), or an
-        # anchor that does NOT describe this pane (the round-5 chimera). An
-        # unidentifiable card is a card we will not type into.
+        # anchor whose OPTION LABELS do not describe this pane. An unidentifiable
+        # card is a card we will not type into.
         return None
     if identity.pane is None:
         # The option block is not fully on the pane at CAPTURE time. It may
@@ -572,7 +574,14 @@ def plan_from_pane(
     )
 
 
-# ── The bytes-landed probe ───────────────────────────────────────────────
+# ── The bytes-landed CORROBORATION (not a guard) ─────────────────────────
+#
+# MEASURED WEAKNESS, stated up front (rig, 2026-07-12): this is a WHOLE-PANE
+# substring check and it CAN PASS SPURIOUSLY — on the rig it matched prose echoed
+# in the transcript scrollback from a PREVIOUS answer, on a card that had received
+# nothing at all. So it corroborates "our bytes are somewhere on this pane"; it
+# does NOT prove they landed in the affordance row, and it is not what stands
+# between a payload and a wrong keystroke. That is the PRE-TYPE landing proof.
 
 # The tail length compared. Long enough to be unique in a pane, short enough to
 # stay well inside the last visible rows of a wrapped draft.
@@ -592,11 +601,13 @@ def _squash(text: str) -> str:
 
 
 def payload_tail_landed(pane_text: str | None, payload: str) -> bool:
-    """True iff the TAIL of ``payload`` is visibly on the pane.
+    """True iff the TAIL of ``payload`` occurs ANYWHERE on the pane.
 
-    The "our bytes landed" proof. The tail (not the head) because the affordance
-    row's FIRST visual line can scroll off under a long draft while its last
-    lines — the ones just above the footer — always remain.
+    A CORROBORATION, not a proof — see the block comment above: it is a whole-pane
+    substring test and it passes spuriously on scrollback that happens to echo the
+    text. The tail (not the head) because the affordance row's FIRST visual line
+    can scroll off under a long draft while its last lines — the ones just above
+    the footer — always remain.
     """
     if not pane_text:
         return False
@@ -614,10 +625,17 @@ def _first_visual_line(payload: str) -> str:
 
 
 def _label_is_our_draft(label: str, payload: str) -> bool:
-    """True iff the row's label is (a prefix of) what we typed — AUTHORSHIP.
+    """True iff the row's label is (a prefix of) what we typed.
 
-    The row renders only the FIRST visual line of a wrapped draft, so the label
-    is a prefix of the payload's first line, not the whole payload. Compared
+    A CONSISTENCY CHECK, not an authorship proof (rig, 2026-07-12 — this CORRECTS
+    the original "AUTHORSHIP" claim): a real option row labelled ``Yes`` is a
+    prefix of the payload ``Yes, but use postgres``, so this predicate is True on
+    a REAL OPTION under a payload that merely starts with its label. Combined with
+    the post-write ``dim is False`` — which a selected real option row also
+    satisfies — the pair is NOT a guard. The guard is the PRE-TYPE landing proof.
+
+    The row renders only the FIRST visual line of a wrapped draft, so the label is
+    a prefix of the payload's first line, not the whole payload. Compared
     whitespace-stripped for the same wrap-immunity reason as the tail probe.
     """
     squashed_label = _squash(label)
@@ -922,9 +940,11 @@ async def _answer_locked(
         len(payload),
     )
 
-    # (2) Monotonic arrow nav onto the affordance row. Never a wrap shortcut:
-    # over-counting past the last row WRAPS to row 1, and Enter there commits it
-    # — the user's prose would silently become "option 1".
+    # (2) Monotonic arrow nav onto the affordance row. ``Down``-ONLY by
+    # construction — the affordance row is the LAST row, so ``delta >= 0`` — and
+    # ``Down`` CLAMPS on 2.1.207 (rig: it never wraps). The ``Up`` branch is
+    # therefore unreachable from this lane and is kept only so a future shape with
+    # the affordance above the cursor cannot silently send the wrong key.
     delta = plan.target_row - plan.cursor_row
     key = "Down" if delta > 0 else "Up"
     for _ in range(abs(delta)):
@@ -936,27 +956,26 @@ async def _answer_locked(
             return _decline(REASON_NAV_FAILED)
     await asyncio.sleep(NAV_SETTLE_S)
 
-    # (3) LANDING PROOF (pre-type): we are STILL ON THE SAME CARD, the cursor is
-    # on its affordance row, the row still carries its placeholder, and the
-    # placeholder is SGR-2 DIM. The dim bit is what makes the row state a proof
-    # rather than a guess — it is applied only while the row is selected AND
-    # untyped, which is exactly the state we require before typing. A failure here
-    # has typed NOTHING, so it falls through to PR-1 (which re-captures and
-    # refuses with the accurate reason).
+    # (3) **THE LANDING PROOF — THE GUARD OF THIS ENTIRE LANE.** Before a single
+    # byte is typed, the row under the cursor must be: cursored, labelled EXACTLY
+    # ``Type something.``, and SGR-2 DIM. ``dim`` holds for exactly ONE shape — the
+    # SELECTED, UNTYPED placeholder — and a REAL OPTION ROW IS NEVER DIM, not even
+    # when selected. So an overshoot, an undershoot, a stale frame or a card that
+    # turned over mid-nav can never put the payload onto an option row: rig-verified
+    # declines on an overshoot, on an undershoot parked at ``target_row``, and on a
+    # payload ``Yes, but use postgres`` against a card whose option 1 is ``Yes``.
+    # A failure here has typed NOTHING and falls through to PR-1, which owns the
+    # single refusal.
     if time.monotonic() > deadline:
         return _decline("deadline")
     obs2 = await _observe(window_id)
     if isinstance(obs2, str):
         return _decline(obs2)
-    # IDENTITY FIRST (peer-review P1): a card that resolved during the nav and was
-    # replaced by a same-geometry successor would satisfy every other leg below —
-    # the successor's row N+1 is a dim placeholder under our freshly-moved cursor.
-    # Checking WHICH CARD before we type is what stops that. Still PRE-KEYSTROKE,
-    # so the question-text binding applies here too (a false refusal costs only a
-    # fall-through, and nothing has been typed to scroll the question away).
-    ident_reason = _identity_reason(
-        obs2.pane, plan, window_id, obs2.anchor, bind_question_text=True
-    )
+    # Identity first, so the log reason names WHICH CARD when a card turned over
+    # during the nav (the anchor moved). It is not what makes the landing safe —
+    # the dim proof below is — but a turned-over card should decline for the right
+    # reason.
+    ident_reason = _identity_reason(obs2.pane, plan, window_id, obs2.anchor)
     if ident_reason is not None:
         return _decline(ident_reason)
     landed = terminal_parser.parse_free_text_row(obs2.ansi, number=plan.target_row)
@@ -1038,7 +1057,15 @@ async def _verify_typed(
 ) -> DeliveryResult | None:
     """The post-type, pre-Enter verifier. ``None`` ⇒ the Enter may be sent.
 
-    THE PROOF SET (every leg AND-ed; a failure withholds the Enter):
+    **THIS IS NOT THE GUARD.** By the time it runs the payload is already typed,
+    and the decision that mattered — WHERE the bytes went — was made by the
+    PRE-TYPE landing proof (cursor + SGR-2 dim + the exact placeholder label; see
+    ``_answer_locked`` step 3 and the module docstring). What follows is a
+    consistency check whose job is to WITHHOLD the Enter when the pane stopped
+    looking like the transaction we started, and to fail closed when it cannot
+    tell. Three of its legs are measurably weak, and they are labelled as such.
+
+    The legs (every one AND-ed; a failure withholds the Enter):
 
       A. ``pane_command_is_claude`` — a bounded re-probe, run FIRST so the pane
          CAPTURE is the LAST observation before the Enter (the r2-F4 ordering:
@@ -1049,33 +1076,30 @@ async def _verify_typed(
          box is back and Enter would submit a half-typed message; refuse.
          Deliberately called WITHOUT ``expected_draft``: the picker trap
          (``prompt_row_is_option``) is exactly what must fire here.
-      C. **IDENTITY — WHICH CARD (peer-review P1).** The extracted surface is
-         still ``plan.surface`` AND ``SurfaceIdentity.still_holds``. Without this
-         leg, a card that resolved mid-transaction and was replaced by ANOTHER
-         card satisfies every remaining leg — B (a card owns the pane), D (our
-         text IS on it, because we typed it into the successor's row), and C1 (the
-         successor's row N+1 carries our cursor, our text, at normal intensity) —
-         and the Enter commits the user's answer to the WRONG QUESTION. On
-         ExitPlanMode that is a plan-approval surface. THIS is the leg that says
-         no.
-      D. THE ROW, or — on AUQ only — THE FOOTER:
-           D1 the affordance row is on the pane: it carries the cursor, its label
-              is NOT SGR-2 dim (⇒ TYPED, not the placeholder) and the label is a
-              prefix of what we typed (⇒ WE typed it);
-           D2 the row scrolled off under a long draft, but the picker footer —
-              scoped to the LIVE extracted AUQ region — carries ``ctrl+g to
-              edit``, which on 2.1.207 appears IFF the free-text row is the
-              ACTIVE row. It proves WHICH ROW, never WHICH CARD; leg C is what
-              supplies the latter (via the out-of-band anchor, since the pane
-              component is exactly what scrolled away).
-      E. the payload TAIL is visibly on the pane (our bytes landed).
+      C. IDENTITY — WHICH CARD: the extracted surface is still ``plan.surface``
+         AND ``SurfaceIdentity.still_holds``. This catches a card that TURNED OVER
+         mid-transaction (a new card's hook rewrites the side file ⇒ the anchor
+         moves ⇒ refuse). It does NOT catch the disclosed same-labels-successor
+         residual (module docstring), and it is not what keeps the prose off an
+         option row.
+      D. THE ROW, or — in the overflow shape — THE FOOTER (BOTH are CORROBORATION):
+           D1 the affordance row is on the pane, carries the cursor, is NOT dim,
+              and its label is a prefix of what we typed. **WEAK:** a selected REAL
+              option row is also not-dim, and an option labelled ``Yes`` is a prefix
+              of the payload ``Yes, but use postgres`` — this pair passes on a real
+              option row and is therefore NOT a guard;
+           D2 the row scrolled off under a long draft, but the live picker's footer
+              carries ``ctrl+g to edit``. **WEAK:** that hint is also present on the
+              ``N+2. Chat about this`` row, so it proves "the cursor is on SOME
+              text-field row", never WHICH row and never WHICH card.
+      E. the payload TAIL occurs on the pane. **WEAK:** a whole-pane substring test
+         that passes spuriously on scrollback echoing a previous answer.
 
-    THE OVERFLOW SHAPE (rig-measured), and how identity survives it: the AUQ
-    picker is BOTTOM-anchored, so a long answer scrolls the option block — the
-    ``❯ N+1.`` cursor row INCLUDED — off the TOP. D2 then carries the ROW and the
-    side-file OCCURRENCE ANCHOR carries the CARD. A TUI has no scrollback
-    (alternate screen), so what scrolls off is genuinely unobservable — which is
-    exactly why the anchor has to be out-of-band.
+    THE OVERFLOW SHAPE (rig-measured): the AUQ picker is BOTTOM-anchored, so a long
+    answer scrolls the option block — the ``❯ N+1.`` cursor row INCLUDED — off the
+    TOP, and a TUI has no scrollback (alternate screen), so what scrolls off is
+    genuinely unobservable. That is why D2 exists at all, and why the CARD is
+    carried by the out-of-band anchor rather than by the pane.
     """
     attempts = 2
     reason: str | None = None
@@ -1130,17 +1154,15 @@ def _identity_reason(
     plan: FreeTextPlan,
     window_id: str,
     anchor: SurfaceAnchor | None,
-    *,
-    bind_question_text: bool = False,
 ) -> str | None:
-    """``None`` iff the pane is PROVABLY still ``plan``'s card. Fail-closed.
+    """``None`` iff the pane still looks like ``plan``'s card. Fail-closed.
 
     ``anchor`` came from an ``_observe`` sandwich — read before AND after this
     pane's capture, with the two reads equal — so it is attributable to the pane,
-    and ``derive_identity`` then binds the record's CONTENT to it (round-5 P1-B).
-
-    ``bind_question_text`` is True only at the PRE-KEYSTROKE observations (see
-    :func:`derive_identity`).
+    and ``derive_identity`` then binds the record's OPTION LABELS to it. It cannot
+    separate two same-labelled cards: that is the disclosed residual (module
+    docstring), and it is bounded to "the answer reaches a different QUESTION",
+    never an option commit.
 
     Two independent gates, and the ORDER matters only for the log reason:
 
@@ -1163,14 +1185,13 @@ def _identity_reason(
         surface=plan.surface,
         target_row=plan.target_row,
         anchor=anchor,
-        bind_question_text=bind_question_text,
     )
     if live is None:
         # Either the OCCURRENCE anchor is gone (the PreToolUse side file was
-        # unlinked — the tool_result fired ⇒ the card RESOLVED), or the record
-        # PROVABLY does not describe this pane (the round-5 chimera). Absence and
-        # disagreement are both positive evidence that the card we planned against
-        # is no longer the one in front of us.
+        # unlinked — the tool_result fired ⇒ the card RESOLVED), or the record's
+        # option labels do not describe this pane. Absence and disagreement are
+        # both positive evidence that the card we planned against is no longer the
+        # one in front of us.
         logger.warning(
             "FREE_TEXT surface anchor UNRECOVERABLE on window %s (surface=%s) — "
             "the card this message was answering can no longer be identified; "
@@ -1199,26 +1220,28 @@ def _typed_state_reason(
     window_id: str,
     anchor: SurfaceAnchor | None,
 ) -> str | None:
-    """``None`` iff the typed state is PROVEN (see ``_verify_typed``'s legs).
+    """``None`` iff the post-write state is CONSISTENT (see ``_verify_typed``).
 
-    ``anchor`` came from the ``_observe`` sandwich around ``pane``'s capture.
-    The question-text binding is deliberately NOT applied here: the payload is
-    already typed, and on a bottom-anchored picker a long answer can scroll the
-    question off the top — a false refusal at this point strands the draft inside
-    a live card and brakes the topic. The anchor KEY (unchanged across the
-    sandwich, and equal to the planned one) carries the occurrence proof.
+    NOT a guard — the payload is already typed by now, and where it went was
+    decided by the PRE-TYPE landing proof. This decides only whether the Enter may
+    be sent, and it fails closed.
+
+    ``anchor`` came from the ``_observe`` sandwich around ``pane``'s capture, so
+    the anchor KEY (unchanged across the sandwich, and equal to the planned one)
+    is attributable to this pane.
     """
     # (B) the blocking surface still owns the pane
     if terminal_parser.pane_input_box_present(pane):
         return "input_box_returned"
-    # (C) WHICH CARD — before anything that merely proves WHICH ROW or WHOSE TEXT
+    # (C) WHICH CARD — a card that TURNED OVER since the plan (its hook rewrote the
+    # side file, so the anchor moved) refuses here.
     ident_reason = _identity_reason(pane, plan, window_id, anchor)
     if ident_reason is not None:
         return ident_reason
-    # (E) our bytes landed
+    # (E) our bytes are somewhere on the pane (weak — see payload_tail_landed)
     if not payload_tail_landed(pane, payload):
         return "payload_absent"
-    # (D) the row, or the AUQ footer
+    # (D) the row, or — in the overflow shape — the AUQ footer. Corroboration.
     row = terminal_parser.parse_free_text_row(ansi, number=plan.target_row)
     if row is not None and row.cursor:
         if row.dim:
@@ -1227,7 +1250,7 @@ def _typed_state_reason(
             return "row_not_our_draft"
         return None  # D1 ✓
     if plan.surface == SURFACE_AUQ and terminal_parser.auq_free_text_row_active(pane):
-        return None  # D2 ✓ — the row scrolled off; leg C already proved the CARD
+        return None  # D2 ✓ — the row scrolled off (the overflow shape)
     return "row_not_found"
 
 

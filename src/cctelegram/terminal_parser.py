@@ -1662,10 +1662,8 @@ def _walk_back_from_picker_footer(
         topmost option (the caller bounds it, so pre-picker scrollback can't be
         pulled in).
 
-    EXTRACTED VERBATIM from ``parse_ask_user_question`` (which still owns the two
-    display fields it feeds) so the GH #50 PR-2 question-region extractor
-    (:func:`auq_question_region`) anchors on the SAME live block the parse does —
-    one walk, one definition of "the block", no drift between them.
+    Extracted from :func:`parse_ask_user_question` (its only caller, which owns
+    the two display fields it feeds) — one walk, one definition of "the block".
     """
     start_idx = footer_idx
     stop_idx: int | None = None
@@ -1718,131 +1716,6 @@ def _walk_back_from_picker_footer(
             stop_idx = j
         break
     return start_idx, stop_idx, blank_gap
-
-
-# How many PHYSICAL rows a question may occupy before ``auq_question_region``
-# gives up. Claude Code renders the question at column 0 and soft-wraps it, so a
-# long question is several rows; the bound keeps an unbroken run of assistant
-# prose above a blank-less picker from being walked in wholesale. At the bot's
-# 160-column geometry this is ~1.9 kB of question — the largest REAL capture in
-# the corpus (``auq_longlabel_160x50_v2.1.198``) is 9 rows, so 12 carries 33%
-# headroom and is the only bound the captures justify.
-#
-# HITTING IT IS A FAILURE, NOT A TRUNCATION (peer-review round-7 P1-2). The
-# walk used to ``break`` at the cap and RETURN the rows it had — a partial
-# region, missing its top. The comment claimed that failed closed. It did NOT:
-# the SUFFIX is a strictly WEAKER identity, and a successor record whose whole
-# question equals that suffix BOUND to the pane and the free-text executor
-# committed onto the WRONG CARD (Codex reproduced it with a 13-row question).
-# An underivable region must never degrade into a weaker one, so the cap now
-# returns ``None`` and every caller refuses.
-_QUESTION_REGION_MAX_ROWS: Final = 12
-
-
-def pane_wrap_column(pane_text: str) -> int | None:
-    """The pane's WRAP COLUMN, measured from the capture itself.
-
-    ``None`` for an empty capture. This is the widest physical row on the pane,
-    which is a LOWER BOUND on the terminal width and, in practice, exactly it: a
-    live picker always renders its full-width ``────`` box rules (160 columns at
-    the bot's machine-surface geometry), and ``capture-pane`` is not given
-    ``-J``, so it emits one line per PHYSICAL row and **no line can exceed the
-    terminal width**. Over-estimation is therefore impossible.
-
-    The one consumer is the free-text lane's question binding
-    (:func:`handlers.auq_source._question_binds_to_pane`), which needs to know
-    whether a row boundary CAN have hard-broken a token: a row shorter than the
-    wrap column provably cannot have (a break mid-token happens only when the
-    row is full), so the question must carry a space there. Under-estimating the
-    column can only make that test MORE permissive at one boundary, never
-    refuse a genuine question — the fail-open direction is bounded to the
-    intrinsic ambiguity documented at the callsite, and the fail-closed
-    direction (a false refusal of a long question) is impossible.
-    """
-    if not pane_text:
-        return None
-    width = max((len(line) for line in pane_text.split("\n")), default=0)
-    return width or None
-
-
-def auq_question_region(pane_text: str) -> str | None:
-    """The pane's QUESTION REGION: the text block ADJACENT to the live options.
-
-    ``None`` when the pane carries no live picker, or when the block above it is
-    not a column-0 text block (the question scrolled off, or the picker is glued
-    straight to chrome). Callers must fail CLOSED on ``None``.
-
-    **WHY THIS EXISTS (peer-review round-6 P1).** The free-text lane binds the
-    PreToolUse record's question to the pane it captured, and that binding used to
-    be a substring search over the WHOLE pane — so a record whose question was
-    merely an option LABEL ("Blue"), an option description, prose in the
-    scrollback, or even the picker's own footer satisfied it, and the executor
-    committed the user's answer onto the WRONG CARD. A card is named by the
-    question it ASKS, so the comparison must target the region that carries it —
-    the block Claude Code renders directly above the option block — and nothing
-    else on the pane.
-
-    The rows are returned SEPARATE (joined by ``\\n``), boundaries intact — and
-    each row is returned at its RENDERED WIDTH (stripped of the padding tmux
-    already drops), because the width is what tells a caller whether a boundary
-    could have hard-broken a token (see :func:`pane_wrap_column`). A caller that
-    wants wrap tolerance must rejoin them explicitly. Anchored on the BOTTOM-MOST
-    picker footer (this repo's bottom-most-is-live rule — the live picker renders
-    at the bottom and its scrollback above is frozen) and on the SAME block walk
-    ``parse_ask_user_question`` uses, so the two can never disagree about which
-    picker is live.
-
-    A region that runs past ``_QUESTION_REGION_MAX_ROWS`` is ``None`` — NOT a
-    truncated suffix (round-7 P1-2; see the constant).
-    """
-    if not pane_text:
-        return None
-    lines = pane_text.split("\n")
-
-    footer_idx: int | None = None
-    for i in range(len(lines) - 1, -1, -1):
-        if _RE_PICKER_FOOTER.search(lines[i]):
-            footer_idx = i
-            break
-    if footer_idx is None:
-        return None
-
-    _block_top, stop_idx, blank_gap = _walk_back_from_picker_footer(lines, footer_idx)
-    # ``blank_gap`` bounded exactly as the walk-back title's is: more than a
-    # couple of blank rows between the text and the topmost option means the two
-    # are not adjacent, and whatever is up there is not this picker's question.
-    if stop_idx is None or blank_gap > 2:
-        return None
-
-    rows: list[str] = [lines[stop_idx].strip()]
-    for k in range(stop_idx - 1, -1, -1):
-        prev = lines[k]
-        prev_stripped = prev.strip()
-        if not prev_stripped:
-            break
-        if _RE_NUMBERED_OPTION.match(prev):
-            break
-        if all(c == "─" for c in prev_stripped):
-            break
-        if prev.startswith(("  ", "\t")):
-            # Indented prior content is an option-description continuation or
-            # unrelated bullet text — not part of the question. (tmux's pane
-            # capture does not re-indent soft-wrapped lines, so a wrapped
-            # question's continuation rows start at column 0.)
-            break
-        # The cap is checked ONLY once the row above is known to still BELONG to
-        # the region — a region that ends exactly at the cap is complete, not
-        # truncated — and it FAILS CLOSED (round-7 P1-2): returning the rows
-        # collected so far would hand the caller a strictly weaker SUFFIX
-        # identity, which a successor record can equal in full.
-        if len(rows) >= _QUESTION_REGION_MAX_ROWS:
-            logger.info(
-                "AUQ question region exceeds %d rows — underivable, refusing",
-                _QUESTION_REGION_MAX_ROWS,
-            )
-            return None
-        rows.append(prev_stripped)
-    return "\n".join(reversed(rows))
 
 
 def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
@@ -4446,44 +4319,58 @@ def pane_input_box_present(
 # runs ``--dangerously-skip-permissions`` anyway. An EPM card now takes PR-1's
 # refusal. The helpers below are AUQ-only; nothing here parses an EPM row.
 #
-# THE TYPED-STATE DISCRIMINATOR IS SGR-2 (rig §5-E11, re-confirmed live on
-# 2.1.207): while the row is SELECTED but UNTYPED, its label is the placeholder
-# and renders DIM (``ESC[2m``); the moment the user types, the label is their
-# text and renders at normal intensity. It holds even for the adversarial payload
-# that is byte-identical to the placeholder (typing the literal placeholder text
-# renders PLAIN). The dim styling is applied ONLY when the cursor is on the row —
-# which is exactly the state the executor verifies in, so the discriminator is
-# available precisely when needed.
+# SGR-2 IS THE *PRE-TYPE* DISCRIMINATOR, AND THAT IS THE ONLY CLAIM IT SUPPORTS
+# (rig, 2026-07-12 — the earlier "typed-state proof" framing OVERCLAIMED and is
+# CORRECTED here). While the affordance row is SELECTED but UNTYPED its label is
+# the placeholder and renders DIM (``ESC[2m``); typing replaces the label with
+# the user's text at normal intensity. ``dim=True`` therefore holds for EXACTLY
+# ONE shape: **the selected, untyped placeholder.** A real option row is never
+# dim — not even when it is the selected row.
+#
+# What that does and does NOT buy:
+#
+#   * It is the LOAD-BEARING guard of the free-text lane, consumed BEFORE the
+#     first byte is typed: the executor requires the row under the cursor to be
+#     ``cursor and dim and label == AUQ_FREE_TEXT_LABEL``. Nothing else on a
+#     picker satisfies all three, so an overshoot / undershoot / stale-frame nav
+#     that parked the cursor on a REAL option cannot pass it, and the payload is
+#     never typed there (rig-verified: typing while parked on a real option row
+#     is SWALLOWED entirely — the pane stays byte-identical).
+#   * It is NOT a post-type identity proof. ``dim=False`` on a cursored row is
+#     satisfied by any selected REAL option row, and the executor's own
+#     "is this label a prefix of our payload?" check is satisfied by an option
+#     labelled ``Yes`` under a payload ``Yes, but use postgres``. The post-write
+#     legs are corroboration, not a guard — see ``handlers/free_text``.
 #
 # Fixtures: ``auq_freetext_row_selected_pretype_v2.1.207.ansi.txt`` (dim),
 # ``auq_freetext_row_typed_v2.1.207.ansi.txt`` (plain),
-# ``auq_freetext_typed_identical_label_v2.1.207.ansi.txt`` (the adversarial
-# payload), ``auq_freetext_row_typed_large_v2.1.207.ansi.txt`` (a 947-char
-# multi-line voice-note-shaped payload), ``auq_freetext_overflow_v2.1.207.txt``
-# (the ~5.3 k answer that scrolls the option block away).
+# ``auq_freetext_typed_identical_label_v2.1.207.ansi.txt`` (typing the literal
+# placeholder text still renders PLAIN),
+# ``auq_freetext_row_typed_large_v2.1.207.ansi.txt`` (a 947-char multi-line
+# voice-note-shaped payload), ``auq_freetext_overflow_v2.1.207.txt`` (the ~5.3 k
+# answer that scrolls the option block away).
 #
 # A TUI-DRIFT AUDIT SURFACE, like ``clean_ghost_input_text`` (the other SGR-2
 # consumer) and ``pane_command_is_claude``. It is why the lane is
 # VERSION-LICENSED (``handlers/free_text``): a CC release that renders the
-# placeholder at normal intensity would make the verifier read an untyped row as
-# typed — so an unlicensed version degrades to PR-1's refusal rather than
-# trusting a stale empiric.
+# placeholder at normal intensity would defeat the pre-type landing proof, so an
+# unlicensed version degrades to PR-1's refusal rather than trusting a stale
+# empiric.
 
-# The two affordance placeholders, per surface. EXACT (post-strip) match — the
-# label is the thing the SGR-2 proof is about, so a drifted label must NOT be
-# silently accepted.
+# The affordance placeholder. EXACT (post-strip) match — the label is half of the
+# pre-type landing proof, so a drifted label must NOT be silently accepted.
 AUQ_FREE_TEXT_LABEL: Final = "Type something."
 
 # ``ctrl+g to edit in <editor>`` — Claude Code's "you are in a text field" hint.
 #
-# On the AUQ picker footer it appears **IFF the free-text row is the ACTIVE
-# row** (rig-confirmed: it tracks the cursor exactly — absent at rows 1/2/3,
-# present at row N+1). That makes it a POSITIVE row-active proof that survives
-# the overflow shape below, where the option rows themselves scroll off.
-#
-# On ExitPlanMode it is ALWAYS present (it is the plan-file footer), so it is
-# NOT a typed-state or row-active proof there (plan §2.1 [r4 P1-4]) — the EPM
-# verifier requires the row itself.
+# **NOT AN EXACT ROW PROOF (rig, 2026-07-12 — this CORRECTS an earlier claim that
+# it "tracks the cursor exactly").** It is absent on the real option rows 1/2/3
+# and present on the affordance row N+1 — but it is ALSO present on the
+# ``N+2. Chat about this`` row, which is a text field too. So it proves "the
+# cursor is on SOME text-field row", never WHICH row and never WHICH card. It is
+# used only as post-write CORROBORATION in the overflow shape (the option block
+# has scrolled off, so the row itself is unobservable); the load-bearing guard is
+# the PRE-TYPE landing proof above, which runs before any byte is typed.
 _RE_FREE_TEXT_EDIT_HINT: Final = re.compile(r"ctrl[+-]g to edit")
 
 
@@ -4577,41 +4464,33 @@ def _visible_chars_with_dim(raw_line: str) -> list[tuple[str, bool]]:
 
 
 def auq_free_text_row_active(pane_text: str | None) -> bool:
-    """True iff a LIVE AUQ picker has its free-text row as the ACTIVE row.
+    """True iff a LIVE AUQ picker has a TEXT-FIELD row as the active row.
 
-    The proof is the picker footer carrying BOTH ``Enter to select`` (the picker
-    is live and Enter commits the cursor row) AND ``ctrl+g to edit`` (the cursor
-    row is a TEXT FIELD — only the free-text affordance row is). Rig-confirmed on
-    2.1.207: the hint is absent with the cursor on options 1/2/3 and present on
-    row N+1, tracking the cursor exactly.
+    The signal is the bottom-most picker footer carrying BOTH ``Enter to select``
+    (the picker is live and Enter commits the cursor row) AND ``ctrl+g to edit``
+    (the cursor row is a TEXT FIELD).
 
-    **SCOPED TO THE LIVE PICKER (peer-review P1).** The first cut asked only
-    "does SOME line carry ``Enter to select`` and, on that line, ``ctrl+g``?" —
-    an OR over the whole pane. Two ways that lies:
+    **WHAT IT IS NOT (rig, 2026-07-12 — this CORRECTS the original docstring,
+    which claimed the hint "tracks the cursor exactly" and was therefore an exact
+    row proof).** The hint is absent on the real option rows 1/2/3 and present on
+    the affordance row N+1 — but it is ALSO present on the ``N+2. Chat about
+    this`` row, which is a text field too. So this predicate proves "the cursor is
+    on SOME text-field row of this live picker". It does NOT prove WHICH row, and
+    it certainly does not prove WHICH CARD.
 
-      1. it never checked the pane was an AskUserQuestion at all, and
-      2. a STALE footer in scrollback — an EARLIER picker, or a transcript the
-         user pasted — could carry the hint while the LIVE picker's footer does
-         not, so a cursor sitting on option 1 read as "the free-text row is
-         active". A positive proof that arbitrary pane text can mint is not a
-         proof.
+    It is therefore used for exactly one thing: post-write CORROBORATION in the
+    OVERFLOW shape, where a long answer scrolls the whole option block — the
+    ``❯ N+1.`` cursor row included — off the top of an alternate screen and the
+    row itself is genuinely unobservable (rig: ``capture-pane -S`` recovers
+    nothing). By then the payload has already been typed into the row the PRE-TYPE
+    landing proof positively identified (cursor + SGR-2 dim + the exact
+    placeholder label), which is the guard that decides where the bytes go. This
+    predicate never authorizes a keystroke.
 
-    So now the pane must extract as a LIVE ``AskUserQuestion``, and the footer
-    consulted is the **BOTTOM-MOST** picker footer on the pane — the repo's
-    bottom-most-is-live rule (Claude Code renders the live picker at the bottom;
-    everything above it is scrollback, and a TUI's scrollback is frozen).
-
-    This is the OVERFLOW proof. A long answer (~4-5 k chars on a 160x50 pane)
-    wraps to more rows than the pane has, and the picker — which is BOTTOM-
-    anchored — scrolls its whole option block, INCLUDING the ``❯ N+1.`` cursor
-    row, off the top. A TUI runs on the alternate screen, so ``capture-pane -S``
-    recovers nothing (rig-measured: 51 lines). The row is then genuinely
-    unobservable, yet the live footer still proves the free-text row is where
-    Enter will commit. It is NOT a surface-identity proof, though — it says WHICH
-    ROW, never WHICH CARD — so ``handlers/free_text`` pairs it with the mandatory
-    surface-identity re-check (which, when the option block has scrolled off,
-    falls to the out-of-band anchor). ExitPlanMode has NO equivalent (its
-    ``ctrl+g`` footer is unconditional), so the EPM lane requires the row itself.
+    SCOPED TO THE LIVE PICKER (peer-review P1): the pane must extract as a live
+    ``AskUserQuestion`` and the footer consulted is the BOTTOM-MOST one (this
+    repo's bottom-most-is-live rule) — otherwise a STALE footer in scrollback, or
+    a transcript the user pasted, could mint the signal from arbitrary pane text.
     """
     if not pane_text:
         return False

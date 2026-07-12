@@ -1220,13 +1220,13 @@ def peek_side_file_tool_use_id_and_written_at(
 class SurfaceAnchor:
     """The AUQ occurrence anchor: its KEY **and the record's own content**.
 
-    The key alone is not enough (peer-review round-5 P1-B). It is read
-    OUT-OF-BAND, so nothing tied it to the pane the caller then captured — and
-    the round-3 argument that made that safe ("a live prompt means Claude is
-    BLOCKED on it, so the side file must be its") silently assumed that a
-    RESOLVED prompt is no longer live-LOOKING on the pane. Carrying the record's
-    ``tool_input`` lets the caller BIND the anchor to the pane it captured
-    (:func:`anchor_pane_agreement`) instead of betting on read order.
+    The key alone is not enough. It is read OUT-OF-BAND, so nothing tied it to
+    the pane the caller then captured — and the argument that made that safe ("a
+    live prompt means Claude is BLOCKED on it, so the side file must be its")
+    silently assumed that a RESOLVED prompt is no longer live-LOOKING on the
+    pane. Carrying the record's ``tool_input`` lets the caller BIND the anchor to
+    the pane it captured (:func:`anchor_pane_agreement` — the OPTION LABELS)
+    instead of betting on read order.
 
     Both fields come from ONE atomic side-file read, so the key and the content
     can never describe two different records.
@@ -1241,127 +1241,24 @@ ANCHOR_MISMATCH: Final = "mismatch"
 ANCHOR_INDETERMINATE: Final = "indeterminate"
 
 
-def _collapse_ws(text: str) -> str:
-    """Whitespace runs → ONE space; edges stripped. BOUNDARY-PRESERVING."""
-    return " ".join(text.split())
-
-
-def _question_binds_to_pane(question: str, pane_text: str) -> bool:
-    """Is ``question`` the question THIS pane's live picker is ASKING?
-
-    **Round-6 P1 — this used to be ``_squash_ws(question) in _squash_ws(pane)``,
-    a substring search over the WHOLE pane.** A card is named by the question it
-    asks, but that test only asked whether the text occurred SOMEWHERE — so a
-    successor record whose question was merely one of the pane's OPTION LABELS
-    ("Blue"), or an option description, or prose the user typed in the
-    scrollback, or the picker's own footer, satisfied it. The executor then typed
-    the user's answer into the pane it had just proved and committed it onto the
-    WRONG CARD (Codex's reproduced interleaving).
-
-    So the comparison targets the pane's QUESTION REGION — the block Claude Code
-    renders directly above the live option block
-    (:func:`terminal_parser.auq_question_region`) — and it is an EQUALITY against
-    that region, never a substring of the pane. A match anywhere else on the pane
-    is not evidence about which card is live, and no longer counts as any.
-
-    **AND THE REJOIN IS DECIDED BY THE PANE'S GEOMETRY, NEVER BY DELETING THE
-    WHITESPACE (round-7 P1-1).** Round 6 kept a fallback: "if the space-join
-    fails, compare both sides with ALL whitespace removed", so a token Claude
-    Code hard-breaks MID-token could still match. Equality does not make that
-    transformation injective, and Codex reproduced the consequence: a pane asking
-    ``Is nowhere safe?`` and a successor record asking ``Is now here safe?`` —
-    two DIFFERENT questions, same option labels — squash to the same string, so
-    the successor's anchor BOUND to the live card and the answer committed onto
-    the WRONG CARD.
-
-    The rejoin is now a CONSUMPTION WALK of the question against the region's
-    rows, with the one genuinely ambiguous boundary decided by the pane's WRAP
-    COLUMN (:func:`terminal_parser.pane_wrap_column`, measured from the capture):
-
-      * each row must be an exact PREFIX of what is left of the question (so no
-        character of either side is ever dropped, reordered, or invented);
-      * at each row boundary the question either carries a SPACE — the word wrap
-        consumed it, the ordinary case — or it does not, which means Claude Code
-        HARD-BROKE a token there. A break mid-token only happens when the row is
-        FULL, so that shape is accepted **only when the row reaches the wrap
-        column**; a short row provably cannot have hard-broken and MUST carry the
-        space. That is what keeps the walk injective;
-      * the question must be exactly CONSUMED — nothing left over.
-
-    **The premise that a row AT the wrap column proves a hard break is FALSE, and
-    the code must not assume it** (fixture-pinned on the real
-    ``auq_longlabel_160x50_v2.1.198`` capture, whose 160-column-wide rows 2 and 4
-    end at WORD boundaries — ``…peer reviewers,`` / ``…choice trades``). A
-    word-wrapped row can land exactly on the column. So the walk lets the
-    QUESTION decide the boundary and uses the geometry only to VETO the hard-break
-    reading — never to force it.
-
-    Whitespace RUNS inside the question (and inside a row) still collapse to one
-    space, exactly as before: that is boundary-PRESERVING (it never merges two
-    tokens) and it is the tolerance the round-6 code already had.
-
-    **The one residual, and it is the PANE's, not the walk's:** a row that ends
-    exactly at the wrap column is rendered IDENTICALLY whether the original had a
-    space there (word wrap consumed it) or not (token hard-broken). No reading of
-    the pane can separate those two questions, and re-wrapping the record's
-    question to the same width produces the same rows — so the walk accepts both.
-    It is the same class as the disclosed "same question + same labels" residual.
-
-    ``False`` is FAIL-CLOSED: the caller reports MISMATCH and, pre-keystroke, the
-    lane declines to PR-1.
-    """
-    from ..terminal_parser import auq_question_region, pane_wrap_column
-
-    region = auq_question_region(pane_text)
-    if not region:
-        return False
-    wrap_column = pane_wrap_column(pane_text)
-
-    rows = region.split("\n")
-    remaining = _collapse_ws(question)
-    if not remaining:
-        return False
-
-    last = len(rows) - 1
-    for i, row in enumerate(rows):
-        # The RENDERED width decides the boundary below; the COLLAPSED text is
-        # what we compare (a whitespace run inside a row is not a boundary).
-        text = _collapse_ws(row)
-        if not text or not remaining.startswith(text):
-            return False
-        remaining = remaining[len(text) :]
-        if i == last:
-            break
-        if remaining.startswith(" "):
-            remaining = remaining[1:]  # a WORD wrap consumed exactly one space
-            continue
-        # No space in the question here ⇒ the pane must have HARD-BROKEN a token
-        # at this boundary, which is only possible on a FULL row.
-        if wrap_column is None or len(row) < wrap_column:
-            return False
-    return remaining == ""
-
-
 def anchor_pane_agreement(
     tool_input: dict[str, Any],
     pane_text: str,
     *,
     target_row: int,
-    bind_question_text: bool,
 ) -> str:
-    """Does the hook RECORD describe the card the PANE is showing? (round-5 P1-B)
+    """Does the hook RECORD describe the card the PANE is showing?
 
     ``ANCHOR_MATCH`` / ``ANCHOR_MISMATCH`` / ``ANCHOR_INDETERMINATE``.
 
-    THE HOLE THIS CLOSES. The free-text executor reads the anchor out-of-band and
+    WHAT THIS BUYS. The free-text executor reads the anchor out-of-band and
     captures the pane separately, so it can mint a CHIMERA — ``(card A's pane,
     card B's anchor)`` — whenever the side file has already moved to B while the
-    pane still renders A. The round-3 fix ordered the reads (anchor first) and
-    argued the dangerous direction was unreachable, but that argument rests on a
-    premise it never states: that a card the user already answered stops looking
-    live on the pane. Binding the record's CONTENT to the captured pane removes
-    the bet entirely — a record that does not describe what we are looking at is
-    refused, whatever the read order was.
+    pane still renders A (``PreToolUse`` writes B's record BEFORE B draws, so a
+    just-answered A can still be on screen). Read order alone cannot close that,
+    so the record's CONTENT is bound to the pane it is paired with: a record whose
+    OPTION LABELS are not the pane's labels is REFUSED, whatever the read order
+    was.
 
     TARGET-ROW-BLIND, for the same reason the pane identity is: the executor
     types into row ``target_row``, and a typed affordance row parses as a FOURTH
@@ -1375,28 +1272,24 @@ def anchor_pane_agreement(
     alone — the documented, rig-measured AUQ overflow case. It is NOT a licence:
     the caller still requires the anchor KEY to be unchanged.
 
-    ``bind_question_text`` additionally requires the record's question to BE THE
-    QUESTION THE LIVE PICKER IS ASKING — an EQUALITY against the pane's question
-    REGION (``_question_binds_to_pane``), never a substring of the pane. That is
-    the leg that separates two cards with IDENTICAL option labels — which the
-    label comparison provably cannot (verified: see below) — and it is the leg
-    that closes the reviewer's exact interleaving. **Round-6 P1: it was a
-    whole-pane substring search, so a record whose question was merely an option
-    LABEL passed it and the answer was committed onto the WRONG CARD.**
-    Callers pass it ONLY at PRE-KEYSTROKE observations, because the question sits
-    ABOVE the option block and a long typed answer can legitimately scroll it off
-    a bottom-anchored picker; a false refusal there would strand a draft inside a
-    live card. Before any key is typed the pane has not grown, and a false refusal
-    costs nothing but a fall-through to the normal gate.
-
-    LIMITS OF THE LABEL LEG, MEASURED — not assumed (this repo's recorded
-    "reuse-claim needs liveness verification" rule). ``_record_consistent_with_pane``
-    DOES reject a record whose option labels differ from the pane
-    (``label_mismatch``), and DOES NOT reject one whose labels are identical but
-    whose QUESTION differs: a pure-pane parse yields ``current_question_title is
-    None`` (the title check is conditional and skips) and empty option
-    descriptions, so the labels are the only pane-observable content it has.
-    Hence ``bind_question_text``.
+    **THE LABEL COMPARISON IS THE WHOLE CONTENT BINDING, AND ITS LIMIT IS AN
+    ACCEPTED RESIDUAL (owner decision 2026-07-12).** ``_record_consistent_with_pane``
+    rejects a record whose option labels differ from the pane (``label_mismatch``)
+    and does NOT reject one whose labels are IDENTICAL but whose QUESTION differs
+    — a pure-pane parse yields ``current_question_title is None`` and empty option
+    descriptions, so the labels are the only pane-observable content it has. An
+    earlier revision therefore grew a question-text binding (a pane
+    question-REGION extractor, a measured wrap column, and a row-consumption
+    walk). **It was DELETED.** It failed three straight review rounds on its own
+    injectivity, and the hazard it defended against was over-scoped: a wrong card
+    CANNOT receive an OPTION COMMIT, because the free-text lane's PRE-TYPE LANDING
+    PROOF (``free_text``: cursor + SGR-2 dim + the exact ``Type something.``
+    label) is satisfied by exactly one shape — the selected, UNTYPED placeholder —
+    and a real option row is never dim. The worst reachable outcome is that the
+    prose answer reaches a DIFFERENT QUESTION (a same-labelled successor's
+    free-text row): a recoverable annoyance the user sees immediately, not a
+    security event. Disclosed in ``handlers/free_text``'s module docstring and in
+    ``.claude/rules/message-handling.md``.
     """
     from ..terminal_parser import resolve_ask_form
 
@@ -1428,26 +1321,6 @@ def anchor_pane_agreement(
             reason,
         )
         return ANCHOR_MISMATCH
-
-    if bind_question_text:
-        questions = tool_input.get("questions")
-        if (
-            not isinstance(questions, list)
-            or len(questions) != 1
-            or not isinstance(questions[0], dict)
-        ):
-            # The free-text lane is single-question only; anything else is a
-            # record that cannot describe the card we are about to type into.
-            return ANCHOR_MISMATCH
-        question = (questions[0].get("question") or "").strip()
-        if not question:
-            return ANCHOR_MISMATCH
-        if not _question_binds_to_pane(question, pane_text):
-            logger.info(
-                "AUQ anchor/pane DISAGREE reason=question_mismatch — the record's "
-                "question is not the one the live picker is asking"
-            )
-            return ANCHOR_MISMATCH
     return ANCHOR_MATCH
 
 
