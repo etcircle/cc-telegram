@@ -44,9 +44,13 @@ from tests.free_text_frames import (
     EPM_P_ANSWER,
     EPM_P_LANDED,
     EPM_P_LIVE,
+    EPM_P_PLAN_PATH,
     EPM_P_TYPED,
+    EPM_Q_PLAN_PATH,
     EPM_Q_TYPED,
+    EPM_Q_TYPED_AT_P_PATH,
     EPM_RESOLVED,
+    EPM_S_PLAN_PATH,
     OVERFLOW_ANSWER,
     plain,
 )
@@ -137,19 +141,52 @@ def stamped(monkeypatch):
     return seen
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def auq_anchor(monkeypatch):
-    """Stub the AUQ out-of-band anchor (the PreToolUse side file's occurrence id).
+    """The AUQ out-of-band anchor (the PreToolUse side file's occurrence id).
 
-    Returns a mutable one-element list so a test can ROTATE the anchor mid-flight
-    — which is what a genuinely new AUQ does (its hook rewrites the side file) —
-    or drop it to ``None`` (the card resolved and its file was unlinked).
+    AUTOUSE, because the anchor is MANDATORY (peer-review round-2 P1): without a
+    live side file the AUQ lane DECLINES, so every AUQ test needs one — and the
+    tests that assert the decline set it to ``None`` themselves.
+
+    A mutable one-element list, so a test can ROTATE the anchor mid-flight —
+    which is what a genuinely new AUQ does (its hook rewrites the side file) — or
+    drop it to ``None`` (the card resolved and its file was unlinked).
     """
     box: list[str | None] = ["tu:toolu_CARD_X"]
     monkeypatch.setattr(
         auq_source, "peek_surface_identity_for_window", lambda _w: box[0]
     )
     return box
+
+
+# The plan bodies behind the corpus's real EPM footers. The EPM anchor is the
+# plan file's CONTENT (hashed), not its path, so these files must EXIST — and a
+# test that revises a plan simply rewrites one of them.
+EPM_PLAN_BODIES = {
+    EPM_P_PLAN_PATH: "# Plan P\n\nWrite goodbye.txt with one paragraph.\n",
+    EPM_Q_PLAN_PATH: "# Plan Q\n\n1. Create goodbye.txt\n2. Verify it\n",
+    EPM_S_PLAN_PATH: "# Plan S\n\nA very short warm plan.\n",
+}
+
+
+@pytest.fixture(autouse=True)
+def epm_plans(monkeypatch, tmp_path):
+    """The real filesystem substrate the EPM anchor reads: ``~/.claude/plans/``.
+
+    HOME is redirected, so ``Path.home()`` and ``Path("~/…").expanduser()`` — the
+    exact seams ``free_text._epm_plan_generation`` uses, traversal guard included
+    — resolve here. No handler internals are stubbed.
+
+    Returns the plans DIRECTORY so a test can REVISE a plan in place (the same
+    slug, new bytes: the round-2 P1 shape).
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    plans = tmp_path / ".claude" / "plans"
+    plans.mkdir(parents=True)
+    for path, body in EPM_PLAN_BODIES.items():
+        (plans / Path(path).name).write_text(body)
+    return plans
 
 
 def _wire(monkeypatch, pane: FakePane) -> None:
@@ -489,26 +526,129 @@ class TestTheOwnersActualUseCase:
         assert pane.enter_sent is True
         assert terminal_parser.parse_free_text_row(AUQ_X_OVERFLOW, number=4) is None
 
+
+class TestTheAuqAnchorIsMANDATORY:
+    """peer-review round-2 P1 — the AUQ anchor was OPTIONAL, so identity silently
+    degraded to the PANE, which cannot tell two same-shaped cards apart.
+
+    Worse, an identity captured with ``anchor=None`` IGNORED a successor's
+    non-``None`` anchor rather than treating it as a mismatch — so card A's text
+    could be committed onto card B. The anchor is now mandatory on BOTH sides of
+    every comparison, and its absence declines BEFORE the first keystroke.
+    """
+
     @pytest.mark.asyncio
-    async def test_overflow_with_NO_anchor_REFUSES_rather_than_guess(
-        self, monkeypatch, stamped
+    async def test_no_side_file_anchor_DECLINES_with_zero_keystrokes(
+        self, monkeypatch, auq_anchor, stamped
     ):
-        """No ``PreToolUse`` side file (the hook isn't installed) ⇒ the option block
-        scrolling away leaves NOTHING that identifies the card. Fail closed: the
-        draft is stranded and honestly reported, never committed on a guess."""
-        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_OVERFLOW, AUQ_RESOLVED])
+        """No PreToolUse side file (the hook isn't installed / hasn't fired / was
+        GC'd) ⇒ nothing OCCURRENCE-unique identifies the card, so the lane never
+        starts. PR-1 owns the single refusal; the user still gets a clean
+        "answer the card" notice, and NOTHING is typed."""
+        auq_anchor[0] = None
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
         _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is None, "DECLINE — never commit on the pane identity alone"
+        assert pane.keys == [], "not one keystroke may reach the pane"
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
+
+    @pytest.mark.asyncio
+    async def test_two_AUQs_with_IDENTICAL_options_are_told_apart_by_the_anchor(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """The hardest AUQ case, and the reason the pane alone is not enough: the
+        successor is BYTE-IDENTICAL on the pane (a re-asked question — same
+        options, and a pure-pane parse carries no title), so its pane identity
+        MATCHES. Only its side file's fresh ``tool_use_id`` says it is a different
+        occurrence."""
+        assert terminal_parser.free_text_surface_identity(
+            plain(AUQ_X_LIVE), surface="AskUserQuestion", target_row=4
+        ) == terminal_parser.free_text_surface_identity(
+            plain(AUQ_X_TYPED), surface="AskUserQuestion", target_row=4
+        ), "premise: the two occurrences are INDISTINGUISHABLE by their option rows"
+
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_X_TYPED])
+        _wire(monkeypatch, pane)
+
+        calls = {"n": 0}
+        real_capture = pane.capture
+
+        async def capture_and_reask(window_id, *, with_ansi=False):
+            out = await real_capture(window_id, with_ansi=with_ansi)
+            calls["n"] += 1
+            if calls["n"] >= 3:  # 1 = plan, 2 = landing, 3 = the pre-Enter capture
+                auq_anchor[0] = "tu:toolu_CARD_X_REASKED"
+            return out
+
         monkeypatch.setattr(
-            auq_source, "peek_surface_identity_for_window", lambda _w: None
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_reask
         )
 
-        result = await free_text.try_answer(WINDOW, OVERFLOW_ANSWER, user_turn=STAMP)
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
 
         assert result is not None
         assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
-        assert pane.enter_sent is False
+        assert pane.enter_sent is False, "the re-asked question must not be answered"
         assert stamped == []
         assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is True
+
+    @pytest.mark.asyncio
+    async def test_a_CAPTURED_none_anchor_can_never_accept_a_LATER_one(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """The precise old hole: with ``anchor=None`` captured, ``still_holds``
+        skipped the anchor check entirely, so a successor's non-``None`` anchor was
+        IGNORED instead of refused. It is now unreachable BY CONSTRUCTION — an
+        anchor-less pane never yields an identity, so the lane never starts."""
+        auq_anchor[0] = None
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_X_TYPED])
+        _wire(monkeypatch, pane)
+
+        calls = {"n": 0}
+        real_capture = pane.capture
+
+        async def capture_and_appear(window_id, *, with_ansi=False):
+            out = await real_capture(window_id, with_ansi=with_ansi)
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                auq_anchor[0] = "tu:toolu_A_DIFFERENT_CARD"
+            return out
+
+        monkeypatch.setattr(
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_appear
+        )
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is None
+        assert pane.keys == []
+        assert stamped == []
+
+
+class TestOverflowWithoutAnAnchorNeverStarts:
+    @pytest.mark.asyncio
+    async def test_no_side_file_means_no_lane_at_all(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """Pre-fix this typed the payload and only THEN discovered — when the
+        option block scrolled away — that nothing identified the card, stranding
+        the draft and braking the topic. With the anchor mandatory at plan time
+        the lane declines up front: strictly better, and the payload still reaches
+        the user's eyes through PR-1's refusal."""
+        auq_anchor[0] = None
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_OVERFLOW, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, OVERFLOW_ANSWER, user_turn=STAMP)
+
+        assert result is None
+        assert pane.keys == []
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
 
 
 class TestEpm:
@@ -571,6 +711,134 @@ class TestEpm:
 
         assert await free_text.try_answer(WINDOW, PAYLOAD, user_turn=STAMP) is None
         assert pane.keys == []
+
+    @pytest.mark.asyncio
+    async def test_an_epm_whose_plan_FILE_is_gone_never_starts(
+        self, monkeypatch, epm_plans
+    ):
+        """The anchor is the plan's CONTENT. An unreadable plan file is not a
+        licence to proceed on the pane alone — every EPM pane looks the same."""
+        (epm_plans / Path(EPM_P_PLAN_PATH).name).unlink()
+        pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_P_TYPED, EPM_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        assert await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP) is None
+        assert pane.keys == []
+
+
+class TestARevisedPlanKeepsTheSameSlug:
+    """peer-review round-2 P1 — the EPM anchor was a PATH, not an OCCURRENCE.
+
+    Re-entering ExitPlanMode after REVISING a plan commonly keeps the SAME slug
+    (Claude rewrites the file in place), and every EPM prompt renders the SAME
+    three real options. So plan P and its revision matched on BOTH identity
+    components, and a mid-transaction successor received the previous plan's
+    feedback — on the surface whose option 1 is "Yes, and bypass permissions".
+
+    The anchor is now the plan-file's CONTENT. Different plan ⇒ different bytes ⇒
+    different anchor ⇒ refuse.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_pane_AND_the_path_both_match_across_the_two_plans(self):
+        """The premise, stated as an assertion: neither pre-fix component sees it."""
+        assert terminal_parser.free_text_surface_identity(
+            plain(EPM_P_TYPED), surface="ExitPlanMode", target_row=4
+        ) == terminal_parser.free_text_surface_identity(
+            plain(EPM_Q_TYPED_AT_P_PATH), surface="ExitPlanMode", target_row=4
+        ), "every EPM renders the same three real options"
+        assert (
+            terminal_parser.extract_epm_plan_file_path(plain(EPM_P_TYPED))
+            == terminal_parser.extract_epm_plan_file_path(plain(EPM_Q_TYPED_AT_P_PATH))
+            == EPM_P_PLAN_PATH
+        ), "a revision keeps the slug — the path is a NAME, not an occurrence"
+
+    @pytest.mark.asyncio
+    async def test_the_revised_plan_does_NOT_receive_the_previous_plans_feedback(
+        self, monkeypatch, epm_plans, stamped
+    ):
+        """Plan P is live; we navigate and type. Claude revises the plan IN PLACE
+        (same file, new bytes) and re-presents it. By the pre-Enter capture the
+        pane is the revision — same options, same footer path — and only the
+        CONTENT generation refuses."""
+        plan_file = epm_plans / Path(EPM_P_PLAN_PATH).name
+        pane = FakePane(
+            [EPM_P_LIVE, EPM_P_LANDED, EPM_Q_TYPED_AT_P_PATH, EPM_Q_TYPED_AT_P_PATH]
+        )
+        _wire(monkeypatch, pane)
+
+        calls = {"n": 0}
+        real_capture = pane.capture
+
+        async def capture_and_revise(window_id, *, with_ansi=False):
+            out = await real_capture(window_id, with_ansi=with_ansi)
+            calls["n"] += 1
+            if calls["n"] >= 3:  # 1 = plan, 2 = landing, 3 = the pre-Enter capture
+                plan_file.write_text(
+                    "# Plan P, REVISED\n\nA different plan entirely.\n"
+                )
+            return out
+
+        monkeypatch.setattr(
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_revise
+        )
+
+        result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
+
+        assert result is not None
+        assert result.outcome is DeliveryOutcome.DRAFT_WRITTEN
+        assert result.reason == delivery.REASON_FREE_TEXT_VERIFY_FAILED
+        assert pane.enter_sent is False, "the REVISED plan must not get P's feedback"
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is True
+
+    @pytest.mark.asyncio
+    async def test_a_revision_during_the_NAV_is_caught_with_nothing_typed(
+        self, monkeypatch, epm_plans, stamped
+    ):
+        """The identity is re-checked at BOTH points bracketing a keystroke, so a
+        revision that lands during the NAV is a clean pre-write bail: fall through
+        to PR-1, no draft, no brake."""
+        plan_file = epm_plans / Path(EPM_P_PLAN_PATH).name
+        pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_P_TYPED, EPM_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        calls = {"n": 0}
+        real_capture = pane.capture
+
+        async def capture_and_revise(window_id, *, with_ansi=False):
+            out = await real_capture(window_id, with_ansi=with_ansi)
+            calls["n"] += 1
+            if calls["n"] >= 2:  # revised before the post-nav landing check
+                plan_file.write_text(
+                    "# Plan P, REVISED\n\nA different plan entirely.\n"
+                )
+            return out
+
+        monkeypatch.setattr(
+            tmux_mod.tmux_manager, "capture_pane_cancellation_safe", capture_and_revise
+        )
+
+        result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
+
+        assert result is None, "pre-write bail ⇒ PR-1 owns the refusal"
+        assert pane.literal_writes == []
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
+
+    @pytest.mark.asyncio
+    async def test_an_UNCHANGED_plan_still_commits(self, monkeypatch, stamped):
+        """The non-regression the content generation must not break: the ordinary
+        flow re-reads the SAME unchanged plan file at every observation point, so
+        the anchor is stable and the feedback commits."""
+        pane = FakePane([EPM_P_LIVE, EPM_P_LANDED, EPM_P_TYPED, EPM_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, EPM_P_ANSWER, user_turn=STAMP)
+
+        assert result is not None and result.ok, result
+        assert pane.enter_sent is True
+        assert stamped == [(1, 42, WINDOW)]
 
 
 class TestTheAdditiveInvariant:

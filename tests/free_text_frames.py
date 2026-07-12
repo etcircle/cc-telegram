@@ -132,6 +132,14 @@ AUQ_RESOLVED = fx(f"auq_after_answer_t5_{V}.txt")  # the surface is GONE
 
 # ── EPM plan P / plan Q / plan S ─────────────────────────────────────────────
 
+# The plan-file slugs the real footers carry. They are the path half of the EPM
+# surface anchor; the CONTENT of the file at that path is the other half (see
+# ``free_text._epm_plan_generation``), which is what makes the anchor an
+# OCCURRENCE token rather than a mere name.
+EPM_P_PLAN_PATH = "~/.claude/plans/write-a-one-paragraph-plan-idempotent-pond.md"
+EPM_Q_PLAN_PATH = "~/.claude/plans/fancy-wibbling-quasar.md"
+EPM_S_PLAN_PATH = "~/.claude/plans/make-a-very-short-warm-sedgewick.md"
+
 EPM_P_LANDED = fx(f"epm_freetext_row_selected_pretype_{V}.ansi.txt")  # ❯4, DIM
 EPM_P_LIVE = move_cursor_to_row(EPM_P_LANDED, 1)  # derived: ❯1
 EPM_P_ANSWER = "please name it farewell.txt instead"
@@ -143,6 +151,28 @@ EPM_S_LIVE = fx(f"gate_epm_{V}.txt")  # a THIRD plan, ❯1
 
 EPM_OVERFLOW = fx(f"epm_freetext_overflow_{V}.ansi.txt")  # footer gone
 EPM_RESOLVED = fx(f"epm_after_approve_t5_{V}.txt")
+
+
+_RE_PLAN_PATH = re.compile(r"~/\.claude/plans/\S+\.md")
+
+
+def retarget_plan_path(ansi: str, new_path: str) -> str:
+    """Rewrite the ``~/.claude/plans/<slug>.md`` path in an EPM footer.
+
+    THE ROUND-2 P1's REAL SHAPE. Re-entering ExitPlanMode after REVISING the same
+    plan commonly keeps the SAME slug — Claude rewrites the file in place — so
+    plan P and its revision render an IDENTICAL footer path. Every EPM also
+    renders the SAME three real options, so the pane identity is identical too.
+    The corpus's plan Q is a genuinely different real capture (different body,
+    different slug); pointing its footer at plan P's path reproduces exactly the
+    successor a revision produces, byte-for-byte real everywhere else.
+    """
+    return _RE_PLAN_PATH.sub(new_path, ansi, count=1)
+
+
+# Plan Q's REAL bytes, wearing plan P's slug: the pane identity AND the footer
+# path both match plan P. Only the plan file's CONTENT tells them apart.
+EPM_Q_TYPED_AT_P_PATH = retarget_plan_path(EPM_Q_TYPED, EPM_P_PLAN_PATH)
 
 # The owner's real shape: a 947-char, 9-line voice note carrying a REPLY-CONTEXT
 # quote (rig-captured; Enter committed all 947 chars, JSONL-verified). This is

@@ -2099,25 +2099,72 @@ is what makes a missing block fail CLOSED (`None`) instead of degrading to a
 shorter, weaker identity. The canonical is the repo's EXISTING
 `AskUserQuestionForm.fingerprint()` — never a new hash (mint/validate parity).
 
-*Two components, and the anchor is the authority.* `SurfaceIdentity.pane` (above)
-is the strong self-contained discriminator whenever the option block is on screen.
-`SurfaceIdentity.anchor` is the OUT-OF-BAND, scroll-independent surface-generation
-id: for **AUQ** the PreToolUse side file's occurrence identity
-(`auq_source.peek_surface_identity_for_window` — the GH #48 composite: a non-empty
-`tool_use_id`, else `(written_at, canonical tool-input fingerprint)`; a new AUQ
-rewrites the file, a resolved one unlinks it); for **EPM** the
-`~/.claude/plans/<slug>.md` path in the footer. `still_holds` is conservative: an
-anchor we HAD must still be there and be EQUAL (gone ⇒ the card resolved; changed ⇒
-a successor), a pane identity we HAD must still be EQUAL **or** be genuinely
-unrecoverable *with a matching anchor carrying the proof*, and something must
-actually have been proven.
+*Two components — and the anchor is MANDATORY on BOTH surfaces, because it is the
+only OCCURRENCE-unique one (peer-review round-2, two P1s).* `SurfaceIdentity.pane`
+(above) is the strong self-contained discriminator whenever the option block is on
+screen — but it identifies a SHAPE, not an OCCURRENCE, and two different cards can
+share a shape. `SurfaceIdentity.anchor` is the OUT-OF-BAND, scroll-independent
+surface-GENERATION id, and `derive_identity` returns **`None`** when it cannot be
+read, so an anchor-less pane never yields an identity at all:
 
-*The EPM anchor is MANDATORY.* Every ExitPlanMode prompt renders the SAME three real
-options ("Yes, and bypass permissions" / "Yes, manually approve edits" / "No,
-refine…"), so the pane identity is IDENTICAL across plans and cannot tell plan A
-from plan B — the plan-file slug is the only discriminator. An EPM whose footer is
-not visible therefore DECLINES at plan time and REFUSES at verify time, never
-guesses (pinned: `test_every_epm_plan_shares_one_pane_identity`).
+- **AUQ** → the PreToolUse side file's occurrence identity
+  (`auq_source.peek_surface_identity_for_window` — the GH #48 composite: a non-empty
+  `tool_use_id`, else `(written_at, canonical tool-input fingerprint)`; a new AUQ
+  rewrites the file, a resolved one unlinks it). **It used to be OPTIONAL**, so a
+  missing / lagging / GC'd side file silently degraded identity to the PANE — and
+  `current_question_title` is normally ABSENT from a pure-pane parse, so two
+  DIFFERENT AUQs with identical option labels produce the IDENTICAL pane identity.
+  Worse, an identity captured with `anchor=None` SKIPPED the anchor comparison
+  entirely, so a successor's non-`None` anchor was IGNORED rather than refused —
+  card A's text could be committed onto card B. **No side file ⇒ the AUQ lane
+  DECLINES** (pre-keystroke, so PR-1 owns the single refusal and nothing is typed).
+  There is no second occurrence-unique source to fall back on: the AUQ `tool_use` is
+  buffered in JSONL until resolution, so the PreToolUse hook is the ONLY
+  pre-resolution witness of *which* AUQ this is. **This makes `PreToolUse` a
+  REQUIREMENT of the AUQ free-text lane (user-visible → README);** the bot already
+  warns at startup when it is missing, and `cc-telegram hook --install` installs it.
+- **EPM** → the plan-CONTENT generation (`free_text._epm_plan_generation`): the live
+  footer's `~/.claude/plans/<slug>.md` path **PLUS a hash of that file's CONTENT**.
+  **It used to be the PATH alone** — but re-entering ExitPlanMode after REVISING a
+  plan commonly keeps the SAME slug (Claude rewrites the file in place), so plan P
+  and its revision carried an IDENTICAL anchor; and every EPM renders the SAME three
+  real options, so the pane component matched too. BOTH components were satisfied by
+  a DIFFERENT prompt, and a mid-transaction successor received the previous plan's
+  feedback — on the surface whose option 1 is "Yes, and bypass permissions". A path
+  is a NAME; the plan's CONTENT is what the prompt is ASKING about, so the content
+  is the generation. Read at every observation point (a bounded ≤512 KiB read of a
+  file that is normally a few KB and page-cached — the same class of synchronous
+  side-file read the AUQ leg already performs); traversal-guarded to
+  `~/.claude/plans/`; unreadable / missing / oversize / no live footer ⇒ `None` ⇒
+  decline (pre-key) or refuse (post-key).
+
+  *Rejected alternatives, for the record.* **`os.stat` (mtime_ns + size)** is
+  cheaper and does catch a rewrite, but it is a METADATA generation: it flips on a
+  no-op touch (a false refusal that costs a stranded draft) and says nothing about
+  what the prompt is asking. **`status_polling._epm_surface_first_seen_at`** looks
+  like a ready-made occurrence token (a per-route FIRST-DETECT stamp, popped at EPM
+  lifecycle end) but is UNSOUND here: it is `setdefault`-ed and only popped on an
+  OBSERVED EPM *absence*, behind the poller's absent-streak hysteresis — so a
+  plan-P→plan-Q transition with no observed gap CARRIES THE SAME STAMP across two
+  different prompts, exactly the case this P1 is about. It would detect nothing
+  while adding a cross-module lifecycle whose pop/re-stamp could false-refuse a live
+  transaction.
+
+`still_holds` is therefore: the surface must match; **the anchors must be EQUAL**
+(both sides always have one — a live derivation without one is `None` and dies on
+rule 1, so there is no "None matches None" and a captured `None` can never silently
+accept a later non-`None`); and a pane identity we HAD must still be EQUAL **or** be
+genuinely unrecoverable, forgiven ONLY because the matching occurrence anchor carries
+the proof by itself (the AUQ overflow shape).
+
+*`extract_epm_plan_file_path` is STRICTLY footer-scoped.* It used to fall back to
+"the LAST plan path ANYWHERE in the pane" when no footer line carried one — so a
+pane with NO live footer, but a stale `~/.claude/plans/…` mention in scrollback (an
+earlier prompt, a quoted transcript, the bot's own posted plan), returned that
+UNRELATED path. It now finds the BOTTOM-MOST `ctrl[+-]g to edit` line (no footer ⇒
+`None`) and consults only that line and its WRAPPED CONTINUATION (the next 2 rows,
+where tmux puts a long footer's overflow). `interactive_ui._maybe_post_epm_plan`
+shares the fix — it would otherwise have posted the WRONG plan body above the picker.
 
 *A numbered plan BODY no longer kills the EPM lane.* `_exit_plan_option_block` is
 now delimited by the prompt's OWN `UIPattern` anchors (the bottom-most `Would you
@@ -2284,15 +2331,23 @@ with the buttons or the ↑/↓/⏎ keys." ExitPlanMode gains the line for the F
     up, the user is told the text is in the card's row and to clear it (Esc). The
     footer is the ONLY thing that distinguishes one plan from another, so this is
     fail-closed by design, not a gap.
-  - **An AUQ answer long enough to scroll the option block off, on an install with
-    no PreToolUse hook**, has neither identity component and REFUSES the same way.
-    With the hook (the documented configuration, and what `cc-telegram hook --install`
-    guarantees) the side-file anchor carries it and the answer commits.
-  - **Two AUQs with identical option labels asked back-to-back** are indistinguishable
-    by the PANE component alone — the side-file anchor discriminates them, so this
-    only degrades to a residual on a hook-less install. It is the same class of
-    residual the shipped AUQ pick-dispatch lane accepts (its `_canonical_repr` is
-    likewise title-less on a pure-pane parse).
+  - **On an install with NO PreToolUse hook the AUQ free-text lane is OFF** — every
+    message at a question card takes PR-1's refusal, pre-keystroke. That is the
+    round-2 P1 fold: the alternative was trusting a pane identity that cannot tell
+    two same-shaped questions apart. It is a DEGRADATION, not a hazard (the card's
+    option buttons are unaffected), it is user-visible and documented in the README,
+    the bot warns at startup, and `cc-telegram hook --install` fixes it.
+  - **An ExitPlanMode prompt whose plan file is unreadable** (deleted, outside
+    `~/.claude/plans/`, >512 KiB) has no anchor and declines the same way. In the
+    documented configuration Claude writes that file before the prompt renders — it
+    is the same file `_maybe_post_epm_plan` reads to post the plan body.
+  - **A plan RE-PRESENTED byte-identically** (same slug, same bytes) yields the same
+    anchor, so feedback typed for it commits. That is coherent, not a wrong-card
+    commit: EPM asks "proceed with THIS plan?", and the plan is unchanged, so it is
+    literally the same question about the same artifact. Disclosed rather than
+    closed — an occurrence token that distinguishes it would have to come from
+    outside the transaction, and the only candidate (the poller's first-seen stamp)
+    is unsound (see above).
   - **An ExitPlanMode prompt whose plan body cannot be separated from its option
     block** would decline (fail-closed). The `UIPattern`-anchored
     `_exit_plan_option_block` closes the common numbered-plan-body case.

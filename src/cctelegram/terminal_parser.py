@@ -464,24 +464,48 @@ def _active_ui_patterns() -> list[UIPattern]:
 _RE_EPM_FOOTER = re.compile(r"ctrl[+-]g to edit")
 _RE_EPM_PLAN_PATH = re.compile(r"(~/\.claude/plans/\S+\.md)")
 
+# How far BELOW the live footer line its wrapped continuation may land. tmux
+# wraps a long line onto the IMMEDIATELY following row(s), so 2 is generous.
+_EPM_FOOTER_WRAP_LINES: Final = 2
+
 
 def extract_epm_plan_file_path(pane_text: str) -> str | None:
-    """Extract the ``~/.claude/plans/<slug>.md`` path from an ExitPlanMode
-    footer. Anchors on the ``ctrl[+-]g to edit`` footer line FIRST (the sole
-    bottom anchor on v2.1.170) so a stray plan-path mention elsewhere in
-    scrollback can't win. If no footer line carries the path (e.g. tmux wrapped
-    the footer onto two lines), falls back to the LAST plan path in the pane —
-    the footer is at the bottom, so the bottom-most mention beats a stale
-    scrollback mention above it. Returns the path string or None."""
-    fallback: str | None = None
-    for line in pane_text.split("\n"):
-        m = _RE_EPM_PLAN_PATH.search(line)
-        if not m:
-            continue
+    """The ``~/.claude/plans/<slug>.md`` path of the **LIVE** ExitPlanMode footer.
+
+    STRICTLY SCOPED TO THAT FOOTER (GH #50 PR-2 peer-review round-2 P1). The
+    earlier version fell back to "the LAST plan path anywhere in the pane"
+    whenever no footer line carried one — so a pane with NO live footer at all,
+    but a stale ``~/.claude/plans/…`` mention in scrollback (an earlier prompt, a
+    quoted transcript, the bot's own posted plan), returned that UNRELATED path.
+    Two callers depend on this being the live plan:
+
+      * ``interactive_ui._maybe_post_epm_plan`` would have posted the WRONG plan
+        body above the picker; and
+      * ``handlers/free_text`` derives the ExitPlanMode SURFACE ANCHOR from it —
+        a stale path there is a wrong-card hazard on a plan-approval surface.
+
+    So: find the BOTTOM-MOST ``ctrl[+-]g to edit`` line (a TUI renders the live
+    prompt at the bottom; everything above is frozen scrollback). No footer ⇒
+    ``None``, never a scrollback path. If that footer line carries the path,
+    return it. Otherwise consult only its WRAPPED CONTINUATION — the next
+    ``_EPM_FOOTER_WRAP_LINES`` rows, where tmux puts the overflow of a long
+    footer. Nothing there ⇒ ``None`` (fail closed), never a path from above.
+    """
+    lines = pane_text.split("\n")
+    footer_idx: int | None = None
+    for i, line in enumerate(lines):
         if _RE_EPM_FOOTER.search(line):
+            footer_idx = i  # bottom-most is the LIVE one
+    if footer_idx is None:
+        return None
+    m = _RE_EPM_PLAN_PATH.search(lines[footer_idx])
+    if m:
+        return m.group(1)
+    for line in lines[footer_idx + 1 : footer_idx + 1 + _EPM_FOOTER_WRAP_LINES]:
+        m = _RE_EPM_PLAN_PATH.search(line)
+        if m:
             return m.group(1)
-        fallback = m.group(1)  # keep the LAST (bottom-most) match
-    return fallback
+    return None
 
 
 # ── Post-processing ──────────────────────────────────────────────────────

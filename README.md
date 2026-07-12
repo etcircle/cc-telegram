@@ -182,6 +182,24 @@ anything cannot be proven, the Enter is withheld and you are told. Any failure
 before the first keystroke falls back to the ordinary refusal. Long messages are
 fine — a multi-paragraph voice note is submitted whole.
 
+**Proving *which* card is not something the screen alone can do**, which is why
+each prompt is identified by something outside it, and why the lane simply
+declines when that identity is unavailable:
+
+- **A question card is identified by the `PreToolUse` hook**, which records each
+  question as Claude asks it. Two different questions can offer the same options,
+  and the terminal shows nothing that tells them apart — so **the free-text lane
+  needs `PreToolUse` installed.** Without it, a message at a question card gets
+  the ordinary refusal instead ("answer the card first"), rather than risking
+  your answer landing on the next question. `cc-telegram hook --install` installs
+  it, and the bot warns at startup if it is missing. Everything else about the
+  question card — the options, the buttons, the descriptions — works as usual.
+- **A plan approval is identified by the plan itself.** Every plan approval shows
+  the same three options, and a revised plan is usually written back to the same
+  file, so neither the screen nor the file name distinguishes plan A from plan B.
+  The bot fingerprints the plan's *contents*: if Claude revises the plan while
+  your feedback is being typed, the revision does not receive it.
+
 Everything else keeps the refusal, on purpose: multi-select questions (their
 answer takes several steps), folder-trust and model-switch prompts (no free-text
 option exists), and anything carrying an attachment, a caption, or a slash
@@ -298,7 +316,7 @@ Everything else has a default.
 - `CC_TELEGRAM_PERMISSION_PROMPTS` surfaces tool permission prompts and Workflow launch gates as Telegram cards. Default: true (set `CC_TELEGRAM_PERMISSION_PROMPTS=false` to disable).
 - `CC_TELEGRAM_DECISION_CARDS` surfaces otherwise unsupported numbered confirmation prompts as display-only cards. Default: true (set `CC_TELEGRAM_DECISION_CARDS=false` to disable).
 - `CC_TELEGRAM_DECISION_DISPATCH` enables verified one-tap dispatch for known-good decision families when decision cards are also enabled. Unknown prompts and uncharacterised Claude versions remain display-only.
-- `CC_TELEGRAM_FREE_TEXT_ANSWERS` lets a plain message (typed or voice, including a swipe-reply that quotes the card) answer a live question card or a plan approval in your own words, by driving that prompt's free-text row. Default: true (set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to fall back to refusing those messages). Limited to Claude Code versions cc-telegram has characterised; an uncharacterised version disables the lane by itself. See [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words).
+- `CC_TELEGRAM_FREE_TEXT_ANSWERS` lets a plain message (typed or voice, including a swipe-reply that quotes the card) answer a live question card or a plan approval in your own words, by driving that prompt's free-text row. Default: true (set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to fall back to refusing those messages). Limited to Claude Code versions cc-telegram has characterised; an uncharacterised version disables the lane by itself. Answering a **question card** additionally requires the `PreToolUse` hook (it is what identifies *which* question you are answering) — without it, those messages are refused rather than delivered. See [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words).
 - `CC_TELEGRAM_ARTIFACT_MAX_MB` sets the maximum upload size for attachment cards and `/file`. Default: 45 MB; Telegram's bot limit is 50 MB.
 - `CC_TELEGRAM_ARTIFACT_ROOTS` adds comma-separated absolute directories that may serve files in addition to the active session directory.
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` limits the input preview shown in tool lines. Default: 40.
@@ -437,7 +455,7 @@ This updates `~/.claude/settings.json` with three entries:
 The hooks have separate jobs:
 
 - `SessionStart` writes `session_map.json` so messages return to the right tmux window.
-- `PreToolUse` captures the structured AskUserQuestion payload before Claude renders its picker.
+- `PreToolUse` captures the structured AskUserQuestion payload before Claude renders its picker. It is also what tells one question apart from another, so **without it a plain message sent at a question card is refused rather than delivered as the answer** — see [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words).
 - `Notification` records that Claude is blocked on an approval prompt that may never appear in the session JSONL.
 
 `cc-telegram doctor` verifies all three managed hooks. A missing SessionStart

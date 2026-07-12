@@ -379,12 +379,35 @@ Additional modules:
                                     AND TARGET-ROW-blind, so it survives the two
                                     mutations the executor ITSELF performs; None ⇒
                                     unrecoverable, never a weaker prefix) and
-                                    `anchor` (out-of-band, scroll-independent: the
-                                    AUQ PreToolUse side-file occurrence id via
-                                    auq_source.peek_surface_identity_for_window, or
-                                    the EPM ~/.claude/plans/<slug>.md footer path —
-                                    MANDATORY on EPM, whose three real options are
-                                    identical across every plan).
+                                    `anchor` — the OCCURRENCE-unique, out-of-band,
+                                    scroll-independent generation id, MANDATORY on
+                                    BOTH surfaces (peer-review round-2, two P1s;
+                                    derive_identity returns None without one, so an
+                                    anchor-less pane never yields an identity and
+                                    "None matches None" is dead by construction):
+                                    the AUQ PreToolUse side-file occurrence id
+                                    (auq_source.peek_surface_identity_for_window —
+                                    the pane cannot tell two identically-optioned
+                                    AUQs apart, so NO side file ⇒ the AUQ lane
+                                    DECLINES; PreToolUse is thus a REQUIREMENT of
+                                    that lane, README-documented), and — for EPM —
+                                    the plan-CONTENT generation (_epm_plan_generation:
+                                    the live footer's ~/.claude/plans/<slug>.md path
+                                    PLUS a hash of that file's CONTENT; the PATH
+                                    alone was a NAME, and a REVISED plan commonly
+                                    keeps the same slug, so plan P and its revision
+                                    matched on BOTH components. Bounded traversal-
+                                    guarded read; unreadable ⇒ decline/refuse.
+                                    Rejected: os.stat (metadata, flips on a touch)
+                                    and status_polling._epm_surface_first_seen_at
+                                    (setdefault + absent-streak hysteresis ⇒ it
+                                    CARRIES across a P→Q transition with no observed
+                                    gap — it would detect nothing here).
+                                    terminal_parser.extract_epm_plan_file_path is
+                                    now STRICTLY footer-scoped (bottom-most ctrl+g
+                                    line + its wrapped continuation; never a stale
+                                    scrollback path — which also stopped
+                                    interactive_ui from posting the WRONG plan body).
                                 A braked window (PR-1's stranded-draft registry) is
                                 checked FIRST and DECLINES — the lane is never a way
                                 around the brake, and never clears it. VERSION-LICENSED
