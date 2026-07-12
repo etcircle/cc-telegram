@@ -106,6 +106,18 @@ REASON_REVERIFY_FAILED: Final = "reverify_failed"
 REASON_STAMP_FAILED: Final = "stamp_failed"
 REASON_ENTER_FAILED: Final = "enter_failed"
 
+# GH #50 PR-2 — the free-text lane (``handlers/free_text``). Declared HERE, not
+# there, because ``REFUSAL_COPY`` below is the ONE refusal vocabulary and a
+# strict key-set-equality test pins it to ``DELIVERY_REFUSAL_REASONS``: a new
+# reason without copy must be a build failure, not a silent empty message.
+#
+# ONLY the two POST-WRITE outcomes are reasons. Every free-text bail BEFORE the
+# first keystroke returns ``None`` and falls through to THIS gate, which then
+# owns the refusal (the lane is purely additive — see ``free_text.try_answer``),
+# so a "nav failed" / "landing failed" never reaches the user as its own message.
+REASON_FREE_TEXT_VERIFY_FAILED: Final = "free_text_verify_failed"
+REASON_FREE_TEXT_COMMIT_UNCONFIRMED: Final = "free_text_commit_unconfirmed"
+
 # Every reason the gate can attach to a NOT_WRITTEN / DRAFT_WRITTEN /
 # COMMIT_UNKNOWN result.
 DELIVERY_REFUSAL_REASONS: Final = (
@@ -125,6 +137,8 @@ DELIVERY_REFUSAL_REASONS: Final = (
             REASON_REVERIFY_FAILED,
             REASON_STAMP_FAILED,
             REASON_ENTER_FAILED,
+            REASON_FREE_TEXT_VERIFY_FAILED,
+            REASON_FREE_TEXT_COMMIT_UNCONFIRMED,
         }
     )
     | terminal_parser.INPUT_BOX_FAILURE_REASONS
@@ -165,6 +179,23 @@ STRANDED_DRAFT_MSG: Final = (
     "mid-run it will ALSO interrupt the run."
 )
 
+# ── The PR-2 free-text lane's copy ───────────────────────────────────────
+#
+# A DRAFT_WRITTEN failure in this lane strands the payload inside a LIVE CARD's
+# free-text row (not the input box), so the copy names that row and the one safe
+# way out. Nothing is auto-cleared: Esc on a card CANCELS the question, which is
+# a real side effect the user must choose.
+FREE_TEXT_VERIFY_FAILED_MSG: Final = (
+    "Not delivered — your message was typed into the card's free-text row but "
+    "the terminal changed before it could be submitted, so the bot did NOT press "
+    "Enter. Your text is still sitting in that row: clear it in the window (Esc), "
+    "then answer the card."
+)
+FREE_TEXT_COMMIT_UNCONFIRMED_MSG: Final = (
+    "Your message may or may not have been submitted as the card's answer — the "
+    "terminal didn't confirm it. Check the window (/screenshot) before resending, "
+    "so you don't answer twice."
+)
 _PROMPT_PRESENT_MSG: Final = (
     "Not delivered — Claude is waiting on a prompt in this topic. Answer the "
     "card first (tap an option, or use the ↑/↓/⏎ keys), then resend."
@@ -217,6 +248,10 @@ REFUSAL_COPY: Final[dict[str, str]] = {
     REASON_REVERIFY_FAILED: DRAFT_WRITTEN_MSG,
     REASON_STAMP_FAILED: DRAFT_WRITTEN_MSG,
     REASON_ENTER_FAILED: COMMIT_UNKNOWN_MSG,
+    # PR-2 free-text lane — only the POST-WRITE outcomes; a pre-write bail falls
+    # through to this gate and is refused by IT (the additive invariant).
+    REASON_FREE_TEXT_VERIFY_FAILED: FREE_TEXT_VERIFY_FAILED_MSG,
+    REASON_FREE_TEXT_COMMIT_UNCONFIRMED: FREE_TEXT_COMMIT_UNCONFIRMED_MSG,
 }
 
 

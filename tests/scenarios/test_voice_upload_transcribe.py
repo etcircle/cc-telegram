@@ -59,7 +59,11 @@ async def test_voice_message_transcribes_and_offers_to_aggregator(
     offered: list[tuple[tuple[int, int, str], str]] = []
 
     async def fake_offer(
-        route: tuple[int, int, str], text: str, *, bot: object | None = None
+        route: tuple[int, int, str],
+        text: str,
+        *,
+        bot: object | None = None,
+        **_kwargs: object,
     ) -> None:
         offered.append((route, text))
 
@@ -91,7 +95,11 @@ async def test_voice_typing_timeout_still_delivers_transcription(
     offered: list[tuple[tuple[int, int, str], str]] = []
 
     async def fake_offer(
-        route: tuple[int, int, str], text: str, *, bot: object | None = None
+        route: tuple[int, int, str],
+        text: str,
+        *,
+        bot: object | None = None,
+        **_kwargs: object,
     ) -> None:
         offered.append((route, text))
 
@@ -262,7 +270,11 @@ async def test_voice_echo_failure_does_not_lose_delivered_turn(
     offered: list[tuple[tuple[int, int, str], str]] = []
 
     async def fake_offer(
-        route: tuple[int, int, str], text: str, *, bot: object | None = None
+        route: tuple[int, int, str],
+        text: str,
+        *,
+        bot: object | None = None,
+        **_kwargs: object,
     ) -> None:
         offered.append((route, text))
 

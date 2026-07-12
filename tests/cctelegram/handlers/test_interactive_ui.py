@@ -225,6 +225,7 @@ class TestKeyboardLayoutForSettings:
 # ── _render_ask_user_question ─────────────────────────────────────────────
 
 
+from cctelegram.handlers import free_text  # noqa: E402
 from cctelegram.handlers.interactive_ui import (  # noqa: E402
     _render_ask_user_question,
 )
@@ -1102,8 +1103,26 @@ class TestRenderAskUserQuestion:
         # Recommended option carries the "(Recommended)" suffix
         assert "❯ 1. C — Parallel tracks (Recommended)" in out
         assert "  2. B — Copilot-first" in out
-        # Free-text hint surfaces when present
-        assert "Type something" in out
+        # GH #50 PR-2 §2.5: the free-text line states the CURRENT truth. Called
+        # WITHOUT a hint (no live CC version to license against), so it must NOT
+        # promise free-text — the old hardcoded "(Type something — send a regular
+        # message to free-text)" was a lie whenever the lane would refuse.
+        assert "Type something — send a regular message" not in out
+        assert free_text.HINT_NO_FREE_TEXT in out
+
+    def test_free_text_hint_is_caller_supplied(self):
+        """§2.5: the caller (which holds the live CC version) owns the promise."""
+        form = AskUserQuestionForm(
+            options=(
+                AskOption(label="A", recommended=False, cursor=True, number=1),
+                AskOption(label="B", recommended=False, cursor=False, number=2),
+            ),
+            is_free_text=True,
+        )
+        assert free_text.HINT_FREE_TEXT in _render_ask_user_question(
+            form, free_text_hint=free_text.HINT_FREE_TEXT
+        )
+        assert free_text.HINT_NO_FREE_TEXT in _render_ask_user_question(form)
 
     def test_review_screen(self):
         form = AskUserQuestionForm(

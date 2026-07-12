@@ -237,6 +237,25 @@ def _track_bot_sent_text(session_id: str, text: str) -> None:
     buf.append((now, normalized))
 
 
+def record_bot_sent_text(window_id: str, text: str) -> None:
+    """Record a bot-originated payload for the 👤-echo dedup, keyed by WINDOW.
+
+    The public seam for a delivery path that commits OUTSIDE
+    ``deliver_to_window`` — today just the GH #50 PR-2 free-text lane
+    (``handlers/free_text``), which types its payload into a live card's
+    affordance row and presses Enter itself. An ExitPlanMode feedback answer
+    lands in the transcript as a genuine user entry, so without this the topic
+    would get a "👤 …" duplicate of the message the user just sent.
+
+    Resolves the window's CURRENT session id (the same lookup
+    ``deliver_to_window`` does) and no-ops when the window is unknown or has no
+    session — a missed dedup is a cosmetic duplicate, never a correctness bug.
+    """
+    state = session_manager.window_states.get(window_id)
+    if state and state.session_id:
+        _track_bot_sent_text(state.session_id, text)
+
+
 def consume_bot_sent_text(session_id: str, text: str) -> bool:
     """Return True iff this user-message text matches a recent bot send.
 

@@ -242,6 +242,26 @@ class Config:
             "CC_TELEGRAM_DECISION_DISPATCH", ""
         ).strip().lower() in ("1", "true", "yes", "on")
 
+        # GH #50 PR-2 — free-text answers on a live interactive card. When a
+        # Telegram message (typed prose or a voice note, with no caption /
+        # attachment / reply-context / command) arrives while an AskUserQuestion
+        # single-select picker or an ExitPlanMode prompt is live, the bot
+        # NAVIGATES to that surface's free-text affordance row, types the message
+        # there, verifies the typed state (the SGR-2 discriminator) and commits it
+        # with Enter — so the message becomes the card's ANSWER instead of being
+        # refused. Default ON: PR-1 already refuses these payloads, so OFF means
+        # a live card simply cannot be answered in prose. Set
+        # ``CC_TELEGRAM_FREE_TEXT_ANSWERS=false`` to fall back to the PR-1
+        # refusal everywhere. Independent of the detector flags. The lane is
+        # additionally VERSION-LICENSED per (surface × CC version) inside the
+        # ``handlers/free_text`` leaf, so an un-characterized CC release degrades
+        # to the PR-1 refusal even with the flag ON. config OWNS this canonical
+        # declaration for the README sync rule; the flag lives on the leaf (which
+        # must not import config) and is SEEDED at startup by ``main._run_bot``.
+        self.free_text_answers_enabled = os.getenv(
+            "CC_TELEGRAM_FREE_TEXT_ANSWERS", "true"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
         # Artifact delivery lane (handlers/artifacts.py). When Claude's prose
         # mentions a deliverable local file, the bot offers a 📎 tap-to-download
         # card; ``/file <path>`` is the durable escape hatch. config OWNS these

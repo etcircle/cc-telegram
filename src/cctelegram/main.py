@@ -97,6 +97,18 @@ def _run_bot() -> None:
         "ON" if config.decision_dispatch_enabled else "OFF",
     )
 
+    # GH #50 PR-2: seed the free-text-answer flag onto the ``free_text`` leaf
+    # (same config-free-leaf discipline). The lane is ALSO version-licensed
+    # inside the leaf, so an un-characterized CC release degrades to the PR-1
+    # refusal regardless of this flag.
+    from .handlers import free_text
+
+    free_text.set_enabled(config.free_text_answers_enabled)
+    logger.info(
+        "Free-text answers on live cards: %s",
+        "ON" if config.free_text_answers_enabled else "OFF",
+    )
+
     session = tmux_manager.get_or_create_session()
     logger.info("Tmux session '%s' ready", session.session_name)
 

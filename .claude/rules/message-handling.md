@@ -2006,6 +2006,151 @@ PR-2 (the free-text lane — making an AUQ single-select / ExitPlanMode card act
 answerable in prose, with the SGR-2 typed-state verifier and per-surface card copy)
 ships separately. Pull-only; no observer (c313657 stays forbidden).
 
+## Free-text answers on a live card (GH #50 PR-2, flag `CC_TELEGRAM_FREE_TEXT_ANSWERS`, default ON)
+
+PR-1 refuses every payload at a live blocking surface — correct, but a dead end:
+the AUQ card literally invited the user to "send a regular message to free-text".
+PR-2 makes that invitation TRUE for the two surfaces Claude Code gives a free-text
+affordance row, and FIXES the card copy everywhere else (§2.5).
+
+| Surface | Row | Effect (rig-verified, 2.1.207) |
+|---|---|---|
+| **AskUserQuestion** (single-select) | N+1 `Type something.` | the prose IS the answer |
+| **ExitPlanMode** | 4 `Tell Claude what to change` | plan REJECTED with the prose as feedback, **plan mode PRESERVED** |
+
+**THE TYPED-STATE PROOF IS SGR-2** (`terminal_parser.parse_free_text_row`). While
+the affordance row is SELECTED but UNTYPED its label is the placeholder and renders
+**DIM** (`ESC[2m`); the moment the user types, the label is their text and renders
+at normal intensity. Verified on BOTH lanes and — decisively — on the adversarial
+payload byte-identical to the placeholder (typing the literal
+`Tell Claude what to change` renders PLAIN), so the plan's contemplated
+"identical-label payload" scope cut is genuinely unnecessary. The dim styling is
+applied ONLY when the cursor is on the row, which is exactly the state the executor
+verifies in. `ctrl+g` is NOT a typed-state proof on EPM (it is the unconditional
+plan-file footer) — [r4 P1-4], confirmed. A TUI-DRIFT AUDIT SURFACE beside
+`clean_ghost_input_text` (the other SGR-2 consumer) and `pane_command_is_claude`.
+
+**THE ADDITIVE INVARIANT (the property that makes default-ON safe).** EVERY bail
+BEFORE the first keystroke returns `None`, and the caller falls through to the
+normal gated `deliver_to_window`, which then owns the decision (PR-1 refuses on a
+live prompt, or delivers into an input box). So the lane can only ever turn a
+REFUSED message into a delivered ANSWER — it can never make a message PR-1 would
+have handled correctly come out worse, and it never invents its own refusal for a
+payload it has not touched. That covers: flag off, an unlicensed CC version, a
+non-Claude pane, a capture failure, a non-free-text surface (multi-select, review
+screen, multi-question, folder-trust, `Switch model?`, Permission, Workflow), an
+incomplete/scrolled option list (the `options_complete` proof — a partial pane BAILS
+rather than guessing N), a nav send failure, and an unproven landing. A LONE DIGIT
+payload also falls through: `deliver_to_window`'s step 0 applies the SAME
+`delivery.lone_hotkey_line` rule and refuses it — ONE rule, ONE owner, never two ❌.
+Once the payload has been TYPED the lane OWNS the outcome and must not fall through
+(a second delivery attempt would APPEND to the text sitting in the row).
+
+**The transaction** (under `window_send_lock`, mirroring `_dispatch_pick` /
+`_dispatch_decision_pane_locked`): (1) a FRESH in-lock `pane_command_is_claude` +
+`(surface × CC-version)` license re-read immediately before the first key (the AUQ
+round-2 P1-1 rule — a `/update`-swapped TUI inside the window-list cache TTL can
+never be arrow-keyed); (2) the strict surface parse
+(`parse_ask_user_question` / the new `parse_exit_plan_form`) → the target row
+(AUQ: N+1, since affordances are DROPPED from `options`; EPM: the last parsed
+option, whose label must be exactly the affordance); (3) MONOTONIC arrow nav, never
+a wrap shortcut (over-counting wraps to row 1, and on EPM row 1 is "Yes, and bypass
+permissions"); (4) the LANDING PROOF — cursor on the target row + the label is still
+the placeholder + the placeholder is SGR-2 **DIM**; (5) ONE literal write with the
+Enter WITHHELD (the `!` two-step is deliberately NOT reproduced: bash mode is a
+property of the INPUT BOX, and a live card owns the keyboard); (6) the TYPED-STATE
+VERIFY (below); (7) the pre-commit `UserTurnStamp` — **PR-2 is the FIFTH Enter-commit
+path and a free-text answer IS a user turn** [r5 P1-1]; a hook raise ⇒ DRAFT_WRITTEN,
+no Enter, no stamp; (8) Enter; (9) a bounded advance confirmation — a committed answer
+TEARS THE SURFACE DOWN, so its continued presence is the honest `commit_unconfirmed`
+signal, NEVER auto-retried.
+
+**The TYPED-STATE VERIFY** (`_typed_state_reason`; every leg AND-ed, a failure
+WITHHOLDS the Enter): (A) a bounded `pane_command_is_claude` re-probe FIRST so the
+pane CAPTURE is the LAST observation before the Enter (the r2-F4 ordering); (B)
+`pane_input_box_present` is **FALSE** — the blocking surface still owns the pane (if
+the card AFK-resolved mid-type, the input box is back and Enter would submit a
+half-typed message); called WITHOUT `expected_draft`, because the picker trap is
+exactly what must fire; (C) **the row, or — on AUQ only — the footer**: (C1) the
+affordance row is on the pane, carries the cursor, its label is NOT SGR-2 dim (⇒
+TYPED) and is a prefix of what we typed (⇒ WE typed it); or (C2) **AUQ-only**: the
+row scrolled off, but the picker footer carries `ctrl+g to edit`, which on 2.1.207
+appears **IFF the free-text row is the ACTIVE row** (rig: it tracks the cursor
+exactly — absent at rows 1/2/3, present at N+1). ExitPlanMode has NO equivalent, so
+an EPM row that scrolled off **REFUSES** — fail-closed, because EPM's option 1 is
+"Yes, and bypass permissions"; (D) the payload TAIL is visibly on the pane (the
+"our bytes landed" probe, compared whitespace-STRIPPED — CC's soft wrap only ever
+INSERTS whitespace, so the probe is immune to every wrap shape including a mid-token
+hard break).
+
+**THE TWO OVERFLOW SHAPES (rig-measured, and they DIFFER).** A long answer wraps to
+more rows than the pane has, and a TUI runs on the ALTERNATE SCREEN — `capture-pane -S`
+recovers nothing (measured: 51 lines), so what scrolls off is genuinely unobservable.
+The AUQ picker is **BOTTOM-anchored**: its option block — the `❯ N+1.` cursor row
+INCLUDED — scrolls off the TOP while the footer stays (C2 carries it). The EPM prompt
+grows **DOWNWARD**: its FOOTER is pushed off the bottom while the row stays (C1 carries
+it). Hence the two independent proofs. Measured boundary on a 160x50 pane: ~947 chars
+and ~2.6 k chars both keep the whole block visible; ~5.3 k triggers overflow (and
+Enter still committed all 5 274 chars — JSONL-verified).
+
+**NO PASTE-COLLAPSE ON AN AFFORDANCE ROW (the question PR-1's regression forced).**
+A payload written in ONE `send-keys -l` past ~800 chars collapses the INPUT BOX to
+`❯\xa0[Pasted text #1 +12 lines]` and replaces the status bar with `paste again to
+expand` (the shipped PR-1 regression, 5ba9b5e). A live CARD's affordance row does
+**NOT** do this: 947 chars / 9 lines and 5.3 k chars / 30 lines both render as
+LITERAL wrapped text, the row keeps its number and cursor, and the label is PLAIN.
+So the SGR-2 discriminator holds on the owner's primary path (a long voice note) and
+the verifier commits it. Fixtures: `{auq,epm}_freetext_row_typed_large_v2.1.207.ansi.txt`,
+`auq_freetext_overflow_v2.1.207.txt`, `epm_freetext_overflow_v2.1.207.ansi.txt`.
+
+**PROVENANCE: explicit composable FACTS, never a `kind`** [r3 P1-2]. `_PendingBundle`
+flattens typed prose, a voice transcription, a caption and a reply-context-rendered
+quote into indistinguishable `text_parts`, so "is this pure user prose?" is NOT
+recoverable from the string — it must be OBSERVED at the offer site. The bundle
+carries an `inbound_aggregator.Provenance` (`typed_text` / `voice` / `caption` /
+`reply_context` / `attachment`), OR-composed across every merge. **Eligible = (typed
+prose OR voice) AND NONE of caption / attachment / reply-context.** Voice IS eligible
+(it is the user speaking — the flow PR-2 exists for). `_apply_reply_context` now
+returns `(rendered_text, applied: bool)` so the fact is OBSERVED, not guessed [r4
+P2-1]; `PendingAttachment` + the pending-text store carry the facts so **pending-bind
+replay preserves them**; a bundle created AFTER a media-group boundary / cap flush
+starts EMPTY and takes its facts from the NEW item (it must never inherit the popped
+bundle's). Slash commands never reach the lane at all —
+`forward_command_handler` force-flushes and then sends the command through
+`send_to_window` directly.
+
+**Integration seam = the AGGREGATOR FLUSH** (`_send_bundle` → `_try_free_text_answer`)
+— the only place that knows the provenance [r2 P1-5]. NOT `send_to_window` (provenance
+is flattened by then) and NOT `text_handler` (the debounce makes any offer-time check
+TOCTOU). Gated FIRST on the cheap, in-memory, route-keyed
+`interactive_ui.has_interactive_surface`, so an ordinary send (no card up) pays
+NOTHING — no extra capture, no lock churn.
+
+**Version-licensing is MANDATORY** (`free_text._FREE_TEXT_LICENSE_TABLE`, the
+`decision_token` precedent): the row index, the placeholder labels, the SGR-2 styling
+and the `ctrl+g` footer proof are per-CC-version TUI empirics. Seeded with `2.1.207`,
+fixture-pinned. **Top residual (disclosed):** every CC upgrade empties the effective
+allowlist → the lane degrades to PR-1's refusal until the surface is re-characterized
+against fresh rig captures (honest, INFO-logged, never a wrong keystroke).
+
+**§2.5 — the false hint is fixed in lockstep.** `interactive_ui` used to print
+`(Type something — send a regular message to free-text)` on EVERY picker with a
+free-text affordance, including the multi-select and unlicensed-version cases where
+PR-1 REFUSES such a message. The line is now per-surface (`free_text.card_hint`,
+resolved at the callsite that holds the live CC version): licensed AUQ-single /
+ExitPlanMode ⇒ "💬 Send a message to answer in your own words."; multi-select ⇒ "Use
+the option buttons, then Submit."; unlicensed / flag-off / no affordance ⇒ "Answer
+with the buttons or the ↑/↓/⏎ keys." ExitPlanMode gains the line for the FIRST time
+(its card never mentioned free-text at all).
+
+**Other disclosed residuals.** An EPM feedback long enough to scroll its option block
+off the pane (~3 k+ chars on 160x50) is REFUSED after being typed — `draft_written`,
+the brake goes up, the user is told the text is in the card's row and to clear it
+(Esc). Fail-closed by design. The verify→Enter TOCTOU is the SAME residual
+`_dispatch_pick` / `_dispatch_decision` already accept and disclose. A reply-context
+voice note is NOT free-text-eligible (a deliberate plan §2.3 decision, not an
+oversight) and keeps PR-1's refusal. Pull-only; no observer (c313657 stays forbidden).
+
 ## Tappable Decision dispatch (`dcp:` lane — Stage B2.3, flag `CC_TELEGRAM_DECISION_DISPATCH`)
 
 A PARALLEL, Decision-specific dispatch lane that gives the B1 `Decision` cards

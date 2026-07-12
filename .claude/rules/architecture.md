@@ -349,6 +349,44 @@ Additional modules:
                                 lone_hotkey_line (the SEGMENT-aware, PER-LINE
                                 bare-digit refusal) + is_bare_slash_payload (the
                                 post-write `/`-completion exemption).
+  handlers/free_text.py       ─ GH #50 PR-2: free-text answers on a LIVE card. The
+                                executor that makes a Telegram message ANSWER an
+                                AskUserQuestion single-select (row N+1 "Type
+                                something.") or REJECT an ExitPlanMode plan with
+                                feedback (row 4 "Tell Claude what to change",
+                                plan mode PRESERVED). Reuses the shipped dispatch
+                                discipline verbatim (window_send_lock, bounded
+                                cancellation-safe captures, a FRESH in-lock
+                                pane_command_is_claude + version-license re-read
+                                before the first key, monotonic arrow nav,
+                                settle→re-parse→verify, Enter as the ONLY commit
+                                key). TYPED-STATE PROOF = SGR-2: the affordance
+                                placeholder renders DIM while the row is SELECTED
+                                and UNTYPED; typed text does not (rig-verified on
+                                BOTH lanes, and on the adversarial payload that is
+                                byte-identical to the placeholder). VERSION-LICENSED
+                                per (surface × CC-version) — the decision_token
+                                precedent; an un-characterized release degrades to
+                                PR-1's refusal. THE ADDITIVE INVARIANT: every bail
+                                BEFORE the first keystroke returns None and the
+                                caller falls through to the normal gated
+                                deliver_to_window, so the lane can only turn a
+                                REFUSED message into a delivered ANSWER — it can
+                                never make a deliverable message undeliverable, and
+                                it never invents its own refusal for a payload it
+                                did not touch. Post-write it OWNS the outcome:
+                                DRAFT_WRITTEN (Enter withheld — arms the SAME
+                                per-window stranded-draft brake, since the payload
+                                sits in the card's row) or, past the Enter,
+                                DELIVERED / COMMIT_UNKNOWN (honest, never
+                                auto-retried). Carries the GH #50 UserTurnStamp —
+                                PR-2 is the FIFTH Enter-commit path and a free-text
+                                answer IS a user turn. Integration seam is the
+                                AGGREGATOR FLUSH (the only place that knows the
+                                bundle's provenance), gated first on the cheap
+                                in-memory has_interactive_surface so an ordinary
+                                send pays nothing. Config-free leaf (the flag is
+                                seeded by main._run_bot); pull-only, no observer.
   transcript_event_adapter.py ─ Translates session_monitor.TranscriptEvent →
                                 route_runtime.TranscriptLifecycleEvent and fans out
                                 per-route. 150-250 LoC budget (kill signal at 250 —

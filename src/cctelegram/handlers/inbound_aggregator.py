@@ -61,11 +61,67 @@ logger = logging.getLogger(__name__)
 Route = tuple[int, int, str]
 
 
+@dataclass(frozen=True)
+class Provenance:
+    """The composable provenance FACTS of one offered item (plan §2.3).
+
+    ``_PendingBundle`` flattens typed prose, a voice transcription, a caption and
+    a reply-context-rendered quote into indistinguishable ``text_parts``, so
+    "is this bundle pure user prose?" is NOT recoverable from the rendered string
+    — it must be OBSERVED at the offer site and carried. [r3 P1-2]
+
+    Facts, never a ``kind``: a single bundle can be several things at once (a
+    voice note plus a later typed line), and the eligibility rule is a boolean
+    expression over the facts, not a taxonomy.
+    """
+
+    typed_text: bool = False
+    voice: bool = False
+    caption: bool = False
+    reply_context: bool = False
+    attachment: bool = False
+
+    def merge(self, other: Provenance) -> Provenance:
+        """OR-compose across every merge into a bundle (plan §2.3)."""
+        return Provenance(
+            typed_text=self.typed_text or other.typed_text,
+            voice=self.voice or other.voice,
+            caption=self.caption or other.caption,
+            reply_context=self.reply_context or other.reply_context,
+            attachment=self.attachment or other.attachment,
+        )
+
+    @property
+    def free_text_eligible(self) -> bool:
+        """Plan §2.3: typed prose OR voice, AND none of caption / attachment /
+        reply-context.
+
+        Voice IS eligible — it is the user speaking, and answering a card by
+        voice is the flow PR-2 exists for. Captions and attachments are not: an
+        ``(attachments: …)`` block is a message ABOUT files, not an answer to the
+        question. A reply-context quote renders a block addressed to Claude as a
+        MESSAGE, not as the card's answer, so it is excluded too (a deliberate
+        plan decision, not an oversight).
+
+        Slash commands never reach here: ``forward_command_handler`` force-flushes
+        the bundle and then sends the command through ``send_to_window``
+        directly, so a command payload can never ride this lane.
+        """
+        return (self.typed_text or self.voice) and not (
+            self.caption or self.reply_context or self.attachment
+        )
+
+
 @dataclass
 class _PendingBundle:
     text_parts: list[str] = field(default_factory=list)
     attachment_paths: list[Path] = field(default_factory=list)
     flush_handle: asyncio.TimerHandle | None = None
+    # OR-composed across every offer merged into this bundle. A bundle created
+    # AFTER a media-group boundary / cap flush starts EMPTY and takes its facts
+    # from the NEW item only — it must never inherit the popped bundle's (plan
+    # §2.3 [r4 P2-1]).
+    provenance: Provenance = field(default_factory=Provenance)
     # Track the current media-group so a transition to a different group's
     # first attachment can force-flush the bundle in progress. Telegram
     # delivers media-group items within milliseconds, but two distinct
@@ -90,6 +146,10 @@ class AggregatorReplayAttachment:
     path: Path
     caption: str | None = None
     media_group_id: str | None = None
+    # Whether a reply-context quote was rendered into ``caption`` (plan §2.3
+    # [r4 P2-1]: pending-bind replay must PRESERVE the provenance facts, so the
+    # pending store carries them rather than guessing at replay time).
+    has_reply_context: bool = False
 
 
 # Per-route pending bundle. Mutation guarded by ``_route_locks[route]`` so the
@@ -216,6 +276,37 @@ async def _report_delivery_refusal(
         logger.exception("delivery refusal notice failed for route %s", route)
 
 
+async def _try_free_text_answer(
+    route: Route, text: str, stamp: UserTurnStamp
+) -> DeliveryResult | None:
+    """Try to answer a live card with ``text``. ``None`` ⇒ the lane declines.
+
+    Gated FIRST on the cheap, in-memory, route-keyed
+    ``interactive_ui.has_interactive_surface`` so the ordinary send path (no card
+    up) pays NOTHING — no extra capture, no lock churn. A False there simply
+    means "no card is published for this route", so the payload takes the normal
+    gated path; if a prompt IS live but uncarded (a restart before the poller
+    re-renders), PR-1 refuses it correctly and the poller posts the card within
+    ~1s.
+
+    ``free_text.try_answer`` then does the real work under the window send lock:
+    a fresh in-lock version-license re-read, the strict surface parse, the nav,
+    the SGR-2 landing + typed-state proofs, and the Enter.
+    """
+    from . import free_text, interactive_ui
+
+    if not free_text.enabled():
+        return None
+    if not interactive_ui.has_interactive_surface(route[0], route[1]):
+        return None
+    return await free_text.try_answer(
+        route[2],
+        text,
+        user_turn=stamp,
+        display=session_manager.get_display_name(route[2]),
+    )
+
+
 async def _send_bundle(
     route: Route, bundle: _PendingBundle, *, report_refusal: bool = True
 ) -> DeliveryResult:
@@ -260,12 +351,28 @@ async def _send_bundle(
     # a REFUSED send is never stamped (the pre-send stamp here used to stamp
     # every refusal). Timing is preserved: the boundary still precedes any prose
     # this turn streams, so a fast prose→AUQ turn can't finalize its prose
-    # before the stamp lands.
+    # before the stamp lands. PR-2's Enter carries the SAME stamp (plan §2.4
+    # [r5 P1-1]) — a free-text answer IS a user turn.
     stamp = UserTurnStamp(user_id=route[0], thread_id=route[1], window_id=window_id)
     try:
-        result = await session_manager.deliver_to_window(
-            window_id, text_to_send, user_turn=stamp
-        )
+        # GH #50 PR-2 — the FREE-TEXT lane (plan §2.4 "Integration seam"). This
+        # is the ONLY place that knows the bundle's PROVENANCE, which is why the
+        # lane is invoked here and not in ``send_to_window`` (provenance is
+        # flattened by then) or ``text_handler`` (the debounce makes any
+        # offer-time check TOCTOU).
+        #
+        # ``try_free_text_answer`` returns ``None`` when the lane does not apply
+        # — no live licensed card on the pane — and the payload falls through to
+        # the normal GATED delivery, which refuses on any other live prompt
+        # (PR-1) or delivers into the input box. So the lane can only ever ADD a
+        # successful answer; it can never make a deliverable message undeliverable.
+        result = None
+        if bundle.provenance.free_text_eligible:
+            result = await _try_free_text_answer(route, text_to_send, stamp)
+        if result is None:
+            result = await session_manager.deliver_to_window(
+                window_id, text_to_send, user_turn=stamp
+            )
     except Exception as exc:
         logger.error(
             "aggregator flush raised for route %s: %s",
@@ -311,8 +418,30 @@ async def _flush(route: Route, *, report_refusal: bool = True) -> DeliveryResult
     return await _send_bundle(route, bundle, report_refusal=report_refusal)
 
 
+async def _offer_text_part(
+    route: Route,
+    text: str,
+    *,
+    bot: Any | None,
+    provenance: Provenance,
+) -> None:
+    if not text:
+        return
+    lock = _get_lock(route)
+    async with lock:
+        bundle = _get_or_create_bundle(route)
+        bundle.text_parts.append(text)
+        bundle.bot = bot or bundle.bot
+        bundle.provenance = bundle.provenance.merge(provenance)
+        _schedule_flush(route, bundle)
+
+
 async def aggregator_offer_text(
-    route: Route, text: str, *, bot: Any | None = None
+    route: Route,
+    text: str,
+    *,
+    bot: Any | None = None,
+    has_reply_context: bool = False,
 ) -> None:
     """Append a text part to the route's bundle and (re)schedule flush.
 
@@ -322,22 +451,38 @@ async def aggregator_offer_text(
     bundling Telegram updates into one Claude turn is correct in both modes.
     ``bot`` (the offering handler's) is captured on the bundle for the P1
     quarantine-refusal notice; None preserves the log-only degradation.
+
+    ``has_reply_context`` is OBSERVED by the caller (``_apply_reply_context``
+    returns whether it actually rendered a quote) — never guessed from the text,
+    which is unrecoverably flattened by then (plan §2.3 [r4 P2-1]).
     """
-    if not text:
-        return
-    lock = _get_lock(route)
-    async with lock:
-        bundle = _get_or_create_bundle(route)
-        bundle.text_parts.append(text)
-        bundle.bot = bot or bundle.bot
-        _schedule_flush(route, bundle)
+    await _offer_text_part(
+        route,
+        text,
+        bot=bot,
+        provenance=Provenance(typed_text=True, reply_context=has_reply_context),
+    )
 
 
 async def aggregator_offer_voice(
-    route: Route, transcribed_text: str, *, bot: Any | None = None
+    route: Route,
+    transcribed_text: str,
+    *,
+    bot: Any | None = None,
+    has_reply_context: bool = False,
 ) -> None:
-    """Voice transcripts ride the same path as text."""
-    await aggregator_offer_text(route, transcribed_text, bot=bot)
+    """Voice transcripts ride the same bundle path, with the VOICE fact set.
+
+    Distinct from ``aggregator_offer_text`` only in provenance — and that
+    distinction is the point: a voice note IS the user speaking, so it is
+    free-text-eligible (plan §2.3).
+    """
+    await _offer_text_part(
+        route,
+        transcribed_text,
+        bot=bot,
+        provenance=Provenance(voice=True, reply_context=has_reply_context),
+    )
 
 
 async def _offer_attachment(
@@ -347,6 +492,7 @@ async def _offer_attachment(
     media_group_id: str | None,
     *,
     bot: Any | None = None,
+    has_reply_context: bool = False,
 ) -> None:
     """Append an attachment (and any caption) to the route's bundle.
 
@@ -354,6 +500,11 @@ async def _offer_attachment(
     force-flushed immediately rather than waiting on the debounce — keeps an
     unbounded media dump from sitting in memory.
     """
+    item = Provenance(
+        attachment=True,
+        caption=bool(caption),
+        reply_context=bool(caption) and has_reply_context,
+    )
     lock = _get_lock(route)
     flush_now = False
     async with lock:
@@ -380,10 +531,16 @@ async def _offer_attachment(
             # quarantine-refused flush of this second bundle silently loses
             # its in-topic notice. Carry the old bundle's bot as fallback.
             bundle.bot = bot or (old_bundle.bot if old_bundle else None)
+            # ...but it must NOT inherit the popped bundle's PROVENANCE (plan
+            # §2.3 [r4 P2-1]): the fresh bundle is a different user intent, and
+            # carrying group-1's facts over would mis-classify group-2. It starts
+            # from the default and takes ``item``'s facts below, like any first
+            # offer into a new bundle.
 
         if caption and caption not in bundle.seen_captions:
             bundle.text_parts.append(caption)
             bundle.seen_captions.add(caption)
+        bundle.provenance = bundle.provenance.merge(item)
         bundle.attachment_paths.append(path)
         # Only update on a grouped attachment: a non-grouped item joining the
         # bundle must not erase the "last group" memory, or the next group's
@@ -408,8 +565,16 @@ async def aggregator_offer_photo(
     media_group_id: str | None,
     *,
     bot: Any | None = None,
+    has_reply_context: bool = False,
 ) -> None:
-    await _offer_attachment(route, path, caption, media_group_id, bot=bot)
+    await _offer_attachment(
+        route,
+        path,
+        caption,
+        media_group_id,
+        bot=bot,
+        has_reply_context=has_reply_context,
+    )
 
 
 async def aggregator_offer_document(
@@ -419,8 +584,16 @@ async def aggregator_offer_document(
     media_group_id: str | None,
     *,
     bot: Any | None = None,
+    has_reply_context: bool = False,
 ) -> None:
-    await _offer_attachment(route, path, caption, media_group_id, bot=bot)
+    await _offer_attachment(
+        route,
+        path,
+        caption,
+        media_group_id,
+        bot=bot,
+        has_reply_context=has_reply_context,
+    )
 
 
 async def aggregator_replay_payload(
@@ -428,6 +601,7 @@ async def aggregator_replay_payload(
     *,
     text: str | None,
     attachments: Sequence[AggregatorReplayAttachment],
+    text_provenance: Provenance | None = None,
 ) -> DeliveryResult:
     """Synchronously send a pending first-turn payload and aggregate status.
 
@@ -463,6 +637,13 @@ async def aggregator_replay_payload(
 
     if text:
         bundle.text_parts.append(text)
+        # Plan §2.3 [r4 P2-1]: the pending store carries the facts OBSERVED at the
+        # original offer (typed vs voice, and whether a reply-context quote was
+        # actually rendered), so the pending-bind replay preserves them instead of
+        # guessing from the already-flattened string. A pre-GH#50-PR-2 pending
+        # payload (no stored facts) degrades to typed-text-only, which is what it
+        # was before this lane existed.
+        bundle.provenance = text_provenance or Provenance(typed_text=True)
 
     async def send_current_bundle() -> bool:
         """Send the in-progress bundle. False ⇒ REFUSED, the caller must stop."""
@@ -497,6 +678,18 @@ async def aggregator_replay_payload(
         if attachment.caption and attachment.caption not in bundle.seen_captions:
             bundle.text_parts.append(attachment.caption)
             bundle.seen_captions.add(attachment.caption)
+        # OR-compose the attachment's facts, exactly as ``_offer_attachment``
+        # does — so a replayed split carrying an attachment is never
+        # free-text-eligible, and a SPLIT bundle created by the loop above
+        # starts from the fresh ``_PendingBundle``'s empty facts (never
+        # inheriting the sent split's).
+        bundle.provenance = bundle.provenance.merge(
+            Provenance(
+                attachment=True,
+                caption=bool(attachment.caption),
+                reply_context=bool(attachment.caption) and attachment.has_reply_context,
+            )
+        )
         bundle.attachment_paths.append(attachment.path)
         if media_group_id is not None:
             bundle.current_media_group_id = media_group_id

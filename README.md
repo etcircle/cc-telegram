@@ -155,6 +155,35 @@ input box again. In the rarer case where the final Enter itself fails, the bot
 says plainly that the message *may or may not* have been submitted — check the
 window with `/screenshot` before resending.
 
+### …but you can still answer a card in your own words
+
+Refusing everything would be a dead end, so the two prompts that *have* a
+free-text option accept one. Send a normal message — typed or a voice note —
+while one of these is on screen and it becomes your answer:
+
+- **A question card** (single-select). Your message is submitted as the answer,
+  exactly as if you had picked "Type something." in the terminal.
+- **A plan approval.** Your message rejects the plan and is delivered as the
+  feedback, and plan mode is preserved — so you can talk Claude out of a plan
+  from your phone instead of approving it blind.
+
+The bot does this by driving the terminal the same way the option buttons do: it
+moves the cursor onto the prompt's free-text row, *proves* it landed there, types
+your message with the Enter withheld, *proves* your text is in that row, and only
+then commits. Any failure before the Enter falls back to the ordinary refusal.
+Long messages are fine — a multi-paragraph voice note is submitted whole.
+
+Everything else keeps the refusal, on purpose: multi-select questions (their
+answer takes several steps), folder-trust and model-switch prompts (no free-text
+option exists), and anything carrying an attachment, a caption, a reply-quote, or
+a slash command — those are messages *about* something, not answers to the
+question. Cards say which of the two you are looking at, so you are never guessing.
+
+This is characterised per Claude Code version. On a version cc-telegram has not
+verified, the free-text lane switches itself off and the prompt goes back to
+buttons-and-refusal rather than trusting a stale assumption about the terminal.
+Set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to turn it off entirely.
+
 ### Sessions survive the boring failures
 
 Claude runs in tmux, so closing Telegram, losing mobile signal, or restarting the bot does not kill the session. Routing and read positions are saved on disk and reconciled at startup.
@@ -260,6 +289,7 @@ Everything else has a default.
 - `CC_TELEGRAM_PERMISSION_PROMPTS` surfaces tool permission prompts and Workflow launch gates as Telegram cards. Default: true (set `CC_TELEGRAM_PERMISSION_PROMPTS=false` to disable).
 - `CC_TELEGRAM_DECISION_CARDS` surfaces otherwise unsupported numbered confirmation prompts as display-only cards. Default: true (set `CC_TELEGRAM_DECISION_CARDS=false` to disable).
 - `CC_TELEGRAM_DECISION_DISPATCH` enables verified one-tap dispatch for known-good decision families when decision cards are also enabled. Unknown prompts and uncharacterised Claude versions remain display-only.
+- `CC_TELEGRAM_FREE_TEXT_ANSWERS` lets a plain message (typed or voice) answer a live question card or a plan approval in your own words, by driving that prompt's free-text row. Default: true (set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to fall back to refusing those messages). Limited to Claude Code versions cc-telegram has characterised; an uncharacterised version disables the lane by itself. See [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words).
 - `CC_TELEGRAM_ARTIFACT_MAX_MB` sets the maximum upload size for attachment cards and `/file`. Default: 45 MB; Telegram's bot limit is 50 MB.
 - `CC_TELEGRAM_ARTIFACT_ROOTS` adds comma-separated absolute directories that may serve files in addition to the active session directory.
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` limits the input preview shown in tool lines. Default: 40.
@@ -286,7 +316,7 @@ The reason is structural. Claude Code's tool-permission prompts are a terminal U
 
 What that means for your security boundary: it is no longer Claude Code's per-tool approval. It is **`ALLOWED_USERS` plus the machine you run on**. Anyone who can post in your forum can make Claude read, edit, and execute anything your user account can. Lock `ALLOWED_USERS` to your own Telegram user ID, run on a machine you trust, and consider `IS_SANDBOX=1`.
 
-> **Sending while a prompt is on screen (GH #50).** This used to be a live hazard: a plain text message sent while Claude was waiting on a question card, a plan approval, or a folder-trust dialog was typed into the terminal, where the text was discarded and the trailing Enter committed the highlighted option (on a plan approval, that meant approving the plan). The delivery gate now refuses those sends with an explanation instead — see [Messages are never typed into a live prompt](#messages-are-never-typed-into-a-live-prompt). Answer the card first, then send your message.
+> **Sending while a prompt is on screen (GH #50).** This used to be a live hazard: a plain text message sent while Claude was waiting on a question card, a plan approval, or a folder-trust dialog was typed into the terminal, where the text was discarded and the trailing Enter committed the highlighted option (on a plan approval, that meant approving the plan). The delivery gate now refuses those sends with an explanation instead — see [Messages are never typed into a live prompt](#messages-are-never-typed-into-a-live-prompt). On the two prompts that offer a free-text option — a single-select question card and a plan approval — your message is instead delivered *into* that option, as the answer or as plan feedback; see [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words). Everywhere else: answer the card first, then send your message.
 
 ### Suggested daily-driver config
 

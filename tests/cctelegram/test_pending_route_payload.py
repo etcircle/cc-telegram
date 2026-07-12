@@ -1140,7 +1140,8 @@ async def test_bound_photo_caption_still_uses_apply_reply_context(
         _patch_both("aggregator_offer_photo", new_callable=AsyncMock) as mock_offer,
         _patch_both("safe_reply", new_callable=AsyncMock),
     ):
-        mock_apply.return_value = "rendered bound caption"
+        # GH #50 PR-2: ``_apply_reply_context`` now returns (text, applied).
+        mock_apply.return_value = ("rendered bound caption", False)
         await bot_module.photo_handler(update, context)
 
     mock_apply.assert_awaited_once_with(update.message, 1, 99, "bound caption")
@@ -1178,7 +1179,8 @@ async def test_bound_document_caption_still_uses_apply_reply_context(
         _patch_both("aggregator_offer_document", new_callable=AsyncMock) as mock_offer,
         _patch_both("safe_reply", new_callable=AsyncMock),
     ):
-        mock_apply.return_value = "rendered bound caption"
+        # GH #50 PR-2: ``_apply_reply_context`` now returns (text, applied).
+        mock_apply.return_value = ("rendered bound caption", False)
         await bot_module.document_handler(update, context)
 
     mock_apply.assert_awaited_once_with(update.message, 1, 99, "bound caption")
@@ -1285,7 +1287,10 @@ async def test_text_replaced_topic_stale_cancel_does_not_clear_new_text_photo_pa
         ),
         _patch_both("safe_reply", new_callable=AsyncMock),
     ):
-        apply_reply.side_effect = lambda _message, _user_id, _thread_id, text: text
+        apply_reply.side_effect = lambda _message, _user_id, _thread_id, text: (
+            text,
+            False,
+        )
         await bot_module.text_handler(
             _make_text_update(thread_id=99, text="topic b text"), context
         )
@@ -1742,7 +1747,13 @@ async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_clea
 
     mock_bind.assert_called_once_with(1, 10, "@0", window_name="created-window")
     mock_replay.assert_awaited_once_with(
-        (1, 10, "@0"), text="hello", attachments=[_replay_attachment(payload)]
+        (1, 10, "@0"),
+        text="hello",
+        attachments=[_replay_attachment(payload)],
+        # GH #50 PR-2: the pending store carries the provenance facts across
+        # the bind. This fixture stashes the text directly (no handler run), so
+        # there are no stored facts and the replay degrades to None.
+        text_provenance=None,
     )
     mock_clear_route.assert_called_once_with((1, 10, "@0"))
     edit_text = mock_edit.await_args.args[1]
@@ -1812,7 +1823,13 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
 
     mock_bind.assert_called_once_with(1, 10, "@0", window_name="existing-window")
     mock_replay.assert_awaited_once_with(
-        (1, 10, "@0"), text="hello", attachments=[_replay_attachment(payload)]
+        (1, 10, "@0"),
+        text="hello",
+        attachments=[_replay_attachment(payload)],
+        # GH #50 PR-2: the pending store carries the provenance facts across
+        # the bind. This fixture stashes the text directly (no handler run), so
+        # there are no stored facts and the replay degrades to None.
+        text_provenance=None,
     )
     mock_clear_route.assert_called_once_with((1, 10, "@0"))
     edit_text = mock_edit.await_args.args[1]
@@ -1870,7 +1887,13 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
 
     mock_bind.assert_called_once_with(1, 10, "@0", window_name="existing-window")
     mock_replay.assert_awaited_once_with(
-        (1, 10, "@0"), text="hello", attachments=[_replay_attachment(payload)]
+        (1, 10, "@0"),
+        text="hello",
+        attachments=[_replay_attachment(payload)],
+        # GH #50 PR-2: the pending store carries the provenance facts across
+        # the bind. This fixture stashes the text directly (no handler run), so
+        # there are no stored facts and the replay degrades to None.
+        text_provenance=None,
     )
     edit_text = mock_edit.await_args.args[1]
     assert edit_text == "✅ Bound to window `existing-window`\n\nFirst message sent."

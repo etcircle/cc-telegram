@@ -3529,27 +3529,9 @@ def _clean_ghost_input_line(raw_line: str) -> str:
         return raw_line
 
     # Walk the raw line, tracking dim state, and classify each VISIBLE char.
-    dim = False
-    pos = 0
-    visible: list[tuple[str, bool]] = []  # (char, is_dim)
-    n = len(raw_line)
-    while pos < n:
-        if raw_line[pos] == "\x1b":
-            m = _RE_CSI.match(raw_line, pos)
-            if m is not None:
-                if m.group(2) == "m":  # SGR
-                    dim = _sgr_updates_dim(m.group(1), dim)
-                pos = m.end()
-                continue
-            m2 = _RE_ANSI_ANY.match(raw_line, pos)
-            if m2 is not None:
-                pos = m2.end()
-                continue
-            # A lone ESC with no recognized sequence — drop it, advance one.
-            pos += 1
-            continue
-        visible.append((raw_line[pos], dim))
-        pos += 1
+    # The SAME walker the PR-2 typed-state discriminator uses
+    # (``_visible_chars_with_dim``) — one SGR state machine, two consumers.
+    visible = _visible_chars_with_dim(raw_line)
 
     plain = "".join(c for c, _ in visible)
     stripped = plain.strip()
@@ -4272,6 +4254,227 @@ def pane_input_box_present(
             expected_draft=expected_draft,
         )
         is None
+    )
+
+
+# ── The free-text affordance row (GH #50 PR-2) ───────────────────────────
+#
+# Claude Code auto-appends a free-text affordance row to two surfaces:
+#
+#   AskUserQuestion  row N+1  ``Type something.``
+#   ExitPlanMode     row 4    ``Tell Claude what to change``
+#
+# Selecting that row and typing turns the user's prose INTO the answer (AUQ) or
+# into plan-rejection feedback that PRESERVES plan mode (EPM) — the lane PR-2
+# drives so a Telegram message sent at a live card actually answers it.
+#
+# THE TYPED-STATE DISCRIMINATOR IS SGR-2 (rig §5-E11, re-confirmed live on
+# 2.1.207): while the row is SELECTED but UNTYPED, its label is the placeholder
+# and renders DIM (``ESC[2m``); the moment the user types, the label is their
+# text and renders at normal intensity. Verified on BOTH lanes, and it holds even
+# for the adversarial payload that is byte-identical to the placeholder (typing
+# the literal ``Tell Claude what to change`` renders PLAIN). The dim styling is
+# applied ONLY when the cursor is on the row — which is exactly the state the
+# executor verifies in, so the discriminator is available precisely when needed.
+#
+# Fixtures: ``{auq,epm}_freetext_row_selected_pretype_v2.1.207.ansi.txt`` (dim),
+# ``{auq,epm}_freetext_row_typed_v2.1.207.ansi.txt`` (plain),
+# ``{auq,epm}_freetext_typed_identical_label_v2.1.207.ansi.txt`` (the adversarial
+# payload), ``{auq,epm}_freetext_row_typed_large_v2.1.207.ansi.txt`` (a 947-char
+# multi-line voice-note-shaped payload).
+#
+# A TUI-DRIFT AUDIT SURFACE, like ``clean_ghost_input_text`` (the other SGR-2
+# consumer) and ``pane_command_is_claude``. It is why the lane is
+# VERSION-LICENSED (``handlers/free_text``): a CC release that renders the
+# placeholder at normal intensity would make the verifier read an untyped row as
+# typed — so an unlicensed version degrades to PR-1's refusal rather than
+# trusting a stale empiric.
+
+# The two affordance placeholders, per surface. EXACT (post-strip) match — the
+# label is the thing the SGR-2 proof is about, so a drifted label must NOT be
+# silently accepted.
+AUQ_FREE_TEXT_LABEL: Final = "Type something."
+EPM_FREE_TEXT_LABEL: Final = "Tell Claude what to change"
+
+# ``ctrl+g to edit in <editor>`` — Claude Code's "you are in a text field" hint.
+#
+# On the AUQ picker footer it appears **IFF the free-text row is the ACTIVE
+# row** (rig-confirmed: it tracks the cursor exactly — absent at rows 1/2/3,
+# present at row N+1). That makes it a POSITIVE row-active proof that survives
+# the overflow shape below, where the option rows themselves scroll off.
+#
+# On ExitPlanMode it is ALWAYS present (it is the plan-file footer), so it is
+# NOT a typed-state or row-active proof there (plan §2.1 [r4 P1-4]) — the EPM
+# verifier requires the row itself.
+_RE_FREE_TEXT_EDIT_HINT: Final = re.compile(r"ctrl[+-]g to edit")
+
+
+@dataclass(frozen=True)
+class FreeTextRow:
+    """One parse of a free-text affordance row from an ANSI pane capture."""
+
+    number: int
+    label: str
+    cursor: bool
+    # True iff EVERY visible non-whitespace char of the label falls inside an
+    # ACTIVE SGR-2 (dim) region ⇒ the row still holds its UNTYPED placeholder.
+    # False ⇒ the label is typed text (or a mixed/plain render — fail-closed for
+    # the pre-type landing proof, which REQUIRES dim).
+    dim: bool
+
+
+def parse_free_text_row(ansi_pane: str | None, *, number: int) -> FreeTextRow | None:
+    """Parse the numbered row ``number`` out of an ANSI pane capture.
+
+    Returns ``None`` when the row is not on the pane (it can legitimately scroll
+    off — see the overflow note in ``handlers/free_text``). The BOTTOM-most match
+    wins: a scrolled TUI capture can retain a stale copy of the row above the
+    live one, and the live render is always the lower (the same bottom-most rule
+    ``_parse_numbered_options`` uses for the cursor).
+
+    Requires an ANSI capture (``capture_pane(with_ansi=True)``) — ``dim`` is the
+    whole point and a plain capture has thrown the styling away.
+    """
+    if not ansi_pane:
+        return None
+    found: FreeTextRow | None = None
+    for raw_line in ansi_pane.split("\n"):
+        visible = _visible_chars_with_dim(raw_line)
+        plain = "".join(c for c, _ in visible)
+        m = _RE_NUMBERED_OPTION.match(plain)
+        if m is None:
+            continue
+        try:
+            if int(m.group("num")) != number:
+                continue
+        except ValueError:
+            continue
+        label = m.group("label").strip()
+        if not label:
+            continue
+        # Map the label back onto the dim-annotated visible chars via the
+        # regex span — ``visible`` is exactly ``plain`` char-for-char.
+        start, end = m.span("label")
+        label_chars = [(c, d) for c, d in visible[start:end] if not c.isspace()]
+        dim = bool(label_chars) and all(d for _, d in label_chars)
+        found = FreeTextRow(
+            number=number,
+            label=label,
+            cursor=m.group("cursor").strip() in ("❯", "›", "▶", "*"),
+            dim=dim,
+        )
+    return found
+
+
+def _visible_chars_with_dim(raw_line: str) -> list[tuple[str, bool]]:
+    """Walk one ANSI line → ``[(visible_char, is_dim), …]`` (the SGR-2 state).
+
+    The shared SGR machine behind ``clean_ghost_input_text``'s ghost detector and
+    the PR-2 typed-state discriminator: combined forms (``ESC[1;2m`` /
+    ``ESC[0;2m`` / ``ESC[38;5;244;2m``) carry dim without a literal ``ESC[2m``
+    byte shape, so a substring probe would be WRONG — the state machine is the
+    only correct reader.
+    """
+    dim = False
+    pos = 0
+    out: list[tuple[str, bool]] = []
+    n = len(raw_line)
+    while pos < n:
+        if raw_line[pos] == "\x1b":
+            m = _RE_CSI.match(raw_line, pos)
+            if m is not None:
+                if m.group(2) == "m":
+                    dim = _sgr_updates_dim(m.group(1), dim)
+                pos = m.end()
+                continue
+            m2 = _RE_ANSI_ANY.match(raw_line, pos)
+            if m2 is not None:
+                pos = m2.end()
+                continue
+            pos += 1
+            continue
+        out.append((raw_line[pos], dim))
+        pos += 1
+    return out
+
+
+def auq_free_text_row_active(pane_text: str | None) -> bool:
+    """True iff a LIVE AUQ picker has its free-text row as the ACTIVE row.
+
+    The proof is the picker footer carrying BOTH ``Enter to select`` (the picker
+    is live and Enter commits the cursor row) AND ``ctrl+g to edit`` (the cursor
+    row is a TEXT FIELD — only the free-text affordance row is). Rig-confirmed on
+    2.1.207: the hint is absent with the cursor on options 1/2/3 and present on
+    row N+1, tracking the cursor exactly.
+
+    This is the OVERFLOW proof. A long answer (~4-5 k chars on a 160x50 pane)
+    wraps to more rows than the pane has, and the picker — which is BOTTOM-
+    anchored — scrolls its whole option block, INCLUDING the ``❯ N+1.`` cursor
+    row, off the top. A TUI runs on the alternate screen, so ``capture-pane -S``
+    recovers nothing (rig-measured: 51 lines). The row is then genuinely
+    unobservable, yet the footer still proves the free-text row is where Enter
+    will commit — which, with "no input box" and the payload-tail probe, is a
+    complete positive proof. ExitPlanMode has NO equivalent (its ``ctrl+g``
+    footer is unconditional), so the EPM lane requires the row itself.
+    """
+    if not pane_text:
+        return False
+    has_picker_footer = False
+    has_edit_hint = False
+    for line in pane_text.split("\n"):
+        if _RE_PICKER_FOOTER.search(line):
+            has_picker_footer = True
+            if _RE_FREE_TEXT_EDIT_HINT.search(line):
+                has_edit_hint = True
+    return has_picker_footer and has_edit_hint
+
+
+def parse_exit_plan_form(pane_text: str | None) -> AskUserQuestionForm | None:
+    """Strict-or-None parse of a LIVE ExitPlanMode prompt's option block.
+
+    ``parse_ask_user_question`` cannot serve here — it anchors on the picker's
+    ``Enter to select`` footer, which ExitPlanMode does not render. This walks
+    the numbered rows between the plan question and the ``ctrl+g`` footer and
+    requires the SHAPE that makes the free-text lane addressable:
+
+      - the EPM question anchor (``_RE_EPM_FOOTER``'s companion — the
+        ``UIPattern`` top line) is present;
+      - ≥ 2 contiguous options numbered from 1;
+      - the LAST option's label is exactly ``EPM_FREE_TEXT_LABEL`` — the row the
+        executor navigates to. A drifted label ⇒ ``None`` ⇒ the lane declines
+        (PR-1 refusal), never a guessed row index.
+
+    Emits the same ``AskUserQuestionForm`` shape the AUQ lane uses so the
+    executor's nav/verify logic is ONE code path. ``is_free_text`` is True (the
+    last row IS the free-text affordance) and ``options_complete`` reflects the
+    contiguity + affordance proof.
+    """
+    if not pane_text:
+        return None
+    lines = pane_text.split("\n")
+    footer_idx: int | None = None
+    for i, line in enumerate(lines):
+        if _RE_EPM_FOOTER.search(line):
+            footer_idx = i
+    if footer_idx is None:
+        # The footer can scroll off under a very long draft; fall back to the
+        # whole pane (the option-shape proof below is what makes this strict).
+        footer_idx = len(lines)
+    options = _parse_numbered_options(lines[:footer_idx])
+    if len(options) < 2:
+        return None
+    if options[0].number != 1:
+        return None
+    last = options[-1]
+    if last.label.strip() != EPM_FREE_TEXT_LABEL:
+        return None
+    return AskUserQuestionForm(
+        questions=(),
+        options=options,
+        select_mode="single",
+        is_free_text=True,
+        is_review_screen=False,
+        options_complete=True,
     )
 
 

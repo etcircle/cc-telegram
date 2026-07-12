@@ -1,0 +1,50 @@
+
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the AskUserQuestion tool to ask me a single-select question with 3 options about my favorite color. Do it now, nothing else.[39m
+
+[38;5;246m[49m⏺ [39mUser answered Claude's questions:
+[38;5;246m  ⎿  · What is your favorite color? → Blue[39m
+
+[38;5;231m⏺[39m Blue it is — noted.
+
+[38;5;246m✻[39m [38;5;246mCogitated for 12s[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the AskUserQuestion tool to ask me a single-select question with exactly 3 options about my favorite color (Red, Blue, Green). Do it now, nothing else.[39m
+
+[38;5;246m[49m⏺ [39mUser answered Claude's questions:
+[38;5;246m  ⎿  · What is your favorite color? → Red[39m
+
+[38;5;231m⏺[39m Red this time — noted.
+
+[38;5;246m✻[39m [38;5;246mSautéed for 8s[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the AskUserQuestion tool to ask me a single-select question with exactly 3 options about my favorite color (Red, Blue, Green). Do it now, nothing else.[39m
+
+[38;5;246m[49m⏺ [39mUser answered Claude's questions:
+[38;5;246m  ⎿  · What is your favorite color? → Green[39m
+[38;5;246m  ⎿  Interrupted · What should Claude do instead?[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the AskUserQuestion tool to ask me a single-select question with exactly 3 options about my favorite color (Red, Blue, Green). Do it now, nothing else.[39m
+
+[38;5;246m[49m⏺ [39mUser declined to answer questions
+[38;5;246m  ⎿  · What is your favorite color? (Red / Blue / Green)[39m
+
+[38;5;246m✻[39m [38;5;246mBaked for 10s[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the AskUserQuestion tool to ask me a single-select question with exactly 3 options about my favorite color (Red, Blue, Green). Do it now, nothing else.[39m
+[38;5;246m[49m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;16m[48;5;153m ☐ Color [39m[49m
+
+[1m[38;5;231mWhat is your favorite color?[0m
+
+  [38;5;246m1.[39m Red
+     [38;5;246mWarm, bold, and energetic.[39m
+  [38;5;246m2.[39m Blue
+     [38;5;246mCool, calm, and classic.[39m
+  [38;5;246m3.[39m Green
+     [38;5;246mNatural, fresh, and balanced.[39m
+[38;5;153m❯[39m [38;5;246m4. [39mteal, actually
+[38;5;246m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  5. Chat about this
+
+[38;5;246mEnter to select · ↑/↓ to navigate · ctrl+g to edit in Vim · Esc to cancel[39m
