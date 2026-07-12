@@ -3626,10 +3626,14 @@ class TestExtractEpmPlanFilePath:
     # ── GH #50 PR-2 peer-review round-2 P1: NEVER borrow a stale path ──────
     #
     # The old fallback was "the LAST plan path ANYWHERE in the pane", so a pane
-    # with no live footer path returned an UNRELATED scrollback mention. Two
-    # callers are burned by that: ``interactive_ui`` would post the WRONG plan
-    # body, and ``free_text`` derives the ExitPlanMode SURFACE ANCHOR from it —
-    # a stale path there is a wrong-card hazard on a plan-approval surface.
+    # with no live footer path returned an UNRELATED scrollback mention, and
+    # ``interactive_ui`` posted the WRONG plan body.
+    #
+    # (This was ALSO the ExitPlanMode free-text lane's surface anchor through
+    # peer-review round 3. That lane is GONE — the owner dropped EPM on
+    # 2026-07-12 — so the plan path is once again a DISPLAY input only, and the
+    # strict footer scoping stays because a wrong plan body is a real bug in its
+    # own right.)
 
     def test_a_footer_with_no_path_never_borrows_a_scrollback_path(self):
         pane = (

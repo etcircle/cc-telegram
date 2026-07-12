@@ -4279,29 +4279,35 @@ def pane_input_box_present(
 
 # ── The free-text affordance row (GH #50 PR-2) ───────────────────────────
 #
-# Claude Code auto-appends a free-text affordance row to two surfaces:
+# Claude Code auto-appends a free-text affordance row to a picker:
 #
 #   AskUserQuestion  row N+1  ``Type something.``
-#   ExitPlanMode     row 4    ``Tell Claude what to change``
 #
-# Selecting that row and typing turns the user's prose INTO the answer (AUQ) or
-# into plan-rejection feedback that PRESERVES plan mode (EPM) — the lane PR-2
-# drives so a Telegram message sent at a live card actually answers it.
+# Selecting that row and typing turns the user's prose INTO the answer — the lane
+# PR-2 drives, so a Telegram message sent at a live card actually answers it.
+#
+# SCOPE: **AskUserQuestion ONLY** (owner decision 2026-07-12). ExitPlanMode has an
+# affordance row too (row 4, ``Tell Claude what to change``) and an earlier PR-2
+# revision drove it, but the lane was DROPPED: naming a plan prompt would have
+# required a whole new ``PreToolUse(ExitPlanMode)`` hook + side file, and the owner
+# runs ``--dangerously-skip-permissions`` anyway. An EPM card now takes PR-1's
+# refusal. The helpers below are AUQ-only; nothing here parses an EPM row.
 #
 # THE TYPED-STATE DISCRIMINATOR IS SGR-2 (rig §5-E11, re-confirmed live on
 # 2.1.207): while the row is SELECTED but UNTYPED, its label is the placeholder
 # and renders DIM (``ESC[2m``); the moment the user types, the label is their
-# text and renders at normal intensity. Verified on BOTH lanes, and it holds even
-# for the adversarial payload that is byte-identical to the placeholder (typing
-# the literal ``Tell Claude what to change`` renders PLAIN). The dim styling is
-# applied ONLY when the cursor is on the row — which is exactly the state the
-# executor verifies in, so the discriminator is available precisely when needed.
+# text and renders at normal intensity. It holds even for the adversarial payload
+# that is byte-identical to the placeholder (typing the literal placeholder text
+# renders PLAIN). The dim styling is applied ONLY when the cursor is on the row —
+# which is exactly the state the executor verifies in, so the discriminator is
+# available precisely when needed.
 #
-# Fixtures: ``{auq,epm}_freetext_row_selected_pretype_v2.1.207.ansi.txt`` (dim),
-# ``{auq,epm}_freetext_row_typed_v2.1.207.ansi.txt`` (plain),
-# ``{auq,epm}_freetext_typed_identical_label_v2.1.207.ansi.txt`` (the adversarial
-# payload), ``{auq,epm}_freetext_row_typed_large_v2.1.207.ansi.txt`` (a 947-char
-# multi-line voice-note-shaped payload).
+# Fixtures: ``auq_freetext_row_selected_pretype_v2.1.207.ansi.txt`` (dim),
+# ``auq_freetext_row_typed_v2.1.207.ansi.txt`` (plain),
+# ``auq_freetext_typed_identical_label_v2.1.207.ansi.txt`` (the adversarial
+# payload), ``auq_freetext_row_typed_large_v2.1.207.ansi.txt`` (a 947-char
+# multi-line voice-note-shaped payload), ``auq_freetext_overflow_v2.1.207.txt``
+# (the ~5.3 k answer that scrolls the option block away).
 #
 # A TUI-DRIFT AUDIT SURFACE, like ``clean_ghost_input_text`` (the other SGR-2
 # consumer) and ``pane_command_is_claude``. It is why the lane is

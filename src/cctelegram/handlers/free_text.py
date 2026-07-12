@@ -61,6 +61,26 @@ discipline the delivery gate's re-verify already applies to its liveness probe
 resolves the window's session FRESH from the hook-written ``session_map.json``,
 never the cached ``WindowState.session_id`` — see :class:`SurfaceIdentity`.
 
+**AND THE ANCHOR IS BOUND TO THE PANE, NOT TO THE READ ORDER (round-5 P1-B).**
+Round 3's ordering argument ("a live prompt means Claude is BLOCKED on it, so the
+side file must be its") has an unstated premise: that a card the user ALREADY
+ANSWERED stops looking live on the pane. ``PreToolUse`` writes card B's record
+BEFORE B renders, so a pane still showing the answered card A pairs with B's
+anchor — ``(OLD pane, NEW anchor)``, the dangerous direction, which two AUQs with
+identical option labels cannot tell apart. Three folds, none of them a bet on
+ordering: the card must OWN the pane (no input box — a resolved AUQ restores it);
+each capture is SANDWICHED between two equal anchor reads (``_observe``); and the
+anchor RECORD's CONTENT must AGREE with the pane it is paired with
+(``auq_source.anchor_pane_agreement`` — labels always, question text before the
+first keystroke). See :func:`derive_identity`.
+
+**AND RAW CONTROL BYTES ARE REFUSED (round-5 P1-A).** ``tmux send-keys -l`` stops
+tmux interpreting KEY NAMES; it does NOT make ESC/C0 bytes inert to the TUI. An
+embedded ``ESC [ B`` + digit is a cursor-move plus a HOTKEY commit, fired during
+the write itself — before any verification runs. ``delivery.unsafe_control_char``
+refuses those payloads at BOTH gated seams (``\\n`` stays allowed: paste-shaped
+multi-line payloads are this lane's primary flow).
+
 It reuses the shipped dispatch discipline (``_dispatch_pick`` /
 ``_dispatch_decision_pane_locked``) verbatim: per-window send lock, bounded
 cancellation-safe captures, a FRESH in-lock ``pane_command_is_claude`` +
@@ -94,11 +114,15 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from .. import delivery, terminal_parser
 from ..delivery import DeliveryResult, UserTurnStamp
 from ..tmux_manager import pane_command_is_claude, tmux_manager
+
+
+if TYPE_CHECKING:  # annotation-only — ``auq_source`` reaches into ``session``
+    from .auq_source import SurfaceAnchor
 
 
 logger = logging.getLogger(__name__)
@@ -310,13 +334,11 @@ class SurfaceIdentity:
 # cannot name is a card we will not type into.
 
 
-def read_surface_anchor(window_id: str) -> str | None:
+def read_surface_anchor(window_id: str) -> SurfaceAnchor | None:
     """The OCCURRENCE-unique surface anchor (see :class:`SurfaceIdentity`).
 
-    **MUST be called BEFORE the pane capture it will be paired with** — see
-    :func:`derive_identity` for why the order is the load-bearing half of the
-    round-3 P1 fix. It takes no pane text: the anchor is derived out-of-band,
-    which is precisely what makes it an occurrence witness.
+    Returns the side-file record's KEY **and its content**, from one atomic read
+    — the content is what :func:`derive_identity` binds to the captured pane.
 
     Each call re-resolves the window's SESSION from the hook-written map and
     embeds it in the returned key (round-4 P1), so the session generation is
@@ -329,7 +351,7 @@ def read_surface_anchor(window_id: str) -> str | None:
     from . import auq_source
 
     try:
-        return auq_source.peek_surface_identity_for_window(window_id)
+        return auq_source.peek_surface_anchor_for_window(window_id)
     except Exception:  # pragma: no cover — a side-file read must never wedge a send
         logger.exception(
             "free_text: AUQ surface-anchor read failed for window %s", window_id
@@ -338,61 +360,76 @@ def read_surface_anchor(window_id: str) -> str | None:
 
 
 def derive_identity(
-    pane_text: str, *, surface: str, target_row: int, anchor: str | None
+    pane_text: str,
+    *,
+    surface: str,
+    target_row: int,
+    anchor: SurfaceAnchor | None,
+    bind_question_text: bool = False,
 ) -> SurfaceIdentity | None:
-    """One pane observation + a PRE-READ anchor → the card's identity.
+    """One pane observation + an anchor → the card's identity, or ``None``.
 
-    ``None`` ⇔ no occurrence anchor. That is the whole point of returning an
-    Optional: a caller can never accidentally construct an anchor-less identity
+    ``None`` ⇔ no occurrence anchor, or an anchor that PROVABLY does not describe
+    this pane. A caller can never accidentally construct an anchor-less identity
     and have it compare equal to another anchor-less one.
 
-    **THE ANCHOR IS AN ARGUMENT, NOT A READ — and that is the second half of the
-    round-3 P1 fix (the half a mere change of anchor SOURCE would not have
-    closed).** This function used to take a ``window_id`` and read the anchor
-    ITSELF, i.e. AFTER the caller had already captured the pane. That ordering
-    mints a CHIMERA whenever the card turns over inside the gap:
-
-        pane captured at t1 (card A)  →  anchor read at t2 > t1 (card B)
-        ⇒ identity = (A's pane shape, B's anchor)
-
-    and because BOTH surfaces' pane components are degenerate across occurrences
-    — every ExitPlanMode renders the same three real options; two AUQs can carry
-    identical option labels — every LATER observation `(B's pane, B's anchor)`
-    MATCHES that chimera. The transaction then types into B and commits, which on
-    ExitPlanMode means committing onto a prompt whose option 1 is "Yes, and
-    bypass permissions". Swapping WHICH value the anchor holds (a plan-content
-    hash → the hook's ``tool_use_id``) does not touch this: a `tool_use_id` read
-    after the pane is chimeric in exactly the same way.
-
-    Reading the anchor STRICTLY BEFORE the pane makes the dangerous direction
-    unreachable. Suppose the anchor is read at t0 and the pane at t1 > t0, and
-    the pane shows a LIVE prompt P:
+    **THE ANCHOR IS BOUND TO THE PANE (peer-review round-5 P1-B).** The anchor is
+    read out-of-band and the pane is captured separately, so nothing but the READ
+    ORDER tied them together — and that was not enough. Round 3 made the executor
+    read the anchor FIRST and argued the only reachable chimera was ``(NEWER pane,
+    OLDER anchor)``, which fails closed. The argument runs:
 
       * a live, unresolved prompt means Claude is BLOCKED on it, so it cannot be
-        invoking the next ExitPlanMode/AskUserQuestion — and each hook fires
-        BEFORE its prompt renders. Therefore "P is live on the pane at t1" implies
-        "the side file at t1 is P's";
-      * so if the anchor read at t0 is X ≠ P, the side file went X → P during
-        (t0, t1] — a FORWARD move (a new occurrence), never backward.
+        invoking the next AskUserQuestion — and the hook fires BEFORE its prompt
+        renders. Therefore "P is live on the pane at t1" implies "the side file at
+        t1 is P's".
 
-    The only chimera we can build is therefore `(NEWER pane, OLDER anchor)`, and
-    that one FAILS CLOSED: the next observation reads P's anchor, `still_holds`
-    compares X ≠ P, and the transaction refuses. The dangerous
-    `(OLDER pane, NEWER anchor)` requires the side file to move BACKWARDS, which
-    it never does.
+    The step that is NOT justified is "P is live on the pane". ``PreToolUse``
+    writes card B's record BEFORE B renders, so between B's invocation and B's
+    paint the side file already names B — and if the pane is still SHOWING card A
+    (which the user has just answered), the pane parses A while the anchor is B's:
+    ``(OLD pane, NEW anchor)``, the dangerous direction, and because two AUQs can
+    carry identical option labels that chimera MATCHES every later observation and
+    the Enter commits onto B. THE WRONG CARD.
 
-    This is the SAME "probe FIRST, capture LAST" discipline `_reverify_input_box`
-    already applies to its liveness probe (r2 F4) — a stale-frame authorization is
-    the identical bug class.
+    Read order cannot fix that, so the anchor is no longer taken on trust: its
+    RECORD's CONTENT must AGREE with the pane it is paired with
+    (``auq_source.anchor_pane_agreement`` — the real option labels, and at every
+    PRE-KEYSTROKE observation the question text too). A record that does not
+    describe what we are looking at yields ``None``, whatever the read order was.
+
+    The read-first ordering is KEPT (it is free, and it makes the residual
+    direction the harmless one), and the executor additionally SANDWICHES each
+    capture between two anchor reads and requires them EQUAL — so a hook write
+    landing inside an observation is detected rather than reasoned about. See
+    ``_observe``.
+
+    ``bind_question_text`` is passed ONLY before the first keystroke: the question
+    sits ABOVE the option block, and a long answer typed into a bottom-anchored
+    picker can legitimately scroll it off, so requiring it post-write would
+    false-refuse and strand a draft inside a live card.
     """
     if anchor is None:
+        return None
+
+    from . import auq_source
+
+    agreement = auq_source.anchor_pane_agreement(
+        anchor.tool_input,
+        pane_text,
+        target_row=target_row,
+        bind_question_text=bind_question_text,
+    )
+    if agreement == auq_source.ANCHOR_MISMATCH:
+        # The record names a card the pane is not showing. Whatever the read
+        # order was, this pairing is a chimera.
         return None
     return SurfaceIdentity(
         surface=surface,
         pane=terminal_parser.free_text_surface_identity(
             pane_text, target_row=target_row
         ),
-        anchor=anchor,
+        anchor=anchor.key,
     )
 
 
@@ -464,7 +501,7 @@ def _auq_shape(pane_text: str, ansi_pane: str) -> _Shape | None:
 
 
 def plan_from_pane(
-    pane_text: str | None, ansi_pane: str, anchor: str | None
+    pane_text: str | None, ansi_pane: str, anchor: SurfaceAnchor | None
 ) -> FreeTextPlan | None:
     """Resolve the free-text lane for a live pane, or ``None`` to decline.
 
@@ -487,6 +524,17 @@ def plan_from_pane(
     """
     if not pane_text:
         return None
+    # THE CARD MUST *OWN* THE PANE (peer-review round-5 P1-B). A live blocking
+    # prompt REPLACES the input box; a RESOLVED one restores it while leaving its
+    # rendering on screen. Without this leg the lane would happily plan against a
+    # card the user has already answered — and that is the precise state in which
+    # the side file can already name the SUCCESSOR (``PreToolUse`` writes B's
+    # record before B renders), i.e. the ``(OLD pane, NEW anchor)`` chimera. It is
+    # the missing premise of the round-3 argument, and it is cheap to prove
+    # instead of assume. (Rig-pinned: ``auq_after_answer_t{0,1,5,30}`` all carry a
+    # restored input box.) Same predicate the post-write verifier already uses.
+    if terminal_parser.pane_input_box_present(pane_text):
+        return None
     content = terminal_parser.extract_interactive_content(pane_text)
     if content is None or content.name != SURFACE_AUQ:
         return None
@@ -498,11 +546,16 @@ def plan_from_pane(
         surface=SURFACE_AUQ,
         target_row=shape.target_row,
         anchor=anchor,
+        # PRE-KEYSTROKE ⇒ bind the record's QUESTION TEXT to the pane too. This
+        # is the only leg that separates two cards with IDENTICAL option labels,
+        # and identical labels are exactly what makes the chimera commit.
+        bind_question_text=True,
     )
     if identity is None:
-        # No occurrence anchor — no PreToolUse side file for this window's
-        # CURRENT session (the hook is not installed, the record was GC'd, the
-        # card already resolved, or the hook captured no ``tool_use_id``). An
+        # Either NO occurrence anchor (no PreToolUse side file for this window's
+        # CURRENT session — the hook is not installed, the record was GC'd, the
+        # card already resolved, or the hook captured no ``tool_use_id``), or an
+        # anchor that does NOT describe this pane (the round-5 chimera). An
         # unidentifiable card is a card we will not type into.
         return None
     if identity.pane is None:
@@ -602,6 +655,58 @@ def _plain(ansi: str) -> str:
     return terminal_parser.clean_ghost_input_text(ansi)
 
 
+# ── ONE OBSERVATION = anchor · pane · anchor (round-5 P1-B) ──────────────
+
+REASON_ANCHOR_LOST: Final = "surface_anchor_lost"
+REASON_ANCHOR_MOVED: Final = "surface_anchor_moved"
+REASON_CAPTURE_FAILED: Final = "capture_failed"
+
+
+@dataclass(frozen=True)
+class _Observation:
+    """A pane capture SANDWICHED between two equal anchor reads."""
+
+    anchor: SurfaceAnchor
+    ansi: str
+    pane: str
+
+
+async def _observe(window_id: str) -> _Observation | str:
+    """One atomic-enough observation of the card, or a failure reason.
+
+    THE SANDWICH (peer-review round-5 P1-B). Reading the anchor BEFORE the pane
+    (round 3) makes the *residual* direction the harmless one, but it does not
+    make the observation coherent: the side file can move inside the gap, and
+    then the anchor names one card while the pane shows another. So the anchor is
+    read again AFTER the capture and the two must be EQUAL. Because the side file
+    only ever moves FORWARD (a new AUQ's hook rewrites it; a resolved one is
+    unlinked), ``anchor(t0) == anchor(t2)`` proves the file did not move anywhere
+    in ``[t0, t2]`` — and therefore not at ``t1`` either, when the pane was
+    captured. The pane and the anchor are then observations of the SAME instant's
+    state, and a hook write landing mid-observation is DETECTED instead of
+    reasoned about.
+
+    Cheap: the anchor read is a small local file read, not a subprocess.
+    """
+    before = read_surface_anchor(window_id)
+    if before is None:
+        return REASON_ANCHOR_LOST
+    ansi = await _capture(window_id)
+    if not isinstance(ansi, str) or not ansi:
+        return REASON_CAPTURE_FAILED
+    after = read_surface_anchor(window_id)
+    if after is None or after.key != before.key:
+        # A hook write (or a resolution) landed INSIDE this observation. The pane
+        # we just captured cannot be attributed to either record. Refuse.
+        logger.info(
+            "FREE_TEXT anchor MOVED across an observation on window %s — "
+            "the card turned over while we were looking at it",
+            window_id,
+        )
+        return REASON_ANCHOR_MOVED
+    return _Observation(anchor=before, ansi=ansi, pane=_plain(ansi))
+
+
 # ── The executor ─────────────────────────────────────────────────────────
 
 
@@ -661,6 +766,17 @@ async def try_answer(
     # the SAME ``delivery.lone_hotkey_line`` rule and refuses it with the
     # lone-hotkey copy — one rule, one owner, no duplicate message.
     if delivery.lone_hotkey_line(payload) is not None:
+        return None
+
+    # The RAW-CONTROL-BYTE rule (round-5 P1-A), BEFORE any capture. ``send-keys
+    # -l`` passes C0/ESC bytes to the pty VERBATIM (rig-confirmed), so an embedded
+    # ``ESC [ B`` + digit would move the cursor OFF the affordance row we proved
+    # and fire a digit HOTKEY — committing an option with no Enter, during the
+    # very write whose result we only verify afterwards. Falling through is
+    # correct AND sufficient: ``deliver_to_window``'s step 0b applies the SAME
+    # ``delivery.unsafe_control_char`` rule and owns the refusal — one rule, one
+    # owner, no duplicate message.
+    if delivery.unsafe_control_char(payload) is not None:
         return None
 
     async with tmux_manager.window_send_lock(window_id):
@@ -781,20 +897,15 @@ async def _answer_locked(
         # correct ``not_claude`` refusal + copy — one owner per refusal reason.
         return _decline("not_claude")
 
-    # THE ANCHOR IS READ BEFORE THE PANE (derive_identity's ordering rule): an
-    # anchor read AFTER the capture can name a SUCCESSOR card while we still hold
-    # the predecessor's pane, and the pane component is degenerate across
-    # same-shaped occurrences, so that chimera matches every later observation and
-    # commits onto the wrong card. Reading first makes the only reachable chimera
-    # `(newer pane, older anchor)`, which fails closed.
-    anchor1 = read_surface_anchor(window_id)
+    # ONE OBSERVATION: anchor · pane · anchor (see ``_observe``). The anchor is
+    # read BEFORE the capture (round 3) AND re-read after it (round 5), so the
+    # pane and the record are attributable to the same instant — and the record's
+    # CONTENT is then bound to that pane inside ``derive_identity``.
+    obs = await _observe(window_id)
+    if isinstance(obs, str):
+        return _decline(obs)
 
-    ansi = await _capture(window_id)
-    if not isinstance(ansi, str) or not ansi:
-        return _decline("capture_failed")
-    pane = _plain(ansi)
-
-    plan = plan_from_pane(pane, ansi, anchor1)
+    plan = plan_from_pane(obs.pane, obs.ansi, obs.anchor)
     if plan is None:
         return _decline("no_free_text_surface")
     if not licensed(plan.surface, cmd):
@@ -834,20 +945,21 @@ async def _answer_locked(
     # refuses with the accurate reason).
     if time.monotonic() > deadline:
         return _decline("deadline")
-    # ANCHOR BEFORE PANE, again (derive_identity's ordering rule).
-    anchor2 = read_surface_anchor(window_id)
-    ansi2 = await _capture(window_id)
-    if not isinstance(ansi2, str):
-        return _decline("capture_failed")
-    pane2 = _plain(ansi2)
+    obs2 = await _observe(window_id)
+    if isinstance(obs2, str):
+        return _decline(obs2)
     # IDENTITY FIRST (peer-review P1): a card that resolved during the nav and was
     # replaced by a same-geometry successor would satisfy every other leg below —
     # the successor's row N+1 is a dim placeholder under our freshly-moved cursor.
-    # Checking WHICH CARD before we type is what stops that.
-    ident_reason = _identity_reason(pane2, plan, window_id, anchor2)
+    # Checking WHICH CARD before we type is what stops that. Still PRE-KEYSTROKE,
+    # so the question-text binding applies here too (a false refusal costs only a
+    # fall-through, and nothing has been typed to scroll the question away).
+    ident_reason = _identity_reason(
+        obs2.pane, plan, window_id, obs2.anchor, bind_question_text=True
+    )
     if ident_reason is not None:
         return _decline(ident_reason)
-    landed = terminal_parser.parse_free_text_row(ansi2, number=plan.target_row)
+    landed = terminal_parser.parse_free_text_row(obs2.ansi, number=plan.target_row)
     if landed is None or not landed.cursor or not landed.dim:
         return _decline(REASON_LANDING_FAILED)
     if landed.label.strip() != plan.placeholder:
@@ -978,19 +1090,20 @@ async def _verify_typed(
         if not pane_command_is_claude(cmd):
             return delivery.refuse(delivery.REASON_NOT_CLAUDE, written=True)
 
-        # ANCHOR BEFORE PANE (derive_identity's ordering rule) — and, like the
-        # command probe above it, BEFORE the capture that is the LAST observation
+        # The anchor·pane·anchor sandwich (``_observe``) — and, like the command
+        # probe above it, the capture inside it is the LAST pane observation
         # preceding the Enter (the r2-F4 discipline).
-        anchor = read_surface_anchor(window_id)
-
-        ansi = await _capture(window_id)
-        if not isinstance(ansi, str):
+        obs = await _observe(window_id)
+        if obs == REASON_CAPTURE_FAILED:
             return delivery.refuse(delivery.REASON_CAPTURE_TIMEOUT, written=True)
-        pane = _plain(ansi)
-
-        reason = _typed_state_reason(ansi, pane, plan, payload, window_id, anchor)
-        if reason is None:
-            return None
+        if isinstance(obs, str):
+            reason = obs  # anchor lost / moved — retried once, then verify_failed
+        else:
+            reason = _typed_state_reason(
+                obs.ansi, obs.pane, plan, payload, window_id, obs.anchor
+            )
+            if reason is None:
+                return None
         if attempt + 1 < attempts:
             # ONE bounded retry for a mid-redraw frame. A false refusal here is
             # the most expensive failure in the transaction: it strands the draft
@@ -1013,13 +1126,21 @@ async def _verify_typed(
 
 
 def _identity_reason(
-    pane: str, plan: FreeTextPlan, window_id: str, anchor: str | None
+    pane: str,
+    plan: FreeTextPlan,
+    window_id: str,
+    anchor: SurfaceAnchor | None,
+    *,
+    bind_question_text: bool = False,
 ) -> str | None:
     """``None`` iff the pane is PROVABLY still ``plan``'s card. Fail-closed.
 
-    ``anchor`` was read BEFORE ``pane`` was captured (:func:`derive_identity`) —
-    so the only chimera reachable here is `(newer pane, older anchor)`, which
-    fails closed on the anchor comparison.
+    ``anchor`` came from an ``_observe`` sandwich — read before AND after this
+    pane's capture, with the two reads equal — so it is attributable to the pane,
+    and ``derive_identity`` then binds the record's CONTENT to it (round-5 P1-B).
+
+    ``bind_question_text`` is True only at the PRE-KEYSTROKE observations (see
+    :func:`derive_identity`).
 
     Two independent gates, and the ORDER matters only for the log reason:
 
@@ -1042,12 +1163,14 @@ def _identity_reason(
         surface=plan.surface,
         target_row=plan.target_row,
         anchor=anchor,
+        bind_question_text=bind_question_text,
     )
     if live is None:
-        # The OCCURRENCE anchor is gone: the PreToolUse side file was unlinked
-        # (the tool_result fired ⇒ the card RESOLVED). Absence is never a licence
-        # to proceed — it is positive evidence the card we planned against is no
-        # longer the one on the pane.
+        # Either the OCCURRENCE anchor is gone (the PreToolUse side file was
+        # unlinked — the tool_result fired ⇒ the card RESOLVED), or the record
+        # PROVABLY does not describe this pane (the round-5 chimera). Absence and
+        # disagreement are both positive evidence that the card we planned against
+        # is no longer the one in front of us.
         logger.warning(
             "FREE_TEXT surface anchor UNRECOVERABLE on window %s (surface=%s) — "
             "the card this message was answering can no longer be identified; "
@@ -1055,7 +1178,7 @@ def _identity_reason(
             window_id,
             plan.surface,
         )
-        return "surface_anchor_lost"
+        return REASON_ANCHOR_LOST
     if not plan.identity.still_holds(live):
         logger.warning(
             "FREE_TEXT surface identity CHANGED on window %s (surface=%s) — "
@@ -1074,12 +1197,16 @@ def _typed_state_reason(
     plan: FreeTextPlan,
     payload: str,
     window_id: str,
-    anchor: str | None,
+    anchor: SurfaceAnchor | None,
 ) -> str | None:
     """``None`` iff the typed state is PROVEN (see ``_verify_typed``'s legs).
 
-    ``anchor`` was read by the caller BEFORE ``pane`` was captured — the
-    :func:`derive_identity` ordering rule.
+    ``anchor`` came from the ``_observe`` sandwich around ``pane``'s capture.
+    The question-text binding is deliberately NOT applied here: the payload is
+    already typed, and on a bottom-anchored picker a long answer can scroll the
+    question off the top — a false refusal at this point strands the draft inside
+    a live card and brakes the topic. The anchor KEY (unchanged across the
+    sandwich, and equal to the planned one) carries the occurrence proof.
     """
     # (B) the blocking surface still owns the pane
     if terminal_parser.pane_input_box_present(pane):

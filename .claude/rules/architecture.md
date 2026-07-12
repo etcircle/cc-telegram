@@ -347,8 +347,18 @@ Additional modules:
                                 shaping: literal_segments (the writes the mode-aware
                                 `!` two-step writer will ACTUALLY emit) +
                                 lone_hotkey_line (the SEGMENT-aware, PER-LINE
-                                bare-digit refusal) + is_bare_slash_payload (the
-                                post-write `/`-completion exemption).
+                                bare-digit refusal) + unsafe_control_char (the
+                                round-5 P1-A RAW-CONTROL-BYTE refusal — `-l` stops
+                                TMUX interpreting key NAMES but passes C0/ESC to
+                                the pty VERBATIM, rig-confirmed, so an embedded
+                                ESC[B + digit is a cursor-move + HOTKEY commit
+                                fired DURING the write; everything in C0 except LF,
+                                plus DEL + C1, is refused at BOTH gated seams. LF
+                                stays ALLOWED — paste-shaped multi-line payloads are
+                                a first-class flow; \t and \r are refused, a pasted
+                                tab-indented snippet being the disclosed cost) +
+                                is_bare_slash_payload (the post-write
+                                `/`-completion exemption).
   handlers/free_text.py       ─ GH #50 PR-2: free-text answers on a LIVE
                                 AskUserQuestion card. The executor that makes a
                                 Telegram message ANSWER an AUQ single-select
@@ -450,6 +460,47 @@ Additional modules:
                                     composite is a guessable stand-in for an
                                     occurrence witness, not one; scoped to the ANCHOR
                                     path, the GH #48 recap lane keeps its composite).
+                                    **AND THE ANCHOR IS BOUND TO THE PANE, NOT TO
+                                    THE READ ORDER** (round-5 P1-B — "anchor before
+                                    pane" was BACKWARDS). Round 3's ordering
+                                    argument silently assumes that a card the user
+                                    ALREADY ANSWERED stops looking LIVE on the pane.
+                                    PreToolUse writes card B's record BEFORE B
+                                    renders, so a pane still holding the answered
+                                    card A pairs with B's anchor — (OLD pane, NEW
+                                    anchor) — and two AUQs with identical option
+                                    labels cannot tell that chimera apart, so the
+                                    Enter commits onto B (REPRO-CONFIRMED: with the
+                                    guards reverted the executor sends it). THREE
+                                    folds, none a bet on ordering: (a) the card must
+                                    OWN the pane (plan_from_pane requires
+                                    pane_input_box_present is False — a live prompt
+                                    REPLACES the input box, a resolved one RESTORES
+                                    it; defence in depth, since today's parser
+                                    declines that shape independently); (b) each
+                                    capture is SANDWICHED between two EQUAL anchor
+                                    reads (_observe — the side file only moves
+                                    FORWARD, so equality at t0/t2 proves it did not
+                                    move at t1, when the pane was captured); (c) the
+                                    anchor RECORD's CONTENT must AGREE with the pane
+                                    (auq_source.anchor_pane_agreement,
+                                    TARGET-ROW-BLIND; match / mismatch /
+                                    indeterminate — the last being the overflow
+                                    shape, where the anchor stands alone). The
+                                    reused _record_consistent_with_pane was VERIFIED
+                                    on the live call path (the recorded reuse-claim
+                                    rule): it DOES reject differing labels and does
+                                    NOT reject a same-labels different-QUESTION
+                                    record (a pure-pane parse carries no title and
+                                    no option descriptions), so agreement also binds
+                                    the record's QUESTION TEXT to the pane — at
+                                    PRE-KEYSTROKE observations ONLY (post-write a
+                                    long answer can legitimately scroll the question
+                                    off a bottom-anchored picker, and a false refusal
+                                    there strands a draft inside a LIVE CARD).
+                                    Disclosed residual, WIDER than the reviewer
+                                    assumed: two AUQs with the same labels AND the
+                                    same question text are pane-indistinguishable.
                                 A braked window (PR-1's stranded-draft registry) is
                                 checked FIRST and DECLINES — the lane is never a way
                                 around the brake, and never clears it. VERSION-LICENSED

@@ -142,7 +142,28 @@ def stamped(monkeypatch):
 # The REAL anchor reader, captured at import — BEFORE the autouse stub below
 # replaces it. The round-4 P1 test drives the genuine ``auq_source`` reader
 # against a real session_map + side files, so it must be able to restore this.
-_REAL_AUQ_ANCHOR = auq_source.peek_surface_identity_for_window
+_REAL_AUQ_ANCHOR = auq_source.peek_surface_anchor_for_window
+
+# The PreToolUse record card X's picker was rendered FROM — the same content the
+# real hook would have written. The anchor carries it (round-5 P1-B) so the
+# executor can BIND the record to the pane it captured instead of trusting read
+# order; every default-anchor test therefore agrees with the card-X frames.
+CARD_X_TOOL_INPUT = {
+    "questions": [
+        {
+            "question": "What's your favorite color?",
+            "header": "Color",
+            "options": [{"label": "Blue"}, {"label": "Green"}, {"label": "Red"}],
+            "multiSelect": False,
+        }
+    ]
+}
+
+
+def _anchor(key: str, tool_input: dict | None = None) -> auq_source.SurfaceAnchor:
+    return auq_source.SurfaceAnchor(
+        key=key, tool_input=tool_input if tool_input is not None else CARD_X_TOOL_INPUT
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -157,15 +178,16 @@ def auq_anchor(monkeypatch):
     which is what a genuinely new AUQ does (its hook rewrites the side file) — or
     drop it to ``None`` (the card resolved and its file was unlinked).
 
-    The value's SHAPE mirrors production (round-4 P1): the anchor embeds the
-    window's FRESHLY-resolved session id, so a session rotation is itself an
-    anchor change. ``TestTheSessionGenerationIsPartOfTheAnchor`` exercises the
-    real reader end-to-end rather than this stub.
+    The value's SHAPE mirrors production: the KEY embeds the window's
+    FRESHLY-resolved session id (round-4 P1), so a session rotation is itself an
+    anchor change, and the record's CONTENT rides along (round-5 P1-B) so the
+    executor can bind it to the pane. ``TestTheSessionGenerationIsPartOfTheAnchor``
+    exercises the real reader end-to-end rather than this stub.
     """
-    box: list[str | None] = ["auq:sid:SESSION_A:tu:toolu_CARD_X"]
-    monkeypatch.setattr(
-        auq_source, "peek_surface_identity_for_window", lambda _w: box[0]
-    )
+    box: list[auq_source.SurfaceAnchor | None] = [
+        _anchor("auq:sid:SESSION_A:tu:toolu_CARD_X")
+    ]
+    monkeypatch.setattr(auq_source, "peek_surface_anchor_for_window", lambda _w: box[0])
     return box
 
 
@@ -359,12 +381,15 @@ class TestTheWrongCard:
         async def capture_and_rotate(window_id, *, with_ansi=False):
             out = await real_capture(window_id, with_ansi=with_ansi)
             calls["n"] += 1
-            # Rotate after capture 2 (the landing), so the PRE-ENTER observation
-            # reads the successor's id — the anchor is read BEFORE its own pane
-            # capture, and in reality the successor's PreToolUse hook fires before
-            # its prompt renders, so that is the true ordering.
-            if calls["n"] >= 2:
-                auq_anchor[0] = "auq:sid:SESSION_A:tu:toolu_CARD_X_REASKED"  # a NEW AUQ
+            # Rotate at the PRE-ENTER observation (capture 3), i.e. AFTER the
+            # payload is already in the row — so this pins the POST-write refusal
+            # specifically: the Enter is withheld and the brake goes up. (A
+            # rotation landing EARLIER is caught pre-write by the round-5 anchor
+            # sandwich — ``test_an_anchor_that_MOVES_across_one_observation``.)
+            if calls["n"] >= 3:
+                auq_anchor[0] = _anchor(
+                    "auq:sid:SESSION_A:tu:toolu_CARD_X_REASKED"
+                )  # a NEW AUQ
             return out
 
         monkeypatch.setattr(
@@ -535,11 +560,11 @@ class TestTheAuqAnchorIsMANDATORY:
         async def capture_and_reask(window_id, *, with_ansi=False):
             out = await real_capture(window_id, with_ansi=with_ansi)
             calls["n"] += 1
-            # After capture 2 (the landing): the pre-Enter observation reads its
-            # anchor BEFORE its own capture, and the successor's hook fires before
-            # the successor's prompt renders.
-            if calls["n"] >= 2:
-                auq_anchor[0] = "tu:toolu_CARD_X_REASKED"
+            # At the PRE-ENTER observation (capture 3) — the payload is already in
+            # the row, so this pins the post-write refusal: the re-asked question
+            # must NOT be answered, and the draft is disclosed + braked.
+            if calls["n"] >= 3:
+                auq_anchor[0] = _anchor("tu:toolu_CARD_X_REASKED")
             return out
 
         monkeypatch.setattr(
@@ -573,7 +598,7 @@ class TestTheAuqAnchorIsMANDATORY:
             out = await real_capture(window_id, with_ansi=with_ansi)
             calls["n"] += 1
             if calls["n"] >= 2:
-                auq_anchor[0] = "tu:toolu_A_DIFFERENT_CARD"
+                auq_anchor[0] = _anchor("tu:toolu_A_DIFFERENT_CARD")
             return out
 
         monkeypatch.setattr(
@@ -632,7 +657,7 @@ class TestTheAnchorIsReadBeforeThePane:
             plain(AUQ_X_LIVE),
             surface=free_text.SURFACE_AUQ,
             target_row=4,
-            anchor="auq:sid:SESSION_A:tu:toolu_CARD_X",
+            anchor=_anchor("auq:sid:SESSION_A:tu:toolu_CARD_X"),
         )
         assert ident is not None
         assert ident.anchor == "auq:sid:SESSION_A:tu:toolu_CARD_X"
@@ -686,7 +711,7 @@ class TestTheAnchorIsReadBeforeThePane:
                 # The successor's PreToolUse hook fires while our capture is in
                 # flight: the bytes we just took are X's, the side file is now
                 # the successor's.
-                auq_anchor[0] = "auq:sid:SESSION_A:tu:toolu_CARD_X2"
+                auq_anchor[0] = _anchor("auq:sid:SESSION_A:tu:toolu_CARD_X2")
             return out
 
         monkeypatch.setattr(
@@ -728,7 +753,7 @@ class TestTheAnchorIsReadBeforeThePane:
         )
         monkeypatch.setattr(
             auq_source,
-            "peek_surface_identity_for_window",
+            "peek_surface_anchor_for_window",
             lambda _w: (events.append("anchor"), auq_anchor[0])[1],
         )
 
@@ -1030,7 +1055,7 @@ class TestTheSessionGenerationIsPartOfTheAnchor:
         real config dir to read."""
         monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
         monkeypatch.setattr(
-            auq_source, "peek_surface_identity_for_window", _REAL_AUQ_ANCHOR
+            auq_source, "peek_surface_anchor_for_window", _REAL_AUQ_ANCHOR
         )
         auq_source.reset_for_tests()
         yield tmp_path
@@ -1178,7 +1203,7 @@ class TestAnEmptyToolUseIdDeclines:
     ):
         monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
         monkeypatch.setattr(
-            auq_source, "peek_surface_identity_for_window", _REAL_AUQ_ANCHOR
+            auq_source, "peek_surface_anchor_for_window", _REAL_AUQ_ANCHOR
         )
         auq_source.reset_for_tests()
         session_id = "550e8400-e29b-41d4-a716-4466554400cc"
@@ -1237,3 +1262,311 @@ class TestAnEmptyToolUseIdDeclines:
         assert await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP) is None
         assert pane.keys == []
         assert stamped == []
+
+
+# ── peer-review round 5 ───────────────────────────────────────────────────
+
+# Card B: a DIFFERENT question with BYTE-IDENTICAL option rows. This is the card
+# the reviewer's interleaving would have us answer, and it is the hardest shape
+# there is — the pane component cannot see the difference (a pure-pane parse
+# carries no title and no option descriptions), so the ONLY pane-observable thing
+# that separates B from card X is the question text itself.
+CARD_B_TOOL_INPUT = {
+    "questions": [
+        {
+            "question": "Which color do you HATE?",
+            "header": "Color",
+            "options": [{"label": "Blue"}, {"label": "Green"}, {"label": "Red"}],
+            "multiSelect": False,
+        }
+    ]
+}
+
+
+class TestTheAnchorIsBoundToThePane:
+    """peer-review round-5 P1-B — "anchor BEFORE pane" is not enough.
+
+    Round 3 argued the dangerous chimera ``(OLD pane, NEW anchor)`` was
+    unreachable, because "a live prompt means Claude is BLOCKED on it, so the side
+    file must be its own". The unstated premise is that a card the user ALREADY
+    ANSWERED stops looking live on the pane — and ``PreToolUse`` writes card B's
+    record BEFORE B renders, so there is a window in which the side file names B
+    while the pane still renders A. Two AUQs can carry identical option labels, so
+    that chimera then matches every later observation and the Enter commits onto
+    B: THE WRONG CARD.
+
+    Three folds, none of them a bet on read order:
+
+      * the card must OWN the pane (no input box — a resolved AUQ restores it);
+      * each capture is SANDWICHED between two equal anchor reads (``_observe``);
+      * the anchor RECORD's CONTENT must AGREE with the pane it is paired with.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_reviewers_interleaving_never_answers_the_SUCCESSOR_card(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """THE ROUND-5 P1-B, reduced to its mechanism — RED before the fix.
+
+        The reviewer's exact interleaving: card A is on the pane; another
+        controller resolves it; B's ``PreToolUse`` hook writes B's record; B has
+        not drawn yet, so the pane still holds A's complete picker; the initial
+        observation therefore mints ``(pane A, anchor B)``; and B then renders with
+        IDENTICAL option geometry, so every later observation agrees with the
+        chimera and the Enter lands on B.
+
+        Card B differs from card X ONLY in its question text — which is precisely
+        why the pane-identity component (option rows) cannot refuse it, and why
+        binding the record's QUESTION to the pane is the leg that must.
+
+        RED before the fix (verified by removing the question binding from
+        ``plan_from_pane``): the transaction runs to completion and returns
+        DELIVERED — the user's answer to "What's your favorite color?" is committed
+        as the answer to "Which color do you HATE?".
+        """
+        auq_anchor[0] = _anchor("auq:sid:SESSION_A:tu:toolu_CARD_B", CARD_B_TOOL_INPUT)
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        # The premise the pane component CANNOT see: B's rows are card X's rows.
+        assert terminal_parser.free_text_surface_identity(
+            plain(AUQ_X_LIVE), target_row=4
+        ) == terminal_parser.free_text_surface_identity(
+            plain(AUQ_X_TYPED), target_row=4
+        )
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert pane.enter_sent is False, (
+            "the answer was committed onto the SUCCESSOR card — the chimera is back"
+        )
+        assert result is None, "declines BEFORE a keystroke; PR-1 owns the refusal"
+        assert pane.keys == []
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
+
+    def test_the_LABEL_comparison_alone_cannot_tell_those_two_cards_apart(self):
+        """The measured limit of the reused helper — NOT assumed (this repo's
+        "verify the reuse claim on the live call path" rule).
+
+        ``_record_consistent_with_pane`` DOES reject a record whose option labels
+        differ from the pane, and DOES NOT reject one whose labels are identical
+        but whose QUESTION differs: a pure-pane parse yields
+        ``current_question_title is None`` (so the title check is skipped) and
+        empty option descriptions. Hence the question-text leg above — and hence
+        the honest residual: two AUQs with the same labels AND the same question
+        are the same card in every pane-observable respect.
+        """
+        pane = plain(AUQ_X_LIVE)
+        assert (
+            auq_source.anchor_pane_agreement(
+                CARD_B_TOOL_INPUT, pane, target_row=4, bind_question_text=False
+            )
+            == auq_source.ANCHOR_MATCH
+        ), "labels alone ACCEPT the successor — this is the hole"
+        assert (
+            auq_source.anchor_pane_agreement(
+                CARD_B_TOOL_INPUT, pane, target_row=4, bind_question_text=True
+            )
+            == auq_source.ANCHOR_MISMATCH
+        ), "the question text is what separates them"
+
+    @pytest.mark.asyncio
+    async def test_an_anchor_whose_LABELS_disagree_with_the_pane_declines(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """The easier half of the same hole: a record for a different question with
+        different options. Caught at plan time, before a keystroke."""
+        auq_anchor[0] = _anchor(
+            "auq:sid:SESSION_A:tu:toolu_PETS",
+            {
+                "questions": [
+                    {
+                        "question": "Pick a pet",
+                        "options": [
+                            {"label": "Cat"},
+                            {"label": "Dog"},
+                            {"label": "Bird"},
+                        ],
+                    }
+                ]
+            },
+        )
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        assert await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP) is None
+        assert pane.keys == []
+        assert stamped == []
+
+    @pytest.mark.asyncio
+    async def test_an_anchor_that_MOVES_across_one_observation_declines(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """THE SANDWICH. The side file is re-read AFTER the capture and must be
+        UNCHANGED. A hook write landing inside an observation means the pane cannot
+        be attributed to either record — so it is DETECTED, not reasoned about."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        real_capture = pane.capture
+
+        async def rotate_inside_the_first_capture(window_id, *, with_ansi=False):
+            out = await real_capture(window_id, with_ansi=with_ansi)
+            # The successor's hook fires while our capture is in flight.
+            auq_anchor[0] = _anchor("auq:sid:SESSION_A:tu:toolu_CARD_X2")
+            return out
+
+        monkeypatch.setattr(
+            tmux_mod.tmux_manager,
+            "capture_pane_cancellation_safe",
+            rotate_inside_the_first_capture,
+        )
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is None
+        assert pane.keys == [], "the observation was torn — not one keystroke"
+        assert stamped == []
+
+    @pytest.mark.asyncio
+    async def test_a_RESOLVED_card_still_rendered_is_never_planned_against(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """THE MISSING PREMISE, made an explicit REQUIREMENT — and honest about
+        being defence in depth.
+
+        The reviewer's step 3 — "the pane still holds A's complete picker" — is
+        only reachable for a card that has ALREADY been answered, and a live
+        blocking prompt REPLACES the input box while a resolved one RESTORES it.
+        The lane therefore now demands that the card OWN the pane.
+
+        WHAT THIS LEG ACTUALLY BUYS. It is NOT the only thing standing here:
+        MEASURED, this same pane already declines without it, because appending a
+        restored input box makes ``parse_ask_user_question`` report
+        ``is_free_text=False`` (the affordance row stops being detected) and
+        ``_auq_shape`` bails. And on the REAL 2.1.207 captures a resolved AUQ
+        collapses entirely — the four ``auq_after_answer_t*`` frames do not even
+        extract as AskUserQuestion. Both of those are properties of TODAY's TUI
+        and TODAY's parser, i.e. accidents. This leg turns the premise the round-3
+        argument silently relied on into a cheap, STATED requirement, so a TUI
+        drift that leaves a resolved picker looking free-text-capable cannot
+        quietly re-open the chimera.
+        """
+        resolved_but_rendered = AUQ_X_LIVE + "\n" + _fx(f"inputbox_idle_{V}.txt")
+
+        # The reviewer's step-3 shape: the picker is still RENDERED (it extracts
+        # as AskUserQuestion) but the card no longer OWNS the pane.
+        content = terminal_parser.extract_interactive_content(
+            plain(resolved_but_rendered)
+        )
+        assert content is not None and content.name == "AskUserQuestion"
+        assert terminal_parser.pane_input_box_present(plain(resolved_but_rendered))
+
+        pane = FakePane(
+            [resolved_but_rendered, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED]
+        )
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is None
+        assert pane.keys == [], "the card does not own the pane — nothing is typed"
+        assert stamped == []
+
+    @pytest.mark.asyncio
+    async def test_the_happy_path_is_unaffected_by_the_binding(
+        self, monkeypatch, stamped
+    ):
+        """The non-regression that matters: a GENUINE record for the card on the
+        pane still commits — including the 947-char multi-line answer, whose typed
+        row parses as a FOURTH option (hence the target-row-blind truncation)."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED_BIG, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, BIG_ANSWER, user_turn=STAMP)
+
+        assert result is not None and result.ok, result
+        assert pane.enter_sent is True
+        assert stamped == [(1, 42, WINDOW)]
+
+
+class TestRawControlBytesAreNeverTyped:
+    """peer-review round-5 P1-A — ``send-keys -l`` is not a sanitizer.
+
+    ``-l`` stops tmux interpreting KEY NAMES. It does NOT make C0/ESC bytes inert
+    to the TUI: RIG-CONFIRMED (``tmux -L ccrig``, ``cat -v`` in the pane) that a
+    payload built with ``printf 'A\\033[B2B'`` lands as the literal bytes
+    ``A^[[B2B`` — Claude's TUI sees ``A``, a CURSOR-DOWN escape sequence, then
+    ``2``. On a single-select-shaped surface that digit is a HOTKEY that COMMITS
+    with no Enter — fired DURING the write, before anything re-observes the pane.
+    """
+
+    def test_the_byte_set(self):
+        assert delivery.unsafe_control_char("\x1b[B2") == "\x1b"  # ESC
+        assert delivery.unsafe_control_char("a\tb") == "\t"  # TAB — a live TUI key
+        assert delivery.unsafe_control_char("a\rb") == "\r"  # CR — Enter at the pty
+        assert delivery.unsafe_control_char("a\x00b") == "\x00"
+        assert delivery.unsafe_control_char("a\x7fb") == "\x7f"  # DEL
+        assert delivery.unsafe_control_char("a\x9bb") == "\x9b"  # C1 CSI
+        # LF is ALLOWED and load-bearing: a paste-shaped multi-line payload is the
+        # lane's primary flow (a voice note with a reply-context quote).
+        assert delivery.unsafe_control_char("line one\nline two\n") is None
+        assert delivery.unsafe_control_char(BIG_ANSWER) is None
+
+    @pytest.mark.asyncio
+    async def test_the_lane_declines_an_escape_sequence_with_zero_keystrokes(
+        self, monkeypatch, stamped
+    ):
+        """The free-text lane DECLINES (PR-1's step 0b owns the single refusal —
+        one rule, one owner, never two ❌)."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(
+            WINDOW, "my answer is\x1b[B2 teal", user_turn=STAMP
+        )
+
+        assert result is None
+        assert pane.keys == [], "an escape sequence must never reach a live card"
+        assert stamped == []
+
+    def test_the_refusal_copy_is_actionable(self):
+        assert delivery.REASON_CONTROL_CHARS in delivery.REFUSAL_COPY
+        assert delivery.REASON_CONTROL_CHARS in delivery.DELIVERY_REFUSAL_REASONS
+
+
+class TestArrowKeysAreNotADraft:
+    """peer-review round-5 P2 — the brake is about a stranded DRAFT, not any key.
+
+    A post-nav bail has moved the cursor and typed NOTHING. Arming the
+    stranded-draft brake there would be actively harmful: while a card owns the
+    pane there is no input row, so ``pane_input_row_empty`` is INDETERMINATE and
+    the brake's only release proof can never fire — the topic would be WEDGED
+    (every later message refused with "an earlier message is still sitting UNSENT
+    in this window's input box", which would be a lie) until the window is killed.
+
+    The real protection is PR-1: the card is still live, so the fall-through
+    ``deliver_to_window`` REFUSES the next payload at its input-box gate. There is
+    no append-and-commit chain to break, because there is nothing to append TO.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_post_nav_bail_leaves_no_draft_no_brake_and_PR1_still_refuses(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LIVE, AUQ_X_LIVE])  # the nav never lands
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is None
+        assert pane.arrows == ["Down", "Down", "Down"], "arrows WERE sent"
+        assert pane.literal_writes == [], "…but nothing was typed — no draft exists"
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
+
+        # …and the fall-through is PR-1, which refuses on the still-live card. This
+        # is the AUTHORITY ``deliver_to_window`` consults, so the next message
+        # cannot be typed onto the pane the arrows touched.
+        assert terminal_parser.classify_input_box_failure(plain(AUQ_X_LIVE)) is not None

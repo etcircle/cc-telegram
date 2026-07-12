@@ -1703,6 +1703,30 @@ quarantine re-check — every step fail-closed):
    (`a y n q z Y N space - ? . ,` …) fire nothing and move nothing; out-of-range
    digits are inert; digit `4` (the `Type something.` row) selects the free-text row
    ⇒ it stays in the refusal set.
+0b. **The RAW-CONTROL-BYTE refusal** (`delivery.unsafe_control_char`, round-5 P1-A) —
+   also before any capture. **`send-keys -l` is not a sanitizer.** `-l` stops *tmux*
+   interpreting KEY NAMES; it does NOT make C0/ESC bytes inert to the program on the
+   other side of the pty. **RIG-CONFIRMED** (`tmux -L ccrig`, `cat -v` in the pane): a
+   payload built with `printf 'A\033[B2B'` lands as the literal bytes `A^[[B2B` — so
+   Claude's TUI reads `A`, a **CURSOR-DOWN escape sequence**, then `2`. That is a
+   complete commit primitive: `lone_hotkey_line` cannot see it (the line is not a lone
+   digit), the pane gate has already passed, and every verification the executors do
+   runs *after* the write — so an embedded `ESC [ B` + digit moves the cursor off the
+   row that was proved and fires a digit HOTKEY (which on a single-select-shaped
+   surface COMMITS with **no Enter**) before anything re-observes the pane. It is
+   refused outright, at BOTH gated seams (`deliver_to_window` step 0b owns the single
+   refusal; `free_text.try_answer` declines and falls through to it — one rule, one
+   owner). The byte set is **everything in C0 except LF**, plus DEL and C1
+   (`U+0080–U+009F`, which a UTF-8 terminal decodes back into the C1 control range).
+   **`\n` is ALLOWED and load-bearing** — a payload written in ONE `send-keys -l` is
+   consumed PASTE-SHAPED and commits whole (rig: 947-char/9-line and 5 274-char/30-line
+   payloads both landed intact), and every voice note and reply-context quote is
+   multi-line; newline handling is **untouched** by this rule. `\t` and `\r` are
+   REFUSED deliberately: Tab is a live TUI *key* (it advances a picker; it drives
+   completion in the input box) and CR **is Enter at the pty** — an embedded one would
+   commit mid-payload. **Disclosed cost:** a pasted tab-indented code snippet is
+   refused, with actionable copy. Stripping or converting the bytes would silently
+   change what Claude receives, which is worse than an honest refusal.
 1. **A bounded, cancellation-safe capture** (`capture_pane_cancellation_safe` under
    `asyncio.wait_for`; ONLY `asyncio.TimeoutError` classifies — a genuine
    caller/shutdown cancellation PROPAGATES, never swallowed into a refusal), plus an
@@ -1788,6 +1812,26 @@ live input box holding a pre-existing draft is legitimately DELIVERABLE (rig D10
 hard non-regression) — so the NEXT message passed the gate, was APPENDED to the
 stranded text, and its Enter committed BOTH: silently submitting a message the bot
 had already disclaimed, concatenated with the new one. Two coupled fixes:
+
+**THE BRAKE IS ABOUT A STRANDED *DRAFT*, NOT ABOUT "ANY KEYSTROKE" (round-5 P2, the
+finding we DECLINED).** The reviewer asked for the brake to be armed at the free-text
+lane's ARROW keys too, because `_WriteAttempt` is set only before the literal payload
+write, so a post-nav bail leaves the cursor moved without arming it. That is correct
+as an observation and wrong as a fix. The hazard the brake exists to break is
+`stranded text` + `the next message's Enter` ⇒ **both** committed. **Arrow keys leave
+no text**, so there is nothing to append to, and the pane they touched is a LIVE CARD
+— which PR-1's gate refuses for every subsequent payload anyway (`no_input_box` /
+`prompt_row_is_option`), so the chain cannot form. Arming the brake there would be
+actively harmful: while a card owns the pane there IS no input row, so the brake's
+only release proof (`pane_input_row_empty`) is permanently INDETERMINATE and the topic
+would be **WEDGED** — every later message refused with *"an earlier message is still
+sitting UNSENT in this window's input box"*, which would be a **lie**, until the user
+kills the window. The nav is also `Down`-only by construction (the affordance row is
+the LAST row, so `delta = target − cursor ≥ 0`), which is what keeps it away from the
+one arrow that could put text anywhere: `Up` recalls history INTO a restored input
+box. `Down` into a stray input box can at worst arm the `Enter to view tasks` mode,
+which PR-1's gate leg 4 positively detects and refuses with the Esc instruction. Pinned
+by `TestArrowKeysAreNotADraft`.
 
   - **(i) Callers STOP on the first non-OK result.** `aggregator_replay_payload`
     used to keep sending the remaining split bundles after a refusal (so split 2
@@ -2210,6 +2254,73 @@ contract, not a degradation to paper over. **Scoped to the ANCHOR path**: the GH
 recap surface-identity lane builds its own composite from `read_side_file_for_recovery`
 and is untouched — a guessy identity there costs a duplicate recap, not a wrong
 keystroke.
+
+**THE ANCHOR IS BOUND TO THE PANE, NOT TO THE READ ORDER — the round-5 P1-B, and
+"anchor before pane" was BACKWARDS.** The round-3 argument above rests on a premise it
+never states: that a card the user has ALREADY ANSWERED stops looking *live* on the
+pane. `PreToolUse` writes card B's record **before B renders** (`hook.py`), so the
+reachable interleaving is:
+
+    1. card A is on the pane; another controller resolves it;
+    2. B's PreToolUse hook writes anchor B (the side file is per-SESSION — it is
+       OVERWRITTEN, not appended);
+    3. B has not drawn yet, so the pane still holds A's picker;
+    4. the initial observation mints `(pane A, anchor B)` — the DANGEROUS chimera;
+    5. B renders with IDENTICAL option geometry;
+    6. the post-nav and pre-Enter observations both see `(pane B, anchor B)`. They
+       AGREE. The Enter commits onto B. **THE WRONG CARD.**
+
+Reading the anchor first does not close that, and neither does the round-4 fresh
+`session_map.json` read (it is the same session). **REPRO-CONFIRMED on the live call
+path**: with the round-5 guards reverted,
+`test_the_reviewers_interleaving_never_answers_the_SUCCESSOR_card` fails with *"the
+answer was committed onto the SUCCESSOR card"* — `pane.enter_sent is True`.
+
+Three folds, none of them a bet on ordering:
+
+  - **The card must OWN the pane.** `plan_from_pane` now requires
+    `pane_input_box_present(pane) is False`. A live blocking prompt REPLACES the input
+    box; a resolved one RESTORES it (rig: `auq_after_answer_t{0,1,5,30}`). This is the
+    round-3 premise, turned from an assumption into a cheap requirement. *Honest about
+    what it buys*: MEASURED, today's parser already declines that shape independently
+    (a restored input box makes `is_free_text` go False), so this leg is defence in
+    depth against a TUI drift, not the load-bearing leg.
+  - **Every observation is a SANDWICH** (`free_text._observe`): read the anchor →
+    capture the pane → read the anchor AGAIN → require the two EQUAL. Because the side
+    file only ever moves FORWARD, `anchor(t0) == anchor(t2)` proves it did not move
+    anywhere in `[t0, t2]` — and therefore not at `t1`, when the pane was captured. A
+    hook write landing mid-observation is now **DETECTED** rather than reasoned about.
+    The cost is one small local file read per observation.
+  - **The anchor RECORD's CONTENT must AGREE with the pane it is paired with**
+    (`auq_source.anchor_pane_agreement`, TARGET-ROW-BLIND for the same reason the pane
+    identity is — a typed affordance row parses as a FOURTH real option). Three states:
+    `match` / `mismatch` (⇒ `derive_identity` returns `None` ⇒ refuse) /
+    `indeterminate` (no complete real-option prefix — the overflow shape, where the
+    caller has no pane component either and the anchor stands alone).
+
+**THE REUSED HELPER WAS VERIFIED, NOT ASSUMED** (this repo's recorded
+`feedback_reuse_claim_needs_liveness_verification` rule). Measured on the live call
+path: `_record_consistent_with_pane` **DOES** reject a record whose option labels
+differ from the pane (`label_mismatch`), and **DOES NOT** reject one whose labels are
+identical but whose QUESTION differs — a pure-pane parse yields
+`current_question_title is None` (so its title check skips) and empty option
+descriptions, so the labels are the only pane-observable content it has. That is
+exactly the shape the interleaving needs, so agreement also requires — **at
+PRE-KEYSTROKE observations only** — the record's question text to be visibly on the
+pane (whitespace-squashed substring; the live picker renders its question directly
+above the options). It is NOT applied post-write, because a long answer typed into a
+bottom-anchored picker can legitimately scroll the question off, and a false refusal
+*there* strands a draft inside a live card — the most expensive failure in the
+transaction. After the first keystroke the anchor KEY (unchanged across the sandwich,
+and equal to the planned one) carries the occurrence proof.
+
+**The residual, disclosed and NOT closed:** two AUQs with the **same option labels AND
+the same question text** are identical in every pane-observable respect, so no content
+binding can separate them. They are covered by the ownership leg + the sandwich + the
+forward-only ordering, and by the fact that a re-asked AUQ always gets a NEW
+`tool_use_id` (so the anchor KEY differs whenever the side file has actually moved).
+Note this residual is **WIDER than "byte-identical content"**: it is "byte-identical
+*question + labels*", since descriptions are not parsed from a pane.
 
 `still_holds` is therefore: the surface must match; **the anchors must be EQUAL**
 (both sides always have one — a live derivation without one is `None` and dies on

@@ -41,6 +41,7 @@ Key components:
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -49,7 +50,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from ..session import peek_session_id_for_window, read_session_id_for_window_fresh
 from ..utils import app_dir
@@ -1213,6 +1214,175 @@ def peek_side_file_tool_use_id_and_written_at(
     if time.time() - rec.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
         return None
     return rec.tool_use_id, rec.written_at
+
+
+@dataclass(frozen=True)
+class SurfaceAnchor:
+    """The AUQ occurrence anchor: its KEY **and the record's own content**.
+
+    The key alone is not enough (peer-review round-5 P1-B). It is read
+    OUT-OF-BAND, so nothing tied it to the pane the caller then captured — and
+    the round-3 argument that made that safe ("a live prompt means Claude is
+    BLOCKED on it, so the side file must be its") silently assumed that a
+    RESOLVED prompt is no longer live-LOOKING on the pane. Carrying the record's
+    ``tool_input`` lets the caller BIND the anchor to the pane it captured
+    (:func:`anchor_pane_agreement`) instead of betting on read order.
+
+    Both fields come from ONE atomic side-file read, so the key and the content
+    can never describe two different records.
+    """
+
+    key: str
+    tool_input: dict[str, Any]
+
+
+ANCHOR_MATCH: Final = "match"
+ANCHOR_MISMATCH: Final = "mismatch"
+ANCHOR_INDETERMINATE: Final = "indeterminate"
+
+
+def _squash_ws(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def anchor_pane_agreement(
+    tool_input: dict[str, Any],
+    pane_text: str,
+    *,
+    target_row: int,
+    bind_question_text: bool,
+) -> str:
+    """Does the hook RECORD describe the card the PANE is showing? (round-5 P1-B)
+
+    ``ANCHOR_MATCH`` / ``ANCHOR_MISMATCH`` / ``ANCHOR_INDETERMINATE``.
+
+    THE HOLE THIS CLOSES. The free-text executor reads the anchor out-of-band and
+    captures the pane separately, so it can mint a CHIMERA — ``(card A's pane,
+    card B's anchor)`` — whenever the side file has already moved to B while the
+    pane still renders A. The round-3 fix ordered the reads (anchor first) and
+    argued the dangerous direction was unreachable, but that argument rests on a
+    premise it never states: that a card the user already answered stops looking
+    live on the pane. Binding the record's CONTENT to the captured pane removes
+    the bet entirely — a record that does not describe what we are looking at is
+    refused, whatever the read order was.
+
+    TARGET-ROW-BLIND, for the same reason the pane identity is: the executor
+    types into row ``target_row``, and a typed affordance row parses as a FOURTH
+    REAL OPTION. Only the real prefix ``1..target_row-1`` — the part the
+    transaction never touches — is compared, so the agreement is stable across
+    the executor's own mutations.
+
+    ``INDETERMINATE`` = the pane carries no complete real-option prefix (the
+    overflow shape: a long answer scrolls the block off the top of an alternate
+    screen). The caller then has no pane component either, and the anchor stands
+    alone — the documented, rig-measured AUQ overflow case. It is NOT a licence:
+    the caller still requires the anchor KEY to be unchanged.
+
+    ``bind_question_text`` additionally requires the record's question text to be
+    VISIBLY ON THE PANE. That is the leg that separates two cards with IDENTICAL
+    option labels — which the label comparison provably cannot (verified: see
+    below) — and it is the leg that closes the reviewer's exact interleaving.
+    Callers pass it ONLY at PRE-KEYSTROKE observations, because the question sits
+    ABOVE the option block and a long typed answer can legitimately scroll it off
+    a bottom-anchored picker; a false refusal there would strand a draft inside a
+    live card. Before any key is typed the pane has not grown, and a false refusal
+    costs nothing but a fall-through to the normal gate.
+
+    LIMITS OF THE LABEL LEG, MEASURED — not assumed (this repo's recorded
+    "reuse-claim needs liveness verification" rule). ``_record_consistent_with_pane``
+    DOES reject a record whose option labels differ from the pane
+    (``label_mismatch``), and DOES NOT reject one whose labels are identical but
+    whose QUESTION differs: a pure-pane parse yields ``current_question_title is
+    None`` (the title check is conditional and skips) and empty option
+    descriptions, so the labels are the only pane-observable content it has.
+    Hence ``bind_question_text``.
+    """
+    from ..terminal_parser import resolve_ask_form
+
+    if not pane_text or target_row < 2:
+        return ANCHOR_INDETERMINATE
+    pane_form = resolve_ask_form(None, pane_text)
+    if pane_form is None or not pane_form.options:
+        return ANCHOR_INDETERMINATE
+    real = tuple(
+        o for o in pane_form.options if o.number is not None and o.number < target_row
+    )
+    if [o.number for o in real] != list(range(1, target_row)):
+        # No complete real-option prefix on this pane ⇒ nothing to bind against.
+        return ANCHOR_INDETERMINATE
+
+    truncated = dataclasses.replace(pane_form, options=real)
+    probe = PreToolAskRecord(
+        tool_input=tool_input,
+        session_id="",
+        tool_use_id="",
+        written_at=0.0,
+        input_fingerprint="",
+    )
+    consistent, reason = _record_consistent_with_pane(probe, truncated)
+    if not consistent:
+        logger.info(
+            "AUQ anchor/pane DISAGREE reason=%s — the PreToolUse record does not "
+            "describe the card on the pane",
+            reason,
+        )
+        return ANCHOR_MISMATCH
+
+    if bind_question_text:
+        questions = tool_input.get("questions")
+        if (
+            not isinstance(questions, list)
+            or len(questions) != 1
+            or not isinstance(questions[0], dict)
+        ):
+            # The free-text lane is single-question only; anything else is a
+            # record that cannot describe the card we are about to type into.
+            return ANCHOR_MISMATCH
+        question = (questions[0].get("question") or "").strip()
+        if not question:
+            return ANCHOR_MISMATCH
+        if _squash_ws(question) not in _squash_ws(pane_text):
+            logger.info(
+                "AUQ anchor/pane DISAGREE reason=question_absent — the record's "
+                "question text is not on the pane"
+            )
+            return ANCHOR_MISMATCH
+    return ANCHOR_MATCH
+
+
+def peek_surface_anchor_for_window(window_id: str) -> SurfaceAnchor | None:
+    """The AUQ occurrence anchor — key **and content** — from ONE atomic read.
+
+    The KEY is exactly what :func:`peek_surface_identity_for_window` returns (all
+    of the round-3 / round-4 contract documented there — the freshly-resolved
+    session generation, the mandatory ``tool_use_id``, the future-skew guard, no
+    read-TTL). The CONTENT is the SAME record's ``tool_input``, so the caller can
+    bind it to the pane it captures (:func:`anchor_pane_agreement`) instead of
+    trusting read order alone (round-5 P1-B).
+
+    One read, so the key and the content can never name two different cards.
+    """
+    session_id = read_session_id_for_window_fresh(window_id)
+    if not session_id:
+        return None
+    record = _read_pretool_side_file(session_id)
+    if record is None:
+        return None
+    if time.time() - record.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
+        return None
+    if not record.tool_use_id:
+        logger.warning(
+            "AUQ anchor read window=%s reason=no_tool_use_id — the PreToolUse "
+            "record carries no occurrence witness; the free-text lane DECLINES",
+            window_id,
+        )
+        return None
+    if not isinstance(record.tool_input, dict):
+        return None
+    return SurfaceAnchor(
+        key=f"auq:sid:{session_id}:tu:{record.tool_use_id}",
+        tool_input=record.tool_input,
+    )
 
 
 def peek_surface_identity_for_window(window_id: str) -> str | None:
