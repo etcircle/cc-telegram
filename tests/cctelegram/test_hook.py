@@ -46,22 +46,11 @@ def _session_start_commands(settings: dict) -> list[str]:
     ]
 
 
-def _pre_tool_use_entries(settings: dict, matcher: str = _AUQ_MATCHER) -> list[dict]:
-    """The managed PreToolUse entries for ONE matcher (default: AskUserQuestion).
-
-    ``--install`` writes TWO PreToolUse entries since GH #50 PR-2 r3 — the
-    AskUserQuestion description capture and the ExitPlanMode occurrence witness
-    (``handlers/epm_source``) — in SEPARATE entries, so that an installation
-    predating the second one gains only that one. These tests are about the AUQ
-    entry, so the helper scopes to a matcher and their ``len(...) == 1``
-    assertions keep their meaning: exactly ONE managed entry per matcher, never a
-    duplicate. The ExitPlanMode entry has its own suite in
-    ``test_hook_exit_plan_mode.py``.
-    """
+def _pre_tool_use_entries(settings: dict) -> list[dict]:
     return [
         entry
         for entry in settings.get("hooks", {}).get("PreToolUse", [])
-        if isinstance(entry, dict) and entry.get("matcher") == matcher
+        if isinstance(entry, dict)
     ]
 
 

@@ -21,7 +21,6 @@ from . import (
     artifacts,
     attention,
     auq_source,
-    epm_source,
     late_answer,
     notify_source,
     pane_signals,
@@ -102,9 +101,6 @@ async def clear_topic_state(
             # Wave B: topic close also tears down the route's notification
             # side file (same session resolution as the md_capture teardown).
             notify_source.unlink_for_session(_md_session)
-            # GH #50 PR-2 r3: … and the ExitPlanMode occurrence witness (same
-            # session resolution again).
-            epm_source.unlink_for_session(_md_session)
         # D2: tomb this window's durable pick mint-intents on topic close (the
         # store is window-keyed; route[2] is the window_id). Orphan-safety is also
         # provided by recovery-time re-validation + the 24h GC, but tombing here

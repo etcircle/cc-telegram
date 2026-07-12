@@ -242,15 +242,24 @@ class Config:
             "CC_TELEGRAM_DECISION_DISPATCH", ""
         ).strip().lower() in ("1", "true", "yes", "on")
 
-        # GH #50 PR-2 — free-text answers on a live interactive card. When a
-        # Telegram message (typed prose or a voice note, with no caption /
-        # attachment / reply-context / command) arrives while an AskUserQuestion
-        # single-select picker or an ExitPlanMode prompt is live, the bot
-        # NAVIGATES to that surface's free-text affordance row, types the message
-        # there, verifies the typed state (the SGR-2 discriminator) and commits it
-        # with Enter — so the message becomes the card's ANSWER instead of being
-        # refused. Default ON: PR-1 already refuses these payloads, so OFF means
-        # a live card simply cannot be answered in prose. Set
+        # GH #50 PR-2 — free-text answers on a live AskUserQuestion card. When a
+        # Telegram message arrives while an AUQ single-select picker is live, the
+        # bot NAVIGATES to the card's free-text affordance row ("Type
+        # something."), types the message there, verifies the typed state (the
+        # SGR-2 discriminator) and commits it with Enter — so the message becomes
+        # the card's ANSWER instead of being refused.
+        #
+        # ELIGIBLE payloads: typed prose OR a voice transcription, INCLUDING a
+        # reply-quoted one (owner decision 2026-07-12 — answering a card by voice
+        # note sent AS A REPLY is the dominant gesture, and Claude receives the
+        # full rendered payload, quote included). INELIGIBLE: a caption, an
+        # attachment bundle, and slash commands (which never reach the lane).
+        #
+        # ExitPlanMode is deliberately NOT a free-text surface (owner decision
+        # 2026-07-12): a plan card takes PR-1's refusal.
+        #
+        # Default ON: PR-1 already refuses these payloads, so OFF means a live
+        # card simply cannot be answered in prose. Set
         # ``CC_TELEGRAM_FREE_TEXT_ANSWERS=false`` to fall back to the PR-1
         # refusal everywhere. Independent of the detector flags. The lane is
         # additionally VERSION-LICENSED per (surface × CC version) inside the

@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from ..session import peek_session_id_for_window
+from ..session import peek_session_id_for_window, read_session_id_for_window_fresh
 from ..utils import app_dir
 
 if TYPE_CHECKING:
@@ -1230,16 +1230,42 @@ def peek_surface_identity_for_window(window_id: str) -> str | None:
     DIFFERENT id (the successor's) or ``None`` (resolved, nothing live) — both of
     which the executor refuses on.
 
-    The occurrence key is the GH #48 composite, reused verbatim rather than
-    reinvented: the non-empty ``tool_use_id`` when the hook captured one, else
-    ``(written_at, canonical tool-input fingerprint)``. Same future-skew guard as
-    :func:`side_file_live_for_session`; deliberately NO read-TTL (a card left open
-    for hours is still that card). Read-only — never mutates the record cache.
+    **THE SESSION GENERATION IS PART OF THE ANCHOR (round-4 P1).** The window's
+    session is resolved through ``session.read_session_id_for_window_fresh`` —
+    the hook-written ``session_map.json``, never the CACHED
+    ``WindowState.session_id``, which only mirrors that map as often as the
+    monitor's poll loop reloads it. A ``/clear`` (or any session replacement) in
+    the SAME tmux window rotates the session while the cache still names the old
+    one, so every anchor read resolved the PREDECESSOR's side file while the pane
+    being captured was the SUCCESSOR's card: three observations in perfect
+    agreement with each other and with nothing real, and the Enter commits onto
+    the wrong card. Embedding the freshly-resolved session id in the key means a
+    rotation between two observation points CHANGES the anchor and
+    ``SurfaceIdentity.still_holds`` refuses. (This lane's record carries no
+    ``window_key``, so the double-``--resume`` sibling residual documented
+    elsewhere is unchanged — the fix here is the session GENERATION, not the
+    window.)
 
-    ``None`` when the window has no session, no side file, or a clock-skewed one
-    — the caller FAILS CLOSED on ``None`` wherever it had an id before.
+    **AN EMPTY ``tool_use_id`` DECLINES (round-4 P2).** ``hook.py`` writes ``""``
+    when the payload carries no id, and the old ``(written_at, canonical
+    fingerprint)`` composite silently upgraded that absence into an ALLOW-capable
+    anchor. A wall-clock stamp plus a content hash is not an occurrence witness:
+    same-session siblings can share a clock quantum, and (there being no
+    read-TTL) a stale record stays "valid" forever. On the only licensed CC
+    version the rig confirms the id is always present. **Scoped to the free-text
+    ANCHOR path only** — the GH #48 recap surface-identity lane builds its own
+    composite from ``read_side_file_for_recovery`` and is untouched, because a
+    guessy identity there costs a duplicate recap, not a wrong keystroke.
+
+    Same future-skew guard as :func:`side_file_live_for_session`; deliberately NO
+    read-TTL (a card left open for hours is still that card). Read-only — never
+    mutates the record cache.
+
+    ``None`` when the window has no session in the fresh map, no side file, a
+    clock-skewed one, or one with no occurrence witness — the caller FAILS CLOSED
+    on ``None`` wherever it had an id before.
     """
-    session_id = peek_session_id_for_window(window_id)
+    session_id = read_session_id_for_window_fresh(window_id)
     if not session_id:
         return None
     record = _read_pretool_side_file(session_id)
@@ -1247,9 +1273,14 @@ def peek_surface_identity_for_window(window_id: str) -> str | None:
         return None
     if time.time() - record.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
         return None
-    if record.tool_use_id:
-        return f"tu:{record.tool_use_id}"
-    return f"wf:{record.written_at!r}:{_canonical_dict_fingerprint(record.tool_input)}"
+    if not record.tool_use_id:
+        logger.warning(
+            "AUQ anchor read window=%s reason=no_tool_use_id — the PreToolUse "
+            "record carries no occurrence witness; the free-text lane DECLINES",
+            window_id,
+        )
+        return None
+    return f"auq:sid:{session_id}:tu:{record.tool_use_id}"
 
 
 @dataclass(frozen=True)

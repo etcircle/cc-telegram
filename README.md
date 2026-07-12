@@ -155,24 +155,19 @@ input box again. In the rarer case where the final Enter itself fails, the bot
 says plainly that the message *may or may not* have been submitted — check the
 window with `/screenshot` before resending.
 
-### …but you can still answer a card in your own words
+### …but you can still answer a question card in your own words
 
-Refusing everything would be a dead end, so the two prompts that *have* a
-free-text option accept one. Send a normal message — typed or a voice note —
-while one of these is on screen and it becomes your answer:
-
-- **A question card** (single-select). Your message is submitted as the answer,
-  exactly as if you had picked "Type something." in the terminal.
-- **A plan approval.** Your message rejects the plan and is delivered as the
-  feedback, and plan mode is preserved — so you can talk Claude out of a plan
-  from your phone instead of approving it blind.
+Refusing everything would be a dead end, so the one prompt that *has* a free-text
+option accepts one. Send a normal message — typed or a voice note — while a
+**question card** (single-select) is on screen and it becomes your answer,
+exactly as if you had picked "Type something." in the terminal.
 
 **Replying to the card works too.** Swipe-reply to the question card and send a
 voice note, and the quote goes along with your words — Claude gets the context
 you were answering *and* the answer.
 
 The bot does this by driving the terminal the same way the option buttons do: it
-moves the cursor onto the prompt's free-text row, *proves* it landed there, types
+moves the cursor onto the card's free-text row, *proves* it landed there, types
 your message with the Enter withheld, *proves* your text is in that row, *proves
 the card is still the one you were answering*, and only then commits. That last
 check matters: a card can resolve on its own while your message is being typed
@@ -183,34 +178,33 @@ before the first keystroke falls back to the ordinary refusal. Long messages are
 fine — a multi-paragraph voice note is submitted whole.
 
 **Proving *which* card is not something the screen alone can do**, which is why
-each prompt is identified by the `PreToolUse` hook — Claude Code runs it *before*
-it draws the prompt, so the hook records which prompt is coming. **Both surfaces
-need their hook installed**, and the lane simply declines when it is missing:
+each question is identified by the `PreToolUse(AskUserQuestion)` hook — Claude
+Code runs it *before* it draws the picker, so the hook records which question is
+coming. Two different questions can offer the same options, and the terminal shows
+nothing that tells them apart. **Without that hook the lane simply declines**: a
+message at a question card gets the ordinary refusal ("answer the card first")
+instead of risking your words landing on a *different* question.
+`cc-telegram hook --install` installs it, `cc-telegram doctor` reports it as
+missing, and the bot warns at startup. Everything else about the card — the
+options, the buttons, the descriptions — works as usual.
 
-- **A question card** needs `PreToolUse(AskUserQuestion)`. Two different questions
-  can offer the same options, and the terminal shows nothing that tells them
-  apart.
-- **A plan approval** needs `PreToolUse(ExitPlanMode)`. Every plan approval shows
-  the same three options, and Claude reuses one plan filename for the whole
-  session — rewriting that file in place each time it re-plans — so neither the
-  screen, nor the file name, nor the file's contents distinguish plan A from plan
-  B. (We tried the contents. Three different plans in a row, one filename.)
-
-Without the relevant hook, a message at that prompt gets the ordinary refusal
-("answer the card first") instead of risking your words landing on a *different*
-prompt — which on a plan approval means the option reading *"Yes, and bypass
-permissions."* `cc-telegram hook --install` installs both, `cc-telegram doctor`
-reports either as missing, and the bot warns at startup. Everything else about
-the prompts — the options, the buttons, the descriptions — works as usual.
+**A plan approval is deliberately not answerable this way.** Its first option
+reads *"Yes, and bypass permissions."*, every plan approval shows the same three
+options, and Claude reuses one plan filename for the whole session (rewriting that
+file in place each time it re-plans) — so neither the screen nor the file can tell
+plan A from plan B. Identifying it safely would need its own hook and its own
+state file, which is not a trade cc-telegram makes. A message sent at a plan
+approval gets the ordinary refusal; approve, reject or amend it with the card's
+buttons and keys.
 
 Everything else keeps the refusal, on purpose: multi-select questions (their
 answer takes several steps), folder-trust and model-switch prompts (no free-text
-option exists), and anything carrying an attachment, a caption, or a slash
-command — those are messages *about* something, not answers to the question.
-Cards say which of the two you are looking at, so you are never guessing.
+option exists), and anything carrying an attachment, a caption, or a slash command
+— those are messages *about* something, not answers to the question. Cards say
+which case you are looking at, so you are never guessing.
 
 This is characterised per Claude Code version. On a version cc-telegram has not
-verified, the free-text lane switches itself off and the prompt goes back to
+verified, the free-text lane switches itself off and the card goes back to
 buttons-and-refusal rather than trusting a stale assumption about the terminal.
 Set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to turn it off entirely.
 
@@ -319,7 +313,7 @@ Everything else has a default.
 - `CC_TELEGRAM_PERMISSION_PROMPTS` surfaces tool permission prompts and Workflow launch gates as Telegram cards. Default: true (set `CC_TELEGRAM_PERMISSION_PROMPTS=false` to disable).
 - `CC_TELEGRAM_DECISION_CARDS` surfaces otherwise unsupported numbered confirmation prompts as display-only cards. Default: true (set `CC_TELEGRAM_DECISION_CARDS=false` to disable).
 - `CC_TELEGRAM_DECISION_DISPATCH` enables verified one-tap dispatch for known-good decision families when decision cards are also enabled. Unknown prompts and uncharacterised Claude versions remain display-only.
-- `CC_TELEGRAM_FREE_TEXT_ANSWERS` lets a plain message (typed or voice, including a swipe-reply that quotes the card) answer a live question card or a plan approval in your own words, by driving that prompt's free-text row. Default: true (set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to fall back to refusing those messages). Limited to Claude Code versions cc-telegram has characterised; an uncharacterised version disables the lane by itself. Both surfaces additionally require their `PreToolUse` hook — `AskUserQuestion` for a question card, `ExitPlanMode` for a plan approval — because that hook is what identifies *which* prompt you are answering. Without it, those messages are refused rather than delivered. `cc-telegram hook --install` installs both; `cc-telegram doctor` reports either as missing. See [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words).
+- `CC_TELEGRAM_FREE_TEXT_ANSWERS` lets a plain message (typed or voice, including a swipe-reply that quotes the card) answer a live question card in your own words, by driving the card's free-text row. Default: true (set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to fall back to refusing those messages). Limited to Claude Code versions cc-telegram has characterised; an uncharacterised version disables the lane by itself. It also requires the `PreToolUse(AskUserQuestion)` hook, because that hook is what identifies *which* question you are answering. Without it, those messages are refused rather than delivered. Plan approvals are deliberately not covered. See [you can still answer a question card in your own words](#but-you-can-still-answer-a-question-card-in-your-own-words).
 - `CC_TELEGRAM_ARTIFACT_MAX_MB` sets the maximum upload size for attachment cards and `/file`. Default: 45 MB; Telegram's bot limit is 50 MB.
 - `CC_TELEGRAM_ARTIFACT_ROOTS` adds comma-separated absolute directories that may serve files in addition to the active session directory.
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` limits the input preview shown in tool lines. Default: 40.
@@ -346,7 +340,7 @@ The reason is structural. Claude Code's tool-permission prompts are a terminal U
 
 What that means for your security boundary: it is no longer Claude Code's per-tool approval. It is **`ALLOWED_USERS` plus the machine you run on**. Anyone who can post in your forum can make Claude read, edit, and execute anything your user account can. Lock `ALLOWED_USERS` to your own Telegram user ID, run on a machine you trust, and consider `IS_SANDBOX=1`.
 
-> **Sending while a prompt is on screen (GH #50).** This used to be a live hazard: a plain text message sent while Claude was waiting on a question card, a plan approval, or a folder-trust dialog was typed into the terminal, where the text was discarded and the trailing Enter committed the highlighted option (on a plan approval, that meant approving the plan). The delivery gate now refuses those sends with an explanation instead — see [Messages are never typed into a live prompt](#messages-are-never-typed-into-a-live-prompt). On the two prompts that offer a free-text option — a single-select question card and a plan approval — your message is instead delivered *into* that option, as the answer or as plan feedback; see [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words). Everywhere else: answer the card first, then send your message.
+> **Sending while a prompt is on screen (GH #50).** This used to be a live hazard: a plain text message sent while Claude was waiting on a question card, a plan approval, or a folder-trust dialog was typed into the terminal, where the text was discarded and the trailing Enter committed the highlighted option (on a plan approval, that meant approving the plan). The delivery gate now refuses those sends with an explanation instead — see [Messages are never typed into a live prompt](#messages-are-never-typed-into-a-live-prompt). On a single-select **question card**, your message is instead delivered *into* its free-text option as the answer; see [you can still answer a question card in your own words](#but-you-can-still-answer-a-question-card-in-your-own-words). Everywhere else — plan approvals included: answer the card first, then send your message.
 
 ### Suggested daily-driver config
 
@@ -405,7 +399,6 @@ cc-telegram stores state under `$CC_TELEGRAM_DIR`, which defaults to `~/.cc-tele
 | `monitor_state.json` | Incremental JSONL read offsets. |
 | `interactive_state.json` | Persisted interactive message IDs and AskUserQuestion context. |
 | `auq_pending/<session_id>.json` | Structured AskUserQuestion input captured by PreToolUse. Files are mode `0600` under a `0700` directory. |
-| `epm_pending/<session_id>.json` | Window-keyed marker identifying *which* plan approval is on screen, captured by `PreToolUse(ExitPlanMode)` before Claude renders it. It stores no plan text — only the prompt's identifier, so a message answering one plan can never be committed onto a different one. Files are mode `0600` under a `0700` directory. |
 | `notify_pending/<session_id>.json` | Window-keyed marker showing that Claude is waiting for approval or input. It stores no notification message text. |
 | `auq_action_ledger.jsonl` | Restart-safe action ledger that prevents duplicate option submissions. |
 | `pick_intent.jsonl` | Recovery data for the first tap on an AskUserQuestion card after a bot restart. |
@@ -425,7 +418,7 @@ Install or repair the managed hooks with:
 cc-telegram hook --install
 ```
 
-This updates `~/.claude/settings.json` with four entries:
+This updates `~/.claude/settings.json` with three entries:
 
 ```json
 {
@@ -440,12 +433,6 @@ This updates `~/.claude/settings.json` with four entries:
     "PreToolUse": [
       {
         "matcher": "AskUserQuestion",
-        "hooks": [
-          { "type": "command", "command": "cc-telegram hook", "timeout": 2 }
-        ]
-      },
-      {
-        "matcher": "ExitPlanMode",
         "hooks": [
           { "type": "command", "command": "cc-telegram hook", "timeout": 2 }
         ]
@@ -465,11 +452,10 @@ This updates `~/.claude/settings.json` with four entries:
 The hooks have separate jobs:
 
 - `SessionStart` writes `session_map.json` so messages return to the right tmux window.
-- `PreToolUse(AskUserQuestion)` captures the structured question payload before Claude renders its picker. It is also what tells one question apart from another, so **without it a plain message sent at a question card is refused rather than delivered as the answer** — see [you can still answer a card in your own words](#but-you-can-still-answer-a-card-in-your-own-words).
-- `PreToolUse(ExitPlanMode)` records which plan approval is on screen, before Claude renders it. Nothing else can: every plan approval shows the same three options, and Claude reuses one plan filename for the whole session (it rewrites that file in place each time it re-plans). So **without this hook a plain message sent at a plan approval is refused rather than delivered as feedback** — the bot will not type into a prompt it cannot identify, because that prompt's first option is *"Yes, and bypass permissions"*.
+- `PreToolUse` captures the structured AskUserQuestion payload before Claude renders its picker. It is also what tells one question apart from another, so **without it a plain message sent at a question card is refused rather than delivered as the answer** — see [you can still answer a question card in your own words](#but-you-can-still-answer-a-question-card-in-your-own-words).
 - `Notification` records that Claude is blocked on an approval prompt that may never appear in the session JSONL.
 
-`cc-telegram doctor` verifies all four managed hooks. A missing SessionStart
+`cc-telegram doctor` verifies all three managed hooks. A missing SessionStart
 hook retains the existing health-check severity; missing PreToolUse or
 Notification hooks are reported as warnings. Repair any missing entry with
 `cc-telegram hook --install`.

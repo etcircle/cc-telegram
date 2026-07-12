@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from cctelegram import delivery
+from cctelegram import tmux_manager as tmux_mod
 from cctelegram.config import config
 from cctelegram.handlers import inbound_aggregator
 from cctelegram.handlers import message_queue
@@ -749,6 +750,80 @@ class TestRefusalOwnership:
         assert result.refused
         assert result.reason == delivery.REASON_SEND_FAILED  # the caller has it…
         bot.send_message.assert_not_awaited()  # …and the aggregator stayed silent.
+
+    @pytest.mark.asyncio
+    async def test_a_raise_PAST_A_WRITE_is_reported_as_DRAFT_WRITTEN(self, monkeypatch):
+        """peer-review round-4 P2 — the reported written-state must AGREE with the
+        pane.
+
+        Both gated transactions (``session.deliver_to_window`` and
+        ``free_text.try_answer``) arm the per-window STRANDED-DRAFT BRAKE inside
+        the send lock, immediately before re-raising, whenever the raise lands PAST
+        a write attempt. The exception arm here HARDCODED ``written=False``, so the
+        machine-visible outcome said NOT_WRITTEN while bytes were sitting in the
+        pane: the brake stayed up only as an out-of-band side effect, and every
+        consumer of the ``DeliveryOutcome`` was reading a claim the transaction had
+        already contradicted.
+
+        The brake registry IS the authority and is already committed by the time we
+        catch — so ask it.
+        """
+        route = (1, 42, "@1")
+        bot = AsyncMock()
+        tmux_mod.tmux_manager.reset_stranded_drafts_for_tests()
+
+        async def raise_after_arming_the_brake(window_id, text, **kwargs):
+            # Exactly what the real transactions do: arm INSIDE the send lock, then
+            # re-raise (a cancelled/failed write can still have landed).
+            tmux_mod.tmux_manager.mark_window_stranded_draft(window_id)
+            raise RuntimeError("tmux exploded AFTER the payload was typed")
+
+        monkeypatch.setattr(
+            inbound_aggregator.session_manager,
+            "deliver_to_window",
+            raise_after_arming_the_brake,
+        )
+        monkeypatch.setattr(
+            inbound_aggregator.session_manager,
+            "get_group_chat_id",
+            lambda user_id, thread_id: -100500,
+        )
+
+        await inbound_aggregator.aggregator_offer_text(route, "hello", bot=bot)
+        result = await inbound_aggregator._flush(route)
+
+        assert result.reason == delivery.REASON_SEND_FAILED
+        assert result.outcome is delivery.DeliveryOutcome.DRAFT_WRITTEN, (
+            "a raise past a write attempt must NOT be reported as NOT_WRITTEN"
+        )
+        assert result.draft_stranded is True
+        assert bot.send_message.await_count == 1  # …and reported, exactly once.
+        tmux_mod.tmux_manager.reset_stranded_drafts_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_a_raise_BEFORE_any_write_stays_NOT_WRITTEN(self, monkeypatch):
+        """The other half: an unbraked window means nothing was typed, so the
+        NOT_WRITTEN claim is PROVEN rather than assumed."""
+        route = (1, 42, "@1")
+        bot = AsyncMock()
+        tmux_mod.tmux_manager.reset_stranded_drafts_for_tests()
+        monkeypatch.setattr(
+            inbound_aggregator.session_manager,
+            "deliver_to_window",
+            AsyncMock(side_effect=RuntimeError("tmux vanished before the write")),
+        )
+        monkeypatch.setattr(
+            inbound_aggregator.session_manager,
+            "get_group_chat_id",
+            lambda user_id, thread_id: -100500,
+        )
+
+        await inbound_aggregator.aggregator_offer_text(route, "hello", bot=bot)
+        result = await inbound_aggregator._flush(route)
+
+        assert result.outcome is delivery.DeliveryOutcome.NOT_WRITTEN
+        assert result.draft_stranded is False
+        assert bot.send_message.await_count == 1
 
     @pytest.mark.asyncio
     async def test_a_CANCELLATION_propagates_and_is_never_reported_as_a_refusal(

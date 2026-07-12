@@ -14,12 +14,14 @@ were taken across several sessions:
 
     AUQ card X   options [Blue, Green, Red]      pretype · typed_large · overflow
     AUQ card Y   options [Red, Blue, Green]      single_picker · typed · identical
-    EPM plan P   ~/.claude/plans/…idempotent-pond      pretype · typed_large
-    EPM plan Q   ~/.claude/plans/fancy-wibbling-quasar typed · identical
-    EPM plan S   ~/.claude/plans/…warm-sedgewick       gate_epm
 
 A happy path therefore has to chain ONE generation end-to-end (mixing them is the
 bug), and a wrong-card test hands the verifier the OTHER generation's REAL bytes.
+
+(ExitPlanMode had its own free-text lane through peer-review round 3; the owner
+DROPPED it on 2026-07-12 — the plan-approval surface is not worth a hook + a
+state file when they run ``--dangerously-skip-permissions`` anyway. An EPM card
+now takes PR-1's refusal, so its frames are gone with the lane.)
 
 TWO FRAMES ARE DERIVED, not captured — the corpus has no "card X with the cursor
 on row 1" and no "card X with a SHORT answer typed". Both derivations are
@@ -130,61 +132,11 @@ AUQ_Y_TYPED = fx(f"auq_freetext_row_typed_{V}.ansi.txt")  # ❯4, PLAIN
 
 AUQ_RESOLVED = fx(f"auq_after_answer_t5_{V}.txt")  # the surface is GONE
 
-# ── EPM plan P / plan Q / plan S ─────────────────────────────────────────────
-
-# The plan-file slugs the real footers carry.
-#
-# NOTE (round-3 P1): these are NO LONGER any part of the EPM surface anchor. The
-# path was tried as the anchor (round-1) and a hash of the file's CONTENT was
-# tried next (round-2); BOTH describe the plan ARTIFACT and neither can name the
-# prompt OCCURRENCE — rig-verified on 2.1.207, three consecutive ExitPlanMode
-# prompts shared ONE slug and the file was rewritten in place each time. The
-# anchor is now the ``PreToolUse(ExitPlanMode)`` hook's per-invocation
-# ``tool_use_id`` (``handlers/epm_source``). The slugs survive here only because
-# ``retarget_plan_path`` uses them to build the adversarial same-path successor
-# frame that pins the pane component's degeneracy.
-EPM_P_PLAN_PATH = "~/.claude/plans/write-a-one-paragraph-plan-idempotent-pond.md"
-EPM_Q_PLAN_PATH = "~/.claude/plans/fancy-wibbling-quasar.md"
-EPM_S_PLAN_PATH = "~/.claude/plans/make-a-very-short-warm-sedgewick.md"
-
-EPM_P_LANDED = fx(f"epm_freetext_row_selected_pretype_{V}.ansi.txt")  # ❯4, DIM
-EPM_P_LIVE = move_cursor_to_row(EPM_P_LANDED, 1)  # derived: ❯1
-EPM_P_ANSWER = "please name it farewell.txt instead"
-EPM_P_TYPED = type_into_row(EPM_P_LANDED, 4, EPM_P_ANSWER)  # derived: ❯4, PLAIN
-EPM_P_TYPED_BIG = fx(f"epm_freetext_row_typed_large_{V}.ansi.txt")
-
-EPM_Q_TYPED = fx(f"epm_freetext_row_typed_{V}.ansi.txt")  # a DIFFERENT plan
-EPM_S_LIVE = fx(f"gate_epm_{V}.txt")  # a THIRD plan, ❯1
-
-EPM_OVERFLOW = fx(f"epm_freetext_overflow_{V}.ansi.txt")  # footer gone
-EPM_RESOLVED = fx(f"epm_after_approve_t5_{V}.txt")
-
-
-_RE_PLAN_PATH = re.compile(r"~/\.claude/plans/\S+\.md")
-
-
-def retarget_plan_path(ansi: str, new_path: str) -> str:
-    """Rewrite the ``~/.claude/plans/<slug>.md`` path in an EPM footer.
-
-    THE ROUND-2/3 P1's REAL SHAPE — and RIG-CONFIRMED on 2.1.207: three
-    consecutive ExitPlanMode prompts (including one for a substantively different
-    task) all carried ONE ``planFilePath``, and the file was rewritten in place
-    each time. The slug is a per-SESSION name, so plan P and its successor render
-    an IDENTICAL footer path. Every EPM also renders the SAME three real options,
-    so the pane identity is identical too — BOTH pre-fix identity components are
-    therefore satisfied by a DIFFERENT prompt.
-
-    The corpus's plan Q is a genuinely different real capture (different body,
-    different slug); pointing its footer at plan P's path reproduces exactly the
-    successor a re-plan produces, byte-for-byte real everywhere else. It is what
-    pins "nothing derived from the plan artifact can name the occurrence".
-    """
-    return _RE_PLAN_PATH.sub(new_path, ansi, count=1)
-
-
-# Plan Q's REAL bytes, wearing plan P's slug: the pane identity AND the footer
-# path both match plan P. Only the plan file's CONTENT tells them apart.
-EPM_Q_TYPED_AT_P_PATH = retarget_plan_path(EPM_Q_TYPED, EPM_P_PLAN_PATH)
+# A LIVE ExitPlanMode prompt (a pre-PR-2 fixture). Not a free-text surface any
+# more — the EPM lane was dropped — but it is exactly the pane a card can turn
+# over INTO, and the most dangerous one: its option 1 is "Yes, and bypass
+# permissions". The identity check must refuse it.
+EPM_LIVE = fx(f"gate_epm_{V}.txt")
 
 # The owner's real shape: a 947-char, 9-line voice note carrying a REPLY-CONTEXT
 # quote (rig-captured; Enter committed all 947 chars, JSONL-verified). This is

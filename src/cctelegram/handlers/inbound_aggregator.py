@@ -53,6 +53,7 @@ from .. import delivery
 from ..config import config
 from ..delivery import DeliveryResult, UserTurnStamp
 from ..session import session_manager
+from ..tmux_manager import tmux_manager
 from .message_sender import safe_send
 
 logger = logging.getLogger(__name__)
@@ -348,6 +349,12 @@ async def _send_bundle(
     and FALLS THROUGH to the one reporting seam. ``CancelledError`` is a
     ``BaseException`` — it is not caught, and must never be reported as an
     ordinary refusal.
+
+    And the raise arm's WRITTEN-STATE now AGREES with reality (peer-review
+    round-4 P2): it reads the per-window stranded-draft brake — armed inside the
+    send lock by whichever transaction raised — instead of asserting
+    ``written=False``. A raise past a write used to be reported as NOT_WRITTEN
+    while bytes sat in the pane.
     """
     text_to_send = _format_bundle(bundle)
     if not text_to_send:
@@ -382,16 +389,33 @@ async def _send_bundle(
                 window_id, text_to_send, user_turn=stamp
             )
     except Exception as exc:
+        # THE REPORTED WRITTEN-STATE MUST AGREE WITH REALITY (peer-review round-4
+        # P2). Both gated transactions — ``session.deliver_to_window`` and
+        # ``free_text.try_answer`` — arm the per-window STRANDED-DRAFT BRAKE
+        # inside the send lock, immediately before re-raising, whenever the raise
+        # lands PAST a write attempt (``_WriteAttempt``). Hard-coding
+        # ``written=False`` here therefore built a result whose machine-visible
+        # outcome said NOT_WRITTEN while bytes may well be sitting in the pane —
+        # the brake stayed up only as an out-of-band side effect, and every
+        # consumer of the ``DeliveryOutcome`` (the caller-abort rules, the copy)
+        # was reading a claim the transaction had already contradicted.
+        #
+        # The brake registry IS the authority, and it is already committed by the
+        # time the exception reaches us — so ASK IT. A braked window ⇒
+        # DRAFT_WRITTEN (the honest NEUTRAL copy tells the user to clear the box,
+        # which is exactly what the brake will demand of their next message); an
+        # unbraked one ⇒ NOT_WRITTEN, which is now a PROVEN claim rather than an
+        # assumption. Note ``CancelledError`` is a ``BaseException`` — it is not
+        # caught here, it propagates, and it is never reported as a refusal.
+        written = tmux_manager.window_has_stranded_draft(window_id)
         logger.error(
-            "aggregator flush raised for route %s: %s",
+            "aggregator flush raised for route %s: %s (written=%s)",
             route,
             exc,
+            written,
         )
         # NOT a bare return — fall through to the single reporting seam below.
-        # The NEUTRAL written-state copy is the right disclosure here: the raise
-        # may have landed before OR after the payload was typed, and if it landed
-        # after, the brake is now up and the user needs to know to clear the box.
-        result = delivery.refuse(delivery.REASON_SEND_FAILED, written=False)
+        result = delivery.refuse(delivery.REASON_SEND_FAILED, written=written)
 
     if not result.ok:
         logger.warning(

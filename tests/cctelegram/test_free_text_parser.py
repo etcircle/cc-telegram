@@ -16,8 +16,10 @@ bit IS the typed-state proof):
   auq_freetext_overflow               ~5.3 k draft: the option block (row 4
                                       INCLUDED) has scrolled off; only the footer
                                       remains
-  epm_*                               the same five states for ExitPlanMode, whose
-                                      overflow scrolls the FOOTER off instead
+
+(ExitPlanMode had the same five captures through peer-review round 3. Its
+free-text lane was DROPPED by owner decision on 2026-07-12 — a plan card now
+takes PR-1's refusal — so the fixtures went with it.)
 """
 
 from __future__ import annotations
@@ -52,32 +54,16 @@ class TestParseFreeTextRow:
         # THE PROOF: an untyped, selected affordance row is DIM.
         assert row.dim is True
 
-    def test_epm_selected_placeholder_is_dim(self):
+    def test_typed_text_is_not_dim(self):
         row = tp.parse_free_text_row(
-            _fx(f"epm_freetext_row_selected_pretype_{V}.ansi.txt"), number=4
-        )
-        assert row is not None
-        assert row.cursor is True
-        assert row.label == tp.EPM_FREE_TEXT_LABEL
-        assert row.dim is True
-
-    @pytest.mark.parametrize("surface", ["auq", "epm"])
-    def test_typed_text_is_not_dim(self, surface: str):
-        row = tp.parse_free_text_row(
-            _fx(f"{surface}_freetext_row_typed_{V}.ansi.txt"), number=4
+            _fx(f"auq_freetext_row_typed_{V}.ansi.txt"), number=4
         )
         assert row is not None
         assert row.cursor is True
         assert row.dim is False, "typed text must never read as the placeholder"
-        assert row.label not in (tp.AUQ_FREE_TEXT_LABEL, tp.EPM_FREE_TEXT_LABEL)
+        assert row.label != tp.AUQ_FREE_TEXT_LABEL
 
-    @pytest.mark.parametrize(
-        "surface,label",
-        [("auq", tp.AUQ_FREE_TEXT_LABEL), ("epm", tp.EPM_FREE_TEXT_LABEL)],
-    )
-    def test_payload_identical_to_the_placeholder_still_reads_as_typed(
-        self, surface: str, label: str
-    ):
+    def test_payload_identical_to_the_placeholder_still_reads_as_typed(self):
         """The adversarial case the plan called out as a possible scope cut.
 
         Typing the literal placeholder text renders it PLAIN, so the SGR-2 signal
@@ -86,16 +72,13 @@ class TestParseFreeTextRow:
         have read this as "nothing was typed" and refused to commit.
         """
         row = tp.parse_free_text_row(
-            _fx(f"{surface}_freetext_typed_identical_label_{V}.ansi.txt"), number=4
+            _fx(f"auq_freetext_typed_identical_label_{V}.ansi.txt"), number=4
         )
         assert row is not None
-        assert row.label == label  # byte-identical to the placeholder…
+        assert row.label == tp.AUQ_FREE_TEXT_LABEL  # byte-identical to it…
         assert row.dim is False  # …yet PROVABLY typed
 
-    @pytest.mark.parametrize("surface", ["auq", "epm"])
-    def test_large_multiline_payload_renders_literally_not_paste_collapsed(
-        self, surface: str
-    ):
+    def test_large_multiline_payload_renders_literally_not_paste_collapsed(self):
         """THE REGRESSION THE PARENT ASKED ABOUT — measured, not reasoned.
 
         A payload written in ONE ``send-keys -l`` past ~800 chars collapses the
@@ -106,7 +89,7 @@ class TestParseFreeTextRow:
         its number and cursor, and the label is PLAIN (rig-measured; Enter then
         submitted the full 947 chars as the answer, JSONL-verified).
         """
-        pane = _fx(f"{surface}_freetext_row_typed_large_{V}.ansi.txt")
+        pane = _fx(f"auq_freetext_row_typed_large_{V}.ansi.txt")
         assert "Pasted text #" not in pane
         assert "paste again to expand" not in pane
         row = tp.parse_free_text_row(pane, number=4)
@@ -153,14 +136,13 @@ class TestAuqFreeTextRowActive:
         assert tp.parse_free_text_row(pane, number=4) is None  # row is GONE
         assert tp.auq_free_text_row_active(pane) is True  # …but still provable
 
-    def test_epm_ctrl_g_is_NOT_a_row_active_proof(self):
-        """[r4 P1-4] EPM renders ``ctrl+g to edit in Vim`` unconditionally (it is
-        the plan-file footer), so it proves nothing about the cursor. That is why
-        the EPM lane REQUIRES the row itself and refuses an overflowed pane —
-        EPM's option 1 is "Yes, and bypass permissions"."""
+    def test_an_epm_ctrl_g_footer_never_mints_the_proof(self):
+        """ExitPlanMode renders ``ctrl+g to edit in Vim`` UNCONDITIONALLY (it is
+        the plan-file footer, not a row-active signal). The predicate must not be
+        fooled by it: an EPM pane is not an AskUserQuestion at all, so it declines
+        before the footer is ever consulted."""
         untouched = _fx(f"gate_epm_{V}.txt")  # cursor on option 1
         assert "ctrl+g to edit" in untouched
-        # …and it is not an AUQ picker at all, so the AUQ proof declines.
         assert tp.auq_free_text_row_active(untouched) is False
 
     def test_a_STALE_footer_above_the_live_one_cannot_mint_the_proof(self):
@@ -218,16 +200,7 @@ class TestTheStableSurfaceIdentity:
 
     def _auq(self, name: str) -> str | None:
         return tp.free_text_surface_identity(
-            tp.clean_ghost_input_text(_fx(name)),
-            surface="AskUserQuestion",
-            target_row=4,
-        )
-
-    def _epm(self, name: str) -> str | None:
-        return tp.free_text_surface_identity(
-            tp.clean_ghost_input_text(_fx(name)),
-            surface="ExitPlanMode",
-            target_row=4,
+            tp.clean_ghost_input_text(_fx(name)), target_row=4
         )
 
     def test_stable_across_the_cursor_move_and_the_typed_text(self):
@@ -254,38 +227,6 @@ class TestTheStableSurfaceIdentity:
         """It must FAIL CLOSED, never silently degrade to a weaker identity."""
         assert self._auq(f"auq_freetext_overflow_{V}.txt") is None
 
-    def test_every_epm_plan_shares_one_pane_identity(self):
-        """The reason the EPM lane's out-of-band anchor (the ``~/.claude/plans/
-        <slug>.md`` footer path) is MANDATORY: every ExitPlanMode prompt renders
-        the SAME three real options, so the pane alone cannot tell plan P from
-        plan Q. If this ever stops being true, the EPM anchor could be relaxed —
-        until then, relaxing it would be a wrong-card commit onto a plan-approval
-        surface."""
-        p = self._epm(f"epm_freetext_row_selected_pretype_{V}.ansi.txt")
-        q = self._epm(f"epm_freetext_row_typed_{V}.ansi.txt")
-        s = self._epm(f"gate_epm_{V}.txt")
-        assert p is not None and p == q == s
-        # …and the anchor DOES discriminate them.
-        paths = {
-            tp.extract_epm_plan_file_path(tp.clean_ghost_input_text(_fx(n)))
-            for n in (
-                f"epm_freetext_row_selected_pretype_{V}.ansi.txt",
-                f"epm_freetext_row_typed_{V}.ansi.txt",
-                f"gate_epm_{V}.txt",
-            )
-        }
-        assert len(paths) == 3 and None not in paths
-
-    def test_a_numbered_plan_BODY_no_longer_hijacks_the_option_walk(self):
-        """Most plans render a numbered list of steps. That list used to capture
-        ``_parse_numbered_options``' top-down walk, so the real option block was
-        never reached and the ENTIRE EPM free-text lane silently declined on the
-        common shape. The block is now delimited by the prompt's own ``UIPattern``
-        anchors. (Fail-closed, so it was never dangerous — just dead.)"""
-        pane = tp.clean_ghost_input_text(_fx(f"epm_freetext_row_typed_{V}.ansi.txt"))
-        assert "1. Create goodbye.txt" in pane  # the numbered plan body
-        assert self._epm(f"epm_freetext_row_typed_{V}.ansi.txt") is not None
-
 
 class TestTheDerivedFramesAreFaithful:
     """``tests/free_text_frames`` derives two frames the rig corpus lacks (a
@@ -303,65 +244,20 @@ class TestTheDerivedFramesAreFaithful:
         return found
 
     def test_the_typed_derivation_is_byte_identical_to_the_real_capture(self):
-        from tests.free_text_frames import AUQ_X_LANDED, EPM_P_LANDED, type_into_row
+        from tests.free_text_frames import AUQ_X_LANDED, type_into_row
 
         auq_real = _fx(f"auq_freetext_row_typed_{V}.ansi.txt")
         assert self._row(
             type_into_row(AUQ_X_LANDED, 4, "teal, actually"), 4
         ) == self._row(auq_real, 4)
 
-        epm_real = _fx(f"epm_freetext_row_typed_{V}.ansi.txt")
-        epm_derived = type_into_row(
-            EPM_P_LANDED, 4, "please name it farewell.txt instead"
-        )
-        assert self._row(epm_derived, 4) == self._row(epm_real, 4)
-
     def test_the_cursor_move_derivation_parses_as_a_real_capture_does(self):
-        from tests.free_text_frames import AUQ_X_LIVE, EPM_P_LIVE
+        from tests.free_text_frames import AUQ_X_LIVE
 
         form = tp.parse_ask_user_question(tp.clean_ghost_input_text(AUQ_X_LIVE))
         assert form is not None
         assert [o.number for o in form.options if o.cursor] == [1]
         assert tp.parse_free_text_row(AUQ_X_LIVE, number=4).cursor is False  # type: ignore[union-attr]
-
-        epm = tp.parse_exit_plan_form(tp.clean_ghost_input_text(EPM_P_LIVE))
-        assert epm is not None
-        assert [o.number for o in epm.options if o.cursor] == [1]
-
-
-class TestParseExitPlanForm:
-    def test_parses_the_live_epm_option_block(self):
-        form = tp.parse_exit_plan_form(_fx(f"gate_epm_{V}.txt"))
-        assert form is not None
-        assert [o.number for o in form.options] == [1, 2, 3, 4]
-        assert form.options[-1].label == tp.EPM_FREE_TEXT_LABEL
-        assert form.options[0].cursor is True  # the default landing row
-        assert form.is_free_text is True
-
-    def test_cursor_tracks_the_selected_row(self):
-        pane = tp.clean_ghost_input_text(
-            _fx(f"epm_freetext_row_selected_pretype_{V}.ansi.txt")
-        )
-        form = tp.parse_exit_plan_form(pane)
-        assert form is not None
-        assert [o.number for o in form.options if o.cursor] == [4]
-
-    def test_declines_a_pane_without_the_feedback_affordance(self):
-        # An AUQ picker is not an EPM prompt — the last row must be the EPM
-        # affordance label or the parse returns None (never a guessed row index).
-        assert tp.parse_exit_plan_form(_fx(f"auq_single_picker_{V}.txt")) is None
-        assert tp.parse_exit_plan_form("") is None
-
-    def test_epm_overflow_keeps_the_row_visible(self):
-        """EPM overflows the OTHER way (rig-measured): its prompt grows DOWNWARD,
-        so a long draft pushes the FOOTER off the bottom while the ``❯ 4.`` row
-        stays on the pane. So the EPM lane's row-based verifier still works
-        exactly where the AUQ lane's footer-based one would not."""
-        ansi = _fx(f"epm_freetext_overflow_{V}.ansi.txt")
-        pane = tp.clean_ghost_input_text(ansi)
-        assert "ctrl+g to edit" not in pane  # footer is GONE
-        row = tp.parse_free_text_row(ansi, number=4)
-        assert row is not None and row.cursor is True and row.dim is False
 
 
 class TestTheInputBoxIsNeverPresentOnThese:
@@ -379,9 +275,6 @@ class TestTheInputBoxIsNeverPresentOnThese:
             f"auq_freetext_row_selected_pretype_{V}.ansi.txt",
             f"auq_freetext_row_typed_large_{V}.ansi.txt",
             f"auq_freetext_overflow_{V}.txt",
-            f"epm_freetext_row_selected_pretype_{V}.ansi.txt",
-            f"epm_freetext_row_typed_large_{V}.ansi.txt",
-            f"epm_freetext_overflow_{V}.ansi.txt",
         ],
     )
     def test_no_input_box(self, name: str):

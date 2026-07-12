@@ -443,9 +443,16 @@ async def _apply_reply_context(
     Returns ``(rendered_text, applied)``. ``applied`` is True IFF a quote block
     was actually rendered into the text — GH #50 PR-2 (plan §2.3 [r4 P2-1]) needs
     the provenance fact OBSERVED, not guessed: by the time the aggregator sees
-    the string, a rendered quote is indistinguishable from prose the user typed,
-    and a reply-context payload is NOT free-text-eligible (it is a message
-    ADDRESSED to Claude, not the card's answer).
+    the string, a rendered quote is indistinguishable from prose the user typed.
+
+    A reply-context payload **IS** free-text-eligible (OWNER DECISION 2026-07-12,
+    superseding plan §2.3, which made it ineligible): the owner's dominant gesture
+    at a card is a VOICE NOTE sent as a REPLY to it, so the as-planned rule refused
+    their most natural way of answering. Claude receives the FULL rendered payload
+    — the quoted context AND the user's words — exactly as it would for any other
+    send. The FACT is still observed and carried through merges and pending-bind
+    replay; only its effect on eligibility changed (see
+    ``inbound_aggregator.Provenance.free_text_eligible``).
 
     ``(text, False)`` when the kill switch is off, when there is no quoted
     referent, or when the quote points at a stale (e.g. /clear-ed) session and

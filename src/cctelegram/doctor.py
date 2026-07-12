@@ -1,9 +1,7 @@
 """Doctor health checks for CC Telegram.
 
 Reports the state of the local install: required env vars, tmux + claude on
-PATH, the four managed Claude Code hook entries (SessionStart,
-PreToolUse(AskUserQuestion), PreToolUse(ExitPlanMode), Notification), and the
-config directory.
+PATH, the three managed Claude Code hooks, and the config directory.
 
 Required-key precedence mirrors ``Config``: an existing process environment
 key wins even when empty, followed by cwd-local ``.env`` and then the config-dir
@@ -137,10 +135,6 @@ def _run_health_checks(target: Path) -> tuple[int, int, int]:
     hook_specs = (
         ("SessionStart", None, "SessionStart hook"),
         ("PreToolUse", "AskUserQuestion", "PreToolUse(AskUserQuestion) hook"),
-        # GH #50 PR-2 r3: the ExitPlanMode occurrence witness. Without it the bot
-        # cannot prove WHICH plan prompt a free-text answer would commit onto, so
-        # the lane declines and those messages take the delivery gate's refusal.
-        ("PreToolUse", "ExitPlanMode", "PreToolUse(ExitPlanMode) hook"),
         ("Notification", None, "Notification hook"),
     )
     for event, matcher, label in hook_specs:

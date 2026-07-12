@@ -4,11 +4,16 @@ Black-box, at the public Telegram seam: a real ``Update`` → the real
 ``text_handler`` → the real aggregator → the real free-text executor → a fake
 tmux whose panes are the REAL CC 2.1.207 rig captures.
 
-PR-1 refuses every payload at a live blocking surface. PR-2 makes the two
-surfaces Claude Code gives a free-text affordance actually answerable:
+PR-1 refuses every payload at a live blocking surface. PR-2 makes the ONE surface
+it ships for actually answerable:
 
     AskUserQuestion (single-select)   row N+1  "Type something."
-    ExitPlanMode                      row 4    "Tell Claude what to change"
+
+ExitPlanMode had its own lane through peer-review round 3; the owner DROPPED it
+on 2026-07-12 (they run ``--dangerously-skip-permissions`` anyway, so hardening a
+plan-approval surface did not justify a whole hook + state file + trust
+boundary). A plan card therefore takes PR-1's refusal — pinned below as an
+explicit, intended degradation, not an accident.
 
 The FakeTmux pane is advanced by a script bound to the keystrokes the executor
 sends — that is the TERMINAL behaving like a terminal (the fake substrate), not
@@ -48,13 +53,6 @@ from tests.free_text_frames import (
     AUQ_X_TYPED_BIG,
     AUQ_Y_TYPED,
     BIG_ANSWER,
-    EPM_P_ANSWER,
-    EPM_P_LANDED,
-    EPM_P_LIVE,
-    EPM_P_PLAN_PATH,
-    EPM_P_TYPED,
-    EPM_Q_TYPED_AT_P_PATH,
-    EPM_RESOLVED,
     plain,
 )
 
@@ -71,20 +69,19 @@ AUQ_TYPED = AUQ_X_TYPED  # card X, cursor row 4, PLAIN
 AUQ_TYPED_BIG = AUQ_X_TYPED_BIG  # card X, the 947-char answer
 AUQ_OTHER_CARD_TYPED = AUQ_Y_TYPED  # card Y — a DIFFERENT question, same geometry
 
-EPM_LIVE = EPM_P_LIVE  # plan P, cursor row 1
-EPM_LANDED = EPM_P_LANDED
-EPM_TYPED = EPM_P_TYPED
-
 OUT_OF_SCOPE = {
     "auq_multi_select": pane_fixture(f"auq_multi_picker_{V}.txt"),
+    # ExitPlanMode is out of scope BY DECISION (2026-07-12), not by accident: its
+    # option 1 is "Yes, and bypass permissions", and a plan card must now take
+    # PR-1's refusal like any other blocking surface.
+    "exit_plan_mode": pane_fixture(f"gate_epm_{V}.txt"),
     "folder_trust": pane_fixture(f"folder_trust_arrival_plain_{V}.txt"),
     "switch_model": pane_fixture(f"switch_model_live_{V}.txt"),
 }
 
-# The exact answers the typed fixtures render (so the authorship + tail proofs
+# The exact answer the typed fixtures render (so the authorship + tail proofs
 # see the truth on the pane).
 AUQ_ANSWER = AUQ_X_ANSWER
-EPM_ANSWER = EPM_P_ANSWER
 
 
 @pytest.fixture(autouse=True)
@@ -100,18 +97,12 @@ def _fast(monkeypatch: pytest.MonkeyPatch):
 # ── The OCCURRENCE anchors, as REAL files on the REAL substrate ───────────
 #
 # The free-text lane refuses to touch a card it cannot identify by an
-# occurrence-unique anchor. BOTH anchors are now the same kind of thing — a
-# ``PreToolUse`` side file minted by the process that is about to block, BEFORE
-# it renders, carrying the prompt's per-invocation ``tool_use_id`` — and the
-# scenario floor drives the real readers over real bytes, stubbing nothing:
-#
-#   AskUserQuestion → the PreToolUse hook's ``auq_pending/<session>.json``
-#   ExitPlanMode    → the PreToolUse hook's ``epm_pending/<session>.json``
-#
-# EPM's anchor was a plan-file PATH (round-1) and then a hash of that file's
-# CONTENT (round-2). Both describe the plan ARTIFACT, and neither can name the
-# prompt OCCURRENCE: rig-verified on 2.1.207, three consecutive ExitPlanMode
-# prompts shared ONE slug and the file was rewritten in place each time.
+# occurrence-unique anchor: the ``PreToolUse(AskUserQuestion)`` side file, minted
+# by the process that is about to block, BEFORE it renders, carrying the prompt's
+# per-invocation ``tool_use_id``. The scenario floor drives the REAL reader over
+# REAL bytes, stubbing nothing — including the hook-written ``session_map.json``
+# (the harness writes it at bind time, exactly as ``SessionStart`` does), because
+# the anchor embeds the window's FRESHLY-resolved session generation (round-4 P1).
 
 SESSION_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"  # the reader validates UUIDs
 
@@ -144,35 +135,6 @@ def _write_auq_side_file() -> None:
             "input_fingerprint": "",  # RECOMPUTED by the reader; never trusted
             "transcript_path": "",
             "cwd": "/repo",
-        },
-    )
-
-
-def _write_epm_side_file(window_id: str, *, tool_use_id: str = "toolu_PLAN_P") -> None:
-    """What the ``PreToolUse(ExitPlanMode)`` hook writes before a plan prompt
-    renders (rig-verified shape, 2.1.207).
-
-    ``window_key`` is MANDATORY in this lane — it is the double-``--resume``
-    sibling predicate, and this is the surface whose option 1 is "Yes, and bypass
-    permissions". It is built exactly as ``epm_source._expected_window_key`` does,
-    so mint and validate share one source.
-    """
-    from cctelegram.utils import app_dir, atomic_write_json
-
-    pending = app_dir() / "epm_pending"
-    pending.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(
-        pending / f"{SESSION_ID}.json",
-        {
-            "schema_version": 1,
-            "session_id": SESSION_ID,
-            "tool_use_id": tool_use_id,
-            "window_key": f"{_real_tmux.session_name}:{window_id}",
-            "written_at": time.time(),
-            # The slug Claude REUSES across plans — carried for observability
-            # only; it is NOT the identity (that is the whole point).
-            "plan_file_path": EPM_P_PLAN_PATH,
-            "plan_fingerprint": "0a1620b6f022f898",
         },
     )
 
@@ -219,11 +181,10 @@ async def _bind(
     )
     h.bind_thread(42, wid, display_name="repo", cwd="/repo", session_id=SESSION_ID)
     if side_file:
-        # The occurrence anchors, both surfaces. ``side_file=False`` is the
-        # hook-less install: the lane then has no way to identify the card and
-        # must DECLINE (PR-1 owns the refusal, nothing is typed).
+        # The occurrence anchor. ``side_file=False`` is the hook-less install:
+        # the lane then has no way to identify the card and must DECLINE (PR-1
+        # owns the refusal, nothing is typed).
         _write_auq_side_file()
-        _write_epm_side_file(wid)
     if card:
         # The REAL render seam the 1 Hz poller drives — this is what publishes
         # the interactive surface the free-text lane is gated on.
@@ -303,28 +264,6 @@ class TestTheOwnersActualUseCase:
         # proved is consumed as literal text on an affordance row.
         assert scenario.tmux.written_texts == [BIG_ANSWER]
         assert not any("Not delivered" in n for n in _notices(scenario))
-
-
-class TestExitPlanMode:
-    @pytest.mark.asyncio
-    async def test_a_message_rejects_the_plan_with_feedback(
-        self, scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
-    ):
-        """Row 4 = "Tell Claude what to change" ⇒ the plan is REJECTED, the
-        feedback is delivered, and PLAN MODE IS PRESERVED (rig-verified: the
-        plan's file was NOT written and the mode line still read "plan mode on").
-
-        It must never reach option 1 — "Yes, and bypass permissions".
-        """
-        wid = await _bind(scenario, EPM_LIVE)
-        _script_pane(
-            scenario, monkeypatch, landed=EPM_LANDED, typed=EPM_TYPED, done=EPM_RESOLVED
-        )
-
-        await _send_text(scenario, wid, EPM_ANSWER)
-
-        assert _arrows(scenario) == ["Down", "Down", "Down"]
-        assert scenario.tmux.delivered(EPM_ANSWER)
 
 
 class TestOutOfScopeSurfacesKeepThePr1Refusal:
@@ -458,81 +397,6 @@ class TestTheWrongCard:
 
         assert scenario.tmux.committed is False, "the wrong card must not be answered"
         assert any("NOT" in n or "not" in n for n in _notices(scenario))
-
-    @pytest.mark.asyncio
-    async def test_a_REVISED_plan_that_kept_its_slug_never_receives_the_feedback(
-        self,
-        scenario: ScenarioHarness,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        """peer-review round-3 P1 — the ExitPlanMode anchor named the ARTIFACT.
-
-        Re-planning rewrites the SAME plan file, so plan P and its successor
-        render the SAME footer path — and every EPM renders the SAME three real
-        options, so the pane component matches too. The round-1 anchor (the PATH)
-        and the round-2 anchor (a hash of that file's CONTENT) were therefore BOTH
-        satisfiable by a DIFFERENT prompt. This is the plan-approval surface whose
-        option 1 is "Yes, and bypass permissions".
-
-        The anchor is now the hook's per-invocation ``tool_use_id``: re-planning
-        re-fires ``PreToolUse(ExitPlanMode)``, which rewrites the side file with a
-        NEW id while the slug and the options stay identical. Driven end to end
-        over the REAL side file and the REAL reader.
-        """
-        wid = await _bind(scenario, EPM_LIVE)
-
-        real_send = scenario.tmux.send_keys
-
-        async def send(window_id, keys, enter=True, literal=True):
-            ok = await real_send(window_id, keys, enter=enter, literal=literal)
-            if not literal and not enter and keys in ("Down", "Up"):
-                scenario.tmux.set_pane(window_id, plain(EPM_LANDED), ansi=EPM_LANDED)
-            elif literal and not enter and keys:
-                # Claude RE-PLANNED while we typed and re-presented: same slug,
-                # same options, different plan — so its PreToolUse hook re-fired
-                # with a NEW tool_use_id (the ONLY thing that can tell them apart).
-                _write_epm_side_file(window_id, tool_use_id="toolu_PLAN_Q")
-                scenario.tmux.set_pane(
-                    window_id,
-                    plain(EPM_Q_TYPED_AT_P_PATH),
-                    ansi=EPM_Q_TYPED_AT_P_PATH,
-                )
-            elif enter and not keys:
-                scenario.tmux.set_pane(
-                    window_id, plain(EPM_RESOLVED), ansi=EPM_RESOLVED
-                )
-            return ok
-
-        monkeypatch.setattr(_real_tmux, "send_keys", send)
-
-        await _send_text(scenario, wid, EPM_ANSWER)
-
-        assert scenario.tmux.committed is False, (
-            "the SUCCESSOR plan must not be approved"
-        )
-        assert any("NOT" in n or "not" in n for n in _notices(scenario))
-
-    @pytest.mark.asyncio
-    async def test_an_epm_with_no_PreToolUse_side_file_falls_back_to_the_pr1_refusal(
-        self, scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
-    ):
-        """peer-review round-3 P1 — with no ``PreToolUse(ExitPlanMode)`` hook the
-        bot cannot name WHICH plan prompt it would be committing onto, and nothing
-        else can: the pane is degenerate across plans and the plan file's path is a
-        reused per-session slug. So the lane DECLINES pre-keystroke and PR-1 owns
-        the refusal — a degradation, never a hazard."""
-        wid = await _bind(scenario, EPM_LIVE, side_file=False)
-        _script_pane(
-            scenario, monkeypatch, landed=EPM_LANDED, typed=EPM_TYPED, done=EPM_RESOLVED
-        )
-
-        await _send_text(scenario, wid, EPM_ANSWER)
-
-        assert scenario.tmux.committed is False
-        assert scenario.tmux.written_texts == [], "nothing may be typed into the card"
-        assert _arrows(scenario) == [], "not a single keystroke"
-        # PR-1 owns the single refusal — the lane never invents its own.
-        assert any("Not delivered" in n for n in _notices(scenario))
 
     @pytest.mark.asyncio
     async def test_an_auq_with_no_PreToolUse_side_file_falls_back_to_the_pr1_refusal(

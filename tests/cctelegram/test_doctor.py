@@ -48,11 +48,7 @@ def _stub_environment_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
                         {
                             "matcher": "AskUserQuestion",
                             "hooks": [{"command": "cc-telegram hook"}],
-                        },
-                        {
-                            "matcher": "ExitPlanMode",
-                            "hooks": [{"command": "cc-telegram hook"}],
-                        },
+                        }
                     ],
                     "Notification": [
                         {"hooks": [{"command": "cc-telegram hook"}]},
@@ -107,11 +103,7 @@ class TestHealthChecks:
                             {
                                 "matcher": "AskUserQuestion",
                                 "hooks": [{"command": "cc-telegram hook"}],
-                            },
-                            {
-                                "matcher": "ExitPlanMode",
-                                "hooks": [{"command": "cc-telegram hook"}],
-                            },
+                            }
                         ],
                         "Notification": [
                             {"hooks": [{"command": "cc-telegram hook"}]},
@@ -132,12 +124,9 @@ class TestHealthChecks:
         assert "OK   claude on PATH" in out
         assert "OK   SessionStart hook" in out
         assert "OK   PreToolUse(AskUserQuestion) hook" in out
-        # GH #50 PR-2 r3: the plan-prompt occurrence witness is a managed hook too.
-        assert "OK   PreToolUse(ExitPlanMode) hook" in out
         assert "OK   Notification hook" in out
         assert "OK   config dir writable" in out
-        # 9 checks since GH #50 PR-2 r3 added PreToolUse(ExitPlanMode).
-        assert "9 ok / 0 warn / 0 fail" in out
+        assert "8 ok / 0 warn / 0 fail" in out
 
     def test_health_reports_missing_token_and_missing_tools(
         self,
@@ -165,8 +154,7 @@ class TestHealthChecks:
         # config dir is writable; that one is OK.
         assert "OK   config dir writable" in out
         summary = [line for line in out.splitlines() if line.endswith(" fail")][-1]
-        # 3 warns: both PreToolUse matchers + Notification (settings file absent).
-        assert summary.startswith("1 ok / 3 warn / 5 fail")
+        assert summary.startswith("1 ok / 2 warn / 5 fail")
 
     def test_health_warns_when_hook_missing_with_settings_present(
         self,

@@ -2388,25 +2388,6 @@ async def post_init(application: Application) -> None:
         # Never let cleanup/maintenance crash bot startup.
         logger.warning("AUQ pretool startup maintenance raised: %s", e)
 
-    # ExitPlanMode PreToolUse side-file maintenance (GH #50 PR-2 r3):
-    #   1. GC stale epm_pending/ files (>24h) left by crashes. Same injected
-    #      liveness conservative-skip as the AUQ GC above — Claude buffers the
-    #      ExitPlanMode tool_use in JSONL until the prompt resolves, so a live
-    #      plan card's side file has a stale mtime yet is STILL the only witness
-    #      of WHICH plan prompt it is.
-    #   2. Warn (one-time) if the PreToolUse(ExitPlanMode) hook is missing —
-    #      without it the free-text lane cannot name the plan prompt it would be
-    #      committing onto, so it DECLINES and every message at a plan card takes
-    #      PR-1's refusal (a degradation, never a hazard).
-    try:
-        from .handlers import epm_source
-        from .handlers.interactive_ui import warn_if_epm_pre_tool_use_hook_missing
-
-        epm_source.gc_stale(is_live_session=startup_gc_is_live)
-        warn_if_epm_pre_tool_use_hook_missing()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("EPM pretool startup maintenance raised: %s", e)
-
     # Notification side-file maintenance (Wave B busy-signal):
     #   1. Garbage-collect stale notify_pending/ files (>24h) left by
     #      crashes / notifications fired while the bot was down. Same

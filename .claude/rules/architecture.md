@@ -74,12 +74,7 @@
 │  - Thread bindings     │         │    PreToolUse(AUQ) →   │
 │    (topic → window)    │         │      write auq_pending │
 │  - Message history     │────────►│      side file         │
-│    retrieval           │  reads  │    PreToolUse(EPM) →   │
-└────────────────────────┘  JSONL  │      write epm_pending │
-                                   │      side file (the    │
-                                   │      plan prompt's     │
-                                   │      OCCURRENCE id)    │
-                                   │    Notification →      │
+│    retrieval           │  reads  │    Notification →      │
                                    │      write notify_     │
                                    │      pending side file │
                                    │  - Receive hook stdin  │
@@ -354,84 +349,107 @@ Additional modules:
                                 lone_hotkey_line (the SEGMENT-aware, PER-LINE
                                 bare-digit refusal) + is_bare_slash_payload (the
                                 post-write `/`-completion exemption).
-  handlers/free_text.py       ─ GH #50 PR-2: free-text answers on a LIVE card. The
-                                executor that makes a Telegram message ANSWER an
-                                AskUserQuestion single-select (row N+1 "Type
-                                something.") or REJECT an ExitPlanMode plan with
-                                feedback (row 4 "Tell Claude what to change",
-                                plan mode PRESERVED). Reuses the shipped dispatch
-                                discipline verbatim (window_send_lock, bounded
-                                cancellation-safe captures, a FRESH in-lock
-                                pane_command_is_claude + version-license re-read
-                                before the first key, monotonic arrow nav,
-                                settle→re-parse→verify, Enter as the ONLY commit
-                                key). TWO THINGS MUST BE PROVEN, NOT ONE:
+  handlers/free_text.py       ─ GH #50 PR-2: free-text answers on a LIVE
+                                AskUserQuestion card. The executor that makes a
+                                Telegram message ANSWER an AUQ single-select
+                                picker by driving its row N+1 "Type something."
+                                affordance. **ExitPlanMode is OUT (owner decision
+                                2026-07-12)** — an earlier revision drove EPM's
+                                own affordance row (row 4), but its safety rested
+                                ENTIRELY on a new PreToolUse(ExitPlanMode) hook +
+                                epm_pending/ side file, because nothing else can
+                                name a plan prompt (every EPM renders the same
+                                three real options; the planFilePath is a
+                                per-session slug Claude rewrites in place). The
+                                owner runs --dangerously-skip-permissions anyway,
+                                so that hook + state file + trust boundary was
+                                not worth it. REMOVED, not disabled: an EPM card
+                                now falls through to PR-1's gate, which REFUSES
+                                the message — a plan card cannot be answered in
+                                prose (the intended degradation; the pre-PR-2 EPM
+                                machinery — the 📋 plan-body post,
+                                extract_epm_plan_file_path, the EPM interactive
+                                card — is untouched).
+                                Reuses the shipped dispatch discipline verbatim
+                                (window_send_lock, bounded cancellation-safe
+                                captures, a FRESH in-lock pane_command_is_claude
+                                + version-license re-read before the first key,
+                                monotonic arrow nav, settle→re-parse→verify,
+                                Enter as the ONLY commit key). TWO THINGS MUST BE
+                                PROVEN, NOT ONE:
                                   * the pane STATE — TYPED-STATE PROOF = SGR-2: the
                                     affordance placeholder renders DIM while the row
                                     is SELECTED and UNTYPED; typed text does not
-                                    (rig-verified on BOTH lanes, and on the
-                                    adversarial payload byte-identical to the
-                                    placeholder); and
+                                    (rig-verified, and on the adversarial payload
+                                    byte-identical to the placeholder); and
                                   * WHICH CARD — SurfaceIdentity, captured before the
                                     first key and RE-CHECKED after the nav and again
                                     in the final pre-Enter capture. Every other leg
                                     is equally satisfied by a SUCCESSOR card holding
                                     our text (another controller can resolve card A
-                                    and render card B mid-transaction), and on EPM
-                                    that is a plan-approval surface. Two components:
-                                    `pane` (terminal_parser.free_text_surface_identity
-                                    — the REAL options 1..target_row-1, CURSOR-blind
+                                    and render card B mid-transaction). Two
+                                    components: `pane`
+                                    (terminal_parser.free_text_surface_identity —
+                                    the REAL options 1..target_row-1, CURSOR-blind
                                     AND TARGET-ROW-blind, so it survives the two
                                     mutations the executor ITSELF performs; None ⇒
                                     unrecoverable, never a weaker prefix) and
                                     `anchor` — the OCCURRENCE-unique, out-of-band,
-                                    scroll-independent generation id, MANDATORY on
-                                    BOTH surfaces (peer-review round-2, two P1s;
-                                    derive_identity returns None without one, so an
-                                    anchor-less pane never yields an identity and
-                                    "None matches None" is dead by construction):
-                                    the PreToolUse side-file occurrence id, on BOTH
-                                    surfaces (auq_source /
-                                    epm_source.peek_surface_identity_for_window —
+                                    scroll-independent generation id, MANDATORY
+                                    (peer-review round-2 P1; derive_identity returns
+                                    None without one, so an anchor-less pane never
+                                    yields an identity and "None matches None" is
+                                    dead by construction): the PreToolUse side-file
+                                    occurrence id
+                                    (auq_source.peek_surface_identity_for_window —
                                     the hook's per-invocation tool_use_id, minted
-                                    BEFORE the prompt renders). The pane cannot tell
-                                    two identically-optioned AUQs apart, nor two
-                                    plan prompts (all EPMs render the same three
-                                    real options), so NO side file ⇒ the lane
-                                    DECLINES; PreToolUse is thus a REQUIREMENT of
-                                    BOTH lanes, README-documented + doctor-checked.
-                                    EPM's anchor was the plan-file PATH (r1) then a
-                                    hash of its CONTENT (r2): both describe the plan
-                                    ARTIFACT, neither names the prompt OCCURRENCE —
-                                    rig-verified 2.1.207, the planFilePath is a
-                                    per-SESSION slug REUSED across three different
-                                    plans and rewritten in place each time (r3 P1).
-                                    Rejected: os.stat (metadata, flips on a touch)
-                                    and status_polling._epm_surface_first_seen_at
-                                    (setdefault + absent-streak hysteresis ⇒ it
-                                    CARRIES across a P→Q transition with no observed
-                                    gap — it would detect nothing here).
-                                    **THE ANCHOR IS READ BEFORE THE PANE** — the
-                                    OTHER half of the r3 fix, which a change of
-                                    anchor SOURCE alone would NOT have closed:
-                                    derive_identity used to read the anchor itself,
-                                    AFTER its caller captured the pane, minting the
-                                    chimera (OLD pane, NEW anchor) — and since both
-                                    surfaces' pane components are degenerate across
-                                    occurrences, that chimera MATCHES every later
-                                    observation and commits onto the successor (a
-                                    tool_use_id read after the pane is chimeric
-                                    identically; REPRO-CONFIRMED by restoring the
-                                    old order). derive_identity now TAKES the anchor;
-                                    read_surface_anchor(s) run strictly BEFORE every
-                                    capture at all three observation points, so the
-                                    only reachable chimera is (NEWER pane, OLDER
+                                    BEFORE the picker renders). The pane cannot tell
+                                    two identically-optioned AUQs apart, so NO side
+                                    file ⇒ the lane DECLINES; PreToolUse is thus a
+                                    REQUIREMENT of the lane, README-documented +
+                                    doctor-checked.
+                                    **THE ANCHOR IS READ BEFORE THE PANE** (round-3
+                                    P1, which a change of anchor SOURCE alone would
+                                    NOT have closed): derive_identity used to read
+                                    the anchor itself, AFTER its caller captured the
+                                    pane, minting the chimera (OLD pane, NEW anchor)
+                                    — and since the pane component is degenerate
+                                    across same-shaped occurrences, that chimera
+                                    MATCHES every later observation and commits onto
+                                    the successor. derive_identity now TAKES the
+                                    anchor; read_surface_anchor runs strictly BEFORE
+                                    every capture at all three observation points, so
+                                    the only reachable chimera is (NEWER pane, OLDER
                                     anchor), which fails closed. Same "probe FIRST,
                                     capture LAST" discipline as the PR-1 re-verify
-                                    (r2 F4). terminal_parser.extract_epm_plan_file_path
-                                    stays STRICTLY footer-scoped (it no longer feeds
-                                    identity, but interactive_ui still uses it to
-                                    post the plan body).
+                                    (r2 F4).
+                                    **THE ANCHOR CARRIES THE SESSION GENERATION**
+                                    (round-4 P1 — the stale session cache defeated
+                                    the anchor ENTIRELY). It used to resolve the
+                                    window's session via the CACHED
+                                    WindowState.session_id — a MIRROR of the
+                                    hook-written session_map.json, refreshed only on
+                                    the monitor's poll cycle. A /clear in the SAME
+                                    tmux window rotates the session while the cache
+                                    still names the old one, so all three
+                                    observations read the PREDECESSOR session's side
+                                    file while capturing the SUCCESSOR's pane: they
+                                    agree with each OTHER, nothing refuses, and the
+                                    Enter commits the answer onto the WRONG QUESTION
+                                    (a per-window predicate cannot see it — both
+                                    sessions occupy the same window). auq_source now
+                                    resolves through
+                                    session.read_session_id_for_window_fresh and
+                                    EMBEDS the id in the anchor
+                                    (auq:sid:<session>:tu:<tool_use_id>), so a
+                                    rotation between any two observation points
+                                    changes the anchor and refuses; a successor with
+                                    no side file yields None, which refuses too. An
+                                    EMPTY hook-captured tool_use_id also yields None
+                                    (round-4 P2 — a (written_at, content-hash)
+                                    composite is a guessable stand-in for an
+                                    occurrence witness, not one; scoped to the ANCHOR
+                                    path, the GH #48 recap lane keeps its composite).
                                 A braked window (PR-1's stranded-draft registry) is
                                 checked FIRST and DECLINES — the lane is never a way
                                 around the brake, and never clears it. VERSION-LICENSED
@@ -642,38 +660,6 @@ Handler modules (handlers/):
                         released / failed_before_digit do NOT spend the row;
                         ``accepted`` stays claimed REGARDLESS of process epoch
                         (crash-ambiguous — Enter may have been sent).
-  epm_source.py       ─ GH #50 PR-2 r3 ExitPlanMode PreToolUse side-file trust
-                        boundary (leaf; imports session.peek + utils, tmux_manager
-                        deferred — the notify_source shape). Owns
-                        epm_pending/<session_id>.json, whose ONE consumer is
-                        free_text.SurfaceIdentity.anchor on the EPM surface.
-                        peek_surface_identity_for_window returns the plan prompt's
-                        OCCURRENCE id — the hook's per-invocation tool_use_id
-                        (defensive composite fallback: (written_at, plan
-                        fingerprint)) — under a HARD
-                        `window_key == "tmux_session:window_id"` read predicate
-                        (double-`--resume` sibling safety; STRICTER than the AUQ
-                        lane, whose session-keyed record cannot disambiguate
-                        siblings — EPM is the surface whose option 1 bypasses
-                        permissions, so it gets the strongest predicate, and the
-                        strictness costs nothing because the file has exactly one
-                        reader) + schema/future-skew validation, and deliberately
-                        NO read-TTL (identity does not expire: a plan card left
-                        open for hours is still that card). Records carry NO plan
-                        BODY (the consumer needs a NAME, not the contents).
-                        WHY IT EXISTS: nothing derived from the plan ARTIFACT can
-                        name the prompt — every EPM renders the same three real
-                        options, and the planFilePath is a per-SESSION slug Claude
-                        REUSES, rewriting the file in place on each re-plan
-                        (rig-verified 2.1.207: three consecutive prompts, one slug,
-                        three distinct tool_use_ids). forget_for_window /
-                        unlink_for_session are the lifecycle seams (EPM resolution
-                        via forget_ask_tool_input, session replacement / /clear via
-                        the monitor's OLD session id, topic close); gc_stale is the
-                        24h startup backstop with the injected is_live_session
-                        conservative-skip (Claude buffers the EPM tool_use in JSONL
-                        until resolution, so a live plan card's file has a stale
-                        mtime yet is still the only witness of which card it is).
   notify_source.py    ─ Wave B Notification-hook side-file trust boundary
                         (leaf; imports session.peek + utils, tmux_manager
                         deferred). Owns notify_pending/<session_id>.json:
@@ -967,19 +953,6 @@ State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
                              dir mode 0700, files mode 0600; kept across
                              multi-select toggles; cleaned on AUQ tool_result,
                              session replacement, or startup GC
-  epm_pending/<sid>.json   ─ GH #50 PR-2 r3 PreToolUse(ExitPlanMode) side files —
-                             the plan prompt's OCCURRENCE witness
-                             {schema_version, session_id, tool_use_id, window_key,
-                             written_at, plan_file_path, plan_fingerprint}; NO plan
-                             body (mode 0600 under dir 0700). Written by the hook
-                             BEFORE the plan prompt renders; read by epm_source with
-                             the hard window_key predicate; the sole EPM input to
-                             free_text.SurfaceIdentity.anchor. Cleaned at EPM
-                             resolution (forget_ask_tool_input), session
-                             replacement / /clear (OLD session id), topic close;
-                             24h startup GC. No hook ⇒ no witness ⇒ the free-text
-                             lane DECLINES on EPM (PR-1 refuses) — a degradation,
-                             never a hazard.
   notify_pending/<sid>.json ─ Wave B Notification-hook side files; window-keyed
                              {ts, window_key, generation, kind} markers (mode
                              0600 under dir 0700) — NO notification message
@@ -1059,7 +1032,7 @@ State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
 - **Window ID-centric** — All internal state keyed by tmux window ID (e.g. `@0`, `@12`), not window names. Window IDs are guaranteed unique within a tmux server session. Window names are kept as display names via `window_display_names` map. Same directory can have multiple windows.
 - **Machine-surface window geometry (Wave B)** — bot windows are `160x50` by default (`CC_TELEGRAM_WINDOW_GEOMETRY`, `config.window_width`/`window_height`): terminals are a MACHINE surface (nobody attaches), so geometry serves the parser — 50 rows keep a tall AUQ picker fully on-screen (real `❯` from frame 1), 160 cols shrink the `N.Label` overflow class. ONE mechanism, `TmuxManager._cmd_resize_window` (per-window `resize-window -x -y`, stderr-checked, flips `window-size=manual`; never session-level `default-size`/`aggressive-resize`/`window-size` options), at TWO callsites: `create_window` resizes BEFORE the claude launch (a failure logs WARNING and still launches), and `bot._reconcile_window_geometry` resizes every listed window once in `post_init` after `resolve_stale_ids` (idempotent, per-window failures non-fatal). Dispatch logic untouched.
 - **Hook-based session tracking** — Claude Code `SessionStart` hook writes `session_map.json`; monitor reads it each poll cycle to auto-detect session changes.
-- **PreToolUse(AskUserQuestion) side files** — the `PreToolUse` hook (matcher `AskUserQuestion`) captures the structured `tool_input` to `auq_pending/<session_id>.json` before Claude renders the picker. The bot reads the side file at picker render time so each option's full description is visible in the Telegram context message immediately, before terminal completion. Side files are mode 0600 under a 0700 directory; multi-select `aqt:` toggles keep them alive, and cleanup happens when the AUQ `tool_result` lifecycle calls `forget_ask_tool_input`, when the session is replaced, or via startup GC. Bot logs a one-time warning if `PreToolUse` is missing from `~/.claude/settings.json`; `cc-telegram hook --install` reinstalls all FOUR managed hook entries (SessionStart / PreToolUse(AskUserQuestion) / PreToolUse(ExitPlanMode) / Notification), and `cc-telegram doctor` reports each.
+- **PreToolUse(AskUserQuestion) side files** — the `PreToolUse` hook (matcher `AskUserQuestion`) captures the structured `tool_input` to `auq_pending/<session_id>.json` before Claude renders the picker. The bot reads the side file at picker render time so each option's full description is visible in the Telegram context message immediately, before terminal completion. Side files are mode 0600 under a 0700 directory; multi-select `aqt:` toggles keep them alive, and cleanup happens when the AUQ `tool_result` lifecycle calls `forget_ask_tool_input`, when the session is replaced, or via startup GC. The AUQ side file is ALSO the free-text lane's occurrence anchor (GH #50 PR-2 — `free_text.SurfaceIdentity.anchor`), so without this hook a plain message at a card is REFUSED rather than delivered as the answer. Bot logs a one-time warning if `PreToolUse` is missing from `~/.claude/settings.json`; `cc-telegram hook --install` reinstalls all three managed hooks (SessionStart / PreToolUse / Notification), and `cc-telegram doctor` reports each.
 - **Interactive approval-gate detection (Permission + Workflow — PR-1, display-only, flag-gated)** — two `UIPattern`s in `terminal_parser.UI_PATTERNS`, ordered **LAST** (after every AUQ/EPM/Settings/RestoreCheckpoint pattern — first-match-wins protects AUQ/EPM and vice-versa): `Permission` (tool-permission prompts: WebFetch/Bash/Edit/Write/…) and `Workflow` (the dynamic-workflow-launch approval). Each is disambiguated on its TOP anchor because the `Esc to cancel` / `Tab to amend` / `ctrl[+-]g` footer family overlaps across Permission/Workflow/EPM: Permission top = `Do you want to (allow|proceed|make|create|run|…)` (the REQUIRED question anchor) with `Claude wants to ` as OPTIONAL preamble context ONLY (peer-review P2 — `Claude wants to ` alone is never sufficient; the strict parser requires the question line); Workflow top = `Run a dynamic workflow?` / `This dynamic workflow will` / `Dynamic workflows can use`. Permission BOTTOM accepts EITHER an inline `(esc)`-tailed numbered option (WebFetch — no footer) OR an `Esc to cancel` footer (Bash/Write); Workflow BOTTOM anchors on the `Esc to cancel` footer line ONLY (the bare `Tab to amend` alt was DROPPED — peer-review P3: the real one-line footer leads with `Esc to cancel`, so the bare alt never matched and only widened the surface; `ctrl+g to edit script` stays excluded — it renders on its own line BELOW that footer and would trip `_try_extract`'s cross-footer pre-top-found bail). **Strict post-validation gate (S-8 fail-closed, peer-review P1):** the two gate `UIPattern`s carry a `validator` hook (`parse_permission_prompt` / `parse_workflow_approval`, wired in post-parser-definition via `dataclasses.replace`); `extract_interactive_content` runs the validator over the FULL pane after a loose top/bottom match and only returns the gate when it strictly parses (else CONTINUES the pattern loop) — the loose anchors alone lit a card on assistant prose QUOTING a gate. The returned content is the strict form's `pane_excerpt` (the trusted region). AUQ/EPM/Settings/RestoreCheckpoint have NO validator → byte-identical. **Bottom-terminal requirement (S-8; round-2 Codex P1 tightening):** each strict parser also requires that below the footer there is an ALLOW-LIST of ONLY the gate's own footer chrome — blank lines, BARE box-drawing separators, and the gate's own `ctrl+<x>` footer-continuation hints (the Workflow `ctrl+g to edit script` line, `ctrl+e to explain`, etc.) — via `_only_chrome_below`. A live gate is the active bottom prompt that REPLACES the input box / status bar, so the ready-for-input chrome that only renders when the gate is NOT live — the `❯` input box (the option cursor `❯ 1.` is ABOVE the footer, so any `❯` below it is the input box), the `? for shortcuts` / `← for agents` / `↓ to manage` / `esc to interrupt` status bar, the `· N shell(s)` background-jobs line, the `◐ … /effort` indicator, the model/context status bar — and any trailing assistant prose all REJECT (a complete-but-QUOTED block sitting in scrollback followed by the pane's normal input box / status bar is rejected, closing the round-1 false positive that allowed input-box/status chrome below the footer). **Empirically resolved** (round-2, `permission_webfetch_bgshells_v2.1.190.txt`, captured WITH 2 background shells running): a live blocking gate has NO `· N shell` / status / input-box line below its footer — the `· 2 shells` line is in the scrollback ABOVE — so Hermes's "a live gate with `· N shell` below its footer would be false-negatived" worry is REFUTED by data, and the check is deliberately NOT loosened for it (Codex was correct; the reject is safe). The strict-or-None parsers emit a single-question `AskUserQuestionForm` (`select_mode="single"`, `is_review_screen=False`) from the BOTTOM-MOST contiguous `❯ N. <label>` block above the footer (`_gate_options_above` extends across a numbered line ONLY while it stays contiguous downward, so a Workflow PHASE list `1. Sweep / 2. Verify / 3. Dossier` directly above the option block is NOT absorbed — peer-review P2), carrying the FULL label minus only a deterministically-stripped trailing `(esc)` (S-6: "Yes" vs "Yes, and don't ask again …" must stay distinct); the Workflow parser additionally validates the option SHAPE (`_is_workflow_option_shape`: option 1 == `Yes, run it` + a `View raw script` option present) so a phase block can't form a bogus gate, and stashes phases + token-cost warning in `_meta["workflow_body"]` for the card. **Deferred residual (now NARROW; PR-2):** after the round-2 tightening, the only residual is a fully-quoted gate that is the LITERAL last semantic content in the pane with NO ready-for-input chrome (no input box / status bar) below it — rare; it requires the pane to be captured with the quoted gate at the very bottom AND Claude not showing its input box (capture landed between frames). Cosmetic-only in display-only PR-1 (no dispatch, no auto-approval); the definitive close belongs in PR-2 (where dispatch makes it matter): gate render/promotion on `route_runtime.snapshot(route).notification_pending` (a genuine gate fires the Notification hook; quoted prose does not), deliberately NOT coupled in PR-1 — PR-1 stays pane-only per the plan (timing risk of delaying legit cards), and the empirically-tightened chrome check closes the realistic case. **Detector kill-switch (P2-3):** a LOCAL `os.getenv("CC_TELEGRAM_PERMISSION_PROMPTS")` parser flag (`_PERMISSION_PROMPTS_ENABLED` + `set_permission_prompts_enabled` + `reset_for_tests`) — NEVER a `config` import (the parser stays a pure stdlib leaf; `config` raises without a bot token; an ISOLATED subprocess test pins the no-token import). The detector defaults ON since 2026-07-11. When OFF, `_active_ui_patterns()` filters BOTH gate patterns out of the detector → a flag-OFF deploy adds NO detection, no card, no `WAITING_ON_USER` promotion (S-9). `config.py` owns the canonical env declaration for docs/README; the parser reads the same var. **§1.1 decision (verified against `permission_write_long_visible_v2.1.190.txt` + the WebFetch/Bash/Write captures):** the planned new `_PICKER_ANCHOR_MARKERS` permission anchor is UNNECESSARY and was NOT added — Claude Code redraws gates IN PLACE (the `Do you want to…?` question stays adjacent to the options at the visible bottom; only the file/content preview scrolls off above), so `visible_pane_liveness(visible)` already returns `"present"` via the `is_interactive_ui` leg (the status poller's `capture_pane(scrollback_lines=0)` visible capture always contains the full gate). **Render (`interactive_ui`):** a thin `content.name in ("Permission","Workflow")` branch posts a DISPLAY-ONLY card — the existing window-keyed manual ↑/↓/⏎/Esc nav keyboard (NO option-pick buttons, S-1) + an honest notice that the controls send raw, un-cursor-verified live-pane keystrokes (P2-1) — and SKIPS `_maybe_post_live_prose` (§6: the AUQ/EPM-only dedup would double a gate prose post). The pane-confirmed `mark_interactive_pending` promotion + WAITING + typing-off machinery is UI-name-agnostic (keys on `ui_content`), so it works unchanged. **Coexistence (§3):** `status_polling._reconcile_decision_card` now DISMISSES the generic "🔔 Claude needs a decision" Notification-hook card (kind-scoped, idempotent) once a live interactive surface owns the topic, so the actionable gate card supersedes the dead-end nudge; the `notification_pending` derivation is untouched. **NOT in PR-1:** no pick buttons, no dispatch, no validator change, no `gate_variant` field, no obscured-pane liveness gate (all PR-2). Pull-only; no observer (c313657 forbidden).
 - **Generic decision-prompt detection (Stage B1, display-only, flag-gated)** — a THIRD `UIPattern` in `terminal_parser.UI_PATTERNS`, `Decision`, ordered **LAST** (after Permission/Workflow, so first-match-wins never lets it steal any NAMED pane — AUQ/EPM/Settings/RestoreCheckpoint/Permission/Workflow keep their exact slots). It surfaces GENERIC titled numbered-option confirmation prompts that no named pattern covers (the "Switch model?" confirmation, the folder-trust prompt, and peers — both verified UNCOVERED: their footer is `Enter to confirm · Esc to cancel`, not AUQ's `Enter to select`). Loose anchors: a numbered-option TOP (`^\s*[❯›▶*)>]?\s*\d+\.\s+\S`) + a confirmation footer bottom that MUST carry `Enter to (confirm|continue)` (`_RE_DECISION_FOOTER`, DELIBERATELY excluding `Enter to select`, AUQ pattern 3's footer). **Requiring the affirmative-commit `Enter to (confirm|continue)` component (Codex P2 fold, NOT a bare `Esc to cancel|exit`) STRUCTURALLY closes the verb-drift veto bypass:** a permission gate whose verb is outside `parse_permission_prompt`'s whitelist (e.g. `Do you want to open …?`) has an `Esc to cancel · Tab to amend` footer with no `Enter to confirm` line, so it never matches Decision's footer at all — independent of the veto. **Strict-or-None validator `parse_generic_decision`** (wired via the same `dataclasses.replace` post-definition mechanism as the gate validators): (1) bottom-most confirmation footer (with `Enter to (confirm|continue)`); (2) `_only_chrome_below` True (the shared live-bottom-prompt guard — a quoted prompt with a ready-for-input input box / status bar below it rejects); (3) `_gate_options_above` → ≥2 contiguous numbered options AND a resolved live `❯` cursor; (4) **the Permission/Workflow VETO (Hermes P2-4), KEPT as defense-in-depth** — it runs the STRICT `parse_permission_prompt` / `parse_workflow_approval` (never a loose regex) and returns None if EITHER parses, so a real permission/workflow gate is NEVER re-surfaced as a Decision even when `CC_TELEGRAM_PERMISSION_PROMPTS` filtered it out of the detector (the cross-flag re-exposure fix; after the footer narrowing it is near-unreachable belt-and-suspenders). `current_question_title` = the TOP meaningful line of the contiguous prompt block above the options (the heading, e.g. "Switch model?"); `pane_excerpt` extends UP through that whole block → footer (`_decision_prompt_block_top`, bounded by a ≥2-blank-line gap / a chrome-separator line / 10 lines) so the card body shows the heading + context + options (Hermes P3 fold). **Accepted narrow residual (Codex P1 / Hermes P2):** a fully-quoted decision block that is the LITERAL last pane content with NO ready-for-input chrome below it passes `_only_chrome_below` — the SAME class as the gate residual above; in a real running pane the input box / status bar are always below and reject it. Flag-ON by default since 2026-07-11 + display-only in B1; the tappable-dispatch upgrade is Stage B2 (below), gated by the SEPARATE `CC_TELEGRAM_DECISION_DISPATCH` flag. NOT closed with a heading/family allowlist — the detector stays GENERIC. **Detector kill-switch:** a SECOND LOCAL parser flag `CC_TELEGRAM_DECISION_CARDS` (`_DECISION_CARDS_ENABLED` + `set_decision_cards_enabled` + `decision_cards_enabled` + `reset_for_tests` resets BOTH flags), independent of the gate flag; `_active_ui_patterns()` filters `Decision` out when OFF → a flag-OFF deploy adds ZERO new detection, no card, no `WAITING_ON_USER` promotion. `config.py` owns the canonical `CC_TELEGRAM_DECISION_CARDS` declaration (docs/README) and `main._run_bot()` seeds the parser from it (the import-order-race dodge, mirroring the Permission seed). **Render:** `Decision` is folded into `interactive_ui._GATE_RENDER_NAMES`, so it rides the EXISTING display-only gate branch (title + options body + the manual ↑/↓/⏎/Esc nav keyboard + the honest un-verified-keystroke notice) and the AUQ/EPM-only `_maybe_post_live_prose` skip — NO pick buttons, NO dispatch (that's Stage B2). The pane-confirmed `mark_interactive_pending` promotion is UI-name-agnostic, so a live Decision prompt flips the route to "🔔 Waiting on you" unchanged; a negative pane never promotes (proven at the `status_polling` seam). Pull-only; no observer (c313657 forbidden).
 - **Tappable Decision dispatch (Stage B2.3, flag-gated `CC_TELEGRAM_DECISION_DISPATCH`, default OFF)** — a PARALLEL, Decision-specific dispatch lane (`dcp:<route_hash>:<fp8>:<opt>:<token>`) that reuses the AUQ dispatch DISCIPLINE (per-window send lock + `_lock_busy` reject, monotonic arrow nav, settle→re-parse→verify, Enter as the ONLY commit key, fail-closed advance classification, `auq_ledger` idempotency) but NEVER the AUQ `resolve_auq_source`/`resolve_ask_form` machinery (a Decision pane returns None there — the P1-C dead-tap the lane avoids). **Render mint** (`interactive_ui._build_decision_pick_rows`, in the `content.name == "Decision"` gate branch): mints one-tap option buttons ONLY when the §7 flag is ON AND the strict `parse_generic_decision` form matches a known `decision_token.identify_family` (which also requires a non-None title — the §5a mint gate) AND `decision_token.lookup(family, w.pane_current_command)` licenses the family × the CACHED CC-version AND the geometry is a clean single-select numbered picker; else display-only, byte-identical to B1. The `fp8` derives from the body-inclusive `terminal_parser.decision_prompt_fingerprint` (a `decision:` DOMAIN PREFIX so the shared `auq_action_ledger.jsonl` key can NEVER collide with the AUQ lane's bare `_canonical_repr` fp8 — §8). **Dispatch transaction** (`callback_dispatcher/interactive._dispatch_decision` → `_dispatch_decision_pane_locked`, under `window_send_lock` with `_lock_busy` reject-if-held): extractor parity (`extract_interactive_content(pane).name == "Decision"` — a Settings/AUQ pane that merely decision-parses bails, the named `settings_warning_v2170.txt` decline) → `decision_prompt_fingerprint` identity + geometry/family gates → the **FRESH** `pane_current_command` version-license re-read (`pane_command_is_claude` + `lookup`, INSIDE the lock, immediately before the first key — a /update-swapped TUI inside the 1s list-cache TTL can never be arrow-keyed; the AUQ round-2 P1-1 fix) → nav→settle→verify with a MOTION proof (delta≠0: cursor moved to target AND ≠ pre-nav; delta==0: the WIGGLE — one arrow away then back, requiring the ❯ to move) → Enter → `_classify_decision_advance` — the confirm runs the FULL `extract_interactive_content` (review r1 P2-B: first-match-wins parity on the CONFIRM side; never the bare `parse_generic_decision`, whose weaker recognition would fp-compare a Settings/AUQ pane that merely decision-parses as a "different Decision" and wrongly confirm): extractor→Decision ⇒ fp compare (dispatched ONLY when the committed fingerprint is proven GONE; a live same-fp form is the zero-absence variant → `commit_unconfirmed`); extractor→another named UI or None ⇒ dispatched only when NO decision footer/marker remains (still-present footer = ambiguous → `commit_unconfirmed`). **Ledger discipline** (mirrors the AUQ v2.1.168 model): `accepted → dispatched` + `auq_ledger.release_key(key)` on the confirmed-gone proof; a **pre-commit bail** records `not_advanced` (Enter provably never sent → the callback FALLS THROUGH / re-renders fresh tokens); once Enter is sent an unconfirmed advance records `commit_unconfirmed` (refresh-only, UNRELEASED). A busy send lock at dispatch downgrades the already-written `accepted` to `not_advanced` (fall through, never a crash-ambiguous `accepted`). **§5b(b) dispatch-terminal teardown** (`interactive_ui.finalize_decision_dispatch`, NOT `clear_interactive_msg`): pops the PERSISTED interactive surface (a stale raw-nav tap then fails `has_interactive_surface` — restart-safe) + `decision_token.teardown_route`, fires the lifecycle hooks (the poller drops `_absent_streak` + `_last_published_ui_hash` → a fast byte-identical re-raise renders FRESH), then edits the card to the inert "✅ … sent" final state — and (review r1 P2-C, plan §3 normative) the finalize runs BEFORE the callback answer, so a crash/network window can never leave an acked callback with a non-terminal persisted surface. `decision_token.teardown_route` is ALSO wired (review r1 P2-A) at the `/clear` `mark_session_reset` seams (bot /clear branch + the monitor rotation sweep) and the `inbound_telegram` stale-window unbind `clear_route` sites, beside the pane_signals/route_runtime teardown calls — a /clear-rotated window keeps its id, so a same-fingerprint re-raised prompt within the 300s token TTL would otherwise validate a stale `dcp:` tap end-to-end. **§5b(c)/O-6 generation-suffixed nav** (closes the pre-existing window-keyed raw-nav replay hole): every GATE card render (Decision AND Permission/Workflow per O-6) rotates `decision_token`'s per-window nav generation and suffixes its ↑/↓/⏎/Esc callbacks `aq:*:<window>:g<gen>`; non-gate (AUQ/EPM/RestoreCheckpoint) renders CLEAR the generation and stay un-suffixed (byte-neutral). `assert_nav_dispatchable` validates: gen present must equal the window's current gen; gen absent + a live gate generation → refuse (a pre-B2 un-suffixed gate card); gen absent + NO gate generation is AMBIGUOUS, not automatically legacy (review r1 P1, BOTH engines — the registry is in-memory, so after EVERY restart/deploy it is empty and a pre-B2.3 gate card's raw un-suffixed `aq:enter:@N` would otherwise raw-dispatch into a live gate pane): the shape is discriminated on the LIVE pane, reusing guard 4's EXISTING visible capture (no new capture on the suffixed/gen-registered paths) — a gate-named `extract_interactive_content(visible)` refuses fail-closed before any key; an AUQ/EPM pane proceeds down the legacy path unchanged (byte-neutral). The generation is invalidated IN-LOCK at `dispatched` (the lock-release→teardown gap) and wiped on restart → a suffixed tap fails closed. **§8 restart:** in-memory tokens + nav generations die; the ledger-first gate answers a `dispatched` duplicate "already received"; NO durable `pick_intent`-style recovery (Decision re-mints from the live pane trivially). Poller (`status_polling` same-hash Decision branch) calls `decision_token.refresh_route_deadlines` (the D3-β analogue) so a long-open card's `dcp:` tokens never TTL-prune. **Top residual (disclosed):** the `decision_token._DECISION_DISPATCH_TABLE` allowlist is empirically per `(family × CC-version)` — every CC upgrade empties the effective allowlist → buttons revert to display-only until re-characterized (honest degradation, INFO logs at mint + tap; never a wrong keystroke). Pull-only; no observer (c313657 forbidden).
