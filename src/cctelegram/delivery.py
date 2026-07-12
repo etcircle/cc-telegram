@@ -23,6 +23,12 @@ user payload into a live Claude Code pane:
     PER-LINE hotkey refusal (§1.3). On CC 2.1.207 a bare digit is a live HOTKEY
     on a single-select-shaped surface (it commits with NO Enter), so a payload
     whose emitted literal segments contain a bare-digit LINE is never written.
+  - ``unsafe_control_char`` — the RAW-CONTROL-BYTE refusal (§1.3b). ``send-keys
+    -l`` stops *tmux* interpreting key NAMES but passes C0/ESC bytes to the pty
+    VERBATIM (rig-confirmed), so an embedded ``ESC [ B`` + digit is a cursor-move
+    + HOTKEY commit fired DURING the write. Everything in C0 except LF, plus DEL
+    and C1, is refused before any keystroke. LF stays ALLOWED — paste-shaped
+    multi-line payloads are a first-class flow.
 """
 
 from __future__ import annotations
@@ -389,7 +395,7 @@ def lone_hotkey_line(text: str) -> str | None:
     return None
 
 
-# ── The raw-control-byte refusal (peer-review round-5 P1-A) ──────────────
+# ── The raw-control-byte refusal ─────────────────────────────────────────
 #
 # ``tmux send-keys -l`` stops tmux from interpreting KEY NAMES ("Down", "Enter").
 # It does NOT neutralize C0/ESC bytes: they reach the pty VERBATIM, and the
@@ -399,8 +405,8 @@ def lone_hotkey_line(text: str) -> str | None:
 # TUI sees ``A``, a CURSOR-DOWN escape sequence, then ``2``.
 #
 # That is a COMMIT primitive. ``delivery.lone_hotkey_line`` cannot see it (the
-# line is not a lone digit), the pane gate has already passed, and the executor's
-# verification runs only AFTER the write — so an embedded ``ESC [ B`` + digit can
+# line is not a lone digit), the pane gate has already passed, and the gate's
+# re-verify runs only AFTER the write — so an embedded ``ESC [ B`` + digit can
 # move the cursor off the row we proved and fire a digit HOTKEY (which on a
 # single-select-shaped surface COMMITS with no Enter) before anything re-observes
 # the pane. The ONLY sound answer is to refuse the payload before any keystroke.
@@ -438,10 +444,12 @@ def unsafe_control_char(text: str) -> str | None:
     the per-character rationale — in particular why ``\\n`` is allowed (paste-
     shaped multi-line payloads are the lane's primary flow) and ``\\t`` is not.
 
-    Applied at BOTH gated seams — ``session.deliver_to_window`` step 0 (which
-    owns the single refusal) and ``free_text.try_answer`` (which declines and
-    falls through to it) — because the SAME payload reaches ``send_keys`` through
-    both, and the hazard is a property of the bytes, not of the lane.
+    ONE implementation, consulted at BOTH seams that reach ``send_keys``:
+    ``session.deliver_to_window`` step 0b — the single gated seam every user
+    payload crosses, and the one that OWNS the refusal message — and
+    ``free_text.try_answer``, which merely DECLINES on it and falls through to
+    that gate. The hazard is a property of the BYTES, not of the lane. REFUSE,
+    never strip: stripping would change what Claude receives.
     """
     m = _RE_UNSAFE_CONTROL.search(text)
     return m.group(0) if m else None

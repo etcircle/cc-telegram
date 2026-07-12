@@ -151,7 +151,7 @@ async def test_lone_hotkey_payload_is_never_written(
     assert "just a number" in result.message
 
 
-# ── round-5 P1-A: the RAW-CONTROL-BYTE refusal ───────────────────────────
+# ── §1.3b: the RAW-CONTROL-BYTE refusal ──────────────────────────────────
 #
 # ``tmux send-keys -l`` stops tmux interpreting KEY NAMES; it does NOT make C0/ESC
 # bytes inert to the TUI on the other side of the pty. RIG-CONFIRMED (``tmux -L
@@ -1257,6 +1257,8 @@ def test_copy_is_actionable_per_reason() -> None:
     assert "Answer the card first" in delivery.REFUSAL_COPY["prompt_present"]
     assert "/update" in delivery.REFUSAL_COPY["not_claude"]
     assert "just a number" in delivery.REFUSAL_COPY["lone_hotkey_segment"]
+    assert "control character" in delivery.REFUSAL_COPY["control_chars"]
+    assert "line breaks are fine" in delivery.REFUSAL_COPY["control_chars"]
     assert "Esc" in delivery.REFUSAL_COPY["tasks_mode"]
     assert "@" in delivery.REFUSAL_COPY["completion_overlay"]
 

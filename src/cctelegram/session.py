@@ -1349,14 +1349,14 @@ class SessionManager:
             )
             return delivery.refuse(delivery.REASON_LONE_HOTKEY, written=False)
 
-        # (0b) The RAW-CONTROL-BYTE refusal (peer-review round-5 P1-A). ``-l``
-        # stops tmux interpreting KEY NAMES; it does NOT make C0/ESC bytes inert
-        # to the TUI on the other side of the pty (rig-confirmed). An embedded
-        # ``ESC [ B`` + digit would move the cursor off whatever we proved and
-        # fire a digit HOTKEY — a commit with no Enter — before ANY of the
-        # post-write verification runs. Payload-only, no capture, never written.
-        # ``\n`` is deliberately ALLOWED (paste-shaped multi-line payloads are a
-        # first-class flow); see ``delivery.unsafe_control_char``.
+        # (0b) The RAW-CONTROL-BYTE refusal. ``-l`` stops tmux interpreting KEY
+        # NAMES; it does NOT make C0/ESC bytes inert to the TUI on the other side
+        # of the pty (rig-confirmed). An embedded ``ESC [ B`` + digit would move
+        # the cursor off whatever we proved and fire a digit HOTKEY — a commit
+        # with no Enter — before ANY of the post-write verification runs.
+        # Payload-only, no capture, never written. ``\n`` is deliberately ALLOWED
+        # (paste-shaped multi-line payloads are a first-class flow); see
+        # ``delivery.unsafe_control_char``.
         ctrl = delivery.unsafe_control_char(text)
         if ctrl is not None:
             logger.info(
