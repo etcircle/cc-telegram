@@ -1246,11 +1246,6 @@ def _collapse_ws(text: str) -> str:
     return " ".join(text.split())
 
 
-def _squash_ws(text: str) -> str:
-    """Every whitespace character removed. Destroys line and token boundaries."""
-    return re.sub(r"\s+", "", text)
-
-
 def _question_binds_to_pane(question: str, pane_text: str) -> bool:
     """Is ``question`` the question THIS pane's live picker is ASKING?
 
@@ -1259,11 +1254,9 @@ def _question_binds_to_pane(question: str, pane_text: str) -> bool:
     asks, but that test only asked whether the text occurred SOMEWHERE — so a
     successor record whose question was merely one of the pane's OPTION LABELS
     ("Blue"), or an option description, or prose the user typed in the
-    scrollback, or the picker's own footer, satisfied it. Squashing made it
-    strictly worse: with every line and token boundary destroyed, a "question"
-    could even SPAN the real question's tail and the first option row. The
-    executor then typed the user's answer into the pane it had just proved and
-    committed it onto the WRONG CARD (Codex's reproduced interleaving).
+    scrollback, or the picker's own footer, satisfied it. The executor then typed
+    the user's answer into the pane it had just proved and committed it onto the
+    WRONG CARD (Codex's reproduced interleaving).
 
     So the comparison targets the pane's QUESTION REGION — the block Claude Code
     renders directly above the live option block
@@ -1271,32 +1264,82 @@ def _question_binds_to_pane(question: str, pane_text: str) -> bool:
     that region, never a substring of the pane. A match anywhere else on the pane
     is not evidence about which card is live, and no longer counts as any.
 
-    **Wrap tolerance, without giving the boundaries back.** A long question is
-    soft-wrapped across several physical rows, and a false refusal here would kill
-    the lane for every long question — so the region's rows are REJOINED before
-    the comparison. Two shapes, in order:
+    **AND THE REJOIN IS DECIDED BY THE PANE'S GEOMETRY, NEVER BY DELETING THE
+    WHITESPACE (round-7 P1-1).** Round 6 kept a fallback: "if the space-join
+    fails, compare both sides with ALL whitespace removed", so a token Claude
+    Code hard-breaks MID-token could still match. Equality does not make that
+    transformation injective, and Codex reproduced the consequence: a pane asking
+    ``Is nowhere safe?`` and a successor record asking ``Is now here safe?`` —
+    two DIFFERENT questions, same option labels — squash to the same string, so
+    the successor's anchor BOUND to the live card and the answer committed onto
+    the WRONG CARD.
 
-      1. the rows rejoined on a single space (a WORD wrap breaks at a space, so
-         this reconstructs the question exactly) — boundary-preserving, and the
-         comparison that decides the ordinary case;
-      2. failing that, both sides with all whitespace removed — the tolerance for
-         a token LONGER than the wrap column, which Claude Code hard-breaks
-         MID-token so no space-join can reconstruct it. Still an EQUALITY, and
-         still against the region alone, so it cannot re-open the substring hole:
-         the most it can do is call two strings equal that differ only in where
-         their spaces fall, which is not a thing the pane can render.
+    The rejoin is now a CONSUMPTION WALK of the question against the region's
+    rows, with the one genuinely ambiguous boundary decided by the pane's WRAP
+    COLUMN (:func:`terminal_parser.pane_wrap_column`, measured from the capture):
+
+      * each row must be an exact PREFIX of what is left of the question (so no
+        character of either side is ever dropped, reordered, or invented);
+      * at each row boundary the question either carries a SPACE — the word wrap
+        consumed it, the ordinary case — or it does not, which means Claude Code
+        HARD-BROKE a token there. A break mid-token only happens when the row is
+        FULL, so that shape is accepted **only when the row reaches the wrap
+        column**; a short row provably cannot have hard-broken and MUST carry the
+        space. That is what keeps the walk injective;
+      * the question must be exactly CONSUMED — nothing left over.
+
+    **The premise that a row AT the wrap column proves a hard break is FALSE, and
+    the code must not assume it** (fixture-pinned on the real
+    ``auq_longlabel_160x50_v2.1.198`` capture, whose 160-column-wide rows 2 and 4
+    end at WORD boundaries — ``…peer reviewers,`` / ``…choice trades``). A
+    word-wrapped row can land exactly on the column. So the walk lets the
+    QUESTION decide the boundary and uses the geometry only to VETO the hard-break
+    reading — never to force it.
+
+    Whitespace RUNS inside the question (and inside a row) still collapse to one
+    space, exactly as before: that is boundary-PRESERVING (it never merges two
+    tokens) and it is the tolerance the round-6 code already had.
+
+    **The one residual, and it is the PANE's, not the walk's:** a row that ends
+    exactly at the wrap column is rendered IDENTICALLY whether the original had a
+    space there (word wrap consumed it) or not (token hard-broken). No reading of
+    the pane can separate those two questions, and re-wrapping the record's
+    question to the same width produces the same rows — so the walk accepts both.
+    It is the same class as the disclosed "same question + same labels" residual.
 
     ``False`` is FAIL-CLOSED: the caller reports MISMATCH and, pre-keystroke, the
     lane declines to PR-1.
     """
-    from ..terminal_parser import auq_question_region
+    from ..terminal_parser import auq_question_region, pane_wrap_column
 
     region = auq_question_region(pane_text)
     if not region:
         return False
-    if _collapse_ws(region) == _collapse_ws(question):
-        return True
-    return _squash_ws(region) == _squash_ws(question)
+    wrap_column = pane_wrap_column(pane_text)
+
+    rows = region.split("\n")
+    remaining = _collapse_ws(question)
+    if not remaining:
+        return False
+
+    last = len(rows) - 1
+    for i, row in enumerate(rows):
+        # The RENDERED width decides the boundary below; the COLLAPSED text is
+        # what we compare (a whitespace run inside a row is not a boundary).
+        text = _collapse_ws(row)
+        if not text or not remaining.startswith(text):
+            return False
+        remaining = remaining[len(text) :]
+        if i == last:
+            break
+        if remaining.startswith(" "):
+            remaining = remaining[1:]  # a WORD wrap consumed exactly one space
+            continue
+        # No space in the question here ⇒ the pane must have HARD-BROKEN a token
+        # at this boundary, which is only possible on a FULL row.
+        if wrap_column is None or len(row) < wrap_column:
+            return False
+    return remaining == ""
 
 
 def anchor_pane_agreement(

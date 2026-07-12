@@ -2333,27 +2333,82 @@ footer and on the SAME block walk `parse_ask_user_question` uses, so the two can
 disagree about which picker is live) — and it is an **EQUALITY against that region,
 never a substring of the pane**. An option label, an option description, prose in the
 scrollback, the picker's own footer: none of them is evidence about which card is live,
-and none of them counts as any. **Wrap tolerance, without giving the boundaries back:**
-a long question soft-wraps across physical rows and a false refusal there would kill the
-lane for every long question, so the region's rows are REJOINED — first on a single
-space (a WORD wrap breaks at a space, so this reconstructs the question exactly;
-boundary-preserving, and the comparison that decides the ordinary case), and failing
-that with all whitespace removed (the tolerance for a token LONGER than the wrap column,
-which CC hard-breaks MID-token so no space-join can reconstruct it). Both are
-EQUALITIES against the region alone, so neither can re-open the substring hole. A region
-that cannot be derived (the question scrolled off; the picker glued straight to chrome)
-is `None` and REFUSES — fail-closed, and identical to the pre-fix behavior for that
-shape (the question was not on the pane to be found either).
+and none of them counts as any.
 
-**SCOPING (deliberate).** The tightening lives in the FREE-TEXT ANCHOR path ONLY. The
-shared `_record_consistent_with_pane` — consumed by the picker RENDER path, the `aqp:`
-dispatch's `validate_and_consume`, `status_polling`'s source-drift re-mint and the
-GH #48 recap identity — never had a question leg and is **byte-untouched**: tightening
-it would flip render decisions (`side_file_ok` → `bail`/`rescue`), dropping the AUQ
-context card or suppressing pick buttons on real cards, and none of those consumers has
-a wrong-card COMMIT hazard to justify it. Pinned by
-`test_the_SHARED_predicate_is_byte_untouched` (the same card-BLUE record the anchor lane
-now refuses is still ACCEPTED by the shared predicate, exactly as before).
+**AND THE REJOIN IS DECIDED BY THE PANE'S GEOMETRY, NEVER BY DELETING THE WHITESPACE
+(round-7 P1-1 — the fallback equated DIFFERENT questions).** Round 6 kept a second
+comparison: "if the space-join fails, compare both sides with ALL whitespace removed",
+the tolerance for a token CC hard-breaks MID-token. It was justified as safe "because it
+is an equality against a tight region" — but **equality does not make a lossy
+transformation injective**, and Codex reproduced the consequence in one counterexample:
+the pane asks `Is nowhere safe?`, the successor record asks `Is now here safe?` — two
+DIFFERENT questions — and with the same option labels the squash makes them EQUAL, so
+the successor's anchor BINDS to the live card and the answer commits onto the WRONG
+CARD. The fallback is **DELETED**, and it is not replaced with another lossy rule.
+
+The rejoin is a **CONSUMPTION WALK** of the question against the region's rows, with the
+one genuinely ambiguous boundary decided by the pane's WRAP COLUMN
+(`terminal_parser.pane_wrap_column` — the widest physical row on the capture; a live
+picker always renders its full-width `────` box rules, and `capture-pane` is not given
+`-J`, so no line can exceed the terminal width and over-estimation is impossible):
+
+  * each row must be an exact PREFIX of what is left of the question, so no character of
+    either side is ever dropped, reordered or invented;
+  * at each row boundary the question either carries a SPACE — the word wrap consumed
+    it, the ordinary case — or it does not, which means CC HARD-BROKE a token there. A
+    break mid-token only happens when the row is FULL, so that reading is accepted
+    **only when the row reaches the wrap column**; a short row provably cannot have
+    hard-broken and MUST carry the space. That is the leg that keeps the walk injective;
+  * the question must be exactly CONSUMED — nothing left over.
+
+**The premise "a row ending exactly at the wrap column was hard-broken" is FALSE, and
+the code must not assume it** (fixture-pinned on the REAL `auq_longlabel_160x50_v2.1.198`
+capture, whose 160-column rows 2 and 4 end at WORD boundaries — `…peer reviewers,` /
+`…choice trades`). A word-wrapped row can land exactly on the column. So the geometry may
+only **VETO** the hard-break reading of a boundary, never force it — a rule that
+reconstructed by geometry alone would glue `reviewers,` onto `but` and false-refuse every
+long question in the corpus. Whitespace RUNS still collapse to one space (boundary-
+PRESERVING — it never merges two tokens; the tolerance round 6 already had). Equivalent
+to re-wrapping the record's question to the pane's width and comparing row by row, but
+without having to reproduce CC's greedy-fit rule.
+
+**The one residual, and it is the PANE's, not the walk's:** a row that ends exactly at
+the wrap column renders IDENTICALLY whether the original had a space there (a word wrap
+consumed it) or not (a token hard-broken). No reading of the pane can separate those two
+questions — re-wrapping produces the same rows too — so the walk accepts both. Same class
+as the disclosed "same question + same labels" residual.
+
+**AND THE REGION CAP FAILS CLOSED (round-7 P1-2).** `auq_question_region` collects at
+most `_QUESTION_REGION_MAX_ROWS` (12 — the largest REAL capture in the corpus is 9 rows,
+so 12 is the only bound the captures justify). It used to `break` at the cap and RETURN
+the rows it had — a partial region, missing its TOP — while its comment claimed the
+truncation failed closed. It did NOT: a SUFFIX is a strictly WEAKER identity, and Codex
+reproduced a 13-row question whose region came back as rows 2..13, so a successor record
+whose ENTIRE question equals that 12-row suffix BOUND to the pane and committed onto the
+WRONG CARD. An underivable region must never degrade into a weaker one, so the cap now
+returns `None` and the binding REFUSES. Disclosed cost: a question longer than 12
+physical rows cannot be bound at all, so the lane declines and PR-1 refuses the message —
+a false refusal, never a wrong-card commit. A region that cannot be derived at all (the
+question scrolled off; the picker glued straight to chrome) is `None` and REFUSES for the
+same reason.
+
+**SCOPING (deliberate) — with the RATIONALE CORRECTED (round-7 P3).** The tightening
+lives in the FREE-TEXT ANCHOR path ONLY. The shared `_record_consistent_with_pane` —
+consumed by the picker RENDER path, the `aqp:` dispatch's `validate_and_consume`,
+`status_polling`'s source-drift re-mint and the GH #48 recap identity — never had a
+question leg and is **byte-untouched**. The round-6 text justified that by claiming those
+consumers "cannot commit keystrokes"; **that is FALSE** — `validate_and_consume` calls
+`resolve_auq_source` and its caller goes on to the `aqp:` navigate→Enter dispatch. What
+actually makes the scoping safe is that the `aqp:` lane is protected INDEPENDENTLY: it
+re-validates the EXACT minted form fingerprint and the minted SOURCE fingerprint against
+the live pane before any key, so a successor card whose question differs cannot be
+dispatched into regardless of this predicate (Codex hunted for an exploit there and found
+none). The decision therefore stands on its own merits: tightening the shared predicate
+would flip render decisions (`side_file_ok` → `bail`/`rescue`), dropping the AUQ context
+card or suppressing pick buttons on real cards — a real cost, bought for a lane that
+already has its own proof. Pinned by `test_the_SHARED_predicate_is_byte_untouched` (the
+same card-BLUE record the anchor lane now refuses is still ACCEPTED by the shared
+predicate, exactly as before).
 
 **The residual, disclosed and NOT closed:** two AUQs with the **same option labels AND
 the same question text** are identical in every pane-observable respect, so no content

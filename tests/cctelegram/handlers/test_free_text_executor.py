@@ -1613,15 +1613,19 @@ WRAPPED_ROWS = [
     "and the dark background?",
 ]
 
-# A question carrying a token longer than the wrap column: CC HARD-BREAKS it, so
-# the rows do NOT rejoin on a space boundary. The binding tolerates that too.
-HARD_BROKEN_Q = (
-    "Which color suits https://example.com/a/deliberately/long/path/segment best?"
-)
-HARD_BROKEN_ROWS = [
-    "Which color suits https://example.com/a/deliberately/lo",
-    "ng/path/segment best?",
-]
+# The frame's WRAP COLUMN, measured from the frame itself (160 — the picker's own
+# full-width ``────`` box rules), exactly as ``pane_wrap_column`` measures it.
+WRAP = max(len(line) for line in plain(AUQ_X_LIVE).split("\n"))
+
+# A question carrying a token LONGER than the wrap column: CC HARD-BREAKS it, so
+# the rows do NOT rejoin on a space boundary. The binding tolerates that — but
+# only because the broken row is FULL, which is the geometry that proves a break
+# is even possible. (Round 7: the rows used to be 55 chars wide, i.e. a hard
+# break the pane could never have rendered; the old whitespace-SQUASH matched
+# them anyway, which is exactly the hole that got closed.)
+_HB_HEAD = "Which color suits the URL https://example.com/"
+HARD_BROKEN_Q = f"{_HB_HEAD}{'a' * 200} best?"
+HARD_BROKEN_ROWS = [HARD_BROKEN_Q[:WRAP], HARD_BROKEN_Q[WRAP:]]
 
 
 def _rewrap_question(ansi: str, rows: list[str]) -> str:
@@ -1800,13 +1804,26 @@ class TestTheQuestionBindingTargetsThePanesQUESTION:
         assert stamped == [(1, 42, WINDOW)]
 
     def test_the_SHARED_predicate_is_byte_untouched(self):
-        """The scoping choice, pinned. ``_record_consistent_with_pane`` is consumed
-        by the picker RENDER path, the ``aqp:`` dispatch's ``validate_and_consume``,
-        the source-drift re-mint and the GH #48 recap identity — none of which has
-        a wrong-card COMMIT hazard. It never had a question leg, and tightening it
-        would flip render decisions (``side_file_ok`` → ``bail``/``rescue``),
-        dropping the AUQ context card or suppressing pick buttons on real cards. So
-        the question binding stays in the ANCHOR path, where the hazard lives.
+        """The scoping choice, pinned — with the RATIONALE CORRECTED (round-7 P3).
+
+        ``_record_consistent_with_pane`` is consumed by the picker RENDER path, the
+        ``aqp:`` dispatch's ``validate_and_consume``, the source-drift re-mint and
+        the GH #48 recap identity. The round-6 text claimed those consumers "cannot
+        commit a keystroke". **That is FALSE**: ``validate_and_consume`` calls
+        ``resolve_auq_source`` and its caller goes on to the ``aqp:``
+        navigate→Enter dispatch. What actually makes the scoping safe is that the
+        ``aqp:`` lane is protected INDEPENDENTLY — it re-validates the EXACT minted
+        form fingerprint and the minted SOURCE fingerprint against the live pane
+        before any key, so a successor card whose question differs cannot be
+        dispatched into regardless of this predicate (Codex looked for an exploit
+        there and found none).
+
+        So the decision STANDS on its own merits: the predicate never had a
+        question leg, and tightening it would flip render decisions
+        (``side_file_ok`` → ``bail``/``rescue``), dropping the AUQ context card or
+        suppressing pick buttons on real cards — a real cost, bought for a lane
+        that already has its own proof. The question binding therefore stays in the
+        ANCHOR path, where the wrong-card COMMIT hazard actually lives.
         """
         pane_form = terminal_parser.parse_ask_user_question(plain(AUQ_X_LIVE))
         assert pane_form is not None
@@ -1833,3 +1850,149 @@ class TestTheQuestionBindingTargetsThePanesQUESTION:
             )
             == auq_source.ANCHOR_MISMATCH
         )
+
+
+# ── peer-review round 7 ───────────────────────────────────────────────────
+
+# THE ROUND-7 P1-1. Round 6 targeted the question binding at the pane's QUESTION
+# REGION — but kept a fallback: "if the space-join fails, compare both sides with
+# ALL whitespace removed", justified as safe "because it is an equality against a
+# tight region". Equality does not make a lossy transformation injective, and
+# Codex demolished it in one counterexample: the pane asks "Is nowhere safe?",
+# the successor record asks "Is now here safe?" — two DIFFERENT questions, and
+# with the SAME option labels the squash makes them EQUAL, so the successor's
+# anchor binds to the live card and the answer commits onto the WRONG CARD.
+NOWHERE_ROWS = ["Is nowhere safe?"]
+NOWHERE_Q = "Is nowhere safe?"
+NOW_HERE_Q = "Is now here safe?"
+
+# The FALSIFIED PREMISE, pinned. "A row that ends exactly at the wrap column was
+# hard-broken mid-token" is FALSE for Claude Code: in the real 160-column capture
+# ``auq_longlabel_160x50_v2.1.198`` the question's rows 2 and 4 are EXACTLY 160
+# characters and both end at a WORD boundary ("…peer reviewers," / "…choice
+# trades"). So the geometry may only VETO the hard-break reading of a boundary —
+# never force it. A join rule that assumed otherwise would glue "reviewers,"
+# onto "but" and false-refuse every long question in the corpus.
+_EXACT_LEAD = "Which colour should the primary accent be"
+EXACT_COL_ROWS = [
+    f"{_EXACT_LEAD} {'x' * (WRAP - len(_EXACT_LEAD) - 1)}",
+    "and nothing?",
+]
+EXACT_COL_Q = " ".join(EXACT_COL_ROWS)
+# Its pane-indistinguishable twin: the pane renders these two questions
+# IDENTICALLY (a word wrap consumes the space; a hard break has none), so the
+# walk accepts both. Disclosed residual, not a hole the walk introduces.
+EXACT_COL_TWIN_Q = "".join(EXACT_COL_ROWS)
+
+# THE ROUND-7 P1-2. ``auq_question_region`` stopped collecting at 12 rows and
+# RETURNED the partial region — a strictly WEAKER, SUFFIX identity — while its
+# comment claimed truncation failed closed. Codex reproduced the consequence with
+# a parseable 13-row question: the region came back as rows 2..13, and a
+# successor record whose ENTIRE question equals that 12-row suffix bound to the
+# pane and committed onto the WRONG CARD.
+THIRTEEN_ROWS = [
+    f"Row {i} of a question that will not fit inside the cap" for i in range(1, 14)
+]
+THIRTEEN_Q = " ".join(THIRTEEN_ROWS)
+TWELVE_ROW_SUFFIX_Q = " ".join(THIRTEEN_ROWS[1:])
+
+
+def _agreement(question: str, rows: list[str]) -> str:
+    return auq_source.anchor_pane_agreement(
+        _tool_input(question),
+        plain(_rewrap_question(AUQ_X_LIVE, rows)),
+        target_row=4,
+        bind_question_text=True,
+    )
+
+
+class TestTheQuestionBindingIsInjective:
+    """Round-7 P1-1: the whitespace-removed fallback equated DIFFERENT questions."""
+
+    def test_a_space_moved_INSIDE_a_word_never_binds(self):
+        """Codex's exact case — RED before the fix.
+
+        ``_squash_ws("Is nowhere safe?") == _squash_ws("Is now here safe?")``, so
+        the round-6 fallback returned MATCH and the free-text executor committed
+        the user's answer onto the successor card.
+        """
+        assert _agreement(NOW_HERE_Q, NOWHERE_ROWS) == auq_source.ANCHOR_MISMATCH
+        # …and the pane's OWN question still binds, so this is not a blanket
+        # refusal of everything that region can hold.
+        assert _agreement(NOWHERE_Q, NOWHERE_ROWS) == auq_source.ANCHOR_MATCH
+
+    @pytest.mark.asyncio
+    async def test_the_successor_card_is_never_ANSWERED(
+        self, monkeypatch, auq_anchor, stamped
+    ):
+        """The same case on the LIVE call path: nothing is typed, nothing commits."""
+        auq_anchor[0] = _anchor(
+            "auq:sid:SESSION_A:tu:toolu_CARD_NOW_HERE", _tool_input(NOW_HERE_Q)
+        )
+        live = _rewrap_question(AUQ_X_LIVE, NOWHERE_ROWS)
+        pane = FakePane([live, live, live, live])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, AUQ_X_ANSWER, user_turn=STAMP)
+
+        assert result is None, "the lane must DECLINE and fall through to PR-1"
+        assert pane.enter_sent is False
+        assert pane.literal_writes == []
+        assert stamped == []
+        assert tmux_mod.tmux_manager.window_has_stranded_draft(WINDOW) is False
+
+    def test_a_row_AT_the_wrap_column_may_still_be_a_WORD_wrap(self):
+        """The falsified premise. Fixture-pinned on the real 160-column capture.
+
+        A join rule that read "row length == wrap column" as "hard-broken
+        mid-token" would reconstruct ``…xxand nothing?`` and refuse the genuine
+        question — killing the lane for the most common long-question shape.
+        """
+        assert len(EXACT_COL_ROWS[0]) == WRAP
+        assert _agreement(EXACT_COL_Q, EXACT_COL_ROWS) == auq_source.ANCHOR_MATCH
+
+    def test_the_exact_column_boundary_is_a_DISCLOSED_residual(self):
+        """The pane renders both of these questions with the SAME rows, so no
+        reading of the pane can separate them (re-wrapping the record's question
+        to the same width produces the same rows too). Accepted and documented —
+        the same class as "same question + same labels"."""
+        assert _agreement(EXACT_COL_TWIN_Q, EXACT_COL_ROWS) == auq_source.ANCHOR_MATCH
+
+    def test_a_hard_break_is_only_credible_on_a_FULL_row(self):
+        """The geometry VETO. A missing space at a SHORT row boundary is not a
+        wrap artefact — it is a different question, and it refuses."""
+        short = ["Which colour", "should we use?"]
+        assert len(short[0]) < WRAP
+        assert _agreement("Which colourshould we use?", short) == (
+            auq_source.ANCHOR_MISMATCH
+        )
+        assert _agreement("Which colour should we use?", short) == (
+            auq_source.ANCHOR_MATCH
+        )
+
+
+class TestTheRegionCapFailsClosed:
+    """Round-7 P1-2: the cap returned a truncated SUFFIX, a weaker identity."""
+
+    def test_an_over_long_region_is_None_not_a_suffix(self):
+        pane = plain(_rewrap_question(AUQ_X_LIVE, THIRTEEN_ROWS))
+        assert terminal_parser.auq_question_region(pane) is None
+
+    def test_the_twelve_row_SUFFIX_never_binds(self):
+        """RED before the fix: the region came back as the 12-row suffix, a
+        successor record whose whole question IS that suffix compared EQUAL, and
+        the answer committed onto the wrong card."""
+        assert _agreement(TWELVE_ROW_SUFFIX_Q, THIRTEEN_ROWS) == (
+            auq_source.ANCHOR_MISMATCH
+        )
+
+    def test_the_GENUINE_over_long_question_also_refuses(self):
+        """Fail-closed, and disclosed: a question past the cap cannot be bound at
+        all, so the lane declines and PR-1 refuses the message (a false refusal,
+        never a wrong-card commit). The largest REAL capture is 9 rows."""
+        assert _agreement(THIRTEEN_Q, THIRTEEN_ROWS) == auq_source.ANCHOR_MISMATCH
+
+    def test_a_region_that_ENDS_at_the_cap_is_complete(self):
+        """The cap is a boundary, not an off-by-one: exactly 12 rows still bind."""
+        rows = THIRTEEN_ROWS[:12]
+        assert _agreement(" ".join(rows), rows) == auq_source.ANCHOR_MATCH

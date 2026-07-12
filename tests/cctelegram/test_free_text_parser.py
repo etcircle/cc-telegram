@@ -377,3 +377,71 @@ class TestTheQuestionRegion:
             ]
         )
         assert tp.auq_question_region(pane) == "What's your favorite color?"
+
+    # ── round-7 P1-2: the cap FAILS CLOSED ───────────────────────────────────
+
+    def _pane_with_question_rows(self, rows: list[str]) -> str:
+        return "\n".join(
+            [*rows, "", "  1. Blue", "❯ 2. Type something.", "Enter to select · Esc"]
+        )
+
+    def test_a_region_that_ENDS_at_the_cap_is_returned_whole(self):
+        rows = [f"row {i} of the question" for i in range(1, 13)]
+        assert tp.auq_question_region(self._pane_with_question_rows(rows)) == (
+            "\n".join(rows)
+        )
+
+    def test_a_region_that_RUNS_PAST_the_cap_is_None_not_a_SUFFIX(self):
+        """Round-7 P1-2 — RED before the fix. The walk used to ``break`` at the cap
+        and RETURN the 12 rows it had, so a 13-row question came back as rows 2..13
+        — its top row silently missing. A SUFFIX is a strictly WEAKER identity: a
+        successor record whose ENTIRE question equals it binds to this pane, and
+        the free-text executor commits onto the WRONG CARD (Codex reproduced it).
+        An underivable region must never degrade into a weaker one.
+        """
+        rows = [f"row {i} of the question" for i in range(1, 14)]
+        assert tp.auq_question_region(self._pane_with_question_rows(rows)) is None
+
+
+class TestThePaneWrapColumn:
+    """``pane_wrap_column`` — measured from the capture, never guessed.
+
+    It is what tells the question binding whether a row boundary CAN have
+    hard-broken a token: only a FULL row can. A live picker always renders its
+    full-width ``────`` box rules, and ``capture-pane`` is not given ``-J``, so no
+    line can exceed the terminal width — over-estimation is impossible.
+    """
+
+    def test_it_measures_the_real_capture_at_the_machine_surface_geometry(self):
+        pane = tp.clean_ghost_input_text(_fx(f"auq_single_picker_{V}.txt"))
+        assert tp.pane_wrap_column(pane) == 160
+
+    def test_no_capture_no_column(self):
+        assert tp.pane_wrap_column("") is None
+
+    def test_a_row_AT_the_wrap_column_can_still_be_a_WORD_wrap(self):
+        """THE FALSIFIED PREMISE, pinned on real bytes.
+
+        "A row that ends exactly at the wrap column was hard-broken mid-token" is
+        FALSE for Claude Code. In this REAL 160-column capture the question's rows
+        2 and 4 are EXACTLY 160 characters and BOTH end at a word boundary
+        ("…peer reviewers," / "…choice trades"), with the next row starting a new
+        word. So the wrap column may only VETO the hard-break reading of a
+        boundary — never force it; a join rule that assumed otherwise would glue
+        "reviewers," onto "but" and false-refuse every long question.
+        """
+        pane = _fx("auq_longlabel_160x50_v2.1.198.txt")
+        width = tp.pane_wrap_column(pane)
+        assert width == 160
+        region = tp.auq_question_region(pane)
+        assert region is not None
+        rows = region.split("\n")
+        assert len(rows) == 9, "the largest REAL question in the corpus"
+
+        full = [(i, r) for i, r in enumerate(rows[:-1]) if len(r) == width]
+        assert full, "the capture must actually exercise the boundary"
+        for i, row in full:
+            # A word boundary: the row ends a word and the next row starts one.
+            assert not row.endswith(" ")
+            assert rows[i + 1][0] != " "
+            assert row.split()[-1] in ("reviewers,", "trades")

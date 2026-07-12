@@ -510,18 +510,55 @@ Additional modules:
                                     column-0 block directly above the live option
                                     block, anchored on the BOTTOM-MOST picker footer
                                     and the SAME block walk parse_ask_user_question
-                                    uses), never a substring of the pane; wrap
-                                    tolerance comes from REJOINING the region's rows
-                                    (space-join, then all-whitespace-removed for a
-                                    hard-broken token), both still equalities against
-                                    the region alone. An underivable region REFUSES.
+                                    uses), never a substring of the pane. AND THE
+                                    REJOIN IS DECIDED BY THE PANE'S GEOMETRY, NEVER
+                                    BY DELETING THE WHITESPACE (round-7 P1-1): the
+                                    round-6 all-whitespace-REMOVED fallback (the
+                                    hard-broken-token tolerance) equated DIFFERENT
+                                    questions — a pane asking "Is nowhere safe?" and
+                                    a successor asking "Is now here safe?" squash
+                                    EQUAL, so the successor bound and committed onto
+                                    the WRONG CARD (Codex-reproduced). DELETED. The
+                                    rejoin is a CONSUMPTION WALK: each region row
+                                    must be an exact PREFIX of what is left of the
+                                    question, and a boundary with NO space in the
+                                    question is accepted ONLY when the row reaches
+                                    the pane's WRAP COLUMN
+                                    (terminal_parser.pane_wrap_column — the widest
+                                    physical row on the capture; capture-pane is not
+                                    given -J, so no line can exceed the terminal
+                                    width and over-estimation is impossible), because
+                                    a break mid-token only happens on a FULL row. The
+                                    premise "a row AT the wrap column was hard-broken"
+                                    is FALSE (fixture-pinned: the real
+                                    auq_longlabel_160x50_v2.1.198 capture's 160-column
+                                    rows end at WORD boundaries), so the geometry only
+                                    VETOES the hard-break reading, never forces it.
+                                    AND THE REGION CAP FAILS CLOSED (round-7 P1-2):
+                                    the 12-row cap used to RETURN the partial region,
+                                    a strictly WEAKER SUFFIX identity a successor's
+                                    whole question can equal (Codex-reproduced with a
+                                    13-row question) — it now returns None and the
+                                    binding REFUSES (an over-long question declines to
+                                    PR-1; the largest REAL capture is 9 rows).
                                     SCOPED to the anchor path — the shared
                                     _record_consistent_with_pane (render, aqp:
                                     dispatch, source-drift re-mint, GH #48 recap)
-                                    never had a question leg and is byte-untouched.
-                                    Disclosed residual, WIDER than the reviewer
-                                    assumed: two AUQs with the same labels AND the
-                                    same question text are pane-indistinguishable.
+                                    never had a question leg and is byte-untouched
+                                    (round-7 P3: those consumers CAN reach a keystroke
+                                    — validate_and_consume → the aqp: navigate→Enter
+                                    dispatch — but that lane re-validates its exact
+                                    minted form + source fingerprint against the live
+                                    pane, so it is protected INDEPENDENTLY; the
+                                    scoping stands, the old "cannot commit a
+                                    keystroke" rationale was false).
+                                    Disclosed residuals: two AUQs with the same labels
+                                    AND the same question text are
+                                    pane-indistinguishable; and a row ending EXACTLY
+                                    at the wrap column renders identically whether the
+                                    original carried a space there or the token was
+                                    hard-broken (intrinsic — re-wrapping produces the
+                                    same rows — so the walk accepts both).
                                 A braked window (PR-1's stranded-draft registry) is
                                 checked FIRST and DECLINES — the lane is never a way
                                 around the brake, and never clears it. VERSION-LICENSED

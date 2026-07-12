@@ -1721,13 +1721,48 @@ def _walk_back_from_picker_footer(
 
 
 # How many PHYSICAL rows a question may occupy before ``auq_question_region``
-# stops collecting. Claude Code renders the question at column 0 and soft-wraps
-# it, so a long question is several rows; the bound keeps an unbroken run of
-# assistant prose above a blank-less picker from being glued in wholesale. At
-# the bot's 160-column geometry this is ~1.9 kB of question — far past anything
-# a picker heading realistically carries, so the truncation it fails closed on
-# is not a shape we expect to meet.
+# gives up. Claude Code renders the question at column 0 and soft-wraps it, so a
+# long question is several rows; the bound keeps an unbroken run of assistant
+# prose above a blank-less picker from being walked in wholesale. At the bot's
+# 160-column geometry this is ~1.9 kB of question — the largest REAL capture in
+# the corpus (``auq_longlabel_160x50_v2.1.198``) is 9 rows, so 12 carries 33%
+# headroom and is the only bound the captures justify.
+#
+# HITTING IT IS A FAILURE, NOT A TRUNCATION (peer-review round-7 P1-2). The
+# walk used to ``break`` at the cap and RETURN the rows it had — a partial
+# region, missing its top. The comment claimed that failed closed. It did NOT:
+# the SUFFIX is a strictly WEAKER identity, and a successor record whose whole
+# question equals that suffix BOUND to the pane and the free-text executor
+# committed onto the WRONG CARD (Codex reproduced it with a 13-row question).
+# An underivable region must never degrade into a weaker one, so the cap now
+# returns ``None`` and every caller refuses.
 _QUESTION_REGION_MAX_ROWS: Final = 12
+
+
+def pane_wrap_column(pane_text: str) -> int | None:
+    """The pane's WRAP COLUMN, measured from the capture itself.
+
+    ``None`` for an empty capture. This is the widest physical row on the pane,
+    which is a LOWER BOUND on the terminal width and, in practice, exactly it: a
+    live picker always renders its full-width ``────`` box rules (160 columns at
+    the bot's machine-surface geometry), and ``capture-pane`` is not given
+    ``-J``, so it emits one line per PHYSICAL row and **no line can exceed the
+    terminal width**. Over-estimation is therefore impossible.
+
+    The one consumer is the free-text lane's question binding
+    (:func:`handlers.auq_source._question_binds_to_pane`), which needs to know
+    whether a row boundary CAN have hard-broken a token: a row shorter than the
+    wrap column provably cannot have (a break mid-token happens only when the
+    row is full), so the question must carry a space there. Under-estimating the
+    column can only make that test MORE permissive at one boundary, never
+    refuse a genuine question — the fail-open direction is bounded to the
+    intrinsic ambiguity documented at the callsite, and the fail-closed
+    direction (a false refusal of a long question) is impossible.
+    """
+    if not pane_text:
+        return None
+    width = max((len(line) for line in pane_text.split("\n")), default=0)
+    return width or None
 
 
 def auq_question_region(pane_text: str) -> str | None:
@@ -1747,13 +1782,18 @@ def auq_question_region(pane_text: str) -> str | None:
     the block Claude Code renders directly above the option block — and nothing
     else on the pane.
 
-    The rows are returned SEPARATE (joined by ``\\n``), boundaries intact: a
-    caller that wants wrap tolerance must rejoin them explicitly, and one that
-    wants token boundaries still has them. Anchored on the BOTTOM-MOST picker
-    footer (this repo's bottom-most-is-live rule — the live picker renders at the
-    bottom and its scrollback above is frozen) and on the SAME block walk
+    The rows are returned SEPARATE (joined by ``\\n``), boundaries intact — and
+    each row is returned at its RENDERED WIDTH (stripped of the padding tmux
+    already drops), because the width is what tells a caller whether a boundary
+    could have hard-broken a token (see :func:`pane_wrap_column`). A caller that
+    wants wrap tolerance must rejoin them explicitly. Anchored on the BOTTOM-MOST
+    picker footer (this repo's bottom-most-is-live rule — the live picker renders
+    at the bottom and its scrollback above is frozen) and on the SAME block walk
     ``parse_ask_user_question`` uses, so the two can never disagree about which
     picker is live.
+
+    A region that runs past ``_QUESTION_REGION_MAX_ROWS`` is ``None`` — NOT a
+    truncated suffix (round-7 P1-2; see the constant).
     """
     if not pane_text:
         return None
@@ -1776,8 +1816,6 @@ def auq_question_region(pane_text: str) -> str | None:
 
     rows: list[str] = [lines[stop_idx].strip()]
     for k in range(stop_idx - 1, -1, -1):
-        if len(rows) >= _QUESTION_REGION_MAX_ROWS:
-            break
         prev = lines[k]
         prev_stripped = prev.strip()
         if not prev_stripped:
@@ -1792,6 +1830,17 @@ def auq_question_region(pane_text: str) -> str | None:
             # capture does not re-indent soft-wrapped lines, so a wrapped
             # question's continuation rows start at column 0.)
             break
+        # The cap is checked ONLY once the row above is known to still BELONG to
+        # the region — a region that ends exactly at the cap is complete, not
+        # truncated — and it FAILS CLOSED (round-7 P1-2): returning the rows
+        # collected so far would hand the caller a strictly weaker SUFFIX
+        # identity, which a successor record can equal in full.
+        if len(rows) >= _QUESTION_REGION_MAX_ROWS:
+            logger.info(
+                "AUQ question region exceeds %d rows — underivable, refusing",
+                _QUESTION_REGION_MAX_ROWS,
+            )
+            return None
         rows.append(prev_stripped)
     return "\n".join(reversed(rows))
 
