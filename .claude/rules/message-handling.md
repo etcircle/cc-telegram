@@ -1703,6 +1703,29 @@ quarantine re-check — every step fail-closed):
    (`a y n q z Y N space - ? . ,` …) fire nothing and move nothing; out-of-range
    digits are inert; digit `4` (the `Type something.` row) selects the free-text row
    ⇒ it stays in the refusal set.
+0b. **The RAW-CONTROL-BYTE refusal** (`delivery.unsafe_control_char`) — also before
+   any capture. **`send-keys -l` is not a sanitizer.** `-l` stops *tmux* interpreting
+   KEY NAMES; it does NOT make C0/ESC bytes inert to the program on the other side of
+   the pty. **RIG-CONFIRMED** (`tmux -L ccrig`, `cat -v` in the pane): a payload built
+   with `printf 'A\033[B2B'` lands as the literal bytes `A^[[B2B` — so Claude's TUI
+   reads `A`, a **CURSOR-DOWN escape sequence**, then `2`. That is a complete commit
+   primitive: `lone_hotkey_line` cannot see it (the line is not a lone digit), the pane
+   gate has already passed, and the re-verify (step 5) runs *after* the write — so an
+   embedded `ESC [ B` + digit moves the cursor off the row that was proved and fires a
+   digit HOTKEY (which on a single-select-shaped surface COMMITS with **no Enter**)
+   before anything re-observes the pane. It is refused outright at this ONE gated seam
+   — `deliver_to_window` owns the single refusal, so exactly one ❌ reaches the user.
+   The byte set is **everything in C0 except LF**, plus DEL and C1 (`U+0080–U+009F`,
+   which a UTF-8 terminal decodes back into the C1 control range). **`\n` is ALLOWED
+   and load-bearing** — a payload written in ONE `send-keys -l` is consumed
+   PASTE-SHAPED and commits whole (rig: 947-char/9-line and 5 274-char/30-line payloads
+   both landed intact), and every voice note and reply-context quote is multi-line;
+   newline handling is **untouched** by this rule. `\t` and `\r` are REFUSED
+   deliberately: Tab is a live TUI *key* (it advances a picker; it drives completion in
+   the input box) and CR **is Enter at the pty** — an embedded one would commit
+   mid-payload. **Disclosed cost:** a pasted tab-indented code snippet is refused, with
+   actionable copy. Stripping or converting the bytes would silently change what Claude
+   receives, which is worse than an honest refusal.
 1. **A bounded, cancellation-safe capture** (`capture_pane_cancellation_safe` under
    `asyncio.wait_for`; ONLY `asyncio.TimeoutError` classifies — a genuine
    caller/shutdown cancellation PROPAGATES, never swallowed into a refusal), plus an

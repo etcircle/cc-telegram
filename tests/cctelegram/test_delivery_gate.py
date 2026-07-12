@@ -151,6 +151,78 @@ async def test_lone_hotkey_payload_is_never_written(
     assert "just a number" in result.message
 
 
+# ── §1.3b: the RAW-CONTROL-BYTE refusal ──────────────────────────────────
+#
+# ``tmux send-keys -l`` stops tmux interpreting KEY NAMES; it does NOT make C0/ESC
+# bytes inert to the TUI on the other side of the pty. RIG-CONFIRMED (``tmux -L
+# ccrig``, ``cat -v`` in the pane): a payload built with ``printf 'A\033[B2B'``
+# lands as the literal bytes ``A^[[B2B``. Claude's TUI reads that as ``A``, a
+# CURSOR-DOWN escape sequence, then ``2`` — and on a single-select-shaped surface
+# a digit is a HOTKEY that COMMITS with no Enter. It fires DURING the write, so no
+# amount of post-write verification can undo it: the payload must never be typed.
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "answer\x1b[B2",  # ESC — the cursor-move + hotkey commit primitive
+        "before\tafter",  # TAB — a live TUI key (advances a picker; completion)
+        "line\rmore",  # CR — Enter at the pty; it would commit mid-payload
+        "nul\x00byte",
+        "del\x7fbyte",
+        "c1\x9bbyte",  # C1 CSI, which a UTF-8 terminal decodes back to a control
+    ],
+)
+def test_control_bytes_are_detected(payload: str) -> None:
+    assert delivery.unsafe_control_char(payload) is not None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "plain text",
+        "line one\nline two\n",  # LF is ALLOWED — a paste-shaped multi-line
+        "> quoted reply\n\nmy actual answer\n",  # …the owner's dominant shape
+        "emoji 🎨 and unicode ü stay fine",
+    ],
+)
+def test_ordinary_payloads_pass(payload: str) -> None:
+    assert delivery.unsafe_control_char(payload) is None
+
+
+@pytest.mark.asyncio
+async def test_a_control_byte_payload_is_never_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refused OUTRIGHT — no capture, no keystroke, even on an idle pane."""
+    pane = _wire(monkeypatch, _Pane([IDLE_PANE_V2_1_207]))
+
+    result = await session_manager.deliver_to_window("@1", "my answer\x1b[B2 teal")
+
+    assert result.refused
+    assert result.reason == delivery.REASON_CONTROL_CHARS
+    assert result.outcome is delivery.DeliveryOutcome.NOT_WRITTEN
+    assert pane.sent == []
+    assert pane.capture_calls == 0
+    assert "control character" in result.message
+
+
+@pytest.mark.asyncio
+async def test_a_multi_line_payload_still_delivers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hard non-regression: newlines are LOAD-BEARING (every voice note and
+    every reply-context quote is multi-line, and CC consumes a single
+    ``send-keys -l`` burst paste-shaped). Nothing here touches that."""
+    pane = _wire(monkeypatch, _Pane([IDLE_PANE_V2_1_207]))
+    payload = "> Re: the card\n>\n> Claude asked: which colour?\n\nTeal, please.\n"
+
+    result = await session_manager.deliver_to_window("@1", payload)
+
+    assert result.ok
+    assert pane.sent == [(payload, False, True), ("", True, False)]
+
+
 # ── §1.2: the happy path + the withheld Enter ────────────────────────────
 
 
@@ -1185,6 +1257,8 @@ def test_copy_is_actionable_per_reason() -> None:
     assert "Answer the card first" in delivery.REFUSAL_COPY["prompt_present"]
     assert "/update" in delivery.REFUSAL_COPY["not_claude"]
     assert "just a number" in delivery.REFUSAL_COPY["lone_hotkey_segment"]
+    assert "control character" in delivery.REFUSAL_COPY["control_chars"]
+    assert "line breaks are fine" in delivery.REFUSAL_COPY["control_chars"]
     assert "Esc" in delivery.REFUSAL_COPY["tasks_mode"]
     assert "@" in delivery.REFUSAL_COPY["completion_overlay"]
 

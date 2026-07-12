@@ -1265,6 +1265,11 @@ class SessionManager:
 
           0. SEGMENT-aware hotkey refusal (``delivery.lone_hotkey_line``) —
              BEFORE any capture, so a lone-digit payload is NEVER written.
+          0b. RAW-CONTROL-BYTE refusal (``delivery.unsafe_control_char``) — also
+             before any capture. ``send-keys -l`` passes C0/ESC bytes to the pty
+             VERBATIM (rig-confirmed), so an embedded ``ESC [ B`` + digit is a
+             cursor-move + HOTKEY commit that no post-write check can undo. LF is
+             allowed (paste-shaped multi-line payloads are a first-class flow).
           1. Bounded, cancellation-safe pane capture (``capture_pane_cancellation_safe``
              under ``asyncio.wait_for``); the whole transaction carries an overall
              deadline.
@@ -1324,6 +1329,23 @@ class SessionManager:
                 delivery.REASON_LONE_HOTKEY,
             )
             return delivery.refuse(delivery.REASON_LONE_HOTKEY, written=False)
+
+        # (0b) The RAW-CONTROL-BYTE refusal. ``-l`` stops tmux interpreting KEY
+        # NAMES; it does NOT make C0/ESC bytes inert to the TUI on the other side
+        # of the pty (rig-confirmed). An embedded ``ESC [ B`` + digit would move
+        # the cursor off whatever we proved and fire a digit HOTKEY — a commit
+        # with no Enter — before ANY of the post-write verification runs.
+        # Payload-only, no capture, never written. ``\n`` is deliberately ALLOWED
+        # (paste-shaped multi-line payloads are a first-class flow); see
+        # ``delivery.unsafe_control_char``.
+        ctrl = delivery.unsafe_control_char(text)
+        if ctrl is not None:
+            logger.info(
+                "DELIVERY REFUSED window=%s reason=%s outcome=not_written",
+                window_id,
+                delivery.REASON_CONTROL_CHARS,
+            )
+            return delivery.refuse(delivery.REASON_CONTROL_CHARS, written=False)
 
         # r2 F2 + the cancellation fold: the brake is armed through ONE seam, and
         # INSIDE the send lock — a queued send already waiting on

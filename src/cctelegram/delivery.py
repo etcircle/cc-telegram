@@ -23,6 +23,12 @@ user payload into a live Claude Code pane:
     PER-LINE hotkey refusal (§1.3). On CC 2.1.207 a bare digit is a live HOTKEY
     on a single-select-shaped surface (it commits with NO Enter), so a payload
     whose emitted literal segments contain a bare-digit LINE is never written.
+  - ``unsafe_control_char`` — the RAW-CONTROL-BYTE refusal (§1.3b). ``send-keys
+    -l`` stops *tmux* interpreting key NAMES but passes C0/ESC bytes to the pty
+    VERBATIM (rig-confirmed), so an embedded ``ESC [ B`` + digit is a cursor-move
+    + HOTKEY commit fired DURING the write. Everything in C0 except LF, plus DEL
+    and C1, is refused before any keystroke. LF stays ALLOWED — paste-shaped
+    multi-line payloads are a first-class flow.
 """
 
 from __future__ import annotations
@@ -100,6 +106,7 @@ REASON_CAPTURE_TIMEOUT: Final = "capture_timeout"
 REASON_CMD_PROBE_TIMEOUT: Final = "cmd_probe_timeout"
 REASON_DEADLINE: Final = "deadline"
 REASON_LONE_HOTKEY: Final = "lone_hotkey_segment"
+REASON_CONTROL_CHARS: Final = "control_chars"
 REASON_STRANDED_DRAFT: Final = "stranded_draft"
 REASON_SEND_FAILED: Final = "send_failed"
 REASON_REVERIFY_FAILED: Final = "reverify_failed"
@@ -120,6 +127,7 @@ DELIVERY_REFUSAL_REASONS: Final = (
             REASON_CMD_PROBE_TIMEOUT,
             REASON_DEADLINE,
             REASON_LONE_HOTKEY,
+            REASON_CONTROL_CHARS,
             REASON_STRANDED_DRAFT,
             REASON_SEND_FAILED,
             REASON_REVERIFY_FAILED,
@@ -209,6 +217,12 @@ REFUSAL_COPY: Final[dict[str, str]] = {
         "Not delivered — a message that is just a number can be read as a "
         "KEYPRESS by the terminal (it would pick that option on a live prompt). "
         "Send it with a word instead, e.g. `option 1`."
+    ),
+    REASON_CONTROL_CHARS: (
+        "Not delivered — your message contains a control character (an escape "
+        "sequence, a tab or a carriage return). The terminal would read those as "
+        "KEYPRESSES rather than text — arrow keys, Tab, Enter — so they are never "
+        "typed into a pane. Resend without them (normal line breaks are fine)."
     ),
     REASON_STRANDED_DRAFT: STRANDED_DRAFT_MSG,
     # A failed literal write does NOT prove zero bytes reached the pane (r2 F5),
@@ -344,6 +358,63 @@ def lone_hotkey_line(text: str) -> str | None:
             if _RE_LONE_DIGIT_LINE.fullmatch(line):
                 return line
     return None
+
+
+# ── The raw-control-byte refusal ─────────────────────────────────────────
+#
+# ``tmux send-keys -l`` stops tmux from interpreting KEY NAMES ("Down", "Enter").
+# It does NOT neutralize C0/ESC bytes: they reach the pty VERBATIM, and the
+# program on the other side is a terminal application that reads them as keys.
+# RIG-CONFIRMED (``tmux -L ccrig``, ``cat -v`` in the pane): a payload built with
+# ``printf 'A\033[B2B'`` lands as the literal bytes ``A^[[B2B`` — i.e. Claude's
+# TUI sees ``A``, a CURSOR-DOWN escape sequence, then ``2``.
+#
+# That is a COMMIT primitive. ``delivery.lone_hotkey_line`` cannot see it (the
+# line is not a lone digit), the pane gate has already passed, and the gate's
+# re-verify runs only AFTER the write — so an embedded ``ESC [ B`` + digit can
+# move the cursor off the row we proved and fire a digit HOTKEY (which on a
+# single-select-shaped surface COMMITS with no Enter) before anything re-observes
+# the pane. The ONLY sound answer is to refuse the payload before any keystroke.
+#
+# WHAT IS ALLOWED, AND WHY (decided deliberately):
+#
+#   \n  (LF, 0x0A) — ALLOWED, and load-bearing. A multi-line payload written in
+#       ONE ``send-keys -l`` is consumed PASTE-SHAPED by CC and commits WHOLE
+#       (rig: 947-char / 9-line and 5 274-char / 30-line payloads both landed
+#       intact). Every real voice note and every reply-context quote is
+#       multi-line, so refusing LF would break the lane's primary flow. This code
+#       does not touch newline handling AT ALL — the byte set below simply
+#       excludes 0x0A.
+#
+#   \t  (TAB, 0x09) — REFUSED. Tab is a live TUI KEY, not whitespace: on a picker
+#       it advances the surface, in the input box it drives completion. The rig
+#       confirms ``send-keys -l`` passes the raw 0x09 through. Disclosed cost: a
+#       pasted tab-indented code snippet is refused (with actionable copy). We do
+#       NOT silently strip or convert it — that would change the bytes Claude
+#       receives, which is worse than an honest refusal.
+#
+#   \r  (CR, 0x0D) — REFUSED. CR is Enter at the pty: an embedded one would COMMIT
+#       mid-payload. Telegram and the transcription API both emit LF.
+#
+#   ESC (0x1B), every other C0, DEL (0x7F) and C1 (U+0080–U+009F) — REFUSED. C1 is
+#       included because a UTF-8 terminal decodes U+0080–U+009F back into the C1
+#       control range.
+_RE_UNSAFE_CONTROL: Final = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
+
+
+def unsafe_control_char(text: str) -> str | None:
+    """The first control character a terminal would read as a KEY, or ``None``.
+
+    Everything in C0 except LF, plus DEL and C1. See the block comment above for
+    the per-character rationale — in particular why ``\\n`` is allowed (paste-
+    shaped multi-line payloads are the lane's primary flow) and ``\\t`` is not.
+
+    Applied at ``session.deliver_to_window`` step 0b — the single gated seam every
+    user payload crosses — because the hazard is a property of the BYTES, not of
+    the lane. REFUSE, never strip: stripping would change what Claude receives.
+    """
+    m = _RE_UNSAFE_CONTROL.search(text)
+    return m.group(0) if m else None
 
 
 def is_bare_slash_payload(text: str) -> bool:

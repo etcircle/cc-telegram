@@ -138,8 +138,14 @@ commit the highlighted option for you.
 Queueing while Claude is busy still works, and so do drafts you already typed in
 the terminal — the gate checks for the input box, not for idleness. Messages that
 are just a bare number are refused: the terminal reads a lone digit as a
-keypress, not as text. `/esc`, the card buttons, and the arrow-key controls are
-deliberately *not* gated — those exist to act on a live prompt.
+keypress, not as text. So are messages carrying control characters — an escape
+sequence, a tab, or a carriage return — because the terminal reads those as
+*keypresses* (arrow keys, Tab, Enter) rather than as text, whatever the bot does
+to type them. Ordinary line breaks are fine, so multi-line messages, voice notes
+and quoted replies all deliver normally; a pasted snippet indented with literal
+tabs is the one thing that gets turned away, with a note saying why. `/esc`, the
+card buttons, and the arrow-key controls are deliberately *not* gated — those
+exist to act on a live prompt.
 
 If a message is refused, it is dropped with a notice naming the reason. Nothing
 is ever replayed silently.
