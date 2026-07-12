@@ -18,6 +18,26 @@ Open a topic to start a session. Switch topics to switch projects. Close Telegra
 
 No web dashboard. No second agent runtime. No pretending a screenshot is an interactive prompt.
 
+## Two things to know before you start
+
+**1. Run Claude Code with permissions bypassed.** In practice this is a bypass-permissions tool:
+
+```bash
+CLAUDE_COMMAND="claude --dangerously-skip-permissions"
+```
+
+Claude Code's per-tool approval prompts are a terminal UI. The bridge can show you one as a card, but approving it from your phone means firing raw arrow keys into a live terminal — slow enough that a permission-prompting session is impractical to drive from Telegram at all. So bypassing permissions is the normal configuration here, not a shortcut.
+
+That moves your security boundary. It is no longer Claude Code's per-tool approval — it is **`ALLOWED_USERS` plus the machine you run on**. Anyone who can post in your forum can make Claude read, edit, and execute anything your user account can. Lock `ALLOWED_USERS` to your own Telegram user ID and run it somewhere you trust. Full reasoning in [Permissions: in practice this is a bypass-permissions tool](#permissions-in-practice-this-is-a-bypass-permissions-tool).
+
+**2. `/screenshot` is always your fallback.** The bridge renders most of what Claude does, but not all of it — a full-screen TUI panel, an unfamiliar prompt, or a session that simply looks stuck. Whenever you cannot tell what is happening or what Claude is waiting on, send:
+
+```text
+/screenshot
+```
+
+You get a PNG of the actual terminal pane. It works in any state, it never types anything, and it is the honest answer to "what is it *actually* doing right now?" When something looks wrong, screenshot first — then decide.
+
 ## Install it
 
 ### The easy way: ask Claude

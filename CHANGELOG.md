@@ -4,6 +4,72 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.0] — 2026-07-12
+
+The "safe to type at a live prompt" release. Sending a message while Claude was waiting on a
+question card, a plan approval, or a folder-trust dialog used to type your text into the terminal —
+where the text was discarded and the trailing Enter **committed the highlighted option**. On a plan
+approval that option is *"Yes, and bypass permissions"*, so a stray "ok thanks" could approve a plan
+with permissions bypassed. That is now closed twice over: every payload must first prove Claude's
+input box is actually there, and on a **question card** your message no longer bounces at all — it
+becomes the answer, in your own words, by voice or by text.
+
+### Added
+- **Answer a question card in prose (GH #50 PR-2).** A voice note, a typed message, a caption, or a
+  quoted reply now *answers* a live `AskUserQuestion` card instead of being refused. The bridge
+  navigates to the card's own free-text row, types your words, and commits them. Quoted replies keep
+  their quote.
+  - **The guard is a landing proof, taken before a single byte is typed:** the row under the cursor
+    must be the *dim* `Type something.` placeholder. A rig on Claude Code 2.1.207 established that
+    dim holds for exactly one shape — the selected, untyped placeholder — and that a real option row
+    is never dim, not even when highlighted. So the bridge cannot begin typing while parked on an
+    option, and a mis-identified card cannot commit one. Verified against an overshoot onto a real
+    option, an undershoot onto a real option, and the payload `"Yes, but use postgres"` against an
+    option literally labelled `Yes`.
+  - Card identity is the `PreToolUse` hook's per-invocation `tool_use_id` (mandatory — no id, no
+    dispatch), re-read around every capture, with a fresh `session_map.json` generation read and
+    structural option-label agreement.
+  - **Accepted, disclosed residual:** a successor card with the same option labels, appearing in the
+    window between the last look and Enter, can receive the prose meant for its predecessor. Your
+    answer reaches a different question; you see it and correct it. It is never an option commit.
+  - **Plan approvals are out of scope by decision** — an `ExitPlanMode` card falls through to the
+    delivery gate and is refused, with an explanation.
+- **README: the two things that actually matter, up front** — that this is in practice a
+  bypass-permissions tool (and what that does to your security boundary), and that `/screenshot` is
+  the always-available fallback whenever you cannot tell what the terminal is doing.
+
+### Fixed
+- **Messages are never typed into a live prompt (GH #50 PR-1).** `deliver_to_window` is now the one
+  choke point every payload crosses — text, voice, captions, attachments, forwarded slash commands,
+  the late-answer card, the pending-bind replay — and it refuses to write unless it has *positive
+  structural proof* of Claude's ready input box. Positive proof, never "no known prompt matched":
+  the `Switch model?` dialog is footer-less and the parser is blind to it, so absence-of-match is
+  worthless. Every blocking prompt replaces the input box, which is why its presence is the one
+  signal that holds for prompts nobody has seen yet.
+  - A **stranded-draft brake** stops the follow-on failure: if a payload was typed but its Enter
+    withheld, the next message would otherwise append to it and commit both. The window refuses
+    further sends until the input box is observed empty (or the window dies).
+  - Refusals carry the actual reason and actionable copy, exactly once, on every path.
+- **Raw control bytes are refused before any keystroke (GH #50).** `tmux send-keys -l` stops tmux
+  interpreting key *names* but passes escape bytes to the terminal verbatim, so a payload carrying
+  `ESC [ A` could move the cursor and fire a hotkey before anything was verified. All C0 control
+  characters except newline, plus DEL and C1, are now refused with an explanation rather than
+  silently stripped. Ordinary line breaks still work, so voice notes and quoted replies are
+  unaffected.
+- **Long voice notes stopped stranding (GH #50 PR-1 regression).** Claude Code collapses a large
+  pasted payload to `[Pasted text #1 +N lines]` **and replaces the status bar** with
+  `paste again to expand`. The gate did not know that shape was still a ready input box, so every
+  message past ~800 characters — a voice note carrying a reply quote, typically — was refused, left
+  stranded in the input box, and braked the topic.
+- **`/update` and `/cost` in any topic where a plan had been approved.** Pre-existing and silent:
+  after a plan approval Claude Code pins the plan's slug into the input box's top rule, and the
+  pure-dashes pattern stopped matching — so `/update` quietly deferred and `/cost` refused, in that
+  topic, forever.
+- **`/cost` and `/usage` refused for anyone running background agents.** They had inherited
+  `/update`'s background-shells guard, which exists only because `/update` *restarts* the session.
+  Reading a usage overlay restarts nothing, so a live `· N shell` token is not a hazard for it —
+  but it made `/cost` refuse essentially every time for a heavy background-agent user.
+
 ## [0.3.0] — 2026-07-10
 
 The "typing truth + supervision surfaces" release: ~159 commits since v0.2.1 making the bridge
