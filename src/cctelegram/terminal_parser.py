@@ -4184,16 +4184,21 @@ def _codepoint_width(ch: str) -> int:
 def _is_grapheme_extender(ch: str) -> bool:
     """True iff ``ch`` EXTENDS the current grapheme cluster at zero cells.
 
-    The terminal-sufficient UAX #29 extend set, stdlib-only (Codex review
-    round-3 F1 — ``unicodedata.combining() > 0`` alone is NOT a complete
-    grapheme-extend predicate: an ENCLOSING mark like U+20E3 COMBINING
-    ENCLOSING KEYCAP has combining class 0, and emoji TAG characters are
-    format chars that were splitting a tag-sequence flag into phantom
-    zero-width clusters — which defeated the straddle/exact accounting at a
-    panel boundary and silently DROPPED the tag chars from a trusted label):
+    The terminal-sufficient subset of the Unicode grapheme-break ``Extend``
+    property, stdlib-only (Codex review rounds 3-4 — ``unicodedata.combining()
+    > 0`` alone is NOT a complete grapheme-extend predicate: an ENCLOSING mark
+    like U+20E3 COMBINING ENCLOSING KEYCAP has combining class 0, emoji TAG
+    characters are format chars that were splitting a tag-sequence flag into
+    phantom zero-width clusters, and ZWNJ is category ``Cf`` too — each of
+    which defeated the straddle/exact accounting at a panel boundary and
+    silently DROPPED codepoints from a trusted label):
 
       * marks — ``category in {"Mn", "Mc", "Me"}`` (nonspacing + spacing +
         enclosing, not just ``combining() > 0``);
+      * ZWNJ U+200C (round-4 residual: category ``Cf``, so the mark leg misses
+        it, but its grapheme-break property is ``Extend``) — a plain BACKWARD
+        zero-cell attachment only, never ZWJ's join-both-sides behavior (ZWNJ
+        exists to PREVENT joining);
       * variation selectors U+FE00-FE0F (VS15/VS16 additionally adjust the
         cluster's width — handled by the iterator before this predicate);
       * emoji skin-tone modifiers U+1F3FB-1F3FF;
@@ -4203,6 +4208,8 @@ def _is_grapheme_extender(ch: str) -> bool:
     ZWJ (U+200D) keeps its separate join-both-sides handling in the iterator.
     """
     code = ord(ch)
+    if code == 0x200C:
+        return True  # ZWNJ — grapheme-break Extend; backward attachment only
     if 0xFE00 <= code <= 0xFE0F:
         return True  # variation selectors
     if 0x1F3FB <= code <= 0x1F3FF:

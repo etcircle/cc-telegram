@@ -197,6 +197,15 @@ class TestDisplayWidth:
         assert display_width(keycap) == 1
         assert len(list(tp._iter_grapheme_clusters(keycap))) == 1
 
+    def test_zwnj_extends_the_cluster_at_zero_cells(self):
+        """Round-4 residual: ZWNJ (U+200C) is category Cf — the Mn/Mc/Me leg
+        misses it — but its grapheme-break property is Extend. base+ZWNJ is
+        ONE cluster at the base's width (a plain backward attachment; never
+        ZWJ's join-both-sides behavior)."""
+        zwnj = "x\u200c"
+        assert display_width(zwnj) == 1
+        assert len(list(tp._iter_grapheme_clusters(zwnj))) == 1
+
     def test_box_drawing_is_one_cell(self):
         assert display_width("┌──┐") == 4
 
@@ -374,6 +383,34 @@ class TestPreviewParse:
         assert form.options_complete is True
         assert form.options[0].label == label
         assert "\U000e007f" in form.options[0].label  # CANCEL TAG survived
+        assert [o.number for o in form.options if o.cursor] == [1]
+
+    def test_boundary_ending_zwnj_label_parses_intact(self):
+        """Round-4 residual, the reviewer's repro: a label whose visible
+        content ends EXACTLY at the panel boundary followed by a ZWNJ
+        (U+200C, zero-cell) must parse with the ZWNJ PRESENT on a trusted
+        preview form — pre-fix, `_cluster_prefix_within_cells` returned
+        BEFORE the ZWNJ with exact=True and it was SILENTLY DROPPED
+        (layout stayed "preview", options_complete stayed True)."""
+        pane = _load("auq_preview_singleselect_v2.1.207.txt")
+        lines = pane.split("\n")
+        opt1_idx = next(
+            i for i, ln in enumerate(lines) if ln.lstrip().startswith("❯ 1.")
+        )
+        box_idx = lines[opt1_idx].index("┌")
+        # "❯ 1. " (5 cells) + 29 ASCII cells + ZWNJ (0 cells) == 34 cells —
+        # the visible content ends exactly at the boundary with the ZWNJ
+        # extending the final cluster.
+        label = "S" * 29 + "\u200c"
+        new_row = "❯ 1. " + label + lines[opt1_idx][box_idx:]
+        assert display_width("❯ 1. " + label) == 34
+        lines[opt1_idx] = new_row
+        form = parse_ask_user_question("\n".join(lines))
+        assert form is not None
+        assert form._meta.get("layout") == "preview"
+        assert form.options_complete is True
+        assert form.options[0].label == label
+        assert form.options[0].label.endswith("\u200c")  # the ZWNJ survived
         assert [o.number for o in form.options if o.cursor] == [1]
 
     def test_wide_cluster_straddling_the_boundary_rejects_the_preview_parse(self):
