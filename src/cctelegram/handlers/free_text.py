@@ -471,6 +471,11 @@ def _auq_shape(pane_text: str, ansi_pane: str) -> _Shape | None:
     #   multi-select   — a THREE-Enter transaction whose first Enter mutates the form
     #   review screen  — the Submit/Cancel screen has no free-text row
     #   multi-question — the tab matrix makes "the answer" ambiguous
+    #
+    # MINT/VALIDATE PARITY (GH #54 W5 r1 P2-1): these eligibility gates are
+    # MIRRORED by ``advertises_free_text`` (the card-copy predicate) — a gate
+    # added here without the mirror makes the card promise a text answer this
+    # executor will refuse. Keep the two in lockstep.
     if form.select_mode != "single" or form.is_review_screen:
         return None
     if len(form.questions) > 1:
@@ -481,6 +486,7 @@ def _auq_shape(pane_text: str, ansi_pane: str) -> _Shape | None:
     # rather than guessing the row index. ``options_complete`` is True only when
     # the numbering is contiguous from 1 AND an affordance row was parsed in the
     # block — i.e. we are looking at the WHOLE list, so N is trustworthy.
+    # (Also mirrored by ``advertises_free_text`` — see above.)
     if not form.options_complete or not form.options:
         return None
     target_row = len(form.options) + 1  # affordances are dropped from ``options``
@@ -1282,29 +1288,63 @@ HINT_NO_FREE_TEXT: Final = "Answer with the buttons or the ↑/↓/⏎ keys."
 
 
 def advertises_free_text(
-    surface: str, *, version: str | None, has_affordance: bool
+    surface: str,
+    *,
+    version: str | None,
+    form: "terminal_parser.AskUserQuestionForm | None",
 ) -> bool:
     """True iff a plain message would ACTUALLY be taken as this card's answer.
 
-    The single (flag ON) × (licensed CC version) × (live free-text affordance)
-    predicate. It is the one gate behind BOTH ``card_hint`` (the card's
+    The single card-copy predicate behind BOTH ``card_hint`` (the card's
     free-text line) AND the three partial/untrusted-pane notices in
-    ``interactive_ui`` (GH #54 W5), so no card copy can ever promise a
-    text answer that PR-1's gate would refuse. A preview single-select
-    (``is_free_text=False`` ⇒ ``has_affordance=False``) therefore never
-    advertises text answers on any version.
+    ``interactive_ui`` (GH #54 W5), so no card copy can ever promise a text
+    answer this lane's executor would decline (⇒ PR-1 refusal).
+
+    It MIRRORS the executor's OWN eligibility gates (``_auq_shape`` — the
+    mint/validate-parity rule, GH #54 W5 r1 P2-1: the earlier flag × license ×
+    affordance form was WEAKER than the executor, so a licensed SCROLLED picker
+    — ``is_free_text=True`` but ``options_complete=False`` — or a
+    multi-question single-select advertised "send your answer as text" while
+    the send was REFUSED):
+
+      * single-select, not the review screen;
+      * single-QUESTION (the tab matrix makes "the answer" ambiguous);
+      * a live free-text affordance (``is_free_text`` — a preview single-select
+        is False here, so it never advertises on any version);
+      * a COMPLETE contiguous option list (a scrolled/partial pane bails);
+      * the flag is ON and the CC version is licensed.
+
+    ``form`` is the LIVE pane-derived form (the closest render-time proxy for
+    what the executor's fresh parse will see); ``None`` ⇒ False.
     """
-    return has_affordance and _ENABLED and licensed(surface, version)
+    if form is None:
+        return False
+    # The executor's gates, mirrored in order (free_text._auq_shape).
+    if form.select_mode != "single" or form.is_review_screen:
+        return False
+    if len(form.questions) > 1:
+        return False
+    if not form.is_free_text:
+        return False
+    if not form.options_complete or not form.options:
+        return False
+    return _ENABLED and licensed(surface, version)
 
 
-def card_hint(surface: str, *, version: str | None, has_affordance: bool) -> str:
+def card_hint(
+    surface: str,
+    *,
+    version: str | None,
+    form: "terminal_parser.AskUserQuestionForm | None",
+) -> str:
     """The per-surface card hint (plan §2.2 [r3 P2-4]).
 
     The card must state the CURRENT truth: pre-PR-2 it promised free-text on
     every AUQ, including the multi-select and unlicensed-version cases where a
     plain message is REFUSED. Now the promise is made only where the lane will
-    actually take it.
+    actually take it — ``advertises_free_text`` mirrors the executor's own
+    eligibility gates (GH #54 W5 r1 P2-1).
     """
-    if advertises_free_text(surface, version=version, has_affordance=has_affordance):
+    if advertises_free_text(surface, version=version, form=form):
         return HINT_FREE_TEXT
     return HINT_NO_FREE_TEXT

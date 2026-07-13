@@ -1,16 +1,22 @@
-"""GH #54 W5 — the three partial/untrusted-pane notices are copy-honest.
+"""GH #54 W5 — the partial/untrusted-pane notices are copy-honest (r1 P2-1).
 
 Three dishonest notices used to promise "send your answer (as text)" on EVERY
-partial/untrusted AUQ pane — including preview single-selects and unlicensed
-versions where PR-1's gate REFUSES a plain message. All three now route through
-the SAME ``free_text.advertises_free_text`` predicate (flag ON × licensed CC
-version × the live free-text affordance): only where a plain message would
-actually be taken does the notice keep the text suggestion; otherwise it points
-at the ↑/↓/⏎ keys.
+partial/untrusted AUQ pane. All three now route through
+``free_text.advertises_free_text``, which MIRRORS the free-text executor's OWN
+eligibility gates (single-question single-select + a live affordance +
+COMPLETE contiguous options + flag ON + licensed CC version — the
+``_auq_shape`` legs). The r1 P2-1 consequence pinned here: the notices fire
+precisely on partial/scrolled/unparseable panes — shapes the EXECUTOR refuses
+(``options_complete`` False / no parseable form) — so on a LICENSED version
+(the fake tmux default ``pane_current_command`` IS the licensed 2.1.207) they
+must STILL say nav-only. The earlier flag × license × affordance predicate
+said "send your answer as text" there while the send was refused.
 
 These drive the public seam (``handle_interactive_ui``) with a fake bot / fake
-tmux and flip the shared predicate to pin BOTH branches of each notice. The
-predicate's own (real) logic is pinned in ``test_free_text_parser.py``.
+tmux and the REAL predicate — no monkeypatch of the predicate (the r1 P2-1
+test defect: boolean substitution hid the executor mismatch). The predicate's
+own truth table, including the text-advertising branch (c) that partial panes
+can never reach, is pinned in ``test_free_text_parser.py`` with real forms.
 """
 
 from __future__ import annotations
@@ -68,12 +74,24 @@ def _multi_q_input(labels: list[str], *, title: str) -> dict[str, Any]:
     }
 
 
-def _partial_pane(rows: list[tuple[int, str]], *, cursor_number: int) -> str:
+def _partial_pane(
+    rows: list[tuple[int, str]], *, cursor_number: int, affordance: bool = True
+) -> str:
+    """A scrolled picker pane: options start past 1 ⇒ ``options_complete`` False.
+
+    ``affordance`` appends the ``Type something.`` row so the parsed form is
+    ``is_free_text=True`` — the EXACT reviewer shape (licensed + affordance +
+    incomplete): only the executor-parity ``options_complete`` leg can make
+    the notice honest.
+    """
     lines: list[str] = []
     for number, label in rows:
         prefix = "❯" if number == cursor_number else " "
         lines.append(f"{prefix} {number}. {label}")
         lines.append(f"     description for option {number}")
+    if affordance:
+        next_num = rows[-1][0] + 1
+        lines.append(f"  {next_num}. Type something.")
     lines.append("")
     lines.append("Enter to select · ↑/↓ to navigate · Esc to cancel")
     return "\n".join(lines) + "\n"
@@ -134,18 +152,27 @@ _LABELS = ["A) alpha", "B) beta", "C) gamma"]
 _TITLE = "What should we do next?"
 
 
-def _pin_predicate(monkeypatch, value: bool) -> None:
-    monkeypatch.setattr(free_text, "advertises_free_text", lambda *a, **k: value)
+@pytest.fixture(autouse=True)
+def _flag_on():
+    """The REAL predicate with the flag ON — never a boolean substitute."""
+    free_text.set_enabled(True)
+    yield
+    free_text.set_enabled(True)
 
 
 # ── Notice 1: the partial-pane "Only options N-M visible" line ────────────────
+#
+# The fake tmux default ``pane_current_command`` is the LICENSED "2.1.207"
+# (conftest.CLAUDE_PANE_COMMAND), and the pane carries the ``Type something.``
+# affordance — so under the pre-fix flag × license × affordance predicate BOTH
+# tests below said "send your answer as text". The executor refuses a scrolled
+# pane (``options_complete`` False), so the honest copy is nav-only.
 
 
 @pytest.mark.asyncio
-async def test_notice1_partial_pane_nav_only_when_no_text_answer(
-    scenario: ScenarioHarness, monkeypatch
+async def test_notice1_partial_pane_is_nav_only_even_when_licensed(
+    scenario: ScenarioHarness,
 ):
-    _pin_predicate(monkeypatch, False)
     pane = _partial_pane([(2, _LABELS[1]), (3, _LABELS[2])], cursor_number=2)
     wid = _bind(scenario, pane)
     # A MULTI-question side file: the single-Q swap (notice 2) declines, so
@@ -153,34 +180,36 @@ async def test_notice1_partial_pane_nav_only_when_no_text_answer(
     _write_side_file(_multi_q_input(_LABELS, title=_TITLE), aged=True)
     await _render(scenario, wid)
     picker = _picker_text(scenario)
-    assert "Only options 2-3 are visible" in picker
+    assert "Only options" in picker
     assert _NAV_ONLY in picker
     assert _TEXT_SUFFIX not in picker
 
 
 @pytest.mark.asyncio
-async def test_notice1_partial_pane_text_when_answer_is_taken(
-    scenario: ScenarioHarness, monkeypatch
+async def test_notice1_unlicensed_version_is_nav_only_too(
+    scenario: ScenarioHarness,
 ):
-    _pin_predicate(monkeypatch, True)
     pane = _partial_pane([(2, _LABELS[1]), (3, _LABELS[2])], cursor_number=2)
     wid = _bind(scenario, pane)
+    scenario.tmux.set_pane_command(wid, "9.9.9")  # un-characterized CC release
     _write_side_file(_multi_q_input(_LABELS, title=_TITLE), aged=True)
     await _render(scenario, wid)
     picker = _picker_text(scenario)
-    assert "Only options 2-3 are visible" in picker
-    assert _TEXT_SUFFIX in picker
-    assert _NAV_ONLY not in picker
+    assert "Only options" in picker
+    assert _NAV_ONLY in picker
+    assert _TEXT_SUFFIX not in picker
 
 
 # ── Notice 2: the recovered-side-file "Tap-to-select is off" line ─────────────
 
 
 @pytest.mark.asyncio
-async def test_notice2_recovered_swap_nav_only_when_no_text_answer(
-    scenario: ScenarioHarness, monkeypatch
+async def test_notice2_recovered_swap_is_nav_only_even_when_licensed(
+    scenario: ScenarioHarness,
 ):
-    _pin_predicate(monkeypatch, False)
+    """The swapped body renders the COMPLETE side-file option list, but the
+    LIVE pane — what the executor's fresh parse will see — is still scrolled,
+    so a text answer would be refused: the notice must stay nav-only."""
     pane = _partial_pane([(2, _LABELS[1]), (3, _LABELS[2])], cursor_number=2)
     wid = _bind(scenario, pane)
     _write_side_file(_single_q_input(_LABELS, title=_TITLE), aged=True)
@@ -191,19 +220,33 @@ async def test_notice2_recovered_swap_nav_only_when_no_text_answer(
     assert _TEXT_SUFFIX not in picker
 
 
+# ── The over-suppression control: a COMPLETE licensed pane hints free-text ────
+
+
 @pytest.mark.asyncio
-async def test_notice2_recovered_swap_text_when_answer_is_taken(
-    scenario: ScenarioHarness, monkeypatch
+async def test_complete_licensed_single_select_still_promises_free_text(
+    scenario: ScenarioHarness,
 ):
-    _pin_predicate(monkeypatch, True)
-    pane = _partial_pane([(2, _LABELS[1]), (3, _LABELS[2])], cursor_number=2)
+    """Executor parity must not OVER-suppress: a complete contiguous
+    single-select with the affordance on the licensed version renders the
+    ``card_hint`` free-text promise (no notice fires at all — the pane is
+    trusted and complete)."""
+    pane = (
+        f"{_TITLE}\n"
+        "\n"
+        f"❯ 1. {_LABELS[0]}\n"
+        f"  2. {_LABELS[1]}\n"
+        f"  3. {_LABELS[2]}\n"
+        "  4. Type something.\n"
+        "\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    )
     wid = _bind(scenario, pane)
-    _write_side_file(_single_q_input(_LABELS, title=_TITLE), aged=True)
     await _render(scenario, wid)
     picker = _picker_text(scenario)
-    assert "Tap-to-select is off on a scrolled screen" in picker
-    assert _TEXT_SUFFIX in picker
-    assert _NAV_ONLY not in picker
+    assert free_text.HINT_FREE_TEXT in picker
+    assert "Only options" not in picker
+    assert "Tap-to-select" not in picker
 
 
 # ── Notice 3: the rescue "live screen is busy" line ───────────────────────────
@@ -215,7 +258,8 @@ async def test_notice2_recovered_swap_text_when_answer_is_taken(
 # cannot be synthesized deterministically through the live ``handle_interactive_ui``
 # gate (a pane parseable enough to be recognized as AUQ also parses its options,
 # so it is never a rescue). It composes its suffix from the SAME ``_nav_suffix``
-# local the render computes ONCE per call — the identical predicate + suffix
-# pinned above for notices 1 and 2 and unit-tested in ``test_free_text_parser``.
-# A per-render divergence between the three notices is therefore unreachable by
-# construction.
+# local the render computes ONCE per call — the identical executor-parity
+# predicate pinned above for notices 1 and 2 and unit-tested in
+# ``test_free_text_parser`` (a rescue's unparseable pane yields a form with no
+# complete options ⇒ nav-only by the same legs). A per-render divergence
+# between the three notices is therefore unreachable by construction.

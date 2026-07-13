@@ -1510,10 +1510,14 @@ _CARD_BODY_CHAR_CAP = 3800
 
 # GH #54 W5 — the tail of the three partial/untrusted-pane notices. The
 # text-answer suffix is used ONLY where a plain message would actually be taken
-# (``free_text.advertises_free_text``: flag ON + licensed CC version + a live
-# free-text affordance); everything else — a preview single-select, an
-# unlicensed version, the flag off — points at the keystroke nav row instead,
-# so the notice can never promise what PR-1's gate would refuse.
+# (``free_text.advertises_free_text``, which MIRRORS the executor's own
+# eligibility gates — single-Q single-select + live affordance + COMPLETE
+# options + flag ON + licensed CC version; r1 P2-1: the weaker
+# flag × license × affordance form advertised text on a licensed SCROLLED
+# picker whose send the executor refuses on ``options_complete``); everything
+# else — a preview single-select, a partial/scrolled pane, a multi-question
+# form, an unlicensed version, the flag off — points at the keystroke nav row
+# instead, so the notice can never promise what PR-1's gate would refuse.
 _NOTICE_NAV_OR_TEXT = "use ↑/↓/Tab below or send your answer as text."
 _NOTICE_NAV_ONLY = "use the ↑/↓/⏎ keys below."
 
@@ -1572,6 +1576,93 @@ def _form_has_postable_content(form: AskUserQuestionForm) -> bool:
         if (opt.label or "").strip():
             return True
     return False
+
+
+# GH #54 W3 r1 P2-2 — the ctx-card chunks must fit Telegram's limit AFTER
+# MarkdownV2 conversion, not before. ``build_response_parts`` splits on a RAW
+# 3000-char budget, but telegramify escaping EXPANDS content (a tilde /
+# underscore / backslash each become two chars — a 3000-char run converts to
+# ~6000 > 4096), so a preview-carrying part could exceed the hard limit and
+# drop the ENTIRE details card. The fix mirrors the GH #48 recap lane's
+# rendered-cost-bounded discipline (``_split_recap_source`` below — chunk
+# membership decided by the CONVERTED size), while keeping
+# ``telegram_sender.split_message`` as the ONE fence balancer: an oversized
+# part is re-split with an adaptive RAW budget derived from its measured
+# rendered cost until every piece's ACTUAL converted output fits (no second
+# divergent fence rule — mint/validate parity).
+_CTX_RENDERED_BUDGET = 4096
+
+
+def _rendered_send_cost(text: str) -> int:
+    """Worst-case length of what ``topic_send`` will actually transmit.
+
+    The formatted path sends ``convert_markdown(text)``; the automatic plain
+    fallback sends ``strip_sentinels(text)`` (≤ ``len(text)``). Budget on the
+    MAX of both so the emitted part fits whichever path lands. A conversion
+    raise is treated as cost-0 for that leg (the send layer would fall back
+    to plain there too).
+    """
+    try:
+        converted = len(convert_markdown(text))
+    except Exception:  # pragma: no cover — telegramify defensive
+        converted = 0
+    return max(len(text), converted)
+
+
+def _refit_part_to_rendered_budget(
+    part: str, budget: int = _CTX_RENDERED_BUDGET
+) -> list[str]:
+    """Re-split one raw-Markdown part until every piece RENDERS within budget.
+
+    Each round measures the piece's rendered cost and, when over budget,
+    re-splits it via ``split_message`` with a raw budget scaled by the
+    measured expansion ratio (minus fence close/reopen headroom) — so fence
+    balance is preserved by the ONE existing balancer and content is never
+    truncated, only spread over more chunks. Escaping expands by at most 2×
+    per character, so the loop converges in one or two rounds; the iteration
+    cap is defensive.
+    """
+    out = [part]
+    for _ in range(8):
+        refitted: list[str] = []
+        any_oversized = False
+        for piece in out:
+            cost = _rendered_send_cost(piece)
+            if cost <= budget:
+                refitted.append(piece)
+                continue
+            any_oversized = True
+            from ..telegram_sender import split_message
+
+            # Scale the raw budget by the measured expansion ratio, with
+            # headroom for the balancer's fence close/reopen overhead. When
+            # cost > budget this is strictly < len(piece), so split_message
+            # always makes progress (≥2 pieces or force-split segments).
+            raw_budget = max(64, (len(piece) * budget) // cost - 64)
+            refitted.extend(split_message(piece, max_length=raw_budget))
+        out = refitted
+        if not any_oversized:
+            break
+    return out
+
+
+def _build_ctx_parts(text: str) -> list[str]:
+    """The ONE ctx-card chunker: raw split + the rendered-cost refit.
+
+    Used by BOTH ``_send_auq_context_message`` (the initial post) and
+    ``maybe_upgrade_auq_context_message`` (the edit/append upgrade) so the two
+    seams can never disagree on part sizing. A refit split leaves the
+    ``[i/N]`` marker of the original part on its LAST sub-piece (markers are
+    trailing text) — cosmetically imperfect numbering on the rare oversized
+    part, never a dropped card.
+    """
+    from .response_builder import build_response_parts
+
+    parts = build_response_parts(text, content_type="text", role="assistant")
+    fitted: list[str] = []
+    for part in parts:
+        fitted.extend(_refit_part_to_rendered_budget(part))
+    return fitted
 
 
 def _sanitize_preview(preview: object) -> str:
@@ -1830,7 +1921,6 @@ async def _send_auq_context_message(
     from telegram.error import RetryAfter
 
     from .message_queue import peek_route_last_user_message
-    from .response_builder import build_response_parts
 
     text = _format_auq_context_message(source)
     if not text.strip():
@@ -1838,7 +1928,10 @@ async def _send_auq_context_message(
         # rollback fires (Wave 1: handled inline here, not by caller).
         rollback_auq_context_post(window_id, claim_token)
         return _ContextSendResult.NONE_SENT
-    parts = build_response_parts(text, content_type="text", role="assistant")
+    # GH #54 W3 r1 P2-2: the rendered-cost-bounded chunker — every part fits
+    # Telegram's 4096 AFTER the real telegramify conversion (preview blocks
+    # expand under MarkdownV2 escaping; a raw-budget-only split can overshoot).
+    parts = _build_ctx_parts(text)
     if not parts:
         rollback_auq_context_post(window_id, claim_token)
         return _ContextSendResult.NONE_SENT
@@ -2023,8 +2116,6 @@ async def maybe_upgrade_auq_context_message(
     """
     from telegram.error import RetryAfter
 
-    from .response_builder import build_response_parts
-
     rec = _auq_context_msgs.get(window_id)
     if rec is None:
         return False
@@ -2070,9 +2161,9 @@ async def maybe_upgrade_auq_context_message(
             _persist_interactive_state()
             return False
 
-        new_parts = build_response_parts(
-            new_text, content_type="text", role="assistant"
-        )
+        # GH #54 W3 r1 P2-2: the SAME rendered-cost-bounded chunker as the
+        # initial post — the two seams must never disagree on part sizing.
+        new_parts = _build_ctx_parts(new_text)
         if not new_parts:
             return False
 
@@ -3703,18 +3794,17 @@ async def handle_interactive_ui(
         # pick buttons, and tell the user to use manual navigation/text.
         p14_suppress_picks = False
         partial_options_notice: str | None = None
-        # GH #54 W5: the notice suffix tracks the LIVE surface's real
-        # affordance × version license — the SAME predicate ``card_hint``
-        # uses — so a preview single-select (``is_free_text=False``) or an
+        # GH #54 W5: the notice suffix tracks whether the free-text executor
+        # would ACTUALLY take a plain message on this pane —
+        # ``free_text.advertises_free_text`` mirrors the executor's own
+        # eligibility gates (single-Q single-select + affordance + COMPLETE
+        # options + flag × license; the ``card_hint`` predicate), so a preview
+        # single-select, a scrolled/partial pane, a multi-question form, or an
         # unlicensed version never advertises a text answer PR-1 would refuse.
-        _advertises_free_text = form is not None and free_text.advertises_free_text(
+        _advertises_free_text = free_text.advertises_free_text(
             free_text.SURFACE_AUQ,
             version=w.pane_current_command,
-            has_affordance=(
-                form.is_free_text
-                and form.select_mode == "single"
-                and not form.is_review_screen
-            ),
+            form=form,
         )
         _nav_suffix = _NOTICE_NAV_OR_TEXT if _advertises_free_text else _NOTICE_NAV_ONLY
         if form is not None and form.options:
@@ -3819,17 +3909,18 @@ async def handle_interactive_ui(
                             f"Tap-to-select is off on a scrolled screen — {_nav_suffix}"
                         )
             # §2.5: the card's free-text line must state the CURRENT truth for
-            # THIS surface. Only a single-select, licensed, flag-ON AUQ can
-            # actually take a plain message as its answer (see
-            # ``free_text.card_hint``); everything else points at the buttons.
+            # THIS surface. ``card_hint`` routes through the SAME
+            # executor-parity predicate as the notices above (GH #54 W5 r1
+            # P2-1) and is fed the RESOLVER ``form`` (the live-pane proxy the
+            # executor's fresh parse will agree with — never the swapped
+            # ``display_form``, whose side-file completeness would overclaim
+            # on a scrolled pane); everything ineligible points at the buttons.
             structured = _render_ask_user_question(
                 display_form,
                 free_text_hint=free_text.card_hint(
                     free_text.SURFACE_AUQ,
                     version=w.pane_current_command,
-                    has_affordance=display_form.is_free_text
-                    and display_form.select_mode == "single"
-                    and not display_form.is_review_screen,
+                    form=form,
                 ),
             )
             if structured:

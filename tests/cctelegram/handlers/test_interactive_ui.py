@@ -574,11 +574,15 @@ class TestAuqContextPreview:
 
     def test_adversarial_preview_survives_the_real_send_path(self):
         """Embedded fence + sentinels + a >4096-char block: the ACTUAL
-        telegramify output stays fence-balanced and within Telegram's limit."""
+        telegramify output stays fence-balanced and within Telegram's limit,
+        through the REAL ctx chunker (``_build_ctx_parts`` — the one both the
+        initial post and the upgrade path use)."""
         import copy
 
-        from cctelegram.handlers.interactive_ui import _format_auq_context_message
-        from cctelegram.handlers.response_builder import build_response_parts
+        from cctelegram.handlers.interactive_ui import (
+            _build_ctx_parts,
+            _format_auq_context_message,
+        )
         from cctelegram.markdown_v2 import convert_markdown
         from cctelegram.transcript_parser import TranscriptParser
 
@@ -591,7 +595,7 @@ class TestAuqContextPreview:
         )
         text = _format_auq_context_message(src)
         assert "\x02" not in text and s not in text
-        parts = build_response_parts(text, content_type="text", role="assistant")
+        parts = _build_ctx_parts(text)
         assert len(parts) > 1  # the 5k block forced a split
         for part in parts:
             converted = convert_markdown(part)
@@ -599,6 +603,50 @@ class TestAuqContextPreview:
             assert converted.count("```") % 2 == 0
             assert len(converted) <= 4096
             assert "\x02" not in converted
+
+    @pytest.mark.parametrize(
+        "payload_name,payload",
+        [
+            # MarkdownV2 escaping EXPANDS these ~2× — a raw-budget-only split
+            # emits parts whose CONVERSION exceeds 4096 (r1 P2-2: 5000 tildes
+            # rendered 6002 pre-fix; the earlier adversarial test used only
+            # non-expanding 'X').
+            ("tilde_heavy", "~" * 5000),
+            ("underscore_heavy", "_" * 5000),
+            ("backslash_heavy", "\\" * 5000),
+            # Defanged backtick runs expand even further (escape + U+200B).
+            ("backtick_heavy", "`" * 5000),
+            ("mixed_multiline", "\n".join(["~_\\*[]()" * 150] * 12)),
+        ],
+    )
+    def test_expanding_preview_fits_after_REAL_conversion(
+        self, payload_name: str, payload: str
+    ):
+        """GH #54 W3 r1 P2-2: chunk membership is decided by the CONVERTED
+        size (the recap lane's rendered-cost-bounded discipline), so every
+        emitted part is ≤4096 after the ACTUAL telegramify conversion and
+        stays fence-balanced — no truncation, just more chunks."""
+        import copy
+
+        from cctelegram.handlers.interactive_ui import (
+            _build_ctx_parts,
+            _format_auq_context_message,
+        )
+        from cctelegram.markdown_v2 import convert_markdown
+
+        src = copy.deepcopy(self._fixture_input())
+        src["questions"][0]["options"][0]["preview"] = payload
+        text = _format_auq_context_message(src)
+        parts = _build_ctx_parts(text)
+        # No truncation: every source char of the oversized preview is still
+        # present across the parts (fences/markers add, never remove).
+        assert sum(p.count(payload[0]) for p in parts) >= payload.count(payload[0])
+        for part in parts:
+            converted = convert_markdown(part)
+            assert len(converted) <= 4096, (
+                f"{payload_name}: converted part {len(converted)} > 4096"
+            )
+            assert converted.count("```") % 2 == 0
 
     def test_preview_does_not_move_the_form_fingerprint(self):
         """W3 PIN: ``build_form_from_tool_input`` ignores ``preview`` for the

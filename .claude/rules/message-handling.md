@@ -1632,12 +1632,22 @@ containing the start marker, so an oversized unsplittable part would drop the EN
 card, and a matched pair would be re-read as an expandable quote + truncated); and
 defang any 3+-backtick run by weaving a zero-width space (U+200B) between the
 backticks (visually identical inside the monospace block, no longer a fence
-delimiter). **Chunk atomicity WITHOUT truncation** is the EXISTING splitter's job:
-`build_response_parts` → `telegram_sender.split_message` already keeps FENCE BALANCE
-(a block that cannot fit closes the chunk with `\n```` and reopens the next with a
-fresh fence, content complete) — the recap lane's independently-complete-chunks
-discipline — so an adversarial preview (embedded ``` + sentinel markers + a >4096-char
-block) stays fence-balanced and ≤4096 through the ACTUAL telegramify output. The
+delimiter). **Chunk atomicity WITHOUT truncation is RENDERED-COST-BOUNDED (r1
+P2-2):** MarkdownV2 escaping EXPANDS content (a tilde / underscore / backslash each
+convert to two chars — 5000 tildes in a preview rendered 6002 > 4096 under the
+raw-budget-only split), so chunk membership is decided by the CONVERTED size — the
+GH #48 recap lane's rendered-cost discipline (`_split_recap_source`), mirrored for
+the ctx card by `interactive_ui._build_ctx_parts`: `build_response_parts` makes the
+coarse raw split, then `_refit_part_to_rendered_budget` measures each part's ACTUAL
+`convert_markdown` cost (max'd with the plain-fallback length) and re-splits any
+oversized part via `telegram_sender.split_message` with a raw budget scaled by the
+measured expansion ratio (minus fence close/reopen headroom) until every piece
+renders ≤4096 — `split_message` stays the ONE fence balancer (close-at-end /
+reopen-at-start, content complete; never a second divergent size rule), so the
+result is more chunks, never truncation. BOTH ctx seams (`_send_auq_context_message`
++ `maybe_upgrade_auq_context_message`) chunk through `_build_ctx_parts`, pinned by
+adversarial EXPANDING payloads (tilde/underscore/backslash/backtick-heavy) asserting
+the actual telegramify output of every part. The
 SELECTION card stays SHORT (labels-only buttons); `build_form_from_tool_input` keeps
 ignoring `preview` for the FORM, so the side file's form fingerprint is UNCHANGED by
 W3 (a move would orphan live pick tokens across the deploy — pinned to a hardcoded
@@ -1648,11 +1658,21 @@ partial-pane notices in `interactive_ui` all used to promise "send your answer (
 text)" on EVERY partial/untrusted pane — including preview single-selects and
 unlicensed versions where PR-1's gate REFUSES a plain message. All three now compose
 their suffix from ONE per-render `_nav_suffix`, decided by
-`free_text.advertises_free_text(surface, version, has_affordance)` — the SAME (flag ON
-× licensed CC version × the live free-text affordance) predicate `card_hint` uses:
-licensed + affordance ⇒ "use ↑/↓/Tab below or send your answer as text."; else ⇒
-"use the ↑/↓/⏎ keys below." A preview single-select (`is_free_text=False` ⇒
-`has_affordance=False`) therefore never advertises text answers on any version.
+`free_text.advertises_free_text(surface, version=…, form=…)` — the predicate
+`card_hint` also routes through, and it MIRRORS the free-text EXECUTOR's own
+eligibility gates (`_auq_shape`, cross-referenced both ways — mint/validate parity,
+r1 P2-1: the earlier flag × license × affordance form was WEAKER than the executor,
+so a licensed SCROLLED picker — `is_free_text=True` but `options_complete=False` —
+or a multi-question single-select advertised a text answer whose send the executor
+refuses): single-question single-select, not the review screen, a live free-text
+affordance, a COMPLETE contiguous option list, flag ON, licensed CC version ⇒
+"use ↑/↓/Tab below or send your answer as text."; ANY leg fails ⇒ "use the ↑/↓/⏎
+keys below." A preview single-select (`is_free_text=False`) and every
+partial/scrolled pane therefore never advertise text answers on any version — and
+since the notices fire precisely on partial/untrusted panes, the text suffix is
+reachable only if a future render shape puts a COMPLETE eligible pane behind a
+notice (then it will be honest). Pinned by scenarios driving the REAL predicate
+(never a boolean substitute) + real-form unit pins for all four reviewer shapes.
 Pull-only; no observer (c313657 stays forbidden).
 
 ## Inbound delivery gate — text on a live interactive surface (GH #50 PR-1)

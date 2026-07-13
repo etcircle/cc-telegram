@@ -283,81 +283,204 @@ class TestTheInputBoxIsNeverPresentOnThese:
         assert tp.pane_input_box_present(pane) is False
 
 
-class TestAdvertisesFreeTextPredicate:
-    """GH #54 W5 — the shared (flag × license × affordance) card-copy gate.
+def _real_form(
+    *,
+    n_options: int = 3,
+    first_number: int = 1,
+    is_free_text: bool = True,
+    options_complete: bool = True,
+    select_mode: str = "single",
+    is_review_screen: bool = False,
+    multi_question: bool = False,
+):
+    """A REAL ``AskUserQuestionForm`` shaped like the executor's inputs.
 
-    It is the ONE predicate behind ``card_hint`` AND the three
-    partial/untrusted-pane notices in ``interactive_ui``, so no card copy can
-    promise a text answer PR-1's gate would refuse.
+    GH #54 W5 r1 P2-1: the predicate pins below must never substitute a
+    boolean for the predicate — they drive ``advertises_free_text`` with the
+    same form fields the executor's ``_auq_shape`` gates consume.
+    """
+    options = tuple(
+        tp.AskOption(
+            label=f"Opt {n}",
+            recommended=False,
+            cursor=(n == first_number),
+            number=n,
+        )
+        for n in range(first_number, first_number + n_options)
+    )
+    questions: tuple = ()
+    if multi_question:
+        questions = (
+            tp.AskQuestion(title="Q1?", header="A", options=options),
+            tp.AskQuestion(title="Q2?", header="B", options=options),
+        )
+    return tp.AskUserQuestionForm(
+        options=options,
+        is_free_text=is_free_text,
+        options_complete=options_complete,
+        select_mode=select_mode,  # type: ignore[arg-type]
+        is_review_screen=is_review_screen,
+        questions=questions,
+    )
+
+
+class TestAdvertisesFreeTextPredicate:
+    """GH #54 W5 (r1 P2-1) — the card-copy gate MIRRORS the executor.
+
+    ``advertises_free_text`` is the ONE predicate behind ``card_hint`` AND the
+    three partial/untrusted-pane notices in ``interactive_ui``. It must be
+    exactly as strict as the executor's ``_auq_shape`` eligibility gates
+    (single-Q single-select + affordance + COMPLETE options + flag × license)
+    — the earlier flag × license × affordance form advertised "send your
+    answer as text" on a licensed SCROLLED picker whose send the executor
+    refuses on ``options_complete``. Every pin here drives the REAL predicate
+    with a REAL form — never a boolean substitute.
     """
 
-    def _reset(self):
+    @pytest.fixture(autouse=True)
+    def _flag_on(self):
         from cctelegram.handlers import free_text as ft
 
         ft.set_enabled(True)
+        yield
+        ft.set_enabled(True)
 
-    def test_licensed_with_affordance_and_flag_on_advertises(self):
+    def test_c_licensed_complete_single_q_single_select_advertises(self):
         from cctelegram.handlers import free_text as ft
 
-        self._reset()
         assert (
             ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.207", has_affordance=True
+                ft.SURFACE_AUQ, version="2.1.207", form=_real_form()
             )
             is True
         )
 
-    def test_no_affordance_never_advertises(self):
+    def test_a_licensed_affordance_but_INCOMPLETE_options_is_nav_only(self):
+        """The reviewer shape: a scrolled picker showing options 2-3 +
+        ``Type something.`` parses ``is_free_text=True,
+        options_complete=False`` — the executor bails, so the copy must too."""
         from cctelegram.handlers import free_text as ft
 
-        self._reset()
-        # A preview single-select is is_free_text=False ⇒ has_affordance=False.
+        form = _real_form(first_number=2, options_complete=False)
+        assert form.is_free_text is True  # the affordance alone must NOT win
+        assert (
+            ft.advertises_free_text(ft.SURFACE_AUQ, version="2.1.207", form=form)
+            is False
+        )
+
+    def test_b_licensed_affordance_but_MULTI_QUESTION_is_nav_only(self):
+        from cctelegram.handlers import free_text as ft
+
+        form = _real_form(multi_question=True)
+        assert form.is_free_text is True
+        assert (
+            ft.advertises_free_text(ft.SURFACE_AUQ, version="2.1.207", form=form)
+            is False
+        )
+
+    def test_d_preview_single_select_no_affordance_is_nav_only(self):
+        """A preview single-select parses ``is_free_text=False`` (no
+        ``Type something.`` row exists on that layout on ANY version)."""
+        from cctelegram.handlers import free_text as ft
+
+        form = _real_form(is_free_text=False)
+        assert (
+            ft.advertises_free_text(ft.SURFACE_AUQ, version="2.1.207", form=form)
+            is False
+        )
+
+    def test_multi_select_and_review_screen_are_nav_only(self):
+        from cctelegram.handlers import free_text as ft
+
         assert (
             ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.207", has_affordance=False
+                ft.SURFACE_AUQ,
+                version="2.1.207",
+                form=_real_form(select_mode="multi"),
+            )
+            is False
+        )
+        assert (
+            ft.advertises_free_text(
+                ft.SURFACE_AUQ,
+                version="2.1.207",
+                form=_real_form(is_review_screen=True),
             )
             is False
         )
 
-    def test_unlicensed_version_never_advertises(self):
+    def test_unlicensed_version_or_none_form_is_nav_only(self):
         from cctelegram.handlers import free_text as ft
 
-        self._reset()
         assert (
             ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.999", has_affordance=True
+                ft.SURFACE_AUQ, version="2.1.999", form=_real_form()
             )
             is False
         )
         assert (
-            ft.advertises_free_text(ft.SURFACE_AUQ, version=None, has_affordance=True)
+            ft.advertises_free_text(ft.SURFACE_AUQ, version=None, form=_real_form())
+            is False
+        )
+        assert (
+            ft.advertises_free_text(ft.SURFACE_AUQ, version="2.1.207", form=None)
             is False
         )
 
-    def test_flag_off_never_advertises(self):
+    def test_flag_off_is_nav_only(self):
         from cctelegram.handlers import free_text as ft
 
         try:
             ft.set_enabled(False)
             assert (
                 ft.advertises_free_text(
-                    ft.SURFACE_AUQ, version="2.1.207", has_affordance=True
+                    ft.SURFACE_AUQ, version="2.1.207", form=_real_form()
                 )
                 is False
             )
         finally:
             ft.set_enabled(True)
 
+    def test_predicate_mirrors_the_executor_gate_for_gate(self):
+        """Mint/validate parity: any form the predicate ADVERTISES must pass
+        the executor's own eligibility gates (``_auq_shape``'s pre-geometry
+        legs). Enumerate the gate axes and require predicate ⇒ executor-legs.
+        """
+        from cctelegram.handlers import free_text as ft
+
+        for form in (
+            _real_form(),
+            _real_form(first_number=2, options_complete=False),
+            _real_form(multi_question=True),
+            _real_form(is_free_text=False),
+            _real_form(select_mode="multi"),
+            _real_form(is_review_screen=True),
+        ):
+            executor_eligible = (
+                form.select_mode == "single"
+                and not form.is_review_screen
+                and len(form.questions) <= 1
+                and form.is_free_text
+                and form.options_complete
+                and bool(form.options)
+            )
+            advertised = ft.advertises_free_text(
+                ft.SURFACE_AUQ, version="2.1.207", form=form
+            )
+            assert not (advertised and not executor_eligible), (
+                "the copy predicate advertised a form the executor refuses"
+            )
+
 
 class TestCardHintRoutesThroughThePredicate:
     """``card_hint`` is exactly ``advertises_free_text`` → FREE_TEXT / NO_FREE_TEXT."""
 
-    def test_licensed_with_affordance_promises_text(self):
+    def test_licensed_complete_single_select_promises_text(self):
         from cctelegram.handlers import free_text as ft
 
         ft.set_enabled(True)
         assert (
-            ft.card_hint(ft.SURFACE_AUQ, version="2.1.207", has_affordance=True)
+            ft.card_hint(ft.SURFACE_AUQ, version="2.1.207", form=_real_form())
             == ft.HINT_FREE_TEXT
         )
 
@@ -365,9 +488,23 @@ class TestCardHintRoutesThroughThePredicate:
         from cctelegram.handlers import free_text as ft
 
         ft.set_enabled(True)
-        # has_affordance=False models is_free_text=False (a preview card).
         assert (
-            ft.card_hint(ft.SURFACE_AUQ, version="2.1.207", has_affordance=False)
+            ft.card_hint(
+                ft.SURFACE_AUQ, version="2.1.207", form=_real_form(is_free_text=False)
+            )
+            == ft.HINT_NO_FREE_TEXT
+        )
+
+    def test_scrolled_incomplete_picker_points_at_the_buttons(self):
+        from cctelegram.handlers import free_text as ft
+
+        ft.set_enabled(True)
+        assert (
+            ft.card_hint(
+                ft.SURFACE_AUQ,
+                version="2.1.207",
+                form=_real_form(first_number=2, options_complete=False),
+            )
             == ft.HINT_NO_FREE_TEXT
         )
 
@@ -376,6 +513,6 @@ class TestCardHintRoutesThroughThePredicate:
 
         ft.set_enabled(True)
         assert (
-            ft.card_hint(ft.SURFACE_AUQ, version="2.1.99", has_affordance=True)
+            ft.card_hint(ft.SURFACE_AUQ, version="2.1.99", form=_real_form())
             == ft.HINT_NO_FREE_TEXT
         )
