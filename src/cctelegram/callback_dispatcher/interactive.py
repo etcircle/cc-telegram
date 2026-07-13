@@ -649,12 +649,13 @@ async def _attempt_pick_recovery(
         )
         return True
 
-    async def _capture(wid: str, scrollback: int) -> str | None:
+    async def _capture(wid: str, scrollback: int, with_ansi: bool = True) -> str | None:
         # GH #54 capture spine: hand pick_token the ANSI frame; it normalizes
         # into a (plain, ansi) pair so the re-parsed cursor is a REAL parsed
-        # cursor (tier-2 SGR on a chevron-less preview picker).
+        # cursor (tier-2 SGR on a chevron-less preview picker). ``with_ansi=False``
+        # is pick_token's one-plain-recapture request on a normalize rejection.
         return await tmux_manager.capture_pane(
-            wid, with_ansi=True, scrollback_lines=scrollback
+            wid, with_ansi=with_ansi, scrollback_lines=scrollback
         )
 
     result = await pick_token.recover_and_consume(
@@ -1861,8 +1862,19 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # the SAME 500-line scrollback as the render path so the validate pane
         # slice matches the mint pane slice (a smaller capture would shift
         # current_tab_inferred / options and bounce long pickers).
-        async def _capture(wid: str, scrollback: int) -> str | None:
-            return await tmux_manager.capture_pane(wid, scrollback_lines=scrollback)
+        # GH #54 capture spine (seam 3, the PRIMARY live tap path — wave-2 review
+        # P1): the frame is captured WITH ANSI so pick_token's re-parse can prove
+        # the SGR tier-2 cursor on a chevron-less preview picker — a plain frame
+        # here parsed NO cursor while the rendered form had one, so the token was
+        # CONSUMED and the dispatch then bailed ``cursor_unknown`` (a dead tap on
+        # every preview pick). ``with_ansi=False`` is pick_token's one-plain-
+        # recapture request on a normalize rejection (P2-A).
+        async def _capture(
+            wid: str, scrollback: int, with_ansi: bool = True
+        ) -> str | None:
+            return await tmux_manager.capture_pane(
+                wid, with_ansi=with_ansi, scrollback_lines=scrollback
+            )
 
         result = await pick_token.validate_and_consume(
             token,

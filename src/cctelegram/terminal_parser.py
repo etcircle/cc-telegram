@@ -4043,8 +4043,8 @@ class PaneCapture:
 _ALLOWED_CONTROL_CHARS: Final = frozenset("\n\t\r")
 
 
-def _strip_ecma48_families(raw: str) -> str | None:
-    """Consume EVERY ECMA-48 escape family, returning plain text or ``None``.
+def _strip_ecma48_families(raw: str) -> tuple[str | None, str]:
+    """Consume EVERY ECMA-48 escape family → ``(plain, reject_reason)``.
 
     Handles, at the SINGLE seam (the ECMA-48 grammar — Codex P2-2):
       * CSI (``ESC [ params intermediates final``) — parameter bytes 0x30-0x3F
@@ -4060,12 +4060,15 @@ def _strip_ecma48_families(raw: str) -> str | None:
         designator never leaks into plain;
       * Fp/Fe/Fs singles (``ESC <0x30-0x7E>``) — the 2-byte forms.
 
-    Returns ``None`` (REJECT the pair) when: an ESC is followed by a byte
-    OUTSIDE the grammar (``ESC NUL`` rejects), a CSI/nF has no final byte, a
-    string control is unterminated, or — after stripping — any UNKNOWN control
-    byte remains (everything in C0 except LF/TAB/CR, plus DEL and C1). The
-    rejection SIGNAL must exist even though the one-plain-recapture recovery is
-    caller-side (a later wave).
+    REJECTS (``(None, <reason>)``) when: an ESC is followed by a byte OUTSIDE
+    the grammar (``ESC NUL`` rejects), a CSI/nF has no final byte, a string
+    control is unterminated, or — after stripping — any UNKNOWN control byte
+    remains (everything in C0 except LF/TAB/CR, plus DEL and C1). The
+    ``reject_reason`` names the byte THIS grammar actually rejected (empty on
+    success) — the diagnostic the spine's one-plain-recapture WARNING logs.
+    Sharing the grammar with the reporter (mint/validate parity) is what keeps
+    the log truthful: a valid SGR followed by a bare BEL must blame the BEL,
+    never the SGR's own ESC (wave-2 review P3).
     """
     out: list[str] = []
     i = 0
@@ -4074,14 +4077,14 @@ def _strip_ecma48_families(raw: str) -> str | None:
         c = raw[i]
         if c == "\x1b":
             if i + 1 >= n:
-                return None  # dangling ESC — unknown
+                return None, "dangling ESC"  # unknown
             nxt = raw[i + 1]
             if nxt == "[":
                 m = _RE_CSI_FULL.match(raw, i)
                 if m is not None:
                     i = m.end()
                     continue
-                return None  # malformed CSI (no final byte)
+                return None, "malformed CSI (no final byte)"
             if nxt in "]PX^_":
                 # String control: consume through BEL or ST.
                 j = i + 2
@@ -4097,7 +4100,7 @@ def _strip_ecma48_families(raw: str) -> str | None:
                         break
                     j += 1
                 if not terminated:
-                    return None  # unterminated string control
+                    return None, f"unterminated ESC+{nxt!r} string control"
                 i = j
                 continue
             nxt_code = ord(nxt)
@@ -4110,22 +4113,24 @@ def _strip_ecma48_families(raw: str) -> str | None:
                 if j < n and 0x30 <= ord(raw[j]) <= 0x7E:
                     i = j + 1
                     continue
-                return None  # nF with no final byte
+                return None, "nF sequence with no final byte"
             if 0x30 <= nxt_code <= 0x7E:
                 # Fp/Fe/Fs single ('[', ']', 'P', 'X', '^', '_' handled above).
                 i += 2
                 continue
-            return None  # ESC + a byte outside the ECMA-48 grammar (ESC NUL …)
+            # ESC + a byte outside the ECMA-48 grammar (ESC NUL …).
+            return None, f"ESC+{nxt!r}"
         if c in _ALLOWED_CONTROL_CHARS:
             out.append(c)
             i += 1
             continue
         code = ord(c)
         if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
-            return None  # unknown control byte — reject the pair
+            # Unknown raw control byte — reject the pair, blaming THIS byte.
+            return None, f"{c!r}(0x{code:02x})"
         out.append(c)
         i += 1
-    return "".join(out)
+    return "".join(out), ""
 
 
 def normalize_capture(raw_ansi: str) -> PaneCapture | None:
@@ -4145,11 +4150,27 @@ def normalize_capture(raw_ansi: str) -> PaneCapture | None:
     compares EXACTLY equal to a plain tmux capture of the same frame; leading
     columns stay intact for the panel-boundary scan.
     """
-    plain = _strip_ecma48_families(raw_ansi)
+    plain, _reason = _strip_ecma48_families(raw_ansi)
     if plain is None:
         return None
     plain = "\n".join(line.rstrip(" ") for line in plain.split("\n"))
     return PaneCapture(plain=plain, ansi=raw_ansi)
+
+
+def normalize_reject_introducer(raw_ansi: str) -> str:
+    """Name the byte :func:`normalize_capture` REJECTED in ``raw_ansi``.
+
+    Diagnostic-only (the spine's one-plain-recapture WARNING). Runs the SAME
+    ECMA-48 grammar as the normalizer (``_strip_ecma48_families`` — mint/validate
+    parity, wave-2 review P3: a scanner that merely found the first ESC blamed a
+    VALID SGR sequence when the actual reject was a later bare BEL). Returns
+    ``"?"`` when the frame is not actually rejected (defensive — callers only
+    consult this after a ``normalize_capture(...) is None``).
+    """
+    plain, reason = _strip_ecma48_families(raw_ansi)
+    if plain is not None:
+        return "?"
+    return reason or "?"
 
 
 # GH #54 W1.1 — terminal display-cell width (wcswidth semantics).

@@ -122,26 +122,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _first_unknown_control_introducer(raw: str) -> str:
-    """Best-effort diagnostic: the repr of the FIRST byte ``normalize_capture``
-    would reject in ``raw`` (GH #54 capture spine, WARNING-log context only).
-
-    Reports the first ESC (with the following byte for context) or the first raw
-    control byte outside the allowed ``\\n\\t\\r`` / printable set. Purely
-    diagnostic — never authoritative (``normalize_capture`` owns the real
-    grammar). Returns ``"?"`` when nothing obviously offending is found (the
-    reject was a structural one — an unterminated sequence).
-    """
-    for i, ch in enumerate(raw):
-        if ch == "\x1b":
-            nxt = raw[i + 1] if i + 1 < len(raw) else ""
-            return f"ESC+{nxt!r}"
-        code = ord(ch)
-        if ch not in "\n\t\r" and (code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F):
-            return f"{ch!r}(0x{code:02x})"
-    return "?"
-
-
 async def capture_pane_pair(
     tmux: Any, window_id: str, scrollback_lines: int = 0
 ) -> "PaneCapture | None":
@@ -167,7 +147,11 @@ async def capture_pane_pair(
     plain frame gives genuinely-today's behavior (the pair's ``ansi`` then
     equals ``plain`` — no styling to read).
     """
-    from .terminal_parser import PaneCapture, normalize_capture
+    from .terminal_parser import (
+        PaneCapture,
+        normalize_capture,
+        normalize_reject_introducer,
+    )
 
     ansi = await tmux.capture_pane(
         window_id, with_ansi=True, scrollback_lines=scrollback_lines
@@ -177,11 +161,13 @@ async def capture_pane_pair(
     pair = normalize_capture(ansi)
     if pair is not None:
         return pair
+    # The introducer reporter shares the normalizer's OWN grammar (wave-2 review
+    # P3) so a valid SGR followed by a bare BEL blames the BEL, never the SGR.
     logger.warning(
         "capture_pane_pair: normalize rejected window=%s introducer=%s; "
         "one plain re-capture",
         window_id,
-        _first_unknown_control_introducer(ansi),
+        normalize_reject_introducer(ansi),
     )
     plain = await tmux.capture_pane(
         window_id, with_ansi=False, scrollback_lines=scrollback_lines

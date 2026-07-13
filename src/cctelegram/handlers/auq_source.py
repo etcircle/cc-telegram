@@ -50,6 +50,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from ..session import peek_session_id_for_window, read_session_id_for_window_fresh
@@ -328,17 +329,26 @@ def resolve_auq_source_for_render(
                 dispatch_trusted=True,
                 reason="consistent",
             )
-        if pane_form is None or not pane_form.options:
+        if pane_form is None or (
+            not pane_form.options
+            and not _zero_option_form_contradicts_record(record, pane_form)
+        ):
             # The pane carries NO parseable picker AT ALL (busy scrollback /
-            # obscured), OR it parsed a form with ZERO options — the same "pane
-            # proves nothing" definition ``_record_consistent_with_pane`` uses
-            # (``no_pane_form``; auq_source mint/validate parity, GH #54 W2). A
-            # 0-option form is exactly the pre-W1 preview-layout shape (F3/F4) and
-            # any pane the region-discovery prepass could not parse: without this
-            # leg it fell through to the untrusted ``bail_partial`` raw dump
-            # instead of the clean side-file RESCUE, dropping the 📋 ctx card and
-            # the buttons. Defense-in-depth — it ships even if W1's preview parse
-            # slips, and is byte-identical for a normal (options-bearing) pane.
+            # obscured), OR it parsed a form with ZERO options AND no
+            # CONTRADICTING evidence — the same "pane proves nothing" definition
+            # ``_record_consistent_with_pane`` uses (``no_pane_form``; auq_source
+            # mint/validate parity, GH #54 W2). A 0-option form is exactly the
+            # pre-W1 preview-layout shape (F3/F4) and any pane the
+            # region-discovery prepass could not parse: without this leg it fell
+            # through to the untrusted ``bail_partial`` raw dump instead of the
+            # clean side-file RESCUE, dropping the 📋 ctx card and the buttons.
+            # Defense-in-depth — it ships even if W1's preview parse slips, and
+            # is byte-identical for a normal (options-bearing) pane. NARROWED
+            # (wave-2 review P2-B): a zero-option form still carrying a parsed
+            # TAB HEADER / current title that CONTRADICTS the (TTL-free, so
+            # possibly stale — restart orphan / double-resume sibling) side file
+            # is POSITIVE proof a DIFFERENT question is live, so it keeps the
+            # pre-W2 ``bail_partial`` instead of rendering the wrong question.
             # The side file is the ONLY content we have. RESCUE it
             # DISPLAY-ONLY. This is the SOLE branch that serves the side file
             # OVER the pane, and it is reserved for "the pane proves nothing",
@@ -749,24 +759,104 @@ def _pane_option_label_matches(option, authority_label: str) -> bool:
     return label_matches_authority(option.label, option.wrap_canonical, authority_label)
 
 
-def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> bool:
-    """True if ``visible`` is a contiguous subsequence of ``full``.
+def _options_are_subsequence(visible_options, full: tuple[str, ...]) -> bool:
+    """True if the visible pane OPTIONS are a contiguous subsequence of ``full``.
 
-    The pane may render only the visible region; earlier options can be
-    pushed off the top by long descriptions. We still accept the record
-    if whatever IS visible matches the corresponding contiguous slice of
-    the record's labels. Labels are compared recommended-suffix-normalized
-    (the pane strips ``(Recommended)``; the side file keeps it).
+    The pane may render only the visible region; earlier options can be pushed
+    off the top by long descriptions. We still accept the record if whatever IS
+    visible matches the corresponding contiguous slice of the record's labels.
+    Each comparison routes through ``_pane_option_label_matches`` (wave-2 review
+    P2-C): recommended-suffix-normalized exact equality for ordinary options
+    (byte-identical to the historic rule) PLUS the wrap-canonical leg for
+    preview options — a wrapped preview label's lossy space-join must not
+    ``no_candidate`` the multi-question candidate selection while the
+    slot-based accept would take it (mint/validate parity).
     """
+    visible = tuple(visible_options)
     if not visible:
         return False
-    visible = tuple(_strip_recommended(v) for v in visible)
-    full = tuple(_strip_recommended(f) for f in full)
     if len(visible) > len(full):
         return False
     for start in range(len(full) - len(visible) + 1):
-        if full[start : start + len(visible)] == visible:
+        if all(
+            _pane_option_label_matches(opt, full[start + i])
+            for i, opt in enumerate(visible)
+        ):
             return True
+    return False
+
+
+def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> bool:
+    """Bare-label wrapper over :func:`_options_are_subsequence` (one matcher —
+    a label-only caller gets the ordinary exact-equality semantics, since a
+    bare label carries no ``wrap_canonical``)."""
+    return _options_are_subsequence(
+        tuple(SimpleNamespace(label=v) for v in visible), full
+    )
+
+
+def _zero_option_form_contradicts_record(record, pane_form) -> bool:
+    """True iff a ZERO-option pane form carries POSITIVE evidence a DIFFERENT
+    question is live than the side-file record's (wave-2 review P2-B).
+
+    The W2 rescue gate treats a zero-option form like ``pane_form is None``
+    ("the pane proves nothing"), but the parser deliberately returns zero-option
+    forms that still carry a parsed TAB HEADER / current question title during
+    redraws — and the render-path side-file read is TTL-free, so a restart
+    orphan / double-resume-sibling STALE record could rescue-render old Q1
+    content over a pane whose surviving evidence PROVES a different tab /
+    question is live. Contradiction = fail back to the pre-W2 ``bail_partial``.
+
+    Checks (each only when the evidence exists — a bare zero-option form, the
+    pure mid-redraw / pre-W1 shape, never contradicts):
+
+      * TITLE — the pane's ``current_question_title`` must bidirectionally
+        prefix-match SOME record question (the ``_record_consistent_with_pane``
+        title rule);
+      * TABS — every content tab label must match SOME record question header
+        under the shared authority-aware normalization
+        (``label_matches_authority`` — whitespace-collapse equality plus the
+        wrap-canonical all-whitespace-stripped leg, prefix-tolerant for a
+        truncated tab render).
+
+    A malformed record (no questions list) never contradicts — the rescue then
+    renders whatever the record holds, exactly as for ``pane_form is None``.
+    """
+    from ..terminal_parser import label_matches_authority
+
+    raw_questions = record.tool_input.get("questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        return False
+    questions = [q for q in raw_questions if isinstance(q, dict)]
+    if not questions:
+        return False
+
+    pane_title = (pane_form.current_question_title or "").strip()
+    if pane_title:
+        titles = [(q.get("question") or "").strip() for q in questions]
+        if not any(
+            t and (t.startswith(pane_title) or pane_title.startswith(t)) for t in titles
+        ):
+            return True
+
+    content_tabs = [
+        t.label.strip() for t in pane_form.tabs if not t.is_submit and t.label.strip()
+    ]
+    if content_tabs:
+        headers: list[str] = []
+        for q in questions:
+            h = q.get("header")
+            if isinstance(h, str) and h.strip():
+                headers.append(h.strip())
+        if headers:
+            for tab in content_tabs:
+                if not any(
+                    label_matches_authority(tab, "", h)
+                    or h.lower().startswith(tab.lower())
+                    or tab.lower().startswith(h.lower())
+                    for h in headers
+                ):
+                    return True
     return False
 
 
@@ -784,9 +874,8 @@ def _pane_labels_match_candidate_by_number(
     """
     from ..terminal_parser import is_affordance_label
 
-    pane_labels = tuple(o.label for o in pane_form.options)
     if any(o.number is None for o in pane_form.options):
-        return _labels_are_subsequence(pane_labels, candidate_labels)
+        return _options_are_subsequence(pane_form.options, candidate_labels)
 
     checked_any = False
     for option in pane_form.options:
@@ -855,7 +944,7 @@ def _record_consistent_with_pane(
             q_labels = _safe_record_labels(q)
             if q_labels is None:
                 continue
-            if _labels_are_subsequence(pane_labels, q_labels):
+            if _options_are_subsequence(pane_form.options, q_labels):
                 candidate = q
                 break
     if candidate is None:
@@ -1570,11 +1659,10 @@ def _ctx_recovery_candidate(record, pane_form):
                 qt = (q.get("question") or "").strip()
                 if qt and (qt.startswith(pane_title) or pane_title.startswith(qt)):
                     return q
-    pane_labels = tuple(o.label for o in pane_form.options)
     for q in raw:
         if isinstance(q, dict):
             ql = _safe_record_labels(q)
-            if ql is not None and _labels_are_subsequence(pane_labels, ql):
+            if ql is not None and _options_are_subsequence(pane_form.options, ql):
                 return q
     return None
 
