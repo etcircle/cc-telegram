@@ -1,0 +1,150 @@
+           minting writers are severed (ISS-062) so near-term risk is low
+          , but (b) content-level dedup/supersede + (c) regression test +
+           (d) hard keyed-line reject remain OPEN.
+      26
+      27  - **Wave A/B/C deferred op — `materialize_contact_people` sweep
+           + L-vs-C person-creation decision.** When prod accumulates CRM
+           contacts (currently **0** → moot, the sweep is a no-op either
+          way): re-run `backend/scripts/materialize_contact_people.py --d
+          ry-run` against prod → quantify → owner picks Option L (link-on
+          ly, the default) vs Option C (`--create-people`) → `--apply`. (
+          Waves A/B/C shipped + PROD-PROMOTED 2026-06-24 → Recently Fixed
+          .)
+
+⏺ Committing the ISS-158 enrichment + ISS-160/161:
+
+⏺ Bash(cd /Users/felixcardix/dev-workspaces/di-copilot
+      git add ISSUES.md…)
+  ⎿  commit EXIT=0
+     be210a6f ISSUES: concept-memory audit — enrich ISS-158 + file ISS-160/
+     161
+     … +3 lines (ctrl+o to expand)
+
+⏺ Captured and pushed — origin/main == be210a6f, tree clean.
+
+  What's now in the tracker
+
+  - ISS-158 enriched with the verified audit: prod confirmation (783), ~55 merge
+  groups (~28–33% reduction), the 19 zero-risk dev seed merges, the 11-parent
+  taxonomy, and the full merge-agent design (signals to combine,
+  auto-vs-human-gated policy, guardrails — never merge across broader_id
+  siblings, preserve the fact_subjects union, populate alt_labels so variants
+  stop re-minting).
+  - ISS-160 (P2) — retrieval returns chunk-text + facts as disconnected lanes;
+  the relationships lane is dead code. The DB spine is 100% connected (verified)
+  — only the response assembly is missing. Flagged as the highest-leverage fix
+  for your "agents easily find connected data" goal.
+  - ISS-161 (P3) — visual_embedding indexed but 0/615 images + 0/956 tables
+  populated; Qwen3-VL never invoked → no cross-modal search.
+  - Full report (all 55 merge groups, taxonomy, connectivity detail, ISS-158
+  design): memory/2026-06-24_concept_memory_audit.md (local).
+
+  Direct answers to your two questions
+
+  - Concepts are far too many — confirmed, and now diagnosed: flat (zero
+  hierarchy/synonyms/merges ever used), ~half dormant (anchor no facts), with
+  cross-type dups + sentences-as-labels as the top offenders. A concrete merge +
+  taxonomy plan is ready; the cleanup itself runs through the ISS-158 agent
+  when you want it.
+  - Is everything connected when we search? The data is fully connected (every
+  fact has its subjects/entities, images & tables are fact-linked) — but the
+  retrieval response doesn't assemble it: a hit comes back as chunk-text plus a
+  parallel fact list with no edges, relationships aren't returned at all, and
+  images/tables match by text only. So the memory substrate is excellent; the
+  retrieval surface is where the connectivity work is (ISS-160 > ISS-161).
+
+  When you're ready to start cleanup, the 19 zero-risk dev merges (7 zz retires
+  + 12 cross-type exact dups, fully reversible) are the natural first batch to
+  prove the ISS-158 pipeline end-to-end — just say the word.
+
+✻ Crunched for 1h 20m 30s
+
+❯ okay can you please do a handoff make sure you refer to the relevant
+  documents for the audit
+   and we'll start working on our goals making sure we improve it
+
+⏺ I'll use the handoff skill to write this up properly.
+
+⏺ Skill(handoff)
+  ⎿  Successfully loaded skill
+
+⏺ I'll refresh the exact state, then write the half-page handoff.
+
+⏺ Bash(cd /Users/felixcardix/dev-workspaces/di-copilot
+      echo "today: $(date +%Y-%m-%d)"…)
+  ⎿  today: 2026-06-24
+     --- recent commits ---
+     be210a6f ISSUES: concept-memory audit — enrich ISS-158 + file ISS-160/
+     … +17 lines (ctrl+o to expand)
+
+⏺ Write(memory/2026-06-24_memory_system_improvement_handoff.md)
+  ⎿  Wrote 28 lines to
+     memory/2026-06-24_memory_system_improvement_handoff.md
+       2 # Memory-system improvement — session handoff (2026-06-24)
+         g the improvements** (concept cleanup + retrieval connectivity)
+         toward the goal: an excellent personal+shared-scope memory where
+       4  agents easily find *connected* data.
+       5 ## Branch state
+         g tree clean.**== `origin/main` == `be210a6f`**, 0 ahead, workin
+       8 ## What's done (today)
+       9 - **Wave A+B+C PROD-PROMOTED** (`456161a2`; prod head `20260619_
+      10 - **ISSUES.md reconciled** (`422c6d3a`): Open 247→~120 lines (24
+          archived / 10 trimmed / 26 kept).
+     … +46 lines (ctrl+o to expand)
+
+⏺ Handoff written: memory/2026-06-24_memory_system_improvement_handoff.md (half
+  a page, local — memory/ is gitignored).
+
+  It points the next session at the goals, not a recap: branch is clean at
+  be210a6f; first action is to read the audit report
+  (memory/2026-06-24_concept_memory_audit.md) then the ISS-158/160/161 entries.
+  authToken (options.js:116). So the chat lane is left with no credential it can use → it bails.
+
+  So the side-panel "Chat" tab is essentially vestigial — a migration-era shortcut. The 404 self-heal I added earlier is still correct, but it's downstream of
+  this; with a device token the chat can't authenticate at all. The architecture as built is: extension = pure relay; you chat in the web app; the server-side
+  agent drives your attached tab through the relay. That relay part is working — your token exchanged fine.
+
+  There's also a second gate: per the owner-approved SC3 "browser-everywhere" plan (task #82, still unbuilt), the agent's browser tools are not yet wired into
+  the chat orchestrator and the capability gate needs un-breaking. So even via the web app, the agent likely can't drive the browser end-to-end today. I've
+  kicked off a read-only audit to confirm exactly what works right now — running in the background.
+
+  The real decision is yours
+
+  This is exactly the "separate-window / multi-surface, doesn't feel polished" problem you described — and fixing it well means picking the target experience.
+  That's a genuine product+security fork, so I want your call before building. All three still need SC3 to give the agent working browser tools; they differ in
+  where you chat:
+
+⏺ Explore(Audit live browser-tool capability)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Chat surface
+
+Where should you actually chat with the agent? This decides the whole redesign. (All three still need the SC3 wave to give the agent working browser tools —
+that part is separate.)
+
+ 1. Embed web chat in side        ┌──────────────────────────────────────────────┐
+   panel                          │ ┌─ DI Copilot ──────────┐                    │
+  2. Native side-panel chat       │ │  [ web-app chat here  ]│  ← iframe, uses   │
+  3. Web app is the cockpit       │ │  [ full features      ]│    your login     │
+                                  │ │                        │                   │
+                                  │ │ Agent Browser: ● ON    │  ← relay controls │
+                                  │ │ Attached: LinkedIn tab │                   │
+                                  │ └────────────────────────┘                   │
+                                  │ Reuses login · no new token                  │
+                                  └──────────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel
+
+  46 tasks (39 done, 7 open)
+  ◻ S3 riders: aspect/style params + classifySlide raw data + docs
+  ◻ Soak readout → S2 go/no-go (due ≥2026-07-09 06:25)
+  ◻ TSR-6 template-carrier wave (post-S2, owner approved)
+  ◻ Wave Q3 build: VIS-1 images (3 sub-slices, absorbs #50) + hero-KPI + stats enrichment; charts/theming DEFERRED
+  ◻ Investigate codex cache_read=0: verify shipped mapping + capture raw usage frame
+   … +2 pending, 39 completed

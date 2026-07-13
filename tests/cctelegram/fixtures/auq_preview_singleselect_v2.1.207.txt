@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.207 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│               Welcome back Emiliyan!               │ Ask Claude to create a new app or clone a repository                                                    │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                              │
+│                      ▝▜█████▛▘                     │ Auto mode is now available without `CLAUDE_CODE_ENABLE_AUTO_MODE` opt-in on Bedrock, Vertex AI, and Fo… │
+│                        ▘▘ ▝▝                       │ Fixed the terminal freezing and keystrokes lagging while streaming responses containing very long list… │
+│   Opus 4.8 (1M context) with me… · Claude Max ·    │ Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… │
+│   em.tanev@gmail.com's Organization                │ /release-notes for more                                                                                 │
+│              /private/tmp/ccrig-gh54               │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ▎ Extended through July 19
+ ▎ We're extending Claude Fable 5 access on all paid plans, as well as keeping Claude Code’s weekly rate limits 50% higher, through July 19.
+ ▎
+ ▎ As before, you can use up to half of your weekly usage limit on Fable 5. After that, you can keep using Fable 5 with usage credits, or switch to another
+ ▎ model to keep working within your remaining limits.
+ ▎
+ ▎ More details here: https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access
+
+❯ Call the AskUserQuestion tool exactly once with one single-select question (multiSelect false), header "Rig test", a question ~120 chars long, and three
+  options. Give EVERY option a label ~25 chars, a description ~200 chars, AND a preview field containing a 6-line ASCII box-drawing mockup using the characters
+  box top-left, vertical bar, and box bottom-left. Do not do anything else, do not write files, just call the tool once.
+
+⏺ I'll call the tool once with the question and three previewed options.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Rig test
+
+Which layout should the rig test harness use to render its status panel when a run is executing in the terminal?
+
+❯ 1. Stacked summary panel        ┌──────────────────────────────────────────┐
+  2. Side-by-side columns         │ ┌──────────────────────────────┐         │
+  3. Single-line ticker           │ │ RUN: rig-test-0421   RUNNING │         │
+                                  │ │ 1. bootstrap          PASSED │         │
+                                  │ │ 2. calibrate         RUNNING │         │
+                                  │ │ 3. teardown          PENDING │         │
+                                  │ └──────────────────────────────┘         │
+                                  └──────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel
+
+
+

@@ -58,6 +58,7 @@ import hashlib
 import logging
 import os
 import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Final, Literal
@@ -823,6 +824,16 @@ class AskOption:
     # Excluded from equality/canonical/fingerprint: toggles must not stale
     # sibling tokens, and off-screen unknown must not collapse to False.
     selected: bool | None = field(default=None, compare=False)
+    # GH #54 W1.2 — the no-space join of a wrapped preview-layout label's
+    # fragments. Empty for every ordinary (single-column) option: the joiner
+    # only runs when a preview panel boundary was detected. Used by the shared
+    # authority-aware matcher (``label_matches_authority``) so a hard mid-word
+    # wrap (``Supercalifragi`` / ``listicexpial``) matches the side-file
+    # authority without guessing where the wrapped space belongs. Excluded from
+    # equality/canonical/fingerprint (``compare=False``) so a preview form's
+    # fingerprint stays IDENTICAL across a cursor move (W1.4 panel-exclusion
+    # invariant) and a wrap-canonical is never a token-staling identity input.
+    wrap_canonical: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True)
@@ -1180,7 +1191,7 @@ def _normalize_pick_label(label: str) -> str:
     return re.sub(r"\s+", " ", stripped).strip().lower()
 
 
-def _loose_label_match(live: str, minted: str) -> bool:
+def _loose_label_match(live: str, minted: str, live_wrap_canonical: str = "") -> bool:
     """True iff the live cursor's label is the minted label (truncation-tolerant).
 
     Both sides are normalized via ``_normalize_pick_label``. An empty normalized
@@ -1202,7 +1213,65 @@ def _loose_label_match(live: str, minted: str) -> bool:
     nm = _normalize_pick_label(minted)
     if not nl or not nm:
         return False
-    return nl == nm or nm.startswith(nl)
+    if nl == nm or nm.startswith(nl):
+        return True
+    # GH #54 W1.2 — wrap-canonical leg. A preview-layout option's live label is
+    # reconstructed from wrapped pane fragments, which is inherently lossy on the
+    # inter-fragment space (word-boundary wrap CONSUMES it, a hard mid-word break
+    # does NOT). ``live_wrap_canonical`` is the no-space fragment join; comparing
+    # both sides with ALL whitespace stripped accepts either wrap kind against the
+    # authority. Non-empty ONLY for preview options, so the ordinary single-column
+    # path is byte-untouched.
+    if live_wrap_canonical and _nospace_norm(live_wrap_canonical) == _nospace_norm(
+        minted
+    ):
+        return True
+    return False
+
+
+def _nospace_norm(label: str) -> str:
+    """Normalize a label for the wrap-canonical comparison: strip a leading
+    checkbox / trailing ``(recommended)``, remove ALL whitespace, lowercase.
+
+    Mirrors ``_normalize_pick_label`` except that internal whitespace is
+    REMOVED entirely (not collapsed to a single space), so a wrapped label
+    reconstructed with or without the wrap space compares equal to the
+    authority label with its own spaces stripped.
+    """
+    stripped = re.sub(r"^\[[ xX✔]\]\s*", "", label.strip(), count=1)
+    stripped = re.sub(r"\(recommended\)\s*$", "", stripped, flags=re.IGNORECASE)
+    return re.sub(r"\s+", "", stripped).lower()
+
+
+def label_matches_authority(
+    pane_label: str, wrap_canonical: str, authority_label: str
+) -> bool:
+    """Shared authority-aware label matcher (GH #54 W1.2).
+
+    True iff the pane-observed ``pane_label`` (a preview-layout option carries
+    its wrapped-fragment ``wrap_canonical`` too) matches the AUTHORITY label (a
+    side-file / JSONL option) under the repo's whitespace normalization:
+
+      * leg A — ``_normalize_pick_label`` equality (the existing single-column
+        rule: collapse whitespace + lowercase + strip checkbox/recommended);
+      * leg B (PREVIEW-ONLY) — ``wrap_canonical`` present AND both sides equal
+        with ALL whitespace stripped (tolerates the word-boundary vs mid-word
+        wrap ambiguity that pane reconstruction cannot resolve).
+
+    ``wrap_canonical`` is empty for every ordinary option, so leg B never fires
+    off the single-column path — the existing behaviour is byte-identical.
+
+    Public because the auq_source comparison call graph
+    (``_record_consistent_with_pane`` and the partial-context recovery) consumes
+    it in a LATER wave; this wave wires the terminal_parser call sites.
+    """
+    if _normalize_pick_label(pane_label) == _normalize_pick_label(authority_label):
+        return True
+    if wrap_canonical and _nospace_norm(wrap_canonical) == _nospace_norm(
+        authority_label
+    ):
+        return True
+    return False
 
 
 # Raw-pane markers that prove an AskUserQuestion picker / review screen is up.
@@ -1718,7 +1787,369 @@ def _walk_back_from_picker_footer(
     return start_idx, stop_idx, blank_gap
 
 
-def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
+# ── GH #54 — preview side-by-side layout parser (W1.0-W1.5) ────────────────
+#
+# When an AskUserQuestion option carries a ``preview`` mockup, Claude Code
+# renders a SIDE-BY-SIDE layout: the numbered options in a left column (labels
+# may WRAP inside that column) and the focused option's preview in a
+# box-drawing PANEL on the right. The ordinary option-block walk absorbs the
+# panel art into the labels (or returns 0 options), so a dedicated prepass
+# owns this shape and REPLACES the ordinary result when it parses.
+
+# Box-drawing chars that mark the preview panel's left edge.
+_PREVIEW_BOX_CHARS: Final = frozenset("┌│└─┐┘┤├┬┴┼╭╮╰╯║╔╗╚╝╠╣╦╩╬")
+
+# The preview footer variant — a picker footer (``Enter to select``) that ALSO
+# carries the notes affordance. Present on BOTH single-question and
+# multi-question preview panes; ABSENT from the standard multi-select layout
+# (which never renders a panel), so it is the activation discriminator.
+_PREVIEW_FOOTER_MARKER: Final = "n to add notes"
+
+_RE_NOTES_CHROME: Final = re.compile(r"press\s+n\s+to\s+add\s+notes", re.IGNORECASE)
+
+
+def _is_preview_footer_line(line: str) -> bool:
+    """True iff ``line`` is the preview footer variant (picker footer + notes)."""
+    return bool(_RE_PICKER_FOOTER.search(line)) and _PREVIEW_FOOTER_MARKER in line
+
+
+def _first_box_char_index(line: str) -> int:
+    """Index of the first box-drawing char in ``line``, or -1."""
+    for i, ch in enumerate(line):
+        if ch in _PREVIEW_BOX_CHARS:
+            return i
+    return -1
+
+
+def _truncate_at_cell(line: str, boundary_cell: int) -> str:
+    """Return the prefix of ``line`` whose display width is < ``boundary_cell``."""
+    if boundary_cell <= 0:
+        return ""
+    width = 0
+    for i, ch in enumerate(line):
+        w = _char_cell_width(ch)
+        if width + w > boundary_cell:
+            return line[:i]
+        width += w
+    return line
+
+
+def _sgr_updates_bold(params: str, bold: bool) -> bool:
+    """Fold one SGR parameter list into the running bold (SGR-1) state.
+
+    ``ESC[1m`` sets bold; ``ESC[0m`` / ``ESC[22m`` clear it. Combined forms
+    (``ESC[1;38;5;153m``) are handled — the shared 38/48 sub-parameter skip
+    keeps a ``1`` inside ``38;5;1`` from being misread as the bold code
+    (``feedback_fastpath_shape_match_falls_through``).
+    """
+    if params == "":
+        return False
+    parts = params.split(";")
+    i = 0
+    while i < len(parts):
+        code = parts[i]
+        if code in ("38", "48"):
+            if i + 1 < len(parts) and parts[i + 1] == "5":
+                i += 3
+                continue
+            if i + 1 < len(parts) and parts[i + 1] == "2":
+                i += 5
+                continue
+            i += 1
+            continue
+        if code in ("0", ""):
+            bold = False
+        elif code == "1":
+            bold = True
+        elif code == "22":
+            bold = False
+        i += 1
+    return bold
+
+
+def _iter_visible_with_bold(ansi_line: str):
+    """Yield ``(char, is_bold, cell_col)`` for each VISIBLE char in an ANSI line.
+
+    Consumes CSI / OSC / DCS / SOS / PM / APC / ESC-single sequences (bold state
+    only advances on SGR ``m`` finals); ``cell_col`` is the display-cell column
+    of the char (cumulative :func:`display_width` of the visible prefix).
+    """
+    bold = False
+    cell = 0
+    i = 0
+    n = len(ansi_line)
+    while i < n:
+        c = ansi_line[i]
+        if c == "\x1b" and i + 1 < n:
+            nxt = ansi_line[i + 1]
+            if nxt == "[":
+                m = _RE_CSI.match(ansi_line, i)
+                if m is not None:
+                    if m.group(2) == "m":
+                        bold = _sgr_updates_bold(m.group(1), bold)
+                    i = m.end()
+                    continue
+                i += 2
+                continue
+            if nxt in "]PX^_":
+                j = i + 2
+                while j < n:
+                    if ansi_line[j] == "\x07":
+                        j += 1
+                        break
+                    if (
+                        ansi_line[j] == "\x1b"
+                        and j + 1 < n
+                        and ansi_line[j + 1] == "\\"
+                    ):
+                        j += 2
+                        break
+                    j += 1
+                i = j
+                continue
+            i += 2
+            continue
+        yield c, bold, cell
+        cell += _char_cell_width(c)
+        i += 1
+
+
+def _ansi_row_label_bold_state(
+    ansi_line: str, boundary_cell: int, *, is_numbered: bool
+) -> str:
+    """Classify the LABEL region of one physical ANSI row as bold/plain/mixed.
+
+    Returns ``"bold"`` (every visible non-space label char is SGR-1),
+    ``"plain"`` (none are), ``"mixed"`` (some are — a mid-redraw frame), or
+    ``"empty"`` (no visible label chars). Only cells strictly LEFT of
+    ``boundary_cell`` count, and the leading ``[cursor] N.`` number token of a
+    numbered row is skipped (it renders dim, never bold — F8).
+    """
+    visible = list(_iter_visible_with_bold(ansi_line))
+    plain = "".join(vc for vc, _, _ in visible)
+    label_start = 0
+    if is_numbered:
+        m = _RE_NUMBERED_OPTION.match(plain)
+        if m is None:
+            return "empty"
+        label_start = m.start("label")
+    states: list[bool] = []
+    for idx, (vc, is_bold, cell) in enumerate(visible):
+        if idx < label_start:
+            continue
+        if cell >= boundary_cell:
+            break
+        if vc.strip() == "":
+            continue
+        states.append(is_bold)
+    if not states:
+        return "empty"
+    if all(states):
+        return "bold"
+    if not any(states):
+        return "plain"
+    return "mixed"
+
+
+def _try_parse_preview_layout(
+    lines: list[str],
+    ansi_lines: list[str] | None,
+    tab_header_idx: int | None,
+    footer_idx: int,
+) -> AskUserQuestionForm | None:
+    """Parse the side-by-side preview AUQ layout, or ``None`` (W1.0-W1.5).
+
+    ``footer_idx`` is the bottom-most picker footer; the caller has already
+    confirmed it is the preview variant (activation). ``ansi_lines`` is the
+    line-aligned ANSI capture for tier-2 SGR cursor detection (``None`` ⇒
+    tier-2 unavailable; a chevron-bearing preview still resolves via tier-1).
+    """
+    # W1.0 — region-discovery prepass: walk UP from the footer collecting rows
+    # until the question/title region. Classify each so the boundary scan and
+    # option parse agree on which rows are label-bearing.
+    KIND_OPTION, KIND_CONT, KIND_PANEL, KIND_CHROME = "opt", "cont", "panel", "chrome"
+    entries: list[tuple[int, str]] = []  # (line_index, kind), top-down after reverse
+    title_candidate: str | None = None
+    for j in range(footer_idx - 1, -1, -1):
+        line = lines[j]
+        stripped = line.strip()
+        if not stripped:
+            entries.append((j, KIND_CHROME))
+            continue
+        if _RE_NUMBERED_OPTION.match(line):
+            entries.append((j, KIND_OPTION))
+            continue
+        if all(c == "─" for c in stripped) and len(stripped) >= 20:
+            entries.append((j, KIND_CHROME))  # bare full-width rule
+            continue
+        if _RE_NOTES_CHROME.search(line):
+            entries.append((j, KIND_CHROME))
+            continue
+        if is_affordance_label(stripped):  # "Chat about this"
+            entries.append((j, KIND_CHROME))
+            continue
+        box_idx = _first_box_char_index(line)
+        if box_idx >= 0:
+            # Text to the LEFT of the panel ⇒ a wrapped-label continuation;
+            # box-drawing as the first non-space ⇒ a panel-only row.
+            if line[:box_idx].strip():
+                entries.append((j, KIND_CONT))
+            else:
+                entries.append((j, KIND_PANEL))
+            continue
+        # A non-chrome, non-option, non-panel line — the question/title region.
+        title_candidate = stripped
+        break
+    entries.reverse()
+
+    # W1.1 — panel-boundary detection in DISPLAY CELLS. Only label-bearing rows
+    # (options + continuations with text left of the panel) vote; chrome / bare
+    # rules / panel-only rows never do (a column-0 ``────`` would otherwise win).
+    vote_cols: set[int] = set()
+    for j, kind in entries:
+        if kind not in (KIND_OPTION, KIND_CONT):
+            continue
+        box_idx = _first_box_char_index(lines[j])
+        if box_idx < 0:
+            continue  # an unwrapped short label with no panel on its row
+        vote_cols.add(_cells_left_of_index(lines[j], box_idx))
+    if len(vote_cols) != 1:
+        return None  # no panel, or inconsistent boundary ⇒ not a clean preview
+    boundary_cell = next(iter(vote_cols))
+    if boundary_cell <= 0:
+        return None
+
+    # W1.2 — truncate every row at the boundary, then parse options + join
+    # wrapped continuation fragments. Track physical rows per logical option
+    # for tier-2 cursor attribution.
+    frag_lists: list[list[str]] = []
+    numbers: list[int] = []
+    glyph_cursor: list[bool] = []
+    phys_rows: list[list[int]] = []  # line indices contributing to each option
+    for j, kind in entries:
+        if kind == KIND_OPTION:
+            truncated = _truncate_at_cell(lines[j], boundary_cell)
+            m = _RE_NUMBERED_OPTION.match(truncated)
+            if m is None:
+                return None  # boundary cut the marker ⇒ at/left of an N. marker
+            try:
+                num = int(m.group("num"))
+            except ValueError:
+                return None
+            label = _strip_option_checkbox(m.group("label").strip())
+            if not label:
+                return None  # boundary cut the label away
+            frag_lists.append([label])
+            numbers.append(num)
+            glyph_cursor.append(m.group("cursor").strip() in ("❯", "›", "▶"))
+            phys_rows.append([j])
+        elif kind == KIND_CONT:
+            if not frag_lists:
+                continue  # a stray continuation above the first option
+            truncated = _truncate_at_cell(lines[j], boundary_cell).strip()
+            if truncated:
+                frag_lists[-1].append(truncated)
+                phys_rows[-1].append(j)
+        # KIND_PANEL / KIND_CHROME contribute nothing to the label column.
+
+    # W1.1b — completeness: contiguous 1..N, N >= 2, + positively-observed
+    # preview chrome (the panel boundary above + the preview footer the caller
+    # already asserted). Anything less ⇒ not a clean preview ⇒ ordinary result.
+    if len(numbers) < 2 or numbers != list(range(1, len(numbers) + 1)):
+        return None
+
+    # W1.3 — two-tier cursor. Tier 1: a structural glyph. Tier 2 (SGR): the
+    # ONE logical option whose EVERY label fragment is bold while all others
+    # are plain. Zero / >1 / a mixed option ⇒ no cursor (fail-closed; the
+    # preview form's layout marker also blocks cursor=option-1 synthesis, F6).
+    cursor_num: int | None = None
+    glyph_idxs = [i for i, c in enumerate(glyph_cursor) if c]
+    if len(glyph_idxs) == 1:
+        cursor_num = numbers[glyph_idxs[0]]
+    elif not glyph_idxs and ansi_lines is not None and len(ansi_lines) == len(lines):
+        states: list[str] = []
+        any_mixed = False
+        for opt_i in range(len(numbers)):
+            frag_states: list[str] = []
+            for k, jrow in enumerate(phys_rows[opt_i]):
+                frag_states.append(
+                    _ansi_row_label_bold_state(
+                        ansi_lines[jrow], boundary_cell, is_numbered=(k == 0)
+                    )
+                )
+            non_empty = [s for s in frag_states if s != "empty"]
+            if any(s == "mixed" for s in non_empty):
+                state = "mixed"
+                any_mixed = True
+            elif non_empty and all(s == "bold" for s in non_empty):
+                state = "bold"
+            else:
+                state = "plain"
+            states.append(state)
+        if not any_mixed:
+            bold_idxs = [i for i, s in enumerate(states) if s == "bold"]
+            if len(bold_idxs) == 1:
+                cursor_num = numbers[bold_idxs[0]]
+
+    options = tuple(
+        AskOption(
+            label=" ".join(frag_lists[i]),
+            recommended=False,
+            cursor=(numbers[i] == cursor_num),
+            number=numbers[i],
+            description="",
+            selected=None,
+            wrap_canonical="".join(frag_lists[i]),
+        )
+        for i in range(len(numbers))
+    )
+
+    # W1.0 — multi-question tab governance. The prepass block top (the topmost
+    # numbered option) feeds ``_footer_block_contiguous_with_header`` so a live
+    # ``←…→`` header directly above the block GOVERNS (populated ``tabs``),
+    # instead of being demoted by the ordinary footer walk crossing the panel's
+    # separators / the ``Chat about this`` row.
+    tabs: tuple[AskTab, ...] = ()
+    current_question_title: str | None = None
+    pane_walkback_title: str | None = None
+    block_top = min((j for j, kind in entries if kind == KIND_OPTION), default=None)
+    if (
+        tab_header_idx is not None
+        and block_top is not None
+        and tab_header_idx < footer_idx
+        and _footer_block_contiguous_with_header(lines, block_top, tab_header_idx)
+    ):
+        parsed_tabs = _parse_tab_header(lines[tab_header_idx])
+        if parsed_tabs is not None:
+            tabs = parsed_tabs
+            current_question_title = title_candidate
+    else:
+        pane_walkback_title = title_candidate
+
+    excerpt_start = (
+        tab_header_idx
+        if tabs and tab_header_idx is not None
+        else (block_top if block_top is not None else max(0, footer_idx - 25))
+    )
+    pane_excerpt = "\n".join(lines[excerpt_start : footer_idx + 1]).rstrip()
+
+    return AskUserQuestionForm(
+        tabs=tabs,
+        current_question_title=current_question_title,
+        options=options,
+        is_review_screen=False,
+        is_free_text=False,  # preview panes have no "Type something" row (F8)
+        pane_excerpt=pane_excerpt,
+        pane_walkback_title=pane_walkback_title,
+        select_mode="single",
+        options_complete=True,
+        _meta={"layout": "preview"},
+    )
+
+
+def parse_ask_user_question(
+    pane_text: str, *, ansi_text: str | None = None
+) -> AskUserQuestionForm | None:
     """Structured parse of the AskUserQuestion picker in ``pane_text``.
 
     PR 1 surface: pure parser, no caller change. Returns ``None`` when the
@@ -1761,6 +2192,21 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
             footer_idx = i
             break
     has_footer = footer_idx is not None
+
+    # GH #54 W1.0 — preview-layout PREPASS. Activation is POSITIVE chrome,
+    # anchored to the LIVE picker: the bottom-most OVERALL picker footer must
+    # itself be the preview footer variant (``n to add notes``). A historical
+    # preview picker in scrollback ABOVE a live ordinary picker never activates
+    # (its footer is not the bottom-most one). On a successful parse the preview
+    # result REPLACES the ordinary walk (garbage on genuine preview panes by
+    # construction); on failure the ordinary walk stands.
+    if footer_idx is not None and _is_preview_footer_line(lines[footer_idx]):
+        ansi_lines = ansi_text.split("\n") if ansi_text is not None else None
+        preview_form = _try_parse_preview_layout(
+            lines, ansi_lines, tab_header_idx, footer_idx
+        )
+        if preview_form is not None:
+            return preview_form
 
     # Review-screen + free-text markers stay scoped to the last 25 lines —
     # they only matter for the live picker state, not historic scrollback.
@@ -2793,6 +3239,34 @@ UI_PATTERNS = [
 ]
 
 
+def _authority_overlap(
+    pane_options: tuple[AskOption, ...], q_options: tuple[AskOption, ...]
+) -> int:
+    """Count pane options whose label matches some question option (GH #54 W1.2).
+
+    For an ordinary (single-column) pane option (``wrap_canonical == ""``) this
+    is EXACTLY the raw set-intersection size the callers used before — the
+    ``po.label in q_labels_raw`` branch — so the existing behaviour is
+    byte-identical. A preview-layout option additionally matches via the shared
+    ``label_matches_authority`` wrap-canonical leg, so a wrapped label still
+    scores against the authoritative JSONL question it belongs to.
+    """
+    q_labels_raw = {o.label for o in q_options if o.label}
+    q_labels_list = [o.label for o in q_options if o.label]
+    matched: set[str] = set()
+    for po in pane_options:
+        if not po.label:
+            continue
+        if po.label in q_labels_raw:
+            matched.add(po.label)
+        elif po.wrap_canonical and any(
+            label_matches_authority(po.label, po.wrap_canonical, ql)
+            for ql in q_labels_list
+        ):
+            matched.add(po.label)
+    return len(matched)
+
+
 def _infer_current_tab_idx(
     questions: tuple[AskQuestion, ...],
     pane_form: AskUserQuestionForm | None,
@@ -2835,8 +3309,7 @@ def _infer_current_tab_idx(
     if pane_labels:
         scored: list[tuple[int, int]] = []
         for i, q in enumerate(questions):
-            q_labels = {o.label for o in q.options if o.label}
-            scored.append((i, len(pane_labels & q_labels)))
+            scored.append((i, _authority_overlap(pane_form.options, q.options)))
         # Drop zero scores so a pane with no overlap with any question
         # doesn't accidentally pick idx 0 as the "winner".
         scored = [(i, s) for (i, s) in scored if s > 0]
@@ -2853,6 +3326,8 @@ def _infer_current_tab_idx(
 def resolve_ask_form(
     tool_input: dict[str, Any] | None,
     pane_text: str,
+    *,
+    ansi_text: str | None = None,
 ) -> AskUserQuestionForm | None:
     """Unified AskUserQuestion form resolution.
 
@@ -2884,7 +3359,15 @@ def resolve_ask_form(
        was lost.
     5. Both missing: returns None.
     """
-    pane_form = parse_ask_user_question(pane_text) if pane_text else None
+    pane_form = (
+        parse_ask_user_question(pane_text, ansi_text=ansi_text) if pane_text else None
+    )
+    # F6 — a preview-layout pane whose cursor could NOT be proven (tier-1 glyph
+    # absent AND tier-2 SGR ambiguous) must never have cursor=option-1
+    # synthesized under it. The overlay respects this via ``is_preview``.
+    is_preview_pane = bool(
+        pane_form is not None and pane_form._meta.get("layout") == "preview"
+    )
 
     jsonl_form = build_form_from_tool_input(tool_input)
     if jsonl_form is None:
@@ -2977,7 +3460,7 @@ def resolve_ask_form(
                 tabs=jsonl_form.tabs,
                 current_question_title=jsonl_form.current_question_title,
                 options=_overlay_cursor_and_selection(
-                    jsonl_form.options, pane_form.options
+                    jsonl_form.options, pane_form.options, is_preview=is_preview_pane
                 ),
                 is_review_screen=pane_form.is_review_screen,
                 is_free_text=pane_form.is_free_text,
@@ -3032,7 +3515,9 @@ def resolve_ask_form(
     # the validator and renderer see a stable shape; pick buttons are
     # suppressed downstream because current_tab_inferred is False.
     options = (
-        _overlay_cursor_and_selection(current_q.options, pane_form.options)
+        _overlay_cursor_and_selection(
+            current_q.options, pane_form.options, is_preview=is_preview_pane
+        )
         if pane_form is not None and inferred
         else current_q.options
     )
@@ -3100,8 +3585,7 @@ def _strong_match(q: AskQuestion, pane_form: AskUserQuestionForm) -> bool:
     pane_labels = {o.label for o in pane_form.options if o.label}
     if not pane_labels:
         return False
-    q_labels = {o.label for o in q.options if o.label}
-    overlap = len(pane_labels & q_labels)
+    overlap = _authority_overlap(pane_form.options, q.options)
     # ≥50% of pane labels recognized in this question's option set.
     return overlap * 2 >= len(pane_labels)
 
@@ -3109,12 +3593,19 @@ def _strong_match(q: AskQuestion, pane_form: AskUserQuestionForm) -> bool:
 def _overlay_cursor_and_selection(
     jsonl_options: tuple[AskOption, ...],
     pane_options: tuple[AskOption, ...],
+    *,
+    is_preview: bool = False,
 ) -> tuple[AskOption, ...]:
     """Apply pane cursor and visible checkbox selection to JSONL options by number.
 
     Cursor follows the existing overlay rule: if no cursor is visible, default
     to option 1. Selection is stricter: only visible pane rows are known; JSONL
     options not present in the pane get ``selected=None`` rather than False.
+
+    GH #54 F6: on a PREVIEW-layout pane (``is_preview``) the option-1
+    SYNTHESIS branch is gated OFF — an unproven cursor stays ``None`` on every
+    option so a preview dispatch fails closed (``not_advanced``) instead of
+    committing a GUESSED option 1.
     """
     cursor_at: int | None = None
     selected_by_num: dict[int, bool | None] = {}
@@ -3129,7 +3620,7 @@ def _overlay_cursor_and_selection(
         # rather than first-wins so the overlay tracks the live cursor.
         if opt.cursor:
             cursor_at = opt.number
-    if cursor_at is None and jsonl_options:
+    if cursor_at is None and jsonl_options and not is_preview:
         cursor_at = jsonl_options[0].number
     if cursor_at is None:
         return jsonl_options
@@ -3460,6 +3951,176 @@ def _strip_ansi(text: str) -> str:
     """
     text = _RE_CSI.sub("", text)
     return _RE_ANSI_ANY.sub("", text)
+
+
+@dataclass(frozen=True)
+class PaneCapture:
+    """A tmux pane captured WITH ANSI, paired with its normalized plain text.
+
+    GH #54 capture spine: every AUQ-consuming observation captures ANSI once and
+    derives ``plain`` via :func:`normalize_capture`, so a single frame drives both
+    the plain parse (options / layout) and the ANSI-fed tier-2 SGR cursor
+    detection without a second tmux round-trip. Non-AUQ consumers of the same
+    observation receive ``plain`` and behave byte-identically to today's plain
+    capture (region-equality is the acceptance criterion, not parse equality).
+    """
+
+    plain: str
+    ansi: str
+
+
+# C0 control bytes that are ALLOWED to survive normalization: LF and TAB (real
+# text layout) plus CR (folded by downstream splitters). Everything else in C0,
+# DEL, and C1 (U+0080-U+009F) is an UNKNOWN control once the ECMA-48 escape
+# families have been consumed — its presence rejects the capture (the spine's
+# fail-closed rule; the caller-side one-plain-recapture is a later wave).
+_ALLOWED_CONTROL_CHARS: Final = frozenset("\n\t\r")
+
+
+def _strip_ecma48_families(raw: str) -> str | None:
+    """Consume EVERY ECMA-48 escape family, returning plain text or ``None``.
+
+    Handles, at the SINGLE seam:
+      * CSI (``ESC [ … final``) — all final bytes (SGR + cursor moves etc.);
+      * the payload-bearing STRING controls OSC / DCS / SOS / PM / APC
+        (``ESC ]`` / ``ESC P`` / ``ESC X`` / ``ESC ^`` / ``ESC _``) — consumed
+        WHOLE through their BEL (``\\x07``) or ST (``ESC \\``) terminator, so an
+        OSC-8 hyperlink's URI never survives as junk (F9);
+      * the ESC-single family (``ESC <0x40-0x5F>`` and other 2-byte forms).
+
+    Returns ``None`` (REJECT the pair) when, after stripping, any UNKNOWN control
+    byte remains — everything in C0 except LF/TAB/CR, plus DEL and C1 — or a lone
+    ESC that forms no recognized sequence. The rejection SIGNAL must exist even
+    though the one-plain-recapture recovery is caller-side (a later wave).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\x1b":
+            if i + 1 >= n:
+                return None  # dangling ESC — unknown
+            nxt = raw[i + 1]
+            if nxt == "[":
+                m = _RE_CSI.match(raw, i)
+                if m is not None:
+                    i = m.end()
+                    continue
+                return None  # malformed CSI
+            if nxt in "]PX^_":
+                # String control: consume through BEL or ST.
+                j = i + 2
+                terminated = False
+                while j < n:
+                    if raw[j] == "\x07":  # BEL
+                        j += 1
+                        terminated = True
+                        break
+                    if raw[j] == "\x1b" and j + 1 < n and raw[j + 1] == "\\":  # ST
+                        j += 2
+                        terminated = True
+                        break
+                    j += 1
+                if not terminated:
+                    return None  # unterminated string control
+                i = j
+                continue
+            # ESC-single family (Fe/Fp/Fs etc.): consume the 2-byte form.
+            i += 2
+            continue
+        if c in _ALLOWED_CONTROL_CHARS:
+            out.append(c)
+            i += 1
+            continue
+        code = ord(c)
+        if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
+            return None  # unknown control byte — reject the pair
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def normalize_capture(raw_ansi: str) -> PaneCapture | None:
+    """Normalize an ANSI pane capture into a ``PaneCapture(plain, ansi)`` pair.
+
+    Strips ALL ECMA-48 escape families (see :func:`_strip_ecma48_families`) to
+    derive ``plain`` while retaining the raw ``ansi`` for tier-2 SGR reads.
+    Returns ``None`` when the frame carries an UNKNOWN control sequence — the
+    fail-closed rejection the spine mandates (recovery is caller-side).
+
+    ``plain`` is NOT rstrip-ped: the ONE disclosed normalization (tmux ``-e``
+    trailing-pad) is applied at the acceptance comparison (line-for-line rstrip),
+    not here, so column positions stay intact for the boundary scan.
+    """
+    plain = _strip_ecma48_families(raw_ansi)
+    if plain is None:
+        return None
+    return PaneCapture(plain=plain, ansi=raw_ansi)
+
+
+# GH #54 W1.1 — terminal display-cell width (wcswidth semantics).
+_ZERO_WIDTH_JOINER: Final = "‍"
+_VARIATION_SELECTOR_16: Final = "️"
+
+
+def _char_cell_width(ch: str) -> int:
+    """Display cells for ONE codepoint (0 combining, 2 wide, else 1)."""
+    if unicodedata.combining(ch):
+        return 0
+    code = ord(ch)
+    if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
+        return 0  # controls are zero-width for column accounting
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def display_width(text: str) -> int:
+    """Terminal display width of ``text`` in cells (GH #54 W1.1).
+
+    wcswidth semantics rather than a per-codepoint East-Asian-Width sum:
+
+      * a ZWJ (U+200D) emoji sequence renders as ONE two-cell grapheme — the
+        joiner and its trailing emoji collapse into the leading emoji's width;
+      * a Variation-Selector-16 (U+FE0F) forces emoji (two-cell) presentation on
+        the preceding base char;
+      * combining marks are zero-width.
+
+    Used by BOTH the plain panel-boundary scan and the ANSI label-region
+    extraction so they can never disagree on where a label ends.
+    """
+    total = 0
+    prev_base = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == _ZERO_WIDTH_JOINER:
+            # Joiner + following emoji collapse into the run already counted.
+            if i + 1 < n:
+                i += 2  # skip the joiner and the joined emoji
+            else:
+                i += 1
+            prev_base = False
+            continue
+        if ch == _VARIATION_SELECTOR_16:
+            # Force two-cell emoji presentation on the preceding base char.
+            if prev_base:
+                total += 1  # bump the base's width 1 -> 2
+            prev_base = False
+            i += 1
+            continue
+        w = _char_cell_width(ch)
+        total += w
+        prev_base = w >= 1
+        i += 1
+    return total
+
+
+def _cells_left_of_index(text: str, char_index: int) -> int:
+    """Display-cell column of the char at ``char_index`` (width of the prefix)."""
+    return display_width(text[:char_index])
 
 
 def _sgr_updates_dim(params: str, dim: bool) -> bool:
