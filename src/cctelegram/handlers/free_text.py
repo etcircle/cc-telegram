@@ -1281,6 +1281,22 @@ HINT_MULTI_SELECT: Final = "Use the option buttons, then Submit."
 HINT_NO_FREE_TEXT: Final = "Answer with the buttons or the ↑/↓/⏎ keys."
 
 
+def advertises_free_text(
+    surface: str, *, version: str | None, has_affordance: bool
+) -> bool:
+    """True iff a plain message would ACTUALLY be taken as this card's answer.
+
+    The single (flag ON) × (licensed CC version) × (live free-text affordance)
+    predicate. It is the one gate behind BOTH ``card_hint`` (the card's
+    free-text line) AND the three partial/untrusted-pane notices in
+    ``interactive_ui`` (GH #54 W5), so no card copy can ever promise a
+    text answer that PR-1's gate would refuse. A preview single-select
+    (``is_free_text=False`` ⇒ ``has_affordance=False``) therefore never
+    advertises text answers on any version.
+    """
+    return has_affordance and _ENABLED and licensed(surface, version)
+
+
 def card_hint(surface: str, *, version: str | None, has_affordance: bool) -> str:
     """The per-surface card hint (plan §2.2 [r3 P2-4]).
 
@@ -1289,8 +1305,6 @@ def card_hint(surface: str, *, version: str | None, has_affordance: bool) -> str
     plain message is REFUSED. Now the promise is made only where the lane will
     actually take it.
     """
-    if not has_affordance:
-        return HINT_NO_FREE_TEXT
-    if _ENABLED and licensed(surface, version):
+    if advertises_free_text(surface, version=version, has_affordance=has_affordance):
         return HINT_FREE_TEXT
     return HINT_NO_FREE_TEXT

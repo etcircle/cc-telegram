@@ -497,6 +497,169 @@ class TestFormatAuqContextMessage:
         assert "1. Real" in out  # numbering still 1-based
 
 
+class TestAuqContextPreview:
+    """GH #54 W3 — option ``preview`` mockups rendered in the 📋 details card."""
+
+    def _fixture_input(self) -> dict:
+        import json
+        from pathlib import Path
+
+        p = (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "auq_preview_side_file.json"
+        )
+        return json.loads(p.read_text())["tool_input"]
+
+    def test_preview_rendered_as_fenced_monospace_block(self):
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+
+        out = _format_auq_context_message(self._fixture_input())
+        # A fenced code block per option (3 options → 6 fence lines).
+        assert out.count("```") == 6
+        # The ASCII art survives verbatim (box-drawing untouched).
+        assert "┌─ DI Copilot ──────────┐" in out
+        assert "Reuses login · no new token" in out
+        # The description still precedes it.
+        assert "1. Embed web chat in side panel" in out
+
+    def test_untrusted_non_string_or_empty_preview_omitted_silently(self):
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+
+        out = _format_auq_context_message(
+            {
+                "questions": [
+                    {
+                        "question": "Q?",
+                        "options": [
+                            {"label": "A", "description": "d", "preview": 123},
+                            {"label": "B", "description": "d", "preview": "   "},
+                            {"label": "C", "description": "d", "preview": None},
+                        ],
+                    }
+                ]
+            }
+        )
+        # No fence emitted for a non-str / whitespace-only / None preview.
+        assert "```" not in out
+
+    def test_sentinel_bytes_stripped_from_preview(self):
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+        from cctelegram.transcript_parser import TranscriptParser
+
+        s = TranscriptParser.EXPANDABLE_QUOTE_START
+        e = TranscriptParser.EXPANDABLE_QUOTE_END
+        out = _format_auq_context_message(
+            {
+                "questions": [
+                    {
+                        "question": "Q?",
+                        "options": [
+                            {
+                                "label": "A",
+                                "description": "d",
+                                "preview": f"art{s}mid{e}end",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        # The raw \x02 sentinel byte must never reach the response builder
+        # (it refuses to split any text containing the start marker).
+        assert "\x02" not in out
+        assert s not in out
+        # The visible letters survive (only the control byte is removed).
+        assert "artmidend" in out or "art" in out
+
+    def test_adversarial_preview_survives_the_real_send_path(self):
+        """Embedded fence + sentinels + a >4096-char block: the ACTUAL
+        telegramify output stays fence-balanced and within Telegram's limit."""
+        import copy
+
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+        from cctelegram.handlers.response_builder import build_response_parts
+        from cctelegram.markdown_v2 import convert_markdown
+        from cctelegram.transcript_parser import TranscriptParser
+
+        s = TranscriptParser.EXPANDABLE_QUOTE_START
+        e = TranscriptParser.EXPANDABLE_QUOTE_END
+        src = copy.deepcopy(self._fixture_input())
+        src["questions"][0]["options"][0]["preview"] = (
+            "┌ART┐\n```\n[inject](http://evil) *bold*\n"
+            f"{s}quoted{e}\n" + ("X" * 5000) + "\n└END┘"
+        )
+        text = _format_auq_context_message(src)
+        assert "\x02" not in text and s not in text
+        parts = build_response_parts(text, content_type="text", role="assistant")
+        assert len(parts) > 1  # the 5k block forced a split
+        for part in parts:
+            converted = convert_markdown(part)
+            # Chunk atomicity: every rendered part is fence-balanced and fits.
+            assert converted.count("```") % 2 == 0
+            assert len(converted) <= 4096
+            assert "\x02" not in converted
+
+    def test_preview_does_not_move_the_form_fingerprint(self):
+        """W3 PIN: ``build_form_from_tool_input`` ignores ``preview`` for the
+        FORM, so the fixture side file's fingerprint is unchanged by W3 — a
+        move would orphan live pick tokens across the deploy. Hardcoded value
+        derived from the current code + fixture."""
+        import copy
+
+        from cctelegram.terminal_parser import build_form_from_tool_input
+
+        base_input = self._fixture_input()
+        form = build_form_from_tool_input(base_input)
+        assert form is not None
+        assert form.fingerprint() == "07916987df5c28ad"
+        # Injecting/removing previews must not perturb it.
+        stripped = copy.deepcopy(base_input)
+        for opt in stripped["questions"][0]["options"]:
+            opt.pop("preview", None)
+        stripped_form = build_form_from_tool_input(stripped)
+        assert stripped_form is not None
+        assert stripped_form.fingerprint() == form.fingerprint()
+
+    def test_multiselect_previews_render_in_the_card(self):
+        """W3: the TUI never renders multi-select previews — the 📋 card is the
+        ONLY place the user sees them, so multiSelect must still render fences."""
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+
+        out = _format_auq_context_message(
+            {
+                "questions": [
+                    {
+                        "question": "Pick any",
+                        "multiSelect": True,
+                        "options": [
+                            {"label": "A", "description": "d", "preview": "ART-A"},
+                            {"label": "B", "description": "d", "preview": "ART-B"},
+                        ],
+                    }
+                ]
+            }
+        )
+        assert out.count("```") == 4
+        assert "ART-A" in out and "ART-B" in out
+
+    def test_form_source_path_renders_no_preview(self):
+        """W3 item 7: the pane-form ctx path is untouched (pane parses never
+        carry previews)."""
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+        from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
+
+        form = AskUserQuestionForm(
+            current_question_title="Q?",
+            options=(
+                AskOption(label="A", recommended=False, cursor=True, number=1),
+                AskOption(label="B", recommended=False, cursor=False, number=2),
+            ),
+        )
+        out = _format_auq_context_message(form)
+        assert "```" not in out
+
+
 class TestAuqContextFromForm:
     """v5 fix (2026-05-24): pane-derived ``AskUserQuestionForm`` is an
     accepted source for the context-message gate, so live AUQs (no

@@ -281,3 +281,101 @@ class TestTheInputBoxIsNeverPresentOnThese:
     def test_no_input_box(self, name: str):
         pane = tp.clean_ghost_input_text(_fx(name))
         assert tp.pane_input_box_present(pane) is False
+
+
+class TestAdvertisesFreeTextPredicate:
+    """GH #54 W5 — the shared (flag × license × affordance) card-copy gate.
+
+    It is the ONE predicate behind ``card_hint`` AND the three
+    partial/untrusted-pane notices in ``interactive_ui``, so no card copy can
+    promise a text answer PR-1's gate would refuse.
+    """
+
+    def _reset(self):
+        from cctelegram.handlers import free_text as ft
+
+        ft.set_enabled(True)
+
+    def test_licensed_with_affordance_and_flag_on_advertises(self):
+        from cctelegram.handlers import free_text as ft
+
+        self._reset()
+        assert (
+            ft.advertises_free_text(
+                ft.SURFACE_AUQ, version="2.1.207", has_affordance=True
+            )
+            is True
+        )
+
+    def test_no_affordance_never_advertises(self):
+        from cctelegram.handlers import free_text as ft
+
+        self._reset()
+        # A preview single-select is is_free_text=False ⇒ has_affordance=False.
+        assert (
+            ft.advertises_free_text(
+                ft.SURFACE_AUQ, version="2.1.207", has_affordance=False
+            )
+            is False
+        )
+
+    def test_unlicensed_version_never_advertises(self):
+        from cctelegram.handlers import free_text as ft
+
+        self._reset()
+        assert (
+            ft.advertises_free_text(
+                ft.SURFACE_AUQ, version="2.1.999", has_affordance=True
+            )
+            is False
+        )
+        assert (
+            ft.advertises_free_text(ft.SURFACE_AUQ, version=None, has_affordance=True)
+            is False
+        )
+
+    def test_flag_off_never_advertises(self):
+        from cctelegram.handlers import free_text as ft
+
+        try:
+            ft.set_enabled(False)
+            assert (
+                ft.advertises_free_text(
+                    ft.SURFACE_AUQ, version="2.1.207", has_affordance=True
+                )
+                is False
+            )
+        finally:
+            ft.set_enabled(True)
+
+
+class TestCardHintRoutesThroughThePredicate:
+    """``card_hint`` is exactly ``advertises_free_text`` → FREE_TEXT / NO_FREE_TEXT."""
+
+    def test_licensed_with_affordance_promises_text(self):
+        from cctelegram.handlers import free_text as ft
+
+        ft.set_enabled(True)
+        assert (
+            ft.card_hint(ft.SURFACE_AUQ, version="2.1.207", has_affordance=True)
+            == ft.HINT_FREE_TEXT
+        )
+
+    def test_preview_single_select_points_at_the_buttons(self):
+        from cctelegram.handlers import free_text as ft
+
+        ft.set_enabled(True)
+        # has_affordance=False models is_free_text=False (a preview card).
+        assert (
+            ft.card_hint(ft.SURFACE_AUQ, version="2.1.207", has_affordance=False)
+            == ft.HINT_NO_FREE_TEXT
+        )
+
+    def test_unlicensed_points_at_the_buttons(self):
+        from cctelegram.handlers import free_text as ft
+
+        ft.set_enabled(True)
+        assert (
+            ft.card_hint(ft.SURFACE_AUQ, version="2.1.99", has_affordance=True)
+            == ft.HINT_NO_FREE_TEXT
+        )

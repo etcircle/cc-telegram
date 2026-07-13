@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -1507,6 +1508,15 @@ async def _notify_waiting_dm(
 # to split — interactive cards are one Telegram message per AUQ.
 _CARD_BODY_CHAR_CAP = 3800
 
+# GH #54 W5 — the tail of the three partial/untrusted-pane notices. The
+# text-answer suffix is used ONLY where a plain message would actually be taken
+# (``free_text.advertises_free_text``: flag ON + licensed CC version + a live
+# free-text affordance); everything else — a preview single-select, an
+# unlicensed version, the flag off — points at the keystroke nav row instead,
+# so the notice can never promise what PR-1's gate would refuse.
+_NOTICE_NAV_OR_TEXT = "use ↑/↓/Tab below or send your answer as text."
+_NOTICE_NAV_ONLY = "use the ↑/↓/⏎ keys below."
+
 
 def _should_post_auq_context(source: dict | AskUserQuestionForm | None) -> bool:
     """True iff the AUQ source has at least one question with renderable text.
@@ -1564,6 +1574,46 @@ def _form_has_postable_content(form: AskUserQuestionForm) -> bool:
     return False
 
 
+def _sanitize_preview(preview: object) -> str:
+    """Make an UNTRUSTED option ``preview`` safe to embed as a fenced block.
+
+    GH #54 W3. ``preview`` is a Claude-authored (hence untrusted) multi-line
+    ASCII-art mockup that goes into the 📋 details card as a MONOSPACE fenced
+    code block (expandable quotes are proportional and would destroy the
+    art's column alignment). Two neutralizations, both at the SOURCE level so
+    the single ``topic_send`` telegramify conversion (message_sender.py) sees
+    already-safe text:
+
+      * **The expandable-quote sentinel bytes** (``\\x02`` — the delimiter
+        of ``TranscriptParser.EXPANDABLE_QUOTE_START``/``_END``) are stripped.
+        They are legal string values a mockup could carry, and
+        ``build_response_parts`` REFUSES to split any text containing the
+        start marker (response_builder.py) — an oversized unsplittable part
+        would drop the ENTIRE details card, and a matched pair would be
+        re-read as an expandable quote and truncated. They are C0 control
+        chars; no legitimate mockup needs them.
+      * **Fence-closer defanging** — any run of 3+ backticks would close our
+        code fence early and let the rest inject markdown (links, emphasis).
+        A zero-width space (U+200B) is woven between the backticks: visually
+        identical inside the monospace block, but no longer a fence delimiter
+        (``split_message`` / telegramify both need ``​``-free ``​``
+        3-backtick runs at a line start).
+
+    Returns the sanitized text, or ``""`` when the value is not a non-empty
+    string after stripping (the untrusted-value contract: render only
+    ``isinstance(preview, str)`` and non-empty; else omit silently).
+    """
+    if not isinstance(preview, str):
+        return ""
+    # Strip the raw expandable-quote sentinel byte (both START and END carry
+    # it as their delimiter, so removing it disarms a matched pair too).
+    cleaned = preview.replace("\x02", "")
+    # Weave a zero-width space through every 3+-backtick run so it can never
+    # close the fence we wrap this preview in.
+    cleaned = re.sub(r"`{3,}", lambda m: "​".join(m.group(0)), cleaned)
+    return cleaned if cleaned.strip() else ""
+
+
 def _format_auq_context_message(source: dict | AskUserQuestionForm) -> str:
     """Render an AUQ source as a readable context dump.
 
@@ -1576,6 +1626,9 @@ def _format_auq_context_message(source: dict | AskUserQuestionForm) -> str:
 
         1. <label>
            <full description, paragraph as-is>
+           ```
+           <option preview mockup, monospace>  ← GH #54 W3, when present
+           ```
 
         2. <label>
            <full description>
@@ -1583,15 +1636,21 @@ def _format_auq_context_message(source: dict | AskUserQuestionForm) -> str:
         Q2. <question>  ← only when len(questions) > 1
         …
 
-    Plain text only — no markdown to convert later. The send layer's
-    ``build_response_parts`` chunks on the 3000-char boundary and adds
-    ``[i/N]`` markers when the message exceeds the limit.
+    Markdown source (NOT pre-escaped): the send layer's ``topic_send``
+    converts to MarkdownV2 exactly ONCE via telegramify. Option ``preview``
+    mockups (GH #54 W3) are emitted as fenced ``` code blocks so their ASCII
+    art renders monospace + left-aligned; ``build_response_parts`` /
+    ``split_message`` keep every chunk fence-balanced (close-at-end /
+    reopen-at-start), and the automatic plain fallback shows the raw fenced
+    text (fences visible, art intact) — the accepted degraded shape. See
+    ``_sanitize_preview`` for the untrusted-value + fence-defang contract.
 
     Accepts EITHER a JSONL ``tool_use.input`` dict (rich source: full
-    multi-question matrix with per-option descriptions) OR an
+    multi-question matrix with per-option descriptions AND previews) OR an
     ``AskUserQuestionForm`` (pane fallback for live AUQs — title and
     visible option labels; descriptions usually empty because Claude
-    Code only writes them to JSONL after the user answers).
+    Code only writes them to JSONL after the user answers, and pane parses
+    never carry previews, so the form path renders none).
     """
     if isinstance(source, AskUserQuestionForm):
         return _format_auq_context_message_from_form(source)
@@ -1622,12 +1681,22 @@ def _format_auq_context_message(source: dict | AskUserQuestionForm) -> str:
             if not label:
                 continue
             description = (o.get("description") or "").strip()
-            labeled.append((label, description))
-        for opt_idx, (label, description) in enumerate(labeled, start=1):
+            # GH #54 W3: previews are untrusted — sanitized + fence-defanged;
+            # an absent/non-str/empty value renders nothing.
+            preview = _sanitize_preview(o.get("preview"))
+            labeled.append((label, description, preview))
+        for opt_idx, (label, description, preview) in enumerate(labeled, start=1):
             parts.append(f"{opt_idx}. {label}")
             if description:
                 for line in description.splitlines() or [description]:
                     parts.append(f"   {line}")
+            if preview:
+                # Fenced monospace block: ASCII art keeps its column
+                # alignment. The fence lines start at column 0 so telegramify
+                # (and split_message's fence balancer) recognise them.
+                parts.append("```")
+                parts.extend(preview.splitlines())
+                parts.append("```")
             parts.append("")
     return "\n".join(parts).rstrip()
 
@@ -2032,7 +2101,12 @@ async def maybe_upgrade_auq_context_message(
                     window_id=window_id,
                     message_id=msg_id,
                     text=chunk,
-                    plain=True,
+                    # GH #54 W3: the SAME formatted (non-plain) path as the
+                    # initial ``_send_auq_context_message`` post + the append
+                    # phase below — telegramify converts the ``` preview
+                    # fences ONCE. ``plain=True`` here would print the fences
+                    # literally on the upgraded chunk.
+                    plain=False,
                 )
             except RetryAfter:
                 raise
@@ -3629,6 +3703,20 @@ async def handle_interactive_ui(
         # pick buttons, and tell the user to use manual navigation/text.
         p14_suppress_picks = False
         partial_options_notice: str | None = None
+        # GH #54 W5: the notice suffix tracks the LIVE surface's real
+        # affordance × version license — the SAME predicate ``card_hint``
+        # uses — so a preview single-select (``is_free_text=False``) or an
+        # unlicensed version never advertises a text answer PR-1 would refuse.
+        _advertises_free_text = form is not None and free_text.advertises_free_text(
+            free_text.SURFACE_AUQ,
+            version=w.pane_current_command,
+            has_affordance=(
+                form.is_free_text
+                and form.select_mode == "single"
+                and not form.is_review_screen
+            ),
+        )
+        _nav_suffix = _NOTICE_NAV_OR_TEXT if _advertises_free_text else _NOTICE_NAV_ONLY
         if form is not None and form.options:
             first_num = form.options[0].number or 0
             last_num = form.options[-1].number or first_num
@@ -3636,8 +3724,7 @@ async def handle_interactive_ui(
             if partial_pane:
                 p14_suppress_picks = True
                 partial_options_notice = (
-                    f"Only options {first_num}-{last_num} are visible; "
-                    "use ↑/↓/Tab below or send your answer as text."
+                    f"Only options {first_num}-{last_num} are visible; {_nav_suffix}"
                 )
                 logger.info(
                     "AskUserQuestion partial pane for window %s — visible "
@@ -3729,8 +3816,7 @@ async def handle_interactive_ui(
                             )
                         display_form = candidate
                         partial_options_notice = (
-                            "Tap-to-select is off on a scrolled screen — "
-                            "use ↑/↓/Tab below or send your answer."
+                            f"Tap-to-select is off on a scrolled screen — {_nav_suffix}"
                         )
             # §2.5: the card's free-text line must state the CURRENT truth for
             # THIS surface. Only a single-select, licensed, flag-ON AUQ can
@@ -3769,8 +3855,7 @@ async def handle_interactive_ui(
                     # notice; add the busy-screen notice only when it didn't.
                     text = (
                         f"{text}\n\n⚠️ The live screen is busy, so the option "
-                        "buttons are disabled — use ↑/↓/Tab below or send your "
-                        "answer as text."
+                        f"buttons are disabled — {_nav_suffix}"
                     )
             elif not p14_suppress_picks:
                 built = _build_pick_button_rows(

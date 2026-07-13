@@ -1500,6 +1500,161 @@ escape if a future variant defeats the auto-dispatch. **Scoped to single-select
 bare digit — rig-CLEARED as safe on 2.1.207 (multi-select digits TOGGLE).**
 Validated against Claude Code v2.1.168 and re-characterized on 2.1.207 (GH #50).
 
+## AskUserQuestion option previews (GH #54)
+
+Claude Code ≥2.1.197 AskUserQuestion options can carry a `preview` — a multi-line
+ASCII-art mockup. The TUI renders it as a **side-by-side layout**: the numbered
+options in a LEFT column (labels WRAP inside it) and the **focused** option's
+`preview` in a box-drawing panel on the RIGHT, with a `Notes: press n to add
+notes` line and a `Chat about this` affordance below a rule. **The panel content
+SWITCHES to whichever option holds the cursor on EVERY cursor move** (cursor-
+dependent churn — it must never enter the parsed form, `_pane_fingerprint`, or the
+render identity). **Multi-SELECT renders the standard tabbed layout with NO panel —
+previews are simply unrendered by the TUI**, so the 📋 details card (W3) is the
+ONLY place the user ever sees a multi-select preview. A preview single-select has
+NO `Type something.` affordance (`is_free_text` stays False), so the GH #50 PR-2
+free-text landing proof can never match a preview card on any version.
+
+**The capture spine (W1) — ONE capture, ONE normalization, ANSI at every AUQ
+seam.** `tmux_manager.capture_pane_pair(...)` captures WITH ANSI and derives the
+plain twin through `terminal_parser.normalize_capture(raw_ansi) -> PaneCapture(plain,
+ansi) | None`. `normalize_capture` strips every ECMA-48 string family — CSI (all
+final bytes), and OSC / DCS / SOS / PM / APC consumed WHOLE through BEL/ST (the
+existing `_strip_ansi` left OSC-8 payloads as junk), the ESC-single family, and
+tmux `-e` trailing-pad — and REJECTS the pair (returns None) on an UNKNOWN control
+sequence. Rejection permits **exactly ONE plain re-capture for that observation**
+(the sole exception to one-capture-per-observation, WARNING-logged with the
+offending introducer byte; a failed re-capture is an ordinary capture failure).
+Acceptance is REGION EQUALITY (`normalize_capture(ansi).plain` == the plain twin,
+rstrip-per-line) over every plain/ANSI fixture pair, glob-enumerated. Four seams
+capture the pair: (1) `interactive_ui.handle_interactive_ui` — BOTH phases (the
+visible-only liveness probe AND the 500-line scrollback structured parse, each its
+OWN pair — the two-phase boundary is preserved, neither replaces the other); (2)
+`status_polling` visible capture (the render-hash path, so an SGR-only cursor move
+changes the hash and repaints); (3) `pick_token.validate_and_consume` +
+`recover_and_consume` (the nav delta cursor); (4) the `_dispatch_pick` transaction
+captures. `resolve_ask_form` / `parse_ask_user_question` grow a keyword-only
+`ansi_text` — plain-only callers stay byte-identical.
+
+**Parsing the side-by-side layout (W1).** A footer-anchored region-discovery
+prepass runs BEFORE boundary detection (the ordinary option walk stops at the first
+unrecognized line and returns 0 options on every preview pane). It is POSITIVE
+chrome detection (the preview footer variant `n to add notes` / the multi-question
+`Tab to switch questions`), anchored to the bottom-most OVERALL picker footer (the
+repo's bottom-most-is-live rule — a historical preview picker in scrollback above a
+live ordinary picker never hijacks the parse); a successful preview parse REPLACES
+the ordinary walk's garbage result, a failed one leaves it. The **panel boundary**
+is the minimum DISPLAY-CELL column where box-drawing panel chars start across the
+block's LABEL-column-bearing rows (chrome rows — the column-0 bare rule, `Notes:`,
+`Chat about this`, blanks — never vote); cell width uses terminal-compatible
+`wcswidth` semantics (ZWJ/VS16 = one two-cell grapheme, combining marks zero-width)
+shared by the plain scan AND the ANSI label-region extraction. Every option-block
+row is truncated at the boundary before label extraction, so **panel text never
+reaches the parsed form / fingerprint / render signature** (the hard exclusion
+invariant, pinned by an IDENTICAL fingerprint across the `cursor1`/`cursor2`
+fixtures). A preview-layout form is COMPLETE when its real options are contiguous
+1..N (N ≥ 2) AND the preview chrome is positively observed — the ordinary
+"numbered affordance row" completeness proof has no counterpart here (`Chat about
+this` is unnumbered), so an aged consistent side file resolves `bail_aged` (trusted
+pane render, buttons minted) instead of a buttonless partial forever. **Trusted
+minting is DECLINED for EVERY pane-only MULTI-question preview form lacking the
+authoritative `questions` matrix** (tabs-present + matrix-absent at
+`_build_pick_button_rows`): `_classify_advance` proves a Q1→Q2 transition via
+`committed.questions[ci+1]`, so such a form could navigate + Enter but never confirm.
+
+**Wrapped-label joining + the shared authority-aware matcher (W1.2).** A
+continuation row (non-numbered, non-chrome, indented into the label column, between
+numbered rows or after the last before chrome) is joined onto the preceding
+option's label. The parser stores the space-joined label PLUS a `wrap_canonical`
+(the fragments joined with NO space). `terminal_parser.label_matches_authority(pane_label,
+wrap_canonical, authority_label)` accepts a preview-layout label when EITHER the
+space-joined form OR the wrap-canonical (both sides space-stripped) matches the
+authority — so a word-boundary wrap (`…side` / `panel`) and a hard mid-word split
+(`Supercalifragi` / `listic…`) both match the side-file authority without guessing
+where the space belongs. `wrap_canonical` is empty for every ordinary option
+(leg B never fires there) and is `compare=False` on `AskOption` (a cursor move never
+stales a token). The matcher is used across the FULL authoritative-comparison call
+graph — `_record_consistent_with_pane`, `_loose_label_match`, `_strong_match`,
+`_infer_current_tab_idx`, and the partial-context recovery. Disclosed residual: two
+SIBLING options differing only by internal spacing are indistinguishable under
+wrap-canonical (positional, so cross-matching is impossible — accepted).
+
+**Two-tier cursor authority — by LAYOUT STATE, not version (W1.3); NO synthesis.**
+The `❯` chevron is WRAP-state-dependent: a picker whose selected (or any) label
+WRAPS renders ZERO chevrons on BOTH 2.1.197 and 2.1.207 — selection is marked ONLY
+by SGR bold + fg-153 on the label. Tier 1 (STRUCTURAL) is the `❯` glyph on an
+option row when nothing wraps. Tier 2 (SGR, REQUIRED on every version) aggregates
+physical rows into LOGICAL options FIRST (a numbered row + its continuation
+fragments — a wrapped selected option styles EVERY fragment bold+153, so a
+physical-row count would always refuse) and marks `cursor=True` on the ONE logical
+option whose fragments are CONSISTENTLY bold while every other option's are plain;
+zero / >1 / a MIXED option (mid-redraw) ⇒ NO cursor. Bold is the discriminator,
+color 153 corroboration. **`_overlay_cursor_and_selection` NEVER synthesizes a
+cursor on a preview-layout form** (the form carries `_meta["layout"]=="preview"` and
+the option-1 synthesis branch is gated off) — no proven cursor ⇒ `cursor=None`
+downstream ⇒ dispatch bails `not_advanced` (fail-closed, never a guessed delta). A
+TUI-drift audit surface beside `clean_ghost_input_text` + `pane_command_is_claude`.
+`Chat about this` is dropped as an affordance (mirrors `Type something.`); `Notes:`
+is chrome, never a continuation. Multi-select takes NO parser change (standard
+layout — pinned byte-identical before/after W1).
+
+**W2 — rescue-gate parity (defense-in-depth; ships even if W1 slips).**
+`resolve_auq_source_for_render` now rescues when `pane_form is None OR not
+pane_form.options` — the SAME "pane proves nothing" definition
+`_record_consistent_with_pane` uses (`no_pane_form` — mint/validate parity). A
+0-option pane form + a live side file ⇒ `rescue` (clean side-file display, 📋 card
+posts, honest no-buttons notice) instead of the `bail_partial` raw dump. The W2
+damaged-evidence narrowing: an ellipsis-truncated pane fragment (`_ellipsis_fragment`
+splits at CC's `…`/`...` glyph and floors sub-3-char damaged shreds) can never
+CONTRADICT the side file into a false non-rescue — a truncation marker's suffix is
+unreliable, so a damaged fragment is indeterminate (⇒ rescue), never a mismatch. The
+strict `resolve_auq_source` is untouched.
+
+**W3 — previews in the 📋 full-details card.** `interactive_ui._format_auq_context_message`
+(the DICT path — side_file / explicit-JSONL sources carry previews; the pane-form
+path `_format_auq_context_message_from_form` is untouched, pane parses never carry
+previews) appends each option's `preview` AFTER its description lines as a **fenced
+MONOSPACE code block** (expandable quotes are proportional and would destroy ASCII-art
+column alignment). It applies to single- AND multi-select (the only place a
+multi-select preview is ever seen). **The Markdown LAYER is explicit:** the ctx
+chunks are RAW Markdown that `topic_send` converts to MarkdownV2 exactly ONCE
+(`message_sender._ensure_formatted` → telegramify), so the formatter emits raw ```
+fences and NEVER pre-escapes MarkdownV2 (double-conversion would corrupt the block).
+`maybe_upgrade_auq_context_message`'s edit path (previously `plain=True`, which would
+print fences literally) now sends `plain=False` — the SAME formatted path as the
+initial post and the append phase. The automatic plain FALLBACK (one text
+representation by design) shows the raw fenced text — fences visible, ASCII art
+intact + left-aligned — the accepted degraded shape. **Untrusted-value contract
+(`_sanitize_preview`):** render only `isinstance(preview, str)` non-empty after strip
+(else omit silently); strip the raw `\x02` expandable-quote sentinel bytes (a legal
+string value a mockup could carry — `build_response_parts` REFUSES to split any text
+containing the start marker, so an oversized unsplittable part would drop the ENTIRE
+card, and a matched pair would be re-read as an expandable quote + truncated); and
+defang any 3+-backtick run by weaving a zero-width space (U+200B) between the
+backticks (visually identical inside the monospace block, no longer a fence
+delimiter). **Chunk atomicity WITHOUT truncation** is the EXISTING splitter's job:
+`build_response_parts` → `telegram_sender.split_message` already keeps FENCE BALANCE
+(a block that cannot fit closes the chunk with `\n```` and reopens the next with a
+fresh fence, content complete) — the recap lane's independently-complete-chunks
+discipline — so an adversarial preview (embedded ``` + sentinel markers + a >4096-char
+block) stays fence-balanced and ≤4096 through the ACTUAL telegramify output. The
+SELECTION card stays SHORT (labels-only buttons); `build_form_from_tool_input` keeps
+ignoring `preview` for the FORM, so the side file's form fingerprint is UNCHANGED by
+W3 (a move would orphan live pick tokens across the deploy — pinned to a hardcoded
+value). No route_runtime change, no new state file, no observer.
+
+**W5 — copy honesty (three notices).** The untrusted-render notice plus the two
+partial-pane notices in `interactive_ui` all used to promise "send your answer (as
+text)" on EVERY partial/untrusted pane — including preview single-selects and
+unlicensed versions where PR-1's gate REFUSES a plain message. All three now compose
+their suffix from ONE per-render `_nav_suffix`, decided by
+`free_text.advertises_free_text(surface, version, has_affordance)` — the SAME (flag ON
+× licensed CC version × the live free-text affordance) predicate `card_hint` uses:
+licensed + affordance ⇒ "use ↑/↓/Tab below or send your answer as text."; else ⇒
+"use the ↑/↓/⏎ keys below." A preview single-select (`is_free_text=False` ⇒
+`has_affordance=False`) therefore never advertises text answers on any version.
+Pull-only; no observer (c313657 stays forbidden).
+
 ## Inbound delivery gate — text on a live interactive surface (GH #50 PR-1)
 
 `SessionManager.deliver_to_window` (and its legacy `(ok, message)` wrapper
