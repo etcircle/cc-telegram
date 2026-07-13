@@ -4137,15 +4137,18 @@ def normalize_capture(raw_ansi: str) -> PaneCapture | None:
     fail-closed rejection the spine mandates (recovery is caller-side).
 
     The tmux ``-e`` trailing-pad normalization lives HERE (Codex P2-3 — the
-    spine owns it, never a test-side rstrip): each derived plain line is
-    rstrip-ped, so ``plain`` compares EXACTLY equal to a plain tmux capture of
-    the same frame. Only TRAILING whitespace is touched — leading columns stay
-    intact for the panel-boundary scan.
+    spine owns it, never a test-side rstrip), and it strips ASCII SPACE ONLY
+    (round-3 F2: tmux pads trailing cells with plain spaces; an unrestricted
+    ``rstrip()`` would eat NBSP / ideographic spaces / tabs / CR — real pane
+    CONTENT, and NBSP folding is deliberately scoped to
+    ``_normalize_input_row`` at the input-box seam, never global). ``plain``
+    compares EXACTLY equal to a plain tmux capture of the same frame; leading
+    columns stay intact for the panel-boundary scan.
     """
     plain = _strip_ecma48_families(raw_ansi)
     if plain is None:
         return None
-    plain = "\n".join(line.rstrip() for line in plain.split("\n"))
+    plain = "\n".join(line.rstrip(" ") for line in plain.split("\n"))
     return PaneCapture(plain=plain, ansi=raw_ansi)
 
 
@@ -4159,16 +4162,13 @@ def normalize_capture(raw_ansi: str) -> PaneCapture | None:
 _ZERO_WIDTH_JOINER: Final = "‍"
 _VARIATION_SELECTOR_15: Final = "︎"  # text presentation
 _VARIATION_SELECTOR_16: Final = "️"  # emoji (two-cell) presentation
-# Emoji skin-tone modifiers (U+1F3FB..U+1F3FF) — zero-width extenders of the
-# preceding emoji base, NOT independent two-cell glyphs (their EAW is W, so a
-# per-codepoint sum over-counts: 👍🏽 is terminal-width 2, not 4).
-_EMOJI_MODIFIER_RANGE: Final = (0x1F3FB, 0x1F3FF)
 
 
 def _codepoint_width(ch: str) -> int:
     """Display cells for ONE standalone codepoint (0 combining/control/format,
-    2 wide, else 1). Cluster EXTENDERS (VS15/VS16, skin tones, ZWJ joins) are
-    handled by :func:`_iter_grapheme_clusters`, never here."""
+    2 wide, else 1). Cluster EXTENDERS (marks, VS15/VS16, skin tones, TAG
+    chars, ZWJ joins) are handled by :func:`_iter_grapheme_clusters`, never
+    here."""
     if unicodedata.combining(ch):
         return 0
     code = ord(ch)
@@ -4181,8 +4181,35 @@ def _codepoint_width(ch: str) -> int:
     return 1
 
 
-def _is_emoji_modifier(ch: str) -> bool:
-    return _EMOJI_MODIFIER_RANGE[0] <= ord(ch) <= _EMOJI_MODIFIER_RANGE[1]
+def _is_grapheme_extender(ch: str) -> bool:
+    """True iff ``ch`` EXTENDS the current grapheme cluster at zero cells.
+
+    The terminal-sufficient UAX #29 extend set, stdlib-only (Codex review
+    round-3 F1 — ``unicodedata.combining() > 0`` alone is NOT a complete
+    grapheme-extend predicate: an ENCLOSING mark like U+20E3 COMBINING
+    ENCLOSING KEYCAP has combining class 0, and emoji TAG characters are
+    format chars that were splitting a tag-sequence flag into phantom
+    zero-width clusters — which defeated the straddle/exact accounting at a
+    panel boundary and silently DROPPED the tag chars from a trusted label):
+
+      * marks — ``category in {"Mn", "Mc", "Me"}`` (nonspacing + spacing +
+        enclosing, not just ``combining() > 0``);
+      * variation selectors U+FE00-FE0F (VS15/VS16 additionally adjust the
+        cluster's width — handled by the iterator before this predicate);
+      * emoji skin-tone modifiers U+1F3FB-1F3FF;
+      * TAG characters U+E0000-E007F (tag letters + CANCEL TAG — the England
+        flag 🏴󠁧󠁢󠁥󠁮󠁧󠁿 tag sequence stays ONE two-cell grapheme).
+
+    ZWJ (U+200D) keeps its separate join-both-sides handling in the iterator.
+    """
+    code = ord(ch)
+    if 0xFE00 <= code <= 0xFE0F:
+        return True  # variation selectors
+    if 0x1F3FB <= code <= 0x1F3FF:
+        return True  # emoji skin-tone modifiers
+    if 0xE0000 <= code <= 0xE007F:
+        return True  # TAG characters (incl. CANCEL TAG)
+    return unicodedata.category(ch) in ("Mn", "Mc", "Me")
 
 
 def _iter_grapheme_clusters(text: str):
@@ -4190,10 +4217,12 @@ def _iter_grapheme_clusters(text: str):
 
     Terminal-oriented cluster rules (wcswidth semantics — GH #54 W1.1):
 
-      * a base char absorbs following COMBINING marks (zero-width);
+      * a base char absorbs every following EXTENDER at zero added width —
+        the :func:`_is_grapheme_extender` set (Mn/Mc/Me marks, variation
+        selectors, skin-tone modifiers, TAG characters), so a tag-sequence
+        flag or a keycap sequence is ONE cluster at the BASE's width;
       * VS16 (U+FE0F) forces the cluster to TWO cells (emoji presentation);
         VS15 (U+FE0E) forces ONE (text presentation); both are zero-width;
-      * a skin-tone MODIFIER (U+1F3FB-FF) extends the cluster at zero width;
       * a ZWJ (U+200D) joins the NEXT base (and its extenders) into the SAME
         cluster at zero added width — a family emoji is ONE two-cell grapheme.
 
@@ -4210,9 +4239,6 @@ def _iter_grapheme_clusters(text: str):
         i += 1
         while i < n:
             c = text[i]
-            if unicodedata.combining(c):
-                i += 1
-                continue
             if c == _VARIATION_SELECTOR_16:
                 if width >= 1:
                     width = 2
@@ -4223,7 +4249,7 @@ def _iter_grapheme_clusters(text: str):
                     width = 1
                 i += 1
                 continue
-            if _is_emoji_modifier(c) and width >= 1:
+            if _is_grapheme_extender(c):
                 i += 1
                 continue
             if c == _ZERO_WIDTH_JOINER:

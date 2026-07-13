@@ -120,11 +120,23 @@ class TestNormalizeCapture:
         assert normalize_capture("a\x1b\x00b") is None
 
     def test_trailing_pad_normalized_inside_the_spine(self):
-        """Per-line trailing whitespace is normalized INSIDE normalize_capture
-        (Codex P2-3); mid-line whitespace and line structure are untouched."""
+        """Per-line trailing ASCII SPACES are normalized INSIDE normalize_capture
+        (Codex P2-3); everything else — mid-line whitespace, line structure, a
+        trailing tab/CR (real content, not tmux padding) — survives (round-3
+        F2: the spine rstrip is ASCII-space-scoped)."""
         cap = normalize_capture("a\tb   \nc\r")
         assert cap is not None
-        assert cap.plain == "a\tb\nc"
+        assert cap.plain == "a\tb\nc\r"
+
+    def test_trailing_nbsp_is_content_and_survives(self):
+        """NBSP is pane CONTENT (CC's input row uses U+00A0) — the spine's
+        trailing-pad rstrip strips ASCII spaces ONLY and must never eat it
+        (round-3 F2: NBSP folding stays scoped to ``_normalize_input_row`` at
+        the input-box seam, never global)."""
+        cap = normalize_capture("question  ")
+        assert cap is not None
+        assert cap.plain == "question "
+        assert cap.plain.endswith(" ")
 
     def test_returns_ansi_verbatim(self):
         raw = _load("auq_preview_wraplabels_cursor1_v2.1.207.ansi.txt")
@@ -168,6 +180,22 @@ class TestDisplayWidth:
         # Codex P1-1: 👍🏽 is ONE two-cell grapheme — the modifier (EAW W on its
         # own) extends the base at zero width, never a per-codepoint 2+2 sum.
         assert display_width("\U0001f44d\U0001f3fd") == 2
+
+    def test_tag_sequence_flag_is_one_two_cell_cluster(self):
+        """Round-3 F1: the England flag TAG sequence (base 🏴 + tag letters +
+        CANCEL TAG) is ONE two-cell grapheme — the TAG chars (U+E0000-E007F)
+        EXTEND the cluster, never split into phantom zero-width clusters."""
+        flag = "\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f"
+        assert display_width(flag) == 2
+        assert len(list(tp._iter_grapheme_clusters(flag))) == 1
+
+    def test_enclosing_keycap_stays_one_cluster(self):
+        """Round-3 F1: U+20E3 COMBINING ENCLOSING KEYCAP is category Me with
+        combining class 0 — ``combining() > 0`` alone missed it; the Mn/Mc/Me
+        extend set keeps '1' + keycap ONE cluster at the base's width."""
+        keycap = "1⃣"
+        assert display_width(keycap) == 1
+        assert len(list(tp._iter_grapheme_clusters(keycap))) == 1
 
     def test_box_drawing_is_one_cell(self):
         assert display_width("┌──┐") == 4
@@ -319,8 +347,57 @@ class TestPreviewParse:
         assert form._meta.get("layout") == "preview"
         assert form.options_complete is True
         assert form.options[0].label == f"{token} summary panel"
-        # No panel content leaked and nothing was cut.
-        assert "d sum" != form.options[0].label[-5:]
+
+    def test_boundary_ending_tag_flag_label_parses_intact(self):
+        """Round-3 F1/F3(b), the reviewer's repro — the exact=True complement:
+        a label whose LAST cluster is the England-flag TAG sequence ending
+        EXACTLY at the panel boundary must parse with ALL tag chars present
+        and stay a trusted preview form (pre-fix, `_cluster_prefix_within_cells`
+        stopped after the 🏴 base, reported exact=True, and the tag chars were
+        SILENTLY DROPPED)."""
+        flag = "\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f"
+        pane = _load("auq_preview_singleselect_v2.1.207.txt")
+        lines = pane.split("\n")
+        opt1_idx = next(
+            i for i, ln in enumerate(lines) if ln.lstrip().startswith("❯ 1.")
+        )
+        box_idx = lines[opt1_idx].index("┌")
+        # Rebuild option 1: "❯ 1. " (5 cells) + 27 filler + flag (2 cells)
+        # == 34 cells — the label ends EXACTLY at the panel boundary.
+        label = "S" * 27 + flag
+        new_row = "❯ 1. " + label + lines[opt1_idx][box_idx:]
+        assert display_width("❯ 1. " + label) == 34
+        lines[opt1_idx] = new_row
+        form = parse_ask_user_question("\n".join(lines))
+        assert form is not None
+        assert form._meta.get("layout") == "preview"
+        assert form.options_complete is True
+        assert form.options[0].label == label
+        assert "\U000e007f" in form.options[0].label  # CANCEL TAG survived
+        assert [o.number for o in form.options if o.cursor] == [1]
+
+    def test_wide_cluster_straddling_the_boundary_rejects_the_preview_parse(self):
+        """Round-3 F3(a) — the straddle path executes: an option row whose
+        label carries a two-cell CJK char CROSSING the panel boundary (the row
+        itself has no panel art, so the boundary vote from the other rows stays
+        consistent) makes `_truncate_at_cell` return None ⇒ the preview parse
+        FAILS CLOSED (no trusted preview form; the ordinary/rescue path owns
+        the pane)."""
+        pane = _load("auq_preview_singleselect_v2.1.207.txt")
+        lines = pane.split("\n")
+        opt2_idx = next(i for i, ln in enumerate(lines) if ln.lstrip().startswith("2."))
+        # "  2. " = 5 cells + 28 filler = 33; 世 occupies cells 33-34 and
+        # STRADDLES the boundary at 34. No box char on this row (non-voting).
+        straddle_row = "  2. " + "x" * 28 + "世 overflowing label"
+        assert display_width("  2. " + "x" * 28) == 33
+        # The mechanism under test: the straddling cluster makes truncation
+        # AMBIGUOUS (None), never a silent cut.
+        assert tp._truncate_at_cell(straddle_row, 34) is None
+        lines[opt2_idx] = straddle_row
+        form = parse_ask_user_question("\n".join(lines))
+        # Fail-closed: whatever the ordinary walk yields, no trusted preview.
+        if form is not None:
+            assert form._meta.get("layout") != "preview"
 
     def test_non_indented_row_with_panel_art_rejects_the_preview_parse(self):
         """Codex P1-2, the REPRODUCED case: a column-0 text row carrying panel
