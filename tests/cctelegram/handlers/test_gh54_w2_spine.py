@@ -588,6 +588,117 @@ class TestZeroOptionRescueNarrowing:
         finally:
             self._teardown()
 
+    # ── r3 residual P2: DAMAGED-but-consistent evidence must NOT contradict ──
+    # (contradiction requires CLEAN positive mismatch; ellipsis-truncated
+    # fragments compare prefix-tolerantly, and a below-floor shred never
+    # decides — indeterminate ⇒ rescue, the pre-narrowing fail direction).
+
+    def test_ellipsized_own_title_still_rescues(self, _cc_dir, monkeypatch):
+        # The reviewer's shape (a): a mid-redraw ellipsized/garbled variant of
+        # the side file's OWN title (record: "Where should you actually chat
+        # with the agent? This decides the whole redesign. …"). Pre-fix the
+        # full-string bidirectional-startswith failed ⇒ a GENUINE rescue fell
+        # to the display-only bail_partial (the exact loss rescue prevents).
+        tool_input = self._setup(_cc_dir)
+        try:
+            zero = dataclasses.replace(
+                tp.build_form_from_tool_input(tool_input),
+                options=(),
+                current_question_title=(
+                    "Where should you actually chat with … whole redesign..."
+                ),
+                tabs=(),
+            )
+            r = self._resolve_with_form(monkeypatch, zero)
+            assert r.decision == "rescue"
+        finally:
+            self._teardown()
+
+    def test_ellipsis_truncated_tab_matching_header_still_rescues(
+        self, _cc_dir, monkeypatch
+    ):
+        # The reviewer's shape (b): a CC-truncated tab label whose remaining
+        # prefix matches the record header "Chat surface" is CONSISTENT.
+        tool_input = self._setup(_cc_dir)
+        try:
+            zero = dataclasses.replace(
+                tp.build_form_from_tool_input(tool_input),
+                options=(),
+                current_question_title=None,
+                tabs=(
+                    tp.AskTab(
+                        label="Chat surfa…",
+                        answered=False,
+                        is_submit=False,
+                        is_current=True,
+                    ),
+                ),
+            )
+            r = self._resolve_with_form(monkeypatch, zero)
+            assert r.decision == "rescue"
+        finally:
+            self._teardown()
+
+    def test_below_floor_shred_title_still_rescues(self, _cc_dir, monkeypatch):
+        # Pin (d): a 2-char damaged shred ("Fo…") is INDETERMINATE — it never
+        # decides a contradiction (the documented
+        # _ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS floor).
+        tool_input = self._setup(_cc_dir)
+        try:
+            zero = dataclasses.replace(
+                tp.build_form_from_tool_input(tool_input),
+                options=(),
+                current_question_title="Fo…",
+                tabs=(),
+            )
+            r = self._resolve_with_form(monkeypatch, zero)
+            assert r.decision == "rescue"
+        finally:
+            self._teardown()
+
+    def test_below_floor_shred_tab_still_rescues(self, _cc_dir, monkeypatch):
+        # The tab-leg twin of pin (d): a damaged tab shred is skipped, not a
+        # contradiction — even though it matches no header.
+        tool_input = self._setup(_cc_dir)
+        try:
+            zero = dataclasses.replace(
+                tp.build_form_from_tool_input(tool_input),
+                options=(),
+                current_question_title=None,
+                tabs=(
+                    tp.AskTab(
+                        label="Zx…",
+                        answered=False,
+                        is_submit=False,
+                        is_current=True,
+                    ),
+                ),
+            )
+            r = self._resolve_with_form(monkeypatch, zero)
+            assert r.decision == "rescue"
+        finally:
+            self._teardown()
+
+    def test_long_damaged_foreign_title_still_bails(self, _cc_dir, monkeypatch):
+        # A DAMAGED fragment ABOVE the floor that matches NO record question is
+        # still a clean positive mismatch on its surviving prefix ⇒ contradicts
+        # (the narrowing must not turn every ellipsis into a rescue pass).
+        tool_input = self._setup(_cc_dir)
+        try:
+            zero = dataclasses.replace(
+                tp.build_form_from_tool_input(tool_input),
+                options=(),
+                current_question_title=(
+                    "Which database engine should the new service … use..."
+                ),
+                tabs=(),
+            )
+            r = self._resolve_with_form(monkeypatch, zero)
+            assert r.decision == "bail"
+            assert r.reason == "bail_partial_no_pane_form"
+        finally:
+            self._teardown()
+
 
 class TestWrappedMultiQuestionCandidateSelection:
     """P2-C — the multi-question candidate SELECTION accepts a wrapped preview

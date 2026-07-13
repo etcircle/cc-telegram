@@ -795,9 +795,41 @@ def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> 
     )
 
 
+# Minimal length an ELLIPSIS-DAMAGED evidence fragment must have before it may
+# CONTRADICT the side-file record in ``_zero_option_form_contradicts_record``
+# (wave-2 review r3 residual P2). A CC-truncated title/tab strips to a fragment;
+# a 2-3 char shred matching nothing proves NOTHING (indeterminate ⇒ rescue, the
+# pre-narrowing fail direction), so only a non-trivially-long fragment decides.
+# 8 chars — the module's existing ``_CTX_TITLE_MIN_CHARS`` anti-coincidence
+# precedent. The floor applies ONLY to damaged (ellipsis-stripped) fragments:
+# a CLEAN label is complete evidence and compares at any length (the round-2
+# clean-contradiction pins — foreign tabs "Alpha"/"Beta" at 5/4 chars — must
+# keep contradicting).
+_ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS: Final = 8
+
+# An ellipsis run: the single-char ``…`` (CC's truncation glyph) or ``...``.
+_RE_ELLIPSIS_RUN = re.compile(r"…|\.{3,}")
+
+
+def _ellipsis_fragment(text: str) -> tuple[str, bool]:
+    """Split evidence at its FIRST ellipsis run → ``(fragment, was_damaged)``.
+
+    A trailing ``…``/``...`` is stripped; a MID-string ellipsis keeps only the
+    pre-ellipsis fragment (the suffix after a truncation marker is not reliable
+    evidence — CC renders garbled/re-joined tails around it). ``was_damaged``
+    is True iff an ellipsis run was found, which is what scopes the
+    ``_ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS`` floor to damaged evidence only.
+    """
+    m = _RE_ELLIPSIS_RUN.search(text)
+    if m is None:
+        return text.strip(), False
+    return text[: m.start()].strip(), True
+
+
 def _zero_option_form_contradicts_record(record, pane_form) -> bool:
-    """True iff a ZERO-option pane form carries POSITIVE evidence a DIFFERENT
-    question is live than the side-file record's (wave-2 review P2-B).
+    """True iff a ZERO-option pane form carries CLEAN POSITIVE evidence a
+    DIFFERENT question is live than the side-file record's (wave-2 review P2-B,
+    narrowed for damaged evidence by the r3 residual P2).
 
     The W2 rescue gate treats a zero-option form like ``pane_form is None``
     ("the pane proves nothing"), but the parser deliberately returns zero-option
@@ -807,14 +839,26 @@ def _zero_option_form_contradicts_record(record, pane_form) -> bool:
     content over a pane whose surviving evidence PROVES a different tab /
     question is live. Contradiction = fail back to the pre-W2 ``bail_partial``.
 
+    Contradiction requires CLEAN positive mismatch; DAMAGED / indeterminate
+    evidence never contradicts (fail direction: indeterminate ⇒ rescue — the
+    pre-narrowing behavior). An ellipsized/garbled variant of the record's OWN
+    title (a mid-redraw ``For the Alpha panel, which layout should … primary
+    arrangement...``) or a ``…``-truncated tab label is DAMAGE, not
+    contradiction: each evidence item is ellipsis-normalized first
+    (:func:`_ellipsis_fragment` — strip a trailing run, keep only the
+    pre-ellipsis fragment of a mid-string run), a damaged fragment below
+    ``_ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS`` is SKIPPED (a shred never
+    decides), and the surviving fragment — being a PREFIX of the true text —
+    matches through the existing prefix-tolerant rules below.
+
     Checks (each only when the evidence exists — a bare zero-option form, the
     pure mid-redraw / pre-W1 shape, never contradicts):
 
-      * TITLE — the pane's ``current_question_title`` must bidirectionally
-        prefix-match SOME record question (the ``_record_consistent_with_pane``
-        title rule);
-      * TABS — every content tab label must match SOME record question header
-        under the shared authority-aware normalization
+      * TITLE — the (normalized) pane ``current_question_title`` fragment must
+        bidirectionally prefix-match SOME record question (the
+        ``_record_consistent_with_pane`` title rule);
+      * TABS — every (normalized) content tab label must match SOME record
+        question header under the shared authority-aware normalization
         (``label_matches_authority`` — whitespace-collapse equality plus the
         wrap-canonical all-whitespace-stripped leg, prefix-tolerant for a
         truncated tab render).
@@ -833,11 +877,16 @@ def _zero_option_form_contradicts_record(record, pane_form) -> bool:
 
     pane_title = (pane_form.current_question_title or "").strip()
     if pane_title:
-        titles = [(q.get("question") or "").strip() for q in questions]
-        if not any(
-            t and (t.startswith(pane_title) or pane_title.startswith(t)) for t in titles
-        ):
-            return True
+        fragment, damaged = _ellipsis_fragment(pane_title)
+        usable = bool(fragment) and (
+            not damaged or len(fragment) >= _ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS
+        )
+        if usable:
+            titles = [(q.get("question") or "").strip() for q in questions]
+            if not any(
+                t and (t.startswith(fragment) or fragment.startswith(t)) for t in titles
+            ):
+                return True
 
     content_tabs = [
         t.label.strip() for t in pane_form.tabs if not t.is_submit and t.label.strip()
@@ -850,10 +899,15 @@ def _zero_option_form_contradicts_record(record, pane_form) -> bool:
                 headers.append(h.strip())
         if headers:
             for tab in content_tabs:
+                fragment, damaged = _ellipsis_fragment(tab)
+                if not fragment or (
+                    damaged and len(fragment) < _ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS
+                ):
+                    continue  # damaged shred — indeterminate, never contradicts
                 if not any(
-                    label_matches_authority(tab, "", h)
-                    or h.lower().startswith(tab.lower())
-                    or tab.lower().startswith(h.lower())
+                    label_matches_authority(fragment, "", h)
+                    or h.lower().startswith(fragment.lower())
+                    or fragment.lower().startswith(h.lower())
                     for h in headers
                 ):
                     return True
