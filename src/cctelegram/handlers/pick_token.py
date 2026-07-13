@@ -669,7 +669,7 @@ async def validate_and_consume(
     telegram/tmux import; ``capture_pane(window_id, scrollback_lines)`` and
     ``find_window_by_id(window_id)`` mirror the live callsites.
     """
-    from ..terminal_parser import resolve_ask_form
+    from ..terminal_parser import normalize_capture, resolve_ask_form
 
     # Phase (a): owner-check-then-reserve under the lock.
     async with _store_lock:
@@ -685,9 +685,24 @@ async def validate_and_consume(
         if w is None:
             return PickValidation("window_gone", entry, None)
 
-        pane = await capture_pane(window_id, 500)
+        # GH #54 capture spine (seam 3): the injected ``capture_pane`` returns the
+        # ANSI frame; ``normalize_capture`` derives plain (region-equal to a plain
+        # capture, fed to the plain-only ``resolve_auq_source``) and retains the
+        # raw for tier-2 SGR cursor detection so the nav delta comes from a REAL
+        # parsed cursor on a chevron-less preview picker. A plain frame (tests /
+        # a no-escape pane) normalizes to ``ansi == plain`` ⇒ tier-2 finds nothing
+        # ⇒ byte-identical to the old plain path. A normalize REJECT (unknown
+        # control) fails closed to no-form → ``stale_form`` (the tap refreshes).
+        raw = await capture_pane(window_id, 500)
+        pair = normalize_capture(raw) if raw else None
+        pane = pair.plain if pair is not None else None
+        pane_ansi = pair.ansi if pair is not None else None
         live_source = resolve_auq_source(window_id, None, pane or "")
-        current_form = resolve_ask_form(live_source.payload, pane) if pane else None
+        current_form = (
+            resolve_ask_form(live_source.payload, pane, ansi_text=pane_ansi)
+            if pane
+            else None
+        )
 
         if current_form is None or current_form.fingerprint() != entry.fingerprint:
             return PickValidation("stale_form", entry, None)
@@ -853,7 +868,7 @@ async def recover_and_consume(
 
     Pane capture / window lookup are INJECTED (no telegram/tmux import).
     """
-    from ..terminal_parser import resolve_ask_form
+    from ..terminal_parser import normalize_capture, resolve_ask_form
 
     route_hash = auq_ledger.make_route_hash(
         intent.user_id, intent.thread_id, intent.window_id
@@ -891,9 +906,17 @@ async def recover_and_consume(
         w = await find_window_by_id(intent.window_id)
         if w is None:
             return PickRecovery("window_gone")
-        pane = await capture_pane(intent.window_id, 500)
+        # GH #54 capture spine (seam 3, D2 recovery): ANSI frame → normalize →
+        # (plain, ansi) so the recovered ``current_form`` cursor is a REAL parsed
+        # cursor (tier-2 SGR on a chevron-less preview picker), never synthetic.
+        raw = await capture_pane(intent.window_id, 500)
+        pair = normalize_capture(raw) if raw else None
+        pane = pair.plain if pair is not None else None
+        pane_ansi = pair.ansi if pair is not None else None
         payload = sf.payload if sf is not None else None
-        current_form = resolve_ask_form(payload, pane) if pane else None
+        current_form = (
+            resolve_ask_form(payload, pane, ansi_text=pane_ansi) if pane else None
+        )
         if (
             current_form is None
             or current_form.fingerprint() != intent.full_fingerprint

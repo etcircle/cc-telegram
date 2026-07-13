@@ -265,7 +265,11 @@ def pane_form_is_complete_picker(form: AskUserQuestionForm | None) -> bool:
 
 
 def resolve_auq_source_for_render(
-    window_id: str, pane_text: str, explicit: dict | None = None
+    window_id: str,
+    pane_text: str,
+    explicit: dict | None = None,
+    *,
+    ansi_text: str | None = None,
 ) -> RenderAuqSource:
     """Resolve the RENDER-path AUQ source + trust for a window (PR-3 PR-B).
 
@@ -294,7 +298,14 @@ def resolve_auq_source_for_render(
     """
     from ..terminal_parser import build_form_from_tool_input, resolve_ask_form
 
-    pane_form = resolve_ask_form(None, pane_text) if pane_text else None
+    # GH #54 capture spine: with ``ansi_text`` present, tier-2 SGR cursor
+    # detection works on chevron-less (wrapping-label / 2.1.197) preview panes,
+    # so the resolved form's cursor — and thus ``render_signature`` and the
+    # poller hash — track an SGR-only cursor move. Plain-only callers pass None
+    # and keep today's behaviour byte-identical.
+    pane_form = (
+        resolve_ask_form(None, pane_text, ansi_text=ansi_text) if pane_text else None
+    )
     record = _read_live_pretool_record(window_id, apply_ttl=False)
     if record is not None:
         consistent, reason = _record_consistent_with_pane(record, pane_form)
@@ -307,7 +318,7 @@ def resolve_auq_source_for_render(
         if consistent and within_ttl:
             # The side file carries the question TITLE the pane lacks; overlay
             # the live pane (cursor / tab / review) onto it.
-            form = resolve_ask_form(record.tool_input, pane_text)
+            form = resolve_ask_form(record.tool_input, pane_text, ansi_text=ansi_text)
             return RenderAuqSource(
                 decision="side_file_ok",
                 kind="side_file",
@@ -317,9 +328,18 @@ def resolve_auq_source_for_render(
                 dispatch_trusted=True,
                 reason="consistent",
             )
-        if pane_form is None:
+        if pane_form is None or not pane_form.options:
             # The pane carries NO parseable picker AT ALL (busy scrollback /
-            # obscured) — the side file is the ONLY content we have. RESCUE it
+            # obscured), OR it parsed a form with ZERO options — the same "pane
+            # proves nothing" definition ``_record_consistent_with_pane`` uses
+            # (``no_pane_form``; auq_source mint/validate parity, GH #54 W2). A
+            # 0-option form is exactly the pre-W1 preview-layout shape (F3/F4) and
+            # any pane the region-discovery prepass could not parse: without this
+            # leg it fell through to the untrusted ``bail_partial`` raw dump
+            # instead of the clean side-file RESCUE, dropping the 📋 ctx card and
+            # the buttons. Defense-in-depth — it ships even if W1's preview parse
+            # slips, and is byte-identical for a normal (options-bearing) pane.
+            # The side file is the ONLY content we have. RESCUE it
             # DISPLAY-ONLY. This is the SOLE branch that serves the side file
             # OVER the pane, and it is reserved for "the pane proves nothing",
             # so a (possibly STALE) side file can NEVER overwrite a
@@ -369,7 +389,7 @@ def resolve_auq_source_for_render(
             decision="explicit_jsonl",
             kind="jsonl_cache",
             payload=explicit,
-            form=resolve_ask_form(explicit, pane_text),
+            form=resolve_ask_form(explicit, pane_text, ansi_text=ansi_text),
             source_fingerprint=_canonical_dict_fingerprint(explicit),
             dispatch_trusted=True,
             reason="explicit",
@@ -380,7 +400,7 @@ def resolve_auq_source_for_render(
             decision="jsonl_cache",
             kind="jsonl_cache",
             payload=cached,
-            form=resolve_ask_form(cached, pane_text),
+            form=resolve_ask_form(cached, pane_text, ansi_text=ansi_text),
             source_fingerprint=_canonical_dict_fingerprint(cached),
             dispatch_trusted=True,
             reason="jsonl_cache",
@@ -445,7 +465,9 @@ def render_signature(form: AskUserQuestionForm | None) -> str:
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
-def peek_render_identity(window_id: str, pane_text: str) -> str:
+def peek_render_identity(
+    window_id: str, pane_text: str, *, ansi_text: str | None = None
+) -> str:
     """Render-identity hash for the status-poll loop dedup (PR-3 PR-B).
 
     Hashes the render DECISION (``decision``/``reason``/``dispatch_trusted``/
@@ -455,7 +477,7 @@ def peek_render_identity(window_id: str, pane_text: str) -> str:
     re-renders on every genuine render transition (decision flip, cursor/tab/
     selection/review/title change). Read-only; never mutates resolver state.
     """
-    r = resolve_auq_source_for_render(window_id, pane_text)
+    r = resolve_auq_source_for_render(window_id, pane_text, ansi_text=ansi_text)
     head = f"{r.decision}|{r.reason}|{int(r.dispatch_trusted)}|{r.kind}"
     return hashlib.sha256(f"{head}|{render_signature(r.form)}".encode()).hexdigest()
 
@@ -700,6 +722,33 @@ def _strip_recommended(label: str) -> str:
     return _RE_RECOMMENDED.sub("", label).rstrip()
 
 
+def _pane_option_label_matches(option, authority_label: str) -> bool:
+    """True iff a pane-parsed option matches the AUTHORITY (side-file / JSONL) label.
+
+    GH #54 W1.2 — the authority-aware comparison for the auq_source label-compare
+    call graph (``_record_consistent_with_pane`` via
+    ``_pane_labels_match_candidate_by_number`` and the partial-context recovery
+    ``_ctx_evidence_floor_ok``). Two legs:
+
+      * leg 1 — the EXISTING single-column rule: ``_strip_recommended`` equality
+        (case- and whitespace-PRESERVING, keeping the wrong-question protection
+        tight). This is the sole leg for an ordinary option, so single-column
+        matching is byte-identical;
+      * leg 2 — PREVIEW ONLY (``option.wrap_canonical`` non-empty): a
+        preview-layout label is a lossy wrapped-fragment reconstruction whose
+        inter-fragment spacing cannot be recovered, so the shared
+        ``terminal_parser.label_matches_authority`` accepts either wrap kind via
+        an all-whitespace-stripped comparison. Confined to preview options.
+    """
+    from ..terminal_parser import label_matches_authority
+
+    if _strip_recommended(authority_label) == _strip_recommended(option.label):
+        return True
+    if not getattr(option, "wrap_canonical", ""):
+        return False
+    return label_matches_authority(option.label, option.wrap_canonical, authority_label)
+
+
 def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> bool:
     """True if ``visible`` is a contiguous subsequence of ``full``.
 
@@ -744,9 +793,7 @@ def _pane_labels_match_candidate_by_number(
         assert option.number is not None
         index = option.number - 1
         if 0 <= index < len(candidate_labels):
-            if _strip_recommended(candidate_labels[index]) != _strip_recommended(
-                option.label
-            ):
+            if not _pane_option_label_matches(option, candidate_labels[index]):
                 return False
             checked_any = True
         else:
@@ -1567,9 +1614,9 @@ def _ctx_evidence_floor_ok(record, pane_form):
         if is_affordance_label(o.label):
             continue
         idx = o.number - 1
-        if 0 <= idx < len(candidate_labels) and _strip_recommended(
-            candidate_labels[idx]
-        ) == _strip_recommended(o.label):
+        if 0 <= idx < len(candidate_labels) and _pane_option_label_matches(
+            o, candidate_labels[idx]
+        ):
             matched_slots.add(o.number)
     return len(matched_slots) >= _CTX_EVIDENCE_MIN_NUMBERED_MATCHES
 

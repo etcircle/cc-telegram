@@ -71,7 +71,7 @@ from ..terminal_parser import (
     resolve_ask_form,
 )
 from ..transcript_parser import read_latest_usage
-from ..tmux_manager import TmuxWindow, tmux_manager
+from ..tmux_manager import TmuxWindow, capture_pane_pair, tmux_manager
 from . import (
     attention,
     auq_source,
@@ -699,7 +699,9 @@ def _on_interactive_clear(
 register_clear_callback(_on_interactive_clear)
 
 
-def _ui_render_hash(window_id: str, pane_text: str, ui_content) -> str:
+def _ui_render_hash(
+    window_id: str, pane_text: str, ui_content, *, ansi_text: str | None = None
+) -> str:
     """Dedup hash for the status-poll loop's "did the live UI change?" check.
 
     PR-3 PR-B loop kill: for AskUserQuestion the basis is the render IDENTITY
@@ -713,7 +715,9 @@ def _ui_render_hash(window_id: str, pane_text: str, ui_content) -> str:
     content hash — they have no AUQ render resolver.
     """
     if ui_content.name == "AskUserQuestion":
-        return auq_source.peek_render_identity(window_id, pane_text)
+        return auq_source.peek_render_identity(
+            window_id, pane_text, ansi_text=ansi_text
+        )
     return hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
 
 
@@ -947,10 +951,18 @@ async def update_status_message(
     # (cumulative-gate r2 false-clear race). Same ``time.time()`` clock the
     # Notification hook stamps ``ts`` with.
     capture_wall = time.time()
-    pane_text = await tmux_manager.capture_pane(window.window_id)
-    if not pane_text:
+    # GH #54 capture spine (seam 2): capture WITH ANSI once and derive plain via
+    # ``normalize_capture``. Every existing consumer below uses ``pane_text``
+    # (plain, region-equal to a plain capture), while the AUQ render-hash path
+    # (``_ui_render_hash`` → ``peek_render_identity``) also sees ``pane_ansi`` so
+    # an SGR-only cursor move on a chevron-less preview picker changes the hash
+    # and repaints (the render-identity contract: cursor moves MUST re-render).
+    pane_pair = await capture_pane_pair(tmux_manager, window.window_id)
+    if pane_pair is None or not pane_pair.plain:
         # Transient capture failure - keep existing status message
         return
+    pane_text = pane_pair.plain
+    pane_ansi = pane_pair.ansi
     _last_pane_capture[route] = time.monotonic()
 
     # GH #43: record the pane's background-shell count on every full capture
@@ -1014,7 +1026,9 @@ async def update_status_message(
             await _maybe_repaint_digest_on_transition(
                 bot, user_id, thread_id, window_id
             )
-            ui_hash = _ui_render_hash(window_id, pane_text, ui_content)
+            ui_hash = _ui_render_hash(
+                window_id, pane_text, ui_content, ansi_text=pane_ansi
+            )
             if ui_hash == _last_published_ui_hash.get(route):
                 # Same UI as last publish — user is mid-interaction, skip the
                 # re-render. D3-β: BUT re-stamp this live card's pick-token
@@ -1297,7 +1311,7 @@ async def update_status_message(
         # fast so Q2→Q3 transitions do not stall every poll.
         is_first_publish_for_route = route not in _last_published_ui_hash
         _last_published_ui_hash[route] = _ui_render_hash(
-            window_id, pane_text, ui_content
+            window_id, pane_text, ui_content, ansi_text=pane_ansi
         )
         if is_first_publish_for_route:
             await _drain_content_queue_before_first_picker_publish(route)

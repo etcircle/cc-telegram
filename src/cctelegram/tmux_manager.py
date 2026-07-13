@@ -83,6 +83,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 # Cache the resolved tmux binary path before libtmux is used. Every
 # libtmux command (libtmux/common.py:tmux_cmd.__init__) calls
@@ -115,7 +116,79 @@ import libtmux  # noqa: E402  (must follow the shutil patch)
 
 from .config import SENSITIVE_ENV_VARS, config  # noqa: E402
 
+if TYPE_CHECKING:
+    from .terminal_parser import PaneCapture
+
 logger = logging.getLogger(__name__)
+
+
+def _first_unknown_control_introducer(raw: str) -> str:
+    """Best-effort diagnostic: the repr of the FIRST byte ``normalize_capture``
+    would reject in ``raw`` (GH #54 capture spine, WARNING-log context only).
+
+    Reports the first ESC (with the following byte for context) or the first raw
+    control byte outside the allowed ``\\n\\t\\r`` / printable set. Purely
+    diagnostic — never authoritative (``normalize_capture`` owns the real
+    grammar). Returns ``"?"`` when nothing obviously offending is found (the
+    reject was a structural one — an unterminated sequence).
+    """
+    for i, ch in enumerate(raw):
+        if ch == "\x1b":
+            nxt = raw[i + 1] if i + 1 < len(raw) else ""
+            return f"ESC+{nxt!r}"
+        code = ord(ch)
+        if ch not in "\n\t\r" and (code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F):
+            return f"{ch!r}(0x{code:02x})"
+    return "?"
+
+
+async def capture_pane_pair(
+    tmux: Any, window_id: str, scrollback_lines: int = 0
+) -> "PaneCapture | None":
+    """Capture a pane WITH ANSI and normalize into a ``(plain, ansi)`` pair.
+
+    GH #54 capture spine: every AUQ-consuming observation captures ANSI once and
+    derives ``plain`` via ``terminal_parser.normalize_capture``, so a single
+    frame drives BOTH the plain parse (options / layout) AND the ANSI-fed tier-2
+    SGR cursor detection without a second tmux round-trip. A non-AUQ consumer of
+    the same observation uses ``.plain`` and behaves byte-identically to a plain
+    capture (region equality).
+
+    A MODULE-LEVEL free function taking the ``tmux`` object (never a method): it
+    only ever calls ``tmux.capture_pane(...)``, so a caller that patches the
+    ``tmux_manager`` singleton with a mock exposing only ``capture_pane`` keeps
+    working — the spine adds no new mock surface.
+
+    Returns ``None`` on capture failure. On an UNKNOWN control sequence
+    ``normalize_capture`` REJECTS the pair; the spine then permits EXACTLY ONE
+    plain re-capture for that observation (the sole exception to
+    one-capture-per-observation, WARNING-logged with the offending introducer
+    byte). A failed re-capture is an ordinary capture failure. The re-captured
+    plain frame gives genuinely-today's behavior (the pair's ``ansi`` then
+    equals ``plain`` — no styling to read).
+    """
+    from .terminal_parser import PaneCapture, normalize_capture
+
+    ansi = await tmux.capture_pane(
+        window_id, with_ansi=True, scrollback_lines=scrollback_lines
+    )
+    if ansi is None:
+        return None
+    pair = normalize_capture(ansi)
+    if pair is not None:
+        return pair
+    logger.warning(
+        "capture_pane_pair: normalize rejected window=%s introducer=%s; "
+        "one plain re-capture",
+        window_id,
+        _first_unknown_control_introducer(ansi),
+    )
+    plain = await tmux.capture_pane(
+        window_id, with_ansi=False, scrollback_lines=scrollback_lines
+    )
+    if plain is None:
+        return None
+    return PaneCapture(plain=plain, ansi=plain)
 
 
 def _compose_launch_command(

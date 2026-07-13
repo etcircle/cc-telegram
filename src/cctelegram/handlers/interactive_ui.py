@@ -60,7 +60,7 @@ from ..terminal_parser import (
 )
 from ..transcript_parser import TranscriptParser
 from .. import md_capture
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import capture_pane_pair, tmux_manager
 from ..utils import atomic_write_json
 from . import (
     attention,
@@ -2500,6 +2500,29 @@ def _build_pick_button_rows(
         )
         return []
 
+    # GH #54 W1.1b: a PANE-ONLY multi-question PREVIEW form parses a populated
+    # tab header (``← ☐ ☒ ✔ →``) but NO authoritative ``questions`` matrix (that
+    # comes only from a side-file / JSONL merge). It slips the FA5 gate above
+    # (``len(form.questions) > 1`` is False when the matrix is empty), yet
+    # ``_classify_advance`` proves a Q1→Q2 transition via
+    # ``committed.questions[ci+1]`` — which a pane-only form can NEVER confirm, so
+    # its buttons would navigate + Enter but forever record ``commit_unconfirmed``.
+    # Decline trusted minting for EVERY pane-only multi-question preview form
+    # (not only the aged one). The FRESH side-file path (matrix present) keeps its
+    # buttons; pane-only SINGLE-question preview keeps its buttons (its advance
+    # proof is resolution, not a tab transition).
+    _is_preview = form._meta.get("layout") == "preview"
+    _content_tab_count = sum(1 for t in form.tabs if not t.is_submit)
+    if _is_preview and _content_tab_count > 1 and not form.questions:
+        logger.info(
+            "_build_pick_button_rows SUPPRESSED gate=preview_multiq_no_matrix "
+            "tabs=%d options=%d question_title=%r",
+            _content_tab_count,
+            len(form.options),
+            (form.current_question_title or "<none>")[:80],
+        )
+        return []
+
     if form.select_mode == "unknown":
         logger.info("_build_pick_button_rows SUPPRESSED gate=select_mode_unknown")
         return []
@@ -3492,7 +3515,13 @@ async def handle_interactive_ui(
     # "tmux probably mid-redraw"; bail without rendering so we don't post
     # a partial card, but ALSO don't destructively clear (callers gate
     # cleanup on ``has_interactive_surface``, which we don't touch).
-    visible = await tmux_mgr.capture_pane(w.window_id, scrollback_lines=0)
+    # GH #54 capture spine (seam 1, phase 1 — the visible-only liveness probe).
+    # Its own ANSI→pair; ``visible_pane_liveness`` consumes the derived plain and
+    # is byte-identical (region equality). The two-phase boundary is preserved:
+    # this probe rejects historical scrollback pickers, the scrollback phase
+    # below does the structured parse — neither replaces the other.
+    visible_pair = await capture_pane_pair(tmux_mgr, w.window_id, scrollback_lines=0)
+    visible = visible_pair.plain if visible_pair is not None else None
     state = visible_pane_liveness(visible)
     if state != "present":
         logger.debug(
@@ -3506,7 +3535,13 @@ async def handle_interactive_ui(
     # Picker confirmed live. Now capture with scrollback for the structured
     # parse — long AskUserQuestion text pushes early options off the top of
     # the visible pane, and the parser needs them.
-    pane_text = await tmux_mgr.capture_pane(w.window_id, scrollback_lines=500)
+    # GH #54 capture spine (seam 1, phase 2 — the scrollback structured parse).
+    # Its OWN ANSI→pair (never the phase-1 visible frame): the render + ctx gate
+    # consume this pair, and ``pane_ansi`` feeds the AUQ parse so tier-2 SGR
+    # cursor detection works on a chevron-less preview picker.
+    pane_pair = await capture_pane_pair(tmux_mgr, w.window_id, scrollback_lines=500)
+    pane_text = pane_pair.plain if pane_pair is not None else None
+    pane_ansi = pane_pair.ansi if pane_pair is not None else None
     if not pane_text:
         logger.debug("No pane text captured for window_id %s", window_id)
         return False
@@ -3559,13 +3594,13 @@ async def handle_interactive_ui(
         # side_file_ok mirrors the TTL'd resolver ``validate_and_consume``
         # re-resolves → mint/validate parity, no dead-tap.
         render_source = auq_source.resolve_auq_source_for_render(
-            window_id, pane_text, explicit=tool_input
+            window_id, pane_text, explicit=tool_input, ansi_text=pane_ansi
         )
         form = render_source.form
         if form is None:
             # Belt-and-braces: the resolver returns a form for every structured
             # decision; this only fires on a pane carrying no AUQ at all.
-            form = parse_ask_user_question(pane_text)
+            form = parse_ask_user_question(pane_text, ansi_text=pane_ansi)
         # The trusted-mint source tags fed to ``_build_pick_button_rows`` /
         # ``pick_token.mint_row``; ``validate_and_consume`` re-resolves the same
         # (kind, fingerprint) via the strict resolver. Only consulted when

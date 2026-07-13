@@ -379,9 +379,10 @@ async def test_slow_capture_observing_within_margin_does_not_clear(
     )
     path = _write_record(_env, ts=set_at, generation="g1")
 
-    async def _slow_capture(_wid):
+    async def _slow_capture(_wid, with_ansi=False, scrollback_lines=0):
         # Frame "observed" at call time (inside the margin); return is
         # delayed past the margin — the post-return clock must not be used.
+        del with_ansi, scrollback_lines
         await asyncio.sleep(0.35)
         return _ACTIVE_PANE
 
