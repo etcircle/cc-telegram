@@ -27,63 +27,48 @@ def _load(name: str) -> str:
     return (_FIXTURES / name).read_text()
 
 
-# The version-suffixed ANSI/plain preview pairs. The 2.1.197 pair uses the
-# SCOPE-ALIGNED plain (its raw plain was captured at a wider ``-S`` than the
+# The version-suffixed ANSI/plain preview pairs, enumerated by GLOB (Codex P3
+# — a future fixture pair must never silently skip acceptance). The plain twin
+# is the same stem's `.txt`, EXCEPT when a scope-ALIGNED `.aligned.txt` exists
+# (the 2.1.197 pair: its raw plain was captured at a wider ``-S`` than the
 # ANSI, so only the aligned last-150-lines file is region-comparable).
-_PREVIEW_PAIRS = [
-    (
-        "auq_preview_singleselect_v2.1.207.ansi.txt",
-        "auq_preview_singleselect_v2.1.207.txt",
-    ),
-    (
-        "auq_preview_singleselect_cursor2_v2.1.207.ansi.txt",
-        "auq_preview_singleselect_cursor2_v2.1.207.txt",
-    ),
-    (
-        "auq_preview_wraplabels_v2.1.207.ansi.txt",
-        "auq_preview_wraplabels_v2.1.207.txt",
-    ),
-    (
-        "auq_preview_wraplabels_cursor1_v2.1.207.ansi.txt",
-        "auq_preview_wraplabels_cursor1_v2.1.207.txt",
-    ),
-    (
-        "auq_preview_wraplabels_cursor2_v2.1.207.ansi.txt",
-        "auq_preview_wraplabels_cursor2_v2.1.207.txt",
-    ),
-    (
-        "auq_preview_multiquestion_q1_v2.1.207.ansi.txt",
-        "auq_preview_multiquestion_q1_v2.1.207.txt",
-    ),
-    (
-        "auq_preview_multiquestion_q2_v2.1.207.ansi.txt",
-        "auq_preview_multiquestion_q2_v2.1.207.txt",
-    ),
-    (
-        "auq_preview_multiselect_v2.1.207.ansi.txt",
-        "auq_preview_multiselect_v2.1.207.txt",
-    ),
-    (
-        "auq_preview_sidebyside_v2.1.197.ansi.txt",
-        "auq_preview_sidebyside_v2.1.197.aligned.txt",
-    ),
-]
+
+
+def _enumerate_preview_pairs() -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for ansi_path in sorted(_FIXTURES.glob("auq_preview_*.ansi.txt")):
+        stem = ansi_path.name[: -len(".ansi.txt")]
+        aligned = _FIXTURES / f"{stem}.aligned.txt"
+        plain = aligned if aligned.exists() else _FIXTURES / f"{stem}.txt"
+        pairs.append((ansi_path.name, plain.name))
+    return pairs
+
+
+_PREVIEW_PAIRS = _enumerate_preview_pairs()
 
 
 # ── W1.6 / F9 — normalize_capture region equality ──────────────────────────
 
 
 class TestNormalizeCapture:
+    def test_every_ansi_fixture_has_a_plain_twin(self):
+        """The glob enumeration (Codex P3) must never pair an ANSI fixture with
+        a missing plain twin — that would silently skip acceptance."""
+        assert _PREVIEW_PAIRS, "no preview ANSI fixtures found by the glob"
+        for ansi_name, plain_name in _PREVIEW_PAIRS:
+            assert (_FIXTURES / ansi_name).is_file()
+            assert (_FIXTURES / plain_name).is_file(), (
+                f"{ansi_name} has no plain twin {plain_name}"
+            )
+
     @pytest.mark.parametrize(("ansi_name", "plain_name"), _PREVIEW_PAIRS)
-    def test_region_equality_line_for_line(self, ansi_name: str, plain_name: str):
-        """``normalize_capture(ansi).plain`` == the plain capture, line-for-line
-        after per-line rstrip (the one disclosed tmux ``-e`` trailing-pad
-        normalization)."""
+    def test_region_equality_exact(self, ansi_name: str, plain_name: str):
+        """``normalize_capture(ansi).plain`` is EXACTLY the plain capture (Codex
+        P2-3 — the tmux trailing-pad normalization lives INSIDE the spine, so
+        the acceptance comparison needs no external rstrip)."""
         cap = normalize_capture(_load(ansi_name))
         assert cap is not None
-        got = [ln.rstrip() for ln in cap.plain.split("\n")]
-        want = [ln.rstrip() for ln in _load(plain_name).split("\n")]
-        assert got == want
+        assert cap.plain == _load(plain_name)
 
     def test_osc8_hyperlink_is_consumed_whole(self):
         """The OSC-8 hyperlink (F9) is consumed through ST — its invisible
@@ -107,10 +92,39 @@ class TestNormalizeCapture:
         # A dangling / unterminated OSC also rejects.
         assert normalize_capture("x\x1b]8;;http://e") is None
 
-    def test_allowed_whitespace_controls_survive(self):
-        cap = normalize_capture("a\tb\nc\r")
+    # ── Codex P2-2 — the ECMA-48 CSI / ESC grammar, the exact sequences ──
+
+    @pytest.mark.parametrize(
+        "seq",
+        [
+            "\x1b[?25l",  # private-parameter CSI (hide cursor)
+            "\x1b[>0c",  # private-parameter CSI (device attributes)
+            "\x1b[0 q",  # intermediate-byte CSI (cursor style; SP intermediate)
+        ],
+    )
+    def test_valid_csi_forms_are_consumed(self, seq: str):
+        cap = normalize_capture(f"a{seq}b")
         assert cap is not None
-        assert cap.plain == "a\tb\nc\r"
+        assert cap.plain == "ab"
+
+    def test_charset_designation_consumes_the_designator(self):
+        """``ESC ( 0`` takes one following byte — the ``0`` designator must be
+        consumed, never leaked into plain."""
+        cap = normalize_capture("x\x1b(0y")
+        assert cap is not None
+        assert cap.plain == "xy"
+
+    def test_esc_followed_by_a_control_byte_rejects(self):
+        """``ESC NUL`` is outside the ECMA-48 grammar — reject, never a blind
+        two-byte skip."""
+        assert normalize_capture("a\x1b\x00b") is None
+
+    def test_trailing_pad_normalized_inside_the_spine(self):
+        """Per-line trailing whitespace is normalized INSIDE normalize_capture
+        (Codex P2-3); mid-line whitespace and line structure are untouched."""
+        cap = normalize_capture("a\tb   \nc\r")
+        assert cap is not None
+        assert cap.plain == "a\tb\nc"
 
     def test_returns_ansi_verbatim(self):
         raw = _load("auq_preview_wraplabels_cursor1_v2.1.207.ansi.txt")
@@ -145,6 +159,15 @@ class TestDisplayWidth:
         # A text-default symbol + VS16 (U+FE0F) presents as a two-cell emoji.
         assert display_width("❤️") == 2  # ❤️
         assert display_width("❤") == 1  # ❤ (text presentation, narrow)
+
+    def test_vs16_on_an_already_wide_emoji_stays_two_cells(self):
+        # Codex P1-1: 👩 is already EAW-wide (2); VS16 must not ADD a cell.
+        assert display_width("\U0001f469️") == 2
+
+    def test_skin_tone_modifier_is_zero_width(self):
+        # Codex P1-1: 👍🏽 is ONE two-cell grapheme — the modifier (EAW W on its
+        # own) extends the base at zero width, never a per-codepoint 2+2 sum.
+        assert display_width("\U0001f44d\U0001f3fd") == 2
 
     def test_box_drawing_is_one_cell(self):
         assert display_width("┌──┐") == 4
@@ -280,6 +303,62 @@ class TestPreviewParse:
         assert form._meta.get("layout") != "preview"
         assert [o.number for o in form.options if o.cursor] == [2]
 
+    def test_emoji_label_is_never_silently_truncated(self):
+        """Codex P1-1, the REPRODUCED case: replacing the seven-cell "Stacked"
+        with an equal-DISPLAY-WIDTH three-family-emoji+"d" string (7 cells, 16
+        chars) must parse an intact label — the old per-codepoint truncation
+        over-counted the emoji and silently cut the label mid-way."""
+        family = "\U0001f468‍\U0001f469‍\U0001f467"
+        token = family * 3 + "d"
+        assert display_width(token) == 7 == display_width("Stacked")
+        pane = _load("auq_preview_singleselect_v2.1.207.txt").replace(
+            "Stacked", token, 1
+        )
+        form = parse_ask_user_question(pane)  # tier-1 chevron; plain suffices
+        assert form is not None
+        assert form._meta.get("layout") == "preview"
+        assert form.options_complete is True
+        assert form.options[0].label == f"{token} summary panel"
+        # No panel content leaked and nothing was cut.
+        assert "d sum" != form.options[0].label[-5:]
+
+    def test_non_indented_row_with_panel_art_rejects_the_preview_parse(self):
+        """Codex P1-2, the REPRODUCED case: a column-0 text row carrying panel
+        art (boundary-aligned so the vote stays consistent) is NOT a
+        continuation — it must REJECT the preview parse, never rename option 1
+        to "... NOT_INDENTED"."""
+        pane = _load("auq_preview_singleselect_v2.1.207.txt")
+        lines = pane.split("\n")
+        opt1_idx = next(
+            i for i, ln in enumerate(lines) if ln.lstrip().startswith("❯ 1.")
+        )
+        box_col = lines[opt1_idx].index("┌")
+        injected = "NOT_INDENTED".ljust(box_col) + "│ x │"
+        lines.insert(opt1_idx + 1, injected)
+        form = parse_ask_user_question("\n".join(lines))
+        # The preview path REJECTS; whatever the ordinary walk yields, the
+        # injected text never becomes part of a trusted preview label.
+        if form is not None:
+            assert form._meta.get("layout") != "preview"
+            assert form.options_complete is False
+            assert all("NOT_INDENTED" not in (o.label or "") for o in form.options)
+
+    def test_continuation_with_no_option_above_rejects(self):
+        """A CONT-classified row with no numbered option above it is an
+        unrecognized row — the preview parse rejects (P1-2 fail-closed)."""
+        pane = _load("auq_preview_singleselect_v2.1.207.txt")
+        lines = pane.split("\n")
+        opt1_idx = next(
+            i for i, ln in enumerate(lines) if ln.lstrip().startswith("❯ 1.")
+        )
+        box_col = lines[opt1_idx].index("┌")
+        # An indented labelled row with panel art ABOVE the first option.
+        stray = "   stray fragment".ljust(box_col) + "│ x │"
+        lines.insert(opt1_idx, stray)
+        form = parse_ask_user_question("\n".join(lines))
+        if form is not None:
+            assert form._meta.get("layout") != "preview"
+
 
 # ── W1.4 — panel-content exclusion ─────────────────────────────────────────
 
@@ -318,6 +397,21 @@ class TestPanelExclusion:
         cur1 = [o.number for o in c1.options if o.cursor]
         cur2 = [o.number for o in c2.options if o.cursor]
         assert cur1 != cur2
+        # Codex P2-1 — the exclusion holds on the FULL form: the excerpt is
+        # built from the TRUNCATED label-column rows, so it carries NO panel
+        # content and is IDENTICAL across the cursor pair (panel churn +
+        # the moving chevron are both normalized out).
+        for excerpt in (c1.pane_excerpt, c2.pane_excerpt):
+            for panel_text in (
+                "RUN: rig-test",  # singleselect cursor-1 panel body
+                "CPU  MEM",  # wraplabels panel body
+                "card A",  # multiquestion-style panel body (defensive)
+                "┌",
+                "│",
+                "└",
+            ):
+                assert panel_text not in excerpt
+        assert c1.pane_excerpt == c2.pane_excerpt
 
 
 # ── F6 — no cursor-1 synthesis on a preview form ───────────────────────────

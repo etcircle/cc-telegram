@@ -1821,17 +1821,30 @@ def _first_box_char_index(line: str) -> int:
     return -1
 
 
-def _truncate_at_cell(line: str, boundary_cell: int) -> str:
-    """Return the prefix of ``line`` whose display width is < ``boundary_cell``."""
+def _truncate_at_cell(line: str, boundary_cell: int) -> str | None:
+    """Return the prefix of ``line`` strictly LEFT of ``boundary_cell``, or ``None``.
+
+    Grapheme-cluster accounting — the SAME `_iter_grapheme_clusters` path
+    boundary discovery uses (Codex r1 P1-1: one cell-accounting authority).
+    ``None`` when a cluster STRADDLES the boundary — a measurement ambiguity
+    the preview parse must FAIL on, never a silent mid-label cut.
+    """
     if boundary_cell <= 0:
         return ""
-    width = 0
-    for i, ch in enumerate(line):
-        w = _char_cell_width(ch)
-        if width + w > boundary_cell:
-            return line[:i]
-        width += w
-    return line
+    char_len, exact = _cluster_prefix_within_cells(line, boundary_cell)
+    if not exact:
+        return None
+    return line[:char_len]
+
+
+# The FULL ECMA-48 CSI grammar (Codex P2-2): parameter bytes 0x30-0x3F
+# (digits, ``;`` and the private ``? < = > :``), intermediate bytes 0x20-0x2F,
+# one final byte 0x40-0x7E. ``ESC[?25l`` / ``ESC[>0c`` / intermediate-byte
+# forms are all valid CSI and must be CONSUMED, not rejected. Group 1 is the
+# parameter+intermediate span, group 2 the final byte (an ``m`` final with
+# plain digit/;-params is SGR).
+_RE_CSI_FULL = re.compile(r"\x1b\[([\x30-\x3f]*[\x20-\x2f]*)([\x40-\x7e])")
+_RE_SGR_PARAMS = re.compile(r"[0-9;]*")
 
 
 def _sgr_updates_bold(params: str, bold: bool) -> bool:
@@ -1868,14 +1881,16 @@ def _sgr_updates_bold(params: str, bold: bool) -> bool:
 
 
 def _iter_visible_with_bold(ansi_line: str):
-    """Yield ``(char, is_bold, cell_col)`` for each VISIBLE char in an ANSI line.
+    """Yield ``(char, is_bold)`` for each VISIBLE char in an ANSI line.
 
-    Consumes CSI / OSC / DCS / SOS / PM / APC / ESC-single sequences (bold state
-    only advances on SGR ``m`` finals); ``cell_col`` is the display-cell column
-    of the char (cumulative :func:`display_width` of the visible prefix).
+    Consumes CSI (the FULL grammar — ``_RE_CSI_FULL``) / OSC / DCS / SOS / PM /
+    APC / charset-designation / ESC-single sequences; bold state advances only
+    on an SGR ``m`` final with plain digit/;-parameters. Cell accounting is NOT
+    done here — callers aggregate the visible text through the SAME
+    :func:`_iter_grapheme_clusters` path as the plain-side scans (P1-1: one
+    cell-accounting authority).
     """
     bold = False
-    cell = 0
     i = 0
     n = len(ansi_line)
     while i < n:
@@ -1883,9 +1898,9 @@ def _iter_visible_with_bold(ansi_line: str):
         if c == "\x1b" and i + 1 < n:
             nxt = ansi_line[i + 1]
             if nxt == "[":
-                m = _RE_CSI.match(ansi_line, i)
+                m = _RE_CSI_FULL.match(ansi_line, i)
                 if m is not None:
-                    if m.group(2) == "m":
+                    if m.group(2) == "m" and _RE_SGR_PARAMS.fullmatch(m.group(1)):
                         bold = _sgr_updates_bold(m.group(1), bold)
                     i = m.end()
                     continue
@@ -1907,10 +1922,18 @@ def _iter_visible_with_bold(ansi_line: str):
                     j += 1
                 i = j
                 continue
+            if 0x20 <= ord(nxt) <= 0x2F:
+                # nF (charset designation etc.): intermediates then one final.
+                j = i + 1
+                while j < n and 0x20 <= ord(ansi_line[j]) <= 0x2F:
+                    j += 1
+                if j < n and 0x30 <= ord(ansi_line[j]) <= 0x7E:
+                    j += 1
+                i = j
+                continue
             i += 2
             continue
-        yield c, bold, cell
-        cell += _char_cell_width(c)
+        yield c, bold
         i += 1
 
 
@@ -1921,24 +1944,24 @@ def _ansi_row_label_bold_state(
 
     Returns ``"bold"`` (every visible non-space label char is SGR-1),
     ``"plain"`` (none are), ``"mixed"`` (some are — a mid-redraw frame), or
-    ``"empty"`` (no visible label chars). Only cells strictly LEFT of
-    ``boundary_cell`` count, and the leading ``[cursor] N.`` number token of a
-    numbered row is skipped (it renders dim, never bold — F8).
+    ``"empty"`` (no visible label chars). Only chars whose whole grapheme
+    cluster fits strictly LEFT of ``boundary_cell`` count — decided by the SAME
+    cluster prefix the plain-side truncation uses (P1-1) — and the leading
+    ``[cursor] N.`` number token of a numbered row is skipped (it renders dim,
+    never bold — F8).
     """
     visible = list(_iter_visible_with_bold(ansi_line))
-    plain = "".join(vc for vc, _, _ in visible)
+    plain = "".join(vc for vc, _ in visible)
     label_start = 0
     if is_numbered:
         m = _RE_NUMBERED_OPTION.match(plain)
         if m is None:
             return "empty"
         label_start = m.start("label")
+    prefix_chars, _exact = _cluster_prefix_within_cells(plain, boundary_cell)
     states: list[bool] = []
-    for idx, (vc, is_bold, cell) in enumerate(visible):
-        if idx < label_start:
-            continue
-        if cell >= boundary_cell:
-            break
+    for idx in range(label_start, min(prefix_chars, len(visible))):
+        vc, is_bold = visible[idx]
         if vc.strip() == "":
             continue
         states.append(is_bold)
@@ -2021,14 +2044,19 @@ def _try_parse_preview_layout(
 
     # W1.2 — truncate every row at the boundary, then parse options + join
     # wrapped continuation fragments. Track physical rows per logical option
-    # for tier-2 cursor attribution.
+    # for tier-2 cursor attribution. A ``None`` truncation (a grapheme cluster
+    # STRADDLING the boundary) is a measurement ambiguity ⇒ FAIL the preview
+    # parse (P1-1 fail-closed — a label is never silently cut).
     frag_lists: list[list[str]] = []
     numbers: list[int] = []
     glyph_cursor: list[bool] = []
     phys_rows: list[list[int]] = []  # line indices contributing to each option
+    marker_cols: list[int] = []  # display-cell column of each option's N. marker
     for j, kind in entries:
         if kind == KIND_OPTION:
             truncated = _truncate_at_cell(lines[j], boundary_cell)
+            if truncated is None:
+                return None  # cluster straddles the boundary — ambiguous
             m = _RE_NUMBERED_OPTION.match(truncated)
             if m is None:
                 return None  # boundary cut the marker ⇒ at/left of an N. marker
@@ -2043,12 +2071,26 @@ def _try_parse_preview_layout(
             numbers.append(num)
             glyph_cursor.append(m.group("cursor").strip() in ("❯", "›", "▶"))
             phys_rows.append([j])
+            marker_cols.append(_cells_left_of_index(truncated, m.start("num")))
         elif kind == KIND_CONT:
+            # P1-2 — a continuation is recognized ONLY when indented INTO the
+            # label column: its first non-space cell must sit strictly DEEPER
+            # than its option's ``N.`` marker column. A column-0 (or shallower)
+            # text row carrying panel art is an UNRECOGNIZED row — it REJECTS
+            # the preview parse rather than silently renaming an option.
             if not frag_lists:
-                continue  # a stray continuation above the first option
-            truncated = _truncate_at_cell(lines[j], boundary_cell).strip()
-            if truncated:
-                frag_lists[-1].append(truncated)
+                return None  # a continuation with no option above it
+            line = lines[j]
+            first_ns = len(line) - len(line.lstrip())
+            indent_cells = _cells_left_of_index(line, first_ns)
+            if indent_cells <= marker_cols[-1]:
+                return None  # not indented into the label column
+            truncated_cont = _truncate_at_cell(line, boundary_cell)
+            if truncated_cont is None:
+                return None  # cluster straddles the boundary — ambiguous
+            fragment = truncated_cont.strip()
+            if fragment:
+                frag_lists[-1].append(fragment)
                 phys_rows[-1].append(j)
         # KIND_PANEL / KIND_CHROME contribute nothing to the label column.
 
@@ -2131,7 +2173,31 @@ def _try_parse_preview_layout(
         if tabs and tab_header_idx is not None
         else (block_top if block_top is not None else max(0, footer_idx - 25))
     )
-    pane_excerpt = "\n".join(lines[excerpt_start : footer_idx + 1]).rstrip()
+    # P2-1 — panel-content exclusion holds on the FULL form: the excerpt is
+    # built from the TRUNCATED (label-column) rows, never the raw pane rows.
+    # Panel-only rows blank out entirely; option/continuation/chrome rows are
+    # cut at the boundary (the ``Notes:`` chrome sits AT the boundary, so it
+    # empties); the option rows' cursor glyph is BLANKED so the excerpt — like
+    # the fingerprint — is IDENTICAL across a cursor move (the panel content
+    # switches with the focused option, so any leak would churn per-move).
+    # Rows above the block (title / tab header) and the footer carry no panel
+    # content and stay verbatim.
+    kind_by_idx = dict(entries)
+    excerpt_lines: list[str] = []
+    for j in range(excerpt_start, footer_idx + 1):
+        kind = kind_by_idx.get(j)
+        if kind is None:
+            excerpt_lines.append(lines[j].rstrip())
+            continue
+        if kind == KIND_PANEL:
+            excerpt_lines.append("")
+            continue
+        prefix_chars, _exact = _cluster_prefix_within_cells(lines[j], boundary_cell)
+        row = lines[j][:prefix_chars]
+        if kind == KIND_OPTION:
+            row = re.sub(r"[❯›▶]", " ", row, count=1)
+        excerpt_lines.append(row.rstrip())
+    pane_excerpt = "\n".join(excerpt_lines).rstrip()
 
     return AskUserQuestionForm(
         tabs=tabs,
@@ -3980,18 +4046,26 @@ _ALLOWED_CONTROL_CHARS: Final = frozenset("\n\t\r")
 def _strip_ecma48_families(raw: str) -> str | None:
     """Consume EVERY ECMA-48 escape family, returning plain text or ``None``.
 
-    Handles, at the SINGLE seam:
-      * CSI (``ESC [ … final``) — all final bytes (SGR + cursor moves etc.);
+    Handles, at the SINGLE seam (the ECMA-48 grammar — Codex P2-2):
+      * CSI (``ESC [ params intermediates final``) — parameter bytes 0x30-0x3F
+        (digits, ``;``, the private ``? < = > :``), intermediate bytes
+        0x20-0x2F, final byte 0x40-0x7E — so ``ESC[?25l`` / ``ESC[>0c`` /
+        intermediate-byte forms are CONSUMED, never rejected;
       * the payload-bearing STRING controls OSC / DCS / SOS / PM / APC
         (``ESC ]`` / ``ESC P`` / ``ESC X`` / ``ESC ^`` / ``ESC _``) — consumed
         WHOLE through their BEL (``\\x07``) or ST (``ESC \\``) terminator, so an
         OSC-8 hyperlink's URI never survives as junk (F9);
-      * the ESC-single family (``ESC <0x40-0x5F>`` and other 2-byte forms).
+      * nF sequences (``ESC <0x20-0x2F intermediates> <0x30-0x7E final>``) —
+        charset designation ``ESC ( 0`` consumes BOTH following bytes, so the
+        designator never leaks into plain;
+      * Fp/Fe/Fs singles (``ESC <0x30-0x7E>``) — the 2-byte forms.
 
-    Returns ``None`` (REJECT the pair) when, after stripping, any UNKNOWN control
-    byte remains — everything in C0 except LF/TAB/CR, plus DEL and C1 — or a lone
-    ESC that forms no recognized sequence. The rejection SIGNAL must exist even
-    though the one-plain-recapture recovery is caller-side (a later wave).
+    Returns ``None`` (REJECT the pair) when: an ESC is followed by a byte
+    OUTSIDE the grammar (``ESC NUL`` rejects), a CSI/nF has no final byte, a
+    string control is unterminated, or — after stripping — any UNKNOWN control
+    byte remains (everything in C0 except LF/TAB/CR, plus DEL and C1). The
+    rejection SIGNAL must exist even though the one-plain-recapture recovery is
+    caller-side (a later wave).
     """
     out: list[str] = []
     i = 0
@@ -4003,11 +4077,11 @@ def _strip_ecma48_families(raw: str) -> str | None:
                 return None  # dangling ESC — unknown
             nxt = raw[i + 1]
             if nxt == "[":
-                m = _RE_CSI.match(raw, i)
+                m = _RE_CSI_FULL.match(raw, i)
                 if m is not None:
                     i = m.end()
                     continue
-                return None  # malformed CSI
+                return None  # malformed CSI (no final byte)
             if nxt in "]PX^_":
                 # String control: consume through BEL or ST.
                 j = i + 2
@@ -4026,9 +4100,22 @@ def _strip_ecma48_families(raw: str) -> str | None:
                     return None  # unterminated string control
                 i = j
                 continue
-            # ESC-single family (Fe/Fp/Fs etc.): consume the 2-byte form.
-            i += 2
-            continue
+            nxt_code = ord(nxt)
+            if 0x20 <= nxt_code <= 0x2F:
+                # nF: one-or-more intermediates then a final byte 0x30-0x7E
+                # (charset designation ESC ( 0 — consume the designator too).
+                j = i + 1
+                while j < n and 0x20 <= ord(raw[j]) <= 0x2F:
+                    j += 1
+                if j < n and 0x30 <= ord(raw[j]) <= 0x7E:
+                    i = j + 1
+                    continue
+                return None  # nF with no final byte
+            if 0x30 <= nxt_code <= 0x7E:
+                # Fp/Fe/Fs single ('[', ']', 'P', 'X', '^', '_' handled above).
+                i += 2
+                continue
+            return None  # ESC + a byte outside the ECMA-48 grammar (ESC NUL …)
         if c in _ALLOWED_CONTROL_CHARS:
             out.append(c)
             i += 1
@@ -4049,73 +4136,133 @@ def normalize_capture(raw_ansi: str) -> PaneCapture | None:
     Returns ``None`` when the frame carries an UNKNOWN control sequence — the
     fail-closed rejection the spine mandates (recovery is caller-side).
 
-    ``plain`` is NOT rstrip-ped: the ONE disclosed normalization (tmux ``-e``
-    trailing-pad) is applied at the acceptance comparison (line-for-line rstrip),
-    not here, so column positions stay intact for the boundary scan.
+    The tmux ``-e`` trailing-pad normalization lives HERE (Codex P2-3 — the
+    spine owns it, never a test-side rstrip): each derived plain line is
+    rstrip-ped, so ``plain`` compares EXACTLY equal to a plain tmux capture of
+    the same frame. Only TRAILING whitespace is touched — leading columns stay
+    intact for the panel-boundary scan.
     """
     plain = _strip_ecma48_families(raw_ansi)
     if plain is None:
         return None
+    plain = "\n".join(line.rstrip() for line in plain.split("\n"))
     return PaneCapture(plain=plain, ansi=raw_ansi)
 
 
 # GH #54 W1.1 — terminal display-cell width (wcswidth semantics).
+#
+# ONE cell-accounting path (Codex r1 P1-1): boundary discovery, row truncation,
+# AND the ANSI label-region extraction all consume the SAME grapheme-cluster
+# iterator below, so they can never disagree on where a label ends. Any
+# measurement ambiguity (a cluster STRADDLING the panel boundary) FAILS the
+# preview parse — a label is never silently truncated.
 _ZERO_WIDTH_JOINER: Final = "‍"
-_VARIATION_SELECTOR_16: Final = "️"
+_VARIATION_SELECTOR_15: Final = "︎"  # text presentation
+_VARIATION_SELECTOR_16: Final = "️"  # emoji (two-cell) presentation
+# Emoji skin-tone modifiers (U+1F3FB..U+1F3FF) — zero-width extenders of the
+# preceding emoji base, NOT independent two-cell glyphs (their EAW is W, so a
+# per-codepoint sum over-counts: 👍🏽 is terminal-width 2, not 4).
+_EMOJI_MODIFIER_RANGE: Final = (0x1F3FB, 0x1F3FF)
 
 
-def _char_cell_width(ch: str) -> int:
-    """Display cells for ONE codepoint (0 combining, 2 wide, else 1)."""
+def _codepoint_width(ch: str) -> int:
+    """Display cells for ONE standalone codepoint (0 combining/control/format,
+    2 wide, else 1). Cluster EXTENDERS (VS15/VS16, skin tones, ZWJ joins) are
+    handled by :func:`_iter_grapheme_clusters`, never here."""
     if unicodedata.combining(ch):
         return 0
     code = ord(ch)
     if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
         return 0  # controls are zero-width for column accounting
+    if unicodedata.category(ch) == "Cf":
+        return 0  # format chars (ZWJ/ZWNJ/BOM…) never occupy a cell
     if unicodedata.east_asian_width(ch) in ("W", "F"):
         return 2
     return 1
 
 
-def display_width(text: str) -> int:
-    """Terminal display width of ``text`` in cells (GH #54 W1.1).
+def _is_emoji_modifier(ch: str) -> bool:
+    return _EMOJI_MODIFIER_RANGE[0] <= ord(ch) <= _EMOJI_MODIFIER_RANGE[1]
 
-    wcswidth semantics rather than a per-codepoint East-Asian-Width sum:
 
-      * a ZWJ (U+200D) emoji sequence renders as ONE two-cell grapheme — the
-        joiner and its trailing emoji collapse into the leading emoji's width;
-      * a Variation-Selector-16 (U+FE0F) forces emoji (two-cell) presentation on
-        the preceding base char;
-      * combining marks are zero-width.
+def _iter_grapheme_clusters(text: str):
+    """Yield ``(start, end, width)`` terminal grapheme clusters of ``text``.
 
-    Used by BOTH the plain panel-boundary scan and the ANSI label-region
-    extraction so they can never disagree on where a label ends.
+    Terminal-oriented cluster rules (wcswidth semantics — GH #54 W1.1):
+
+      * a base char absorbs following COMBINING marks (zero-width);
+      * VS16 (U+FE0F) forces the cluster to TWO cells (emoji presentation);
+        VS15 (U+FE0E) forces ONE (text presentation); both are zero-width;
+      * a skin-tone MODIFIER (U+1F3FB-FF) extends the cluster at zero width;
+      * a ZWJ (U+200D) joins the NEXT base (and its extenders) into the SAME
+        cluster at zero added width — a family emoji is ONE two-cell grapheme.
+
+    The single accounting authority for :func:`display_width`,
+    :func:`_cells_left_of_index`, :func:`_truncate_at_cell`, and the ANSI
+    label-region bold scan.
     """
-    total = 0
-    prev_base = False
     i = 0
     n = len(text)
     while i < n:
+        start = i
         ch = text[i]
-        if ch == _ZERO_WIDTH_JOINER:
-            # Joiner + following emoji collapse into the run already counted.
-            if i + 1 < n:
-                i += 2  # skip the joiner and the joined emoji
-            else:
-                i += 1
-            prev_base = False
-            continue
-        if ch == _VARIATION_SELECTOR_16:
-            # Force two-cell emoji presentation on the preceding base char.
-            if prev_base:
-                total += 1  # bump the base's width 1 -> 2
-            prev_base = False
-            i += 1
-            continue
-        w = _char_cell_width(ch)
-        total += w
-        prev_base = w >= 1
+        width = _codepoint_width(ch)
         i += 1
-    return total
+        while i < n:
+            c = text[i]
+            if unicodedata.combining(c):
+                i += 1
+                continue
+            if c == _VARIATION_SELECTOR_16:
+                if width >= 1:
+                    width = 2
+                i += 1
+                continue
+            if c == _VARIATION_SELECTOR_15:
+                if width >= 1:
+                    width = 1
+                i += 1
+                continue
+            if _is_emoji_modifier(c) and width >= 1:
+                i += 1
+                continue
+            if c == _ZERO_WIDTH_JOINER:
+                # Join the next base into this cluster at zero added width.
+                i += 1
+                if i < n:
+                    i += 1  # the joined base
+                continue
+            break
+        yield start, i, width
+
+
+def display_width(text: str) -> int:
+    """Terminal display width of ``text`` in cells (GH #54 W1.1).
+
+    Grapheme-cluster aggregation, never a per-codepoint East-Asian-Width sum:
+    a ZWJ emoji sequence is ONE two-cell grapheme, VS16 forces two-cell emoji
+    presentation (👩️ == 2, not 3), a skin-tone modifier is zero-width
+    (👍🏽 == 2, not 4), and combining marks are zero-width.
+    """
+    return sum(w for _, _, w in _iter_grapheme_clusters(text))
+
+
+def _cluster_prefix_within_cells(text: str, cells: int) -> tuple[int, bool]:
+    """``(char_len, exact)`` — the maximal whole-CLUSTER prefix of ``text``
+    whose display width is <= ``cells``.
+
+    ``exact`` is False when a cluster STRADDLES the cell boundary (its start
+    is left of ``cells`` but its end crosses it) — the measurement-ambiguity
+    signal callers must fail closed on (P1-1: never truncate a label).
+    """
+    cum = 0
+    for start, _end, w in _iter_grapheme_clusters(text):
+        if cum >= cells:
+            return start, True
+        if cum + w > cells:
+            return start, False  # straddles the boundary — ambiguous
+        cum += w
+    return len(text), True
 
 
 def _cells_left_of_index(text: str, char_index: int) -> int:
