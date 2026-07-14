@@ -1135,15 +1135,15 @@ def test_every_real_status_row_the_grammar_accepts_also_satisfies_leg3() -> None
     """The load-bearing property, asserted BEHAVIOURALLY on the real rows: a row the
     grammar accepts must not be one leg 3 would then reject — otherwise the fallback
     would locate a box only for leg 3 to refuse the pane."""
-    below_marker_ok = lambda row: (
-        any(  # noqa: E731
-            m in row for m in tp._INPUT_READY_CHROME_MARKERS
+
+    def _below_marker_ok(row: str) -> bool:
+        return any(m in row for m in tp._INPUT_READY_CHROME_MARKERS) or bool(
+            tp._RE_INPUT_READY_SHELL_TOKEN.search("· " + row)
         )
-        or tp._RE_INPUT_READY_SHELL_TOKEN.search("· " + row)
-    )
+
     for row in _LIVE_BOT_ROWS + _REAL_CORPUS_STATUS_ROWS:
         assert tp._is_status_row(row) is True, row
-        assert below_marker_ok(row), row
+        assert _below_marker_ok(row), row
 
 
 # ── GH #56 r3 fold (Codex P1, THIRD spoof family): the whole-row ORDERED
@@ -1339,3 +1339,74 @@ def test_the_two_separator_path_never_consults_the_status_row_predicate(
         tp.classify_input_box_failure(text)  # must not raise
         checked += 1
     assert checked >= 40
+
+
+# ── GH #56 r6 fold: mode GLYPHS are BOUND to their mode TEXT ─────────────────
+#
+# The r5 MODE segment cross-producted glyph × text, so it accepted pairings CC
+# never renders (`⏸ bypass permissions on`, `⏵⏵ manual mode on`). Clear-eyed about
+# the impact: this buys ~nothing in SAFETY (anyone who can print the mispaired
+# glyph can equally print the correctly-paired one, which MUST be accepted), so the
+# delta is ≈0 — it is a tightening for CORRECTNESS and reviewability, not a hazard
+# fix. Nothing else about the grammar changed.
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "⏸ bypass permissions on",  # bypass is ⏵⏵-only
+        "⏸ bypass permissions on (shift+tab to cycle)",
+        "⏵⏵ manual mode on",  # manual is ⏸-only
+        "⏵⏵ manual mode on (shift+tab to cycle)",
+        # …and a mispaired mode cannot be laundered by a valid hint tail.
+        "⏸ bypass permissions on · ← for agents",
+    ],
+)
+def test_mispaired_mode_glyphs_refuse_through_the_full_predicates(row: str) -> None:
+    """CC binds each mode text to one glyph: `bypass permissions on` renders with
+    `⏵⏵` (live panes + corpus), `manual mode on` with `⏸` (the 2.1.209 rig
+    fixture). The cross-product pairings are refused."""
+    assert tp._is_status_row(row) is False, row
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None, row
+    assert tp.pane_input_box_present(pane) is False, row
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True, row
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "⏵⏵ bypass permissions on",
+        "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        "⏸ manual mode on",
+        "⏸ manual mode on · ? for shortcuts · ← for agents",
+    ],
+)
+def test_correctly_paired_modes_are_still_accepted(row: str) -> None:
+    """The binding must not cost completeness on the OBSERVED pairings."""
+    assert tp._is_status_row(row) is True, row
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "⏵⏵ accept edits on",
+        "⏸ accept edits on",
+        "⏵⏵ plan mode on",
+        "⏸ plan mode on",
+        "⏵⏵ accept edits on (shift+tab to cycle)",
+        "⏸ plan mode on (shift+tab to cycle)",
+    ],
+)
+def test_unobserved_modes_accept_EITHER_glyph_the_disclosed_choice(row: str) -> None:
+    """DISCLOSED completeness-over-tightness choice: the `accept edits on` /
+    `plan mode on` glyph decoration is UNOBSERVED (no rig capture, no fixture), and
+    guessing one would re-create exactly the r4 false-refusal cliff on a real pane
+    (a user in accept-edits mode with a tall draft would wedge). So EITHER glyph is
+    accepted until a rig capture lets us bind them. It adds no recombination power —
+    still exactly ONE mode segment per row."""
+    assert tp._is_status_row(row) is True, row
+    # Still at-most-once: two modes never combine, whatever their glyphs.
+    assert tp._is_status_row(f"{row} · ⏸ manual mode on") is False

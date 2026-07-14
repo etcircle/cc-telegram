@@ -4112,13 +4112,29 @@ _STATUS_ROW_EXCLUSIVE: Final = frozenset(
         "! for shell mode",  # bash mode
     }
 )
-# AT MOST ONE per row. The ``accept edits on`` / ``plan mode on`` siblings exist but
-# their glyph decoration is not corpus-observed, so BOTH glyphs and BOTH the bare
-# and parenthesized forms are accepted — the safe direction for COMPLETENESS, and
-# it adds no recombination power (still exactly one mode segment).
+# AT MOST ONE per row. Each mode text is BOUND to the glyph it is actually OBSERVED
+# with (r6) — the earlier form cross-producted glyph × text and accepted pairings CC
+# never renders (``⏸ bypass permissions on``, ``⏵⏵ manual mode on``). Be clear-eyed
+# about what that fold buys: ~nothing in SAFETY (anyone who can print the mispaired
+# glyph can equally print the correctly-paired one, which MUST be accepted), so the
+# delta is ≈0 — it is a tightening for CORRECTNESS and reviewability, not a hazard
+# fix.
+#
+#   bypass permissions on  ⇒ ``⏵⏵`` ONLY  (live panes + corpus)
+#   manual mode on         ⇒ ``⏸``  ONLY  (the 2.1.209 tall-draft rig fixture)
+#   accept edits on / plan mode on ⇒ glyph UNOBSERVED ⇒ EITHER glyph accepted.
+#
+# That last line is a DELIBERATE completeness-over-tightness choice: guessing a
+# glyph for the two unobserved modes would re-create exactly the r4 false-refusal
+# cliff on a real pane (a user in accept-edits mode with a tall draft would wedge).
+# A rig capture of those two modes would let us bind them — until then, either
+# glyph. It adds no recombination power (still exactly ONE mode segment per row).
 _RE_STATUS_MODE: Final = re.compile(
-    r"(?:⏵⏵|⏸)[ ]+"
-    r"(?:bypass permissions on|accept edits on|plan mode on|manual mode on)"
+    r"(?:"
+    r"⏵⏵[ ]+bypass permissions on"
+    r"|⏸[ ]+manual mode on"
+    r"|(?:⏵⏵|⏸)[ ]+(?:accept edits on|plan mode on)"
+    r")"
     r"(?:[ ]+\(shift\+tab to cycle\))?"
 )
 # ASCII digits ONLY (``\d`` is Unicode-wide — the r3 ``١ shell`` spoof).

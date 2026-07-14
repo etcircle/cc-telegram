@@ -1689,7 +1689,17 @@ hold" for "what CC renders".** The terminal shape is a grammar:
     BAR       := [MODE] · [SHELL] · [EFFORT-PAIR] · [HINT…]
                  …requiring MODE or ≥1 HINT
 
-with **MODE** at most one (never two, never repeated); **SHELL** ASCII-only
+with **MODE** at most one (never two, never repeated), and each mode text **BOUND to
+the glyph it is actually observed with** (r6): `bypass permissions on` ⇒ `⏵⏵` only
+(live panes + corpus), `manual mode on` ⇒ `⏸` only (the 2.1.209 rig fixture) — the
+earlier form cross-producted glyph × text and accepted pairings CC never renders.
+That binding buys ≈0 SAFETY (anyone who can print `⏸ bypass permissions on` can
+equally print the correctly-paired `⏵⏵ bypass permissions on`, which MUST be
+accepted); it is a tightening for CORRECTNESS and reviewability. `accept edits on` /
+`plan mode on` keep EITHER glyph — their decoration is UNOBSERVED, and guessing one
+would re-create exactly the r4 false-refusal cliff on a real pane (a user in
+accept-edits mode with a tall draft would wedge); a rig capture of those two modes
+would let us bind them. **SHELL** ASCII-only
 (`[0-9]+ shell(s)[ still running]` — `[0-9]`, NEVER `\d`; leg 3's substring shell
 token is ASCII-flipped in the same audit, while the refusal-side option-row traps
 and the idle-lane bg-shells parsers deliberately KEEP `\d`, where wider matching is
