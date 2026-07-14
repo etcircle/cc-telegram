@@ -545,3 +545,174 @@ async def test_decision_lock_busy_downgrades_accepted_to_not_advanced(
     assert entry.failed_reason == "lock_busy"
     assert picker.sent == []  # Enter provably never sent
     rerender.assert_awaited()  # fell through to a fresh re-render
+
+
+# ── GH #52 r2 P2-3: the POSITIVE-authorization matrix — variant ∈ {missing,
+# unknown, footerless, footered} across ALL FOUR seams (mint / identify_family /
+# dispatch pre-commit / confirm-side). The three non-footered variants carry
+# folder-trust's EXACT licensed title/options, so nothing but the variant gate
+# stands between them and a mint/license/commit. ──────────────────────────────
+
+_FT_LABELS = ("Yes, I trust this folder", "No, exit")
+_FT_TITLE = "Accessing workspace:"
+
+_VARIANT_META: dict[str, dict[str, str]] = {
+    "missing": {},
+    "unknown": {"decision_variant": "bogus"},
+    "footerless": {"decision_variant": tp.DECISION_VARIANT_FOOTERLESS},
+    "footered": {"decision_variant": tp.DECISION_VARIANT_FOOTERED},
+}
+_NON_FOOTERED = ["missing", "unknown", "footerless"]
+
+
+def _ft_form(variant: str) -> tp.AskUserQuestionForm:
+    """A clean single-select folder-trust-signature form carrying ``variant``."""
+    options = tuple(
+        tp.AskOption(label=label, recommended=False, cursor=(i == 0), number=i + 1)
+        for i, label in enumerate(_FT_LABELS)
+    )
+    excerpt_lines = [_FT_TITLE, "body line"] + [
+        f"{'❯ ' if o.cursor else '  '}{o.number}. {o.label}" for o in options
+    ]
+    return tp.AskUserQuestionForm(
+        current_question_title=_FT_TITLE,
+        options=options,
+        is_review_screen=False,
+        is_free_text=False,
+        pane_excerpt="\n".join(excerpt_lines),
+        select_mode="single",
+        options_complete=True,
+        _meta=dict(_VARIANT_META[variant]),
+    )
+
+
+# Seam 1 — decision_token.identify_family (the leaf belt-and-braces gate).
+
+
+@pytest.mark.parametrize("variant", _NON_FOOTERED)
+def test_identify_family_refuses_non_footered_variant(variant: str) -> None:
+    assert dt.identify_family(_ft_form(variant)) is None
+
+
+def test_identify_family_accepts_footered_variant() -> None:
+    assert dt.identify_family(_ft_form("footered")) == "folder-trust"
+
+
+# Seam 2 — the render mint (_build_decision_pick_rows).
+
+
+@pytest.mark.parametrize("variant", _NON_FOOTERED)
+def test_mint_refuses_non_footered_variant(variant: str) -> None:
+    from unittest.mock import patch
+
+    from cctelegram.handlers import interactive_ui as iui
+
+    with patch.object(iui, "parse_generic_decision", return_value=_ft_form(variant)):
+        rows = iui._build_decision_pick_rows(
+            _OWNER_ID, _THREAD_ID, _WINDOW_ID, "pane text", _LICENSED
+        )
+    assert rows is None
+
+
+def test_mint_accepts_footered_variant() -> None:
+    from unittest.mock import patch
+
+    from cctelegram.handlers import interactive_ui as iui
+
+    with patch.object(iui, "parse_generic_decision", return_value=_ft_form("footered")):
+        rows = iui._build_decision_pick_rows(
+            _OWNER_ID, _THREAD_ID, _WINDOW_ID, "pane text", _LICENSED
+        )
+    assert rows, "the footered positive control must mint dcp: rows"
+    datas = [b.callback_data for row in rows for b in row]
+    assert all(d and d.startswith("dcp:") for d in datas)
+
+
+# Seam 3 — the dispatch pre-commit gate (_dispatch_decision_pane_locked).
+
+
+async def _run_pane_locked_with_form(
+    form: tp.AskUserQuestionForm, minted_fingerprint: str
+) -> cbi._DecisionPaneOutcome:
+    from unittest.mock import patch
+
+    tmux = SimpleNamespace(
+        capture_pane=AsyncMock(return_value="pane text"),
+        pane_current_command=AsyncMock(return_value=_LICENSED),
+        send_keys=AsyncMock(return_value=True),
+    )
+    with (
+        patch.object(
+            cbi,
+            "extract_interactive_content",
+            return_value=tp.InteractiveUIContent(content="x", name="Decision"),
+        ),
+        patch.object(cbi, "parse_generic_decision", return_value=form),
+    ):
+        return await cbi._dispatch_decision_pane_locked(
+            user=SimpleNamespace(id=_OWNER_ID),
+            tmux_manager=tmux,
+            w=SimpleNamespace(window_id=_WINDOW_ID),
+            window_id=_WINDOW_ID,
+            minted_fingerprint=minted_fingerprint,
+            option_number=1,
+            option_label=_FT_LABELS[0],
+            ledger_key=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", _NON_FOOTERED)
+async def test_precommit_bails_on_non_footered_variant(variant: str) -> None:
+    form = _ft_form(variant)
+    outcome = await _run_pane_locked_with_form(
+        form, tp.decision_prompt_fingerprint(form)
+    )
+    assert outcome.kind == "not_advanced"
+    assert outcome.reason == "variant_not_footered"
+
+
+@pytest.mark.asyncio
+async def test_precommit_passes_variant_gate_on_footered() -> None:
+    # Positive control for the GATE (not the whole transaction): a footered form
+    # proceeds PAST the variant gate — a deliberately-mismatched fingerprint then
+    # bails at the NEXT check, proving the variant gate was traversed.
+    outcome = await _run_pane_locked_with_form(_ft_form("footered"), "nope")
+    assert outcome.kind == "not_advanced"
+    assert outcome.reason == "fingerprint_mismatch"
+
+
+# Seam 4 — the confirm-side (_classify_decision_advance).
+
+
+@pytest.mark.parametrize("variant", _NON_FOOTERED)
+def test_confirm_refuses_non_footered_variant(variant: str) -> None:
+    from unittest.mock import patch
+
+    form = _ft_form(variant)
+    with (
+        patch.object(
+            cbi,
+            "extract_interactive_content",
+            return_value=tp.InteractiveUIContent(content="x", name="Decision"),
+        ),
+        patch.object(cbi, "parse_generic_decision", return_value=form),
+    ):
+        # Even with a DIFFERENT fingerprint (which for a proven-footered form
+        # would confirm), a non-footered variant must NOT establish resolution.
+        assert cbi._classify_decision_advance("pane text", "different-fp") is False
+
+
+def test_confirm_accepts_different_footered_form() -> None:
+    from unittest.mock import patch
+
+    form = _ft_form("footered")
+    with (
+        patch.object(
+            cbi,
+            "extract_interactive_content",
+            return_value=tp.InteractiveUIContent(content="x", name="Decision"),
+        ),
+        patch.object(cbi, "parse_generic_decision", return_value=form),
+    ):
+        assert cbi._classify_decision_advance("pane text", "different-fp") is True
