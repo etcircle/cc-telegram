@@ -1665,10 +1665,19 @@ STRUCTURAL proof the lone in-window separator is the box's BOTTOM rule (substrin
 markers are model-spoofable — an AUQ header carrying `/effort` hits the leg-3
 substring alphabet — so each part kills an independently-reproduced spoof): **(a)**
 the FIRST non-blank row below the lone separator FULLMATCHES the strict
-`_is_status_row` grammar (derived from the SAME `_INPUT_READY_CHROME_MARKERS` +
-shell-token arm leg 3 consumes — SINGLE source — but the WHOLE row must reduce to
-chrome glyphs once its markers are removed; any residual LETTER is prose and
-fails, so the `/effort`-header spoof refuses here); **(b)** NO option-row shape
+`_is_status_row` grammar — an ENUMERATED whitelist of the exact observed segment
+forms (r2 fold, Codex P1 twice: the first SUBTRACTIVE grammar let `❯ /effort?`
+through — a full gate bypass + a keyless brake release on a stale empty `❯` row;
+the r1 generative fullmatch still accepted `· /effort ·` via SKIPPED empty
+segments and cross-product forms like `/effort (manual mode on)` / `⏵◐⏸/effort`).
+Every `·`-split segment must FULLMATCH an exact literal from
+`_STATUS_ROW_LITERAL_SEGMENTS` (each `_INPUT_READY_CHROME_MARKERS` marker appears
+ONLY in the decorations it actually renders with — lockstep-tested single source,
+so the whitelist and leg 3's substring alphabet never drift) or a tight token arm
+(`N shell(s)[ still running]`, the `◐ <level>` effort spinner); an EMPTY segment
+REJECTS the row (a real bar never renders `· ·` or leading/trailing bare
+separators — corpus-verified), and no leading/trailing residue is ever accepted;
+**(b)** NO option-row shape
 (`_RE_INPUT_OPTION_ROW`) below the lone separator (Codex's "lone separator is a
 live prompt's TOP rule, `❯ 1. Yes` below it" spoof refuses even if (a) were
 spoofed); **(c)** the first non-blank row directly below the found top rule is a

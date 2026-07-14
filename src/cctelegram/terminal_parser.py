@@ -4017,49 +4017,66 @@ def _normalize_input_row(row: str) -> str:
 # ``clean_ghost_input_text``.
 _INPUT_BOX_TOP_SCAN_LINES: Final = 60
 
-# The strict status-row segment grammar (GH #56 r1 fold — Codex P1). The
-# ORIGINAL grammar was SUBTRACTIVE (strip known marker substrings, reject only
-# ALPHABETIC residue), which was not a fullmatch: ``❯ /effort?`` passed it (the
-# ``/effort`` marker stripped, the ``❯ ?`` residue is non-alphabetic), and with
-# an older reachable rule + a stale ``❯`` row above, the fallback located a fake
-# bracket on a LIVE BLOCKING surface — a full gate bypass (and, on an empty stale
-# ``❯`` row, a keyless brake release). Codex reproduced all three; each is pinned
-# as a refusing test.
+# The strict status-row segment grammar (GH #56 r1+r2 folds — Codex P1 twice).
 #
-# The replacement is ANCHORED: split the row on ``·``; EVERY whitespace-stripped
-# segment must FULLMATCH one of the canonical forms — an exact marker string from
-# ``_INPUT_READY_CHROME_MARKERS`` (SINGLE source with leg 3's substring alphabet,
-# so the two never drift), optionally carrying a leading mode-glyph run (``⏵⏵``,
-# ``⏸``, the ``◐◑◒◓`` spinner) and/or a parenthetical that is ITSELF a canonical
-# marker (``⏵⏵ bypass permissions on (shift+tab to cycle)``) — or the shell-token
-# form ``N shell(s)`` with its known ``still running`` suffix. No leading or
-# trailing residue is EVER accepted: ``❯ /effort?`` fails (the segment does not
-# fullmatch any form) and ``❯ 1 shell?`` fails on the glyph and the trailing
-# ``?``. Zero segments → False.
-_STATUS_SEGMENT_PATTERNS: Final = (
-    re.compile(
-        r"(?:[⏵⏸◐◑◒◓]+\s*)?"
-        + "(?:"
-        + "|".join(re.escape(m) for m in _INPUT_READY_CHROME_MARKERS)
-        + ")"
-        + r"(?:\s*\((?:"
-        + "|".join(re.escape(m) for m in _INPUT_READY_CHROME_MARKERS)
-        + r")\))?"
-    ),
+# The ORIGINAL grammar was SUBTRACTIVE (strip known marker substrings, reject
+# only ALPHABETIC residue) — ``❯ /effort?`` passed it, a full gate bypass on a
+# live-blocking-shaped pane. The r1 replacement was fullmatch but GENERATIVE
+# (any glyph run × any marker × any marker-parenthetical), which was still
+# gameable at two edges (r2): EMPTY ``·`` segments were SKIPPED, so ``· /effort ·``
+# reduced to the single valid segment ``/effort`` (a reproduced gate bypass +
+# keyless brake release in the full fallback geometry); and the cross-product
+# accepted impossible forms like ``/effort (manual mode on)`` and ``⏵◐⏸/effort``.
+#
+# The grammar is therefore an ENUMERATED whitelist of the EXACT observed segment
+# forms (fixture corpus + the message-handling.md alphabet — each marker appears
+# ONLY in the decorations it actually renders with; a marker never validates
+# wrapped in another marker's parenthetical or prefixed by glyph soup), plus two
+# tightly-shaped token arms (the ``N shell(s)`` count and the ``◐ <level>``
+# effort spinner — observed ``◐ medium · /effort``). An EMPTY segment REJECTS
+# the row: a real status bar never renders ``· ·`` or leading/trailing bare
+# separators (corpus-verified — the only ``·``-leading rows are prompt-body
+# bullets), while model-controlled bullet content routinely does.
+#
+# SINGLE SOURCE with leg 3: every marker in ``_INPUT_READY_CHROME_MARKERS``
+# appears in at least one form below, and every literal form carries at least
+# one marker — pinned by a lockstep test, so the two alphabets can never drift.
+# The ``accept edits`` / ``plan mode`` decorations are the documented shift+tab
+# mode family (not corpus-observed on a first-below row); if their real
+# decoration differs the fallback merely fails CLOSED on those panes.
+_STATUS_ROW_LITERAL_SEGMENTS: Final = (
+    "⏵⏵ bypass permissions on (shift+tab to cycle)",
+    "⏵⏵ bypass permissions on",
+    "⏵⏵ accept edits on (shift+tab to cycle)",
+    "⏵⏵ accept edits on",
+    "⏸ plan mode on (shift+tab to cycle)",
+    "⏸ plan mode on",
+    "⏸ manual mode on",
+    "? for shortcuts",
+    "← for agents",
+    "↓ to manage",
+    "esc to interrupt",
+    "! for shell mode",
+    "paste again to expand",
+    "/effort",
+)
+_STATUS_ROW_TOKEN_SEGMENTS: Final = (
     re.compile(r"\d+\s+shells?(?:\s+still\s+running)?"),
+    re.compile(r"[◐◑◒◓]\s+(?:low|medium|high|xhigh)"),
 )
 
 
 def _is_status_row(line: str) -> bool:
     """True iff ``line`` is a WHOLE Claude Code ready-status-bar row (GH #56).
 
-    A STRICT anchored segment-FULLMATCH grammar (see
-    ``_STATUS_SEGMENT_PATTERNS``). The exactly-one-separator fallback in
-    ``_input_box_rows`` uses it to prove the lone in-window separator is the
-    input box's BOTTOM rule: the first non-blank row below a genuine bottom rule
-    is the status bar. Model-controlled prompt content that merely EMBEDS a
-    marker substring can never qualify — the whole segment must BE a canonical
-    chrome form.
+    A STRICT enumerated segment-FULLMATCH grammar (see
+    ``_STATUS_ROW_LITERAL_SEGMENTS`` / ``_STATUS_ROW_TOKEN_SEGMENTS``). The
+    exactly-one-separator fallback in ``_input_box_rows`` uses it to prove the
+    lone in-window separator is the input box's BOTTOM rule: the first non-blank
+    row below a genuine bottom rule is the status bar. Model-controlled prompt
+    content that merely EMBEDS a marker substring can never qualify — every
+    ``·``-delimited segment must BE an exact observed chrome form, and an empty
+    segment rejects the whole row.
     """
     s = _normalize_input_row(_strip_ansi(line)).strip()
     if not s:
@@ -4068,8 +4085,13 @@ def _is_status_row(line: str) -> bool:
     for segment in s.split("·"):
         seg = segment.strip()
         if not seg:
-            continue
-        if not any(p.fullmatch(seg) for p in _STATUS_SEGMENT_PATTERNS):
+            # A bare leading/trailing/double separator is NEVER status chrome
+            # (r2 P1a — skipping these let ``· /effort ·`` reduce to one valid
+            # segment and re-open the gate bypass).
+            return False
+        if seg not in _STATUS_ROW_LITERAL_SEGMENTS and not any(
+            p.fullmatch(seg) for p in _STATUS_ROW_TOKEN_SEGMENTS
+        ):
             return False
         saw_chrome = True
     return saw_chrome

@@ -808,6 +808,10 @@ _BASELINE_CLASSIFICATIONS = {
     "inputbox_multiline_draft_v2.1.207.txt": None,
     "inputbox_paste_collapsed_reverted_v2.1.207.txt": None,
     "inputbox_paste_collapsed_v2.1.207.txt": None,
+    # r2 fold P3: the 2.1.209 paste-collapse twin is NOT flipped by GH #56 (it
+    # classified deliverable pre-change — a normal 2-separator box whose status
+    # bar is the paste hint), so it belongs in the baked map.
+    "inputbox_paste_collapsed_v2.1.209.txt": None,
     "inputbox_slash_exact_clear_v2.1.207.txt": "completion_overlay",
     "inputbox_slash_overlay_v2.1.207.txt": "completion_overlay",
     "inputbox_slash_with_arg_v2.1.207.txt": None,
@@ -848,14 +852,15 @@ def test_existing_corpus_classifications_are_unchanged() -> None:
 def test_the_baked_baseline_covers_the_whole_fixture_directory() -> None:
     """SET EQUALITY between the fixture-directory listing and the baked dict
     (r1 fold P2): any future fixture landing in the directory without a baked
-    classification fails HERE instead of being silently uncovered. The four
-    2.1.209 GH #56 fixtures are the only exclusions — they are the fixtures this
-    change deliberately FLIPS, and they carry their own explicit pins above."""
+    classification fails HERE instead of being silently uncovered. The three
+    tall-draft 2.1.209 GH #56 fixtures are the only exclusions — they are the
+    fixtures this change deliberately FLIPS / newly-introduces with their own
+    explicit pins above (`inputbox_paste_collapsed_v2.1.209.txt` is NOT flipped
+    — it classified deliverable pre-change too — so it is BAKED, r2 fold P3)."""
     gh56_fixtures = {
         _TALL_DRAFT,
         _TALL_DRAFT_ANSI,
         _TALL_DRAFT_CLEARED,
-        "inputbox_paste_collapsed_v2.1.209.txt",
     }
     on_disk = {p.name for p in FIXTURES.glob("*.txt")}
     assert on_disk == set(_BASELINE_CLASSIFICATIONS) | gh56_fixtures
@@ -926,9 +931,72 @@ def test_the_strict_grammar_accepts_the_real_status_rows() -> None:
         "⏸ manual mode on",  # the tall-draft fixture's only status row
         "⏸ manual mode on · ? for shortcuts · ← for agents",  # the cleared twin
         "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        "⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents",
         "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
         "paste again to expand",
         "esc to interrupt",
+        "! for shell mode",
         "1 shell still running",
+        "◐ medium · /effort",  # the effort segment pair (inputbox_paste_collapsed_v2.1.207)
     ):
         assert tp._is_status_row(row) is True, row
+
+
+# ── GH #56 r2 fold (Codex P1): the ENUMERATED whitelist — no empty segments,
+#    no glyph×marker×parenthetical cross-product ─────────────────────────────
+#
+# The r1 fullmatch grammar was still gameable at two edges: EMPTY `·` segments
+# were SKIPPED, so `· /effort ·` reduced to the single valid segment `/effort`
+# (Codex drove the full tall-fallback geometry: classify None +
+# pane_input_box_present True + a keyless brake release on the stale-empty-`❯`
+# variant); and the generative prefix/parenthetical combination accepted
+# impossible forms like `/effort (manual mode on)` and `⏵◐⏸/effort`. All three
+# reproduced RED against the r1 grammar; the enumerated whitelist refuses each.
+
+
+def test_spoof_empty_dot_segments_STILL_refuse_full_geometry() -> None:
+    """Codex r2 repro (a): `· /effort ·` — empty segments must REJECT the row,
+    not be skipped. Driven through the FULL fallback geometry: the gate refuses
+    AND the stale-empty-`❯` variant never yields a keyless brake release."""
+    assert tp._is_status_row("· /effort ·") is False
+    assert tp._is_status_row("·") is False
+    assert tp._is_status_row("· ·") is False
+    # Full geometry — the gate bypass shape (stale draft above, lone in-window
+    # separator, the spoof row below it).
+    pane = _lone_sep_pane("· /effort ·")
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+    # The keyless-brake-release shape: a stale EMPTY `❯` under the older rule.
+    rule = "─" * 40
+    empty_pane = (
+        "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + "\n  · /effort ·\n"
+    )
+    assert tp.pane_input_row_empty(empty_pane) is not True
+    assert tp.classify_input_box_failure(empty_pane) == "no_input_box"
+
+
+def test_spoof_marker_wrapped_in_another_markers_parenthetical_refuses() -> None:
+    """Codex r2 repro (b1): the cross-product accepted `/effort (manual mode
+    on)` — a marker must never validate wrapped in another marker's
+    parenthetical. Only the exact observed decorated forms are whitelisted."""
+    assert tp._is_status_row("/effort (manual mode on)") is False
+
+
+def test_spoof_glyph_soup_prefix_refuses() -> None:
+    """Codex r2 repro (b2): the cross-product accepted `⏵◐⏸/effort` — a marker
+    must never validate behind an arbitrary glyph run. Each whitelist form
+    carries exactly the decoration it renders with on real panes."""
+    assert tp._is_status_row("⏵◐⏸/effort") is False
+
+
+def test_the_whitelist_and_leg3_alphabet_stay_in_lockstep() -> None:
+    """SINGLE SOURCE (r2): every leg-3 marker appears in at least one whitelist
+    form (a marker added to `_INPUT_READY_CHROME_MARKERS` without a whitelist
+    form fails HERE — the two alphabets can never silently drift), and every
+    literal whitelist form carries at least one marker (no form can exist that
+    leg 3's substring alphabet would not also recognize)."""
+    forms = tp._STATUS_ROW_LITERAL_SEGMENTS
+    for marker in tp._INPUT_READY_CHROME_MARKERS:
+        assert any(marker in form for form in forms), marker
+    for form in forms:
+        assert any(marker in form for marker in tp._INPUT_READY_CHROME_MARKERS), form
