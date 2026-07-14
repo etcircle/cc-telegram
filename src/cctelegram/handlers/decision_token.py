@@ -422,14 +422,26 @@ _DECISION_DISPATCH_TABLE: Final[dict[str, frozenset[str]]] = {
 }
 
 
+# GH #52 — the footerless-Decision provenance value that authorizes dispatch.
+# Mirrors ``terminal_parser.DECISION_VARIANT_FOOTERED`` (a leaf-preserving literal
+# so this module stays pure-stdlib — the ``_meta`` dict is read directly, never a
+# ``terminal_parser`` runtime import). A footered variant is the ONLY dispatchable
+# shape; ABSENT / footerless / unknown all refuse (positive authorization).
+_DECISION_VARIANT_FOOTERED: Final[str] = "footered"
+
+
 def identify_family(form: AskUserQuestionForm) -> str | None:
     """Return the §2b family id this Decision form matches, or ``None``.
 
-    Match IFF the EXACT ordered option-label tuple equals the family signature
-    AND the normalized (stripped) title matches the family's anchored pattern.
-    A title-less form (``current_question_title is None``) never matches a
-    title-anchored family.
+    Match IFF the form is a proven-FOOTERED Decision variant (GH #52 — belt and
+    braces at the leaf: a footerless / variant-less form never mints ``dcp:``
+    rows regardless of family) AND the EXACT ordered option-label tuple equals the
+    family signature AND the normalized (stripped) title matches the family's
+    anchored pattern. A title-less form (``current_question_title is None``) never
+    matches a title-anchored family.
     """
+    if form._meta.get("decision_variant") != _DECISION_VARIANT_FOOTERED:
+        return None
     labels = tuple(o.label for o in form.options)
     title = (form.current_question_title or "").strip()
     for family, (sig_labels, title_re) in _FAMILY_SIGNATURES.items():

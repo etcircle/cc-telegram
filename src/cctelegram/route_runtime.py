@@ -82,8 +82,12 @@ Concurrency contract:
   - A pane/lifecycle signal may also **PROMOTE** an *active* ``RUNNING``
     route (empty ``open_tools``) to ``WAITING_ON_USER`` via
     ``mark_interactive_pending`` — for the window where Claude Code buffers
-    an interactive ``tool_use`` (AskUserQuestion / ExitPlanMode) in JSONL,
-    so the transcript can't yet open the id. It is **strictly lower
+    an interactive ``tool_use`` in JSONL (or shows a live blocking prompt with
+    no JSONL trace at all) so the transcript can't yet open the id. It is
+    **UI-name-agnostic** — the poller fires it from any pane-confirmed live
+    interactive surface (AskUserQuestion / ExitPlanMode, and the flag-gated
+    Permission / Workflow / Decision cards, incl. the GH #52 footerless
+    ``Switch model?`` Decision). It is **strictly lower
     authority than the transcript**: the deriver checks ``open_tools``
     first, the promote fires only on an active ``RUNNING`` route, and the
     ``tool_use`` / known-``tool_result`` / end-of-turn / user branches zero
@@ -1359,12 +1363,14 @@ async def mark_inbound_sent(route: Route) -> RouteRuntimeSnapshot:
 
 
 async def mark_interactive_pending(route: Route) -> RouteRuntimeSnapshot:
-    """Promote an active ``RUNNING`` route to ``WAITING_ON_USER`` for a
-    buffered interactive ``tool_use`` (AskUserQuestion / ExitPlanMode).
+    """Promote an active ``RUNNING`` route to ``WAITING_ON_USER`` for a live
+    blocking interactive surface the transcript can't yet open.
 
-    Called by ``status_polling`` from a **pane-confirmed** live picker /
-    plan-approval surface while Claude Code buffers the interactive
-    ``tool_use`` in JSONL (so the transcript can't open the id yet). Lower
+    **UI-name-agnostic** — called by ``status_polling`` from ANY pane-confirmed
+    live interactive surface: an AskUserQuestion picker / ExitPlanMode
+    plan-approval whose ``tool_use`` is buffered in JSONL, and the flag-gated
+    Permission / Workflow / Decision cards (incl. the GH #52 footerless
+    ``Switch model?`` Decision, which has no JSONL trace at all). Lower
     authority than the transcript:
 
       - **Promote-from-RUNNING-with-empty-open-tools-only.** No-op on an
