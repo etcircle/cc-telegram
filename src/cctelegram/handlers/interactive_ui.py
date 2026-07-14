@@ -48,11 +48,13 @@ from ..session import (
     session_manager,
 )
 from ..terminal_parser import (
+    DECISION_VARIANT_FOOTERED,
     REVIEW_SUBMIT_LABEL,
     AskUserQuestionForm,
     InteractiveUIContent,
     build_form_from_tool_input,
     decision_prompt_fingerprint,
+    decision_variant_of,
     extract_epm_plan_file_path,
     extract_interactive_content,
     parse_ask_user_question,
@@ -2930,6 +2932,11 @@ def _build_decision_pick_rows(
         return None
     form = parse_generic_decision(pane_text)
     if form is None:
+        return None
+    # GH #52 — POSITIVE authorization: mint ``dcp:`` rows ONLY for a proven-FOOTERED
+    # variant, checked BEFORE ``identify_family`` (which also refuses a non-footered
+    # form — belt and braces). A footerless / variant-less form is display-only.
+    if decision_variant_of(form) != DECISION_VARIANT_FOOTERED:
         return None
     family = decision_token.identify_family(form)
     if family is None:

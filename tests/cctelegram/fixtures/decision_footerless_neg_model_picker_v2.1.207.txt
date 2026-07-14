@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.207 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│               Welcome back Emiliyan!               │ Run /init to create a CLAUDE.md file with instructions for Claude                                       │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                              │
+│                      ▝▜█████▛▘                     │ Auto mode is now available without `CLAUDE_CODE_ENABLE_AUTO_MODE` opt-in on Bedrock, Vertex AI, and Fo… │
+│                        ▘▘ ▝▝                       │ Fixed the terminal freezing and keystrokes lagging while streaming responses containing very long list… │
+│      Fable 5 with high effort · Claude Max ·       │ Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… │
+│      em.tanev@gmail.com's Organization             │ /release-notes for more                                                                                 │
+│              /private/tmp/ccrig2-cwd               │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 3 MCP servers need authentication · run /mcp
+
+❯ Use the WebFetch tool on https://example.com and tell me the title. Do it now.
+
+⏺ I'll load the WebFetch tool and fetch the page.
+
+⏺ Fetch(https://example.com)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Sautéed for 1m 17s
+
+❯ Now WebFetch https://example.org and give me the title.
+
+⏺ Fetch(https://example.org)
+  ⎿  Received 559 bytes (200 OK)
+
+⏺ The title of https://example.org is "Example Domain".
+
+✻ Churned for 13s
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names, specify with --model.
+
+     1. Default (recommended)  Opus 4.8 with 1M context · Best for everyday, complex tasks
+     2. Opus                   Opus 4.8 with 1M context · Best for everyday, complex tasks
+   ❯ 3. Fable ✔                Fable 5 · Most capable for your hardest and longest-running tasks
+     4. Sonnet                 Sonnet 5 · Efficient for routine tasks
+     5. Haiku                  Haiku 4.5 · Fastest for quick answers
+
+   ● High effort (default) ←/→ to adjust
+
+   Enter to set as default · s to use this session only · Esc to cancel

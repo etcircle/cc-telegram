@@ -2935,6 +2935,30 @@ there — the P1-C dead-tap). Default OFF; a flag-OFF deploy mints no buttons an
 `dcp:` callback declines ("Dispatch disabled — use the nav keys."). Requires
 `CC_TELEGRAM_DECISION_CARDS` ON to matter.
 
+**GH #52 — the FOOTERLESS `Switch model?` Decision shape + the footered-only
+dispatch fence.** CC 2.1.207's `Switch model?` confirmation renders with NO footer
+(it ends at its last option under a full-width `▔` modal rule), so
+`parse_generic_decision` grew a SECOND leg (`_parse_footerless_decision`) that runs
+whenever the footered leg returns None. A footerless parse requires {a TERMINAL
+1..N numbered block anchored at the last non-blank line + a live `❯` cursor + a
+title IMMEDIATELY below a `▔` rule + the named-anchor / verb-agnostic /
+attached-footer / strict-validator VETOES}, and `extract_interactive_content` runs
+it as a **flag-gated PREFLIGHT** before accepting any loose validator-less named
+match (so a stale scrollback AUQ/EPM/Settings above a live footerless modal can't
+shadow it). Each leg stamps `_meta["decision_variant"]` (`"footered"` /
+`"footerless"`), folded into `decision_prompt_fingerprint`. **The footerless
+variant is DISPLAY-ONLY — it never dispatches:** `_build_decision_pick_rows` +
+`decision_token.identify_family` + the `_dispatch_decision_pane_locked` pre-commit
+gate + `_classify_decision_advance`'s confirm-side ALL require `decision_variant ==
+"footered"` (positive authorization: an ABSENT / footerless / unknown variant fails
+the same way). The confirm-side records `dispatched` ONLY when the post-Enter pane
+shows a DIFFERENT proven-FOOTERED form OR **NO DECISION RESIDUE** — a new confirm
+predicate `terminal_parser.has_decision_residue` (a strict Decision footer line OR a
+terminal contiguous numbered block; a still-standing option block IS residue even
+when no parser recognizes the frame) — so a footered mint whose pane re-parses
+FOOTERLESS mid-redraw, and a `─`-ruled footer-dropped folder-trust frame that
+extract-None's, both record `commit_unconfirmed`, never a false `dispatched`.
+
 **Render mint** (`interactive_ui._build_decision_pick_rows`, in the
 `content.name == "Decision"` gate branch): mints `dcp:<route_hash>:<fp8>:<opt>:<token>`
 buttons ONLY when the flag is ON, the strict `parse_generic_decision` form matches a

@@ -49,12 +49,14 @@ from cctelegram.handlers.interactive_ui import (
     handle_interactive_ui,
 )
 from cctelegram.terminal_parser import (
+    DECISION_VARIANT_FOOTERED,
     AskUserQuestionForm,
-    _is_decision_footer_line,
     _loose_label_match,
     _pane_looks_like_picker,
     decision_prompt_fingerprint,
+    decision_variant_of,
     extract_interactive_content,
+    has_decision_residue,
     parse_generic_decision,
     resolve_ask_form,
 )
@@ -767,30 +769,34 @@ def _decision_stable_key(entry: decision_token.DecisionTokenEntry) -> str:
 
 
 def _classify_decision_advance(pane2: str, minted_fingerprint: str) -> bool:
-    """True iff the committed Decision fingerprint is GONE from the post-Enter pane
-    — under the SAME extractor semantics the render mint and the pre-commit gate
-    use (review r1 P2-B: first-match-wins parity on the CONFIRM side too).
+    """True iff the committed Decision provably resolved on the post-Enter pane —
+    the r4 P1 + r5 P1 false-advance close (with a DEFINED confirm-side residue
+    predicate).
 
-    Sound ONLY under §2b-proven families (Enter was the only commit-capable key
-    sent). ``dispatched`` fires ONLY on the confirmed-absence proof; every
-    ambiguity fails CLOSED to ``commit_unconfirmed`` (refresh-only). Runs the
-    FULL ``extract_interactive_content`` (never the bare ``parse_generic_decision``
-    — a WEAKER recognizer: a Settings/AUQ pane that merely decision-parses would
-    fp-compare as a "different Decision" and wrongly confirm):
+    ``dispatched`` may be recorded ONLY when the confirm pane shows (i) a DIFFERENT
+    proven-FOOTERED Decision form, OR (ii) NO DECISION RESIDUE. Anything else —
+    a footerless / variant-less Decision form, or residue present under a named UI
+    or a None extract — fails CLOSED to ``commit_unconfirmed`` (refresh-only).
 
-      * extractor → ``Decision``: compare ``decision_prompt_fingerprint``. Same
-        fp = the round-3 zero-absence variant (a byte-identical prompt re-raised
-        before the committed one's absence was ever observed) → unconfirmed;
-        different fp = the committed prompt resolved and a NEW one raised within
-        the settle → resolved (§11-5).
-      * extractor → ANOTHER named interactive UI, or None: ``dispatched`` ONLY
-        when the capture is NON-EMPTY and no Decision footer/marker line remains
-        on it (the committed fingerprint is positively absent from an actually
-        observed frame); a still-present footer — under a named UI that stole
-        first-match, or an unparseable frame — is AMBIGUOUS → unconfirmed, never
-        dispatched. An EMPTY/blank capture is NOT absence proof ("we didn't see
-        the thing" — r2 Hermes P2): it fails closed to unconfirmed rather than
-        falsely finalizing + releasing the single-use key.
+    Runs the FULL ``extract_interactive_content`` (never the bare
+    ``parse_generic_decision`` — a WEAKER recognizer: a Settings/AUQ pane that
+    merely decision-parses would fp-compare as a "different Decision" and wrongly
+    confirm):
+
+      * extractor → ``Decision`` AND the live form is proven FOOTERED: compare
+        ``decision_prompt_fingerprint``. Same fp = the round-3 zero-absence variant
+        (the committed prompt re-raised before its absence was observed) →
+        unconfirmed; different fp = it resolved and a new FOOTERED one raised within
+        the settle → resolved. A footerless / variant-less re-parse of the SAME
+        logical prompt (the r5 P1(a) reproduced false-advance) is NOT a different
+        form → fail closed.
+      * extractor → ANOTHER named UI, or None: ``dispatched`` ONLY when there is NO
+        DECISION RESIDUE (``has_decision_residue`` — a strict Decision footer line
+        OR a terminal contiguous numbered-option block; a still-standing option
+        block IS residue even when no parser recognizes the frame, closing the r5
+        P1(b) ``─``-ruled footer-dropped folder-trust false-advance). An EMPTY/blank
+        capture carries no residue but is NOT positive absence proof (r2 Hermes P2)
+        → fail closed to unconfirmed.
     """
     content = extract_interactive_content(pane2)
     if content is not None and content.name == "Decision":
@@ -798,10 +804,16 @@ def _classify_decision_advance(pane2: str, minted_fingerprint: str) -> bool:
         if aform is None:
             # Extractor/validator disagreement — ambiguous, fail closed.
             return False
+        # Only a proven-FOOTERED live form may establish a "different form"
+        # resolution (r4 P1): a footerless / variant-less re-parse is treated as
+        # the same logical prompt still present → unconfirmed.
+        if decision_variant_of(aform) != DECISION_VARIANT_FOOTERED:
+            return False
         return decision_prompt_fingerprint(aform) != minted_fingerprint
     if not pane2 or not pane2.strip():
         return False  # empty capture ≠ positive absence proof (r2 Hermes P2)
-    return not any(_is_decision_footer_line(line) for line in pane2.split("\n"))
+    # Named UI / unparseable frame: dispatched ONLY when NO Decision residue remains.
+    return not has_decision_residue(pane2)
 
 
 @dataclass(frozen=True)
@@ -866,6 +878,13 @@ async def _dispatch_decision_pane_locked(
     live_form = parse_generic_decision(pane)
     if live_form is None:
         return _bail_not_advanced("parse_failed")
+
+    # GH #52 — POSITIVE authorization at tap: a card minted FOOTERED whose live pane
+    # re-parses footerless / variant-less mid-dispatch must NOT commit (the digit
+    # HOTKEY / Enter semantics of the two shapes are not proven equivalent). Bail
+    # PRE-COMMIT (Enter never sent → fall through / re-render).
+    if decision_variant_of(live_form) != DECISION_VARIANT_FOOTERED:
+        return _bail_not_advanced("variant_not_footered")
 
     # (c) Identity — the body-inclusive fingerprint (two folder-trust prompts for
     # DIFFERENT dirs differ) + geometry/family gates.
