@@ -1,0 +1,50 @@
+
+[38;5;174m╭───[39m [38;5;174mClaude Code[39m [38;5;246mv2.1.207[39m [38;5;174m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[39m                                                    [2m[38;5;174m│[0m [1m[38;5;174mTips for getting started[0m                                                                                [38;5;174m│
+│[39m               [1mWelcome back Emiliyan![0m               [2m[38;5;174m│[0m Ask Claude to create a new app or clone a repository                                                    [38;5;174m│
+│[39m                                                    [2m[38;5;174m│[0m [38;5;174m───────────────────────────────────────────────────────────────────────────────────────────────────────[39m [38;5;174m│
+│[39m                      [38;5;174m ▐[48;5;16m▛███▜[49m▌[39m                      [2m[38;5;174m│[0m [1m[38;5;174mWhat's new[0m                                                                                              [38;5;174m│
+│[39m                      [38;5;174m▝▜[48;5;16m█████[49m▛▘[39m                     [2m[38;5;174m│[0m Auto mode is now available without `CLAUDE_CODE_ENABLE_AUTO_MODE` opt-in on Bedrock, Vertex AI, and Fo… [38;5;174m│
+│[39m                      [38;5;174m  ▘▘ ▝▝  [39m                     [2m[38;5;174m│[0m Fixed the terminal freezing and keystrokes lagging while streaming responses containing very long list… [38;5;174m│
+│[39m   [38;5;246mOpus 4.8 (1M context) with me… · Claude Max · [39m   [2m[38;5;174m│[0m Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… [38;5;174m│
+│[39m   [38;5;246mem.tanev@gmail.com's Organization[39m                [2m[38;5;174m│[0m [3m[38;5;246m/release-notes for more[0m                                                                                 [38;5;174m│
+│[39m          [38;5;246m/private/tmp/ccrig-gh54-mq/work[39m           [2m[38;5;174m│[0m                                                                                                         [38;5;174m│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+[39m [38;5;174m▎[39m [38;5;174mExtended through July 19[39m
+ [38;5;174m▎[39m We're extending Claude Fable 5 access on all paid plans, as well as keeping Claude Code’s weekly rate limits 50% higher, through July 19.
+ [38;5;174m▎[39m
+ [38;5;174m▎[39m As before, you can use up to half of your weekly usage limit on Fable 5. After that, you can keep using Fable 5 with usage credits, or switch to another
+ [38;5;174m▎[39m model to keep working within your remaining limits.
+ [38;5;174m▎[39m
+ [38;5;174m▎[39m More details here: [94m]8;id=1iz7s2z;https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access\https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access[39m]8;;\
+
+[38;5;239m[48;5;237m❯ [38;5;231mCall the AskUserQuestion tool exactly once with TWO questions in the questions array, BOTH single-select (multiSelect false). Question 1: header 'Alpha', [39m
+  [38;5;231m~100-char question, three options each with a label, a ~150-char description, AND a preview field containing a 6-line ASCII box-drawing mockup (using the [39m
+  [38;5;231mbox-drawing corner and vertical characters). Question 2: header 'Beta', same shape, three options with previews. Do nothing else.[39m
+
+[38;5;246m[49m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+← [38;5;16m[48;5;153m ☐ Alpha [39m[49m ☐ Beta  ✔ Submit  →
+
+[1m[38;5;231mFor the Alpha panel, which layout should the dashboard use as its primary arrangement for the summary widgets?[0m
+
+[38;5;153m❯[38;5;246m 1.[1m[38;5;153m Sidebar + main[0m               [38;5;246m┌──────────────────────────────────────────┐[39m
+ [38;5;246m 2.[39m Stacked cards                [38;5;246m│ [39m┌────┬──────────────────────┐[38;5;246m            │[39m
+ [38;5;246m 3.[39m Grid of tiles                [38;5;246m│ [39m│ NAV│  MAIN CONTENT        │[38;5;246m            │[39m
+                                  [38;5;246m│ [39m│ ●  │  ┌────────┐┌────────┐│[38;5;246m            │[39m
+                                  [38;5;246m│ [39m│ ○  │  │ card A ││ card B ││[38;5;246m            │[39m
+                                  [38;5;246m│ [39m│ ○  │  └────────┘└────────┘│[38;5;246m            │[39m
+                                  [38;5;246m│ [39m└────┴──────────────────────┘[38;5;246m            │[39m
+                                  [38;5;246m└──────────────────────────────────────────┘[39m
+
+                                  [38;5;153mNotes:[39m [3m[38;5;246mpress n to add notes[0m
+
+[38;5;246m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  Chat about this
+
+[38;5;246mEnter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel[39m
+
+
+
+
+

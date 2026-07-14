@@ -1,0 +1,50 @@
+[38;5;174m│[39m   [38;5;246mOpus 4.8 (1M context) with me… · Claude Max · [39m   [2m[38;5;174m│[0m Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… [38;5;174m│
+│[39m   [38;5;246mem.tanev@gmail.com's Organization[39m                [2m[38;5;174m│[0m [3m[38;5;246m/release-notes for more[0m                                                                                 [38;5;174m│
+│[39m              [38;5;246m/private/tmp/ccrig-gh54[39m               [2m[38;5;174m│[0m                                                                                                         [38;5;174m│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+[39m [38;5;174m▎[39m [38;5;174mExtended through July 19[39m
+ [38;5;174m▎[39m We're extending Claude Fable 5 access on all paid plans, as well as keeping Claude Code’s weekly rate limits 50% higher, through July 19.
+ [38;5;174m▎[39m
+ [38;5;174m▎[39m As before, you can use up to half of your weekly usage limit on Fable 5. After that, you can keep using Fable 5 with usage credits, or switch to another
+ [38;5;174m▎[39m model to keep working within your remaining limits.
+ [38;5;174m▎[39m
+ [38;5;174m▎[39m More details here: [94m]8;id=1iz7s2z;https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access\https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access[39m]8;;\
+
+[38;5;239m[48;5;237m❯ [38;5;231mCall the AskUserQuestion tool exactly once with one single-select question (multiSelect false), header "Rig test", a question ~120 chars long, and three [39m
+  [38;5;231moptions. Give EVERY option a label ~25 chars, a description ~200 chars, AND a preview field containing a 6-line ASCII box-drawing mockup using the characters[39m
+  [38;5;231mbox top-left, vertical bar, and box bottom-left. Do not do anything else, do not write files, just call the tool once.[39m
+[49m
+[38;5;231m⏺[39m I'll call the tool once with the question and three previewed options.
+
+[38;5;246m⏺ [39mUser answered Claude's questions:
+[38;5;246m  ⎿  · Which layout should the rig test harness use to render its status panel when a run is executing in the terminal? → Side-by-side columns[39m
+
+[38;5;231m⏺[39m Done — the tool was called once and you selected [1mSide-by-side columns[0m (phases on the left, live counters and timings on the right). Nothing else was run and
+  no files were written.
+
+[38;5;246m✻[39m [38;5;246mCogitated for 12s[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mNow call the AskUserQuestion tool exactly once again with the SAME shape but multiSelect TRUE: header "Rig test multi", one question ~120 chars, three [39m
+  [38;5;231moptions each with a ~25 char label, a ~200 char description, AND a preview field containing a 6-line ASCII box-drawing mockup using box top-left, vertical [39m
+  [38;5;231mbar, box bottom-left characters. Just call the tool once, nothing else.[39m
+[38;5;246m[49m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+← [38;5;16m[48;5;153m ☐ Rig test multi [39m[49m ✔ Submit  →
+
+[1m[38;5;231mWhich extras should the rig test harness render alongside the side-by-side status panel while a run is executing?[0m
+
+[38;5;153m❯[39m [38;5;246m1.[39m [ ] [38;5;153mLive phase timing gutter[39m
+  [38;5;246mAdds a narrow gutter to the right of each phase row showing its elapsed or final wall time, so slow phases stand out mid-run. Costs a few columns of width and
+[39m  [38;5;246mforces phase names to truncate sooner.[39m
+  [38;5;246m2.[39m [ ] Inline failure excerpt
+  [38;5;246mWhen a phase fails, splices the last few lines of its stderr directly into the panel instead of deferring them to the end of the run. Fast triage without [39m
+  [38;5;246mscrollback, but a noisy failure can push the panel past a screen.[39m
+  [38;5;246m3.[39m [ ] Run history sparkline
+  [38;5;246mDraws a compact sparkline of the last several runs beneath the panel, marking pass and fail so flaky phases are visible over time. Requires the harness to [39m
+  [38;5;246mpersist a small local history file between runs.[39m
+  [38;5;246m4. [39m[ ] [38;5;246mType something[39m
+     [1mSubmit[0m
+[38;5;246m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  5. Chat about this
+
+[38;5;246mEnter to select · ↑/↓ to navigate · Esc to cancel[39m

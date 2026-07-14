@@ -739,6 +739,27 @@ _BASELINE_CLASSIFICATIONS = {
     "auq_multiselect_ready_to_submit_tmux_capture.txt": "no_input_box",
     "auq_multiselect_review_cursor_cancel.txt": "no_input_box",
     "auq_multiselect_review_cursor_submit.txt": "no_input_box",
+    # GH #54 preview fixtures (r1 fold P2 — added to keep the dict corpus-complete
+    # after the merge onto main; all live pickers ⇒ no_input_box, verified).
+    "auq_preview_multiquestion_q1_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_multiquestion_q1_v2.1.207.txt": "no_input_box",
+    "auq_preview_multiquestion_q2_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_multiquestion_q2_v2.1.207.txt": "no_input_box",
+    "auq_preview_multiselect_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_multiselect_v2.1.207.txt": "no_input_box",
+    "auq_preview_sidebyside_v2.1.197.aligned.txt": "no_input_box",
+    "auq_preview_sidebyside_v2.1.197.ansi.txt": "no_input_box",
+    "auq_preview_sidebyside_v2.1.197.txt": "no_input_box",
+    "auq_preview_singleselect_cursor2_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_singleselect_cursor2_v2.1.207.txt": "no_input_box",
+    "auq_preview_singleselect_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_singleselect_v2.1.207.txt": "no_input_box",
+    "auq_preview_wraplabels_cursor1_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_wraplabels_cursor1_v2.1.207.txt": "no_input_box",
+    "auq_preview_wraplabels_cursor2_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_wraplabels_cursor2_v2.1.207.txt": "no_input_box",
+    "auq_preview_wraplabels_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_wraplabels_v2.1.207.txt": "no_input_box",
     "auq_single_long_scrolled_cursor1_S500.txt": "no_input_box",
     "auq_single_long_scrolled_cursor2_S500.txt": "no_input_box",
     "auq_single_long_scrolled_cursor3_S500.txt": "no_input_box",
@@ -822,3 +843,92 @@ def test_existing_corpus_classifications_are_unchanged() -> None:
     for name, expected in _BASELINE_CLASSIFICATIONS.items():
         assert (FIXTURES / name).exists(), name  # baseline must not go stale
         assert tp.classify_input_box_failure(_pane(name)) == expected, name
+
+
+def test_the_baked_baseline_covers_the_whole_fixture_directory() -> None:
+    """SET EQUALITY between the fixture-directory listing and the baked dict
+    (r1 fold P2): any future fixture landing in the directory without a baked
+    classification fails HERE instead of being silently uncovered. The four
+    2.1.209 GH #56 fixtures are the only exclusions — they are the fixtures this
+    change deliberately FLIPS, and they carry their own explicit pins above."""
+    gh56_fixtures = {
+        _TALL_DRAFT,
+        _TALL_DRAFT_ANSI,
+        _TALL_DRAFT_CLEARED,
+        "inputbox_paste_collapsed_v2.1.209.txt",
+    }
+    on_disk = {p.name for p in FIXTURES.glob("*.txt")}
+    assert on_disk == set(_BASELINE_CLASSIFICATIONS) | gh56_fixtures
+
+
+# ── GH #56 r1 fold (Codex P1): the strict segment-FULLMATCH status-row grammar ──
+#
+# The original `_is_status_row` was SUBTRACTIVE (strip marker substrings, reject
+# only ALPHABETIC residue) — `❯ /effort?` passed it (marker stripped, residue
+# `❯ ?` non-alphabetic) and, with an older reachable rule + a stale `❯` row
+# above, produced a FULL gate bypass on a live-blocking-shaped pane; the empty
+# stale-`❯` variant even allowed a KEYLESS brake release. All three reproduced
+# RED against the subtractive grammar; the anchored fullmatch grammar refuses
+# each (every `·`-segment must BE a canonical chrome form — no leading/trailing
+# residue is ever accepted).
+
+
+def _lone_sep_pane(status_row: str, *, stale_rows: list[str] | None = None) -> str:
+    """A pane with exactly ONE separator in the 20-line window: an older rule +
+    stale rows above, >18 draft/blank rows, the lone separator, then the spoof
+    "status" row below it."""
+    rule = "─" * 40
+    pad = "\n".join(f"  filler line {i}" for i in range(6))
+    body = "\n".join(
+        stale_rows
+        if stale_rows is not None
+        else ["❯ a stale draft above"] + [f"  draft cont {i}" for i in range(18)]
+    )
+    return f"{pad}\n{rule}\n{body}\n{rule}\n  {status_row}\n"
+
+
+def test_spoof_effort_marker_row_below_lone_separator_STILL_refuses() -> None:
+    """Codex r1-fold repro (i): `❯ /effort?` passed the SUBTRACTIVE grammar and
+    `classify_input_box_failure` returned None on a live-blocking-shaped pane —
+    a full gate bypass. The fullmatch grammar rejects the segment outright."""
+    assert tp._is_status_row("❯ /effort?") is False
+    pane = _lone_sep_pane("❯ /effort?")
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+
+
+def test_spoof_shell_token_row_below_lone_separator_STILL_refuses() -> None:
+    """Codex r1-fold repro (ii): the shell arm was equally weak — `❯ 1 shell?`
+    passed the subtractive grammar (glyph + trailing `?` residue tolerated). The
+    fullmatch form `\\d+ shells?(…)` accepts no residue on either side."""
+    assert tp._is_status_row("❯ 1 shell?") is False
+    assert tp._is_status_row("1 shell?") is False
+    pane = _lone_sep_pane("❯ 1 shell?")
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+
+
+def test_spoof_empty_stale_prompt_row_never_releases_the_brake() -> None:
+    """Codex r1-fold repro (iii): with a stale EMPTY `❯` row under the older
+    rule, the subtractive grammar's fake bracket made `pane_input_row_empty`
+    return True — a KEYLESS brake release on a spoofed surface. Post-fix the
+    fallback never fires, so the probe stays indeterminate (None), never True."""
+    rule = "─" * 40
+    pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + "\n  ❯ /effort?\n"
+    assert tp.pane_input_row_empty(pane) is not True
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+def test_the_strict_grammar_accepts_the_real_status_rows() -> None:
+    """The fullmatch grammar must still accept every REAL captured status-row
+    shape the fallback relies on (incl. the tall-draft fixture's own row)."""
+    for row in (
+        "⏸ manual mode on",  # the tall-draft fixture's only status row
+        "⏸ manual mode on · ? for shortcuts · ← for agents",  # the cleared twin
+        "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+        "paste again to expand",
+        "esc to interrupt",
+        "1 shell still running",
+    ):
+        assert tp._is_status_row(row) is True, row

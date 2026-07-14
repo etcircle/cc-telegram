@@ -1,0 +1,550 @@
+     ======================================================================
+     … +251 lines (ctrl+o to expand)
+
+⏺ The audit is complete and decisive. Here's what 10 agents found across
+  prod+dev concepts and the full retrieval path.
+
+  Concept landscape — your instinct is correct, and the why is clear
+
+  Prod 783 / dev 398 concepts, entirely flat — broader_id, alt_labels,
+  merged_into are 0% used (the SKOS machinery exists, never populated). Three
+  pathologies dominate (all verified live):
+
+  1. Cross-type exact duplication — concept_type is a noise axis, not a
+  classifier. The same concept is emitted under both system and technology (Data
+  Actions, SAC, SAP BW, Planning Model, Excel add-in…). system (581 prod / 270
+  dev) is a dumping bucket.
+  2. Description-as-label — description is 100% NULL; the extractor wrote full
+  English sentences into pref_label ("A hidden data store that holds baseline
+  and inflation values…"). 24 dev rows are prose. Worst graph-readability
+  offender.
+  3. Flat + dormant long tail — 49.7% of dev concepts (198/398) anchor zero
+  facts; 531/783 prod unused. Half the vocabulary is dead weight still polluting
+  the extractor's candidate set and the agent's graph.
+
+  Estimated cleanup: ~55 merge groups → dev 398 → ~250-270, prod 783 → ~520-560.
+  19 zero-risk immediate wins on dev (7 zz synthetic retires + 12 cross-type
+  exact dups, confidence >0.9). Proposed 11-parent taxonomy: SAP Platform → SAC
+  → {Calculation Logic, BW Write-back, Planning App, Dashboard, P&L, Excel,
+  Cockpit, Calendar family, UI-widget residue}.
+
+  Connectivity audit — the answer to "are facts/entities/images/tables connected
+  on search?"
+
+  Verdict: PARTIAL — the data spine is perfect, but retrieval doesn't assemble
+  it.
+
+  Dim: D2 data integrity
+  Status: ✅ YES
+  Finding: Spine pristine both banks: every approved fact (dev 2,867 / prod
+    2,189) has ≥1 subject, 0 orphan chunks, 0 missing embeddings, 0  isolated
+    masters. The data is fully connected.
+  ────────────────────────────────────────
+  Dim: D1 retrieval response
+  Status: ⚠️ PARTIAL
+  Finding: A matched chunk comes back text-only — no fact_id, no subjects. Facts
+
+    return on a separate parallel lane with no chunk→fact edge; ISS-131
+    source-chunk lineage is discarded after the RRF merge. The agent sees two
+    disconnected streams, not one graph.
+  ────────────────────────────────────────
+  Dim: D4 graph reachability
+  Status: ⚠️ PARTIAL
+  Finding: The relationships field is declared, initialized empty, never
+    populated — dead code. Typed relations/links are only reachable via a
+    separate graph_neighborhood tool call, not from a search hit.
+  ────────────────────────────────────────
+  Dim: D3 images & tables
+  Status: ⚠️ PARTIAL
+  Finding: They are fact-linked (676 facts, 100% subject-anchored) and surface
+    via text descriptions — but visual_embedding is 0/615 images + 0/956  tables
+
+    populated (Qwen3-VL configured, never invoked). No true cross-modal search.
+
+  So: facts/entities = returned but disconnected (parallel lists, no edges);
+  relationships = not returned at all; images/tables = present but text-only.
+  The graph the agent needs is in Postgres; the retrieval response just doesn't
+  build it.
+
+  Top actions (ranked by the synthesis)
+
+  1. Ship the 19 zero-risk dev merges/retires as a human-confirmed seed batch
+  (proves the ISS-158 pipeline).
+  2. NFKC/hyphen-normalize label_norm at the write chokepoint (reuse the ISS-068
+  fix) so variants stop minting twice.
+  3. Populate description from the sentence-labels, relabel to clean
+  noun-phrases.
+  4. Connect the retrieval response (D1+D4) — add fact_id+subjects+relationships
+  to ContentSearchResult, populate the dead relationships lane. "Single
+  highest-leverage change for agents easily finding connected data."
+  5. Build the broader_id taxonomy scaffold.
+  6. Triage the 198 dev / 531 prod zero-link concepts through the ISS-158 agent.
+  7. Wire visual embeddings (Qwen3-VL → backfill 615 images + 956 tables) —
+  larger effort, unlocks cross-modal search.
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Capture
+
+How should I persist these findings? (cleanup itself stays deferred to the
+ISS-158 agent, per your note)
+ ☐ Capture
+
+How should I persist these findings? (cleanup itself stays deferred to the
+ISS-158 agent, per your note)
+  larger effort, unlocks cross-modal search.
+
+  The full report (all 55 merge groups, per-domain reviews, ISS-158
+  signal/UX/auto-vs-gated design) is in the workflow output. How do you want to
+  capture this?
+
+⏺ User answered Claude's questions:
+  ⎿  · How should I persist these findings? (cleanup itself stays deferred to
+     the ISS-158 agent, per your note) → Enrich ISS-158 + file the connectivity
+     gaps (Recommended)
+
+⏺ Option 1 — enriching ISS-158 + filing the two connectivity gaps, no data
+  mutations. First let me preserve the detailed report (all 55 merge groups +
+  taxonomy + connectivity detail) to a memory doc so the tracker entries stay
+  concise but reference the full analysis. Let me generate it from the workflow
+  output and locate ISS-158.
+
+⏺ Bash(cd /Users/felixcardix/dev-workspaces/di-copilot
+      python3 - <<'PY'…)
+  ⎿  wrote memory/2026-06-24_concept_memory_audit.md 52220 chars, 152 block
+     s
+     --- ISS-158 location in ISSUES.md ---
+     … +43 lines (ctrl+o to expand)
+
+⏺ Update(ISSUES.md)
+  ⎿  Added 5 lines, removed 1 line
+      16
+      17  - **ISS-157 (P3 — Wave C: `works_on` edges don't auto-populate
+          from real docs; person+project never co-subject).** Surfaced by
+           the Wave D whole-program dev SAT (2026-06-24, real reprocess o
+          f a Kerry customer doc `upload:ec3428ba…`). The `works_on` mint
+           (`FactStagingService._mint_party_project_links`) only fires fo
+          r a fact carrying BOTH a person-party subject AND a project sub
+          ject. On real Kerry content the LLM extractor emits person/org
+          party subjects but **`project_id=null` on every fact** — the de
+          terministic project rung (post-extraction, keyed on LLM-emitted
+           project-type subjects) never produces a person+project co-subj
+          ect fact, so **0 `works_on` links mint live** even though the d
+          oc is plainly about people working on the Kerry project. NOT a
+          Wave C defect: the render-derived mechanics (support→fact→conta
+          iner floor), the demote→de-render privacy guard, and the foreig
+          n-user floor were all verified end-to-end through the live API
+          + a synthetic fixture (fully torn down). The Wave B people-supp
+          ly arm offers PEOPLE to the extractor but **no project arm** (`
+          v3_offered_candidates` has no projects), and the project rung i
+          s reactive to what the LLM emits. FIX (future): offer project c
+          andidates to the extractor (a project arm analogous to Wave B's
+           people-supply), and/or a project co-subject rung that attaches
+           the dossier's project to a person-fact in a customer container
+           when the content clearly concerns it. Owner: Unassigned. Statu
+          s: OPEN (Wave D SAT finding; Wave C render/privacy mechanics ve
+          rified correct).
+      18
+      19 -- **ISS-158 (P3 — concept vocabulary (`di_concepts`) needs AI-a
+         -ssisted de-duplication / merge-suggestion).** Owner-flagged 202
+         -6-06-24 from the AdminConcepts surface (`/admin/concepts`): the
+         - curated concept vocabulary has accumulated many near-duplicate
+         -s that need merging, and manual one-by-one merge via the UI (`m
+         -erged_into` SKOS supersession) doesn't scale. **Evidence (dev,
+         -398 approved concepts):** (a) **12 exact `label_norm` duplicate
+         - groups (24 rows)** — the SAME label minted under BOTH `technol
+         -ogy` AND `system` `concept_type` (e.g., "SAC", "Excel add-in",
+         -"SAP Business Warehouse", "BW write-back OData services", "Sale
+         -s Forecast Dashboard", "Cost Planning Application", "Data Actio
+         -ns"); the deterministic resolver keys on `label_norm` but the d
+         -iffering `concept_type` leaves them as separate rows → the KG g
+         -raph shows two nodes for one concept; (b) **semantic near-dupli
+         -cates** the exact-match resolver can't catch ("Admin App" vs "A
+         -dmin application"; "4-Panel Dashboard" vs "4-panel single-scree
+         -n dashboard" vs "4-panel single-screen dashboard (system)"; "Ad
+         -d-in for detailed adjustments in Excel" vs "Add-in that allows
+         -detailed adjustments in Excel"); (c) **32 verbose phrase-concep
+         -ts** (`pref_label` > 45 chars) — extraction emitted full descri
+         -ptions as concepts ("A hidden data store that holds baseline an
+         -d inflation values for decomposition and write-back") = noise.
+         -**Why it matters:** duplicates fragment the concept axis — fact
+         -s about one concept anchor to different rows → split graph node
+         -s, split retrieval/typed-relations, and a noisier candidate voc
+         -abulary offered back to the extractor. **Root cause:** determin
+         -istic resolution matches exact `label_norm` → normalised `alt_l
+         -abels` ONLY and deliberately never auto-merges on fuzzy/embeddi
+         -ng (suggestion-only by design); `concept_type` being part of th
+         -e row means same-label-different-type isn't collapsed; the tria
+         -ge's strong-trgm→merge-queue routing only applies to NEW candid
+         -ates, not the existing approved set. **Proposed fix (owner's as
+         -k — an AI agent to SUGGEST merges):** all 398 concepts already
+         -carry an `embedding` (HNSW `ix`) + `label_norm`/`alt_labels` (t
+         -rgm), so a batch/on-demand pass can (1) cluster near-duplicate
+         -concepts (embedding cosine ∪ trgm ∪ same-label-different-type),
+         - (2) propose a canonical survivor + the rows to fold, with a co
+         -nfidence + rationale, (3) surface them as a **review queue in A
+         -dminConcepts** for human approve/reject — mirroring the existin
+         -g candidate-review model + the `merged_into` merge endpoint, hu
+         -man-in-the-loop, NEVER auto-merge (consistent with the suggesti
+         -on-only invariant). Optional adjuncts: an extractor-side guard
+         -rejecting verbose-phrase concepts (length/shape heuristic) so n
+         -oise stops entering, and a same-label-different-type auto-colla
+         -pse rule (pick the dominant type). Files: `app/shared/concepts/
+         -models.py`, `app/modules/knowledge/services/concept_service.py`
+         -, `endpoints_concepts.py` (`/api/v1/admin/concepts`), `frontend
+         -/src/pages/admin/AdminConcepts/`. Owner: Unassigned. Status: OP
+         -EN (owner-flagged; design TBD).
+      19 +- **ISS-158 (P3 — concept vocabulary (`di_concepts`) needs AI-a
+         +ssisted de-duplication / merge-suggestion).** Owner-flagged 202
+         +6-06-24 from the AdminConcepts surface (`/admin/concepts`): the
+         + curated concept vocabulary has accumulated many near-duplicate
+         +s that need merging, and manual one-by-one merge via the UI (`m
+         +erged_into` SKOS supersession) doesn't scale. **Evidence (dev,
+         +398 approved concepts):** (a) **12 exact `label_norm` duplicate
+         + groups (24 rows)** — the SAME label minted under BOTH `technol
+         +ogy` AND `system` `concept_type` (e.g., "SAC", "Excel add-in",
+         +"SAP Business Warehouse", "BW write-back OData services", "Sale
+         +s Forecast Dashboard", "Cost Planning Application", "Data Actio
+         +ns"); the deterministic resolver keys on `label_norm` but the d
+         +iffering `concept_type` leaves them as separate rows → the KG g
+         +raph shows two nodes for one concept; (b) **semantic near-dupli
+         +cates** the exact-match resolver can't catch ("Admin App" vs "A
+         +dmin application"; "4-Panel Dashboard" vs "4-panel single-scree
+         +n dashboard" vs "4-panel single-screen dashboard (system)"; "Ad
+         +d-in for detailed adjustments in Excel" vs "Add-in that allows
+         +detailed adjustments in Excel"); (c) **32 verbose phrase-concep
+         +ts** (`pref_label` > 45 chars) — extraction emitted full descri
+         +ptions as concepts ("A hidden data store that holds baseline an
+         +d inflation values for decomposition and write-back") = noise.
+         +**Why it matters:** duplicates fragment the concept axis — fact
+         +s about one concept anchor to different rows → split graph node
+         +s, split retrieval/typed-relations, and a noisier candidate voc
+         +abulary offered back to the extractor. **Root cause:** determin
+         +istic resolution matches exact `label_norm` → normalised `alt_l
+         +abels` ONLY and deliberately never auto-merges on fuzzy/embeddi
+         +ng (suggestion-only by design); `concept_type` being part of th
+         +e row means same-label-different-type isn't collapsed; the tria
+         +ge's strong-trgm→merge-queue routing only applies to NEW candid
+         +ates, not the existing approved set. **Proposed fix (owner's as
+         +k — an AI agent to SUGGEST merges):** all 398 concepts already
+         +carry an `embedding` (HNSW `ix`) + `label_norm`/`alt_labels` (t
+         +rgm), so a batch/on-demand pass can (1) cluster near-duplicate
+         +concepts (embedding cosine ∪ trgm ∪ same-label-different-type),
+         + (2) propose a canonical survivor + the rows to fold, with a co
+         +nfidence + rationale, (3) surface them as a **review queue in A
+         +dminConcepts** for human approve/reject — mirroring the existin
+         +g candidate-review model + the `merged_into` merge endpoint, hu
+         +man-in-the-loop, NEVER auto-merge (consistent with the suggesti
+         +on-only invariant). Optional adjuncts: an extractor-side guard
+         +rejecting verbose-phrase concepts (length/shape heuristic) so n
+         +oise stops entering, and a same-label-different-type auto-colla
+         +pse rule (pick the dominant type). Files: `app/shared/concepts/
+         +models.py`, `app/modules/knowledge/services/concept_service.py`
+         +, `endpoints_concepts.py` (`/api/v1/admin/concepts`), `frontend
+         +/src/pages/admin/AdminConcepts/`. **AUDIT 2026-06-24 (10-agent
+         +workflow; full report `memory/2026-06-24_concept_memory_audit.m
+         +d`):** confirmed + extended to PROD (**783** concepts: 581 syst
+         +em / 201 tech) — same pathologies, and the SKOS machinery (`bro
+         +ader_id` / `alt_labels` / `merged_into`) is **0% used on BOTH b
+         +anks** (clean slate, no rollback risk). **~55 merge groups** →
+         +est. reduction dev 398→~250-270, prod 783→~520-560. **19 zero-r
+         +isk seed merges ready on dev** (7 `zz` retires + 12 cross-type
+         +exact `label_norm` dups, conf >0.9). **~Half the vocabulary is
+         +dormant** (dev 198/398=49.7% / prod 531/783 anchor 0 facts) = t
+         +he priority triage pool. Proposed **11-parent taxonomy** (SAP P
+         +latform→SAC→{Calculation Logic, BW Write-back, Planning App, Da
+         +shboard, P&L, Excel, Cockpit, Calendar family, UI-widget residu
+         +e}). **Agent design (signals verified present):** combine pgvec
+         +tor-NN ∪ exact `label_norm` (after NFKC/hyphen fold — ties to [
+         +[ISS-068]]) ∪ description-shape (prose `pref_label`→move to the
+         + 100%-NULL `description` col) ∪ usage counts (survivor = higher
+         +-usage row; **preserve the union of `fact_subjects`** or D2 spi
+         +ne integrity breaks). **AUTO-APPLY only** the exact-`label_norm
+         +` + `zz`-retire tier (>0.9, reversible, human-confirmed batch);
+         + **HUMAN-GATE** all NN/description/taxonomy; downgrade borderli
+         +ne merges to a `broader_id` parent suggestion instead of a hard
+         + collapse; **guardrails:** never merge across distinct `broader
+         +_id` siblings (SAP ECC ≠ S/4HANA ≠ Datasphere), never merge a h
+         +igh-usage concept into a zero-usage one, populate `alt_labels`
+         +with merged labels so the extractor stops re-minting the varian
+         +t. Connectivity tie-in: concept fragmentation compounds the ret
+         +rieval-assembly gap → see [[ISS-160]]. Owner: Unassigned. Statu
+         +s: OPEN (audited 2026-06-24; design ready; cleanup deferred to
+         +the agent).
+      20
+      21 +- **ISS-160 (P2 — retrieval returns facts/entities/relations as
+         + DISCONNECTED lanes, not a connected graph; the `relationships`
+         + lane is dead code).** Audit 2026-06-24 (`memory/2026-06-24_con
+         +cept_memory_audit.md` D1/D4). The `di_facts` spine is **fully c
+         +onnected in the DB** — every approved fact ≥1 subject, 0 orphan
+         + projection chunks, 0 missing-embedding source chunks, 0 isolat
+         +ed masters (dev 2,867 / prod 2,189 approved facts, both 100%).
+         +BUT a semantic-search hit returns the matched chunk **text-only
+         +**: `ContentSearchResult` carries no `fact_id`/`canonical_id`/s
+         +ubjects; the facts come back on a **separate parallel `Retrieva
+         +lContext.entities` lane with no chunk→fact edge**; the `relatio
+         +nships` field is **declared, initialized empty, and never popul
+         +ated (dead code)**; and the ISS-131 source-chunk lineage is dis
+         +carded after the RRF merge. Net: the agent receives two disconn
+         +ected streams and cannot drill from a hit to the related entiti
+         +es/typed-relations without a second explicit `graph_neighborhoo
+         +d` tool call. **This is the single highest-leverage change for
+         +the "agents easily find connected data" goal** — the data is al
+         +ready perfect, only the response assembly is missing. FIX: exte
+         +nd `ContentSearchResult` with `fact_id` + subjects (party/conce
+         +pt/project) + a populated `relationships` list; populate `Retri
+         +evalContext.relationships` (Stage 3b) by fetching incident `di_
+         +subject_relationships` / `di_party_project_links` for the match
+         +ed entities **under the container visibility floor** (personal/
+         +shared scope must hold). Owner: Unassigned. Status: OPEN (found
+         + by the 2026-06-24 connectivity audit).
+      22 +
+      23 +- **ISS-161 (P3 — `di_kb_chunks.visual_embedding` is schema-def
+         +ined + ivfflat-indexed but 0% populated → no cross-modal image/
+         +table search).** Audit 2026-06-24 (D3). Image/table chunks ARE
+         +fact-linked + subject-anchored (676 facts, 100%) and DO surface
+         + in retrieval via type-aware slots — but **only through their T
+         +EXT descriptions**; `visual_embedding` is populated for **0/615
+         + image + 0/956 table chunks**, and the configured **Qwen3-VL vi
+         +sion model is never invoked** by `EmbeddingService`. So a chart
+         +/table matches only if its text caption happens to match — ther
+         +e is no content-based visual similarity. FIX (larger effort, lo
+         +wer priority — the text path already gives basic connectivity):
+         + wire Qwen3-VL into `EmbeddingService`, backfill `visual_embedd
+         +ing` for the 615 image + 956 table chunks, and add a Stage-2d v
+         +isual-similarity lane gated on `document_image` / `document_tab
+         +le` source types. Owner: Unassigned. Status: OPEN (found by the
+         + 2026-06-24 connectivity audit).
+      24 +
+      25  - **ISS-152 (P2 — user Working Memory is polluted with duplicat
+          e/low-value preferences).** The Personal-memory → Working Memor
+          y "Preferences" surface (prod, `coding.agent` user, observed 20
+          26-06-22) is flooded with ~20+ near-identical `formatting.*` en
+          tries, overwhelmingly **mermaid-diagram formatting rules**, wit
+          h many SEMANTIC DUPLICATES stored under different auto-generate
+          d keys: `mermaid_avoid_raw_label_characters` == `mermaid_label_
+          character_avoidance` (identical text), `mermaid_flowchart_direc
+          tion` == `mermaid_flowchart_orientation`, `mermaid_quoted_label
+          s` == `mermaid_quoted_square_labels`, `mermaid_short_alphanumer
+          ic_node_ids` == `mermaid_short_node_ids`, `decision_inc_colour_
+          palette` == `decision_inc_corporate_palette`, `mermaid_code_onl
+          y` ≈ `mermaid_only_response`. Effect: the preference store accu
+          mulates unboundedly (no dedup/supersession across the LLM-inven
+          ted dotted keys), it bloats the `<user_memory>` block injected
+          into EVERY agent prompt (token waste + signal dilution), and it
+          's dominated by one narrow over-captured topic (mermaid). **ROO
+          T CAUSE — confirmed 2026-06-22 (3-lane workflow + adversarial v
+          erify, high confidence): FROZEN LEGACY POLLUTION, not active ac
+          cumulation.** (1) **The "stupidity" = a self-capture loop, alre
+          ady removed in ISS-062 (May 2026).** A Phase-4 "real-time prefe
+          rence extraction" service (`preference_extraction_service.py`,
+          now DELETED) ran after EVERY chat turn and fed the **agent's OW
+          N response text** (`ai_response=full_response_text`) into an LL
+          M extractor. When the agent emitted a mermaid diagram per its o
+          wn output-formatting policy, a cheap regex gate (`always/never/
+          use X instead`) tripped on the imperative phrasing in the agent
+          's *own* guidance, and the LLM scraped those rules and re-filed
+           them as "user preferences" under a fresh model-invented `forma
+          tting.mermaid_<slug>` key each turn → `mermaid_quoted_labels` v
+          s `mermaid_quoted_square_labels` never collided → unbounded dup
+          licates. A second pre-ISS-062 path (`update_curated_memory(key=
+          ...)`) let the agent mint keys too. (2) **No dedup, ever, on th
+          e store:** "Preferences" is NOT a table/keyed JSON — it's free-
+          text markdown lines in ONE `di_user_memory.working_memory` TEXT
+           blob (1 row/user). The live append path `MemoryUpdateService.a
+          pply_patches` is a literal string concat (`memory_update_servic
+          e.py:124-126`) with ZERO content/embedding dedup; the only back
+          stop is a 4000-char cap that blindly trims the LONGEST section'
+          s tail (`_truncate_longest_section`, a guillotine, not dedup).
+          The real content_hash + embedding-supersede dedup exists but ta
+          rgets the di_facts **spine**, never the blob. (3) **Both mintin
+          g writers are GONE on main** (ISS-062; `_maybe_extract_preferen
+          ces` removed in Wave 4; `update_curated_memory` now prose-only
+          + soft-bans keyed lines; nightly-reflection prompt bans `format
+          ting.*` bullets) — **so no live writer mints new keys; the floo
+          d is stale text frozen in the blob because the ISS-062 prose re
+          shape never auto-rewrote existing blobs.** **Injection cost (me
+          asured, dev user 6 = the prod repro):** the ENTIRE blob is inje
+          cted verbatim as `<user_memory>` into EVERY agent prompt (no re
+          trieval/filter); Preferences section = 2255 chars / ~560 tokens
+           = 78% of the blob, all mermaid. Clean users (7/51/29) have 0.
+          **FIX (ranked):** (a) **one-time cleanup — true immediate fix,
+          no code:** run the existing admin `rewrite_user_blob` (`POST /a
+          pi/v1/memory/admin/reflect-now/{user_id}`) on polluted users (s
+          napshot + spot-check first) → collapses duplicates to prose und
+          er the keyed-line ban; (b) **content-level dedup/supersede + sm
+          arter eviction in `apply_patches`** — the durable structural fi
+          x (the blob still has zero per-line dedup, so re-flooding is po
+          ssible); (c) regression test that no live path feeds the agent'
+          s own response into a preference writer (insurance — loop alrea
+          dy severed); (d) make the soft keyed-line ban a hard programmat
+          ic reject. NOT (e) bumping the cap. Owner: Unassigned. Status:
+          **(a) CLEANUP DONE 2026-06-22 (prod) — (b)/(c)/(d) still OPEN.*
+          * Ran the sanctioned `NightlyReflectionService.rewrite_user_blo
+          b` on prod user 3 (`coding.agent`, the polluted blob): 3644→190
+          6 chars, **21 `formatting.*` keyed lines → 0**, the duplicate m
+          ermaid bullets collapsed into ~5 clean prose paragraphs under p
+          roper section headers; snapshot anchored at `infra-core:/tmp` +
+           locally before the rewrite; browser-verified (Working Memory n
+          ow clean prose, "updated <1 min ago"). User 1 (`e.tanev`) left
+          untouched (0 keyed lines — prose only). NOTE: the admin endpoin
+          t `POST /memory/admin/reflect-now/{id}` requires `_require_admi
+          n_strict` (coding.agent=Manager got 403); the cleanup ran via a
+           one-off backend-prod container script that replicates the 3 st
+          artup steps the rewrite needs (`load_all_models()` + `_register
+          _reflection_providers()` + `_validate_ai_config()`). **(b) the
+          structural fix is the real durable one** — `apply_patches` stil
+          l has ZERO per-line dedup, so re-flooding remains possible; the
+           minting writers are severed (ISS-062) so near-term risk is low
+          artup steps the rewrite needs (`load_all_models()` + `_register
+          _reflection_providers()` + `_validate_ai_config()`). **(b) the
+          structural fix is the real durable one** — `apply_patches` stil
+          l has ZERO per-line dedup, so re-flooding remains possible; the
+           minting writers are severed (ISS-062) so near-term risk is low
+          , but (b) content-level dedup/supersede + (c) regression test +
+           (d) hard keyed-line reject remain OPEN.
+      26
+      27  - **Wave A/B/C deferred op — `materialize_contact_people` sweep
+           + L-vs-C person-creation decision.** When prod accumulates CRM
+           contacts (currently **0** → moot, the sweep is a no-op either
+          way): re-run `backend/scripts/materialize_contact_people.py --d
+          ry-run` against prod → quantify → owner picks Option L (link-on
+          ly, the default) vs Option C (`--create-people`) → `--apply`. (
+          Waves A/B/C shipped + PROD-PROMOTED 2026-06-24 → Recently Fixed
+          .)
+
+⏺ Committing the ISS-158 enrichment + ISS-160/161:
+
+⏺ Bash(cd /Users/felixcardix/dev-workspaces/di-copilot
+      git add ISSUES.md…)
+  ⎿  commit EXIT=0
+     be210a6f ISSUES: concept-memory audit — enrich ISS-158 + file ISS-160/
+     161
+     … +3 lines (ctrl+o to expand)
+
+⏺ Captured and pushed — origin/main == be210a6f, tree clean.
+
+  What's now in the tracker
+
+  - ISS-158 enriched with the verified audit: prod confirmation (783), ~55 merge
+  groups (~28–33% reduction), the 19 zero-risk dev seed merges, the 11-parent
+  taxonomy, and the full merge-agent design (signals to combine,
+  auto-vs-human-gated policy, guardrails — never merge across broader_id
+  siblings, preserve the fact_subjects union, populate alt_labels so variants
+  stop re-minting).
+  - ISS-160 (P2) — retrieval returns chunk-text + facts as disconnected lanes;
+  the relationships lane is dead code. The DB spine is 100% connected (verified)
+  — only the response assembly is missing. Flagged as the highest-leverage fix
+  for your "agents easily find connected data" goal.
+  - ISS-161 (P3) — visual_embedding indexed but 0/615 images + 0/956 tables
+  populated; Qwen3-VL never invoked → no cross-modal search.
+  - Full report (all 55 merge groups, taxonomy, connectivity detail, ISS-158
+  design): memory/2026-06-24_concept_memory_audit.md (local).
+
+  Direct answers to your two questions
+
+  - Concepts are far too many — confirmed, and now diagnosed: flat (zero
+  hierarchy/synonyms/merges ever used), ~half dormant (anchor no facts), with
+  cross-type dups + sentences-as-labels as the top offenders. A concrete merge +
+  taxonomy plan is ready; the cleanup itself runs through the ISS-158 agent
+  when you want it.
+  - Is everything connected when we search? The data is fully connected (every
+  fact has its subjects/entities, images & tables are fact-linked) — but the
+  retrieval response doesn't assemble it: a hit comes back as chunk-text plus a
+  parallel fact list with no edges, relationships aren't returned at all, and
+  images/tables match by text only. So the memory substrate is excellent; the
+  retrieval surface is where the connectivity work is (ISS-160 > ISS-161).
+
+  When you're ready to start cleanup, the 19 zero-risk dev merges (7 zz retires
+  + 12 cross-type exact dups, fully reversible) are the natural first batch to
+  prove the ISS-158 pipeline end-to-end — just say the word.
+
+✻ Crunched for 1h 20m 30s
+
+❯ okay can you please do a handoff make sure you refer to the relevant
+  documents for the audit
+   and we'll start working on our goals making sure we improve it
+
+⏺ I'll use the handoff skill to write this up properly.
+
+⏺ Skill(handoff)
+  ⎿  Successfully loaded skill
+
+⏺ I'll refresh the exact state, then write the half-page handoff.
+
+⏺ Bash(cd /Users/felixcardix/dev-workspaces/di-copilot
+      echo "today: $(date +%Y-%m-%d)"…)
+  ⎿  today: 2026-06-24
+     --- recent commits ---
+     be210a6f ISSUES: concept-memory audit — enrich ISS-158 + file ISS-160/
+     … +17 lines (ctrl+o to expand)
+
+⏺ Write(memory/2026-06-24_memory_system_improvement_handoff.md)
+  ⎿  Wrote 28 lines to
+     memory/2026-06-24_memory_system_improvement_handoff.md
+       2 # Memory-system improvement — session handoff (2026-06-24)
+         g the improvements** (concept cleanup + retrieval connectivity)
+         toward the goal: an excellent personal+shared-scope memory where
+       4  agents easily find *connected* data.
+       5 ## Branch state
+         g tree clean.**== `origin/main` == `be210a6f`**, 0 ahead, workin
+       8 ## What's done (today)
+       9 - **Wave A+B+C PROD-PROMOTED** (`456161a2`; prod head `20260619_
+      10 - **ISSUES.md reconciled** (`422c6d3a`): Open 247→~120 lines (24
+          archived / 10 trimmed / 26 kept).
+     … +46 lines (ctrl+o to expand)
+
+⏺ Handoff written: memory/2026-06-24_memory_system_improvement_handoff.md (half
+  a page, local — memory/ is gitignored).
+
+  It points the next session at the goals, not a recap: branch is clean at
+  be210a6f; first action is to read the audit report
+  (memory/2026-06-24_concept_memory_audit.md) then the ISS-158/160/161 entries.
+  authToken (options.js:116). So the chat lane is left with no credential it can use → it bails.
+
+  So the side-panel "Chat" tab is essentially vestigial — a migration-era shortcut. The 404 self-heal I added earlier is still correct, but it's downstream of
+  this; with a device token the chat can't authenticate at all. The architecture as built is: extension = pure relay; you chat in the web app; the server-side
+  agent drives your attached tab through the relay. That relay part is working — your token exchanged fine.
+
+  There's also a second gate: per the owner-approved SC3 "browser-everywhere" plan (task #82, still unbuilt), the agent's browser tools are not yet wired into
+  the chat orchestrator and the capability gate needs un-breaking. So even via the web app, the agent likely can't drive the browser end-to-end today. I've
+  kicked off a read-only audit to confirm exactly what works right now — running in the background.
+
+  The real decision is yours
+
+  This is exactly the "separate-window / multi-surface, doesn't feel polished" problem you described — and fixing it well means picking the target experience.
+  That's a genuine product+security fork, so I want your call before building. All three still need SC3 to give the agent working browser tools; they differ in
+  where you chat:
+
+⏺ Explore(Audit live browser-tool capability)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Chat surface
+
+Where should you actually chat with the agent? This decides the whole redesign. (All three still need the SC3 wave to give the agent working browser tools —
+that part is separate.)
+
+ 1. Embed web chat in side        ┌──────────────────────────────────────────────┐
+   panel                          │ ┌─ DI Copilot ──────────┐                    │
+  2. Native side-panel chat       │ │  [ web-app chat here  ]│  ← iframe, uses   │
+  3. Web app is the cockpit       │ │  [ full features      ]│    your login     │
+                                  │ │                        │                   │
+                                  │ │ Agent Browser: ● ON    │  ← relay controls │
+                                  │ │ Attached: LinkedIn tab │                   │
+                                  │ └────────────────────────┘                   │
+                                  │ Reuses login · no new token                  │
+                                  └──────────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel
+
+  46 tasks (39 done, 7 open)
+  ◻ S3 riders: aspect/style params + classifySlide raw data + docs
+  ◻ Soak readout → S2 go/no-go (due ≥2026-07-09 06:25)
+  ◻ TSR-6 template-carrier wave (post-S2, owner approved)
+  ◻ Wave Q3 build: VIS-1 images (3 sub-slices, absorbs #50) + hero-KPI + stats enrichment; charts/theming DEFERRED
+  ◻ Investigate codex cache_read=0: verify shipped mapping + capture raw usage frame
+   … +2 pending, 39 completed

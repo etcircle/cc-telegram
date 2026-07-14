@@ -4017,28 +4017,49 @@ def _normalize_input_row(row: str) -> str:
 # ``clean_ghost_input_text``.
 _INPUT_BOX_TOP_SCAN_LINES: Final = 60
 
-# The segment form of the ``· N shell`` status row AFTER splitting on ``·`` (the
-# ``·`` prefix is consumed by the split): the strict status-row grammar honors the
-# leg-3 markers-OR-shell-token rule by including this arm.
-_RE_STATUS_SHELL_SEGMENT: Final = re.compile(r"\b\d+\s+shells?\b")
+# The strict status-row segment grammar (GH #56 r1 fold — Codex P1). The
+# ORIGINAL grammar was SUBTRACTIVE (strip known marker substrings, reject only
+# ALPHABETIC residue), which was not a fullmatch: ``❯ /effort?`` passed it (the
+# ``/effort`` marker stripped, the ``❯ ?`` residue is non-alphabetic), and with
+# an older reachable rule + a stale ``❯`` row above, the fallback located a fake
+# bracket on a LIVE BLOCKING surface — a full gate bypass (and, on an empty stale
+# ``❯`` row, a keyless brake release). Codex reproduced all three; each is pinned
+# as a refusing test.
+#
+# The replacement is ANCHORED: split the row on ``·``; EVERY whitespace-stripped
+# segment must FULLMATCH one of the canonical forms — an exact marker string from
+# ``_INPUT_READY_CHROME_MARKERS`` (SINGLE source with leg 3's substring alphabet,
+# so the two never drift), optionally carrying a leading mode-glyph run (``⏵⏵``,
+# ``⏸``, the ``◐◑◒◓`` spinner) and/or a parenthetical that is ITSELF a canonical
+# marker (``⏵⏵ bypass permissions on (shift+tab to cycle)``) — or the shell-token
+# form ``N shell(s)`` with its known ``still running`` suffix. No leading or
+# trailing residue is EVER accepted: ``❯ /effort?`` fails (the segment does not
+# fullmatch any form) and ``❯ 1 shell?`` fails on the glyph and the trailing
+# ``?``. Zero segments → False.
+_STATUS_SEGMENT_PATTERNS: Final = (
+    re.compile(
+        r"(?:[⏵⏸◐◑◒◓]+\s*)?"
+        + "(?:"
+        + "|".join(re.escape(m) for m in _INPUT_READY_CHROME_MARKERS)
+        + ")"
+        + r"(?:\s*\((?:"
+        + "|".join(re.escape(m) for m in _INPUT_READY_CHROME_MARKERS)
+        + r")\))?"
+    ),
+    re.compile(r"\d+\s+shells?(?:\s+still\s+running)?"),
+)
 
 
 def _is_status_row(line: str) -> bool:
     """True iff ``line`` is a WHOLE Claude Code ready-status-bar row (GH #56).
 
-    A STRICT full-ROW grammar. The exactly-one-separator fallback in
-    ``_input_box_rows`` uses it to prove the lone in-window separator is the input
-    box's BOTTOM rule: the first non-blank row below a genuine bottom rule is the
-    status bar.
-
-    Derived from the SAME canonical constants leg 3 consumes
-    (``_INPUT_READY_CHROME_MARKERS`` + the shell-token arm — SINGLE source, so the
-    grammar and leg 3's substring alphabet can never drift apart), but it requires
-    the WHOLE row to be chrome rather than merely CONTAIN a marker: each
-    ``·``-delimited segment must reduce to pure chrome glyphs once its markers are
-    removed. A residue carrying any LETTER is prose and fails — so model-controlled
-    prompt content that embeds a marker substring (e.g. an AUQ header carrying
-    ``/effort``, Codex r2's reproduced spoof) no longer qualifies.
+    A STRICT anchored segment-FULLMATCH grammar (see
+    ``_STATUS_SEGMENT_PATTERNS``). The exactly-one-separator fallback in
+    ``_input_box_rows`` uses it to prove the lone in-window separator is the
+    input box's BOTTOM rule: the first non-blank row below a genuine bottom rule
+    is the status bar. Model-controlled prompt content that merely EMBEDS a
+    marker substring can never qualify — the whole segment must BE a canonical
+    chrome form.
     """
     s = _normalize_input_row(_strip_ansi(line)).strip()
     if not s:
@@ -4048,17 +4069,7 @@ def _is_status_row(line: str) -> bool:
         seg = segment.strip()
         if not seg:
             continue
-        residue = seg
-        matched = False
-        for marker in _INPUT_READY_CHROME_MARKERS:
-            if marker in residue:
-                residue = residue.replace(marker, " ")
-                matched = True
-        shell = _RE_STATUS_SHELL_SEGMENT.search(residue)
-        if shell:
-            residue = residue.replace(shell.group(0), " ")
-            matched = True
-        if not matched or any(ch.isalpha() for ch in residue):
+        if not any(p.fullmatch(seg) for p in _STATUS_SEGMENT_PATTERNS):
             return False
         saw_chrome = True
     return saw_chrome
