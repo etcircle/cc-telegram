@@ -179,6 +179,14 @@ class UIPattern:
     name: str  # Descriptive label (not used programmatically)
     top: tuple[re.Pattern[str], ...]
     bottom: tuple[re.Pattern[str], ...]
+    # A STABLE, UNIQUE identifier (GH #52 r4 P2-1). ``name`` is NOT unique —
+    # THREE patterns are named ``AskUserQuestion`` — so it cannot key the
+    # footerless-decision anchor-classification map. ``id`` is the classification
+    # key component (``auq-multi`` / ``auq-single`` / ``auq-plain`` / ``epm`` /
+    # ``settings`` / …) that lets ``_DECISION_ANCHOR_CLASSIFICATION`` classify
+    # every top anchor EXACTLY ONCE. Defaulted so ``dataclasses.replace`` (the
+    # validator-wiring rebuild below) preserves it.
+    id: str = ""
     min_gap: int = 2  # minimum lines between top and bottom (inclusive)
     bottom_up: bool = False  # scan bottom marker first, then matching top upward
     # Additional pre-top-found bail markers. While walking back from
@@ -312,6 +320,16 @@ def _strip_esc_affordance(label: str) -> str:
 # which is KEPT as defense-in-depth. Ordered LAST + flag-gated.
 _RE_DECISION_TOP_OPTION = re.compile(r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S")
 _RE_DECISION_FOOTER = re.compile(r"\bEnter to (?:confirm|continue)\b")
+# GH #52 (Codex r1 P2-2): a footerless ``Switch model?`` confirmation has NO
+# footer — its bottom-most content is a numbered option row — so ``Decision``'s
+# loose ``bottom`` must also accept an ANY-numbered-option row (NOT cursored-only:
+# ``_try_extract``'s top walk starts one line ABOVE the selected bottom, and the
+# cursored row is never the terminal row in the positive fixtures, so a
+# cursored-bottom anchor could not produce the required top/bottom gap). The
+# cursor + 1..N + rule-adjacency validation stays in the strict validator
+# (``parse_generic_decision`` → ``_parse_footerless_decision``); this loose
+# anchor only PRODUCES the candidate the validator then gates.
+_RE_DECISION_BOTTOM_OPTION = re.compile(r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S")
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
@@ -319,6 +337,7 @@ _RE_DECISION_FOOTER = re.compile(r"\bEnter to (?:confirm|continue)\b")
 UI_PATTERNS: list[UIPattern] = [
     UIPattern(
         name="ExitPlanMode",
+        id="epm",
         top=(
             re.compile(r"^\s*Would you like to proceed\?"),
             # v2.1.29+: longer prefix that may wrap across lines
@@ -336,6 +355,7 @@ UI_PATTERNS: list[UIPattern] = [
     ),
     UIPattern(
         name="AskUserQuestion",
+        id="auq-multi",
         top=(re.compile(r"^\s*←\s+[☐✔☒]"),),  # Multi-tab: no bottom needed
         bottom=(),
         min_gap=1,
@@ -344,6 +364,7 @@ UI_PATTERNS: list[UIPattern] = [
     ),
     UIPattern(
         name="AskUserQuestion",
+        id="auq-single",
         top=(re.compile(r"^\s*[☐✔☒]"),),  # Single-tab: bottom required
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=1,
@@ -358,6 +379,7 @@ UI_PATTERNS: list[UIPattern] = [
     # Claude Code versions (❯, ›, ▶, *, ), >) or may be plain indent.
     UIPattern(
         name="AskUserQuestion",
+        id="auq-plain",
         top=(re.compile(r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S"),),
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=0,
@@ -366,11 +388,13 @@ UI_PATTERNS: list[UIPattern] = [
     ),
     UIPattern(
         name="RestoreCheckpoint",
+        id="restore-checkpoint",
         top=(re.compile(r"^\s*Restore the code"),),
         bottom=(re.compile(r"^\s*Enter to continue"),),
     ),
     UIPattern(
         name="Settings",
+        id="settings",
         top=(
             re.compile(r"^\s*Settings:.*tab to cycle"),
             re.compile(r"^\s*Select model"),
@@ -396,6 +420,7 @@ UI_PATTERNS: list[UIPattern] = [
     # Each is disambiguated on its TOP anchor (the footer family overlaps).
     UIPattern(
         name="Permission",
+        id="permission",
         top=(_RE_PERMISSION_TOP_QUESTION, _RE_PERMISSION_TOP_PREAMBLE),
         bottom=(_RE_PERMISSION_BOTTOM_INLINE_ESC, _RE_PERMISSION_BOTTOM_FOOTER),
         min_gap=1,
@@ -404,6 +429,7 @@ UI_PATTERNS: list[UIPattern] = [
     ),
     UIPattern(
         name="Workflow",
+        id="workflow",
         top=_RE_WORKFLOW_TOP,
         bottom=_RE_WORKFLOW_BOTTOM,
         min_gap=1,
@@ -419,8 +445,9 @@ UI_PATTERNS: list[UIPattern] = [
     # Workflow veto so a flag-OFF gate is never re-surfaced here.
     UIPattern(
         name="Decision",
+        id="decision",
         top=(_RE_DECISION_TOP_OPTION,),
-        bottom=(_RE_DECISION_FOOTER,),
+        bottom=(_RE_DECISION_FOOTER, _RE_DECISION_BOTTOM_OPTION),
         min_gap=1,
         bottom_up=True,
         bail_markers=(_RE_COLLAPSED_REGION,),
@@ -622,6 +649,28 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
     """
     if not pane_text:
         return None
+
+    # GH #52 — the STRICT-FOOTERLESS PREFLIGHT (flag-gated on
+    # ``CC_TELEGRAM_DECISION_CARDS``, so a flag-OFF deploy keeps today's walk
+    # BYTE-IDENTICAL). ``extract_interactive_content`` returns the FIRST loose
+    # named match, and a stale COMPLETE AUQ / EPM / Settings surface in the
+    # scrollback ABOVE a live footerless modal matches loosely (those patterns
+    # carry no strict validator), so ``parse_generic_decision`` would never run.
+    # A successful strict footerless parse PROVES the pane's TERMINAL content is
+    # the footerless modal (blank-below to pane end + rule-adjacent title +
+    # vetoes), and the bottom-most-is-live rule then says any named loose match is
+    # STALE scrollback above it — so it wins the race. A LIVE named surface can
+    # never lose it: while a named surface owns the pane bottom, the footerless
+    # parser refuses (its footer/options are below-or-inside the scanned region).
+    # Patterns WITH strict validators are unaffected (they too require owning the
+    # pane bottom, which the footerless blank-below excludes).
+    if _DECISION_CARDS_ENABLED:
+        footerless = _parse_footerless_decision(pane_text)
+        if footerless is not None:
+            return InteractiveUIContent(
+                content=_shorten_separators(footerless.pane_excerpt.rstrip()),
+                name=_DECISION_PATTERN_NAME,
+            )
 
     lines = pane_text.strip().split("\n")
     for pattern in _active_ui_patterns():
@@ -2900,6 +2949,22 @@ def _decision_option_block_top(lines: list[str], footer_idx: int) -> int | None:
     return block_top_idx
 
 
+# GH #52 — the footerless "modal owns the pane" top chrome. CC 2.1.207 renders
+# the ``Switch model?`` confirmation under a FULL-WIDTH ``▔`` (U+2594 UPPER ONE
+# EIGHTH BLOCK) rule, with the title IMMEDIATELY below it. A run of ≥40 ``▔`` is
+# the modal rule; it is DISTINCT from the ``─`` box rules (``▔`` is NOT in
+# ``_RE_GATE_TRAILING_SEPARATOR``'s char class), so it can anchor the footerless
+# title-adjacency requirement without disturbing the footered leg (whose real
+# targets — folder-trust — use ``─`` rules, never ``▔``).
+_MODAL_RULE_MIN_RUN: Final[int] = 40
+
+
+def _is_modal_rule(line: str) -> bool:
+    """True iff ``line`` is a full-width ``▔`` (U+2594) modal rule (≥40 chars)."""
+    stripped = line.strip()
+    return len(stripped) >= _MODAL_RULE_MIN_RUN and all(c == "▔" for c in stripped)
+
+
 # The prompt block above the option block can span several lines (a heading, a
 # subtitle, a body paragraph) separated by SINGLE blank lines. The card must
 # show the heading, so the excerpt extends UP through that contiguous block —
@@ -2938,10 +3003,15 @@ def _decision_prompt_block_top(lines: list[str], block_top_idx: int) -> int | No
                 # Clean terminator: a ≥2-blank gap to unrelated scrollback.
                 return top_idx
             continue
-        if all(c == "─" for c in stripped) or _RE_GATE_TRAILING_SEPARATOR.match(
-            lines[j]
+        if (
+            all(c == "─" for c in stripped)
+            or _RE_GATE_TRAILING_SEPARATOR.match(lines[j])
+            or _is_modal_rule(lines[j])
         ):
-            # Clean terminator: a chrome / box-drawing separator line.
+            # Clean terminator: a chrome / box-drawing separator line, or the
+            # GH #52 footerless ``▔`` modal rule (a BLOCK TERMINATOR so the
+            # title resolves to the line IMMEDIATELY below the rule, which the
+            # footerless leg then requires to be rule-adjacent).
             return top_idx
         blank_run = 0
         meaningful += 1
@@ -3023,10 +3093,320 @@ def _is_decision_footer_line(line: str) -> bool:
     )
 
 
-def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
-    """Strict-or-None parse of a GENERIC titled numbered-option confirmation
-    prompt (Stage B1 — the "Switch model?" confirmation, the folder-trust
-    prompt, and peers that no NAMED pattern covers).
+# ── GH #52 — FOOTERLESS Decision leg (the CC 2.1.207 ``Switch model?`` shape) ──
+#
+# The provenance stamp value that distinguishes the two Decision legs (§5). The
+# footered leg stamps ``"footered"``; the footerless leg ``"footerless"``. THREE
+# consumers (mint / tap pre-commit / confirm) require ``"footered"`` — an ABSENT
+# or UNKNOWN variant fails the same way footerless does (positive authorization,
+# never a blacklist).
+DECISION_VARIANT_META_KEY: Final[str] = "decision_variant"
+DECISION_VARIANT_FOOTERED: Final[str] = "footered"
+DECISION_VARIANT_FOOTERLESS: Final[str] = "footerless"
+
+
+def decision_variant_of(form: AskUserQuestionForm) -> str | None:
+    """The Decision provenance variant a form carries, or ``None`` (§5).
+
+    ``"footered"`` / ``"footerless"`` for a parser-produced Decision form; ``None``
+    for any other form (an ABSENT variant must fail authorization the same way a
+    footerless one does)."""
+    v = form._meta.get(DECISION_VARIANT_META_KEY)
+    return v if v in (DECISION_VARIANT_FOOTERED, DECISION_VARIANT_FOOTERLESS) else None
+
+
+# The verb-AGNOSTIC permission question shape (requirement 4): a verb-drifted
+# permission gate (``Do you want to open …?``) whose footer frame was dropped
+# mid-redraw. Broader than ``_RE_PERMISSION_TOP_QUESTION``'s whitelisted verbs.
+_RE_VERB_AGNOSTIC_PERMISSION = re.compile(r"^\s*Do you want to\b.*\?")
+
+# A bounded SINGLE-KEY hint segment (r4 P2-3): real Settings/AUQ footers carry
+# segments like ``s to use this session only`` that ``_RE_DECISION_HINT_SEGMENT``
+# (whose key set is enter/esc/tab/… only) does NOT accept. The key is a single
+# LETTER (real single-key hints are letters — ``s`` / ``n`` / ``y`` / ``d``), so a
+# body line like ``5 to 10 items`` is NOT mistaken for a hint. Bounded tail so a
+# prose continuation overruns.
+_RE_SINGLE_KEY_HINT_SEGMENT = re.compile(r"^[A-Za-z] to \S+(?:\s+\S+){0,5}$")
+
+
+def _is_key_hint_segment(seg: str) -> bool:
+    """True iff ``seg`` is a recognized key-hint OR a bounded single-key hint."""
+    s = seg.strip()
+    if not s:
+        return False
+    return bool(
+        _RE_DECISION_HINT_SEGMENT.fullmatch(s) or _RE_SINGLE_KEY_HINT_SEGMENT.match(s)
+    )
+
+
+def _is_key_hint_row(line: str) -> bool:
+    """True iff ``line`` decomposes ENTIRELY into ``·``-separated key-hint segments.
+
+    Covers the footer families the strict Decision footer does NOT — ``Enter to
+    select · ↑/↓ to navigate · Esc to cancel`` (AUQ), ``Enter to set as default ·
+    s to use this session only · Esc to cancel`` (Settings) — so the attached-footer
+    veto refuses a footered/named surface's footer sitting inside the footerless
+    region. Numbered option rows are excluded by the caller BEFORE this runs."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return all(_is_key_hint_segment(seg) for seg in stripped.split("·"))
+
+
+def _is_attached_footer_veto_line(line: str) -> bool:
+    """True iff ``line`` is a footer-shaped line the ATTACHED-FOOTER veto refuses
+    (requirement 4 / control-flow item b).
+
+    The explicit attached-footer veto set: the strict Decision footer, the
+    key-hint / bounded-single-key ``·``-row, a ``ctrl+<x>`` hint row, and the
+    inline ``(esc)``-tailed permission option shape. Decision's OWN plain numbered
+    option rows are EXPLICITLY EXCLUDED (they are the terminal block) — but a
+    numbered row that ALSO carries a trailing ``(esc)`` is a Permission option and
+    DOES veto (checked FIRST)."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # An inline ``(esc)``-tailed permission option — a numbered row that is a
+    # permission footer. Checked BEFORE the plain-numbered exclusion.
+    if _RE_PERMISSION_BOTTOM_INLINE_ESC.match(line):
+        return True
+    # A plain Decision numbered option row is the terminal block — NOT a veto.
+    if _RE_NUMBERED_OPTION.match(line):
+        return False
+    if _is_decision_footer_line(line):
+        return True
+    if _RE_GATE_TRAILING_CTRL_HINT.match(line):
+        return True
+    if _is_key_hint_row(line):
+        return True
+    return False
+
+
+# ── Named-surface anchor classification for the footerless veto (r3 P2-1 / r4
+# P2-1) ────────────────────────────────────────────────────────────────────
+#
+# Keyed ``(id, anchor_index, regex.pattern, regex.flags)`` so a regex EDIT at the
+# same index INVALIDATES the classification (the tie test fails loudly). Value is
+# ``"vetoed"`` (a DISTINCTIVE named TOP anchor whose dropped-footer redraw must
+# refuse the footerless parse) or ``"excluded(<reason>)"`` (the generic
+# numbered-option-row shape shared by plain-AUQ + Decision itself, which would
+# self-reject every positive). The tie test asserts EVERY top anchor of EVERY
+# pattern in ``UI_PATTERNS`` is classified EXACTLY once.
+_VETOED: Final[str] = "vetoed"
+# ``re.Pattern.flags`` for a str regex compiled with NO flags is ``re.UNICODE``
+# (32), not 0 — that value is part of the classification key so a flags EDIT also
+# invalidates it.
+_UF: Final[int] = re.UNICODE
+_DECISION_ANCHOR_CLASSIFICATION: Final[dict[tuple[str, int, str, int], str]] = {
+    ("epm", 0, r"^\s*Would you like to proceed\?", _UF): _VETOED,
+    ("epm", 1, r"^\s*Claude has written up a plan", _UF): _VETOED,
+    ("auq-multi", 0, r"^\s*←\s+[☐✔☒]", _UF): _VETOED,
+    ("auq-single", 0, r"^\s*[☐✔☒]", _UF): _VETOED,
+    (
+        "auq-plain",
+        0,
+        r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S",
+        _UF,
+    ): "excluded(generic-option-shape)",
+    ("restore-checkpoint", 0, r"^\s*Restore the code", _UF): _VETOED,
+    ("settings", 0, r"^\s*Settings:.*tab to cycle", _UF): _VETOED,
+    ("settings", 1, r"^\s*Select model", _UF): _VETOED,
+    ("settings", 2, r"^\s*Settings Warning\b", _UF): _VETOED,
+    (
+        "permission",
+        0,
+        r"^\s*Do you want to (?:allow|proceed|make|create|run|read|edit|write|"
+        r"fetch|search|delete|move|install|update|execute|apply|modify)\b",
+        _UF,
+    ): _VETOED,
+    ("permission", 1, r"^\s*Claude wants to ", _UF): _VETOED,
+    ("workflow", 0, r"^\s*Run a dynamic workflow\?", _UF): _VETOED,
+    ("workflow", 1, r"^\s*This dynamic workflow will\b", _UF): _VETOED,
+    ("workflow", 2, r"^\s*Dynamic workflows can use\b", _UF): _VETOED,
+    (
+        "decision",
+        0,
+        r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S",
+        _UF,
+    ): "excluded(decision-own-options)",
+}
+
+
+def _footerless_veto_anchors() -> list[tuple[str, re.Pattern[str]]]:
+    """The live ``(key, regex)`` pairs classified ``vetoed``, iterated over the
+    (validator-wired) ``UI_PATTERNS`` so the compiled objects match the live
+    patterns. ``key`` is ``"<id>:<idx>"`` for the redraw-matrix reject reason."""
+    out: list[tuple[str, re.Pattern[str]]] = []
+    for p in UI_PATTERNS:
+        for idx, rx in enumerate(p.top):
+            cls = _DECISION_ANCHOR_CLASSIFICATION.get((p.id, idx, rx.pattern, rx.flags))
+            if cls == _VETOED:
+                out.append((f"{p.id}:{idx}", rx))
+    return out
+
+
+def _terminal_numbered_option_block(
+    lines: list[str],
+) -> tuple[tuple[AskOption, ...], int] | None:
+    """The bottom-most contiguous ``N. <label>`` block anchored at the pane's LAST
+    non-blank line (requirement 1 terminal-block + requirement 2 blank-below).
+
+    Returns ``(options, last_nonblank_idx)`` when the last non-blank line IS a
+    numbered option AND the block is ≥2 options contiguous 1..N; else ``None``. NO
+    cursor requirement here — the confirm-side residue predicate uses it as-is; the
+    footerless leg adds the cursor + rule-adjacency + veto gates."""
+    last_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip():
+            last_idx = i
+            break
+    if last_idx is None:
+        return None
+    if not _RE_NUMBERED_OPTION.match(lines[last_idx]):
+        return None
+    options = _gate_options_above(lines, last_idx + 1)
+    if len(options) < 2:
+        return None
+    if [o.number for o in options] != list(range(1, len(options) + 1)):
+        return None
+    return options, last_idx
+
+
+def has_decision_residue(pane_text: str) -> bool:
+    """True iff the pane carries DECISION RESIDUE (the r5 P1 confirm-side predicate):
+    a strict Decision footer line OR a terminal contiguous numbered-option block.
+
+    A still-standing option block IS residue even when no parser recognizes the
+    frame (a footer-dropped ``─``-ruled prompt fails ``_parse_footerless_decision``
+    entirely but still shows its option block). Used by ``_classify_decision_advance``
+    to fail closed to ``commit_unconfirmed`` when the committed prompt has not
+    provably resolved."""
+    if not pane_text:
+        return False
+    lines = pane_text.split("\n")
+    if any(_is_decision_footer_line(line) for line in lines):
+        return True
+    return _terminal_numbered_option_block(lines) is not None
+
+
+@dataclass(frozen=True)
+class _FooterlessGate:
+    """Result of the footerless gate: a machine ``reason`` (None on ACCEPT) plus
+    the boundary indices needed to build the form. ``reason`` is exposed for the
+    redraw-matrix test via ``footerless_decision_reject_reason``."""
+
+    reason: str | None
+    options: tuple[AskOption, ...] = ()
+    title_idx: int = -1
+    last_idx: int = -1
+    title: str = ""
+
+
+def _footerless_decision_gate(pane_text: str) -> _FooterlessGate:
+    """The strict FOOTERLESS gate (GH #52), returning a machine reason (None on
+    ACCEPT). Requirements, ALL fail-closed:
+
+      1. TERMINAL option block: ≥2 contiguous 1..N options anchored at the pane's
+         last non-blank line, with a resolved live ``❯`` cursor somewhere in it;
+      2. STRICT BLANK-BELOW (implied by (1)'s last-non-blank anchoring);
+      3. MODAL-RULE-ADJACENT title: the walk-up title must sit IMMEDIATELY below a
+         full-width ``▔`` rule (blank between rule and title NOT tolerated); title
+         REQUIRED;
+      4. NAMED-SURFACE + verb-agnostic + ATTACHED-FOOTER + strict validator VETOES.
+
+    The veto reasons are ``veto_anchor:<id>:<idx>`` / ``veto_verb_agnostic`` /
+    ``veto_attached_footer`` / ``veto_strict_permission`` / ``veto_strict_workflow``
+    so a redraw-matrix test can assert the SPECIFIC refusing entry."""
+    if not pane_text:
+        return _FooterlessGate("empty_pane")
+    lines = pane_text.split("\n")
+
+    block = _terminal_numbered_option_block(lines)
+    if block is None:
+        return _FooterlessGate("no_terminal_block")
+    options, last_idx = block
+    if not any(o.cursor for o in options):  # live cursor REQUIRED
+        return _FooterlessGate("no_cursor")
+
+    block_top_idx = _decision_option_block_top(lines, last_idx + 1)
+    if block_top_idx is None:
+        return _FooterlessGate("no_block_top")
+
+    # (3) modal-rule-adjacent REQUIRED title. ``_decision_prompt_block_top`` now
+    # treats the ``▔`` rule as a BLOCK TERMINATOR, so the title resolves to the
+    # line immediately below the rule; require that neighbour to BE the rule (a
+    # blank / ``─`` rule / prose terminator between them fails).
+    title_idx = _decision_prompt_block_top(lines, block_top_idx)
+    if title_idx is None or title_idx < 1:
+        return _FooterlessGate("no_title")
+    if not _is_modal_rule(lines[title_idx - 1]):
+        return _FooterlessGate("not_rule_adjacent")
+    title = lines[title_idx].strip()
+    if not title:
+        return _FooterlessGate("empty_title")
+
+    # (4) VETOES. (a) named-surface anchors on the PRE-OPTION region ONLY
+    # (rule → line above option 1), NEVER the option rows.
+    for i in range(title_idx, block_top_idx):
+        line = lines[i]
+        if _RE_VERB_AGNOSTIC_PERMISSION.match(line):
+            return _FooterlessGate("veto_verb_agnostic")
+        for key, rx in _footerless_veto_anchors():
+            if rx.search(line):
+                return _FooterlessGate(f"veto_anchor:{key}")
+    # (b) attached-footer veto across the rule→terminal-options region (excludes
+    # Decision's own numbered option rows) — a strict footer / hint row sitting
+    # between the title and the terminal options is a malformed footered frame.
+    for i in range(title_idx, last_idx + 1):
+        if _is_attached_footer_veto_line(lines[i]):
+            return _FooterlessGate("veto_attached_footer")
+    # (c) strict permission / workflow validators (defence in depth).
+    if parse_permission_prompt(pane_text) is not None:
+        return _FooterlessGate("veto_strict_permission")
+    if parse_workflow_approval(pane_text) is not None:
+        return _FooterlessGate("veto_strict_workflow")
+
+    return _FooterlessGate(
+        None, options=options, title_idx=title_idx, last_idx=last_idx, title=title
+    )
+
+
+def footerless_decision_reject_reason(pane_text: str) -> str | None:
+    """The machine reason ``_parse_footerless_decision`` would refuse on (None on
+    ACCEPT). Test-only observability for the redraw matrix (assert the SPECIFIC
+    refusing veto entry, not just None)."""
+    return _footerless_decision_gate(pane_text).reason
+
+
+def _parse_footerless_decision(pane_text: str) -> AskUserQuestionForm | None:
+    """Strict-or-None parse of the FOOTERLESS Decision modal (GH #52 — the CC
+    2.1.207 ``Switch model?`` confirmation, which ends at its last option with NO
+    footer). Delegates the gating to ``_footerless_decision_gate`` (which owns the
+    fail-closed requirements); stamps ``_meta[decision_variant]="footerless"``."""
+    if not pane_text:
+        return None
+    gate = _footerless_decision_gate(pane_text)
+    if gate.reason is not None:
+        return None
+    lines = pane_text.split("\n")
+    pane_excerpt = "\n".join(lines[gate.title_idx : gate.last_idx + 1]).rstrip()
+    return AskUserQuestionForm(
+        current_question_title=gate.title,
+        options=gate.options,
+        is_review_screen=False,
+        is_free_text=False,
+        pane_excerpt=pane_excerpt,
+        select_mode="single",
+        options_complete=True,
+        _meta={DECISION_VARIANT_META_KEY: DECISION_VARIANT_FOOTERLESS},
+    )
+
+
+def _parse_footered_decision(pane_text: str) -> AskUserQuestionForm | None:
+    """Strict-or-None parse of the FOOTERED Decision leg (a GENERIC titled
+    numbered-option confirmation prompt whose bottom is a live ``Enter to
+    (confirm|continue)`` footer — the folder-trust prompt, the pre-2.1.207
+    ``Switch model?`` shape, and peers that no NAMED pattern covers).
 
     Behind the ``CC_TELEGRAM_DECISION_CARDS`` flag (default ON since
     2026-07-11; explicit falsy value disables) and ordered
@@ -3138,7 +3518,35 @@ def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
         pane_excerpt=pane_excerpt,
         select_mode="single",
         options_complete=options[0].number == 1,
+        _meta={DECISION_VARIANT_META_KEY: DECISION_VARIANT_FOOTERED},
     )
+
+
+def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
+    """Strict-or-None parse of a GENERIC titled numbered-option confirmation
+    prompt (Stage B1, flag-gated ``CC_TELEGRAM_DECISION_CARDS``, LAST in
+    ``UI_PATTERNS``).
+
+    TWO legs, tried in order (GH #52):
+
+      * the FOOTERED leg (``_parse_footered_decision``) — the pre-existing shape,
+        byte-identical, stamps ``_meta[decision_variant]="footered"``;
+      * the FOOTERLESS leg (``_parse_footerless_decision``) — the CC 2.1.207
+        ``Switch model?`` modal that ends at its last option with NO footer, stamps
+        ``"footerless"``. It runs whenever the footered leg returns ``None`` for ANY
+        reason (a STALE footered Decision above a live footerless modal would
+        otherwise select the stale footer, fail ``_only_chrome_below``, and never
+        reach the footerless leg).
+
+    The footered leg's ``Enter to (confirm|continue)`` requirement closes verb-drift
+    FOR THAT LEG; the footerless leg's exclusion rests on {strict blank-below +
+    rule-adjacent title + named-anchor vetoes + verb-agnostic question veto +
+    attached-footer veto}. See ``_parse_footerless_decision`` for the requirements
+    and the disclosed dropped-footer-redraw residual."""
+    footered = _parse_footered_decision(pane_text)
+    if footered is not None:
+        return footered
+    return _parse_footerless_decision(pane_text)
 
 
 def parse_unknown_blocking_prompt(pane_text: str) -> str | None:
@@ -3264,10 +3672,15 @@ def decision_prompt_fingerprint(form: AskUserQuestionForm) -> str:
             if _is_decision_footer_line(excerpt_lines[i]):
                 footer_idx = i
                 break
+        # GH #52: a FOOTERLESS form's excerpt ends at its last OPTION (no footer
+        # line), so derive the option block from the excerpt END; every option row
+        # (INCLUDING the moving ``❯``) would otherwise fold into the body and churn
+        # the fingerprint on a cursor move. The footered form still finds its footer
+        # and derives the block above it — byte-identical.
         option_top = (
             _decision_option_block_top(excerpt_lines, footer_idx)
             if footer_idx is not None
-            else None
+            else _decision_option_block_top(excerpt_lines, len(excerpt_lines))
         )
         # ``parse_generic_decision`` sets ``excerpt_start = prompt_top_idx`` when a
         # title was resolved, so the title occupies excerpt line 0; with no title
@@ -3278,7 +3691,11 @@ def decision_prompt_fingerprint(form: AskUserQuestionForm) -> str:
             trimmed = line.rstrip()
             if trimmed:
                 body_lines.append(trimmed)
-    parts = ["decision:", f"T:{title}"]
+    # Fold the Decision VARIANT into the canonical (§5 identity separation): the
+    # SAME title/body/options rendered footered vs footerless yield DIFFERENT
+    # fingerprints, so a mid-dispatch redraw that flips the variant is a fp change.
+    variant = form._meta.get(DECISION_VARIANT_META_KEY, "")
+    parts = ["decision:", f"V:{variant}", f"T:{title}"]
     parts.extend(f"B:{b}" for b in body_lines)
     parts.extend(f"O:{o.number}:{o.label}" for o in form.options)
     canonical = "\n".join(parts)
