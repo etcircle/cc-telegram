@@ -1510,14 +1510,18 @@ _CARD_BODY_CHAR_CAP = 3800
 
 # GH #54 W5 — the tail of the three partial/untrusted-pane notices. The
 # text-answer suffix is used ONLY where a plain message would actually be taken
-# (``free_text.advertises_free_text``, which MIRRORS the executor's own
-# eligibility gates — single-Q single-select + live affordance + COMPLETE
-# options + flag ON + licensed CC version; r1 P2-1: the weaker
-# flag × license × affordance form advertised text on a licensed SCROLLED
-# picker whose send the executor refuses on ``options_complete``); everything
-# else — a preview single-select, a partial/scrolled pane, a multi-question
-# form, an unlicensed version, the flag off — points at the keystroke nav row
-# instead, so the notice can never promise what PR-1's gate would refuse.
+# (``free_text.advertises_free_text``, which REUSES the executor's own shape
+# gate ``_auq_form_shape`` — single-Q single-select + live affordance +
+# COMPLETE options + a PROVEN cursor — plus the executor's anchor reader
+# ``read_surface_anchor`` and flag × license; r1 P2-1 → r3: a mirrored gate
+# LIST drifted twice — first missing ``options_complete``, then the cursor
+# and anchor legs — so the predicate now CALLS the executor's own gates
+# instead of copying them); everything else — a preview single-select, a
+# partial/scrolled pane, a multi-question form, a cursor-less frame, an
+# anchor-less window (no PreToolUse side file), an unlicensed version, the
+# flag off — points at the keystroke nav row instead, so the notice can never
+# promise what PR-1's gate would refuse. Honest-at-render (disclosed): the
+# executor's own gates stay the authority at send time.
 _NOTICE_NAV_OR_TEXT = "use ↑/↓/Tab below or send your answer as text."
 _NOTICE_NAV_ONLY = "use the ↑/↓/⏎ keys below."
 
@@ -3796,15 +3800,21 @@ async def handle_interactive_ui(
         partial_options_notice: str | None = None
         # GH #54 W5: the notice suffix tracks whether the free-text executor
         # would ACTUALLY take a plain message on this pane —
-        # ``free_text.advertises_free_text`` mirrors the executor's own
-        # eligibility gates (single-Q single-select + affordance + COMPLETE
-        # options + flag × license; the ``card_hint`` predicate), so a preview
-        # single-select, a scrolled/partial pane, a multi-question form, or an
-        # unlicensed version never advertises a text answer PR-1 would refuse.
+        # ``free_text.advertises_free_text`` REUSES the executor's own shape
+        # gate (``_auq_form_shape``: single-Q single-select + affordance +
+        # COMPLETE options + a PROVEN cursor) AND its anchor reader
+        # (``read_surface_anchor`` — no PreToolUse side file ⇒ the executor
+        # declines ⇒ nav-only copy), on top of flag × license. So a preview
+        # single-select, a scrolled/partial pane, a multi-question form, a
+        # cursor-less frame, an anchor-less window, or an unlicensed version
+        # never advertises a text answer PR-1 would refuse. Honest-at-render:
+        # the executor's own gates remain the authority at send time.
         _advertises_free_text = free_text.advertises_free_text(
             free_text.SURFACE_AUQ,
             version=w.pane_current_command,
             form=form,
+            window_id=window_id,
+            ansi_pane=pane_ansi,
         )
         _nav_suffix = _NOTICE_NAV_OR_TEXT if _advertises_free_text else _NOTICE_NAV_ONLY
         if form is not None and form.options:
@@ -3921,6 +3931,8 @@ async def handle_interactive_ui(
                     free_text.SURFACE_AUQ,
                     version=w.pane_current_command,
                     form=form,
+                    window_id=window_id,
+                    ansi_pane=pane_ansi,
                 ),
             )
             if structured:

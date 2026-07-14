@@ -2,10 +2,13 @@
 
 Three dishonest notices used to promise "send your answer (as text)" on EVERY
 partial/untrusted AUQ pane. All three now route through
-``free_text.advertises_free_text``, which MIRRORS the free-text executor's OWN
-eligibility gates (single-question single-select + a live affordance +
-COMPLETE contiguous options + flag ON + licensed CC version — the
-``_auq_shape`` legs). The r1 P2-1 consequence pinned here: the notices fire
+``free_text.advertises_free_text``, which REUSES the free-text executor's OWN
+gates (r3 structural remedy — never a mirrored list): the shared shape gate
+``_auq_form_shape`` (single-question single-select + a live affordance +
+COMPLETE contiguous options + a PROVEN cursor), the executor's anchor reader
+``read_surface_anchor`` (no PreToolUse side file ⇒ ``surface_anchor_lost`` ⇒
+nav-only), and flag ON × licensed CC version. The r1 P2-1 consequence pinned
+here: the notices fire
 precisely on partial/scrolled/unparseable panes — shapes the EXECUTOR refuses
 (``options_complete`` False / no parseable form) — so on a LICENSED version
 (the fake tmux default ``pane_current_command`` IS the licensed 2.1.207) they
@@ -220,18 +223,11 @@ async def test_notice2_recovered_swap_is_nav_only_even_when_licensed(
     assert _TEXT_SUFFIX not in picker
 
 
-# ── The over-suppression control: a COMPLETE licensed pane hints free-text ────
+# ── The anchor leg (r3 P2-1(b)) + the over-suppression control ────────────────
 
 
-@pytest.mark.asyncio
-async def test_complete_licensed_single_select_still_promises_free_text(
-    scenario: ScenarioHarness,
-):
-    """Executor parity must not OVER-suppress: a complete contiguous
-    single-select with the affordance on the licensed version renders the
-    ``card_hint`` free-text promise (no notice fires at all — the pane is
-    trusted and complete)."""
-    pane = (
+def _complete_pane() -> str:
+    return (
         f"{_TITLE}\n"
         "\n"
         f"❯ 1. {_LABELS[0]}\n"
@@ -241,7 +237,40 @@ async def test_complete_licensed_single_select_still_promises_free_text(
         "\n"
         "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
     )
-    wid = _bind(scenario, pane)
+
+
+@pytest.mark.asyncio
+async def test_complete_pane_WITHOUT_side_file_is_nav_only(
+    scenario: ScenarioHarness,
+):
+    """r3 P2-1(b), the FLIPPED r1 control: a complete licensed pane with NO
+    PreToolUse side file constructs EXACTLY the state the executor's
+    ``_observe`` declines (``surface_anchor_lost``) — the send the old copy
+    advertised would be refused, so the hint must point at the buttons. The
+    predicate consults the SAME anchor reader the executor trusts
+    (``read_surface_anchor`` → ``peek_surface_anchor_for_window``), driven
+    REAL here: no side file exists for the bound session."""
+    wid = _bind(scenario, _complete_pane())
+    await _render(scenario, wid)
+    picker = _picker_text(scenario)
+    assert free_text.HINT_NO_FREE_TEXT in picker
+    assert free_text.HINT_FREE_TEXT not in picker
+    assert "Only options" not in picker
+    assert "Tap-to-select" not in picker
+
+
+@pytest.mark.asyncio
+async def test_complete_pane_WITH_live_side_file_still_promises_free_text(
+    scenario: ScenarioHarness,
+):
+    """The over-suppression control: executor parity must not over-suppress.
+    A complete contiguous single-select with the affordance, a licensed
+    version, AND a live consistent side file (the anchor the executor
+    requires — the harness's ``bind_thread`` writes the fresh
+    ``session_map.json`` entry the anchor reader resolves through) renders
+    the ``card_hint`` free-text promise."""
+    wid = _bind(scenario, _complete_pane())
+    _write_side_file(_single_q_input(_LABELS, title=_TITLE), aged=False)
     await _render(scenario, wid)
     picker = _picker_text(scenario)
     assert free_text.HINT_FREE_TEXT in picker

@@ -463,19 +463,42 @@ class _Shape:
 
 
 def _auq_shape(pane_text: str, ansi_pane: str) -> _Shape | None:
-    """The AUQ single-select free-text geometry, or ``None`` to decline."""
+    """The AUQ single-select free-text geometry, or ``None`` to decline.
+
+    A thin parse + delegate: the eligibility + cursor-geometry gates live in
+    :func:`_auq_form_shape` — ONE authority, SHARED with the card-copy
+    predicate ``advertises_free_text`` (GH #54 W5 r3: the r1 mirrored-list copy
+    missed the cursor-geometry leg, so a complete licensed pane whose form
+    parsed NO cursor advertised a text answer this executor declines; reuse
+    kills the drift class instead of patching its next instance).
+    """
     form = terminal_parser.parse_ask_user_question(pane_text)
+    return _auq_form_shape(form, ansi_pane)
+
+
+def _auq_form_shape(
+    form: "terminal_parser.AskUserQuestionForm | None", ansi_pane: str | None
+) -> _Shape | None:
+    """The executor's OWN form-shape eligibility gate (GH #54 W5 r3).
+
+    Called by BOTH :func:`_auq_shape` (the executor, via a fresh pane parse)
+    and ``advertises_free_text`` (the card-copy predicate) — one authority, no
+    enumerated-list copy anywhere. A gate added here binds both by
+    construction.
+
+    Out of scope (plan §2.2), each for a stated reason:
+      * multi-select   — a THREE-Enter transaction whose first Enter mutates
+        the form
+      * review screen  — the Submit/Cancel screen has no free-text row
+      * multi-question — the tab matrix makes "the answer" ambiguous
+
+    ``ansi_pane`` feeds the zero-nav cursor leg (a cursor already parked on
+    the affordance row is only observable via the SGR row parse); ``None``
+    means "no ANSI frame available" and that leg fails closed — the predicate
+    side under-advertises rather than over-promising.
+    """
     if form is None:
         return None
-    # Out of scope (plan §2.2), each for a stated reason:
-    #   multi-select   — a THREE-Enter transaction whose first Enter mutates the form
-    #   review screen  — the Submit/Cancel screen has no free-text row
-    #   multi-question — the tab matrix makes "the answer" ambiguous
-    #
-    # MINT/VALIDATE PARITY (GH #54 W5 r1 P2-1): these eligibility gates are
-    # MIRRORED by ``advertises_free_text`` (the card-copy predicate) — a gate
-    # added here without the mirror makes the card promise a text answer this
-    # executor will refuse. Keep the two in lockstep.
     if form.select_mode != "single" or form.is_review_screen:
         return None
     if len(form.questions) > 1:
@@ -486,12 +509,17 @@ def _auq_shape(pane_text: str, ansi_pane: str) -> _Shape | None:
     # rather than guessing the row index. ``options_complete`` is True only when
     # the numbering is contiguous from 1 AND an affordance row was parsed in the
     # block — i.e. we are looking at the WHOLE list, so N is trustworthy.
-    # (Also mirrored by ``advertises_free_text`` — see above.)
     if not form.options_complete or not form.options:
         return None
     target_row = len(form.options) + 1  # affordances are dropped from ``options``
     cursor = next((o.number for o in form.options if o.cursor and o.number), None)
+    if cursor is None and ansi_pane is None:
+        # No proven cursor and no ANSI frame to read the affordance row with —
+        # the predicate caller's shape. Fail closed (the executor always
+        # supplies ANSI, so this leg never fires for it).
+        return None
     if cursor is None:
+        assert ansi_pane is not None
         # THE CURSOR IS ALREADY ON THE AFFORDANCE ROW (peer-review P2).
         # ``_parse_numbered_options`` DROPS the affordance row and — because an
         # affordance ❯ is the bottom-most, hence live, cursor — deliberately
@@ -1292,6 +1320,8 @@ def advertises_free_text(
     *,
     version: str | None,
     form: "terminal_parser.AskUserQuestionForm | None",
+    window_id: str | None,
+    ansi_pane: str | None = None,
 ) -> bool:
     """True iff a plain message would ACTUALLY be taken as this card's answer.
 
@@ -1300,35 +1330,42 @@ def advertises_free_text(
     ``interactive_ui`` (GH #54 W5), so no card copy can ever promise a text
     answer this lane's executor would decline (⇒ PR-1 refusal).
 
-    It MIRRORS the executor's OWN eligibility gates (``_auq_shape`` — the
-    mint/validate-parity rule, GH #54 W5 r1 P2-1: the earlier flag × license ×
-    affordance form was WEAKER than the executor, so a licensed SCROLLED picker
-    — ``is_free_text=True`` but ``options_complete=False`` — or a
-    multi-question single-select advertised "send your answer as text" while
-    the send was REFUSED):
+    **Composition — REUSE, never a mirrored list (r3: the r1 enumerated copy
+    missed the cursor-geometry and anchor legs; a copied list drifts, a shared
+    call cannot):**
 
-      * single-select, not the review screen;
-      * single-QUESTION (the tab matrix makes "the answer" ambiguous);
-      * a live free-text affordance (``is_free_text`` — a preview single-select
-        is False here, so it never advertises on any version);
-      * a COMPLETE contiguous option list (a scrolled/partial pane bails);
-      * the flag is ON and the CC version is licensed.
+      1. the flag × license gate (this module's own ``_ENABLED`` +
+         ``licensed`` — the same pair ``try_answer`` checks);
+      2. the executor's OWN form-shape gate — :func:`_auq_form_shape`, the ONE
+         helper ``_auq_shape`` itself delegates to (single-Q single-select,
+         not review, live affordance, COMPLETE options, AND a proven cursor:
+         a glyph/SGR cursor on an option, or — with ``ansi_pane`` — the
+         zero-nav affordance-row cursor; no ANSI + no cursor fails closed);
+      3. the MANDATORY occurrence anchor, read through the SAME reader the
+         executor's ``_observe`` declines without (``surface_anchor_lost``):
+         :func:`read_surface_anchor` → ``auq_source.peek_surface_anchor_for_window``
+         — no PreToolUse side file / no fresh session-map entry / no
+         ``tool_use_id`` ⇒ the executor would decline ⇒ the copy says nav-only.
 
     ``form`` is the LIVE pane-derived form (the closest render-time proxy for
-    what the executor's fresh parse will see); ``None`` ⇒ False.
+    the executor's fresh parse); ``None`` ⇒ False. ``window_id`` feeds the
+    anchor read; ``None`` ⇒ False (no window, no anchor, no promise).
+
+    **DISCLOSED RESIDUAL (honest-at-render):** the notice is computed at
+    RENDER time — the anchor can vanish (side file unlinked / session
+    rotation) or the pane can change between the render and the moment the
+    user actually sends, so the copy is honest AS OF the render; the
+    executor's own gates remain the authority at send time and a send the
+    copy promised can still be declined (⇒ PR-1's refusal, never a wrong
+    keystroke).
     """
-    if form is None:
+    if not (_ENABLED and licensed(surface, version)):
         return False
-    # The executor's gates, mirrored in order (free_text._auq_shape).
-    if form.select_mode != "single" or form.is_review_screen:
+    if _auq_form_shape(form, ansi_pane) is None:
         return False
-    if len(form.questions) > 1:
+    if not window_id:
         return False
-    if not form.is_free_text:
-        return False
-    if not form.options_complete or not form.options:
-        return False
-    return _ENABLED and licensed(surface, version)
+    return read_surface_anchor(window_id) is not None
 
 
 def card_hint(
@@ -1336,15 +1373,23 @@ def card_hint(
     *,
     version: str | None,
     form: "terminal_parser.AskUserQuestionForm | None",
+    window_id: str | None,
+    ansi_pane: str | None = None,
 ) -> str:
     """The per-surface card hint (plan §2.2 [r3 P2-4]).
 
     The card must state the CURRENT truth: pre-PR-2 it promised free-text on
     every AUQ, including the multi-select and unlicensed-version cases where a
     plain message is REFUSED. Now the promise is made only where the lane will
-    actually take it — ``advertises_free_text`` mirrors the executor's own
-    eligibility gates (GH #54 W5 r1 P2-1).
+    actually take it — ``advertises_free_text`` REUSES the executor's own
+    shape gate + anchor reader (GH #54 W5 r1 P2-1 → r3 structural remedy).
     """
-    if advertises_free_text(surface, version=version, form=form):
+    if advertises_free_text(
+        surface,
+        version=version,
+        form=form,
+        window_id=window_id,
+        ansi_pane=ansi_pane,
+    ):
         return HINT_FREE_TEXT
     return HINT_NO_FREE_TEXT

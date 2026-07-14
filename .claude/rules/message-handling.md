@@ -1658,22 +1658,36 @@ partial-pane notices in `interactive_ui` all used to promise "send your answer (
 text)" on EVERY partial/untrusted pane — including preview single-selects and
 unlicensed versions where PR-1's gate REFUSES a plain message. All three now compose
 their suffix from ONE per-render `_nav_suffix`, decided by
-`free_text.advertises_free_text(surface, version=…, form=…)` — the predicate
-`card_hint` also routes through, and it MIRRORS the free-text EXECUTOR's own
-eligibility gates (`_auq_shape`, cross-referenced both ways — mint/validate parity,
-r1 P2-1: the earlier flag × license × affordance form was WEAKER than the executor,
-so a licensed SCROLLED picker — `is_free_text=True` but `options_complete=False` —
-or a multi-question single-select advertised a text answer whose send the executor
-refuses): single-question single-select, not the review screen, a live free-text
-affordance, a COMPLETE contiguous option list, flag ON, licensed CC version ⇒
-"use ↑/↓/Tab below or send your answer as text."; ANY leg fails ⇒ "use the ↑/↓/⏎
-keys below." A preview single-select (`is_free_text=False`) and every
-partial/scrolled pane therefore never advertise text answers on any version — and
-since the notices fire precisely on partial/untrusted panes, the text suffix is
-reachable only if a future render shape puts a COMPLETE eligible pane behind a
-notice (then it will be honest). Pinned by scenarios driving the REAL predicate
-(never a boolean substitute) + real-form unit pins for all four reviewer shapes.
-Pull-only; no observer (c313657 stays forbidden).
+`free_text.advertises_free_text(surface, version=…, form=…, window_id=…,
+ansi_pane=…)` — the predicate `card_hint` also routes through. **Its composition is
+REUSE, never a mirrored list (r1 P2-1 → r3: an enumerated gate copy drifted TWICE —
+the r1 flag × license × affordance form missed `options_complete` and
+multi-question, the r2 mirrored list missed the CURSOR-GEOMETRY leg — `_auq_shape`
+also requires a proven cursor or a positively-cursored affordance row — and the
+MANDATORY PreToolUse ANCHOR — `_observe` declines `surface_anchor_lost` without a
+side file; reuse kills the drift class):** (1) flag ON × licensed CC version;
+(2) the executor's OWN shape gate `free_text._auq_form_shape` — the ONE helper
+`_auq_shape` itself delegates to (single-question single-select, not the review
+screen, a live free-text affordance, a COMPLETE contiguous option list, AND a
+proven cursor — glyph/SGR on an option, or the ANSI-read affordance-row cursor;
+no ANSI + no cursor fails closed); (3) the MANDATORY occurrence anchor through the
+SAME reader the executor trusts (`free_text.read_surface_anchor` →
+`auq_source.peek_surface_anchor_for_window` — no side file / no fresh session-map
+entry / no `tool_use_id` ⇒ nav-only). ALL legs pass ⇒ "use ↑/↓/Tab below or send
+your answer as text."; ANY leg fails ⇒ "use the ↑/↓/⏎ keys below." A preview
+single-select (`is_free_text=False`), every partial/scrolled pane, a cursor-less
+frame, and an ANCHOR-LESS window (no PreToolUse side file — a complete licensed
+pane included) therefore never advertise text answers. **Disclosed
+(honest-at-render):** the copy is computed at RENDER time — the anchor can vanish
+or the pane can change before the user sends; the executor's own gates remain the
+authority at send time (a promised send can still take PR-1's refusal, never a
+wrong keystroke). Pinned by scenarios driving the REAL predicate + reader (never a
+boolean substitute — incl. the complete-pane-NO-side-file nav-only flip and the
+side-file-anchored positive control), real-form unit pins for every reviewer
+shape, and the r3 P3 parity SWEEP: over all gate axes,
+`advertises_free_text(...) is True ⇒ _auq_form_shape(form, ansi) is not None`,
+plus a delegation pin proving `_auq_shape` IS the shared gate over a fresh pane
+parse. Pull-only; no observer (c313657 stays forbidden).
 
 ## Inbound delivery gate — text on a live interactive surface (GH #50 PR-1)
 
