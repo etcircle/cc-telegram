@@ -580,3 +580,833 @@ def test_agreement_predicate_and_classifier_never_disagree() -> None:
 
 def test_indeterminate_reasons_are_a_subset_of_the_leg_names() -> None:
     assert tp.INPUT_BOX_INDETERMINATE_REASONS <= tp.INPUT_BOX_FAILURE_REASONS
+
+
+# ── GH #56: the tall multi-line draft fallback (exactly-1-separator scan) ──
+#
+# A reply-quoted message renders a ~18-row draft INSIDE the input box, pushing the
+# box's TOP rule above the 20-line `_CHROME_SCAN_LINES` window. Only the bottom
+# rule is in view, so the original `_input_box_rows` returned None and the delivery
+# gate's POST-WRITE re-verify concluded `no_input_box` — Enter withheld, the
+# stranded-draft brake armed, the NEXT message refused too (a topic wedge on the
+# owner's dominant gesture). The fallback scans UPWARD for the top rule under a
+# three-part structural proof; the coupled fix adds `⏸ manual mode on` to leg 3's
+# alphabet (the rig fixture's only status row).
+
+_TALL_DRAFT = "inputbox_tall_draft_v2.1.209.txt"
+_TALL_DRAFT_ANSI = "inputbox_tall_draft_v2.1.209.ansi.txt"
+_TALL_DRAFT_CLEARED = "inputbox_tall_draft_cleared_v2.1.209.txt"
+
+
+@pytest.mark.parametrize("name", [_TALL_DRAFT, _TALL_DRAFT_ANSI])
+def test_tall_reply_quoted_draft_is_a_READY_input_box(name: str) -> None:
+    """RED-first: today `classify_input_box_failure` returns `no_input_box` on this
+    real rig capture (the top rule at line 30 is outside the 20-line window); the
+    fallback flips it to a fully-ready box. Plain AND ANSI captures agree."""
+    pane = _pane(name)
+    # The fixture genuinely has the tall shape — top rule far above, one in-window
+    # separator — otherwise this pin is vacuous.
+    assert "[Telegram reply context]" in tp._strip_ansi(pane)
+    assert tp.pane_input_box_present(pane) is True
+    assert tp.classify_input_box_failure(pane) is None
+    # The brake's release proof reads the SAME rows: the box is FOUND and its input
+    # row is non-empty (False, never None — None would mean "box not found").
+    assert tp.pane_input_row_empty(pane) is False
+
+
+def test_tall_draft_cleared_capture_releases_the_brake() -> None:
+    """The brake-release twin: after the draft is cleared the input row is provably
+    empty (True), so `clear_window_stranded_draft`'s only proof holds."""
+    pane = _pane(_TALL_DRAFT_CLEARED)
+    assert tp.pane_input_row_empty(pane) is True
+    assert tp.pane_input_box_present(pane) is True
+
+
+def test_the_manual_mode_marker_is_in_the_leg3_alphabet_not_the_idle_one() -> None:
+    """The coupled alphabet fix, pinned BOTH ways: `manual mode on` is a leg-3
+    ready marker (so the tall-draft box passes) but is NOT in the idle-status
+    alphabet (a manual-mode pane holding a draft is not "idle" for /update /
+    /cost — the paste-collapse precedent)."""
+    assert "manual mode on" in tp._INPUT_READY_CHROME_MARKERS
+    assert "manual mode on" not in tp._READY_STATUS_MARKERS
+
+
+def test_a_manual_mode_status_bar_passes_leg3_with_a_draft_present() -> None:
+    """The direct leg-3 pin: a normal 2-separator box whose ONLY status marker is
+    `⏸ manual mode on`, holding a draft, is a ready input box (before the addition,
+    leg 3 returned `no_ready_chrome` — the same false-refusal class as the
+    paste-collapse regression)."""
+    rule = "─" * 40
+    pane = f"  prose above\n{rule}\n❯ my drafted reply\n{rule}\n  ⏸ manual mode on\n"
+    assert tp.classify_input_box_failure(pane) is None
+    assert tp.pane_input_box_present(pane) is True
+
+
+# ── The three-part structural proof: two reproduced spoofs must STILL refuse ──
+
+
+def _tall(draft_rows: list[str], status_row: str, below_extra: str = "") -> str:
+    """A synthetic pane whose TOP rule is pushed out of the 20-line window by a
+    tall draft (so exactly ONE separator is in the window). Mirrors the rig
+    fixture's geometry."""
+    rule = "─" * 40
+    pad = "\n".join(f"  filler line {i}" for i in range(6))
+    body = "\n".join(draft_rows)
+    tail = f"\n{below_extra}" if below_extra else ""
+    return f"{pad}\n{rule}\n{body}\n{rule}\n  {status_row}{tail}\n"
+
+
+def test_spoof_lone_separator_is_a_live_prompts_TOP_rule_STILL_refuses() -> None:
+    """Codex r2 (b): the lone in-window separator is a LIVE PROMPT's top rule with
+    the picker body `❯ 1. Yes` below it — no numbered row may sit below the
+    presumed bottom rule."""
+    draft = ["❯ a stale draft above"] + [f"  draft cont {i}" for i in range(18)]
+    pane = _tall(
+        draft,
+        "❯ 1. Yes",
+        below_extra="    2. No\n  Enter to select · Esc to cancel",
+    )
+    assert tp.pane_input_box_present(pane) is False
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+def test_the_option_row_below_the_lone_separator_guard_is_load_bearing() -> None:
+    """Part (b) in isolation: even when the first-below row IS a status bar
+    (spoofing part (a)), a picker option row further below refuses."""
+    draft = ["❯ a stale draft above"] + [f"  draft cont {i}" for i in range(18)]
+    pane = _tall(draft, "esc to interrupt", below_extra="  ❯ 1. Yes\n    2. No")
+    assert tp.pane_input_box_present(pane) is False
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+def test_spoof_effort_header_substring_marker_STILL_refuses() -> None:
+    """Codex r2 (a): a header below the lone separator CONTAINS `/effort` (a leg-3
+    substring-alphabet hit), but the STRICT full-row grammar rejects it — the whole
+    row must BE a status bar, not merely embed a marker."""
+    draft = ["❯ a stale draft above"] + [f"  draft cont {i}" for i in range(18)]
+    pane = _tall(draft, "Which /effort level do you want? Choose one:")
+    # Sanity: the leg-3 substring alphabet WOULD hit `/effort` (the spoof's premise).
+    assert any(m in "Which /effort level" for m in tp._INPUT_READY_CHROME_MARKERS)
+    # The strict grammar is what refuses it.
+    assert tp._is_status_row("Which /effort level do you want? Choose one:") is False
+    assert tp.pane_input_box_present(pane) is False
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+def test_a_draft_containing_a_rule_like_line_still_refuses_fail_closed() -> None:
+    """Disclosed residual: a reply-quote of terminal output that CONTAINS a `─…`
+    line makes the upward scan pair with the draft-internal rule → no glyph row
+    directly below it → fail-closed refusal, exactly as today."""
+    draft = [
+        "❯ pasted some terminal output:",
+        "  " + "─" * 40,  # a rule-like line INSIDE the draft
+        "  and here is more of the pasted output continuing below the rule",
+    ] + [f"  draft cont {i}" for i in range(16)]
+    pane = _tall(draft, "⏸ manual mode on")
+    assert tp.pane_input_box_present(pane) is False
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+# ── The STRONG corpus pin: every EXISTING fixture's classification is unchanged ──
+#
+# The fallback only fires when there is EXACTLY ONE separator in the 20-line
+# window, so it cannot disturb the ≥2 path. This bakes the pre-change
+# classification of every existing corpus fixture (the 2.1.209 fixtures are new /
+# changing, so they are excluded) and asserts byte-exact equality — a stronger pin
+# than refused-vs-passed.
+_BASELINE_CLASSIFICATIONS = {
+    "auq-baseline-pane.txt": "no_input_box",
+    "auq_4option_160x50_v2.1.198.txt": "no_input_box",
+    "auq_after_answer_t0_v2.1.207.txt": None,
+    "auq_after_answer_t1_v2.1.207.txt": None,
+    "auq_after_answer_t30_v2.1.207.txt": None,
+    "auq_after_answer_t5_v2.1.207.txt": None,
+    "auq_before_answer_v2.1.207.txt": "no_input_box",
+    "auq_freetext_overflow_v2.1.207.txt": "no_input_box",
+    "auq_freetext_row_selected_pretype_v2.1.207.ansi.txt": "no_input_box",
+    "auq_freetext_row_typed_large_v2.1.207.ansi.txt": "no_input_box",
+    "auq_freetext_row_typed_v2.1.207.ansi.txt": "prompt_row_is_option",
+    "auq_freetext_typed_identical_label_v2.1.207.ansi.txt": "prompt_row_is_option",
+    "auq_longlabel_160x50_v2.1.198.txt": "no_input_box",
+    "auq_multi_picker_v2.1.207.txt": "no_input_box",
+    "auq_multiq_q1_pane.txt": "prompt_row_is_option",
+    "auq_multiq_q2_after_pick_pane.txt": "prompt_row_is_option",
+    "auq_multiq_submit_pane.txt": "no_input_box",
+    "auq_multiselect_2_toggled_tmux_capture.txt": "prompt_row_is_option",
+    "auq_multiselect_compressed_long_cursor_only_tmux_capture.txt": "no_input_box",
+    "auq_multiselect_fresh_tmux_capture.txt": "no_input_box",
+    "auq_multiselect_long_scrolled_toggled_S500.txt": "no_input_box",
+    "auq_multiselect_ready_to_submit_tmux_capture.txt": "no_input_box",
+    "auq_multiselect_review_cursor_cancel.txt": "no_input_box",
+    "auq_multiselect_review_cursor_submit.txt": "no_input_box",
+    # GH #54 preview fixtures (r1 fold P2 — added to keep the dict corpus-complete
+    # after the merge onto main; all live pickers ⇒ no_input_box, verified).
+    "auq_preview_multiquestion_q1_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_multiquestion_q1_v2.1.207.txt": "no_input_box",
+    "auq_preview_multiquestion_q2_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_multiquestion_q2_v2.1.207.txt": "no_input_box",
+    "auq_preview_multiselect_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_multiselect_v2.1.207.txt": "no_input_box",
+    "auq_preview_sidebyside_v2.1.197.aligned.txt": "no_input_box",
+    "auq_preview_sidebyside_v2.1.197.ansi.txt": "no_input_box",
+    "auq_preview_sidebyside_v2.1.197.txt": "no_input_box",
+    "auq_preview_singleselect_cursor2_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_singleselect_cursor2_v2.1.207.txt": "no_input_box",
+    "auq_preview_singleselect_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_singleselect_v2.1.207.txt": "no_input_box",
+    "auq_preview_wraplabels_cursor1_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_wraplabels_cursor1_v2.1.207.txt": "no_input_box",
+    "auq_preview_wraplabels_cursor2_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_wraplabels_cursor2_v2.1.207.txt": "no_input_box",
+    "auq_preview_wraplabels_v2.1.207.ansi.txt": "no_input_box",
+    "auq_preview_wraplabels_v2.1.207.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor1_S500.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor2_S500.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor3_S500.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor4_S500.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor5_S500.txt": "no_input_box",
+    "auq_single_picker_v2.1.207.txt": "prompt_row_is_option",
+    "auq_single_select_with_affordances_pane.txt": "no_input_box",
+    "auq_stale_tabheader_over_live_picker_S500.txt": "no_input_box",
+    "control_gitrepo_branch_no_label_v2.1.207.txt": None,
+    "cost_overlay_d_v2.1.206.txt": "no_input_box",
+    "cost_overlay_live_v2.1.206.txt": "no_input_box",
+    "cost_overlay_w_v2.1.206.txt": "no_input_box",
+    "decision_negative_quoted_scrollback_v2.1.200.txt": None,
+    "decision_switch_model_v2.1.200.txt": "no_input_box",
+    "decision_trust_folder_postdown_v2.1.204.txt": "no_input_box",
+    "decision_trust_folder_postup_v2.1.204.txt": "no_input_box",
+    "decision_trust_folder_v2.1.200.txt": "no_input_box",
+    "decision_trust_folder_v2.1.204.txt": "no_input_box",
+    "detailed_transcript_full_v2.1.206.txt": "no_input_box",
+    "epm_after_approve_t0_v2.1.207.txt": None,
+    "epm_after_approve_t1_v2.1.207.txt": None,
+    "epm_after_approve_t30_idle_v2.1.207.txt": None,
+    "epm_after_approve_t5_v2.1.207.txt": None,
+    "epm_before_approve_v2.1.207.txt": "no_input_box",
+    "epm_plan_label_after_clear_v2.1.207.txt": None,
+    "epm_plan_label_persists_next_turn_v2.1.207.txt": None,
+    "epm_v2170_ctrl_plus_g.txt": "no_input_box",
+    "folder_trust_arrival_plain_v2.1.206.txt": "no_input_box",
+    "folder_trust_arrival_plain_v2.1.207.txt": "no_input_box",
+    "gate_epm_v2.1.207.txt": "no_input_box",
+    "gate_permission_v2.1.207.txt": "no_input_box",
+    "gate_workflow_v2.1.207.txt": "no_input_box",
+    "gh43_bg_shell_frame.txt": None,
+    "idle_frame_plain_v2.1.206.txt": None,
+    "idle_ghost_input_row_v2.1.206.txt": None,
+    "idle_real_draft_input_row_v2.1.206.txt": None,
+    "inputbox_at_overlay_v2.1.207.txt": "completion_overlay",
+    "inputbox_bashmode_draft_v2.1.207.txt": None,
+    "inputbox_bashmode_empty_v2.1.207.txt": None,
+    "inputbox_bgshell_v2.1.207.txt": None,
+    "inputbox_busy_thinking_v2.1.207.txt": None,
+    "inputbox_busy_tool_v2.1.207.txt": None,
+    "inputbox_draft_typed_v2.1.207.txt": None,
+    "inputbox_idle_v2.1.207.txt": None,
+    "inputbox_manual_mode_v2.1.207.txt": None,
+    "inputbox_multiline_draft_v2.1.207.txt": None,
+    "inputbox_paste_collapsed_reverted_v2.1.207.txt": None,
+    "inputbox_paste_collapsed_v2.1.207.txt": None,
+    # r2 fold P3: the 2.1.209 paste-collapse twin is NOT flipped by GH #56 (it
+    # classified deliverable pre-change — a normal 2-separator box whose status
+    # bar is the paste hint), so it belongs in the baked map.
+    "inputbox_paste_collapsed_v2.1.209.txt": None,
+    "inputbox_slash_exact_clear_v2.1.207.txt": "completion_overlay",
+    "inputbox_slash_overlay_v2.1.207.txt": "completion_overlay",
+    "inputbox_slash_with_arg_v2.1.207.txt": None,
+    "inputbox_tasklist_footer_v2.1.207.txt": None,
+    "inputbox_tasks_mode_v2.1.207.txt": "tasks_mode",
+    "inputbox_wrapped_draft_v2.1.207.txt": None,
+    "overlay_cost_modal_v2.1.207.txt": "no_input_box",
+    "permission_bash_v2.1.190.txt": "no_input_box",
+    "permission_negative_prose_v2.1.190.txt": "no_input_box",
+    "permission_webfetch_advance_v2.1.190.txt": None,
+    "permission_webfetch_bgshells_v2.1.190.txt": "no_input_box",
+    "permission_webfetch_v2.1.190.txt": "no_input_box",
+    "permission_write_long_v2.1.190.txt": "no_input_box",
+    "permission_write_long_visible_v2.1.190.txt": "no_input_box",
+    "scrollback_full_with_live_auq_v2.1.206.txt": "prompt_row_is_option",
+    "settings_select_model_v2.1.200.txt": "no_input_box",
+    "settings_warning_v2170.txt": "no_input_box",
+    "shell_after_esc_v2.1.207.txt": "no_input_box",
+    "status_busy_160x50_v2.1.198.txt": None,
+    "switch_model_live_v2.1.207.txt": "no_input_box",
+    "trust_after_accept_t0_v2.1.207.txt": None,
+    "trust_after_accept_t5_v2.1.207.txt": None,
+    "trust_before_answer_v2.1.207.txt": "no_input_box",
+    "unknown_blocking_confirm_switch_model_v2.1.197.txt": "no_input_box",
+    "usage_overlay_live_v2.1.206.txt": "no_input_box",
+    "workflow_dynamic_launch_v2.1.190.txt": "no_input_box",
+    "workflow_dynamic_launch_visible_v2.1.190.txt": "no_input_box",
+    "workflow_negative_prose_v2.1.190.txt": "no_input_box",
+}
+
+
+def test_existing_corpus_classifications_are_unchanged() -> None:
+    for name, expected in _BASELINE_CLASSIFICATIONS.items():
+        assert (FIXTURES / name).exists(), name  # baseline must not go stale
+        assert tp.classify_input_box_failure(_pane(name)) == expected, name
+
+
+def test_the_baked_baseline_covers_the_whole_fixture_directory() -> None:
+    """SET EQUALITY between the fixture-directory listing and the baked dict
+    (r1 fold P2): any future fixture landing in the directory without a baked
+    classification fails HERE instead of being silently uncovered. The three
+    tall-draft 2.1.209 GH #56 fixtures are the only exclusions — they are the
+    fixtures this change deliberately FLIPS / newly-introduces with their own
+    explicit pins above (`inputbox_paste_collapsed_v2.1.209.txt` is NOT flipped
+    — it classified deliverable pre-change too — so it is BAKED, r2 fold P3)."""
+    gh56_fixtures = {
+        _TALL_DRAFT,
+        _TALL_DRAFT_ANSI,
+        _TALL_DRAFT_CLEARED,
+    }
+    on_disk = {p.name for p in FIXTURES.glob("*.txt")}
+    assert on_disk == set(_BASELINE_CLASSIFICATIONS) | gh56_fixtures
+
+
+# ── GH #56 r1 fold (Codex P1): the strict segment-FULLMATCH status-row grammar ──
+#
+# The original `_is_status_row` was SUBTRACTIVE (strip marker substrings, reject
+# only ALPHABETIC residue) — `❯ /effort?` passed it (marker stripped, residue
+# `❯ ?` non-alphabetic) and, with an older reachable rule + a stale `❯` row
+# above, produced a FULL gate bypass on a live-blocking-shaped pane; the empty
+# stale-`❯` variant even allowed a KEYLESS brake release. All three reproduced
+# RED against the subtractive grammar; the anchored fullmatch grammar refuses
+# each (every `·`-segment must BE a canonical chrome form — no leading/trailing
+# residue is ever accepted).
+
+
+def _lone_sep_pane(status_row: str, *, stale_rows: list[str] | None = None) -> str:
+    """A pane with exactly ONE separator in the 20-line window: an older rule +
+    stale rows above, >18 draft/blank rows, the lone separator, then the spoof
+    "status" row below it."""
+    rule = "─" * 40
+    pad = "\n".join(f"  filler line {i}" for i in range(6))
+    body = "\n".join(
+        stale_rows
+        if stale_rows is not None
+        else ["❯ a stale draft above"] + [f"  draft cont {i}" for i in range(18)]
+    )
+    return f"{pad}\n{rule}\n{body}\n{rule}\n  {status_row}\n"
+
+
+def test_spoof_effort_marker_row_below_lone_separator_STILL_refuses() -> None:
+    """Codex r1-fold repro (i): `❯ /effort?` passed the SUBTRACTIVE grammar and
+    `classify_input_box_failure` returned None on a live-blocking-shaped pane —
+    a full gate bypass. The fullmatch grammar rejects the segment outright."""
+    assert tp._is_status_row("❯ /effort?") is False
+    pane = _lone_sep_pane("❯ /effort?")
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+
+
+def test_spoof_shell_token_row_below_lone_separator_STILL_refuses() -> None:
+    """Codex r1-fold repro (ii): the shell arm was equally weak — `❯ 1 shell?`
+    passed the subtractive grammar (glyph + trailing `?` residue tolerated). The
+    fullmatch form `\\d+ shells?(…)` accepts no residue on either side."""
+    assert tp._is_status_row("❯ 1 shell?") is False
+    assert tp._is_status_row("1 shell?") is False
+    pane = _lone_sep_pane("❯ 1 shell?")
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+
+
+def test_spoof_empty_stale_prompt_row_never_releases_the_brake() -> None:
+    """Codex r1-fold repro (iii): with a stale EMPTY `❯` row under the older
+    rule, the subtractive grammar's fake bracket made `pane_input_row_empty`
+    return True — a KEYLESS brake release on a spoofed surface. Post-fix the
+    fallback never fires, so the probe stays indeterminate (None), never True."""
+    rule = "─" * 40
+    pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + "\n  ❯ /effort?\n"
+    assert tp.pane_input_row_empty(pane) is not True
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+def test_the_grammar_accepts_the_real_status_rows() -> None:
+    """The grammar must accept every REAL captured status-row shape the fallback
+    relies on (incl. the tall-draft fixture's own row)."""
+    for row in (
+        "⏸ manual mode on",  # the tall-draft fixture's only status row
+        "⏸ manual mode on · ? for shortcuts · ← for agents",  # the cleared twin
+        "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        "⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents",
+        "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+        "⏵⏵ bypass permissions on · 1 shell",
+        "⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage",
+        "? for shortcuts · ← for agents",
+        "esc to interrupt · ← for agents",
+        "paste again to expand",
+        "! for shell mode",
+    ):
+        assert tp._is_status_row(row) is True, row
+
+
+# ── GH #56 r5 fold: the CANONICAL GRAMMAR — sound against recombination,
+#    COMPLETE against the real panes ──────────────────────────────────────────
+#
+# r4's literal ENUMERATION was sound but TOO NARROW: sampling the owner's three
+# LIVE bot panes (2.1.208/2.1.209) surfaced `ctrl+t to hide tasks` — a hint the
+# fixture corpus does not contain — so the fallback fail-closed EXACTLY on the
+# busy/tasks panes where the owner's reply-quoted messages actually wedge.
+# Enumeration had mistaken "what our fixtures hold" for "what CC renders".
+
+_LIVE_BOT_ROWS = [
+    # Sampled from the running bot's panes, 2026-07-14 (real 2.1.208/2.1.209
+    # sessions; status row = first non-blank row below the bottom rule).
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt "
+    "· ctrl+t to hide tasks · ← for agents",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+    "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+]
+
+# The DISTINCT real status rows the non-circular corpus sweep derives (the
+# >=2-separator deliverable fixtures — see the sweep test below).
+_REAL_CORPUS_STATUS_ROWS = [
+    "! for shell mode",
+    "? for shortcuts · ← for agents",
+    "esc to interrupt · ← for agents",
+    "paste again to expand",
+    "⏵⏵ bypass permissions on (shift+tab to cycle)",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+    "⏵⏵ bypass permissions on · 1 shell",
+    "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+    "⏸ manual mode on",
+    "⏸ manual mode on · ? for shortcuts · ← for agents",
+]
+
+
+@pytest.mark.parametrize("row", _LIVE_BOT_ROWS)
+def test_the_three_live_bot_rows_are_accepted(row: str) -> None:
+    """THE COMPLETENESS PIN (provenance: sampled from the running bot's panes
+    2026-07-14). Row 1 carries `ctrl+t to hide tasks`, which NO fixture contains —
+    under r4's enumeration it was REFUSED, fail-closing the tall-draft fallback on
+    the owner's busiest windows."""
+    assert tp._is_status_row(row) is True, row
+    # And it works end-to-end: a tall draft under this status bar delivers.
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is None, row
+    assert tp.pane_input_box_present(pane) is True, row
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # A hint repeated — at-most-once membership.
+        "⏵⏵ bypass permissions on · ← for agents · ← for agents",
+        "esc to interrupt · esc to interrupt",
+        # A MODE after a HINT — the ordered structure (mode is the head or absent).
+        "← for agents · ⏸ manual mode on",
+        # TWO modes.
+        "⏸ manual mode on · ⏵⏵ bypass permissions on",
+        "⏸ manual mode on · ⏸ manual mode on",
+        # A mode combined with an EXCLUSIVE standalone form — structurally
+        # impossible: the exclusive forms are whole ROWS, never segments.
+        "⏸ manual mode on · paste again to expand",
+        "⏸ manual mode on · ! for shell mode",
+        "paste again to expand · ← for agents",
+        # A bare shell / effort is not a status bar.
+        "1 shell",
+        "/effort",
+        # Unknown text in any segment.
+        "⏸ manual mode on · surprise text",
+    ],
+)
+def test_grammar_edges_refuse_through_the_full_predicates(row: str) -> None:
+    """The grammar's own edges — repeats, ordering, mode/exclusive combination,
+    bare tokens, unknown text — all refuse, driven END-TO-END (the gate refuses the
+    pane and the stale-empty-`❯` geometry yields no keyless brake release)."""
+    assert tp._is_status_row(row) is False, row
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None, row
+    assert tp.pane_input_box_present(pane) is False, row
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True, row
+
+
+def test_the_hint_tail_is_deliberately_ORDER_FREE() -> None:
+    """DISCLOSED: the corpus + the three live rows pin `esc → ctrl+t → ← → ↓` and
+    `? → ←`, but NO observed row contains BOTH `? for shortcuts` and `esc to
+    interrupt`, so their relative order cannot be established without GUESSING.
+    Order-freedom adds no unsoundness — a valid bar's hints are all valid hints,
+    and REPEATS + UNKNOWN text are still rejected (pinned above)."""
+    assert tp._is_status_row("⏸ manual mode on · ← for agents · ? for shortcuts")
+    assert tp._is_status_row("⏸ manual mode on · ? for shortcuts · ← for agents")
+    # …but a repeat still refuses, which is what keeps order-freedom sound.
+    assert (
+        tp._is_status_row("⏸ manual mode on · ? for shortcuts · ? for shortcuts")
+        is False
+    )
+
+
+# ── GH #56 r2 fold (Codex P1): the ENUMERATED whitelist — no empty segments,
+#    no glyph×marker×parenthetical cross-product ─────────────────────────────
+#
+# The r1 fullmatch grammar was still gameable at two edges: EMPTY `·` segments
+# were SKIPPED, so `· /effort ·` reduced to the single valid segment `/effort`
+# (Codex drove the full tall-fallback geometry: classify None +
+# pane_input_box_present True + a keyless brake release on the stale-empty-`❯`
+# variant); and the generative prefix/parenthetical combination accepted
+# impossible forms like `/effort (manual mode on)` and `⏵◐⏸/effort`. All three
+# reproduced RED against the r1 grammar; the enumerated whitelist refuses each.
+
+
+def test_spoof_empty_dot_segments_STILL_refuse_full_geometry() -> None:
+    """Codex r2 repro (a): `· /effort ·` — empty segments must REJECT the row,
+    not be skipped. Driven through the FULL fallback geometry: the gate refuses
+    AND the stale-empty-`❯` variant never yields a keyless brake release."""
+    assert tp._is_status_row("· /effort ·") is False
+    assert tp._is_status_row("·") is False
+    assert tp._is_status_row("· ·") is False
+    # Full geometry — the gate bypass shape (stale draft above, lone in-window
+    # separator, the spoof row below it).
+    pane = _lone_sep_pane("· /effort ·")
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+    # The keyless-brake-release shape: a stale EMPTY `❯` under the older rule.
+    rule = "─" * 40
+    empty_pane = (
+        "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + "\n  · /effort ·\n"
+    )
+    assert tp.pane_input_row_empty(empty_pane) is not True
+    assert tp.classify_input_box_failure(empty_pane) == "no_input_box"
+
+
+def test_spoof_marker_wrapped_in_another_markers_parenthetical_refuses() -> None:
+    """Codex r2 repro (b1): the cross-product accepted `/effort (manual mode
+    on)` — a marker must never validate wrapped in another marker's
+    parenthetical. Only the exact observed decorated forms are whitelisted."""
+    assert tp._is_status_row("/effort (manual mode on)") is False
+
+
+def test_spoof_glyph_soup_prefix_refuses() -> None:
+    """Codex r2 repro (b2): the cross-product accepted `⏵◐⏸/effort` — a marker
+    must never validate behind an arbitrary glyph run. Each whitelist form
+    carries exactly the decoration it renders with on real panes."""
+    assert tp._is_status_row("⏵◐⏸/effort") is False
+
+
+def _grammar_vocabulary() -> set[str]:
+    """Every literal token the canonical grammar can consume."""
+    return (
+        set(tp._STATUS_ROW_EXCLUSIVE)
+        | set(tp._STATUS_ROW_HINTS)
+        | {tp._STATUS_EFFORT_TAIL}
+        | {"bypass permissions on", "accept edits on", "plan mode on", "manual mode on"}
+        | {"shift+tab to cycle"}
+    )
+
+
+def test_the_grammar_and_leg3_alphabet_stay_in_lockstep() -> None:
+    """SINGLE SOURCE, both directions pinned so neither can drift silently.
+
+    (a) Every leg-3 marker is part of the grammar's vocabulary — a marker added to
+        `_INPUT_READY_CHROME_MARKERS` without deciding its grammar membership fails
+        HERE. (Under r4's enumeration three markers were uncovered; the canonical
+        grammar now covers them all.)
+
+    (b) The grammar tokens that leg 3's alphabet does NOT carry are an EXPLICIT,
+        pinned set. That divergence is FAIL-CLOSED, not a hazard: a row made only
+        of such tokens would let the fallback LOCATE the box, and leg 3 would then
+        refuse the pane as `no_ready_chrome` — a refusal, never a wrong commit.
+        (In practice they only ever appear alongside a mode bar, which leg 3 does
+        carry — e.g. the live `… · ctrl+t to hide tasks · ← for agents` row.)
+    """
+    vocab = _grammar_vocabulary()
+    uncovered_markers = {
+        m for m in tp._INPUT_READY_CHROME_MARKERS if not any(m in v for v in vocab)
+    }
+    assert uncovered_markers == set()
+
+    not_in_leg3 = {
+        v for v in vocab if not any(m in v for m in tp._INPUT_READY_CHROME_MARKERS)
+    }
+    assert not_in_leg3 == {
+        "ctrl+t to hide tasks",
+        "ctrl+t to show tasks",
+        "Enter to view tasks",
+    }
+
+
+def test_every_real_status_row_the_grammar_accepts_also_satisfies_leg3() -> None:
+    """The load-bearing property, asserted BEHAVIOURALLY on the real rows: a row the
+    grammar accepts must not be one leg 3 would then reject — otherwise the fallback
+    would locate a box only for leg 3 to refuse the pane."""
+
+    def _below_marker_ok(row: str) -> bool:
+        return any(m in row for m in tp._INPUT_READY_CHROME_MARKERS) or bool(
+            tp._RE_INPUT_READY_SHELL_TOKEN.search("· " + row)
+        )
+
+    for row in _LIVE_BOT_ROWS + _REAL_CORPUS_STATUS_ROWS:
+        assert tp._is_status_row(row) is True, row
+        assert _below_marker_ok(row), row
+
+
+# ── GH #56 r3 fold (Codex P1, THIRD spoof family): the whole-row ORDERED
+#    TEMPLATE — ends the segment-recombination class ─────────────────────────
+#
+# r1 (subtractive), r2 (per-segment fullmatch) and the r2 whitelist all validated
+# segments INDEPENDENTLY, so ANY recombination of individually-valid segments
+# passed: `/effort · /effort` (repeat), a doubled paste hint, TWO incompatible
+# mode markers, and `١ shell` (`\d` is Unicode-wide). Each drove the FULL gate
+# bypass + the keyless brake release. The terminal fix is the ordered slot
+# machine (fixed order, at-most-once, ASCII digits, whole-row consumption) —
+# per-segment validation was the wrong SHAPE, so this is an approach change, not
+# a fourth edge patch.
+
+_R3_SPOOF_ROWS = [
+    "/effort · /effort",  # repeated segment
+    "paste again to expand · paste again to expand",  # repeated hint
+    "⏸ manual mode on · ⏵⏵ bypass permissions on",  # two incompatible modes
+    "١ shell · /effort",  # Arabic-Indic digit + unpaired /effort
+]
+
+
+@pytest.mark.parametrize("row", _R3_SPOOF_ROWS)
+def test_r3_recombination_spoofs_refuse_through_the_full_predicates(
+    row: str,
+) -> None:
+    """All four r3 reproductions, driven end-to-end: the grammar refuses the
+    row, the gate refuses the pane, and the stale-empty-`❯` geometry never
+    yields a keyless brake release."""
+    assert tp._is_status_row(row) is False
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True
+    assert tp.classify_input_box_failure(empty_pane) == "no_input_box"
+
+
+def test_the_shell_token_is_ascii_only() -> None:
+    """`\\d` is UNICODE-wide — an Arabic-Indic `١ shell` must never read as the
+    shell-count token, in the template OR in leg 3's substring arm."""
+    assert tp._is_status_row("١ shell") is False
+    assert tp._is_status_row("⏵⏵ bypass permissions on · 1 shell") is True
+    assert tp._RE_INPUT_READY_SHELL_TOKEN.search("· ١ shell") is None
+    assert tp._RE_INPUT_READY_SHELL_TOKEN.search("· 1 shell") is not None
+
+
+# ── GH #56 r4 fold (Codex P1, FIFTH round of the same class): WHOLE-ROW
+#    ENUMERATION — the terminal end of the recombination class ───────────────
+#
+# r3's slot machine STILL let mutually exclusive slots coexist
+# (`⏸ manual mode on · paste again to expand` passed, though the paste hint
+# REPLACES the whole status bar): ordering + at-most-once does not imply
+# COMPATIBILITY. And it normalized Unicode spaces, so an NBSP variant of a real
+# row passed. ANY per-part predicate over segments/slots is unsoundable here —
+# so the grammar is now an ENUMERATION of COMPLETE rows. Mutually exclusive
+# shapes cannot combine BY CONSTRUCTION: no template contains both.
+
+
+def test_spoof_mutually_exclusive_shapes_cannot_combine() -> None:
+    """Codex r4 repro (a): the paste hint REPLACES the status bar, so it can
+    never appear alongside a mode bar. Under whole-row enumeration there simply
+    IS no template containing both — driven through the FULL predicates."""
+    row = "⏸ manual mode on · paste again to expand"
+    assert tp._is_status_row(row) is False
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True
+    assert tp.classify_input_box_failure(empty_pane) == "no_input_box"
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "⏸\xa0manual mode on",  # NBSP inside a real mode row
+        "paste\xa0again to expand",  # NBSP inside the paste hint
+        "? for shortcuts\xa0· ← for agents",  # NBSP around the separator
+    ],
+)
+def test_spoof_nbsp_variants_of_real_rows_refuse(row: str) -> None:
+    """Codex r4 repro (b): the chrome region is explicitly OUTSIDE
+    `_normalize_input_row`'s contract (which is scoped to the rows INSIDE the
+    input-box bracket), so the templates match ASCII space ONLY and an NBSP
+    variant of a real row REFUSES. Driven through the FULL predicates."""
+    assert tp._is_status_row(row) is False
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True
+
+
+def test_no_real_corpus_chrome_row_carries_a_unicode_space() -> None:
+    """The ASCII-only rule is corpus-SAFE, not just strict: the NBSP CC emits
+    lives in the INPUT row (`❯\\xa0`), never in a status bar."""
+    unicode_spaces = ("\xa0", " ", " ", "﻿")
+    for name, expected in _BASELINE_CLASSIFICATIONS.items():
+        if expected is not None:
+            continue  # only deliverable panes have a status bar below the box
+        lines = tp._strip_ansi(_pane(name)).split("\n")
+        located = tp._input_box_rows(lines)
+        if located is None:
+            continue
+        _top, bottom, _rows = located
+        for i in range(bottom + 1, len(lines)):
+            assert not any(ch in lines[i] for ch in unicode_spaces), (name, i)
+
+
+def test_the_exclusive_forms_are_rows_not_segments() -> None:
+    """The STRUCTURAL property, asserted on the grammar itself (r5): the paste hint
+    and the bash-mode indicator REPLACE the whole status bar, so they are modelled
+    as WHOLE-ROW alternatives — never as segments a bar can also carry. Mutual
+    exclusion is therefore unrepresentable, not a rule to enforce."""
+    # They are exclusive-row forms …
+    assert tp._STATUS_ROW_EXCLUSIVE == {"paste again to expand", "! for shell mode"}
+    # … and they are NOT reachable as a segment of a composed BAR.
+    assert not (tp._STATUS_ROW_EXCLUSIVE & tp._STATUS_ROW_HINTS)
+    for exclusive in tp._STATUS_ROW_EXCLUSIVE:
+        assert tp._RE_STATUS_MODE.fullmatch(exclusive) is None, exclusive
+        assert tp._is_status_row(exclusive) is True, exclusive
+        # A bar can never absorb one.
+        assert tp._is_status_row(f"⏸ manual mode on · {exclusive}") is False
+        assert tp._is_status_row(f"{exclusive} · ← for agents") is False
+
+
+def test_every_real_corpus_status_row_matches_a_template() -> None:
+    """THE CORPUS IS THE AUTHORITY, and the sweep is NON-CIRCULAR (r4 P2).
+
+    The r3 sweep filtered fixtures with `classify_input_box_failure`, which on
+    the ONE-separator path calls `_is_status_row` — so a too-narrow template
+    just SKIPPED the fixture and the loose count still passed. Here the sweep is
+    restricted to fixtures with >=2 separators in the bottom scan window: that
+    is exactly the path `_input_box_rows` resolves WITHOUT ever consulting
+    `_is_status_row`, so neither the fixture selection nor the extracted row
+    depends on the predicate under test. Every real status bar so derived must
+    FULLMATCH a template — a too-narrow enumeration fails LOUDLY here instead of
+    silently fail-closing panes.
+    """
+    checked: list[str] = []
+    for path in sorted(FIXTURES.glob("*.txt")):
+        text = path.read_text()
+        lines = tp._strip_ansi(text).split("\n")
+        start = max(0, len(lines) - tp._CHROME_SCAN_LINES)
+        seps = [i for i in range(start, len(lines)) if tp._is_rule_separator(lines[i])]
+        if len(seps) < 2:
+            continue  # the fallback path — would be circular
+        # On this path classify_* never consults _is_status_row, so using it to
+        # select the READY (status-bar-bearing) panes is not circular.
+        if tp.classify_input_box_failure(text) is not None:
+            continue
+        first_below = next(
+            (
+                lines[i].strip()
+                for i in range(seps[-1] + 1, len(lines))
+                if lines[i].strip()
+            ),
+            None,
+        )
+        if first_below is None:
+            continue
+        checked.append(first_below)
+        assert tp._is_status_row(first_below) is True, (path.name, first_below)
+    # The sweep genuinely covered the corpus, across DISTINCT real shapes.
+    assert len(checked) >= 30
+    assert len(set(checked)) >= 8
+
+
+def test_the_two_separator_path_never_consults_the_status_row_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The NON-CIRCULARITY of the sweep above, PROVEN rather than asserted: with
+    `_is_status_row` replaced by a bomb, every >=2-separator fixture still
+    classifies — so that path (and the sweep built on it) is independent of the
+    predicate under test."""
+
+    def _boom(_line: str) -> bool:
+        raise AssertionError("_is_status_row must NOT be consulted on the >=2-sep path")
+
+    monkeypatch.setattr(tp, "_is_status_row", _boom)
+    checked = 0
+    for path in sorted(FIXTURES.glob("*.txt")):
+        text = path.read_text()
+        lines = tp._strip_ansi(text).split("\n")
+        start = max(0, len(lines) - tp._CHROME_SCAN_LINES)
+        seps = [i for i in range(start, len(lines)) if tp._is_rule_separator(lines[i])]
+        if len(seps) < 2:
+            continue
+        tp.classify_input_box_failure(text)  # must not raise
+        checked += 1
+    assert checked >= 40
+
+
+# ── GH #56 r6 fold: mode GLYPHS are BOUND to their mode TEXT ─────────────────
+#
+# The r5 MODE segment cross-producted glyph × text, so it accepted pairings CC
+# never renders (`⏸ bypass permissions on`, `⏵⏵ manual mode on`). Clear-eyed about
+# the impact: this buys ~nothing in SAFETY (anyone who can print the mispaired
+# glyph can equally print the correctly-paired one, which MUST be accepted), so the
+# delta is ≈0 — it is a tightening for CORRECTNESS and reviewability, not a hazard
+# fix. Nothing else about the grammar changed.
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "⏸ bypass permissions on",  # bypass is ⏵⏵-only
+        "⏸ bypass permissions on (shift+tab to cycle)",
+        "⏵⏵ manual mode on",  # manual is ⏸-only
+        "⏵⏵ manual mode on (shift+tab to cycle)",
+        # …and a mispaired mode cannot be laundered by a valid hint tail.
+        "⏸ bypass permissions on · ← for agents",
+    ],
+)
+def test_mispaired_mode_glyphs_refuse_through_the_full_predicates(row: str) -> None:
+    """CC binds each mode text to one glyph: `bypass permissions on` renders with
+    `⏵⏵` (live panes + corpus), `manual mode on` with `⏸` (the 2.1.209 rig
+    fixture). The cross-product pairings are refused."""
+    assert tp._is_status_row(row) is False, row
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None, row
+    assert tp.pane_input_box_present(pane) is False, row
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True, row
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "⏵⏵ bypass permissions on",
+        "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        "⏸ manual mode on",
+        "⏸ manual mode on · ? for shortcuts · ← for agents",
+    ],
+)
+def test_correctly_paired_modes_are_still_accepted(row: str) -> None:
+    """The binding must not cost completeness on the OBSERVED pairings."""
+    assert tp._is_status_row(row) is True, row
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "⏵⏵ accept edits on",
+        "⏸ accept edits on",
+        "⏵⏵ plan mode on",
+        "⏸ plan mode on",
+        "⏵⏵ accept edits on (shift+tab to cycle)",
+        "⏸ plan mode on (shift+tab to cycle)",
+    ],
+)
+def test_unobserved_modes_accept_EITHER_glyph_the_disclosed_choice(row: str) -> None:
+    """DISCLOSED completeness-over-tightness choice: the `accept edits on` /
+    `plan mode on` glyph decoration is UNOBSERVED (no rig capture, no fixture), and
+    guessing one would re-create exactly the r4 false-refusal cliff on a real pane
+    (a user in accept-edits mode with a tall draft would wedge). So EITHER glyph is
+    accepted until a rig capture lets us bind them. It adds no recombination power —
+    still exactly ONE mode segment per row."""
+    assert tp._is_status_row(row) is True, row
+    # Still at-most-once: two modes never combine, whatever their glyphs.
+    assert tp._is_status_row(f"{row} · ⏸ manual mode on") is False

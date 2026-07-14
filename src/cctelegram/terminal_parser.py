@@ -4779,13 +4779,29 @@ _RE_OPTION_ROW_CONTENT: Final = re.compile(r"^\d+\.\s")
 # which is exactly right: the hint proves the input box is live, so the "gate"
 # above it is not the active bottom prompt. No coupling, no split needed.
 _INPUT_PASTE_COLLAPSED_MARKER: Final = "paste again to expand"
+# ``⏸ manual mode on`` (CC 2.1.208/2.1.209) — a ready input box whose status bar
+# is the manual-mode indicator (rig ``inputbox_tall_draft_v2.1.209``). Added to
+# the LEG-3 alphabet ONLY (not ``_READY_STATUS_MARKERS``, the idle alphabet
+# ``pane_looks_idle`` / ``classify_pane_idle_failure`` consume) — the
+# paste-collapse precedent: this widens the delivery gate's readiness proof
+# without asserting the pane is idle. Its absence was the COUPLED alphabet gap in
+# the GH #56 tall-draft repro: leg 3 returned ``no_ready_chrome`` on a
+# manual-mode pane holding a draft, the same false-refusal class as the
+# paste-collapse regression (memory rule: marker-alphabet completeness).
+_INPUT_MANUAL_MODE_MARKER: Final = "manual mode on"
 _INPUT_READY_CHROME_MARKERS: Final = _READY_STATUS_MARKERS + (
     "esc to interrupt",
     "! for shell mode",
     _INPUT_PASTE_COLLAPSED_MARKER,
+    _INPUT_MANUAL_MODE_MARKER,
 )
-# ``· 1 shell ·`` — the background-shell status bar (rig D10).
-_RE_INPUT_READY_SHELL_TOKEN: Final = re.compile(r"·\s*\d+\s+shells?\b")
+# ``· 1 shell ·`` — the background-shell status bar (rig D10). ASCII digits
+# only (GH #56 r3 audit — ``\d`` is Unicode-wide, and this token is ACCEPT-side
+# chrome proof; CC renders ASCII). The refusal-side traps
+# (``_RE_INPUT_OPTION_ROW`` / ``_RE_OPTION_ROW_CONTENT``) and the idle-lane
+# bg-shells parsers deliberately KEEP ``\d``: there, wider matching is the
+# fail-closed direction (more refusals / more /update deferrals).
+_RE_INPUT_READY_SHELL_TOKEN: Final = re.compile(r"·\s*[0-9]+\s+shells?\b")
 
 # Leg 4 — the Enter-stealing background-tasks mode (rig §5 finding 1). One
 # ``Down`` at an empty box while a background shell exists arms a mode where
@@ -4857,11 +4873,224 @@ def _normalize_input_row(row: str) -> str:
     return row
 
 
-def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
-    """Locate the bottom rule-pair and return ``(top, bottom, non-blank rows)``.
+# GH #56: the exactly-one-separator fallback scans UPWARD for the input box's TOP
+# rule when a TALL multi-line draft has pushed it above the ``_CHROME_SCAN_LINES``
+# window (a reply-quoted message renders a ~18-row draft inside the box; the top
+# rule sat outside the 20-line tail and the post-write re-verify concluded
+# ``no_input_box``, withholding Enter and arming the stranded-draft brake). Bounded
+# by this many rows — covers a full 160x50 pane; the gate/brake captures are
+# visible-only (``scrollback_lines=0``), so the bound only protects a future
+# scrollback-carrying caller. A TUI-drift audit surface beside
+# ``clean_ghost_input_text``.
+_INPUT_BOX_TOP_SCAN_LINES: Final = 60
 
-    ``None`` when fewer than two ``──`` rule separators are in the bottom scan
-    window (no rendered input-box bracket).
+# The status-row grammar: a WHOLE-ROW ORDERED TEMPLATE (GH #56 r3 fold — the
+# APPROACH change that ends the segment-recombination class).
+#
+# Three rounds of per-segment validation each closed one combination and Codex
+# found another: r1's SUBTRACTIVE grammar passed ``❯ /effort?``; r2's fullmatch
+# skipped EMPTY ``·`` segments (``· /effort ·``) and cross-producted decorations
+# (``/effort (manual mode on)``, ``⏵◐⏸/effort``); r3's enumerated whitelist still
+# validated each segment INDEPENDENTLY, so ANY recombination of individually-
+# valid segments passed — ``/effort · /effort``, ``paste again to expand · paste
+# again to expand``, TWO incompatible mode markers (``⏸ manual mode on · ⏵⏵
+# bypass permissions on``), and a UNICODE-digit shell token (``١ shell`` — ``\d``
+# is Unicode-wide). Root cause: the segment set is small but the ROW space
+# (order, count, repeats, digit width, marker compatibility) is large, so
+# per-segment validation is the wrong SHAPE.
+#
+# r4 then showed the SLOT MACHINE was the same class a FIFTH time: ordering +
+# at-most-once does not imply COMPATIBILITY, so mutually exclusive slots still
+# coexisted (``⏸ manual mode on · paste again to expand`` passed, though the
+# paste hint REPLACES the whole status bar), and normalizing Unicode spaces let
+# an NBSP variant of a real row through.
+#
+# THE LESSON, recorded: ANY per-part predicate over segments/slots is
+# unsoundable here — each round closes one combination and the next finds
+# another. The terminal fix is WHOLE-ROW ENUMERATION (below): one anchored,
+# complete-row template per real observed status bar, with only genuinely
+# variable parts parameterized. Compatibility, ordering, repetition and
+# emptiness all stop being separate rules — they are simply not expressible.
+#
+# THE CANONICAL GRAMMAR (r5 — the terminal shape).
+#
+# r4 tried a literal ENUMERATION of complete rows. It was SOUND but TOO NARROW
+# against reality: sampling the owner's three LIVE bot panes (2.1.208/2.1.209)
+# surfaced ``⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt ·
+# ctrl+t to hide tasks · ← for agents`` — a hint the fixture corpus simply does
+# not contain. Enumeration had mistaken "what our fixtures happen to hold" for
+# "what CC renders", and it fail-closed EXACTLY on the busy/tasks panes where the
+# owner's reply-quoted messages actually wedge. Hand-adding one more literal would
+# repeat the mistake, so the shape is a CANONICAL ORDERED GRAMMAR: sound against
+# every recombination the five review rounds found, and complete against every
+# well-formed real bar.
+#
+# THE GRAMMAR (whole-row, anchored; every ``·``-split segment must be consumed):
+#
+#   ROW := EXCLUSIVE | BAR
+#   EXCLUSIVE := "paste again to expand" | "! for shell mode"      (the WHOLE row)
+#   BAR  := [MODE] [· SHELL] [· EFFORT-PAIR] [· HINT]*
+#           …requiring MODE or ≥1 HINT (a bare shell/effort row is not a status bar)
+#
+#   MODE       — AT MOST ONE, never two, never repeated.
+#   SHELL      — ASCII ONLY: ``[0-9]+ shell(s)[ still running]`` (``[0-9]``, NEVER
+#                ``\d``, which is Unicode-wide — the ``١ shell`` spoof).
+#   EFFORT-PAIR— the spinner + ``/effort`` as TWO consecutive segments, both or
+#                neither (a bare ``/effort`` never validates).
+#   HINT       — from a FIXED set, each AT MOST ONCE.
+#
+# THE EXCLUSIVE forms are WHOLE-ROW alternatives, so they are structurally unable
+# to combine with a mode bar (the r4 P1a spoof ``⏸ manual mode on · paste again to
+# expand``): the paste hint REPLACES the entire status bar, and that is expressed
+# by making it a row, not a segment.
+#
+# HINT ORDER IS NOT ENFORCED — and that is a DELIBERATE, disclosed choice. The
+# corpus + the three live rows pin ``esc → ctrl+t → ← → ↓`` and ``? → ←``, but NO
+# observed row contains BOTH ``? for shortcuts`` and ``esc to interrupt``, so their
+# relative order cannot be established without GUESSING. Order-freedom adds NO
+# unsoundness: a valid bar's hints are all valid hints, while REPEATS and UNKNOWN
+# text are still rejected (a hint may appear at most once, and every segment must
+# be consumed).
+#
+# SOUNDNESS: this accepts exactly the WELL-FORMED status bars and rejects every
+# malformed recombination the review rounds produced — two modes, a repeated
+# segment, mode+paste, wide digits, NBSP variants, and embedded prose. The residual
+# — pane content that reproduces a genuinely VALID status bar — is IDENTICAL for
+# the enumeration and for this grammar (both accept valid bars by definition), so
+# the grammar costs NO safety versus r4 while removing the false-refusal cliff.
+# That is the honest trade, and it is why we are not hand-listing rows.
+#
+# BYTE DISCIPLINE: the chrome region is explicitly OUTSIDE
+# ``_normalize_input_row``'s contract (scoped to the rows INSIDE the box), so this
+# lane does NOT normalize Unicode spaces, trims ASCII-only, and uses NO
+# Unicode-wide ``\s``/``\d``. An NBSP variant of a real row REFUSES.
+#
+# ACCEPTED COST: a real status bar whose SHAPE is outside this grammar still fails
+# CLOSED — the tall-draft fallback does not fire on that pane, i.e. exactly today's
+# shipped behavior (refuse), never a wrong commit.
+_STATUS_ROW_EXCLUSIVE: Final = frozenset(
+    {
+        "paste again to expand",  # the paste-collapse hint REPLACES the bar
+        "! for shell mode",  # bash mode
+    }
+)
+# AT MOST ONE per row. Each mode text is BOUND to the glyph it is actually OBSERVED
+# with (r6) — the earlier form cross-producted glyph × text and accepted pairings CC
+# never renders (``⏸ bypass permissions on``, ``⏵⏵ manual mode on``). Be clear-eyed
+# about what that fold buys: ~nothing in SAFETY (anyone who can print the mispaired
+# glyph can equally print the correctly-paired one, which MUST be accepted), so the
+# delta is ≈0 — it is a tightening for CORRECTNESS and reviewability, not a hazard
+# fix.
+#
+#   bypass permissions on  ⇒ ``⏵⏵`` ONLY  (live panes + corpus)
+#   manual mode on         ⇒ ``⏸``  ONLY  (the 2.1.209 tall-draft rig fixture)
+#   accept edits on / plan mode on ⇒ glyph UNOBSERVED ⇒ EITHER glyph accepted.
+#
+# That last line is a DELIBERATE completeness-over-tightness choice: guessing a
+# glyph for the two unobserved modes would re-create exactly the r4 false-refusal
+# cliff on a real pane (a user in accept-edits mode with a tall draft would wedge).
+# A rig capture of those two modes would let us bind them — until then, either
+# glyph. It adds no recombination power (still exactly ONE mode segment per row).
+_RE_STATUS_MODE: Final = re.compile(
+    r"(?:"
+    r"⏵⏵[ ]+bypass permissions on"
+    r"|⏸[ ]+manual mode on"
+    r"|(?:⏵⏵|⏸)[ ]+(?:accept edits on|plan mode on)"
+    r")"
+    r"(?:[ ]+\(shift\+tab to cycle\))?"
+)
+# ASCII digits ONLY (``\d`` is Unicode-wide — the r3 ``١ shell`` spoof).
+_RE_STATUS_SHELL: Final = re.compile(r"[0-9]+[ ]+shells?(?:[ ]+still[ ]+running)?")
+_RE_STATUS_EFFORT_SPINNER: Final = re.compile(r"[◐◑◒◓][ ]+(?:low|medium|high|xhigh)")
+_STATUS_EFFORT_TAIL: Final = "/effort"
+# Each AT MOST ONCE; order-free (see the grammar note above).
+_STATUS_ROW_HINTS: Final = frozenset(
+    {
+        "esc to interrupt",
+        "ctrl+t to hide tasks",
+        "ctrl+t to show tasks",
+        "← for agents",
+        "↓ to manage",
+        "? for shortcuts",
+        # The tasks-mode bar is a REAL status bar; accepting it lets the box be
+        # located so leg 4 can refuse it precisely as ``tasks_mode`` (a positive
+        # hazard) instead of the blunt ``no_input_box``.
+        "Enter to view tasks",
+    }
+)
+
+
+def _is_status_row(line: str) -> bool:
+    """True iff ``line`` is a WHOLE Claude Code ready-status-bar row (GH #56).
+
+    The canonical ordered grammar documented above: an EXCLUSIVE standalone form,
+    or a BAR of ``[MODE] · [SHELL] · [EFFORT-PAIR] · [HINT…]`` with at-most-once
+    membership, ASCII-only digits and spaces, no empty segments, and every segment
+    consumed. The exactly-one-separator fallback in ``_input_box_rows`` uses it to
+    prove the lone in-window separator is the input box's BOTTOM rule: the first
+    non-blank row below a genuine bottom rule is the status bar.
+    """
+    s = _strip_ansi(line).strip(" \t\r\n")
+    if not s:
+        return False
+    if s in _STATUS_ROW_EXCLUSIVE:
+        return True
+
+    segs = [seg.strip(" \t\r\n") for seg in s.split("·")]
+    if any(not seg for seg in segs):
+        return False  # a bare leading/trailing/double separator is never chrome
+
+    i = 0
+    has_mode = bool(segs) and _RE_STATUS_MODE.fullmatch(segs[0]) is not None
+    if has_mode:
+        i = 1
+    if i < len(segs) and _RE_STATUS_SHELL.fullmatch(segs[i]):
+        i += 1
+    if (
+        i + 1 < len(segs)
+        and _RE_STATUS_EFFORT_SPINNER.fullmatch(segs[i])
+        and segs[i + 1] == _STATUS_EFFORT_TAIL
+    ):
+        i += 2
+
+    seen: set[str] = set()
+    for seg in segs[i:]:
+        if seg not in _STATUS_ROW_HINTS or seg in seen:
+            return False  # unknown text, a repeat, or an out-of-place segment
+        seen.add(seg)
+
+    # A bare shell / effort row is not a status bar.
+    return has_mode or bool(seen)
+
+
+def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
+    """Locate the input-box rule-pair and return ``(top, bottom, non-blank rows)``.
+
+    Two paths (GH #56):
+
+    - **≥2 rule separators in the ``_CHROME_SCAN_LINES`` (20) tail** — byte-identical
+      to the original: the last two ARE the pair. Every existing fixture keeps its
+      exact result.
+    - **Exactly 1** — a tall multi-line draft has pushed the box's TOP rule out of
+      the window; the lone in-window separator is the candidate BOTTOM rule. The
+      fallback fires ONLY on a THREE-PART STRUCTURAL proof (substring markers are
+      spoofable by model-controlled prompt content, so each part kills an
+      independently-reproduced spoof):
+        (a) the FIRST NON-BLANK row below the lone separator FULLMATCHES
+            ``_is_status_row`` (a genuine bottom rule is followed by the status
+            bar — not a picker footer, and not model prose that merely embeds a
+            marker substring);
+        (b) NO row below the lone separator matches the picker option-row shape
+            (Codex r2's "lone separator is a live prompt's TOP rule, ``❯ 1. Yes``
+            below it" shape refuses here even if (a) were spoofed);
+        (c) after an UPWARD scan (bounded by ``_INPUT_BOX_TOP_SCAN_LINES``, NEAREST
+            rule) finds the candidate TOP rule, the FIRST non-blank row below it is
+            a prompt-glyph (``❯``/``!``) row — the box's cursor row is always the
+            first row inside the bracket (a draft that merely CONTAINS a rule-like
+            ``─…`` line pairs with the draft-internal rule → no glyph row below →
+            fail-closed refusal, unchanged from today).
+      Any part failing / no reachable top rule → ``None`` (unchanged fail-closed).
+    - **0** — ``None`` (unchanged).
 
     The returned rows are NBSP-normalized (``_normalize_input_row``) — this is the
     single seam every input-box-lane reader goes through.
@@ -4870,15 +5099,65 @@ def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
     sep_idxs = [
         i for i in range(search_start, len(lines)) if _is_rule_separator(lines[i])
     ]
-    if len(sep_idxs) < 2:
+    if len(sep_idxs) >= 2:
+        top, bottom = sep_idxs[-2], sep_idxs[-1]
+    elif len(sep_idxs) == 1:
+        located = _locate_tall_draft_pair(lines, sep_idxs[0])
+        if located is None:
+            return None
+        top, bottom = located
+    else:
         return None
-    top, bottom = sep_idxs[-2], sep_idxs[-1]
     rows = [
         stripped
         for i in range(top + 1, bottom)
         if (stripped := _normalize_input_row(lines[i]).strip())
     ]
     return top, bottom, rows
+
+
+def _locate_tall_draft_pair(lines: list[str], bottom: int) -> tuple[int, int] | None:
+    """The GH #56 exactly-one-separator fallback: prove ``bottom`` is the input
+    box's bottom rule and scan UPWARD for its top rule. See ``_input_box_rows``.
+
+    ``lines`` are already ANSI-stripped by the callers, but each candidate row is
+    re-stripped / whitespace-trimmed before the full-row and option-row matches
+    (defensive, r3 P3).
+    """
+    # (a) The first non-blank row below the lone separator must BE a status bar.
+    first_below = next(
+        (lines[i] for i in range(bottom + 1, len(lines)) if lines[i].strip()),
+        None,
+    )
+    if first_below is None or not _is_status_row(first_below):
+        return None
+
+    # (b) No picker option-row may sit below the lone separator (a live picker's
+    #     body would — the presumed bottom rule would then be the prompt's TOP).
+    for i in range(bottom + 1, len(lines)):
+        if _RE_INPUT_OPTION_ROW.match(_normalize_input_row(lines[i]).strip()):
+            return None
+
+    # (c) The NEAREST rule separator above (bounded) is the candidate TOP rule, and
+    #     the first non-blank row inside the bracket must be a prompt-glyph row.
+    lower = max(0, bottom - _INPUT_BOX_TOP_SCAN_LINES)
+    top = next(
+        (i for i in range(bottom - 1, lower - 1, -1) if _is_rule_separator(lines[i])),
+        None,
+    )
+    if top is None:
+        return None
+    first_inside = next(
+        (
+            stripped
+            for i in range(top + 1, bottom)
+            if (stripped := _normalize_input_row(lines[i]).strip())
+        ),
+        None,
+    )
+    if first_inside is None or first_inside[0] not in _INPUT_PROMPT_GLYPHS:
+        return None
+    return top, bottom
 
 
 def _prompt_row_content(rows: list[str]) -> str | None:

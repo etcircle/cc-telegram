@@ -6,7 +6,8 @@
 │  - Topic-based routing: 1 topic = 1 window = 1 session             │
 │  - /history: Paginated message history (default: latest page)      │
 │  - /screenshot: Capture tmux pane as PNG                           │
-│  - /esc: Send Escape to interrupt Claude                           │
+│  - /esc: Send Escape to interrupt Claude; on a braked window it     │
+│    double-Escapes to CLEAR a stranded draft (GH #56)                │
 │  - /update: Update CLI + restart THIS topic's idle session in place │
 │    (/update all = every idle session)                              │
 │  - Send text → Claude Code via tmux keystrokes                     │

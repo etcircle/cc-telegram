@@ -160,31 +160,40 @@ DELIVERY_REFUSAL_REASONS: Final = (
 # Ctrl-U have surface-specific semantics — Esc on folder-trust KILLS Claude).
 DRAFT_WRITTEN_MSG: Final = (
     "Not delivered — the terminal changed while your message was being typed. "
-    "Your text was NOT submitted; if you see it in the input box, clear it "
-    "before continuing."
+    "Your text was NOT submitted. If you see it in the input box, clear it before "
+    "resending: press Escape TWICE quickly in the window, or send /esc (which "
+    "does exactly that for you)."
 )
 
 # The COMMIT_UNKNOWN copy (r2 F3). ``send_keys`` returning False does NOT prove
 # the Enter never reached the pty, so this must NOT claim the message was
-# withheld — it says exactly what is known.
+# withheld — it says exactly what is known. It keeps its SCREENSHOT-FIRST guidance
+# (GH #56 Codex r1 P2-1): the message may already be SUBMITTED, so it must NOT
+# unconditionally advise the draft-clear double-Escape (that would interrupt the
+# resulting turn). ``/esc`` is mentioned only CONDITIONALLY — and the braked-``/esc``
+# clear mode is itself self-protecting (it double-Escapes only a pane that PROVES a
+# non-empty input box, never a busy or already-clear one).
 COMMIT_UNKNOWN_MSG: Final = (
     "Your message may or may not have been submitted — the terminal didn't "
     "confirm the final Enter. Check the window (/screenshot) before resending, "
-    "so you don't send it twice."
+    "so you don't send it twice. If you still see your text sitting in the input "
+    "box, send /esc to clear it."
 )
 
 # The stranded-draft brake (r2 F2). A DRAFT_WRITTEN payload is still sitting in
 # the input box with its Enter withheld; the NEXT send would append to it and
 # Enter would commit BOTH — including the one the user was told was not
-# delivered. Nothing is auto-cleared: Esc has surface-specific semantics (on the
-# folder-trust prompt it KILLS Claude), and /esc mid-generation ALSO interrupts
-# the run — so the copy states the cost instead of hiding it.
+# delivered. GH #56 rig fact (2.1.209): a SINGLE Escape does NOT clear a draft
+# (it only dismisses the ctrl+g hint), and Ctrl+U kills only the current LINE (a
+# multi-line reply-quote draft survives) — so the copy no longer claims either
+# clears the box. TWO rapid Escapes DO clear it; ``/esc`` on a braked window
+# performs exactly that (bot-side, one action), and it is self-protecting — it
+# double-Escapes only after PROVING the box holds a non-empty draft.
 STRANDED_DRAFT_MSG: Final = (
     "Not delivered — an earlier message is still sitting UNSENT in this "
     "window's input box (the bot typed it but withheld Enter). Sending now "
-    "would submit both at once. Clear the input box in the terminal (Esc, or "
-    "Ctrl+U), then resend. /esc sends that Escape for you — but if Claude is "
-    "mid-run it will ALSO interrupt the run."
+    "would submit both at once. To clear it, press Escape TWICE quickly in the "
+    "window — or just send /esc, which clears the box for you on this topic."
 )
 
 # ── The PR-2 free-text lane's copy ───────────────────────────────────────

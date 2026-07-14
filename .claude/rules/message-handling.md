@@ -1854,6 +1854,150 @@ the real post-resolution rig captures (`epm_after_approve_*`, `epm_plan_label_*`
 `auq_after_answer_*`, `trust_after_accept_*`, `control_gitrepo_branch_no_label`,
 plus the live-prompt positive controls `*_before_*`).
 
+**A TALL multi-line draft moves the box's TOP rule out of the scan window (GH #56,
+fixture-pinned 2.1.209).** A reply-quoted / long payload renders a ~18-row draft
+INSIDE the input box (the rig `inputbox_tall_draft_v2.1.209` measures top rule
+line 30 / bottom rule line 49 on 160x50), so `_input_box_rows`'s 20-line
+`_CHROME_SCAN_LINES` window contains only ONE separator, the ORIGINAL code
+returned `None`, and the delivery gate's POST-write re-verify concluded
+`no_input_box` — Enter withheld, the stranded-draft brake armed, the NEXT message
+refused too (a topic wedge on the owner's dominant gesture; the non-collapsed twin
+of the paste-collapse regression — 698 chars is under CC's ~800-char threshold, so
+it renders in full rather than collapsing to `[Pasted text #1 …]`). `_input_box_rows`
+v2: the **≥2-separator path is byte-identical** (every existing fixture keeps its
+EXACT `classify_input_box_failure` string — pinned by a baked baseline over the
+whole corpus); on **exactly 1** it scans UPWARD for the top rule
+(`_INPUT_BOX_TOP_SCAN_LINES = 60` rows, NEAREST rule) but ONLY after a THREE-PART
+STRUCTURAL proof the lone in-window separator is the box's BOTTOM rule (substring
+markers are model-spoofable — an AUQ header carrying `/effort` hits the leg-3
+substring alphabet — so each part kills an independently-reproduced spoof): **(a)**
+the FIRST non-blank row below the lone separator satisfies `_is_status_row`'s
+**CANONICAL ORDERED GRAMMAR** — sound against recombination, COMPLETE against the
+real panes. **This predicate took SIX rounds, and the history is the lesson.**
+Every early grammar validated the row PART-WISE and each round closed one
+combination while the next found another: r1's SUBTRACTIVE grammar let `❯ /effort?`
+through (a full gate bypass + a keyless brake release on a stale empty `❯` row);
+r2's per-segment fullmatch accepted `· /effort ·` via SKIPPED empty segments and
+cross-products (`/effort (manual mode on)`, `⏵◐⏸/effort`); r3's enumerated
+whitelist still validated each segment INDEPENDENTLY, so ANY RECOMBINATION passed
+(`/effort · /effort`, a doubled paste hint, TWO incompatible mode markers, and
+`١ shell` — `\d` is Unicode-wide); r3's ORDERED SLOT MACHINE still let MUTUALLY
+EXCLUSIVE slots coexist (`⏸ manual mode on · paste again to expand`) — **ordering +
+at-most-once does not imply COMPATIBILITY**; and r4's literal WHOLE-ROW ENUMERATION
+was finally SOUND but **TOO NARROW AGAINST REALITY**: sampling the owner's three
+LIVE bot panes surfaced `⏵⏵ bypass permissions on (shift+tab to cycle) · esc to
+interrupt · ctrl+t to hide tasks · ← for agents` — a hint **no fixture contains** —
+so it fail-closed EXACTLY on the busy/tasks panes where the owner's reply-quoted
+messages actually wedge. **Enumeration had mistaken "what our fixtures happen to
+hold" for "what CC renders".** The terminal shape is a grammar:
+
+    ROW       := EXCLUSIVE | BAR
+    EXCLUSIVE := "paste again to expand" | "! for shell mode"     (the WHOLE row)
+    BAR       := [MODE] · [SHELL] · [EFFORT-PAIR] · [HINT…]
+                 …requiring MODE or ≥1 HINT
+
+with **MODE** at most one (never two, never repeated), and each mode text **BOUND to
+the glyph it is actually observed with** (r6): `bypass permissions on` ⇒ `⏵⏵` only
+(live panes + corpus), `manual mode on` ⇒ `⏸` only (the 2.1.209 rig fixture) — the
+earlier form cross-producted glyph × text and accepted pairings CC never renders.
+That binding buys ≈0 SAFETY (anyone who can print `⏸ bypass permissions on` can
+equally print the correctly-paired `⏵⏵ bypass permissions on`, which MUST be
+accepted); it is a tightening for CORRECTNESS and reviewability. `accept edits on` /
+`plan mode on` keep EITHER glyph — their decoration is UNOBSERVED, and guessing one
+would re-create exactly the r4 false-refusal cliff on a real pane (a user in
+accept-edits mode with a tall draft would wedge); a rig capture of those two modes
+would let us bind them. **SHELL** ASCII-only
+(`[0-9]+ shell(s)[ still running]` — `[0-9]`, NEVER `\d`; leg 3's substring shell
+token is ASCII-flipped in the same audit, while the refusal-side option-row traps
+and the idle-lane bg-shells parsers deliberately KEEP `\d`, where wider matching is
+fail-closed); **EFFORT-PAIR** the spinner + `/effort` as two consecutive segments,
+both or neither (a bare `/effort` never validates); and **HINT** from a fixed set
+(`esc to interrupt`, `ctrl+t to hide tasks`, `ctrl+t to show tasks`, `← for
+agents`, `↓ to manage`, `? for shortcuts`, `Enter to view tasks`), each **at most
+once**. No empty segments; **every segment must be consumed**. The EXCLUSIVE forms
+are whole-ROW alternatives, so mutual exclusion is **unrepresentable** rather than
+enforced — the paste hint REPLACES the bar, and modelling it as a row (not a
+segment) is what kills the r4 spoof BY CONSTRUCTION.
+**HINT ORDER IS NOT ENFORCED — a deliberate, disclosed choice.** The corpus + the
+three live rows pin `esc → ctrl+t → ← → ↓` and `? → ←`, but NO observed row carries
+BOTH `? for shortcuts` and `esc to interrupt`, so their relative order cannot be
+established without GUESSING. Order-freedom adds **no unsoundness**: a valid bar's
+hints are all valid hints, while repeats and unknown text are still rejected.
+**SOUNDNESS:** the grammar accepts exactly the WELL-FORMED bars and rejects every
+malformed recombination the rounds produced (two modes, repeats, mode+paste, wide
+digits, NBSP, embedded prose). The residual — pane content reproducing a genuinely
+VALID status bar — is IDENTICAL for enumeration and for the grammar (both accept
+valid bars by definition), so **the grammar costs no safety versus r4 while
+removing the false-refusal cliff**. That is the honest trade, and it is why we do
+not hand-list rows.
+**BYTE DISCIPLINE:** the chrome region is explicitly OUTSIDE
+`_normalize_input_row`'s contract (which is scoped to the rows INSIDE the box), so
+this lane does NOT normalize Unicode spaces, trims ASCII-only, and uses no
+Unicode-wide `\s`/`\d` — an NBSP variant of a real row REFUSES (corpus-verified
+safe: the NBSP CC emits lives in the INPUT row `❯\xa0`, never in a status bar).
+**ACCEPTED COST:** a real status bar whose SHAPE is outside the grammar still fails
+CLOSED — the fallback does not fire on that pane, i.e. exactly today's shipped
+behavior (refuse), never a wrong commit. Pinned by: the three LIVE bot rows as
+accepted vectors; a NON-CIRCULAR corpus-coverage sweep (derived from the
+`>=2`-separator fixtures — the path that provably never consults `_is_status_row`,
+asserted by replacing the predicate with a bomb) so a too-narrow grammar fails
+LOUDLY; every r1–r4 spoof still refusing through the full predicates; the grammar's
+own edges (repeated hint, mode-after-hint, mode + exclusive, bare shell/effort,
+unknown segment); and a two-way lockstep with `_INPUT_READY_CHROME_MARKERS`;
+**(b)** NO option-row shape
+(`_RE_INPUT_OPTION_ROW`) below the lone separator (Codex's "lone separator is a
+live prompt's TOP rule, `❯ 1. Yes` below it" spoof refuses even if (a) were
+spoofed); **(c)** the first non-blank row directly below the found top rule is a
+prompt-glyph (`❯`/`!`) row (a draft that merely CONTAINS a rule-like `─…` line
+pairs with the draft-internal rule → no glyph row below → fail-closed refusal,
+unchanged). Any part failing / no reachable top rule → `None` (fail-closed).
+**Coupled alphabet fix (REQUIRED for the repro):** the rig fixture's only status
+row is `⏸ manual mode on`, absent from `_INPUT_READY_CHROME_MARKERS`, so leg 3
+returned `no_ready_chrome` even with the box located; `manual mode on` is added to
+the LEG-3 alphabet ONLY — not `_READY_STATUS_MARKERS` (a manual-mode pane holding
+a draft is NOT idle for `/update`/`/cost`; the paste-collapse precedent).
+`pane_input_row_empty` (the brake's ONLY release proof) reads the SAME
+`_input_box_rows` seam, so a tall leftover draft now reports False (box found,
+non-empty) rather than None. Disclosed residuals: a draft taller than 60 rows /
+the visible pane still refuses fail-closed (reachable only under ~800 chars spread
+over >46 short lines — paste-collapse catches anything larger); and an adversarial
+model output rendering a byte-exact full status row + zero numbered rows + a `❯`
+row beneath a reachable separator would still spoof the fallback (no longer
+reachable from ordinary content — pinned as a refusing test).
+
+**Braked-`/esc` = the WORKING draft-clear escape hatch (GH #56, 2.1.209 rig).**
+The refusal copy used to advertise `/esc` (a single Escape) as the clear gesture,
+but on 2.1.209 a SINGLE Escape does NOT clear a draft (it only dismisses the
+`ctrl+g` hint and primes a confirmation that lapses ~1s later), and Ctrl+U kills
+only the current LINE (a multi-line reply-quote survives). TWO RAPID Escapes
+(~0.15s apart) DO clear both tall and single-line drafts — no interrupt, no exit —
+and two ~1s apart do NOT (the confirmation lapses between presses), so the
+double-press must be ONE bot-side action, not two manual `/esc` taps. On a window
+under the stranded-draft brake (`window_has_stranded_draft`), `bot.esc_command`
+becomes the clear gesture — still under `window_send_lock` (reject-if-held, the
+existing `/esc` discipline). It takes ONE bounded, cancellation-safe capture and
+branches THREE ways: **box present AND `pane_input_row_empty` is False** (proven
+non-empty draft) → send Escape twice ~0.15s apart (return-checked) → settle →
+re-capture → release the brake (`clear_window_stranded_draft`, the SAME positive
+proof the send-path self-heal uses) ONLY on a fresh `pane_input_row_empty` True,
+else keep it with an honest reply; **`pane_input_row_empty` is True** (already
+clear — the brake can be armed over an empty box: a `commit_unknown` whose Enter
+landed, a post-Enter cancellation, or a user who cleared in the terminal) → NO
+keys, release on that existing proof; **anything else** (indeterminate frame, a
+live blocking prompt, box-proof failure) → NO keys, KEEP the brake (Esc on
+folder-trust KILLS Claude — a braked pane that doesn't prove a held draft gets
+zero keystrokes). An UNBRAKED window keeps today's single-Escape interrupt
+byte-identical. It is a RECOVERY gesture (fail-safe — worst case the box stays
+uncleared and the brake stays up, never a wrong commit), so it needs no
+version-license table (a code comment marks it a TUI-drift audit surface beside
+`clean_ghost_input_text`). Refusal copy corrected in lockstep: `stranded_draft` /
+`draft_written` say "press Escape TWICE quickly" + `/esc`; `commit_unknown` KEEPS
+its screenshot-first guidance (the Enter may already have landed — unconditional
+double-Escape could interrupt the resulting turn) with only a CONDITIONAL `/esc`
+mention. Disclosed residual: the capture→key race (a prompt drawn after the final
+capture) is the same one tmux round-trip every dispatch path accepts. Pull-only;
+no observer (c313657 stays forbidden).
+
 **Deliberately NOT asserted:** no-active-run, background-shell absence, and
 input-row emptiness. **Queueing a message while Claude is BUSY is a first-class
 flow** and MUST keep working (rig design-killer A2: the rule-pair + prompt row +
@@ -2087,10 +2231,14 @@ by `TestArrowKeysAreNotADraft`.
     `draft_stranded` outcome MARKS the window; while marked, `deliver_to_window`
     REFUSES with the
     `stranded_draft` reason + actionable copy ("an earlier message is still sitting
-    UNSENT in this window's input box … clear it (Esc, or Ctrl+U), then resend. /esc
-    sends that Escape for you — but if Claude is mid-run it will ALSO interrupt the
-    run"). **NOTHING is auto-cleared** (Esc on folder-trust KILLS Claude; mid-run it
-    interrupts) — the cost is stated, not hidden. The brake is released ONLY on
+    UNSENT in this window's input box … press Escape TWICE quickly in the window —
+    or just send /esc, which clears the box for you on this topic"). **The copy no
+    longer claims a SINGLE Escape or Ctrl+U clears the draft** (GH #56 rig fact,
+    2.1.209: a single Escape doesn't clear it, and Ctrl+U kills only one line);
+    `/esc` on a braked window performs the two-rapid-Escape clear bot-side, and it
+    is SELF-PROTECTING — it double-Escapes only a pane that PROVES a non-empty input
+    box (see the braked-`/esc` clear-mode contract above), so it never interrupts a
+    running turn. The brake is released ONLY on
     POSITIVE proof: one extra capture whose `terminal_parser.pane_input_row_empty`
     is True (ANSI-cleaned via `clean_ghost_input_text`, so a CC ≥2.1.206 DIM ghost
     suggestion never strands it forever); an INDETERMINATE frame — a capture
