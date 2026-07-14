@@ -1673,10 +1673,16 @@ disclosed), the strict Claude proof-of-life, the full `plan_from_pane` (pane
 ownership + `_auq_shape` + `derive_identity` with the MANDATORY anchor and
 anchor–pane agreement, exactly as `_observe`/`try_answer` apply them), and the
 version license — and **`try_answer`'s `_answer_locked` CONSUMES that same
-callable for its own phase** (its early brake check keeps the documented
-before-any-capture ordering and re-checks the same one registry; the cmd-probe
-TIMEOUT is the only classification outside it — the Claude proof itself is a phase
-leg). `advertises_free_text(surface, version=…, window_id=…, pane_text=…,
+callable for its own phase**, with exactly TWO sanctioned idempotent DUPLICATES
+(r5 P2 — each re-checks a value the phase ALSO checks, never a divergent gate): the
+early brake check (the documented before-any-capture ordering) and the early
+`not_claude` decline on the in-lock probe result BEFORE `_observe` — PROBE-FIRST
+ordering: the r4 restructure ran the observation (pane capture + anchor reads)
+before the phase's Claude leg, so a `zsh` pane paid two captures and a capture
+RAISE propagated as a generic `send_failed` where the old code fell through
+cleanly to PR-1's actionable `not_claude` refusal (pinned: cmd=`zsh` + raising
+capture ⇒ clean `None`, zero captures, no escape). The cmd-probe TIMEOUT stays the
+only classification outside the phase. `advertises_free_text(surface, version=…, window_id=…, pane_text=…,
 ansi_pane=…)` = read the anchor via the executor's `read_surface_anchor`, then
 dry-run `plan_pre_keystroke` on the render seam's ALREADY-captured RAW pane pair
 (no new tmux round-trips) — **the MERGED form is no longer consulted for the copy
@@ -1692,10 +1698,14 @@ nav-only, cursorless raw pane + synthesized-cursor merge ⇒ nav-only, mismatche
 side file + complete pane ⇒ nav-only, braked window ⇒ nav-only, and the genuine
 positive control (complete cursored pane + agreeing live side file, real anchor
 path) ⇒ text-advertising; plus the DELEGATION PINS replacing the r3 tautological
-sweep — interception tests proving `advertises_free_text` and `try_answer`'s
-pre-keystroke phase call the SAME `plan_pre_keystroke` (either consumer growing a
-private gate fails them), with direct real-pane pins on every phase decline.
-Pull-only; no observer (c313657 stays forbidden).
+sweep — interception tests proving exactly (r5 P3): INVOCATION UNITY (both
+consumers call the SAME `plan_pre_keystroke`, once, on the raw inputs),
+DECLINE-HONORED (a phase decline reaches the executor's bail with zero
+keystrokes) and SUCCESS-CONSUMED (a phase-returned plan is what the executor
+navigates on — the delta's arrows are sent); they do NOT prove gate-ABSENCE
+elsewhere, which stays a review invariant kept visible by the two
+sanctioned-duplicate comments. Direct real-pane pins cover every phase decline
+incl. `surface_mismatch`. Pull-only; no observer (c313657 stays forbidden).
 
 ## Inbound delivery gate — text on a live interactive surface (GH #50 PR-1)
 

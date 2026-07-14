@@ -787,8 +787,15 @@ def plan_pre_keystroke(
     state remained (merged-form completeness/cursor synthesis, anchor–pane
     AGREEMENT, the stranded-draft brake). A parallel predicate LOSES; the only
     stable form is the executor's own phase. A gate added here binds both
-    consumers by construction; a gate added to the executor OUTSIDE this
-    function fails the delegation pin in ``test_free_text_parser``.
+    consumers by construction. What the ``test_free_text_parser`` delegation
+    pins PROVE (r5 P3 — stated exactly, not more): INVOCATION UNITY (both
+    consumers call this function, once, on the raw inputs), DECLINE-HONORED
+    (a phase decline reaches the executor's bail with zero keystrokes) and
+    SUCCESS-CONSUMED (a phase plan is what the executor navigates on). They
+    do NOT prove the ABSENCE of a private gate elsewhere in either consumer —
+    that stays a review invariant, kept visible by the two idempotent-
+    duplicate comments (the early brake + the early Claude probe) at the only
+    sanctioned duplicates.
 
     The phase, in the executor's own order:
 
@@ -798,7 +805,9 @@ def plan_pre_keystroke(
          documented before-any-capture ordering; both consult the ONE registry,
          so the dry-run can never miss it. Lock-free at render — disclosed);
       3. the strict Claude proof-of-life on the version string
-         (``pane_command_is_claude``);
+         (``pane_command_is_claude`` — ``_answer_locked`` ALSO early-declines
+         this on the in-lock probe result BEFORE its observation, the r5 P2
+         probe-first ordering; same value, the second sanctioned duplicate);
       4. :func:`plan_from_pane` on the RAW pane pair + the anchor — pane
          ownership, the AUQ extract, ``_auq_shape`` (single-Q single-select +
          affordance + COMPLETE options + a proven cursor), and
@@ -1014,13 +1023,24 @@ async def _answer_locked(
 
     # (1) FRESH proof of life probe, INSIDE the lock and immediately before the
     # first key (the AUQ round-2 P1-1 rule): a /update-swapped TUI inside the
-    # window-list cache TTL must never be arrow-keyed. Only the TIMEOUT is
-    # classified here — the Claude proof itself is a leg of the SHARED
-    # pre-keystroke phase below.
+    # window-list cache TTL must never be arrow-keyed.
     cmd = await _pane_command(window_id)
     if cmd is _CMD_TIMEOUT:
         return _decline("cmd_probe_timeout")
     assert cmd is None or isinstance(cmd, str)
+    # PROBE-FIRST ordering (r5 P2): a non-Claude pane declines IMMEDIATELY,
+    # BEFORE ``_observe``'s pane capture + anchor reads — the r4 restructure
+    # moved the Claude proof wholly into the shared phase (which runs AFTER
+    # the observation), so a `zsh` pane started paying two captures and, on a
+    # capture RAISE, propagated an exception where the old code fell through
+    # cleanly to PR-1's actionable `not_claude` refusal. The SHARED
+    # ``plan_pre_keystroke`` KEEPS its own Claude leg (the render dry-run
+    # needs it); this early re-check of the SAME value is a harmless
+    # idempotent duplicate — do NOT "deduplicate" it away, in either
+    # direction: removing THIS one re-opens the r5 ordering regression,
+    # removing the PHASE's one re-opens the r4 dry-run hole.
+    if not pane_command_is_claude(cmd):
+        return _decline("not_claude")
 
     # ONE OBSERVATION: anchor · pane · anchor (see ``_observe``). The anchor is
     # read BEFORE the capture (round 3) AND re-read after it (round 5), so the
@@ -1032,8 +1052,12 @@ async def _answer_locked(
 
     # THE PRE-KEYSTROKE PHASE — the ONE callable ``advertises_free_text``
     # dry-runs at render time (GH #54 W5 r4). Every eligibility gate between
-    # here and the first arrow key lives INSIDE it; adding one anywhere else
-    # re-opens the copy-drift class and fails the delegation pin.
+    # here and the first arrow key lives INSIDE it (the two sanctioned
+    # duplicates above — the early brake + the early Claude probe — re-check
+    # values the phase ALSO checks; adding a gate here that the phase does
+    # NOT carry re-opens the copy-drift class — a REVIEW invariant: the
+    # delegation pins prove invocation-unity + decline-honored +
+    # success-consumed, not gate-absence).
     phase = plan_pre_keystroke(
         SURFACE_AUQ,
         version=cmd,
