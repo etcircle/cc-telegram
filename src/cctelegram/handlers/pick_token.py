@@ -631,11 +631,55 @@ def _commit_phase_c(token: str, entry: PickTokenEntry) -> PickValidation:
     return PickValidation("ok", entry, None)
 
 
+async def _capture_normalized_pair(
+    capture_pane: Callable[..., Awaitable[str | None]], window_id: str
+) -> tuple[str | None, str | None]:
+    """One ANSI capture → normalized ``(plain, ansi)``, with the spine's
+    one-plain-recapture on a normalize rejection (wave-2 review P2-A).
+
+    The injected ``capture_pane(window_id, scrollback_lines, with_ansi=True)``
+    returns the ANSI frame; ``normalize_capture`` derives plain (region-equal to
+    a plain capture) and retains the raw for tier-2 SGR cursor detection. On an
+    UNKNOWN control sequence the normalizer REJECTS — the spine then permits
+    EXACTLY ONE plain re-capture for this observation (WARNING-logged with the
+    byte the normalizer's own grammar rejected), and the observation proceeds
+    PLAIN-ONLY: ``ansi=None`` disables the SGR tier, so a chevron-less preview
+    pane fails closed to no-cursor (the documented degradation) instead of the
+    pre-fold FOREVER-``stale_form`` on a card the render path had published via
+    its own plain fallback. A failed re-capture — including a legacy injected
+    callable without the ``with_ansi`` parameter — stays an ordinary capture
+    failure (``(None, None)``).
+    """
+    from ..terminal_parser import normalize_capture, normalize_reject_introducer
+
+    raw = await capture_pane(window_id, 500)
+    if not raw:
+        return None, None
+    pair = normalize_capture(raw)
+    if pair is not None:
+        return pair.plain, pair.ansi
+    logger.warning(
+        "pick_token capture: normalize rejected window=%s introducer=%s; "
+        "one plain re-capture",
+        window_id,
+        normalize_reject_introducer(raw),
+    )
+    try:
+        plain = await capture_pane(window_id, 500, False)
+    except TypeError:
+        # A legacy injected callable without the with_ansi parameter — treat as
+        # an ordinary capture failure (fail-closed; live callers all take it).
+        return None, None
+    if not plain:
+        return None, None
+    return plain, None
+
+
 async def validate_and_consume(
     token: str,
     sender_id: int,
     *,
-    capture_pane: Callable[[str, int], Awaitable[str | None]],
+    capture_pane: Callable[..., Awaitable[str | None]],
     find_window_by_id: Callable[[str], Awaitable[object | None]],
 ) -> PickValidation:
     """Atomically validate + single-use-consume a pick token by reservation.
@@ -685,9 +729,22 @@ async def validate_and_consume(
         if w is None:
             return PickValidation("window_gone", entry, None)
 
-        pane = await capture_pane(window_id, 500)
+        # GH #54 capture spine (seam 3): the injected ``capture_pane`` returns the
+        # ANSI frame; ``_capture_normalized_pair`` derives plain (region-equal to
+        # a plain capture, fed to the plain-only ``resolve_auq_source``) and
+        # retains the raw for tier-2 SGR cursor detection so the nav delta comes
+        # from a REAL parsed cursor on a chevron-less preview picker. A plain
+        # frame (tests / a no-escape pane) normalizes to ``ansi == plain`` ⇒
+        # tier-2 finds nothing ⇒ byte-identical to the old plain path. A
+        # normalize REJECT takes the ONE plain re-capture (P2-A) — plain-only,
+        # never a forever-``stale_form`` against a plain-fallback-rendered card.
+        pane, pane_ansi = await _capture_normalized_pair(capture_pane, window_id)
         live_source = resolve_auq_source(window_id, None, pane or "")
-        current_form = resolve_ask_form(live_source.payload, pane) if pane else None
+        current_form = (
+            resolve_ask_form(live_source.payload, pane, ansi_text=pane_ansi)
+            if pane
+            else None
+        )
 
         if current_form is None or current_form.fingerprint() != entry.fingerprint:
             return PickValidation("stale_form", entry, None)
@@ -825,7 +882,7 @@ async def recover_and_consume(
     intent: PickIntent,
     sender_id: int,
     *,
-    capture_pane: Callable[[str, int], Awaitable[str | None]],
+    capture_pane: Callable[..., Awaitable[str | None]],
     find_window_by_id: Callable[[str], Awaitable[object | None]],
 ) -> PickRecovery:
     """Row-scoped restart-recovery of a token-less pick tap.
@@ -891,9 +948,15 @@ async def recover_and_consume(
         w = await find_window_by_id(intent.window_id)
         if w is None:
             return PickRecovery("window_gone")
-        pane = await capture_pane(intent.window_id, 500)
+        # GH #54 capture spine (seam 3, D2 recovery): ANSI frame → normalize →
+        # (plain, ansi) so the recovered ``current_form`` cursor is a REAL parsed
+        # cursor (tier-2 SGR on a chevron-less preview picker), never synthetic.
+        # A normalize REJECT takes the ONE plain re-capture (P2-A, plain-only).
+        pane, pane_ansi = await _capture_normalized_pair(capture_pane, intent.window_id)
         payload = sf.payload if sf is not None else None
-        current_form = resolve_ask_form(payload, pane) if pane else None
+        current_form = (
+            resolve_ask_form(payload, pane, ansi_text=pane_ansi) if pane else None
+        )
         if (
             current_form is None
             or current_form.fingerprint() != intent.full_fingerprint

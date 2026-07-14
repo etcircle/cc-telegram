@@ -1,0 +1,50 @@
+│   Opus 4.8 (1M context) with me… · Claude Max ·    │ Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK) being permanently reco… │
+│   em.tanev@gmail.com's Organization                │ /release-notes for more                                                                                 │
+│              /private/tmp/ccrig-gh54               │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ▎ Extended through July 19
+ ▎ We're extending Claude Fable 5 access on all paid plans, as well as keeping Claude Code’s weekly rate limits 50% higher, through July 19.
+ ▎
+ ▎ As before, you can use up to half of your weekly usage limit on Fable 5. After that, you can keep using Fable 5 with usage credits, or switch to another
+ ▎ model to keep working within your remaining limits.
+ ▎
+ ▎ More details here: https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access
+
+❯ Call the AskUserQuestion tool exactly once with one single-select question (multiSelect false), header "Rig test", a question ~120 chars long, and three
+  options. Give EVERY option a label ~25 chars, a description ~200 chars, AND a preview field containing a 6-line ASCII box-drawing mockup using the characters
+  box top-left, vertical bar, and box bottom-left. Do not do anything else, do not write files, just call the tool once.
+
+⏺ I'll call the tool once with the question and three previewed options.
+
+⏺ User answered Claude's questions:
+  ⎿  · Which layout should the rig test harness use to render its status panel when a run is executing in the terminal? → Side-by-side columns
+
+⏺ Done — the tool was called once and you selected Side-by-side columns (phases on the left, live counters and timings on the right). Nothing else was run and
+  no files were written.
+
+✻ Cogitated for 12s
+
+❯ Now call the AskUserQuestion tool exactly once again with the SAME shape but multiSelect TRUE: header "Rig test multi", one question ~120 chars, three
+  options each with a ~25 char label, a ~200 char description, AND a preview field containing a 6-line ASCII box-drawing mockup using box top-left, vertical
+  bar, box bottom-left characters. Just call the tool once, nothing else.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Rig test multi  ✔ Submit  →
+
+Which extras should the rig test harness render alongside the side-by-side status panel while a run is executing?
+
+❯ 1. [ ] Live phase timing gutter
+  Adds a narrow gutter to the right of each phase row showing its elapsed or final wall time, so slow phases stand out mid-run. Costs a few columns of width and
+  forces phase names to truncate sooner.
+  2. [ ] Inline failure excerpt
+  When a phase fails, splices the last few lines of its stderr directly into the panel instead of deferring them to the end of the run. Fast triage without
+  scrollback, but a noisy failure can push the panel past a screen.
+  3. [ ] Run history sparkline
+  Draws a compact sparkline of the last several runs beneath the panel, marking pass and fail so flaky phases are visible over time. Requires the harness to
+  persist a small local history file between runs.
+  4. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

@@ -58,7 +58,7 @@ from cctelegram.terminal_parser import (
     parse_generic_decision,
     resolve_ask_form,
 )
-from cctelegram.tmux_manager import pane_command_is_claude
+from cctelegram.tmux_manager import capture_pane_pair, pane_command_is_claude
 from cctelegram.tmux_manager import tmux_manager as _tmux_singleton
 
 from . import (
@@ -436,8 +436,15 @@ async def _dispatch_pick_pane_locked(
     # (Making an off-screen option-1 tap actually dispatch is a separate
     # follow-up; here it SAFELY no-ops.)
     if any(o.cursor for o in current_form.options):
-        gpane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
-        gpane_form = resolve_ask_form(None, gpane) if gpane else None
+        # GH #54 capture spine (seam 4): ANSI pair so a chevron-less preview
+        # picker's SGR cursor is parsed here — else the pre-guard would BAIL every
+        # preview dispatch as ``cursor_synthetic``.
+        gpair = await capture_pane_pair(tmux_manager, w.window_id, scrollback_lines=500)
+        gpane = gpair.plain if gpair is not None else None
+        gpane_ansi = gpair.ansi if gpair is not None else None
+        gpane_form = (
+            resolve_ask_form(None, gpane, ansi_text=gpane_ansi) if gpane else None
+        )
         if gpane_form is None or not any(o.cursor for o in gpane_form.options):
             logger.info(
                 "AUQ_PICK nav cursor_synthetic user=%d window=%s opt=%d "
@@ -480,11 +487,13 @@ async def _dispatch_pick_pane_locked(
 
     await asyncio.sleep(NAV_SETTLE)
 
-    vpane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+    vpair = await capture_pane_pair(tmux_manager, w.window_id, scrollback_lines=500)
+    vpane = vpair.plain if vpair is not None else None
+    vpane_ansi = vpair.ansi if vpair is not None else None
     vform: AskUserQuestionForm | None = None
     if vpane:
         vsource = auq_source.resolve_auq_source(window_id, None, vpane)
-        vform = resolve_ask_form(vsource.payload, vpane)
+        vform = resolve_ask_form(vsource.payload, vpane, ansi_text=vpane_ansi)
     vc = next((o for o in vform.options if o.cursor), None) if vform else None
     # PANE-ONLY real-cursor requirement (the load-bearing fail-closed gate). The
     # overlaid ``vform`` cursor above may be the SYNTHETIC default that
@@ -496,7 +505,7 @@ async def _dispatch_pick_pane_locked(
     # NEVER sent against an off-screen cursor. A legitimate navigate-into-view
     # scrolls the real cursor onto the captured region, so the pane-only form
     # WILL carry a real cursor at the target on the happy path.
-    vpane_only = resolve_ask_form(None, vpane) if vpane else None
+    vpane_only = resolve_ask_form(None, vpane, ansi_text=vpane_ansi) if vpane else None
     vpane_real_cursor = (
         next((o for o in vpane_only.options if o.cursor), None) if vpane_only else None
     )
@@ -515,7 +524,7 @@ async def _dispatch_pick_pane_locked(
         and vform.fingerprint() == fingerprint  # still the SAME form (cursor-blind)
         and vc is not None
         and vc.number == target
-        and _loose_label_match(vc.label, option_label)
+        and _loose_label_match(vc.label, option_label, vc.wrap_canonical)
         and (
             not is_review_submit
             or (vform.review_submit_dispatchable(option_label) and vc.number == 1)
@@ -545,11 +554,19 @@ async def _dispatch_pick_pane_locked(
     await asyncio.sleep(COMMIT_SETTLE)
 
     # ── Enter WAS sent: from here a failure is at worst ``commit_unconfirmed`` ──
-    pane2 = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+    pane2_pair = await capture_pane_pair(
+        tmux_manager, w.window_id, scrollback_lines=500
+    )
+    pane2 = pane2_pair.plain if pane2_pair is not None else None
+    pane2_ansi = pane2_pair.ansi if pane2_pair is not None else None
     if pane2 is None:
         return _bail_commit_unconfirmed("confirm_capture_failed")
     asource = auq_source.resolve_auq_source(window_id, None, pane2)
-    aform = resolve_ask_form(asource.payload, pane2) if pane2 else None
+    aform = (
+        resolve_ask_form(asource.payload, pane2, ansi_text=pane2_ansi)
+        if pane2
+        else None
+    )
     if aform is None:
         if _pane_looks_like_picker(pane2):
             # Markers present but unparseable → AMBIGUOUS; never record dispatched.
@@ -632,8 +649,14 @@ async def _attempt_pick_recovery(
         )
         return True
 
-    async def _capture(wid: str, scrollback: int) -> str | None:
-        return await tmux_manager.capture_pane(wid, scrollback_lines=scrollback)
+    async def _capture(wid: str, scrollback: int, with_ansi: bool = True) -> str | None:
+        # GH #54 capture spine: hand pick_token the ANSI frame; it normalizes
+        # into a (plain, ansi) pair so the re-parsed cursor is a REAL parsed
+        # cursor (tier-2 SGR on a chevron-less preview picker). ``with_ansi=False``
+        # is pick_token's one-plain-recapture request on a normalize rejection.
+        return await tmux_manager.capture_pane(
+            wid, with_ansi=with_ansi, scrollback_lines=scrollback
+        )
 
     result = await pick_token.recover_and_consume(
         token,
@@ -1839,8 +1862,19 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # the SAME 500-line scrollback as the render path so the validate pane
         # slice matches the mint pane slice (a smaller capture would shift
         # current_tab_inferred / options and bounce long pickers).
-        async def _capture(wid: str, scrollback: int) -> str | None:
-            return await tmux_manager.capture_pane(wid, scrollback_lines=scrollback)
+        # GH #54 capture spine (seam 3, the PRIMARY live tap path — wave-2 review
+        # P1): the frame is captured WITH ANSI so pick_token's re-parse can prove
+        # the SGR tier-2 cursor on a chevron-less preview picker — a plain frame
+        # here parsed NO cursor while the rendered form had one, so the token was
+        # CONSUMED and the dispatch then bailed ``cursor_unknown`` (a dead tap on
+        # every preview pick). ``with_ansi=False`` is pick_token's one-plain-
+        # recapture request on a normalize rejection (P2-A).
+        async def _capture(
+            wid: str, scrollback: int, with_ansi: bool = True
+        ) -> str | None:
+            return await tmux_manager.capture_pane(
+                wid, with_ansi=with_ansi, scrollback_lines=scrollback
+            )
 
         result = await pick_token.validate_and_consume(
             token,

@@ -50,6 +50,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from ..session import peek_session_id_for_window, read_session_id_for_window_fresh
@@ -265,7 +266,11 @@ def pane_form_is_complete_picker(form: AskUserQuestionForm | None) -> bool:
 
 
 def resolve_auq_source_for_render(
-    window_id: str, pane_text: str, explicit: dict | None = None
+    window_id: str,
+    pane_text: str,
+    explicit: dict | None = None,
+    *,
+    ansi_text: str | None = None,
 ) -> RenderAuqSource:
     """Resolve the RENDER-path AUQ source + trust for a window (PR-3 PR-B).
 
@@ -294,7 +299,14 @@ def resolve_auq_source_for_render(
     """
     from ..terminal_parser import build_form_from_tool_input, resolve_ask_form
 
-    pane_form = resolve_ask_form(None, pane_text) if pane_text else None
+    # GH #54 capture spine: with ``ansi_text`` present, tier-2 SGR cursor
+    # detection works on chevron-less (wrapping-label / 2.1.197) preview panes,
+    # so the resolved form's cursor — and thus ``render_signature`` and the
+    # poller hash — track an SGR-only cursor move. Plain-only callers pass None
+    # and keep today's behaviour byte-identical.
+    pane_form = (
+        resolve_ask_form(None, pane_text, ansi_text=ansi_text) if pane_text else None
+    )
     record = _read_live_pretool_record(window_id, apply_ttl=False)
     if record is not None:
         consistent, reason = _record_consistent_with_pane(record, pane_form)
@@ -307,7 +319,7 @@ def resolve_auq_source_for_render(
         if consistent and within_ttl:
             # The side file carries the question TITLE the pane lacks; overlay
             # the live pane (cursor / tab / review) onto it.
-            form = resolve_ask_form(record.tool_input, pane_text)
+            form = resolve_ask_form(record.tool_input, pane_text, ansi_text=ansi_text)
             return RenderAuqSource(
                 decision="side_file_ok",
                 kind="side_file",
@@ -317,9 +329,27 @@ def resolve_auq_source_for_render(
                 dispatch_trusted=True,
                 reason="consistent",
             )
-        if pane_form is None:
+        if pane_form is None or (
+            not pane_form.options
+            and not _zero_option_form_contradicts_record(record, pane_form)
+        ):
             # The pane carries NO parseable picker AT ALL (busy scrollback /
-            # obscured) — the side file is the ONLY content we have. RESCUE it
+            # obscured), OR it parsed a form with ZERO options AND no
+            # CONTRADICTING evidence — the same "pane proves nothing" definition
+            # ``_record_consistent_with_pane`` uses (``no_pane_form``; auq_source
+            # mint/validate parity, GH #54 W2). A 0-option form is exactly the
+            # pre-W1 preview-layout shape (F3/F4) and any pane the
+            # region-discovery prepass could not parse: without this leg it fell
+            # through to the untrusted ``bail_partial`` raw dump instead of the
+            # clean side-file RESCUE, dropping the 📋 ctx card and the buttons.
+            # Defense-in-depth — it ships even if W1's preview parse slips, and
+            # is byte-identical for a normal (options-bearing) pane. NARROWED
+            # (wave-2 review P2-B): a zero-option form still carrying a parsed
+            # TAB HEADER / current title that CONTRADICTS the (TTL-free, so
+            # possibly stale — restart orphan / double-resume sibling) side file
+            # is POSITIVE proof a DIFFERENT question is live, so it keeps the
+            # pre-W2 ``bail_partial`` instead of rendering the wrong question.
+            # The side file is the ONLY content we have. RESCUE it
             # DISPLAY-ONLY. This is the SOLE branch that serves the side file
             # OVER the pane, and it is reserved for "the pane proves nothing",
             # so a (possibly STALE) side file can NEVER overwrite a
@@ -369,7 +399,7 @@ def resolve_auq_source_for_render(
             decision="explicit_jsonl",
             kind="jsonl_cache",
             payload=explicit,
-            form=resolve_ask_form(explicit, pane_text),
+            form=resolve_ask_form(explicit, pane_text, ansi_text=ansi_text),
             source_fingerprint=_canonical_dict_fingerprint(explicit),
             dispatch_trusted=True,
             reason="explicit",
@@ -380,7 +410,7 @@ def resolve_auq_source_for_render(
             decision="jsonl_cache",
             kind="jsonl_cache",
             payload=cached,
-            form=resolve_ask_form(cached, pane_text),
+            form=resolve_ask_form(cached, pane_text, ansi_text=ansi_text),
             source_fingerprint=_canonical_dict_fingerprint(cached),
             dispatch_trusted=True,
             reason="jsonl_cache",
@@ -445,7 +475,9 @@ def render_signature(form: AskUserQuestionForm | None) -> str:
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
-def peek_render_identity(window_id: str, pane_text: str) -> str:
+def peek_render_identity(
+    window_id: str, pane_text: str, *, ansi_text: str | None = None
+) -> str:
     """Render-identity hash for the status-poll loop dedup (PR-3 PR-B).
 
     Hashes the render DECISION (``decision``/``reason``/``dispatch_trusted``/
@@ -455,7 +487,7 @@ def peek_render_identity(window_id: str, pane_text: str) -> str:
     re-renders on every genuine render transition (decision flip, cursor/tab/
     selection/review/title change). Read-only; never mutates resolver state.
     """
-    r = resolve_auq_source_for_render(window_id, pane_text)
+    r = resolve_auq_source_for_render(window_id, pane_text, ansi_text=ansi_text)
     head = f"{r.decision}|{r.reason}|{int(r.dispatch_trusted)}|{r.kind}"
     return hashlib.sha256(f"{head}|{render_signature(r.form)}".encode()).hexdigest()
 
@@ -700,24 +732,185 @@ def _strip_recommended(label: str) -> str:
     return _RE_RECOMMENDED.sub("", label).rstrip()
 
 
-def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> bool:
-    """True if ``visible`` is a contiguous subsequence of ``full``.
+def _pane_option_label_matches(option, authority_label: str) -> bool:
+    """True iff a pane-parsed option matches the AUTHORITY (side-file / JSONL) label.
 
-    The pane may render only the visible region; earlier options can be
-    pushed off the top by long descriptions. We still accept the record
-    if whatever IS visible matches the corresponding contiguous slice of
-    the record's labels. Labels are compared recommended-suffix-normalized
-    (the pane strips ``(Recommended)``; the side file keeps it).
+    GH #54 W1.2 — the authority-aware comparison for the auq_source label-compare
+    call graph (``_record_consistent_with_pane`` via
+    ``_pane_labels_match_candidate_by_number`` and the partial-context recovery
+    ``_ctx_evidence_floor_ok``). Two legs:
+
+      * leg 1 — the EXISTING single-column rule: ``_strip_recommended`` equality
+        (case- and whitespace-PRESERVING, keeping the wrong-question protection
+        tight). This is the sole leg for an ordinary option, so single-column
+        matching is byte-identical;
+      * leg 2 — PREVIEW ONLY (``option.wrap_canonical`` non-empty): a
+        preview-layout label is a lossy wrapped-fragment reconstruction whose
+        inter-fragment spacing cannot be recovered, so the shared
+        ``terminal_parser.label_matches_authority`` accepts either wrap kind via
+        an all-whitespace-stripped comparison. Confined to preview options.
     """
+    from ..terminal_parser import label_matches_authority
+
+    if _strip_recommended(authority_label) == _strip_recommended(option.label):
+        return True
+    if not getattr(option, "wrap_canonical", ""):
+        return False
+    return label_matches_authority(option.label, option.wrap_canonical, authority_label)
+
+
+def _options_are_subsequence(visible_options, full: tuple[str, ...]) -> bool:
+    """True if the visible pane OPTIONS are a contiguous subsequence of ``full``.
+
+    The pane may render only the visible region; earlier options can be pushed
+    off the top by long descriptions. We still accept the record if whatever IS
+    visible matches the corresponding contiguous slice of the record's labels.
+    Each comparison routes through ``_pane_option_label_matches`` (wave-2 review
+    P2-C): recommended-suffix-normalized exact equality for ordinary options
+    (byte-identical to the historic rule) PLUS the wrap-canonical leg for
+    preview options — a wrapped preview label's lossy space-join must not
+    ``no_candidate`` the multi-question candidate selection while the
+    slot-based accept would take it (mint/validate parity).
+    """
+    visible = tuple(visible_options)
     if not visible:
         return False
-    visible = tuple(_strip_recommended(v) for v in visible)
-    full = tuple(_strip_recommended(f) for f in full)
     if len(visible) > len(full):
         return False
     for start in range(len(full) - len(visible) + 1):
-        if full[start : start + len(visible)] == visible:
+        if all(
+            _pane_option_label_matches(opt, full[start + i])
+            for i, opt in enumerate(visible)
+        ):
             return True
+    return False
+
+
+def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> bool:
+    """Bare-label wrapper over :func:`_options_are_subsequence` (one matcher —
+    a label-only caller gets the ordinary exact-equality semantics, since a
+    bare label carries no ``wrap_canonical``)."""
+    return _options_are_subsequence(
+        tuple(SimpleNamespace(label=v) for v in visible), full
+    )
+
+
+# Minimal length an ELLIPSIS-DAMAGED evidence fragment must have before it may
+# CONTRADICT the side-file record in ``_zero_option_form_contradicts_record``
+# (wave-2 review r3 residual P2). A CC-truncated title/tab strips to a fragment;
+# a 2-3 char shred matching nothing proves NOTHING (indeterminate ⇒ rescue, the
+# pre-narrowing fail direction), so only a non-trivially-long fragment decides.
+# 8 chars — the module's existing ``_CTX_TITLE_MIN_CHARS`` anti-coincidence
+# precedent. The floor applies ONLY to damaged (ellipsis-stripped) fragments:
+# a CLEAN label is complete evidence and compares at any length (the round-2
+# clean-contradiction pins — foreign tabs "Alpha"/"Beta" at 5/4 chars — must
+# keep contradicting).
+_ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS: Final = 8
+
+# An ellipsis run: the single-char ``…`` (CC's truncation glyph) or ``...``.
+_RE_ELLIPSIS_RUN = re.compile(r"…|\.{3,}")
+
+
+def _ellipsis_fragment(text: str) -> tuple[str, bool]:
+    """Split evidence at its FIRST ellipsis run → ``(fragment, was_damaged)``.
+
+    A trailing ``…``/``...`` is stripped; a MID-string ellipsis keeps only the
+    pre-ellipsis fragment (the suffix after a truncation marker is not reliable
+    evidence — CC renders garbled/re-joined tails around it). ``was_damaged``
+    is True iff an ellipsis run was found, which is what scopes the
+    ``_ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS`` floor to damaged evidence only.
+    """
+    m = _RE_ELLIPSIS_RUN.search(text)
+    if m is None:
+        return text.strip(), False
+    return text[: m.start()].strip(), True
+
+
+def _zero_option_form_contradicts_record(record, pane_form) -> bool:
+    """True iff a ZERO-option pane form carries CLEAN POSITIVE evidence a
+    DIFFERENT question is live than the side-file record's (wave-2 review P2-B,
+    narrowed for damaged evidence by the r3 residual P2).
+
+    The W2 rescue gate treats a zero-option form like ``pane_form is None``
+    ("the pane proves nothing"), but the parser deliberately returns zero-option
+    forms that still carry a parsed TAB HEADER / current question title during
+    redraws — and the render-path side-file read is TTL-free, so a restart
+    orphan / double-resume-sibling STALE record could rescue-render old Q1
+    content over a pane whose surviving evidence PROVES a different tab /
+    question is live. Contradiction = fail back to the pre-W2 ``bail_partial``.
+
+    Contradiction requires CLEAN positive mismatch; DAMAGED / indeterminate
+    evidence never contradicts (fail direction: indeterminate ⇒ rescue — the
+    pre-narrowing behavior). An ellipsized/garbled variant of the record's OWN
+    title (a mid-redraw ``For the Alpha panel, which layout should … primary
+    arrangement...``) or a ``…``-truncated tab label is DAMAGE, not
+    contradiction: each evidence item is ellipsis-normalized first
+    (:func:`_ellipsis_fragment` — strip a trailing run, keep only the
+    pre-ellipsis fragment of a mid-string run), a damaged fragment below
+    ``_ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS`` is SKIPPED (a shred never
+    decides), and the surviving fragment — being a PREFIX of the true text —
+    matches through the existing prefix-tolerant rules below.
+
+    Checks (each only when the evidence exists — a bare zero-option form, the
+    pure mid-redraw / pre-W1 shape, never contradicts):
+
+      * TITLE — the (normalized) pane ``current_question_title`` fragment must
+        bidirectionally prefix-match SOME record question (the
+        ``_record_consistent_with_pane`` title rule);
+      * TABS — every (normalized) content tab label must match SOME record
+        question header under the shared authority-aware normalization
+        (``label_matches_authority`` — whitespace-collapse equality plus the
+        wrap-canonical all-whitespace-stripped leg, prefix-tolerant for a
+        truncated tab render).
+
+    A malformed record (no questions list) never contradicts — the rescue then
+    renders whatever the record holds, exactly as for ``pane_form is None``.
+    """
+    from ..terminal_parser import label_matches_authority
+
+    raw_questions = record.tool_input.get("questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        return False
+    questions = [q for q in raw_questions if isinstance(q, dict)]
+    if not questions:
+        return False
+
+    pane_title = (pane_form.current_question_title or "").strip()
+    if pane_title:
+        fragment, damaged = _ellipsis_fragment(pane_title)
+        usable = bool(fragment) and (
+            not damaged or len(fragment) >= _ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS
+        )
+        if usable:
+            titles = [(q.get("question") or "").strip() for q in questions]
+            if not any(
+                t and (t.startswith(fragment) or fragment.startswith(t)) for t in titles
+            ):
+                return True
+
+    content_tabs = [
+        t.label.strip() for t in pane_form.tabs if not t.is_submit and t.label.strip()
+    ]
+    if content_tabs:
+        headers: list[str] = []
+        for q in questions:
+            h = q.get("header")
+            if isinstance(h, str) and h.strip():
+                headers.append(h.strip())
+        if headers:
+            for tab in content_tabs:
+                fragment, damaged = _ellipsis_fragment(tab)
+                if not fragment or (
+                    damaged and len(fragment) < _ZERO_OPT_DAMAGED_EVIDENCE_MIN_CHARS
+                ):
+                    continue  # damaged shred — indeterminate, never contradicts
+                if not any(
+                    label_matches_authority(fragment, "", h)
+                    or h.lower().startswith(fragment.lower())
+                    or fragment.lower().startswith(h.lower())
+                    for h in headers
+                ):
+                    return True
     return False
 
 
@@ -735,18 +928,15 @@ def _pane_labels_match_candidate_by_number(
     """
     from ..terminal_parser import is_affordance_label
 
-    pane_labels = tuple(o.label for o in pane_form.options)
     if any(o.number is None for o in pane_form.options):
-        return _labels_are_subsequence(pane_labels, candidate_labels)
+        return _options_are_subsequence(pane_form.options, candidate_labels)
 
     checked_any = False
     for option in pane_form.options:
         assert option.number is not None
         index = option.number - 1
         if 0 <= index < len(candidate_labels):
-            if _strip_recommended(candidate_labels[index]) != _strip_recommended(
-                option.label
-            ):
+            if not _pane_option_label_matches(option, candidate_labels[index]):
                 return False
             checked_any = True
         else:
@@ -808,7 +998,7 @@ def _record_consistent_with_pane(
             q_labels = _safe_record_labels(q)
             if q_labels is None:
                 continue
-            if _labels_are_subsequence(pane_labels, q_labels):
+            if _options_are_subsequence(pane_form.options, q_labels):
                 candidate = q
                 break
     if candidate is None:
@@ -1523,11 +1713,10 @@ def _ctx_recovery_candidate(record, pane_form):
                 qt = (q.get("question") or "").strip()
                 if qt and (qt.startswith(pane_title) or pane_title.startswith(qt)):
                     return q
-    pane_labels = tuple(o.label for o in pane_form.options)
     for q in raw:
         if isinstance(q, dict):
             ql = _safe_record_labels(q)
-            if ql is not None and _labels_are_subsequence(pane_labels, ql):
+            if ql is not None and _options_are_subsequence(pane_form.options, ql):
                 return q
     return None
 
@@ -1567,9 +1756,9 @@ def _ctx_evidence_floor_ok(record, pane_form):
         if is_affordance_label(o.label):
             continue
         idx = o.number - 1
-        if 0 <= idx < len(candidate_labels) and _strip_recommended(
-            candidate_labels[idx]
-        ) == _strip_recommended(o.label):
+        if 0 <= idx < len(candidate_labels) and _pane_option_label_matches(
+            o, candidate_labels[idx]
+        ):
             matched_slots.add(o.number)
     return len(matched_slots) >= _CTX_EVIDENCE_MIN_NUMBERED_MATCHES
 

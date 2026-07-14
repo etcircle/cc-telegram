@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -60,7 +61,7 @@ from ..terminal_parser import (
 )
 from ..transcript_parser import TranscriptParser
 from .. import md_capture
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import capture_pane_pair, tmux_manager
 from ..utils import atomic_write_json
 from . import (
     attention,
@@ -1507,6 +1508,24 @@ async def _notify_waiting_dm(
 # to split — interactive cards are one Telegram message per AUQ.
 _CARD_BODY_CHAR_CAP = 3800
 
+# GH #54 W5 — the tail of the three partial/untrusted-pane notices. The
+# text-answer suffix is used ONLY where a plain message would actually be
+# taken: ``free_text.advertises_free_text`` DRY-RUNS the executor's OWN
+# pre-keystroke phase (``free_text.plan_pre_keystroke`` — the callable
+# ``try_answer`` itself consumes) on the RAW captured pane pair + the
+# executor's anchor reader (r1→r4: three parallel-predicate rounds each left a
+# reproduced over-advertising state — the merged form restores options, forces
+# completeness and synthesizes cursors; anchor EXISTENCE isn't anchor–pane
+# AGREEMENT; the brake was omitted — the r4 class diagnosis is that ANY
+# parallel predicate loses). Everything else — a preview single-select, a
+# partial/scrolled RAW pane, a multi-question form, a cursor-less frame, a
+# missing/mismatched anchor, a braked window, an unlicensed version, the flag
+# off — points at the keystroke nav row instead, so the copy can never promise
+# what the executor would decline (⇒ PR-1's refusal). Honest-at-render
+# (disclosed): the executor's own gates stay the authority at send time.
+_NOTICE_NAV_OR_TEXT = "use ↑/↓/Tab below or send your answer as text."
+_NOTICE_NAV_ONLY = "use the ↑/↓/⏎ keys below."
+
 
 def _should_post_auq_context(source: dict | AskUserQuestionForm | None) -> bool:
     """True iff the AUQ source has at least one question with renderable text.
@@ -1564,6 +1583,133 @@ def _form_has_postable_content(form: AskUserQuestionForm) -> bool:
     return False
 
 
+# GH #54 W3 r1 P2-2 — the ctx-card chunks must fit Telegram's limit AFTER
+# MarkdownV2 conversion, not before. ``build_response_parts`` splits on a RAW
+# 3000-char budget, but telegramify escaping EXPANDS content (a tilde /
+# underscore / backslash each become two chars — a 3000-char run converts to
+# ~6000 > 4096), so a preview-carrying part could exceed the hard limit and
+# drop the ENTIRE details card. The fix mirrors the GH #48 recap lane's
+# rendered-cost-bounded discipline (``_split_recap_source`` below — chunk
+# membership decided by the CONVERTED size), while keeping
+# ``telegram_sender.split_message`` as the ONE fence balancer: an oversized
+# part is re-split with an adaptive RAW budget derived from its measured
+# rendered cost until every piece's ACTUAL converted output fits (no second
+# divergent fence rule — mint/validate parity).
+_CTX_RENDERED_BUDGET = 4096
+
+
+def _rendered_send_cost(text: str) -> int:
+    """Worst-case length of what ``topic_send`` will actually transmit.
+
+    The formatted path sends ``convert_markdown(text)``; the automatic plain
+    fallback sends ``strip_sentinels(text)`` (≤ ``len(text)``). Budget on the
+    MAX of both so the emitted part fits whichever path lands. A conversion
+    raise is treated as cost-0 for that leg (the send layer would fall back
+    to plain there too).
+    """
+    try:
+        converted = len(convert_markdown(text))
+    except Exception:  # pragma: no cover — telegramify defensive
+        converted = 0
+    return max(len(text), converted)
+
+
+def _refit_part_to_rendered_budget(
+    part: str, budget: int = _CTX_RENDERED_BUDGET
+) -> list[str]:
+    """Re-split one raw-Markdown part until every piece RENDERS within budget.
+
+    Each round measures the piece's rendered cost and, when over budget,
+    re-splits it via ``split_message`` with a raw budget scaled by the
+    measured expansion ratio (minus fence close/reopen headroom) — so fence
+    balance is preserved by the ONE existing balancer and content is never
+    truncated, only spread over more chunks. Escaping expands by at most 2×
+    per character, so the loop converges in one or two rounds; the iteration
+    cap is defensive.
+    """
+    out = [part]
+    for _ in range(8):
+        refitted: list[str] = []
+        any_oversized = False
+        for piece in out:
+            cost = _rendered_send_cost(piece)
+            if cost <= budget:
+                refitted.append(piece)
+                continue
+            any_oversized = True
+            from ..telegram_sender import split_message
+
+            # Scale the raw budget by the measured expansion ratio, with
+            # headroom for the balancer's fence close/reopen overhead. When
+            # cost > budget this is strictly < len(piece), so split_message
+            # always makes progress (≥2 pieces or force-split segments).
+            raw_budget = max(64, (len(piece) * budget) // cost - 64)
+            refitted.extend(split_message(piece, max_length=raw_budget))
+        out = refitted
+        if not any_oversized:
+            break
+    return out
+
+
+def _build_ctx_parts(text: str) -> list[str]:
+    """The ONE ctx-card chunker: raw split + the rendered-cost refit.
+
+    Used by BOTH ``_send_auq_context_message`` (the initial post) and
+    ``maybe_upgrade_auq_context_message`` (the edit/append upgrade) so the two
+    seams can never disagree on part sizing. A refit split leaves the
+    ``[i/N]`` marker of the original part on its LAST sub-piece (markers are
+    trailing text) — cosmetically imperfect numbering on the rare oversized
+    part, never a dropped card.
+    """
+    from .response_builder import build_response_parts
+
+    parts = build_response_parts(text, content_type="text", role="assistant")
+    fitted: list[str] = []
+    for part in parts:
+        fitted.extend(_refit_part_to_rendered_budget(part))
+    return fitted
+
+
+def _sanitize_preview(preview: object) -> str:
+    """Make an UNTRUSTED option ``preview`` safe to embed as a fenced block.
+
+    GH #54 W3. ``preview`` is a Claude-authored (hence untrusted) multi-line
+    ASCII-art mockup that goes into the 📋 details card as a MONOSPACE fenced
+    code block (expandable quotes are proportional and would destroy the
+    art's column alignment). Two neutralizations, both at the SOURCE level so
+    the single ``topic_send`` telegramify conversion (message_sender.py) sees
+    already-safe text:
+
+      * **The expandable-quote sentinel bytes** (``\\x02`` — the delimiter
+        of ``TranscriptParser.EXPANDABLE_QUOTE_START``/``_END``) are stripped.
+        They are legal string values a mockup could carry, and
+        ``build_response_parts`` REFUSES to split any text containing the
+        start marker (response_builder.py) — an oversized unsplittable part
+        would drop the ENTIRE details card, and a matched pair would be
+        re-read as an expandable quote and truncated. They are C0 control
+        chars; no legitimate mockup needs them.
+      * **Fence-closer defanging** — any run of 3+ backticks would close our
+        code fence early and let the rest inject markdown (links, emphasis).
+        A zero-width space (U+200B) is woven between the backticks: visually
+        identical inside the monospace block, but no longer a fence delimiter
+        (``split_message`` / telegramify both need ``​``-free ``​``
+        3-backtick runs at a line start).
+
+    Returns the sanitized text, or ``""`` when the value is not a non-empty
+    string after stripping (the untrusted-value contract: render only
+    ``isinstance(preview, str)`` and non-empty; else omit silently).
+    """
+    if not isinstance(preview, str):
+        return ""
+    # Strip the raw expandable-quote sentinel byte (both START and END carry
+    # it as their delimiter, so removing it disarms a matched pair too).
+    cleaned = preview.replace("\x02", "")
+    # Weave a zero-width space through every 3+-backtick run so it can never
+    # close the fence we wrap this preview in.
+    cleaned = re.sub(r"`{3,}", lambda m: "​".join(m.group(0)), cleaned)
+    return cleaned if cleaned.strip() else ""
+
+
 def _format_auq_context_message(source: dict | AskUserQuestionForm) -> str:
     """Render an AUQ source as a readable context dump.
 
@@ -1576,6 +1722,9 @@ def _format_auq_context_message(source: dict | AskUserQuestionForm) -> str:
 
         1. <label>
            <full description, paragraph as-is>
+           ```
+           <option preview mockup, monospace>  ← GH #54 W3, when present
+           ```
 
         2. <label>
            <full description>
@@ -1583,15 +1732,21 @@ def _format_auq_context_message(source: dict | AskUserQuestionForm) -> str:
         Q2. <question>  ← only when len(questions) > 1
         …
 
-    Plain text only — no markdown to convert later. The send layer's
-    ``build_response_parts`` chunks on the 3000-char boundary and adds
-    ``[i/N]`` markers when the message exceeds the limit.
+    Markdown source (NOT pre-escaped): the send layer's ``topic_send``
+    converts to MarkdownV2 exactly ONCE via telegramify. Option ``preview``
+    mockups (GH #54 W3) are emitted as fenced ``` code blocks so their ASCII
+    art renders monospace + left-aligned; ``build_response_parts`` /
+    ``split_message`` keep every chunk fence-balanced (close-at-end /
+    reopen-at-start), and the automatic plain fallback shows the raw fenced
+    text (fences visible, art intact) — the accepted degraded shape. See
+    ``_sanitize_preview`` for the untrusted-value + fence-defang contract.
 
     Accepts EITHER a JSONL ``tool_use.input`` dict (rich source: full
-    multi-question matrix with per-option descriptions) OR an
+    multi-question matrix with per-option descriptions AND previews) OR an
     ``AskUserQuestionForm`` (pane fallback for live AUQs — title and
     visible option labels; descriptions usually empty because Claude
-    Code only writes them to JSONL after the user answers).
+    Code only writes them to JSONL after the user answers, and pane parses
+    never carry previews, so the form path renders none).
     """
     if isinstance(source, AskUserQuestionForm):
         return _format_auq_context_message_from_form(source)
@@ -1622,12 +1777,22 @@ def _format_auq_context_message(source: dict | AskUserQuestionForm) -> str:
             if not label:
                 continue
             description = (o.get("description") or "").strip()
-            labeled.append((label, description))
-        for opt_idx, (label, description) in enumerate(labeled, start=1):
+            # GH #54 W3: previews are untrusted — sanitized + fence-defanged;
+            # an absent/non-str/empty value renders nothing.
+            preview = _sanitize_preview(o.get("preview"))
+            labeled.append((label, description, preview))
+        for opt_idx, (label, description, preview) in enumerate(labeled, start=1):
             parts.append(f"{opt_idx}. {label}")
             if description:
                 for line in description.splitlines() or [description]:
                     parts.append(f"   {line}")
+            if preview:
+                # Fenced monospace block: ASCII art keeps its column
+                # alignment. The fence lines start at column 0 so telegramify
+                # (and split_message's fence balancer) recognise them.
+                parts.append("```")
+                parts.extend(preview.splitlines())
+                parts.append("```")
             parts.append("")
     return "\n".join(parts).rstrip()
 
@@ -1761,7 +1926,6 @@ async def _send_auq_context_message(
     from telegram.error import RetryAfter
 
     from .message_queue import peek_route_last_user_message
-    from .response_builder import build_response_parts
 
     text = _format_auq_context_message(source)
     if not text.strip():
@@ -1769,7 +1933,10 @@ async def _send_auq_context_message(
         # rollback fires (Wave 1: handled inline here, not by caller).
         rollback_auq_context_post(window_id, claim_token)
         return _ContextSendResult.NONE_SENT
-    parts = build_response_parts(text, content_type="text", role="assistant")
+    # GH #54 W3 r1 P2-2: the rendered-cost-bounded chunker — every part fits
+    # Telegram's 4096 AFTER the real telegramify conversion (preview blocks
+    # expand under MarkdownV2 escaping; a raw-budget-only split can overshoot).
+    parts = _build_ctx_parts(text)
     if not parts:
         rollback_auq_context_post(window_id, claim_token)
         return _ContextSendResult.NONE_SENT
@@ -1954,8 +2121,6 @@ async def maybe_upgrade_auq_context_message(
     """
     from telegram.error import RetryAfter
 
-    from .response_builder import build_response_parts
-
     rec = _auq_context_msgs.get(window_id)
     if rec is None:
         return False
@@ -2001,9 +2166,9 @@ async def maybe_upgrade_auq_context_message(
             _persist_interactive_state()
             return False
 
-        new_parts = build_response_parts(
-            new_text, content_type="text", role="assistant"
-        )
+        # GH #54 W3 r1 P2-2: the SAME rendered-cost-bounded chunker as the
+        # initial post — the two seams must never disagree on part sizing.
+        new_parts = _build_ctx_parts(new_text)
         if not new_parts:
             return False
 
@@ -2032,7 +2197,12 @@ async def maybe_upgrade_auq_context_message(
                     window_id=window_id,
                     message_id=msg_id,
                     text=chunk,
-                    plain=True,
+                    # GH #54 W3: the SAME formatted (non-plain) path as the
+                    # initial ``_send_auq_context_message`` post + the append
+                    # phase below — telegramify converts the ``` preview
+                    # fences ONCE. ``plain=True`` here would print the fences
+                    # literally on the upgraded chunk.
+                    plain=False,
                 )
             except RetryAfter:
                 raise
@@ -2496,6 +2666,29 @@ def _build_pick_button_rows(
             len(form.questions),
             len(form.options),
             form.is_review_screen,
+            (form.current_question_title or "<none>")[:80],
+        )
+        return []
+
+    # GH #54 W1.1b: a PANE-ONLY multi-question PREVIEW form parses a populated
+    # tab header (``← ☐ ☒ ✔ →``) but NO authoritative ``questions`` matrix (that
+    # comes only from a side-file / JSONL merge). It slips the FA5 gate above
+    # (``len(form.questions) > 1`` is False when the matrix is empty), yet
+    # ``_classify_advance`` proves a Q1→Q2 transition via
+    # ``committed.questions[ci+1]`` — which a pane-only form can NEVER confirm, so
+    # its buttons would navigate + Enter but forever record ``commit_unconfirmed``.
+    # Decline trusted minting for EVERY pane-only multi-question preview form
+    # (not only the aged one). The FRESH side-file path (matrix present) keeps its
+    # buttons; pane-only SINGLE-question preview keeps its buttons (its advance
+    # proof is resolution, not a tab transition).
+    _is_preview = form._meta.get("layout") == "preview"
+    _content_tab_count = sum(1 for t in form.tabs if not t.is_submit)
+    if _is_preview and _content_tab_count > 1 and not form.questions:
+        logger.info(
+            "_build_pick_button_rows SUPPRESSED gate=preview_multiq_no_matrix "
+            "tabs=%d options=%d question_title=%r",
+            _content_tab_count,
+            len(form.options),
             (form.current_question_title or "<none>")[:80],
         )
         return []
@@ -3492,7 +3685,13 @@ async def handle_interactive_ui(
     # "tmux probably mid-redraw"; bail without rendering so we don't post
     # a partial card, but ALSO don't destructively clear (callers gate
     # cleanup on ``has_interactive_surface``, which we don't touch).
-    visible = await tmux_mgr.capture_pane(w.window_id, scrollback_lines=0)
+    # GH #54 capture spine (seam 1, phase 1 — the visible-only liveness probe).
+    # Its own ANSI→pair; ``visible_pane_liveness`` consumes the derived plain and
+    # is byte-identical (region equality). The two-phase boundary is preserved:
+    # this probe rejects historical scrollback pickers, the scrollback phase
+    # below does the structured parse — neither replaces the other.
+    visible_pair = await capture_pane_pair(tmux_mgr, w.window_id, scrollback_lines=0)
+    visible = visible_pair.plain if visible_pair is not None else None
     state = visible_pane_liveness(visible)
     if state != "present":
         logger.debug(
@@ -3506,7 +3705,13 @@ async def handle_interactive_ui(
     # Picker confirmed live. Now capture with scrollback for the structured
     # parse — long AskUserQuestion text pushes early options off the top of
     # the visible pane, and the parser needs them.
-    pane_text = await tmux_mgr.capture_pane(w.window_id, scrollback_lines=500)
+    # GH #54 capture spine (seam 1, phase 2 — the scrollback structured parse).
+    # Its OWN ANSI→pair (never the phase-1 visible frame): the render + ctx gate
+    # consume this pair, and ``pane_ansi`` feeds the AUQ parse so tier-2 SGR
+    # cursor detection works on a chevron-less preview picker.
+    pane_pair = await capture_pane_pair(tmux_mgr, w.window_id, scrollback_lines=500)
+    pane_text = pane_pair.plain if pane_pair is not None else None
+    pane_ansi = pane_pair.ansi if pane_pair is not None else None
     if not pane_text:
         logger.debug("No pane text captured for window_id %s", window_id)
         return False
@@ -3559,13 +3764,13 @@ async def handle_interactive_ui(
         # side_file_ok mirrors the TTL'd resolver ``validate_and_consume``
         # re-resolves → mint/validate parity, no dead-tap.
         render_source = auq_source.resolve_auq_source_for_render(
-            window_id, pane_text, explicit=tool_input
+            window_id, pane_text, explicit=tool_input, ansi_text=pane_ansi
         )
         form = render_source.form
         if form is None:
             # Belt-and-braces: the resolver returns a form for every structured
             # decision; this only fires on a pane carrying no AUQ at all.
-            form = parse_ask_user_question(pane_text)
+            form = parse_ask_user_question(pane_text, ansi_text=pane_ansi)
         # The trusted-mint source tags fed to ``_build_pick_button_rows`` /
         # ``pick_token.mint_row``; ``validate_and_consume`` re-resolves the same
         # (kind, fingerprint) via the strict resolver. Only consulted when
@@ -3594,6 +3799,25 @@ async def handle_interactive_ui(
         # pick buttons, and tell the user to use manual navigation/text.
         p14_suppress_picks = False
         partial_options_notice: str | None = None
+        # GH #54 W5 (r4): the notice suffix is a DRY-RUN of the free-text
+        # executor's OWN pre-keystroke phase (``free_text.plan_pre_keystroke``,
+        # via ``advertises_free_text``) on the SAME raw inputs the executor
+        # would see — the RAW captured pane pair, the executor's anchor reader,
+        # the stranded-draft brake, the Claude proof + license. NEVER the
+        # resolver-MERGED ``form`` (the merge restores missing options, forces
+        # ``options_complete`` and synthesizes option-1's cursor, so a
+        # merged-form predicate advertised on partial/cursorless raw panes the
+        # executor refuses — the r4(a) repro; the merged form stays what
+        # renders the card BODY). Honest-at-render: the executor's own gates
+        # remain the authority at send time.
+        _advertises_free_text = free_text.advertises_free_text(
+            free_text.SURFACE_AUQ,
+            version=w.pane_current_command,
+            window_id=window_id,
+            pane_text=pane_text,
+            ansi_pane=pane_ansi,
+        )
+        _nav_suffix = _NOTICE_NAV_OR_TEXT if _advertises_free_text else _NOTICE_NAV_ONLY
         if form is not None and form.options:
             first_num = form.options[0].number or 0
             last_num = form.options[-1].number or first_num
@@ -3601,8 +3825,7 @@ async def handle_interactive_ui(
             if partial_pane:
                 p14_suppress_picks = True
                 partial_options_notice = (
-                    f"Only options {first_num}-{last_num} are visible; "
-                    "use ↑/↓/Tab below or send your answer as text."
+                    f"Only options {first_num}-{last_num} are visible; {_nav_suffix}"
                 )
                 logger.info(
                     "AskUserQuestion partial pane for window %s — visible "
@@ -3694,21 +3917,23 @@ async def handle_interactive_ui(
                             )
                         display_form = candidate
                         partial_options_notice = (
-                            "Tap-to-select is off on a scrolled screen — "
-                            "use ↑/↓/Tab below or send your answer."
+                            f"Tap-to-select is off on a scrolled screen — {_nav_suffix}"
                         )
             # §2.5: the card's free-text line must state the CURRENT truth for
-            # THIS surface. Only a single-select, licensed, flag-ON AUQ can
-            # actually take a plain message as its answer (see
-            # ``free_text.card_hint``); everything else points at the buttons.
+            # THIS surface. ``card_hint`` routes through the SAME executor
+            # dry-run as the notices above (GH #54 W5 r4) and is fed the RAW
+            # captured pane pair — never the resolver ``form`` or the swapped
+            # ``display_form``, whose merged completeness / synthesized cursor
+            # would overclaim on a pane the executor's fresh parse refuses;
+            # everything ineligible points at the buttons.
             structured = _render_ask_user_question(
                 display_form,
                 free_text_hint=free_text.card_hint(
                     free_text.SURFACE_AUQ,
                     version=w.pane_current_command,
-                    has_affordance=display_form.is_free_text
-                    and display_form.select_mode == "single"
-                    and not display_form.is_review_screen,
+                    window_id=window_id,
+                    pane_text=pane_text,
+                    ansi_pane=pane_ansi,
                 ),
             )
             if structured:
@@ -3734,8 +3959,7 @@ async def handle_interactive_ui(
                     # notice; add the busy-screen notice only when it didn't.
                     text = (
                         f"{text}\n\n⚠️ The live screen is busy, so the option "
-                        "buttons are disabled — use ↑/↓/Tab below or send your "
-                        "answer as text."
+                        f"buttons are disabled — {_nav_suffix}"
                     )
             elif not p14_suppress_picks:
                 built = _build_pick_button_rows(

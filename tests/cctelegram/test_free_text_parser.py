@@ -281,3 +281,390 @@ class TestTheInputBoxIsNeverPresentOnThese:
     def test_no_input_box(self, name: str):
         pane = tp.clean_ghost_input_text(_fx(name))
         assert tp.pane_input_box_present(pane) is False
+
+
+# ── GH #54 W5 (r4) — the card-copy predicate IS the executor's phase ───────
+#
+# Four rounds established the class diagnosis: ANY parallel predicate loses
+# (r1 flag×license×affordance, r2 mirrored gate list, r3 shared shape gate +
+# anchor EXISTENCE — each round left a reproduced over-advertising state).
+# The stable form: ``advertises_free_text`` DRY-RUNS ``plan_pre_keystroke`` —
+# the ONE callable ``try_answer`` consumes for its own pre-keystroke phase —
+# on the same raw inputs. Behavior below is pinned on the REAL callable with
+# REAL panes; the delegation pins prove both consumers call the SAME function.
+
+_W5_WID = "@77"
+
+_W5_PANE = (
+    "What should we do next?\n"
+    "\n"
+    "❯ 1. A) alpha\n"
+    "  2. B) beta\n"
+    "  3. C) gamma\n"
+    "  4. Type something.\n"
+    "\n"
+    "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+)
+_W5_PARTIAL = (
+    "❯ 2. B) beta\n"
+    "  3. C) gamma\n"
+    "  4. Type something.\n"
+    "\n"
+    "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+)
+_W5_CURSORLESS = _W5_PANE.replace("❯ 1.", "  1.")
+
+
+def _w5_anchor(labels: list[str] | None = None, key: str = "auq:sid:S:tu:toolu_X"):
+    from cctelegram.handlers.auq_source import SurfaceAnchor
+
+    return SurfaceAnchor(
+        key=key,
+        tool_input={
+            "questions": [
+                {
+                    "question": "What should we do next?",
+                    "header": "Scope",
+                    "options": [
+                        {"label": lbl}
+                        for lbl in (labels or ["A) alpha", "B) beta", "C) gamma"])
+                    ],
+                    "multiSelect": False,
+                }
+            ]
+        },
+    )
+
+
+class TestPlanPreKeystrokePhase:
+    """The shared pre-keystroke phase, driven directly with real panes.
+
+    Every state the r4 review reproduced against the parallel predicates is a
+    DECLINE of this one callable: the partial raw pane, the cursorless raw
+    pane, the mismatched anchor (agreement, not existence), the braked window
+    — plus the r1-r3 legs (license, flag, Claude proof, missing anchor).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from cctelegram.handlers import free_text as ft
+        from cctelegram.tmux_manager import tmux_manager
+
+        ft.set_enabled(True)
+        tmux_manager.reset_stranded_drafts_for_tests()
+        yield
+        ft.set_enabled(True)
+        tmux_manager.reset_stranded_drafts_for_tests()
+
+    def _run(self, *, pane=_W5_PANE, version="2.1.207", anchor="default"):
+        from cctelegram.handlers import free_text as ft
+
+        return ft.plan_pre_keystroke(
+            ft.SURFACE_AUQ,
+            version=version,
+            window_id=_W5_WID,
+            pane_text=pane,
+            ansi_pane=pane,
+            anchor=_w5_anchor() if anchor == "default" else anchor,
+        )
+
+    def test_complete_cursored_agreeing_licensed_yields_a_plan(self):
+        from cctelegram.handlers import free_text as ft
+
+        phase = self._run()
+        assert isinstance(phase, ft.FreeTextPlan)
+        assert phase.target_row == 4
+
+    def test_partial_raw_pane_declines(self):
+        assert self._run(pane=_W5_PARTIAL) == "no_free_text_surface"
+
+    def test_cursorless_raw_pane_declines(self):
+        assert self._run(pane=_W5_CURSORLESS) == "no_free_text_surface"
+
+    def test_missing_anchor_declines(self):
+        assert self._run(anchor=None) == "no_free_text_surface"
+
+    def test_mismatched_anchor_declines(self):
+        """r4(b): anchor–pane AGREEMENT, not existence — a valid side file
+        naming DIFFERENT labels is a card the executor will not type into."""
+        bad = _w5_anchor(labels=["Different 1", "Different 2", "Different 3"])
+        assert self._run(anchor=bad) == "no_free_text_surface"
+
+    def test_braked_window_declines(self):
+        """r4(c): the stranded-draft brake is part of the phase."""
+        from cctelegram.tmux_manager import tmux_manager
+
+        tmux_manager.mark_window_stranded_draft(_W5_WID)
+        assert self._run() == "stranded_draft"
+
+    def test_non_claude_version_declines(self):
+        assert self._run(version=None) == "not_claude"
+        assert self._run(version="bash") == "not_claude"
+
+    def test_unlicensed_version_declines(self):
+        assert self._run(version="9.9.9").startswith("unlicensed:")
+
+    def test_surface_mismatch_declines(self):
+        """r5 P3(b): a caller asking about a DIFFERENT surface than the plan
+        resolves (``plan_from_pane`` is AUQ-only today) gets the distinct
+        ``surface_mismatch:`` reason, never a plan."""
+        from cctelegram.handlers import free_text as ft
+
+        phase = ft.plan_pre_keystroke(
+            "ExitPlanMode",  # not the surface the pane resolves to
+            version="2.1.207",
+            window_id=_W5_WID,
+            pane_text=_W5_PANE,
+            ansi_pane=_W5_PANE,
+            anchor=_w5_anchor(),
+        )
+        assert phase == "surface_mismatch:AskUserQuestion"
+
+    def test_flag_off_declines(self):
+        from cctelegram.handlers import free_text as ft
+
+        ft.set_enabled(False)
+        assert self._run() == "disabled"
+
+
+class TestDryRunDelegationPins:
+    """r4 P3 → r5 P3(c) — what these pins PROVE, stated exactly:
+
+      * INVOCATION UNITY — ``advertises_free_text`` and ``try_answer``'s
+        pre-keystroke phase both call the SAME ``plan_pre_keystroke``, exactly
+        once, fed the raw inputs;
+      * DECLINE-HONORED — a phase decline reaches the executor's bail with
+        ZERO keystrokes sent;
+      * SUCCESS-CONSUMED — a phase-returned plan is what the executor
+        navigates on (its first keystrokes follow the plan's delta).
+
+    They do NOT prove the ABSENCE of a private gate elsewhere in either
+    consumer — that stays a review invariant (see ``plan_pre_keystroke``'s
+    docstring and the two sanctioned idempotent duplicates in
+    ``_answer_locked``).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from cctelegram.handlers import free_text as ft
+        from cctelegram.tmux_manager import tmux_manager
+
+        ft.set_enabled(True)
+        tmux_manager.reset_stranded_drafts_for_tests()
+        tmux_manager.reset_window_send_locks_for_tests()
+        yield
+        ft.set_enabled(True)
+        tmux_manager.reset_stranded_drafts_for_tests()
+
+    def test_advertises_is_exactly_the_phase_dry_run(self, monkeypatch):
+        from cctelegram.handlers import free_text as ft
+
+        calls: list[dict] = []
+        real = ft.plan_pre_keystroke
+
+        def probe(surface, **kw):
+            calls.append(kw)
+            return real(surface, **kw)
+
+        monkeypatch.setattr(ft, "plan_pre_keystroke", probe)
+        monkeypatch.setattr(ft, "read_surface_anchor", lambda wid: _w5_anchor())
+        assert (
+            ft.advertises_free_text(
+                ft.SURFACE_AUQ,
+                version="2.1.207",
+                window_id=_W5_WID,
+                pane_text=_W5_PANE,
+                ansi_pane=_W5_PANE,
+            )
+            is True
+        )
+        assert len(calls) == 1
+        # The dry-run feeds the RAW pane pair — never a merged form.
+        assert calls[0]["pane_text"] == _W5_PANE
+        assert calls[0]["ansi_pane"] == _W5_PANE
+        # And the phase's verdict IS the predicate's verdict (decline ⇒ False).
+        monkeypatch.setattr(ft, "plan_pre_keystroke", lambda *a, **k: "stranded_draft")
+        assert (
+            ft.advertises_free_text(
+                ft.SURFACE_AUQ,
+                version="2.1.207",
+                window_id=_W5_WID,
+                pane_text=_W5_PANE,
+                ansi_pane=_W5_PANE,
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_try_answer_pre_keystroke_phase_is_the_same_function(
+        self, monkeypatch
+    ):
+        """Drive the REAL executor to its phase boundary and intercept: the
+        eligibility verdict it acts on comes from ``plan_pre_keystroke`` —
+        and a phase decline means ZERO keystrokes were sent."""
+        from cctelegram import tmux_manager as tm_mod
+        from cctelegram.handlers import auq_source, free_text as ft
+
+        keys: list[str] = []
+        tm = tm_mod.tmux_manager
+
+        async def _capture(window_id, *, with_ansi=False):
+            return _W5_PANE
+
+        async def _cmd(window_id):
+            return "2.1.207"
+
+        async def _find(window_id):
+            class W:
+                pass
+
+            w = W()
+            w.window_id = window_id
+            return w
+
+        async def _send(window_id, text, enter=True, literal=True):
+            keys.append(text)
+            return True
+
+        monkeypatch.setattr(tm, "capture_pane_cancellation_safe", _capture)
+        monkeypatch.setattr(tm, "pane_current_command", _cmd)
+        monkeypatch.setattr(tm, "find_window_by_id", _find)
+        monkeypatch.setattr(tm, "send_keys", _send)
+        monkeypatch.setattr(
+            auq_source, "peek_surface_anchor_for_window", lambda w: _w5_anchor()
+        )
+
+        calls: list[dict] = []
+
+        def probe(surface, **kw):
+            calls.append(kw)
+            return "no_free_text_surface"  # a phase decline ⇒ the lane bails
+
+        monkeypatch.setattr(ft, "plan_pre_keystroke", probe)
+
+        result = await ft.try_answer(_W5_WID, "my answer", user_turn=None)
+
+        assert result is None  # declined pre-keystroke ⇒ falls through to PR-1
+        assert len(calls) == 1  # the executor consulted THE shared phase
+        assert keys == []  # and sent NOTHING on its verdict
+        # The executor fed the phase its own observation of the same window.
+        assert calls[0]["window_id"] == _W5_WID
+        assert calls[0]["ansi_pane"] == _W5_PANE
+
+    @pytest.mark.asyncio
+    async def test_try_answer_navigates_on_the_phase_returned_plan(self, monkeypatch):
+        """r5 P3(a) — SUCCESS-CONSUMED: intercept the phase to RETURN the real
+        plan on a real pane and assert the executor PROCEEDS to its first
+        keystrokes ON THAT PLAN (the nav delta), with exactly ONE phase call.
+        A private executor gate inserted AFTER a successful phase would send
+        zero keystrokes and break this pin."""
+        from cctelegram import tmux_manager as tm_mod
+        from cctelegram.handlers import auq_source, free_text as ft
+
+        keys: list[tuple[str, bool, bool]] = []
+        tm = tm_mod.tmux_manager
+
+        async def _capture(window_id, *, with_ansi=False):
+            return _W5_PANE
+
+        async def _cmd(window_id):
+            return "2.1.207"
+
+        async def _find(window_id):
+            class W:
+                pass
+
+            w = W()
+            w.window_id = window_id
+            return w
+
+        async def _send(window_id, text, enter=True, literal=True):
+            keys.append((text, enter, literal))
+            return True
+
+        monkeypatch.setattr(tm, "capture_pane_cancellation_safe", _capture)
+        monkeypatch.setattr(tm, "pane_current_command", _cmd)
+        monkeypatch.setattr(tm, "find_window_by_id", _find)
+        monkeypatch.setattr(tm, "send_keys", _send)
+        monkeypatch.setattr(
+            auq_source, "peek_surface_anchor_for_window", lambda w: _w5_anchor()
+        )
+        monkeypatch.setattr(ft, "NAV_SETTLE_S", 0)
+
+        calls: list[dict] = []
+        real = ft.plan_pre_keystroke
+
+        def probe(surface, **kw):
+            calls.append(kw)
+            return real(surface, **kw)  # the REAL plan from the real pane
+
+        monkeypatch.setattr(ft, "plan_pre_keystroke", probe)
+
+        # The plan on _W5_PANE: cursor row 1 → target row 4 ⇒ 3 Downs. The
+        # plain fixture carries no SGR-2 dim row, so the post-nav landing
+        # proof declines AFTER the keystrokes — the pin is about the phase's
+        # plan being CONSUMED, and the executor's own guards still own the
+        # rest of the transaction.
+        result = await ft.try_answer(_W5_WID, "my answer", user_turn=None)
+
+        assert len(calls) == 1  # exactly one phase call
+        arrows = [t for t, e, lit in keys if not lit and not e]
+        assert arrows == ["Down", "Down", "Down"]  # the plan's delta, consumed
+        literal_writes = [t for t, e, lit in keys if lit]
+        assert literal_writes == []  # the landing proof still gates the write
+        assert result is None  # post-nav decline stays a clean fall-through
+
+    @pytest.mark.asyncio
+    async def test_r5_non_claude_declines_before_any_capture(self, monkeypatch):
+        """r5 P2 repro pin — PROBE-FIRST ordering: cmd=`zsh` + a capture that
+        RAISES ⇒ a clean ``None`` fall-through (PR-1 owns the actionable
+        `not_claude` refusal), ZERO captures attempted, no exception escapes.
+        The r4 restructure ran ``_observe`` (captures + anchor reads) BEFORE
+        the phase's Claude leg, so this exact shape propagated a RuntimeError
+        and the aggregator reported a generic `send_failed`."""
+        from cctelegram import tmux_manager as tm_mod
+        from cctelegram.handlers import auq_source, free_text as ft
+
+        captures: list[str] = []
+        tm = tm_mod.tmux_manager
+
+        async def _capture(window_id, *, with_ansi=False):
+            captures.append(window_id)
+            raise RuntimeError("tmux exploded")
+
+        async def _cmd(window_id):
+            return "zsh"
+
+        async def _find(window_id):
+            class W:
+                pass
+
+            w = W()
+            w.window_id = window_id
+            return w
+
+        monkeypatch.setattr(tm, "capture_pane_cancellation_safe", _capture)
+        monkeypatch.setattr(tm, "pane_current_command", _cmd)
+        monkeypatch.setattr(tm, "find_window_by_id", _find)
+        monkeypatch.setattr(
+            auq_source, "peek_surface_anchor_for_window", lambda w: _w5_anchor()
+        )
+
+        result = await ft.try_answer(_W5_WID, "my answer", user_turn=None)
+
+        assert result is None  # clean decline — PR-1 owns the refusal
+        assert captures == []  # zero captures on a non-Claude pane
+
+    def test_card_hint_routes_through_the_dry_run(self, monkeypatch):
+        from cctelegram.handlers import free_text as ft
+
+        kwargs = dict(
+            version="2.1.207",
+            window_id=_W5_WID,
+            pane_text=_W5_PANE,
+            ansi_pane=_W5_PANE,
+        )
+        monkeypatch.setattr(ft, "advertises_free_text", lambda *a, **k: True)
+        assert ft.card_hint(ft.SURFACE_AUQ, **kwargs) == ft.HINT_FREE_TEXT
+        monkeypatch.setattr(ft, "advertises_free_text", lambda *a, **k: False)
+        assert ft.card_hint(ft.SURFACE_AUQ, **kwargs) == ft.HINT_NO_FREE_TEXT

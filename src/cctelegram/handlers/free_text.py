@@ -463,14 +463,41 @@ class _Shape:
 
 
 def _auq_shape(pane_text: str, ansi_pane: str) -> _Shape | None:
-    """The AUQ single-select free-text geometry, or ``None`` to decline."""
+    """The AUQ single-select free-text geometry, or ``None`` to decline.
+
+    A thin parse + delegate: the eligibility + cursor-geometry gates live in
+    :func:`_auq_form_shape`. Reached (via ``plan_from_pane``) from BOTH the
+    executor's pre-keystroke phase AND its render dry-run — see
+    :func:`plan_pre_keystroke`, the ONE callable both consumers share
+    (GH #54 W5 r4).
+    """
     form = terminal_parser.parse_ask_user_question(pane_text)
+    return _auq_form_shape(form, ansi_pane)
+
+
+def _auq_form_shape(
+    form: "terminal_parser.AskUserQuestionForm | None", ansi_pane: str | None
+) -> _Shape | None:
+    """The executor's OWN form-shape eligibility gate (GH #54 W5 r3→r4).
+
+    Reached only through :func:`_auq_shape` → ``plan_from_pane`` →
+    :func:`plan_pre_keystroke` — the ONE pre-keystroke phase BOTH the executor
+    and the card-copy dry-run (``advertises_free_text``) consume, so a gate
+    added here binds both by construction.
+
+    Out of scope (plan §2.2), each for a stated reason:
+      * multi-select   — a THREE-Enter transaction whose first Enter mutates
+        the form
+      * review screen  — the Submit/Cancel screen has no free-text row
+      * multi-question — the tab matrix makes "the answer" ambiguous
+
+    ``ansi_pane`` feeds the zero-nav cursor leg (a cursor already parked on
+    the affordance row is only observable via the SGR row parse); ``None``
+    means "no ANSI frame available" and that leg fails closed — the predicate
+    side under-advertises rather than over-promising.
+    """
     if form is None:
         return None
-    # Out of scope (plan §2.2), each for a stated reason:
-    #   multi-select   — a THREE-Enter transaction whose first Enter mutates the form
-    #   review screen  — the Submit/Cancel screen has no free-text row
-    #   multi-question — the tab matrix makes "the answer" ambiguous
     if form.select_mode != "single" or form.is_review_screen:
         return None
     if len(form.questions) > 1:
@@ -485,7 +512,13 @@ def _auq_shape(pane_text: str, ansi_pane: str) -> _Shape | None:
         return None
     target_row = len(form.options) + 1  # affordances are dropped from ``options``
     cursor = next((o.number for o in form.options if o.cursor and o.number), None)
+    if cursor is None and ansi_pane is None:
+        # No proven cursor and no ANSI frame to read the affordance row with —
+        # the predicate caller's shape. Fail closed (the executor always
+        # supplies ANSI, so this leg never fires for it).
+        return None
     if cursor is None:
+        assert ansi_pane is not None
         # THE CURSOR IS ALREADY ON THE AFFORDANCE ROW (peer-review P2).
         # ``_parse_numbered_options`` DROPS the affordance row and — because an
         # affordance ❯ is the bottom-most, hence live, cursor — deliberately
@@ -725,6 +758,89 @@ async def _observe(window_id: str) -> _Observation | str:
     return _Observation(anchor=before, ansi=ansi, pane=_plain(ansi))
 
 
+# ── THE pre-keystroke eligibility phase (ONE callable, r4) ────────────────
+
+
+def plan_pre_keystroke(
+    surface: str,
+    *,
+    version: str | None,
+    window_id: str,
+    pane_text: str | None,
+    ansi_pane: str,
+    anchor: SurfaceAnchor | None,
+) -> FreeTextPlan | str:
+    """The executor's ENTIRE pre-keystroke eligibility phase, on one observation.
+
+    Returns the resolved :class:`FreeTextPlan` when this lane would proceed to
+    its first keystroke, else the decline-reason string (the executor's own
+    decline vocabulary).
+
+    **ONE code path, two consumers (GH #54 W5 r4 — the structural remedy that
+    kills the drift class):** ``try_answer``'s ``_answer_locked`` calls THIS
+    function for its own pre-keystroke phase, and ``advertises_free_text`` (the
+    card-copy predicate behind ``card_hint`` + the three partial/untrusted-pane
+    notices) DRY-RUNS the same function on the SAME raw inputs the executor
+    would see. Three previous rounds tried a parallel predicate — a flag ×
+    license × affordance list (r1), a mirrored gate list (r2), a shared shape
+    gate + anchor EXISTENCE (r3) — and each round a reproduced over-advertising
+    state remained (merged-form completeness/cursor synthesis, anchor–pane
+    AGREEMENT, the stranded-draft brake). A parallel predicate LOSES; the only
+    stable form is the executor's own phase. A gate added here binds both
+    consumers by construction. What the ``test_free_text_parser`` delegation
+    pins PROVE (r5 P3 — stated exactly, not more): INVOCATION UNITY (both
+    consumers call this function, once, on the raw inputs), DECLINE-HONORED
+    (a phase decline reaches the executor's bail with zero keystrokes) and
+    SUCCESS-CONSUMED (a phase plan is what the executor navigates on). They
+    do NOT prove the ABSENCE of a private gate elsewhere in either consumer —
+    that stays a review invariant, kept visible by the two idempotent-
+    duplicate comments (the early brake + the early Claude probe) at the only
+    sanctioned duplicates.
+
+    The phase, in the executor's own order:
+
+      1. the lane flag (``_ENABLED``);
+      2. the STRANDED-DRAFT BRAKE (``tmux_manager.window_has_stranded_draft``
+         — ``_answer_locked`` also fast-paths this BEFORE its captures, per the
+         documented before-any-capture ordering; both consult the ONE registry,
+         so the dry-run can never miss it. Lock-free at render — disclosed);
+      3. the strict Claude proof-of-life on the version string
+         (``pane_command_is_claude`` — ``_answer_locked`` ALSO early-declines
+         this on the in-lock probe result BEFORE its observation, the r5 P2
+         probe-first ordering; same value, the second sanctioned duplicate);
+      4. :func:`plan_from_pane` on the RAW pane pair + the anchor — pane
+         ownership, the AUQ extract, ``_auq_shape`` (single-Q single-select +
+         affordance + COMPLETE options + a proven cursor), and
+         ``derive_identity`` (the MANDATORY anchor + the anchor–pane
+         AGREEMENT, exactly as ``_observe``/``try_answer`` apply them);
+      5. the per-``(surface × CC-version)`` license on the PLAN's surface.
+
+    ``anchor`` is caller-supplied: the executor reads it inside ``_observe``'s
+    sandwich; the render dry-run reads it once via the SAME
+    :func:`read_surface_anchor`. ``None`` declines through ``plan_from_pane``
+    (an unidentifiable card is a card the executor will not type into).
+    """
+    if not _ENABLED:
+        return "disabled"
+    if tmux_manager.window_has_stranded_draft(window_id):
+        return "stranded_draft"
+    # A non-string version is NOT proof of Claude (the render seam's cached
+    # ``pane_current_command`` is untyped at some fakes/callsites; the strict
+    # fullmatch below requires a real string) — fail closed, same verdict.
+    if not isinstance(version, str) or not pane_command_is_claude(version):
+        return "not_claude"
+    plan = plan_from_pane(pane_text, ansi_pane, anchor)
+    if plan is None:
+        return "no_free_text_surface"
+    if plan.surface != surface:
+        return f"surface_mismatch:{plan.surface}"
+    if not licensed(plan.surface, version):
+        # The honest per-(surface × CC-version) degradation: buttons + the PR-1
+        # refusal, never a keystroke driven by an un-characterized empiric.
+        return f"unlicensed:{plan.surface}@{version}"
+    return plan
+
+
 # ── The executor ─────────────────────────────────────────────────────────
 
 
@@ -898,21 +1014,32 @@ async def _answer_locked(
     # chain the brake exists to break. DECLINE, so PR-1 owns the single refusal and
     # the single user-facing notice — and never clear the brake from here (its
     # release rules — an empty-input-row capture or confirmed window death — are
-    # PR-1's, and they are the only proofs that mean anything).
+    # PR-1's, and they are the only proofs that mean anything). This early check
+    # preserves the documented BEFORE-any-capture ordering; the SHARED
+    # pre-keystroke phase below re-checks the SAME registry, so the render
+    # dry-run can never miss the brake (r4 — one authority, checked twice).
     if tmux_manager.window_has_stranded_draft(window_id):
         return _decline("stranded_draft")
 
-    # (1) FRESH proof of life + the version license, INSIDE the lock and
-    # immediately before the first key (the AUQ round-2 P1-1 rule): a
-    # /update-swapped TUI inside the window-list cache TTL must never be
-    # arrow-keyed.
+    # (1) FRESH proof of life probe, INSIDE the lock and immediately before the
+    # first key (the AUQ round-2 P1-1 rule): a /update-swapped TUI inside the
+    # window-list cache TTL must never be arrow-keyed.
     cmd = await _pane_command(window_id)
     if cmd is _CMD_TIMEOUT:
         return _decline("cmd_probe_timeout")
     assert cmd is None or isinstance(cmd, str)
+    # PROBE-FIRST ordering (r5 P2): a non-Claude pane declines IMMEDIATELY,
+    # BEFORE ``_observe``'s pane capture + anchor reads — the r4 restructure
+    # moved the Claude proof wholly into the shared phase (which runs AFTER
+    # the observation), so a `zsh` pane started paying two captures and, on a
+    # capture RAISE, propagated an exception where the old code fell through
+    # cleanly to PR-1's actionable `not_claude` refusal. The SHARED
+    # ``plan_pre_keystroke`` KEEPS its own Claude leg (the render dry-run
+    # needs it); this early re-check of the SAME value is a harmless
+    # idempotent duplicate — do NOT "deduplicate" it away, in either
+    # direction: removing THIS one re-opens the r5 ordering regression,
+    # removing the PHASE's one re-opens the r4 dry-run hole.
     if not pane_command_is_claude(cmd):
-        # Not Claude ⇒ this lane cannot apply. The normal gate produces its own,
-        # correct ``not_claude`` refusal + copy — one owner per refusal reason.
         return _decline("not_claude")
 
     # ONE OBSERVATION: anchor · pane · anchor (see ``_observe``). The anchor is
@@ -923,13 +1050,25 @@ async def _answer_locked(
     if isinstance(obs, str):
         return _decline(obs)
 
-    plan = plan_from_pane(obs.pane, obs.ansi, obs.anchor)
-    if plan is None:
-        return _decline("no_free_text_surface")
-    if not licensed(plan.surface, cmd):
-        # The honest per-(surface × CC-version) degradation: buttons + the PR-1
-        # refusal, never a keystroke driven by an un-characterized empiric.
-        return _decline(f"unlicensed:{plan.surface}@{cmd}")
+    # THE PRE-KEYSTROKE PHASE — the ONE callable ``advertises_free_text``
+    # dry-runs at render time (GH #54 W5 r4). Every eligibility gate between
+    # here and the first arrow key lives INSIDE it (the two sanctioned
+    # duplicates above — the early brake + the early Claude probe — re-check
+    # values the phase ALSO checks; adding a gate here that the phase does
+    # NOT carry re-opens the copy-drift class — a REVIEW invariant: the
+    # delegation pins prove invocation-unity + decline-honored +
+    # success-consumed, not gate-absence).
+    phase = plan_pre_keystroke(
+        SURFACE_AUQ,
+        version=cmd,
+        window_id=window_id,
+        pane_text=obs.pane,
+        ansi_pane=obs.ansi,
+        anchor=obs.anchor,
+    )
+    if isinstance(phase, str):
+        return _decline(phase)
+    plan = phase
 
     logger.info(
         "FREE_TEXT window=%s surface=%s target_row=%d cursor_row=%d len=%d",
@@ -1281,16 +1420,83 @@ HINT_MULTI_SELECT: Final = "Use the option buttons, then Submit."
 HINT_NO_FREE_TEXT: Final = "Answer with the buttons or the ↑/↓/⏎ keys."
 
 
-def card_hint(surface: str, *, version: str | None, has_affordance: bool) -> str:
+def advertises_free_text(
+    surface: str,
+    *,
+    version: str | None,
+    window_id: str | None,
+    pane_text: str | None,
+    ansi_pane: str | None,
+) -> bool:
+    """True iff a plain message would ACTUALLY be taken as this card's answer.
+
+    The single card-copy predicate behind BOTH ``card_hint`` (the card's
+    free-text line) AND the three partial/untrusted-pane notices in
+    ``interactive_ui`` (GH #54 W5), so no card copy can ever promise a text
+    answer this lane's executor would decline (⇒ PR-1 refusal).
+
+    **It IS the executor's pre-keystroke phase, DRY-RUN on the SAME raw inputs
+    (r4 — the fourth round on this predicate; the class diagnosis is that ANY
+    parallel predicate loses):** it reads the anchor through the executor's own
+    :func:`read_surface_anchor` and calls :func:`plan_pre_keystroke` — the ONE
+    callable ``try_answer`` consumes for its own pre-keystroke phase — on the
+    RAW captured pane pair, never a resolver-MERGED form (the r4(a) repro: the
+    merge restores missing options / forces ``options_complete`` / synthesizes
+    option-1's cursor, so a merged-form predicate advertised on a partial or
+    cursorless raw pane the executor's fresh parse refuses). The phase carries
+    the flag, the STRANDED-DRAFT BRAKE (r4(c)), the Claude proof-of-life, the
+    full ``plan_from_pane`` (pane ownership + shape + cursor + the MANDATORY
+    anchor with anchor–pane AGREEMENT — r4(b)), and the version license:
+    everything knowable at render comes from the executor's own phase.
+
+    ``pane_text`` / ``ansi_pane`` are the render seam's ALREADY-captured raw
+    pair (no new tmux round-trips); ``window_id`` feeds the anchor read + the
+    brake peek (lock-free at render — disclosed). Any missing input ⇒ False
+    (no promise without the inputs the executor needs).
+
+    **DISCLOSED RESIDUAL (honest-at-render):** the copy is computed at RENDER
+    time — the anchor can vanish (side file unlinked / session rotation) or
+    the pane can change between the render and the moment the user actually
+    sends, so the copy is honest AS OF the render; the executor's own gates
+    remain the authority at send time and a send the copy promised can still
+    be declined (⇒ PR-1's refusal, never a wrong keystroke).
+    """
+    if not window_id or ansi_pane is None:
+        return False
+    anchor = read_surface_anchor(window_id)
+    phase = plan_pre_keystroke(
+        surface,
+        version=version,
+        window_id=window_id,
+        pane_text=pane_text,
+        ansi_pane=ansi_pane,
+        anchor=anchor,
+    )
+    return isinstance(phase, FreeTextPlan)
+
+
+def card_hint(
+    surface: str,
+    *,
+    version: str | None,
+    window_id: str | None,
+    pane_text: str | None,
+    ansi_pane: str | None,
+) -> str:
     """The per-surface card hint (plan §2.2 [r3 P2-4]).
 
     The card must state the CURRENT truth: pre-PR-2 it promised free-text on
     every AUQ, including the multi-select and unlicensed-version cases where a
     plain message is REFUSED. Now the promise is made only where the lane will
-    actually take it.
+    actually take it — ``advertises_free_text`` DRY-RUNS the executor's own
+    pre-keystroke phase on the raw pane (GH #54 W5 r4).
     """
-    if not has_affordance:
-        return HINT_NO_FREE_TEXT
-    if _ENABLED and licensed(surface, version):
+    if advertises_free_text(
+        surface,
+        version=version,
+        window_id=window_id,
+        pane_text=pane_text,
+        ansi_pane=ansi_pane,
+    ):
         return HINT_FREE_TEXT
     return HINT_NO_FREE_TEXT
