@@ -990,13 +990,109 @@ def test_spoof_glyph_soup_prefix_refuses() -> None:
 
 
 def test_the_whitelist_and_leg3_alphabet_stay_in_lockstep() -> None:
-    """SINGLE SOURCE (r2): every leg-3 marker appears in at least one whitelist
-    form (a marker added to `_INPUT_READY_CHROME_MARKERS` without a whitelist
-    form fails HERE — the two alphabets can never silently drift), and every
-    literal whitelist form carries at least one marker (no form can exist that
-    leg 3's substring alphabet would not also recognize)."""
-    forms = tp._STATUS_ROW_LITERAL_SEGMENTS
+    """SINGLE SOURCE (r2, carried through the r3 template): every leg-3 marker
+    appears in at least one template literal (a marker added to
+    `_INPUT_READY_CHROME_MARKERS` without a template slot fails HERE — the two
+    alphabets can never silently drift), and every template literal carries at
+    least one marker (no slot can exist that leg 3's substring alphabet would
+    not also recognize)."""
+    forms = (
+        tp._STATUS_ROW_MODE_SEGMENTS
+        + tp._STATUS_ROW_HINT_SEGMENTS
+        + (tp._STATUS_ROW_EFFORT_SEGMENT,)
+    )
     for marker in tp._INPUT_READY_CHROME_MARKERS:
         assert any(marker in form for form in forms), marker
     for form in forms:
         assert any(marker in form for marker in tp._INPUT_READY_CHROME_MARKERS), form
+
+
+# ── GH #56 r3 fold (Codex P1, THIRD spoof family): the whole-row ORDERED
+#    TEMPLATE — ends the segment-recombination class ─────────────────────────
+#
+# r1 (subtractive), r2 (per-segment fullmatch) and the r2 whitelist all validated
+# segments INDEPENDENTLY, so ANY recombination of individually-valid segments
+# passed: `/effort · /effort` (repeat), a doubled paste hint, TWO incompatible
+# mode markers, and `١ shell` (`\d` is Unicode-wide). Each drove the FULL gate
+# bypass + the keyless brake release. The terminal fix is the ordered slot
+# machine (fixed order, at-most-once, ASCII digits, whole-row consumption) —
+# per-segment validation was the wrong SHAPE, so this is an approach change, not
+# a fourth edge patch.
+
+_R3_SPOOF_ROWS = [
+    "/effort · /effort",  # repeated segment
+    "paste again to expand · paste again to expand",  # repeated hint
+    "⏸ manual mode on · ⏵⏵ bypass permissions on",  # two incompatible modes
+    "١ shell · /effort",  # Arabic-Indic digit + unpaired /effort
+]
+
+
+@pytest.mark.parametrize("row", _R3_SPOOF_ROWS)
+def test_r3_recombination_spoofs_refuse_through_the_full_predicates(
+    row: str,
+) -> None:
+    """All four r3 reproductions, driven end-to-end: the grammar refuses the
+    row, the gate refuses the pane, and the stale-empty-`❯` geometry never
+    yields a keyless brake release."""
+    assert tp._is_status_row(row) is False
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True
+    assert tp.classify_input_box_failure(empty_pane) == "no_input_box"
+
+
+def test_the_shell_token_is_ascii_only() -> None:
+    """`\\d` is UNICODE-wide — an Arabic-Indic `١ shell` must never read as the
+    shell-count token, in the template OR in leg 3's substring arm."""
+    assert tp._is_status_row("١ shell") is False
+    assert tp._is_status_row("1 shell") is True
+    assert tp._RE_STATUS_SHELL_SEGMENT.fullmatch("١ shell") is None
+    assert tp._RE_INPUT_READY_SHELL_TOKEN.search("· ١ shell") is None
+    assert tp._RE_INPUT_READY_SHELL_TOKEN.search("· 1 shell") is not None
+
+
+def test_template_slots_are_at_most_once_and_ordered() -> None:
+    """The structural properties that end the recombination class: no slot
+    repeats, no second mode, no out-of-order hint sequence, no unpaired
+    `/effort`, and every segment must be consumed."""
+    # A bare /effort never validates alone (the pair requires the spinner).
+    assert tp._is_status_row("/effort") is False
+    # The pair in the wrong order refuses.
+    assert tp._is_status_row("/effort · ◐ medium") is False
+    # Out-of-order hints refuse (`← for agents` precedes `? for shortcuts`
+    # nowhere in the corpus).
+    assert tp._is_status_row("← for agents · ? for shortcuts") is False
+    # A trailing unconsumed segment refuses.
+    assert tp._is_status_row("⏸ manual mode on · not chrome at all") is False
+
+
+def test_every_real_corpus_status_row_matches_the_template() -> None:
+    """THE CORPUS IS THE AUTHORITY: extract the first non-blank row below the
+    located bottom rule on EVERY deliverable fixture and require the template to
+    accept it — a too-narrow template fails LOUDLY here instead of silently
+    fail-closing panes. (38 rows across the corpus at the time of writing.)"""
+    checked = 0
+    for path in sorted(FIXTURES.glob("*.txt")):
+        text = path.read_text()
+        if tp.classify_input_box_failure(text) is not None:
+            continue  # only deliverable panes have a located ready box
+        lines = tp._strip_ansi(text).split("\n")
+        located = tp._input_box_rows(lines)
+        assert located is not None, path.name  # deliverable ⇒ box located
+        _top, bottom, _rows = located
+        first_below = next(
+            (
+                lines[i].strip()
+                for i in range(bottom + 1, len(lines))
+                if lines[i].strip()
+            ),
+            None,
+        )
+        if first_below is None:
+            continue
+        checked += 1
+        assert tp._is_status_row(first_below) is True, (path.name, first_below)
+    assert checked >= 30  # the sweep genuinely covered the corpus

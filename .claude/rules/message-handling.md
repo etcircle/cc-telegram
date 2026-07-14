@@ -1664,20 +1664,33 @@ whole corpus); on **exactly 1** it scans UPWARD for the top rule
 STRUCTURAL proof the lone in-window separator is the box's BOTTOM rule (substring
 markers are model-spoofable — an AUQ header carrying `/effort` hits the leg-3
 substring alphabet — so each part kills an independently-reproduced spoof): **(a)**
-the FIRST non-blank row below the lone separator FULLMATCHES the strict
-`_is_status_row` grammar — an ENUMERATED whitelist of the exact observed segment
-forms (r2 fold, Codex P1 twice: the first SUBTRACTIVE grammar let `❯ /effort?`
-through — a full gate bypass + a keyless brake release on a stale empty `❯` row;
-the r1 generative fullmatch still accepted `· /effort ·` via SKIPPED empty
-segments and cross-product forms like `/effort (manual mode on)` / `⏵◐⏸/effort`).
-Every `·`-split segment must FULLMATCH an exact literal from
-`_STATUS_ROW_LITERAL_SEGMENTS` (each `_INPUT_READY_CHROME_MARKERS` marker appears
-ONLY in the decorations it actually renders with — lockstep-tested single source,
-so the whitelist and leg 3's substring alphabet never drift) or a tight token arm
-(`N shell(s)[ still running]`, the `◐ <level>` effort spinner); an EMPTY segment
-REJECTS the row (a real bar never renders `· ·` or leading/trailing bare
-separators — corpus-verified), and no leading/trailing residue is ever accepted;
-**(b)** NO option-row shape
+the FIRST non-blank row below the lone separator matches the `_is_status_row`
+WHOLE-ROW ORDERED TEMPLATE (r3 fold — the APPROACH change that ends the
+segment-recombination class after THREE per-segment rounds: r1's SUBTRACTIVE
+grammar let `❯ /effort?` through — a full gate bypass + a keyless brake release
+on a stale empty `❯` row; r2's fullmatch accepted `· /effort ·` via SKIPPED empty
+segments and cross-products like `/effort (manual mode on)` / `⏵◐⏸/effort`; the
+r2 enumerated whitelist still validated segments INDEPENDENTLY, so ANY
+recombination passed — `/effort · /effort`, a doubled paste hint, TWO
+incompatible mode markers, and `١ shell` since `\d` is Unicode-wide — per-segment
+validation is the wrong SHAPE: the segment set is small but the ROW space is
+large). The template is a SLOT MACHINE over the `·`-split segments, DERIVED from
+the real corpus (every first-below-bottom-rule row on every deliverable fixture —
+pinned by a corpus-coverage test, so a too-narrow template fails loudly instead
+of silently fail-closing panes): `[MODE] · [SHELL] · [EFFORT-PAIR] · [HINT…]` —
+every slot OPTIONAL (the corpus has mode-less rows) but AT MOST ONCE, in FIXED
+order; MODE = one literal of the mode family (`⏵⏵ bypass permissions on
+[(shift+tab to cycle)]` / `⏸ manual mode on` / `! for shell mode` / the
+accept-edits + plan-mode siblings — never two, never repeated); SHELL =
+ASCII-ONLY `[0-9]+ shell(s)[ still running]` (`[0-9]`, NEVER `\d`; leg 3's
+substring shell token is ASCII-flipped too); EFFORT-PAIR = `◐ <level>` + `/effort`
+as TWO consecutive segments, both or neither (a bare `/effort` never validates);
+HINTs each at most once in the corpus-observed relative order. An EMPTY segment
+REJECTS the row (a real bar never renders `· ·` — corpus-verified), repeats are
+structurally impossible (each slot is consumed by advancing past it), and EVERY
+segment must be consumed (whole-row anchoring — leftover segments reject). The
+mode/hint literals stay lockstep-tested single-source with
+`_INPUT_READY_CHROME_MARKERS`; **(b)** NO option-row shape
 (`_RE_INPUT_OPTION_ROW`) below the lone separator (Codex's "lone separator is a
 live prompt's TOP rule, `❯ 1. Yes` below it" spoof refuses even if (a) were
 spoofed); **(c)** the first non-blank row directly below the found top rule is a
