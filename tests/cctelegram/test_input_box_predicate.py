@@ -925,9 +925,8 @@ def test_spoof_empty_stale_prompt_row_never_releases_the_brake() -> None:
 
 
 def test_the_grammar_accepts_the_real_status_rows() -> None:
-    """The enumeration must accept every REAL captured status-row shape the
-    fallback relies on (incl. the tall-draft fixture's own row) — the corpus-derived
-    templates, with only the shell COUNT parameterized."""
+    """The grammar must accept every REAL captured status-row shape the fallback
+    relies on (incl. the tall-draft fixture's own row)."""
     for row in (
         "⏸ manual mode on",  # the tall-draft fixture's only status row
         "⏸ manual mode on · ? for shortcuts · ← for agents",  # the cleared twin
@@ -942,6 +941,105 @@ def test_the_grammar_accepts_the_real_status_rows() -> None:
         "! for shell mode",
     ):
         assert tp._is_status_row(row) is True, row
+
+
+# ── GH #56 r5 fold: the CANONICAL GRAMMAR — sound against recombination,
+#    COMPLETE against the real panes ──────────────────────────────────────────
+#
+# r4's literal ENUMERATION was sound but TOO NARROW: sampling the owner's three
+# LIVE bot panes (2.1.208/2.1.209) surfaced `ctrl+t to hide tasks` — a hint the
+# fixture corpus does not contain — so the fallback fail-closed EXACTLY on the
+# busy/tasks panes where the owner's reply-quoted messages actually wedge.
+# Enumeration had mistaken "what our fixtures hold" for "what CC renders".
+
+_LIVE_BOT_ROWS = [
+    # Sampled from the running bot's panes, 2026-07-14 (real 2.1.208/2.1.209
+    # sessions; status row = first non-blank row below the bottom rule).
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt "
+    "· ctrl+t to hide tasks · ← for agents",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+    "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+]
+
+# The DISTINCT real status rows the non-circular corpus sweep derives (the
+# >=2-separator deliverable fixtures — see the sweep test below).
+_REAL_CORPUS_STATUS_ROWS = [
+    "! for shell mode",
+    "? for shortcuts · ← for agents",
+    "esc to interrupt · ← for agents",
+    "paste again to expand",
+    "⏵⏵ bypass permissions on (shift+tab to cycle)",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+    "⏵⏵ bypass permissions on · 1 shell",
+    "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+    "⏸ manual mode on",
+    "⏸ manual mode on · ? for shortcuts · ← for agents",
+]
+
+
+@pytest.mark.parametrize("row", _LIVE_BOT_ROWS)
+def test_the_three_live_bot_rows_are_accepted(row: str) -> None:
+    """THE COMPLETENESS PIN (provenance: sampled from the running bot's panes
+    2026-07-14). Row 1 carries `ctrl+t to hide tasks`, which NO fixture contains —
+    under r4's enumeration it was REFUSED, fail-closing the tall-draft fallback on
+    the owner's busiest windows."""
+    assert tp._is_status_row(row) is True, row
+    # And it works end-to-end: a tall draft under this status bar delivers.
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is None, row
+    assert tp.pane_input_box_present(pane) is True, row
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # A hint repeated — at-most-once membership.
+        "⏵⏵ bypass permissions on · ← for agents · ← for agents",
+        "esc to interrupt · esc to interrupt",
+        # A MODE after a HINT — the ordered structure (mode is the head or absent).
+        "← for agents · ⏸ manual mode on",
+        # TWO modes.
+        "⏸ manual mode on · ⏵⏵ bypass permissions on",
+        "⏸ manual mode on · ⏸ manual mode on",
+        # A mode combined with an EXCLUSIVE standalone form — structurally
+        # impossible: the exclusive forms are whole ROWS, never segments.
+        "⏸ manual mode on · paste again to expand",
+        "⏸ manual mode on · ! for shell mode",
+        "paste again to expand · ← for agents",
+        # A bare shell / effort is not a status bar.
+        "1 shell",
+        "/effort",
+        # Unknown text in any segment.
+        "⏸ manual mode on · surprise text",
+    ],
+)
+def test_grammar_edges_refuse_through_the_full_predicates(row: str) -> None:
+    """The grammar's own edges — repeats, ordering, mode/exclusive combination,
+    bare tokens, unknown text — all refuse, driven END-TO-END (the gate refuses the
+    pane and the stale-empty-`❯` geometry yields no keyless brake release)."""
+    assert tp._is_status_row(row) is False, row
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None, row
+    assert tp.pane_input_box_present(pane) is False, row
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True, row
+
+
+def test_the_hint_tail_is_deliberately_ORDER_FREE() -> None:
+    """DISCLOSED: the corpus + the three live rows pin `esc → ctrl+t → ← → ↓` and
+    `? → ←`, but NO observed row contains BOTH `? for shortcuts` and `esc to
+    interrupt`, so their relative order cannot be established without GUESSING.
+    Order-freedom adds no unsoundness — a valid bar's hints are all valid hints,
+    and REPEATS + UNKNOWN text are still rejected (pinned above)."""
+    assert tp._is_status_row("⏸ manual mode on · ← for agents · ? for shortcuts")
+    assert tp._is_status_row("⏸ manual mode on · ? for shortcuts · ← for agents")
+    # …but a repeat still refuses, which is what keeps order-freedom sound.
+    assert (
+        tp._is_status_row("⏸ manual mode on · ? for shortcuts · ? for shortcuts")
+        is False
+    )
 
 
 # ── GH #56 r2 fold (Codex P1): the ENUMERATED whitelist — no empty segments,
@@ -991,37 +1089,61 @@ def test_spoof_glyph_soup_prefix_refuses() -> None:
     assert tp._is_status_row("⏵◐⏸/effort") is False
 
 
-def test_every_template_is_recognized_by_leg3(monkeypatch: pytest.MonkeyPatch) -> None:
-    """SINGLE SOURCE, in the direction that is LOAD-BEARING (r4): every enumerated
-    template must be recognized by leg 3's substring alphabet, so the fallback can
-    never locate a box on a row leg 3 would then reject as `no_ready_chrome`
-    (template ⊆ leg-3-acceptable). A template added without a corresponding marker
-    fails HERE.
+def _grammar_vocabulary() -> set[str]:
+    """Every literal token the canonical grammar can consume."""
+    return (
+        set(tp._STATUS_ROW_EXCLUSIVE)
+        | set(tp._STATUS_ROW_HINTS)
+        | {tp._STATUS_EFFORT_TAIL}
+        | {"bypass permissions on", "accept edits on", "plan mode on", "manual mode on"}
+        | {"shift+tab to cycle"}
+    )
 
-    The REVERSE direction is deliberately NOT asserted: leg 3's alphabet is a
-    broader SUBSTRING alphabet, and some of its markers are not whole status-bar
-    ROWS at all — `/effort` renders ABOVE the input box (corpus-verified), and the
-    `accept edits on` / `plan mode on` glyph decorations are not corpus-observed
-    first-below. Fabricating templates for them would be guesswork; leaving them
-    out only fails CLOSED (see the enumeration's accepted-cost comment).
+
+def test_the_grammar_and_leg3_alphabet_stay_in_lockstep() -> None:
+    """SINGLE SOURCE, both directions pinned so neither can drift silently.
+
+    (a) Every leg-3 marker is part of the grammar's vocabulary — a marker added to
+        `_INPUT_READY_CHROME_MARKERS` without deciding its grammar membership fails
+        HERE. (Under r4's enumeration three markers were uncovered; the canonical
+        grammar now covers them all.)
+
+    (b) The grammar tokens that leg 3's alphabet does NOT carry are an EXPLICIT,
+        pinned set. That divergence is FAIL-CLOSED, not a hazard: a row made only
+        of such tokens would let the fallback LOCATE the box, and leg 3 would then
+        refuse the pane as `no_ready_chrome` — a refusal, never a wrong commit.
+        (In practice they only ever appear alongside a mode bar, which leg 3 does
+        carry — e.g. the live `… · ctrl+t to hide tasks · ← for agents` row.)
     """
-    # Compare against the UNESCAPED pattern text (`\(shift\+tab to cycle\)` carries
-    # the marker `shift+tab to cycle`).
-    sources = [t.pattern.replace("\\", "") for t in tp._STATUS_ROW_TEMPLATES]
-    for src in sources:
-        # A row that FULLMATCHES this template must also satisfy leg 3.
-        assert any(
-            marker in src for marker in tp._INPUT_READY_CHROME_MARKERS
-        ) or tp._RE_INPUT_READY_SHELL_TOKEN.search("· 1 shell"), src
-
-    # The markers with NO template are an EXPLICIT, pinned set — adding a new
-    # marker without deciding its template membership fails here.
-    uncovered = {
-        m
-        for m in tp._INPUT_READY_CHROME_MARKERS
-        if not any(m in src for src in sources)
+    vocab = _grammar_vocabulary()
+    uncovered_markers = {
+        m for m in tp._INPUT_READY_CHROME_MARKERS if not any(m in v for v in vocab)
     }
-    assert uncovered == {"/effort", "accept edits on", "plan mode on"}
+    assert uncovered_markers == set()
+
+    not_in_leg3 = {
+        v for v in vocab if not any(m in v for m in tp._INPUT_READY_CHROME_MARKERS)
+    }
+    assert not_in_leg3 == {
+        "ctrl+t to hide tasks",
+        "ctrl+t to show tasks",
+        "Enter to view tasks",
+    }
+
+
+def test_every_real_status_row_the_grammar_accepts_also_satisfies_leg3() -> None:
+    """The load-bearing property, asserted BEHAVIOURALLY on the real rows: a row the
+    grammar accepts must not be one leg 3 would then reject — otherwise the fallback
+    would locate a box only for leg 3 to refuse the pane."""
+    below_marker_ok = lambda row: (
+        any(  # noqa: E731
+            m in row for m in tp._INPUT_READY_CHROME_MARKERS
+        )
+        or tp._RE_INPUT_READY_SHELL_TOKEN.search("· " + row)
+    )
+    for row in _LIVE_BOT_ROWS + _REAL_CORPUS_STATUS_ROWS:
+        assert tp._is_status_row(row) is True, row
+        assert below_marker_ok(row), row
 
 
 # ── GH #56 r3 fold (Codex P1, THIRD spoof family): the whole-row ORDERED
@@ -1135,19 +1257,21 @@ def test_no_real_corpus_chrome_row_carries_a_unicode_space() -> None:
             assert not any(ch in lines[i] for ch in unicode_spaces), (name, i)
 
 
-def test_no_template_mixes_a_mode_bar_with_the_paste_hint() -> None:
-    """The structural property, asserted on the ENUMERATION itself: mutual
-    exclusion is not a rule to enforce — it is unrepresentable."""
-    modes = (
-        "bypass permissions on",
-        "manual mode on",
-        "accept edits on",
-        "plan mode on",
-    )
-    for template in tp._STATUS_ROW_TEMPLATES:
-        src = template.pattern
-        if "paste again to expand" in src:
-            assert not any(m in src for m in modes), src
+def test_the_exclusive_forms_are_rows_not_segments() -> None:
+    """The STRUCTURAL property, asserted on the grammar itself (r5): the paste hint
+    and the bash-mode indicator REPLACE the whole status bar, so they are modelled
+    as WHOLE-ROW alternatives — never as segments a bar can also carry. Mutual
+    exclusion is therefore unrepresentable, not a rule to enforce."""
+    # They are exclusive-row forms …
+    assert tp._STATUS_ROW_EXCLUSIVE == {"paste again to expand", "! for shell mode"}
+    # … and they are NOT reachable as a segment of a composed BAR.
+    assert not (tp._STATUS_ROW_EXCLUSIVE & tp._STATUS_ROW_HINTS)
+    for exclusive in tp._STATUS_ROW_EXCLUSIVE:
+        assert tp._RE_STATUS_MODE.fullmatch(exclusive) is None, exclusive
+        assert tp._is_status_row(exclusive) is True, exclusive
+        # A bar can never absorb one.
+        assert tp._is_status_row(f"⏸ manual mode on · {exclusive}") is False
+        assert tp._is_status_row(f"{exclusive} · ← for agents") is False
 
 
 def test_every_real_corpus_status_row_matches_a_template() -> None:

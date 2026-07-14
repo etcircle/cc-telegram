@@ -1664,46 +1664,69 @@ whole corpus); on **exactly 1** it scans UPWARD for the top rule
 STRUCTURAL proof the lone in-window separator is the box's BOTTOM rule (substring
 markers are model-spoofable — an AUQ header carrying `/effort` hits the leg-3
 substring alphabet — so each part kills an independently-reproduced spoof): **(a)**
-the FIRST non-blank row below the lone separator FULLMATCHES ONE COMPLETE ROW in
-`_is_status_row`'s **WHOLE-ROW ENUMERATION** (`_STATUS_ROW_TEMPLATES`). **This is
-the FIFTH round of one bug class, and its terminal fix.** Every earlier grammar
-validated the row PART-WISE and each round closed one combination while the next
-found another: r1's SUBTRACTIVE grammar let `❯ /effort?` through (a full gate
-bypass + a keyless brake release on a stale empty `❯` row); r2's per-segment
-fullmatch accepted `· /effort ·` via SKIPPED empty segments and cross-products
-(`/effort (manual mode on)`, `⏵◐⏸/effort`); r3's enumerated whitelist still
-validated each segment INDEPENDENTLY, so ANY RECOMBINATION passed (`/effort ·
-/effort`, a doubled paste hint, TWO incompatible mode markers, and `١ shell` —
-`\d` is Unicode-wide); and r3's ORDERED SLOT MACHINE still let MUTUALLY EXCLUSIVE
-slots coexist (`⏸ manual mode on · paste again to expand`, though the paste hint
-REPLACES the whole status bar) — **ordering + at-most-once does not imply
-COMPATIBILITY**. The segment set is small but the ROW space (order, count,
-repeats, digit width, compatibility) is large, so ANY per-part predicate is
-unsoundable here. The enumeration is a list of COMPLETE anchored rows, DERIVED
-from the real corpus, with ONLY the genuinely variable part parameterized (the
-shell COUNT, ASCII `[0-9]+` — NEVER `\d`; leg 3's substring shell token is
-ASCII-flipped in the same audit, while the refusal-side option-row traps and the
-idle-lane bg-shells parsers deliberately KEEP `\d`, where wider matching is
-fail-closed). Mutual exclusion, repetition, ordering and empty segments all stop
-being rules to enforce — they are **unrepresentable**: no template contains both a
-mode bar and the paste hint, so they cannot combine BY CONSTRUCTION.
+the FIRST non-blank row below the lone separator satisfies `_is_status_row`'s
+**CANONICAL ORDERED GRAMMAR** — sound against recombination, COMPLETE against the
+real panes. **This predicate took SIX rounds, and the history is the lesson.**
+Every early grammar validated the row PART-WISE and each round closed one
+combination while the next found another: r1's SUBTRACTIVE grammar let `❯ /effort?`
+through (a full gate bypass + a keyless brake release on a stale empty `❯` row);
+r2's per-segment fullmatch accepted `· /effort ·` via SKIPPED empty segments and
+cross-products (`/effort (manual mode on)`, `⏵◐⏸/effort`); r3's enumerated
+whitelist still validated each segment INDEPENDENTLY, so ANY RECOMBINATION passed
+(`/effort · /effort`, a doubled paste hint, TWO incompatible mode markers, and
+`١ shell` — `\d` is Unicode-wide); r3's ORDERED SLOT MACHINE still let MUTUALLY
+EXCLUSIVE slots coexist (`⏸ manual mode on · paste again to expand`) — **ordering +
+at-most-once does not imply COMPATIBILITY**; and r4's literal WHOLE-ROW ENUMERATION
+was finally SOUND but **TOO NARROW AGAINST REALITY**: sampling the owner's three
+LIVE bot panes surfaced `⏵⏵ bypass permissions on (shift+tab to cycle) · esc to
+interrupt · ctrl+t to hide tasks · ← for agents` — a hint **no fixture contains** —
+so it fail-closed EXACTLY on the busy/tasks panes where the owner's reply-quoted
+messages actually wedge. **Enumeration had mistaken "what our fixtures happen to
+hold" for "what CC renders".** The terminal shape is a grammar:
+
+    ROW       := EXCLUSIVE | BAR
+    EXCLUSIVE := "paste again to expand" | "! for shell mode"     (the WHOLE row)
+    BAR       := [MODE] · [SHELL] · [EFFORT-PAIR] · [HINT…]
+                 …requiring MODE or ≥1 HINT
+
+with **MODE** at most one (never two, never repeated); **SHELL** ASCII-only
+(`[0-9]+ shell(s)[ still running]` — `[0-9]`, NEVER `\d`; leg 3's substring shell
+token is ASCII-flipped in the same audit, while the refusal-side option-row traps
+and the idle-lane bg-shells parsers deliberately KEEP `\d`, where wider matching is
+fail-closed); **EFFORT-PAIR** the spinner + `/effort` as two consecutive segments,
+both or neither (a bare `/effort` never validates); and **HINT** from a fixed set
+(`esc to interrupt`, `ctrl+t to hide tasks`, `ctrl+t to show tasks`, `← for
+agents`, `↓ to manage`, `? for shortcuts`, `Enter to view tasks`), each **at most
+once**. No empty segments; **every segment must be consumed**. The EXCLUSIVE forms
+are whole-ROW alternatives, so mutual exclusion is **unrepresentable** rather than
+enforced — the paste hint REPLACES the bar, and modelling it as a row (not a
+segment) is what kills the r4 spoof BY CONSTRUCTION.
+**HINT ORDER IS NOT ENFORCED — a deliberate, disclosed choice.** The corpus + the
+three live rows pin `esc → ctrl+t → ← → ↓` and `? → ←`, but NO observed row carries
+BOTH `? for shortcuts` and `esc to interrupt`, so their relative order cannot be
+established without GUESSING. Order-freedom adds **no unsoundness**: a valid bar's
+hints are all valid hints, while repeats and unknown text are still rejected.
+**SOUNDNESS:** the grammar accepts exactly the WELL-FORMED bars and rejects every
+malformed recombination the rounds produced (two modes, repeats, mode+paste, wide
+digits, NBSP, embedded prose). The residual — pane content reproducing a genuinely
+VALID status bar — is IDENTICAL for enumeration and for the grammar (both accept
+valid bars by definition), so **the grammar costs no safety versus r4 while
+removing the false-refusal cliff**. That is the honest trade, and it is why we do
+not hand-list rows.
 **BYTE DISCIPLINE:** the chrome region is explicitly OUTSIDE
 `_normalize_input_row`'s contract (which is scoped to the rows INSIDE the box), so
-the templates match **ASCII space only** and an NBSP variant of a real row REFUSES
-(corpus-verified safe: the NBSP CC emits lives in the INPUT row `❯\xa0`, never in a
-status bar). **ACCEPTED COST, stated in the code:** a REAL status bar whose shape
-is not in the list fails CLOSED — the fallback simply does not fire on that pane,
-i.e. EXACTLY today's shipped behavior (refuse), never a wrong commit. That is the
-correct direction and it is what makes enumeration acceptable. Two known-uncovered
-shapes: `accept edits on` / `plan mode on` (their glyph decoration is not
-corpus-observed — a guessed glyph would be fabrication) and the `◐ <level> ·
-/effort` indicator (corpus-verified to render ABOVE the input box, never as the
-first row BELOW the bottom rule — it is not a status-bar row at all). The
-enumeration is pinned by a NON-CIRCULAR corpus-coverage test — derived from the
-`>=2`-separator fixtures, the path that provably never consults `_is_status_row`
-(asserted by replacing the predicate with a bomb) — so a too-narrow enumeration
-fails LOUDLY instead of silently fail-closing panes; and every template is
-lockstep-tested to be leg-3-recognizable (template ⊆ leg-3 alphabet);
+this lane does NOT normalize Unicode spaces, trims ASCII-only, and uses no
+Unicode-wide `\s`/`\d` — an NBSP variant of a real row REFUSES (corpus-verified
+safe: the NBSP CC emits lives in the INPUT row `❯\xa0`, never in a status bar).
+**ACCEPTED COST:** a real status bar whose SHAPE is outside the grammar still fails
+CLOSED — the fallback does not fire on that pane, i.e. exactly today's shipped
+behavior (refuse), never a wrong commit. Pinned by: the three LIVE bot rows as
+accepted vectors; a NON-CIRCULAR corpus-coverage sweep (derived from the
+`>=2`-separator fixtures — the path that provably never consults `_is_status_row`,
+asserted by replacing the predicate with a bomb) so a too-narrow grammar fails
+LOUDLY; every r1–r4 spoof still refusing through the full predicates; the grammar's
+own edges (repeated hint, mode-after-hint, mode + exclusive, bare shell/effort,
+unknown segment); and a two-way lockstep with `_INPUT_READY_CHROME_MARKERS`;
 **(b)** NO option-row shape
 (`_RE_INPUT_OPTION_ROW`) below the lone separator (Codex's "lone separator is a
 live prompt's TOP rule, `❯ 1. Yes` below it" spoof refuses even if (a) were
