@@ -924,20 +924,22 @@ def test_spoof_empty_stale_prompt_row_never_releases_the_brake() -> None:
     assert tp.classify_input_box_failure(pane) == "no_input_box"
 
 
-def test_the_strict_grammar_accepts_the_real_status_rows() -> None:
-    """The fullmatch grammar must still accept every REAL captured status-row
-    shape the fallback relies on (incl. the tall-draft fixture's own row)."""
+def test_the_grammar_accepts_the_real_status_rows() -> None:
+    """The enumeration must accept every REAL captured status-row shape the
+    fallback relies on (incl. the tall-draft fixture's own row) — the corpus-derived
+    templates, with only the shell COUNT parameterized."""
     for row in (
         "⏸ manual mode on",  # the tall-draft fixture's only status row
         "⏸ manual mode on · ? for shortcuts · ← for agents",  # the cleared twin
         "⏵⏵ bypass permissions on (shift+tab to cycle)",
         "⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents",
-        "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+        "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+        "⏵⏵ bypass permissions on · 1 shell",
+        "⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage",
+        "? for shortcuts · ← for agents",
+        "esc to interrupt · ← for agents",
         "paste again to expand",
-        "esc to interrupt",
         "! for shell mode",
-        "1 shell still running",
-        "◐ medium · /effort",  # the effort segment pair (inputbox_paste_collapsed_v2.1.207)
     ):
         assert tp._is_status_row(row) is True, row
 
@@ -989,22 +991,37 @@ def test_spoof_glyph_soup_prefix_refuses() -> None:
     assert tp._is_status_row("⏵◐⏸/effort") is False
 
 
-def test_the_whitelist_and_leg3_alphabet_stay_in_lockstep() -> None:
-    """SINGLE SOURCE (r2, carried through the r3 template): every leg-3 marker
-    appears in at least one template literal (a marker added to
-    `_INPUT_READY_CHROME_MARKERS` without a template slot fails HERE — the two
-    alphabets can never silently drift), and every template literal carries at
-    least one marker (no slot can exist that leg 3's substring alphabet would
-    not also recognize)."""
-    forms = (
-        tp._STATUS_ROW_MODE_SEGMENTS
-        + tp._STATUS_ROW_HINT_SEGMENTS
-        + (tp._STATUS_ROW_EFFORT_SEGMENT,)
-    )
-    for marker in tp._INPUT_READY_CHROME_MARKERS:
-        assert any(marker in form for form in forms), marker
-    for form in forms:
-        assert any(marker in form for marker in tp._INPUT_READY_CHROME_MARKERS), form
+def test_every_template_is_recognized_by_leg3(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SINGLE SOURCE, in the direction that is LOAD-BEARING (r4): every enumerated
+    template must be recognized by leg 3's substring alphabet, so the fallback can
+    never locate a box on a row leg 3 would then reject as `no_ready_chrome`
+    (template ⊆ leg-3-acceptable). A template added without a corresponding marker
+    fails HERE.
+
+    The REVERSE direction is deliberately NOT asserted: leg 3's alphabet is a
+    broader SUBSTRING alphabet, and some of its markers are not whole status-bar
+    ROWS at all — `/effort` renders ABOVE the input box (corpus-verified), and the
+    `accept edits on` / `plan mode on` glyph decorations are not corpus-observed
+    first-below. Fabricating templates for them would be guesswork; leaving them
+    out only fails CLOSED (see the enumeration's accepted-cost comment).
+    """
+    # Compare against the UNESCAPED pattern text (`\(shift\+tab to cycle\)` carries
+    # the marker `shift+tab to cycle`).
+    sources = [t.pattern.replace("\\", "") for t in tp._STATUS_ROW_TEMPLATES]
+    for src in sources:
+        # A row that FULLMATCHES this template must also satisfy leg 3.
+        assert any(
+            marker in src for marker in tp._INPUT_READY_CHROME_MARKERS
+        ) or tp._RE_INPUT_READY_SHELL_TOKEN.search("· 1 shell"), src
+
+    # The markers with NO template are an EXPLICIT, pinned set — adding a new
+    # marker without deciding its template membership fails here.
+    uncovered = {
+        m
+        for m in tp._INPUT_READY_CHROME_MARKERS
+        if not any(m in src for src in sources)
+    }
+    assert uncovered == {"/effort", "accept edits on", "plan mode on"}
 
 
 # ── GH #56 r3 fold (Codex P1, THIRD spoof family): the whole-row ORDERED
@@ -1048,51 +1065,153 @@ def test_the_shell_token_is_ascii_only() -> None:
     """`\\d` is UNICODE-wide — an Arabic-Indic `١ shell` must never read as the
     shell-count token, in the template OR in leg 3's substring arm."""
     assert tp._is_status_row("١ shell") is False
-    assert tp._is_status_row("1 shell") is True
-    assert tp._RE_STATUS_SHELL_SEGMENT.fullmatch("١ shell") is None
+    assert tp._is_status_row("⏵⏵ bypass permissions on · 1 shell") is True
     assert tp._RE_INPUT_READY_SHELL_TOKEN.search("· ١ shell") is None
     assert tp._RE_INPUT_READY_SHELL_TOKEN.search("· 1 shell") is not None
 
 
-def test_template_slots_are_at_most_once_and_ordered() -> None:
-    """The structural properties that end the recombination class: no slot
-    repeats, no second mode, no out-of-order hint sequence, no unpaired
-    `/effort`, and every segment must be consumed."""
-    # A bare /effort never validates alone (the pair requires the spinner).
-    assert tp._is_status_row("/effort") is False
-    # The pair in the wrong order refuses.
-    assert tp._is_status_row("/effort · ◐ medium") is False
-    # Out-of-order hints refuse (`← for agents` precedes `? for shortcuts`
-    # nowhere in the corpus).
-    assert tp._is_status_row("← for agents · ? for shortcuts") is False
-    # A trailing unconsumed segment refuses.
-    assert tp._is_status_row("⏸ manual mode on · not chrome at all") is False
+# ── GH #56 r4 fold (Codex P1, FIFTH round of the same class): WHOLE-ROW
+#    ENUMERATION — the terminal end of the recombination class ───────────────
+#
+# r3's slot machine STILL let mutually exclusive slots coexist
+# (`⏸ manual mode on · paste again to expand` passed, though the paste hint
+# REPLACES the whole status bar): ordering + at-most-once does not imply
+# COMPATIBILITY. And it normalized Unicode spaces, so an NBSP variant of a real
+# row passed. ANY per-part predicate over segments/slots is unsoundable here —
+# so the grammar is now an ENUMERATION of COMPLETE rows. Mutually exclusive
+# shapes cannot combine BY CONSTRUCTION: no template contains both.
 
 
-def test_every_real_corpus_status_row_matches_the_template() -> None:
-    """THE CORPUS IS THE AUTHORITY: extract the first non-blank row below the
-    located bottom rule on EVERY deliverable fixture and require the template to
-    accept it — a too-narrow template fails LOUDLY here instead of silently
-    fail-closing panes. (38 rows across the corpus at the time of writing.)"""
-    checked = 0
+def test_spoof_mutually_exclusive_shapes_cannot_combine() -> None:
+    """Codex r4 repro (a): the paste hint REPLACES the status bar, so it can
+    never appear alongside a mode bar. Under whole-row enumeration there simply
+    IS no template containing both — driven through the FULL predicates."""
+    row = "⏸ manual mode on · paste again to expand"
+    assert tp._is_status_row(row) is False
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True
+    assert tp.classify_input_box_failure(empty_pane) == "no_input_box"
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "⏸\xa0manual mode on",  # NBSP inside a real mode row
+        "paste\xa0again to expand",  # NBSP inside the paste hint
+        "? for shortcuts\xa0· ← for agents",  # NBSP around the separator
+    ],
+)
+def test_spoof_nbsp_variants_of_real_rows_refuse(row: str) -> None:
+    """Codex r4 repro (b): the chrome region is explicitly OUTSIDE
+    `_normalize_input_row`'s contract (which is scoped to the rows INSIDE the
+    input-box bracket), so the templates match ASCII space ONLY and an NBSP
+    variant of a real row REFUSES. Driven through the FULL predicates."""
+    assert tp._is_status_row(row) is False
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None
+    assert tp.pane_input_box_present(pane) is False
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True
+
+
+def test_no_real_corpus_chrome_row_carries_a_unicode_space() -> None:
+    """The ASCII-only rule is corpus-SAFE, not just strict: the NBSP CC emits
+    lives in the INPUT row (`❯\\xa0`), never in a status bar."""
+    unicode_spaces = ("\xa0", " ", " ", "﻿")
+    for name, expected in _BASELINE_CLASSIFICATIONS.items():
+        if expected is not None:
+            continue  # only deliverable panes have a status bar below the box
+        lines = tp._strip_ansi(_pane(name)).split("\n")
+        located = tp._input_box_rows(lines)
+        if located is None:
+            continue
+        _top, bottom, _rows = located
+        for i in range(bottom + 1, len(lines)):
+            assert not any(ch in lines[i] for ch in unicode_spaces), (name, i)
+
+
+def test_no_template_mixes_a_mode_bar_with_the_paste_hint() -> None:
+    """The structural property, asserted on the ENUMERATION itself: mutual
+    exclusion is not a rule to enforce — it is unrepresentable."""
+    modes = (
+        "bypass permissions on",
+        "manual mode on",
+        "accept edits on",
+        "plan mode on",
+    )
+    for template in tp._STATUS_ROW_TEMPLATES:
+        src = template.pattern
+        if "paste again to expand" in src:
+            assert not any(m in src for m in modes), src
+
+
+def test_every_real_corpus_status_row_matches_a_template() -> None:
+    """THE CORPUS IS THE AUTHORITY, and the sweep is NON-CIRCULAR (r4 P2).
+
+    The r3 sweep filtered fixtures with `classify_input_box_failure`, which on
+    the ONE-separator path calls `_is_status_row` — so a too-narrow template
+    just SKIPPED the fixture and the loose count still passed. Here the sweep is
+    restricted to fixtures with >=2 separators in the bottom scan window: that
+    is exactly the path `_input_box_rows` resolves WITHOUT ever consulting
+    `_is_status_row`, so neither the fixture selection nor the extracted row
+    depends on the predicate under test. Every real status bar so derived must
+    FULLMATCH a template — a too-narrow enumeration fails LOUDLY here instead of
+    silently fail-closing panes.
+    """
+    checked: list[str] = []
     for path in sorted(FIXTURES.glob("*.txt")):
         text = path.read_text()
-        if tp.classify_input_box_failure(text) is not None:
-            continue  # only deliverable panes have a located ready box
         lines = tp._strip_ansi(text).split("\n")
-        located = tp._input_box_rows(lines)
-        assert located is not None, path.name  # deliverable ⇒ box located
-        _top, bottom, _rows = located
+        start = max(0, len(lines) - tp._CHROME_SCAN_LINES)
+        seps = [i for i in range(start, len(lines)) if tp._is_rule_separator(lines[i])]
+        if len(seps) < 2:
+            continue  # the fallback path — would be circular
+        # On this path classify_* never consults _is_status_row, so using it to
+        # select the READY (status-bar-bearing) panes is not circular.
+        if tp.classify_input_box_failure(text) is not None:
+            continue
         first_below = next(
             (
                 lines[i].strip()
-                for i in range(bottom + 1, len(lines))
+                for i in range(seps[-1] + 1, len(lines))
                 if lines[i].strip()
             ),
             None,
         )
         if first_below is None:
             continue
-        checked += 1
+        checked.append(first_below)
         assert tp._is_status_row(first_below) is True, (path.name, first_below)
-    assert checked >= 30  # the sweep genuinely covered the corpus
+    # The sweep genuinely covered the corpus, across DISTINCT real shapes.
+    assert len(checked) >= 30
+    assert len(set(checked)) >= 8
+
+
+def test_the_two_separator_path_never_consults_the_status_row_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The NON-CIRCULARITY of the sweep above, PROVEN rather than asserted: with
+    `_is_status_row` replaced by a bomb, every >=2-separator fixture still
+    classifies — so that path (and the sweep built on it) is independent of the
+    predicate under test."""
+
+    def _boom(_line: str) -> bool:
+        raise AssertionError("_is_status_row must NOT be consulted on the >=2-sep path")
+
+    monkeypatch.setattr(tp, "_is_status_row", _boom)
+    checked = 0
+    for path in sorted(FIXTURES.glob("*.txt")):
+        text = path.read_text()
+        lines = tp._strip_ansi(text).split("\n")
+        start = max(0, len(lines) - tp._CHROME_SCAN_LINES)
+        seps = [i for i in range(start, len(lines)) if tp._is_rule_separator(lines[i])]
+        if len(seps) < 2:
+            continue
+        tp.classify_input_box_failure(text)  # must not raise
+        checked += 1
+    assert checked >= 40

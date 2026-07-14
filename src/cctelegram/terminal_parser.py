@@ -4037,104 +4037,85 @@ _INPUT_BOX_TOP_SCAN_LINES: Final = 60
 # (order, count, repeats, digit width, marker compatibility) is large, so
 # per-segment validation is the wrong SHAPE.
 #
-# The terminal fix is an ordered SLOT MACHINE over the ``·``-split segments,
-# derived from the REAL fixture corpus (the authority — every first-below-
-# bottom-rule row on every deliverable fixture, pinned by a corpus-coverage
-# test so a too-narrow template fails loudly instead of silently fail-closing
-# panes). The observed row shape is:
+# r4 then showed the SLOT MACHINE was the same class a FIFTH time: ordering +
+# at-most-once does not imply COMPATIBILITY, so mutually exclusive slots still
+# coexisted (``⏸ manual mode on · paste again to expand`` passed, though the
+# paste hint REPLACES the whole status bar), and normalizing Unicode spaces let
+# an NBSP variant of a real row through.
 #
-#     [MODE] · [SHELL] · [EFFORT-PAIR] · [HINT…]
+# THE LESSON, recorded: ANY per-part predicate over segments/slots is
+# unsoundable here — each round closes one combination and the next finds
+# another. The terminal fix is WHOLE-ROW ENUMERATION (below): one anchored,
+# complete-row template per real observed status bar, with only genuinely
+# variable parts parameterized. Compatibility, ordering, repetition and
+# emptiness all stop being separate rules — they are simply not expressible.
 #
-# where every slot is OPTIONAL (the corpus contains mode-less rows —
-# ``? for shortcuts · ← for agents``, ``esc to interrupt · ← for agents``,
-# ``paste again to expand``) but each may match AT MOST ONCE, in this FIXED
-# order:
+# THE ENUMERATION (r4). Each entry is ONE COMPLETE row, anchored and fullmatched.
+# There is no slot composition and no cross-slot assembly, so MUTUALLY EXCLUSIVE
+# shapes cannot combine BY CONSTRUCTION: no template contains both a mode bar and
+# the paste hint, because the paste hint REPLACES the whole status bar (that is
+# what the corpus shows, and it is what the r3 slot machine could not express —
+# ``⏸ manual mode on · paste again to expand`` passed it).
 #
-#   - MODE: exactly one of the mode-family literals below (never two, never
-#     repeated — the bash-mode ``! for shell mode`` indicator slots here; the
-#     ``accept edits`` / ``plan mode`` decorations are the documented shift+tab
-#     family, not corpus-observed first-below — if their real decoration
-#     differs the fallback merely fails CLOSED on those panes);
-#   - SHELL: the ASCII-ONLY count token ``[0-9]+ shell(s)[ still running]``
-#     (``[0-9]``, NEVER ``\d`` — ``\d`` matches Arabic-Indic and every other
-#     Unicode digit class, the r3 spoof);
-#   - EFFORT-PAIR: the spinner + ``/effort`` pair in its real observed shape
-#     ``◐ medium · /effort`` — TWO consecutive segments, both or neither
-#     (a bare ``/effort`` never validates alone);
-#   - HINTs: each at most once, in the corpus-observed relative order
-#     (``paste again to expand`` / ``? for shortcuts`` / ``esc to interrupt``
-#     precede ``← for agents``, which precedes ``↓ to manage``).
+# Derived by sweeping the fixture corpus on the ≥2-SEPARATOR path — the path that
+# does NOT consult this predicate (proven: classifying all 47 such fixtures with
+# ``_is_status_row`` disabled never calls it), so the derivation and its coverage
+# test are NON-CIRCULAR. Only genuinely variable parts are parameterized: the
+# shell COUNT (ASCII ``[0-9]+`` — NEVER ``\d``, which is Unicode-wide).
 #
-# Repeats are structurally impossible (each slot is consumed by advancing past
-# it), an EMPTY segment rejects the row (a real bar never renders ``· ·`` or
-# leading/trailing bare separators — corpus-verified), and EVERY segment must be
-# consumed by some slot (whole-row anchoring: leftover segments reject).
-#
-# SINGLE SOURCE with leg 3: every marker in ``_INPUT_READY_CHROME_MARKERS``
-# appears in at least one template literal, and every template literal carries
-# at least one marker — pinned by the lockstep test.
-_STATUS_ROW_MODE_SEGMENTS: Final = (
-    "⏵⏵ bypass permissions on (shift+tab to cycle)",
-    "⏵⏵ bypass permissions on",
-    "⏵⏵ accept edits on (shift+tab to cycle)",
-    "⏵⏵ accept edits on",
-    "⏸ plan mode on (shift+tab to cycle)",
-    "⏸ plan mode on",
-    "⏸ manual mode on",
-    "! for shell mode",
+# ACCEPTED COST (stated plainly): a REAL status bar whose shape is NOT in this
+# list fails CLOSED — the tall-draft fallback simply does not fire on that pane,
+# i.e. EXACTLY today's shipped behavior (refuse), never a wrong commit. That is
+# the correct direction, and it is what makes enumeration acceptable here. Two
+# known uncovered shapes: the ``accept edits on`` / ``plan mode on`` shift+tab
+# siblings (their glyph decoration is not corpus-observed — a guessed glyph would
+# be fabrication) and the ``◐ <level> · /effort`` indicator (corpus-verified to
+# render ABOVE the input box, never as the first row BELOW the bottom rule, so it
+# is not a status-bar row at all). A pane in those modes keeps today's refusal.
+_STATUS_ROW_TEMPLATES: Final = tuple(
+    re.compile(pattern)
+    for pattern in (
+        # The bypass-permissions mode bar, in its four observed shapes.
+        r"⏵⏵ bypass permissions on \(shift\+tab to cycle\)",
+        r"⏵⏵ bypass permissions on \(shift\+tab to cycle\) · esc to interrupt · ← for agents",
+        r"⏵⏵ bypass permissions on \(shift\+tab to cycle\) · ← for agents",
+        r"⏵⏵ bypass permissions on · [0-9]+ shells?",
+        r"⏵⏵ bypass permissions on · [0-9]+ shells? · ← for agents · ↓ to manage",
+        # The manual-mode bar (the GH #56 tall-draft rig fixture's own row).
+        r"⏸ manual mode on",
+        r"⏸ manual mode on · \? for shortcuts · ← for agents",
+        # Mode-less bars.
+        r"\? for shortcuts · ← for agents",
+        r"esc to interrupt · ← for agents",
+        # The paste-collapse hint — it REPLACES the status bar (never combines).
+        r"paste again to expand",
+        # Bash mode.
+        r"! for shell mode",
+    )
 )
-_STATUS_ROW_HINT_SEGMENTS: Final = (
-    "paste again to expand",
-    "? for shortcuts",
-    "esc to interrupt",
-    "← for agents",
-    "↓ to manage",
-)
-_STATUS_ROW_EFFORT_SEGMENT: Final = "/effort"
-# ASCII digits ONLY — ``\d`` is Unicode-wide (the r3 ``١ shell`` spoof).
-_RE_STATUS_SHELL_SEGMENT: Final = re.compile(r"[0-9]+\s+shells?(?:\s+still\s+running)?")
-_RE_STATUS_EFFORT_SPINNER: Final = re.compile(r"[◐◑◒◓]\s+(?:low|medium|high|xhigh)")
 
 
 def _is_status_row(line: str) -> bool:
     """True iff ``line`` is a WHOLE Claude Code ready-status-bar row (GH #56).
 
-    A whole-row ORDERED TEMPLATE match (the slot machine documented above — see
-    the constants block). The exactly-one-separator fallback in
-    ``_input_box_rows`` uses it to prove the lone in-window separator is the
-    input box's BOTTOM rule: the first non-blank row below a genuine bottom rule
-    is the status bar. Model-controlled prompt content can never qualify by
-    recombining chrome fragments: fixed slot order, at-most-once membership,
-    ASCII-only digits, no empty segments, and every segment must be consumed.
+    Whole-row ENUMERATION: the row must FULLMATCH one complete template in
+    ``_STATUS_ROW_TEMPLATES`` (see that block for the derivation and the accepted
+    fail-closed cost). The exactly-one-separator fallback in ``_input_box_rows``
+    uses it to prove the lone in-window separator is the input box's BOTTOM rule:
+    the first non-blank row below a genuine bottom rule is the status bar.
+
+    BYTE DISCIPLINE (r4 P1b): the chrome region is explicitly OUTSIDE
+    ``_normalize_input_row``'s contract (which is scoped to the rows INSIDE the
+    input-box bracket), so this predicate does NOT normalize Unicode spaces and
+    the templates match ASCII space only — an NBSP variant of a real row REFUSES.
+    Trimming is ASCII-only for the same reason (bare ``str.strip()`` is
+    Unicode-aware). Corpus-verified: no real chrome row carries a Unicode space —
+    the NBSP CC emits lives in the INPUT row (``❯\\xa0``), never in the status bar.
     """
-    s = _normalize_input_row(_strip_ansi(line)).strip()
+    s = _strip_ansi(line).strip(" \t\r\n")
     if not s:
         return False
-    segs = [segment.strip() for segment in s.split("·")]
-    if any(not seg for seg in segs):
-        # A bare leading/trailing/double separator is NEVER status chrome
-        # (r2 — skipping these let ``· /effort ·`` reduce to one valid segment).
-        return False
-    i = 0
-    # Slot 1: at most ONE mode segment.
-    if segs[i] in _STATUS_ROW_MODE_SEGMENTS:
-        i += 1
-    # Slot 2: at most one ASCII shell-count token.
-    if i < len(segs) and _RE_STATUS_SHELL_SEGMENT.fullmatch(segs[i]):
-        i += 1
-    # Slot 3: the effort pair — two consecutive segments, both or neither.
-    if (
-        i + 1 < len(segs)
-        and _RE_STATUS_EFFORT_SPINNER.fullmatch(segs[i])
-        and segs[i + 1] == _STATUS_ROW_EFFORT_SEGMENT
-    ):
-        i += 2
-    # Hint slots: each at most once, in the fixed corpus-observed order.
-    for hint in _STATUS_ROW_HINT_SEGMENTS:
-        if i < len(segs) and segs[i] == hint:
-            i += 1
-    # Whole-row anchoring: every segment must have been consumed by a slot.
-    return i == len(segs)
+    return any(t.fullmatch(s) for t in _STATUS_ROW_TEMPLATES)
 
 
 def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:

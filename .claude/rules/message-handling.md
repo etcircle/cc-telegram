@@ -1664,33 +1664,47 @@ whole corpus); on **exactly 1** it scans UPWARD for the top rule
 STRUCTURAL proof the lone in-window separator is the box's BOTTOM rule (substring
 markers are model-spoofable — an AUQ header carrying `/effort` hits the leg-3
 substring alphabet — so each part kills an independently-reproduced spoof): **(a)**
-the FIRST non-blank row below the lone separator matches the `_is_status_row`
-WHOLE-ROW ORDERED TEMPLATE (r3 fold — the APPROACH change that ends the
-segment-recombination class after THREE per-segment rounds: r1's SUBTRACTIVE
-grammar let `❯ /effort?` through — a full gate bypass + a keyless brake release
-on a stale empty `❯` row; r2's fullmatch accepted `· /effort ·` via SKIPPED empty
-segments and cross-products like `/effort (manual mode on)` / `⏵◐⏸/effort`; the
-r2 enumerated whitelist still validated segments INDEPENDENTLY, so ANY
-recombination passed — `/effort · /effort`, a doubled paste hint, TWO
-incompatible mode markers, and `١ shell` since `\d` is Unicode-wide — per-segment
-validation is the wrong SHAPE: the segment set is small but the ROW space is
-large). The template is a SLOT MACHINE over the `·`-split segments, DERIVED from
-the real corpus (every first-below-bottom-rule row on every deliverable fixture —
-pinned by a corpus-coverage test, so a too-narrow template fails loudly instead
-of silently fail-closing panes): `[MODE] · [SHELL] · [EFFORT-PAIR] · [HINT…]` —
-every slot OPTIONAL (the corpus has mode-less rows) but AT MOST ONCE, in FIXED
-order; MODE = one literal of the mode family (`⏵⏵ bypass permissions on
-[(shift+tab to cycle)]` / `⏸ manual mode on` / `! for shell mode` / the
-accept-edits + plan-mode siblings — never two, never repeated); SHELL =
-ASCII-ONLY `[0-9]+ shell(s)[ still running]` (`[0-9]`, NEVER `\d`; leg 3's
-substring shell token is ASCII-flipped too); EFFORT-PAIR = `◐ <level>` + `/effort`
-as TWO consecutive segments, both or neither (a bare `/effort` never validates);
-HINTs each at most once in the corpus-observed relative order. An EMPTY segment
-REJECTS the row (a real bar never renders `· ·` — corpus-verified), repeats are
-structurally impossible (each slot is consumed by advancing past it), and EVERY
-segment must be consumed (whole-row anchoring — leftover segments reject). The
-mode/hint literals stay lockstep-tested single-source with
-`_INPUT_READY_CHROME_MARKERS`; **(b)** NO option-row shape
+the FIRST non-blank row below the lone separator FULLMATCHES ONE COMPLETE ROW in
+`_is_status_row`'s **WHOLE-ROW ENUMERATION** (`_STATUS_ROW_TEMPLATES`). **This is
+the FIFTH round of one bug class, and its terminal fix.** Every earlier grammar
+validated the row PART-WISE and each round closed one combination while the next
+found another: r1's SUBTRACTIVE grammar let `❯ /effort?` through (a full gate
+bypass + a keyless brake release on a stale empty `❯` row); r2's per-segment
+fullmatch accepted `· /effort ·` via SKIPPED empty segments and cross-products
+(`/effort (manual mode on)`, `⏵◐⏸/effort`); r3's enumerated whitelist still
+validated each segment INDEPENDENTLY, so ANY RECOMBINATION passed (`/effort ·
+/effort`, a doubled paste hint, TWO incompatible mode markers, and `١ shell` —
+`\d` is Unicode-wide); and r3's ORDERED SLOT MACHINE still let MUTUALLY EXCLUSIVE
+slots coexist (`⏸ manual mode on · paste again to expand`, though the paste hint
+REPLACES the whole status bar) — **ordering + at-most-once does not imply
+COMPATIBILITY**. The segment set is small but the ROW space (order, count,
+repeats, digit width, compatibility) is large, so ANY per-part predicate is
+unsoundable here. The enumeration is a list of COMPLETE anchored rows, DERIVED
+from the real corpus, with ONLY the genuinely variable part parameterized (the
+shell COUNT, ASCII `[0-9]+` — NEVER `\d`; leg 3's substring shell token is
+ASCII-flipped in the same audit, while the refusal-side option-row traps and the
+idle-lane bg-shells parsers deliberately KEEP `\d`, where wider matching is
+fail-closed). Mutual exclusion, repetition, ordering and empty segments all stop
+being rules to enforce — they are **unrepresentable**: no template contains both a
+mode bar and the paste hint, so they cannot combine BY CONSTRUCTION.
+**BYTE DISCIPLINE:** the chrome region is explicitly OUTSIDE
+`_normalize_input_row`'s contract (which is scoped to the rows INSIDE the box), so
+the templates match **ASCII space only** and an NBSP variant of a real row REFUSES
+(corpus-verified safe: the NBSP CC emits lives in the INPUT row `❯\xa0`, never in a
+status bar). **ACCEPTED COST, stated in the code:** a REAL status bar whose shape
+is not in the list fails CLOSED — the fallback simply does not fire on that pane,
+i.e. EXACTLY today's shipped behavior (refuse), never a wrong commit. That is the
+correct direction and it is what makes enumeration acceptable. Two known-uncovered
+shapes: `accept edits on` / `plan mode on` (their glyph decoration is not
+corpus-observed — a guessed glyph would be fabrication) and the `◐ <level> ·
+/effort` indicator (corpus-verified to render ABOVE the input box, never as the
+first row BELOW the bottom rule — it is not a status-bar row at all). The
+enumeration is pinned by a NON-CIRCULAR corpus-coverage test — derived from the
+`>=2`-separator fixtures, the path that provably never consults `_is_status_row`
+(asserted by replacing the predicate with a bomb) — so a too-narrow enumeration
+fails LOUDLY instead of silently fail-closing panes; and every template is
+lockstep-tested to be leg-3-recognizable (template ⊆ leg-3 alphabet);
+**(b)** NO option-row shape
 (`_RE_INPUT_OPTION_ROW`) below the lone separator (Codex's "lone separator is a
 live prompt's TOP rule, `❯ 1. Yes` below it" spoof refuses even if (a) were
 spoofed); **(c)** the first non-blank row directly below the found top rule is a
