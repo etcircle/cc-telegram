@@ -3333,9 +3333,17 @@ def _footerless_decision_gate(pane_text: str) -> _FooterlessGate:
         return _FooterlessGate("no_block_top")
 
     # (3) modal-rule-adjacent REQUIRED title. ``_decision_prompt_block_top`` now
-    # treats the ``▔`` rule as a BLOCK TERMINATOR, so the title resolves to the
-    # line immediately below the rule; require that neighbour to BE the rule (a
-    # blank / ``─`` rule / prose terminator between them fails).
+    # treats the ``▔`` rule as a BLOCK TERMINATOR, so the resolved title is the
+    # TOP meaningful line of the pre-option block; require the neighbour ABOVE it
+    # to BE the rule — a blank line or a ``─`` rule between them fails.
+    # DISCLOSED (r2 review, argued): the resolved title is whatever line sits
+    # directly under the rule — a PROSE line there becomes the title, because
+    # "prose directly under the rule" is byte-structurally the SAME class as the
+    # genuine title+subtitle modal (gap3-03 has TWO contiguous meaningful lines
+    # under its rule; deleting the title line makes the subtitle the resolved
+    # title). Refusing it would require a content heuristic for "title-ness",
+    # which the generic detector forbids; the cost is a wrong TITLE STRING on a
+    # display-only card (footerless never dispatches).
     title_idx = _decision_prompt_block_top(lines, block_top_idx)
     if title_idx is None or title_idx < 1:
         return _FooterlessGate("no_title")
@@ -3346,14 +3354,18 @@ def _footerless_decision_gate(pane_text: str) -> _FooterlessGate:
         return _FooterlessGate("empty_title")
 
     # (4) VETOES. (a) named-surface anchors on the PRE-OPTION region ONLY
-    # (rule → line above option 1), NEVER the option rows.
+    # (rule → line above option 1), NEVER the option rows. The CLASSIFIED
+    # anchors are checked FIRST (Codex r1 P2-2 fold: a footer-dropped redraw of a
+    # named surface must refuse through ITS classification entry — assertable in
+    # the redraw matrix); the verb-agnostic question shape is the FALLBACK for
+    # NOVEL verbs outside `parse_permission_prompt`'s whitelist.
     for i in range(title_idx, block_top_idx):
         line = lines[i]
-        if _RE_VERB_AGNOSTIC_PERMISSION.match(line):
-            return _FooterlessGate("veto_verb_agnostic")
         for key, rx in _footerless_veto_anchors():
             if rx.search(line):
                 return _FooterlessGate(f"veto_anchor:{key}")
+        if _RE_VERB_AGNOSTIC_PERMISSION.match(line):
+            return _FooterlessGate("veto_verb_agnostic")
     # (b) attached-footer veto across the rule→terminal-options region (excludes
     # Decision's own numbered option rows) — a strict footer / hint row sitting
     # between the title and the terminal options is a malformed footered frame.

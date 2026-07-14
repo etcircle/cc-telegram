@@ -161,18 +161,42 @@ def test_rule_separated_from_title_by_blank_refuses() -> None:
     assert footerless_decision_reject_reason(frame) == "not_rule_adjacent"
 
 
-def test_rule_separated_from_title_by_prose_refuses() -> None:
+def test_prose_directly_under_the_rule_becomes_the_resolved_title_DISCLOSED() -> None:
+    """KNOWN-ACCEPTED disclosed residual (r2 review, ARGUED — not a silent pass).
+
+    A prose line inserted between the ▔ rule and the heading is byte-structurally
+    INDISTINGUISHABLE from the genuine title+subtitle modal: the REAL gap3-03
+    renders TWO contiguous meaningful lines directly under its rule ("Switch
+    model?" + the subtitle prose), so any content-blind predicate that refuses
+    "prose directly under the rule" refuses the genuine modal class too — proven
+    below by deleting gap3-03's title line, which makes its SUBTITLE (prose) the
+    rule-adjacent resolved title and still parses. The prescribed check ("the
+    line immediately below the rule must BE the resolved title") is already the
+    shipped gate (``_is_modal_rule(lines[title_idx - 1])`` on the walk-up top).
+    Consequence bound: a wrong TITLE STRING on a display-only card (options +
+    excerpt correct; the footerless variant never dispatches — the GH #52
+    footered-only fence). The BLANK-separation half of the plan's negative DOES
+    refuse (``test_rule_separated_from_title_by_blank_refuses``)."""
     frame = (
         f"{_MODAL_RULE}\n   prose line\n   Switch model?\n\n   ❯ 1. Yes\n     2. No\n"
     )
-    # The walk-up stops at the ▔ rule and returns the top meaningful line ("prose
-    # line"), whose neighbour above IS the rule — so the resolved title is "prose
-    # line", not "Switch model?". Rule-adjacency still holds structurally, but the
-    # named-anchor / attached-footer vetoes don't fire here. This documents that a
-    # multi-line pre-option block resolves its TOP line as the title.
     form = parse_generic_decision(frame)
     assert form is not None
     assert form.current_question_title == "prose line"
+
+    # The structural-indistinguishability proof: the REAL fixture minus its title
+    # line puts its subtitle PROSE directly under the rule — the same shape, and
+    # it MUST keep parsing (refusing it would refuse the whole multi-line modal
+    # class the positive fixtures pin).
+    real = _load(_POS_CLEAN)
+    mutated = "\n".join(
+        line for line in real.split("\n") if line.strip() != "Switch model?"
+    )
+    mform = parse_generic_decision(mutated)
+    assert mform is not None
+    assert mform.current_question_title == (
+        "Your next response will be slower and use more tokens"
+    )
 
 
 def test_title_less_block_refuses() -> None:
@@ -216,11 +240,6 @@ def test_malformed_footer_between_title_and_options_refuses() -> None:
     assert parse_generic_decision(frame) is None
 
 
-def test_verb_drifted_permission_shape_refuses() -> None:
-    frame = _synthetic_footerless(anchor="Do you want to open the file?")
-    assert footerless_decision_reject_reason(frame) == "veto_verb_agnostic"
-
-
 def test_settings_footer_between_title_and_options_refuses() -> None:
     # The exact Settings footer row (single-key hint segment) must be recognized by
     # the attached-footer veto's hint-row recognizer.
@@ -259,6 +278,63 @@ def test_stale_answered_folder_trust_above_live_footerless_detects(decision_on) 
     )
 
 
+# ── The r3 P1 preflight composites: stale VALIDATOR-LESS named surface above a
+# live footerless modal (r2 review P2-4 — the r3 pins mandated ALL THREE loose
+# validator-less families, not only the stale FOOTERED Decision above) ─────────
+
+# Each stale surface loose-matches its NAMED pattern (no strict validator), so
+# WITHOUT the preflight first-match-wins would return it and
+# `parse_generic_decision` would never run. Vacuity guard: each must extract as
+# its OWN name when it is the pane's terminal content.
+_STALE_AUQ = "  1. Alpha\n  2. Beta\n Enter to select · Esc to cancel\n"
+_STALE_EPM = " Would you like to proceed?\n\n ❯ 1. Yes\n   2. No\n Esc to cancel\n"
+_STALE_SETTINGS = (
+    " Select model\n\n ❯ 1. Default\n   2. Opus\n Enter to confirm · Esc to cancel\n"
+)
+
+
+@pytest.mark.parametrize(
+    "stale,own_name",
+    [
+        (_STALE_AUQ, "AskUserQuestion"),
+        (_STALE_EPM, "ExitPlanMode"),
+        (_STALE_SETTINGS, "Settings"),
+    ],
+    ids=["stale-auq", "stale-epm", "stale-settings"],
+)
+def test_stale_named_surface_above_live_footerless_decision_wins(
+    decision_on, stale: str, own_name: str
+) -> None:
+    # Vacuity guard: the stale surface ALONE is a genuine loose match of its
+    # named pattern (else the composite proves nothing about the preflight).
+    alone = extract_interactive_content(stale)
+    assert alone is not None and alone.name == own_name
+
+    composite = stale + "\n\n" + _load(_POS_CLEAN)
+    content = extract_interactive_content(composite)
+    assert content is not None
+    assert content.name == "Decision"
+    assert decision_variant_of(parse_generic_decision(composite)) == (
+        DECISION_VARIANT_FOOTERLESS
+    )
+
+
+def test_live_auq_with_stale_modal_chrome_above_stays_auq(decision_on) -> None:
+    # The INVERSE composite: a LIVE AUQ owns the pane bottom; stale ▔ modal
+    # chrome sits above it in scrollback. The footerless preflight must refuse
+    # (the AUQ footer is the last non-blank line — no terminal numbered block)
+    # and the named walk returns AskUserQuestion.
+    stale_chrome = (
+        f"{_MODAL_RULE}\n   old modal title\n   old body\n\n"
+        "   ❯ 1. Old one\n     2. Old two\n"
+    )
+    live_auq = "  1. Alpha\n  2. Beta\n Enter to select · Esc to cancel\n"
+    composite = stale_chrome + "\n\n" + live_auq
+    content = extract_interactive_content(composite)
+    assert content is not None
+    assert content.name == "AskUserQuestion"
+
+
 def test_stale_modal_rule_high_with_unrelated_bottom_list_refuses() -> None:
     # Stale ▔ chrome high in scrollback + an unrelated numbered list at pane bottom,
     # separated by a ≥2-blank CLEAN TERMINATOR gap (the rule is NOT attached to a
@@ -285,6 +361,11 @@ def test_literal_model_prose_pane_bottom_is_accepted_residual() -> None:
 # The validator-less patterns' DISTINCTIVE anchors: a dropped-footer redraw of each
 # named surface, ▔-adjacent, must refuse SPECIFICALLY through its classification
 # entry (assert the refusing veto entry, not just None).
+# One sample line per VETOED classification entry (r5 P2 fold, exact-reason):
+# each frame must refuse SPECIFICALLY through its own classification entry —
+# never merely "some veto*" — so the matrix exercises the veto WIRING, not just
+# rule-adjacency failure. The classified anchors run BEFORE the verb-agnostic
+# fallback (r2 fold), so permission:0's whitelisted-verb sample reports ITS entry.
 _VETOED_ANCHOR_SAMPLES: dict[str, str] = {
     "epm:0": "Would you like to proceed?",
     "epm:1": "Claude has written up a plan for you",
@@ -294,7 +375,24 @@ _VETOED_ANCHOR_SAMPLES: dict[str, str] = {
     "settings:0": "Settings: press tab to cycle",
     "settings:1": "Select model",
     "settings:2": "Settings Warning found",
+    "permission:0": "Do you want to allow this?",
+    "permission:1": "Claude wants to run a command",
+    "workflow:0": "Run a dynamic workflow?",
+    "workflow:1": "This dynamic workflow will do things",
+    "workflow:2": "Dynamic workflows can use tools",
 }
+
+
+def test_redraw_matrix_covers_every_vetoed_classification_entry() -> None:
+    """The sample map is EXHAUSTIVE over the VETOED classification entries
+    (set-equality — a future vetoed anchor without a redraw-matrix sample fails
+    here instead of silently escaping the matrix)."""
+    vetoed = {
+        f"{id_}:{idx}"
+        for (id_, idx, _p, _f), cls in tp._DECISION_ANCHOR_CLASSIFICATION.items()
+        if cls == tp._VETOED
+    }
+    assert set(_VETOED_ANCHOR_SAMPLES) == vetoed
 
 
 @pytest.mark.parametrize("key,anchor", sorted(_VETOED_ANCHOR_SAMPLES.items()))
@@ -305,20 +403,12 @@ def test_footer_dropped_redraw_refuses_via_its_veto_entry(
     assert footerless_decision_reject_reason(frame) == f"veto_anchor:{key}"
 
 
-def test_permission_workflow_dropped_footer_frames_refuse() -> None:
-    # Permission/Workflow have strict validators; their dropped-footer ▔-adjacent
-    # frames refuse via the verb-agnostic veto or their named anchor (either is a
-    # correct refusal — the point is they never footerless-parse).
-    for anchor in (
-        "Do you want to allow this?",  # verb-agnostic
-        "Claude wants to run a command",  # permission:1
-        "Run a dynamic workflow?",  # workflow:0
-        "This dynamic workflow will do things",  # workflow:1
-        "Dynamic workflows can use tools",  # workflow:2
-    ):
-        frame = _synthetic_footerless(anchor=anchor)
-        reason = footerless_decision_reject_reason(frame)
-        assert reason is not None and reason.startswith("veto")
+def test_novel_verb_permission_shape_refuses_via_verb_agnostic_fallback() -> None:
+    """A verb OUTSIDE ``parse_permission_prompt``'s whitelist ("open") matches no
+    classified anchor, so the verb-AGNOSTIC ``Do you want to…?`` veto is the
+    fallback that refuses it (the r2 reorder keeps classified anchors FIRST)."""
+    frame = _synthetic_footerless(anchor="Do you want to open the file?")
+    assert footerless_decision_reject_reason(frame) == "veto_verb_agnostic"
 
 
 def test_plain_numbered_auq_anchor_is_the_disclosed_dropped_footer_residual() -> None:
@@ -394,6 +484,18 @@ def test_full_corpus_names_unchanged_except_footerless_positives(both_gates_on) 
     # baseline can never silently drop a footerless positive.
     for name, expected in _GH52_EXPECTED_FLIPS.items():
         assert baseline[name] == expected
+
+
+def test_the_baked_baseline_covers_the_whole_fixture_directory(both_gates_on) -> None:
+    """SET EQUALITY between the fixture-directory listing and the baked JSON
+    (r2 review P3, the GH #56 input-box-baseline pattern): a future fixture
+    landing in the directory without a baked classification fails HERE instead
+    of silently escaping the corpus sweep."""
+    baseline = json.loads(
+        (_FIXTURES / "decision_footerless_corpus_baseline.json").read_text()
+    )
+    on_disk = {p.name for p in _FIXTURES.glob("*.txt")}
+    assert on_disk == set(baseline)
 
 
 # ── Fingerprint stability + variant separation ─────────────────────────────
@@ -524,8 +626,11 @@ def test_mixed_stale_footer_and_live_option_block(decision_on) -> None:
 @pytest.mark.usefixtures("fresh_handler_state")
 class TestFooterlessRouteStatePromotion:
     """A LIVE footerless Decision pane driven through the real
-    ``update_status_message`` seam promotes RUNNING → WAITING_ON_USER (typing off)
-    and publishes ONE card; flag OFF promotes nothing."""
+    ``update_status_message`` seam promotes RUNNING → WAITING_ON_USER (typing
+    off); flag OFF promotes nothing. The renderer is MOCKED here (the B1
+    promotion-test precedent); the UNMOCKED render/count + one-card/tombstone
+    interplay is pinned by the scenario
+    ``tests/scenarios/test_decision_footerless_card.py`` (r2 review P2-4)."""
 
     @pytest.fixture
     def mock_bot(self):
