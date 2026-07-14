@@ -4,6 +4,66 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.1] — 2026-07-14
+
+The "your reply-quoted message actually sends" release. Three fixes, all found in live use of
+0.4.0: a long or quoted message was typed into the terminal but never submitted (and then wedged
+the whole topic), question cards carrying ASCII mockups rendered as garbage, and the bot posted
+duplicate copies of its own messages whenever the network was slow.
+
+### Fixed
+- **A tall multi-line draft no longer false-refuses, and no longer wedges the topic (GH #56).**
+  A reply-quoted message (~700 chars over ~18 rendered rows — under Claude Code's paste-collapse
+  threshold, so it renders in full) pushed the input box's top border above the delivery gate's
+  fixed 20-line scan window. The gate concluded the input box had vanished, withheld the Enter,
+  armed the stranded-draft brake, and then refused the *next* message too. Two legitimate messages
+  refused, one left sitting unsent in the pane — on the single most common way of replying.
+  - The gate now scans **upward** for the box's top border when only one border is in view,
+    authorized by a three-part structural proof that the border it found is really the box's
+    bottom: a canonical status bar directly below it, no option-row-shaped line below it, and a
+    prompt-glyph row directly under the located top border. The brake's release probe inherits the
+    fix through the same seam.
+  - **The status-bar recognizer took six review rounds and one approach change.** Each round, a
+    different malformed row slipped through (fragment matching, empty segments, cross-products,
+    repeated segments, two modes at once, mode + paste-hint, Unicode digits, non-breaking spaces,
+    mismatched glyphs) — and every one of those would have let a **live question card be read as a
+    ready input box**, i.e. the exact "type into a prompt and commit the highlighted option" hazard
+    the 0.4.0 gate exists to prevent. Per-fragment validation was abandoned for a canonical ordered
+    grammar in which malformed rows are *unrepresentable* rather than merely rejected.
+  - **Soundness is not enough — completeness matters too.** An intermediate design whitelisted whole
+    rows drawn from the test fixtures; it was safe, and it would have silently kept the bug alive on
+    real machines, because live sessions render status bars (`… · ctrl+t to hide tasks · …`) that the
+    fixtures never captured. The shipped grammar is pinned against live-sampled bars as well as the
+    fixture corpus.
+- **`/esc` can finally clear a stranded draft (GH #56).** On Claude Code 2.1.209 a **single Escape
+  clears nothing** — not even a one-line draft — so the refusal message telling you to use `/esc`
+  was wrong for *every* draft, not just tall ones. Two rapid Escapes are the only safe full clear
+  (Ctrl+U kills just one line; Ctrl+C clears but a second press exits Claude to a bare shell, so the
+  bridge never sends it). `/esc` on a braked window now performs that double-Escape — but only after
+  proving the box actually holds text, and it sends **zero keystrokes** if a card or an unreadable
+  frame is on the pane. Refusal copy corrected to match reality.
+- **No more duplicate messages when the network is slow (GH #55).** The MarkdownV2→plain-text
+  fallback caught *every* exception, including `TimedOut` — but a client-side timeout does not mean
+  the request failed: Telegram usually delivered the formatted message anyway, so the "fallback"
+  posted a second, plain copy. The fallback now fires only when the content provably did **not**
+  reach Telegram (a `BadRequest` rejection, or a formatting error before the request left). Ambiguous
+  transients log and stop.
+  - Scoped to the four *send* paths. The edit lanes deliberately keep the broad fallback: an edit
+    cannot mint a second message, and removing it would have pushed message recreation up into the
+    callers.
+  - Trade-off, accepted: a timeout whose request genuinely never arrived now loses that message
+    (visible in the log; `/history` and the transcript remain the escape hatch) — better than routine
+    duplicates under load.
+
+### Added
+- **Option previews in question cards (GH #54).** Claude Code ≥2.1.197 lets an `AskUserQuestion`
+  option carry a `preview` — a multi-line ASCII mockup. These panes previously parsed as garbage:
+  no details card, no option buttons. Now the mockups render as monospace blocks in the 📋 details
+  message, posted before a short labels-only selection card, and the option buttons work — a tap
+  navigates, verifies, and commits, including the wrapped-label case where Claude Code drops the `❯`
+  cursor and marks the selection with styling alone. Multi-select previews are shown too (the
+  terminal doesn't render them at all, so the details card is the only place they're visible).
+
 ## [0.4.0] — 2026-07-12
 
 The "safe to type at a live prompt" release. Sending a message while Claude was waiting on a
