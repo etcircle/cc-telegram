@@ -1,25 +1,23 @@
-"""GH #54 W5 — the partial/untrusted-pane notices are copy-honest (r1 P2-1).
+"""GH #54 W5 — the card copy is a DRY-RUN of the free-text executor (r1→r4).
 
-Three dishonest notices used to promise "send your answer (as text)" on EVERY
-partial/untrusted AUQ pane. All three now route through
-``free_text.advertises_free_text``, which REUSES the free-text executor's OWN
-gates (r3 structural remedy — never a mirrored list): the shared shape gate
-``_auq_form_shape`` (single-question single-select + a live affordance +
-COMPLETE contiguous options + a PROVEN cursor), the executor's anchor reader
-``read_surface_anchor`` (no PreToolUse side file ⇒ ``surface_anchor_lost`` ⇒
-nav-only), and flag ON × licensed CC version. The r1 P2-1 consequence pinned
-here: the notices fire
-precisely on partial/scrolled/unparseable panes — shapes the EXECUTOR refuses
-(``options_complete`` False / no parseable form) — so on a LICENSED version
-(the fake tmux default ``pane_current_command`` IS the licensed 2.1.207) they
-must STILL say nav-only. The earlier flag × license × affordance predicate
-said "send your answer as text" there while the send was refused.
+Three dishonest notices (plus ``card_hint``) used to promise "send your answer
+(as text)" where the executor would REFUSE the send. Three predicate rounds —
+flag × license × affordance (r1), a mirrored gate list (r2), a shared shape
+gate + anchor EXISTENCE (r3) — each left reproduced over-advertising states;
+the r4 class diagnosis is that ANY parallel predicate loses. The copy is now
+decided by ``free_text.advertises_free_text``, which DRY-RUNS
+``free_text.plan_pre_keystroke`` — the ONE callable ``try_answer`` consumes
+for its own pre-keystroke phase — on the SAME raw inputs the executor would
+see: the RAW captured pane pair (never the resolver-MERGED form, which
+restores missing options / forces completeness / synthesizes option-1's
+cursor), the executor's anchor reader with anchor–pane AGREEMENT, the
+stranded-draft brake, the Claude proof-of-life, and the version license.
 
-These drive the public seam (``handle_interactive_ui``) with a fake bot / fake
-tmux and the REAL predicate — no monkeypatch of the predicate (the r1 P2-1
-test defect: boolean substitution hid the executor mismatch). The predicate's
-own truth table, including the text-advertising branch (c) that partial panes
-can never reach, is pinned in ``test_free_text_parser.py`` with real forms.
+These drive the public seam (``handle_interactive_ui``) with a fake bot /
+fake tmux, FRESH ``side_file_ok`` shapes (the r3 tests concealed the merged-
+form hole by using AGED side files, which force the pane/bail form), and the
+REAL predicate + reader end-to-end. The delegation pins (both consumers call
+the SAME function) live in ``test_free_text_parser.py``.
 """
 
 from __future__ import annotations
@@ -30,7 +28,8 @@ from typing import Any
 
 import pytest
 
-from cctelegram.handlers import free_text, interactive_ui
+from cctelegram.handlers import auq_source, free_text, interactive_ui
+from cctelegram.tmux_manager import tmux_manager as _tmux_singleton
 from cctelegram.utils import app_dir
 from tests.conftest import ScenarioHarness
 
@@ -159,8 +158,10 @@ _TITLE = "What should we do next?"
 def _flag_on():
     """The REAL predicate with the flag ON — never a boolean substitute."""
     free_text.set_enabled(True)
+    _tmux_singleton.reset_stranded_drafts_for_tests()
     yield
     free_text.set_enabled(True)
+    _tmux_singleton.reset_stranded_drafts_for_tests()
 
 
 # ── Notice 1: the partial-pane "Only options N-M visible" line ────────────────
@@ -292,3 +293,106 @@ async def test_complete_pane_WITH_live_side_file_still_promises_free_text(
 # ``test_free_text_parser`` (a rescue's unparseable pane yields a form with no
 # complete options ⇒ nav-only by the same legs). A per-render divergence
 # between the three notices is therefore unreachable by construction.
+
+
+# ── The r4 reproduced states — FRESH side_file_ok shapes (never aged) ─────────
+#
+# The r3 scenarios used AGED side files, which force the pane/bail form and so
+# CONCEALED the merged-form hole: on a FRESH consistent side file the resolver
+# returns side_file_ok and ``resolve_ask_form`` restores missing options,
+# forces ``options_complete=True`` and synthesizes option-1's cursor — the
+# probe-confirmed premise each test below asserts before its copy assertion.
+# The executor reparses the RAW pane at send time and refuses these shapes,
+# so the copy must be nav-only whatever the merged form claims.
+
+
+@pytest.mark.asyncio
+async def test_r4a_partial_raw_pane_with_FRESH_side_file_is_nav_only(
+    scenario: ScenarioHarness,
+):
+    """(i) The reviewer shape: raw pane shows [2,3] (incomplete) but the FRESH
+    consistent side file merges to a complete cursored form — the r3
+    form-based predicate advertised here while the executor refuses."""
+    pane = _partial_pane([(2, _LABELS[1]), (3, _LABELS[2])], cursor_number=2)
+    wid = _bind(scenario, pane)
+    _write_side_file(_single_q_input(_LABELS, title=_TITLE), aged=False)
+
+    # Premise guard — the merged form IS the over-claiming shape.
+    r = auq_source.resolve_auq_source_for_render(wid, pane)
+    assert r.decision == "side_file_ok"
+    assert r.form is not None and r.form.options_complete is True
+    assert [o.number for o in r.form.options] == [1, 2, 3]
+
+    await _render(scenario, wid)
+    picker = _picker_text(scenario)
+    assert free_text.HINT_NO_FREE_TEXT in picker
+    assert free_text.HINT_FREE_TEXT not in picker
+    assert _TEXT_SUFFIX not in picker
+
+
+@pytest.mark.asyncio
+async def test_r4a_cursorless_raw_pane_with_FRESH_side_file_is_nav_only(
+    scenario: ScenarioHarness,
+):
+    """(ii) The raw pane parses NO cursor; the merged form SYNTHESIZES
+    option-1's cursor. The executor's fresh parse has no proven cursor ⇒ the
+    send would bail ⇒ nav-only copy."""
+    pane = (
+        f"{_TITLE}\n"
+        "\n"
+        f"  1. {_LABELS[0]}\n"
+        f"  2. {_LABELS[1]}\n"
+        f"  3. {_LABELS[2]}\n"
+        "  4. Type something.\n"
+        "\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    )
+    wid = _bind(scenario, pane)
+    _write_side_file(_single_q_input(_LABELS, title=_TITLE), aged=False)
+
+    # Premise guard — the merged form carries a SYNTHESIZED cursor.
+    r = auq_source.resolve_auq_source_for_render(wid, pane)
+    assert r.form is not None and any(o.cursor for o in r.form.options)
+
+    await _render(scenario, wid)
+    picker = _picker_text(scenario)
+    assert free_text.HINT_NO_FREE_TEXT in picker
+    assert free_text.HINT_FREE_TEXT not in picker
+    assert _TEXT_SUFFIX not in picker
+
+
+@pytest.mark.asyncio
+async def test_r4b_mismatched_side_file_with_complete_pane_is_nav_only(
+    scenario: ScenarioHarness,
+):
+    """(iii) A VALID side file whose labels do not describe this pane: the
+    anchor EXISTS (the r3 leg passed) but the executor's ``derive_identity``
+    requires anchor–pane AGREEMENT and declines — a stable state, not the
+    render→send race."""
+    wid = _bind(scenario, _complete_pane())
+    _write_side_file(
+        _single_q_input(["X) other", "Y) other", "Z) other"], title="Different?"),
+        aged=False,
+    )
+    await _render(scenario, wid)
+    picker = _picker_text(scenario)
+    assert free_text.HINT_NO_FREE_TEXT in picker
+    assert free_text.HINT_FREE_TEXT not in picker
+    assert _TEXT_SUFFIX not in picker
+
+
+@pytest.mark.asyncio
+async def test_r4c_braked_window_with_fresh_agreeing_card_is_nav_only(
+    scenario: ScenarioHarness,
+):
+    """(iv) The stranded-draft brake: every send is refused while it is up, so
+    a fresh card must not advertise a text answer. The brake is part of the
+    executor's pre-keystroke phase, which the copy dry-runs."""
+    wid = _bind(scenario, _complete_pane())
+    _write_side_file(_single_q_input(_LABELS, title=_TITLE), aged=False)
+    _tmux_singleton.mark_window_stranded_draft(wid)
+    await _render(scenario, wid)
+    picker = _picker_text(scenario)
+    assert free_text.HINT_NO_FREE_TEXT in picker
+    assert free_text.HINT_FREE_TEXT not in picker
+    assert _TEXT_SUFFIX not in picker

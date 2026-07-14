@@ -1509,19 +1509,20 @@ async def _notify_waiting_dm(
 _CARD_BODY_CHAR_CAP = 3800
 
 # GH #54 W5 — the tail of the three partial/untrusted-pane notices. The
-# text-answer suffix is used ONLY where a plain message would actually be taken
-# (``free_text.advertises_free_text``, which REUSES the executor's own shape
-# gate ``_auq_form_shape`` — single-Q single-select + live affordance +
-# COMPLETE options + a PROVEN cursor — plus the executor's anchor reader
-# ``read_surface_anchor`` and flag × license; r1 P2-1 → r3: a mirrored gate
-# LIST drifted twice — first missing ``options_complete``, then the cursor
-# and anchor legs — so the predicate now CALLS the executor's own gates
-# instead of copying them); everything else — a preview single-select, a
-# partial/scrolled pane, a multi-question form, a cursor-less frame, an
-# anchor-less window (no PreToolUse side file), an unlicensed version, the
-# flag off — points at the keystroke nav row instead, so the notice can never
-# promise what PR-1's gate would refuse. Honest-at-render (disclosed): the
-# executor's own gates stay the authority at send time.
+# text-answer suffix is used ONLY where a plain message would actually be
+# taken: ``free_text.advertises_free_text`` DRY-RUNS the executor's OWN
+# pre-keystroke phase (``free_text.plan_pre_keystroke`` — the callable
+# ``try_answer`` itself consumes) on the RAW captured pane pair + the
+# executor's anchor reader (r1→r4: three parallel-predicate rounds each left a
+# reproduced over-advertising state — the merged form restores options, forces
+# completeness and synthesizes cursors; anchor EXISTENCE isn't anchor–pane
+# AGREEMENT; the brake was omitted — the r4 class diagnosis is that ANY
+# parallel predicate loses). Everything else — a preview single-select, a
+# partial/scrolled RAW pane, a multi-question form, a cursor-less frame, a
+# missing/mismatched anchor, a braked window, an unlicensed version, the flag
+# off — points at the keystroke nav row instead, so the copy can never promise
+# what the executor would decline (⇒ PR-1's refusal). Honest-at-render
+# (disclosed): the executor's own gates stay the authority at send time.
 _NOTICE_NAV_OR_TEXT = "use ↑/↓/Tab below or send your answer as text."
 _NOTICE_NAV_ONLY = "use the ↑/↓/⏎ keys below."
 
@@ -3798,22 +3799,22 @@ async def handle_interactive_ui(
         # pick buttons, and tell the user to use manual navigation/text.
         p14_suppress_picks = False
         partial_options_notice: str | None = None
-        # GH #54 W5: the notice suffix tracks whether the free-text executor
-        # would ACTUALLY take a plain message on this pane —
-        # ``free_text.advertises_free_text`` REUSES the executor's own shape
-        # gate (``_auq_form_shape``: single-Q single-select + affordance +
-        # COMPLETE options + a PROVEN cursor) AND its anchor reader
-        # (``read_surface_anchor`` — no PreToolUse side file ⇒ the executor
-        # declines ⇒ nav-only copy), on top of flag × license. So a preview
-        # single-select, a scrolled/partial pane, a multi-question form, a
-        # cursor-less frame, an anchor-less window, or an unlicensed version
-        # never advertises a text answer PR-1 would refuse. Honest-at-render:
-        # the executor's own gates remain the authority at send time.
+        # GH #54 W5 (r4): the notice suffix is a DRY-RUN of the free-text
+        # executor's OWN pre-keystroke phase (``free_text.plan_pre_keystroke``,
+        # via ``advertises_free_text``) on the SAME raw inputs the executor
+        # would see — the RAW captured pane pair, the executor's anchor reader,
+        # the stranded-draft brake, the Claude proof + license. NEVER the
+        # resolver-MERGED ``form`` (the merge restores missing options, forces
+        # ``options_complete`` and synthesizes option-1's cursor, so a
+        # merged-form predicate advertised on partial/cursorless raw panes the
+        # executor refuses — the r4(a) repro; the merged form stays what
+        # renders the card BODY). Honest-at-render: the executor's own gates
+        # remain the authority at send time.
         _advertises_free_text = free_text.advertises_free_text(
             free_text.SURFACE_AUQ,
             version=w.pane_current_command,
-            form=form,
             window_id=window_id,
+            pane_text=pane_text,
             ansi_pane=pane_ansi,
         )
         _nav_suffix = _NOTICE_NAV_OR_TEXT if _advertises_free_text else _NOTICE_NAV_ONLY
@@ -3919,19 +3920,19 @@ async def handle_interactive_ui(
                             f"Tap-to-select is off on a scrolled screen — {_nav_suffix}"
                         )
             # §2.5: the card's free-text line must state the CURRENT truth for
-            # THIS surface. ``card_hint`` routes through the SAME
-            # executor-parity predicate as the notices above (GH #54 W5 r1
-            # P2-1) and is fed the RESOLVER ``form`` (the live-pane proxy the
-            # executor's fresh parse will agree with — never the swapped
-            # ``display_form``, whose side-file completeness would overclaim
-            # on a scrolled pane); everything ineligible points at the buttons.
+            # THIS surface. ``card_hint`` routes through the SAME executor
+            # dry-run as the notices above (GH #54 W5 r4) and is fed the RAW
+            # captured pane pair — never the resolver ``form`` or the swapped
+            # ``display_form``, whose merged completeness / synthesized cursor
+            # would overclaim on a pane the executor's fresh parse refuses;
+            # everything ineligible points at the buttons.
             structured = _render_ask_user_question(
                 display_form,
                 free_text_hint=free_text.card_hint(
                     free_text.SURFACE_AUQ,
                     version=w.pane_current_command,
-                    form=form,
                     window_id=window_id,
+                    pane_text=pane_text,
                     ansi_pane=pane_ansi,
                 ),
             )

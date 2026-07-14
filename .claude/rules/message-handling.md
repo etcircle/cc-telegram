@@ -1653,41 +1653,49 @@ ignoring `preview` for the FORM, so the side file's form fingerprint is UNCHANGE
 W3 (a move would orphan live pick tokens across the deploy — pinned to a hardcoded
 value). No route_runtime change, no new state file, no observer.
 
-**W5 — copy honesty (three notices).** The untrusted-render notice plus the two
-partial-pane notices in `interactive_ui` all used to promise "send your answer (as
-text)" on EVERY partial/untrusted pane — including preview single-selects and
-unlicensed versions where PR-1's gate REFUSES a plain message. All three now compose
-their suffix from ONE per-render `_nav_suffix`, decided by
-`free_text.advertises_free_text(surface, version=…, form=…, window_id=…,
-ansi_pane=…)` — the predicate `card_hint` also routes through. **Its composition is
-REUSE, never a mirrored list (r1 P2-1 → r3: an enumerated gate copy drifted TWICE —
-the r1 flag × license × affordance form missed `options_complete` and
-multi-question, the r2 mirrored list missed the CURSOR-GEOMETRY leg — `_auq_shape`
-also requires a proven cursor or a positively-cursored affordance row — and the
-MANDATORY PreToolUse ANCHOR — `_observe` declines `surface_anchor_lost` without a
-side file; reuse kills the drift class):** (1) flag ON × licensed CC version;
-(2) the executor's OWN shape gate `free_text._auq_form_shape` — the ONE helper
-`_auq_shape` itself delegates to (single-question single-select, not the review
-screen, a live free-text affordance, a COMPLETE contiguous option list, AND a
-proven cursor — glyph/SGR on an option, or the ANSI-read affordance-row cursor;
-no ANSI + no cursor fails closed); (3) the MANDATORY occurrence anchor through the
-SAME reader the executor trusts (`free_text.read_surface_anchor` →
-`auq_source.peek_surface_anchor_for_window` — no side file / no fresh session-map
-entry / no `tool_use_id` ⇒ nav-only). ALL legs pass ⇒ "use ↑/↓/Tab below or send
-your answer as text."; ANY leg fails ⇒ "use the ↑/↓/⏎ keys below." A preview
-single-select (`is_free_text=False`), every partial/scrolled pane, a cursor-less
-frame, and an ANCHOR-LESS window (no PreToolUse side file — a complete licensed
-pane included) therefore never advertise text answers. **Disclosed
-(honest-at-render):** the copy is computed at RENDER time — the anchor can vanish
-or the pane can change before the user sends; the executor's own gates remain the
-authority at send time (a promised send can still take PR-1's refusal, never a
-wrong keystroke). Pinned by scenarios driving the REAL predicate + reader (never a
-boolean substitute — incl. the complete-pane-NO-side-file nav-only flip and the
-side-file-anchored positive control), real-form unit pins for every reviewer
-shape, and the r3 P3 parity SWEEP: over all gate axes,
-`advertises_free_text(...) is True ⇒ _auq_form_shape(form, ansi) is not None`,
-plus a delegation pin proving `_auq_shape` IS the shared gate over a fresh pane
-parse. Pull-only; no observer (c313657 stays forbidden).
+**W5 — copy honesty: the card copy is a DRY-RUN of the executor (r1→r4).** The
+untrusted-render notice plus the two partial-pane notices in `interactive_ui` (and
+`card_hint`) used to promise "send your answer (as text)" where the executor would
+REFUSE the send. **Four review rounds established the class diagnosis: ANY parallel
+predicate loses** — r1's flag × license × affordance missed `options_complete` +
+multi-question; r2's mirrored gate list missed cursor geometry + the anchor; r3's
+shared shape gate + anchor EXISTENCE still over-advertised on three REPRODUCED
+states: (a) it consumed the resolver-MERGED form, which on a fresh consistent side
+file RESTORES missing options, FORCES `options_complete=True` and SYNTHESIZES
+option-1's cursor while the executor reparses the RAW pane; (b) anchor existence is
+not anchor–pane AGREEMENT (`derive_identity` declines a valid-but-mismatched side
+file); (c) the STRANDED-DRAFT BRAKE was omitted. The structural remedy: the
+executor's ENTIRE pre-keystroke eligibility phase is ONE callable,
+`free_text.plan_pre_keystroke(surface, version=…, window_id=…, pane_text=…,
+ansi_pane=…, anchor=…) -> FreeTextPlan | decline-reason` — the lane flag, the
+brake peek (`tmux_manager.window_has_stranded_draft`; lock-free at render,
+disclosed), the strict Claude proof-of-life, the full `plan_from_pane` (pane
+ownership + `_auq_shape` + `derive_identity` with the MANDATORY anchor and
+anchor–pane agreement, exactly as `_observe`/`try_answer` apply them), and the
+version license — and **`try_answer`'s `_answer_locked` CONSUMES that same
+callable for its own phase** (its early brake check keeps the documented
+before-any-capture ordering and re-checks the same one registry; the cmd-probe
+TIMEOUT is the only classification outside it — the Claude proof itself is a phase
+leg). `advertises_free_text(surface, version=…, window_id=…, pane_text=…,
+ansi_pane=…)` = read the anchor via the executor's `read_surface_anchor`, then
+dry-run `plan_pre_keystroke` on the render seam's ALREADY-captured RAW pane pair
+(no new tmux round-trips) — **the MERGED form is no longer consulted for the copy
+decision** (it stays what renders the card body). Phase yields a plan ⇒ "use
+↑/↓/Tab below or send your answer as text."; any decline ⇒ "use the ↑/↓/⏎ keys
+below." **Disclosed (honest-at-render):** the copy is computed at RENDER time —
+the anchor can vanish or the pane can change before the user sends; the
+executor's own gates remain the authority at send time (a promised send can still
+take PR-1's refusal, never a wrong keystroke). Pinned by: scenarios through the
+REAL render callsite with FRESH `side_file_ok` shapes (the r3 tests concealed the
+merge hole with AGED side files) — partial raw pane + merged-complete side file ⇒
+nav-only, cursorless raw pane + synthesized-cursor merge ⇒ nav-only, mismatched
+side file + complete pane ⇒ nav-only, braked window ⇒ nav-only, and the genuine
+positive control (complete cursored pane + agreeing live side file, real anchor
+path) ⇒ text-advertising; plus the DELEGATION PINS replacing the r3 tautological
+sweep — interception tests proving `advertises_free_text` and `try_answer`'s
+pre-keystroke phase call the SAME `plan_pre_keystroke` (either consumer growing a
+private gate fails them), with direct real-pane pins on every phase decline.
+Pull-only; no observer (c313657 stays forbidden).
 
 ## Inbound delivery gate — text on a live interactive surface (GH #50 PR-1)
 

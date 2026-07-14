@@ -283,355 +283,260 @@ class TestTheInputBoxIsNeverPresentOnThese:
         assert tp.pane_input_box_present(pane) is False
 
 
-def _real_form(
-    *,
-    n_options: int = 3,
-    first_number: int = 1,
-    is_free_text: bool = True,
-    options_complete: bool = True,
-    select_mode: str = "single",
-    is_review_screen: bool = False,
-    multi_question: bool = False,
-    cursored: bool = True,
-):
-    """A REAL ``AskUserQuestionForm`` shaped like the executor's inputs.
+# ── GH #54 W5 (r4) — the card-copy predicate IS the executor's phase ───────
+#
+# Four rounds established the class diagnosis: ANY parallel predicate loses
+# (r1 flag×license×affordance, r2 mirrored gate list, r3 shared shape gate +
+# anchor EXISTENCE — each round left a reproduced over-advertising state).
+# The stable form: ``advertises_free_text`` DRY-RUNS ``plan_pre_keystroke`` —
+# the ONE callable ``try_answer`` consumes for its own pre-keystroke phase —
+# on the same raw inputs. Behavior below is pinned on the REAL callable with
+# REAL panes; the delegation pins prove both consumers call the SAME function.
 
-    GH #54 W5 r1 P2-1 → r3: the predicate pins below must never substitute a
-    boolean for the predicate — they drive ``advertises_free_text`` with the
-    same form fields the executor's ``_auq_form_shape`` gate consumes,
-    including the r3 cursor-geometry axis (``cursored=False`` parses NO ❯).
-    """
-    options = tuple(
-        tp.AskOption(
-            label=f"Opt {n}",
-            recommended=False,
-            cursor=(cursored and n == first_number),
-            number=n,
-        )
-        for n in range(first_number, first_number + n_options)
+_W5_WID = "@77"
+
+_W5_PANE = (
+    "What should we do next?\n"
+    "\n"
+    "❯ 1. A) alpha\n"
+    "  2. B) beta\n"
+    "  3. C) gamma\n"
+    "  4. Type something.\n"
+    "\n"
+    "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+)
+_W5_PARTIAL = (
+    "❯ 2. B) beta\n"
+    "  3. C) gamma\n"
+    "  4. Type something.\n"
+    "\n"
+    "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+)
+_W5_CURSORLESS = _W5_PANE.replace("❯ 1.", "  1.")
+
+
+def _w5_anchor(labels: list[str] | None = None, key: str = "auq:sid:S:tu:toolu_X"):
+    from cctelegram.handlers.auq_source import SurfaceAnchor
+
+    return SurfaceAnchor(
+        key=key,
+        tool_input={
+            "questions": [
+                {
+                    "question": "What should we do next?",
+                    "header": "Scope",
+                    "options": [
+                        {"label": lbl}
+                        for lbl in (labels or ["A) alpha", "B) beta", "C) gamma"])
+                    ],
+                    "multiSelect": False,
+                }
+            ]
+        },
     )
-    questions: tuple = ()
-    if multi_question:
-        questions = (
-            tp.AskQuestion(title="Q1?", header="A", options=options),
-            tp.AskQuestion(title="Q2?", header="B", options=options),
-        )
-    return tp.AskUserQuestionForm(
-        options=options,
-        is_free_text=is_free_text,
-        options_complete=options_complete,
-        select_mode=select_mode,  # type: ignore[arg-type]
-        is_review_screen=is_review_screen,
-        questions=questions,
-    )
 
 
-_WID = "@77"
+class TestPlanPreKeystrokePhase:
+    """The shared pre-keystroke phase, driven directly with real panes.
 
-
-class TestAdvertisesFreeTextPredicate:
-    """GH #54 W5 (r1 P2-1 → r3) — the card-copy gate REUSES the executor.
-
-    ``advertises_free_text`` is the ONE predicate behind ``card_hint`` AND the
-    three partial/untrusted-pane notices in ``interactive_ui``. It is composed
-    of flag × license, the executor's OWN shape gate (``_auq_form_shape`` —
-    the helper ``_auq_shape`` itself delegates to; no mirrored gate list left
-    anywhere), and the executor's OWN anchor reader (``read_surface_anchor``
-    — the ``surface_anchor_lost`` authority). Every pin here drives the REAL
-    predicate with a REAL form — never a boolean substitute. The anchor fact
-    is held TRUE via the reader seam except where the anchor leg itself is
-    the pin.
+    Every state the r4 review reproduced against the parallel predicates is a
+    DECLINE of this one callable: the partial raw pane, the cursorless raw
+    pane, the mismatched anchor (agreement, not existence), the braked window
+    — plus the r1-r3 legs (license, flag, Claude proof, missing anchor).
     """
 
     @pytest.fixture(autouse=True)
-    def _flag_on_anchor_true(self, monkeypatch):
+    def _clean(self):
         from cctelegram.handlers import free_text as ft
+        from cctelegram.tmux_manager import tmux_manager
 
         ft.set_enabled(True)
-        # Hold the anchor fact TRUE through the SAME reader the executor
-        # trusts — the shape/license axes are what each pin varies.
-        monkeypatch.setattr(ft, "read_surface_anchor", lambda wid: object())
+        tmux_manager.reset_stranded_drafts_for_tests()
         yield
         ft.set_enabled(True)
+        tmux_manager.reset_stranded_drafts_for_tests()
 
-    def test_c_licensed_complete_single_q_single_select_advertises(self):
+    def _run(self, *, pane=_W5_PANE, version="2.1.207", anchor="default"):
         from cctelegram.handlers import free_text as ft
 
+        return ft.plan_pre_keystroke(
+            ft.SURFACE_AUQ,
+            version=version,
+            window_id=_W5_WID,
+            pane_text=pane,
+            ansi_pane=pane,
+            anchor=_w5_anchor() if anchor == "default" else anchor,
+        )
+
+    def test_complete_cursored_agreeing_licensed_yields_a_plan(self):
+        from cctelegram.handlers import free_text as ft
+
+        phase = self._run()
+        assert isinstance(phase, ft.FreeTextPlan)
+        assert phase.target_row == 4
+
+    def test_partial_raw_pane_declines(self):
+        assert self._run(pane=_W5_PARTIAL) == "no_free_text_surface"
+
+    def test_cursorless_raw_pane_declines(self):
+        assert self._run(pane=_W5_CURSORLESS) == "no_free_text_surface"
+
+    def test_missing_anchor_declines(self):
+        assert self._run(anchor=None) == "no_free_text_surface"
+
+    def test_mismatched_anchor_declines(self):
+        """r4(b): anchor–pane AGREEMENT, not existence — a valid side file
+        naming DIFFERENT labels is a card the executor will not type into."""
+        bad = _w5_anchor(labels=["Different 1", "Different 2", "Different 3"])
+        assert self._run(anchor=bad) == "no_free_text_surface"
+
+    def test_braked_window_declines(self):
+        """r4(c): the stranded-draft brake is part of the phase."""
+        from cctelegram.tmux_manager import tmux_manager
+
+        tmux_manager.mark_window_stranded_draft(_W5_WID)
+        assert self._run() == "stranded_draft"
+
+    def test_non_claude_version_declines(self):
+        assert self._run(version=None) == "not_claude"
+        assert self._run(version="bash") == "not_claude"
+
+    def test_unlicensed_version_declines(self):
+        assert self._run(version="9.9.9").startswith("unlicensed:")
+
+    def test_flag_off_declines(self):
+        from cctelegram.handlers import free_text as ft
+
+        ft.set_enabled(False)
+        assert self._run() == "disabled"
+
+
+class TestDryRunDelegationPins:
+    """r4 P3 — both consumers call the SAME function, proven by interception.
+
+    Parity is BY CONSTRUCTION (one callable); these pins fail if EITHER
+    consumer grows a private eligibility gate that bypasses it (the predicate
+    would stop calling it, or the executor's phase would stop flowing through
+    it).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from cctelegram.handlers import free_text as ft
+        from cctelegram.tmux_manager import tmux_manager
+
+        ft.set_enabled(True)
+        tmux_manager.reset_stranded_drafts_for_tests()
+        tmux_manager.reset_window_send_locks_for_tests()
+        yield
+        ft.set_enabled(True)
+        tmux_manager.reset_stranded_drafts_for_tests()
+
+    def test_advertises_is_exactly_the_phase_dry_run(self, monkeypatch):
+        from cctelegram.handlers import free_text as ft
+
+        calls: list[dict] = []
+        real = ft.plan_pre_keystroke
+
+        def probe(surface, **kw):
+            calls.append(kw)
+            return real(surface, **kw)
+
+        monkeypatch.setattr(ft, "plan_pre_keystroke", probe)
+        monkeypatch.setattr(ft, "read_surface_anchor", lambda wid: _w5_anchor())
         assert (
             ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.207", form=_real_form(), window_id=_WID
+                ft.SURFACE_AUQ,
+                version="2.1.207",
+                window_id=_W5_WID,
+                pane_text=_W5_PANE,
+                ansi_pane=_W5_PANE,
             )
             is True
         )
-
-    def test_a_licensed_affordance_but_INCOMPLETE_options_is_nav_only(self):
-        """The r1 reviewer shape: a scrolled picker showing options 2-3 +
-        ``Type something.`` parses ``is_free_text=True,
-        options_complete=False`` — the executor bails, so the copy must too."""
-        from cctelegram.handlers import free_text as ft
-
-        form = _real_form(first_number=2, options_complete=False)
-        assert form.is_free_text is True  # the affordance alone must NOT win
-        assert (
-            ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.207", form=form, window_id=_WID
-            )
-            is False
-        )
-
-    def test_b_licensed_affordance_but_MULTI_QUESTION_is_nav_only(self):
-        from cctelegram.handlers import free_text as ft
-
-        form = _real_form(multi_question=True)
-        assert (
-            ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.207", form=form, window_id=_WID
-            )
-            is False
-        )
-
-    def test_d_preview_single_select_no_affordance_is_nav_only(self):
-        from cctelegram.handlers import free_text as ft
-
-        form = _real_form(is_free_text=False)
-        assert (
-            ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.207", form=form, window_id=_WID
-            )
-            is False
-        )
-
-    def test_r3a_no_cursor_and_no_ansi_is_nav_only(self):
-        """r3 P2-1(a): the CURSOR-GEOMETRY leg. A complete licensed pane whose
-        form parses NO ❯ (and no ANSI frame proves the affordance-row cursor)
-        makes ``_auq_shape`` return None — the copy must not advertise."""
-        from cctelegram.handlers import free_text as ft
-
-        form = _real_form(cursored=False)
+        assert len(calls) == 1
+        # The dry-run feeds the RAW pane pair — never a merged form.
+        assert calls[0]["pane_text"] == _W5_PANE
+        assert calls[0]["ansi_pane"] == _W5_PANE
+        # And the phase's verdict IS the predicate's verdict (decline ⇒ False).
+        monkeypatch.setattr(ft, "plan_pre_keystroke", lambda *a, **k: "stranded_draft")
         assert (
             ft.advertises_free_text(
                 ft.SURFACE_AUQ,
                 version="2.1.207",
-                form=form,
-                window_id=_WID,
-                ansi_pane=None,
+                window_id=_W5_WID,
+                pane_text=_W5_PANE,
+                ansi_pane=_W5_PANE,
             )
             is False
         )
 
-    def test_r3b_missing_anchor_is_nav_only(self, monkeypatch):
-        """r3 P2-1(b): the MANDATORY PreToolUse anchor. The executor's
-        ``_observe`` declines ``surface_anchor_lost`` without one; the copy
-        consults the SAME reader and says nav-only."""
-        from cctelegram.handlers import free_text as ft
+    @pytest.mark.asyncio
+    async def test_try_answer_pre_keystroke_phase_is_the_same_function(
+        self, monkeypatch
+    ):
+        """Drive the REAL executor to its phase boundary and intercept: the
+        eligibility verdict it acts on comes from ``plan_pre_keystroke`` —
+        and a phase decline means ZERO keystrokes were sent."""
+        from cctelegram import tmux_manager as tm_mod
+        from cctelegram.handlers import auq_source, free_text as ft
 
-        monkeypatch.setattr(ft, "read_surface_anchor", lambda wid: None)
-        assert (
-            ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.207", form=_real_form(), window_id=_WID
-            )
-            is False
-        )
-        # No window id ⇒ no anchor read possible ⇒ never advertises.
-        assert (
-            ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.207", form=_real_form(), window_id=None
-            )
-            is False
-        )
+        keys: list[str] = []
+        tm = tm_mod.tmux_manager
 
-    def test_multi_select_review_screen_and_none_form_are_nav_only(self):
-        from cctelegram.handlers import free_text as ft
+        async def _capture(window_id, *, with_ansi=False):
+            return _W5_PANE
 
-        for form in (
-            _real_form(select_mode="multi"),
-            _real_form(is_review_screen=True),
-            None,
-        ):
-            assert (
-                ft.advertises_free_text(
-                    ft.SURFACE_AUQ, version="2.1.207", form=form, window_id=_WID
-                )
-                is False
-            )
+        async def _cmd(window_id):
+            return "2.1.207"
 
-    def test_unlicensed_version_or_flag_off_is_nav_only(self):
-        from cctelegram.handlers import free_text as ft
+        async def _find(window_id):
+            class W:
+                pass
 
-        assert (
-            ft.advertises_free_text(
-                ft.SURFACE_AUQ, version="2.1.999", form=_real_form(), window_id=_WID
-            )
-            is False
-        )
-        assert (
-            ft.advertises_free_text(
-                ft.SURFACE_AUQ, version=None, form=_real_form(), window_id=_WID
-            )
-            is False
-        )
-        try:
-            ft.set_enabled(False)
-            assert (
-                ft.advertises_free_text(
-                    ft.SURFACE_AUQ,
-                    version="2.1.207",
-                    form=_real_form(),
-                    window_id=_WID,
-                )
-                is False
-            )
-        finally:
-            ft.set_enabled(True)
+            w = W()
+            w.window_id = window_id
+            return w
 
+        async def _send(window_id, text, enter=True, literal=True):
+            keys.append(text)
+            return True
 
-class TestPredicateExecutorParity:
-    """r3 P3 — REAL parity, by construction AND by sweep.
-
-    The r1 "parity" test re-enumerated the advertised gates one-way and never
-    invoked the executor. Now: (1) a SWEEP over every gate axis (including
-    the r3 no-cursor and empty-options axes) asserts
-    ``advertises_free_text(...) is True ⇒ the executor's shape gate accepts
-    the SAME form`` by CALLING ``_auq_form_shape`` — the one shared authority
-    — with the anchor fact held true; (2) a DELEGATION pin proves
-    ``_auq_shape`` (the executor's entry point) IS that shared gate over a
-    fresh pane parse, so a future executor gate added to ``_auq_form_shape``
-    binds the predicate automatically and one added to ``_auq_shape`` OUTSIDE
-    the shared helper fails the delegation pin.
-    """
-
-    def _sweep_forms(self):
-        yield _real_form()
-        yield _real_form(first_number=2, options_complete=False)
-        yield _real_form(options_complete=False)
-        yield _real_form(multi_question=True)
-        yield _real_form(is_free_text=False)
-        yield _real_form(select_mode="multi")
-        yield _real_form(is_review_screen=True)
-        yield _real_form(cursored=False)
-        yield _real_form(n_options=0, options_complete=True)  # empty options
-        yield None
-
-    def test_advertised_implies_executor_shape_gate_accepts(self, monkeypatch):
-        from cctelegram.handlers import free_text as ft
-
-        ft.set_enabled(True)
-        monkeypatch.setattr(ft, "read_surface_anchor", lambda wid: object())
-        checked_any = False
-        for form in self._sweep_forms():
-            for ansi in (None,):  # the predicate callers' no-proof frame
-                advertised = ft.advertises_free_text(
-                    ft.SURFACE_AUQ,
-                    version="2.1.207",
-                    form=form,
-                    window_id=_WID,
-                    ansi_pane=ansi,
-                )
-                executor_accepts = ft._auq_form_shape(form, ansi) is not None
-                checked_any = True
-                assert not (advertised and not executor_accepts), (
-                    "the copy predicate advertised a form the executor's own "
-                    "shape gate refuses"
-                )
-        assert checked_any  # vacuous-true guard
-
-    def test_auq_shape_delegates_to_the_shared_gate(self):
-        """The executor's entry point IS the shared gate over a fresh parse —
-        pinned on a REAL licensed picker pane (glyph cursor present) and on a
-        scrolled partial pane (gate refuses both ways)."""
-        from cctelegram.handlers import free_text as ft
-
-        complete_pane = (
-            "Pick one.\n"
-            "\n"
-            "❯ 1. A\n"
-            "  2. B\n"
-            "  3. C\n"
-            "  4. Type something.\n"
-            "\n"
-            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
-        )
-        partial_pane = (
-            "❯ 2. B\n"
-            "  3. C\n"
-            "  4. Type something.\n"
-            "\n"
-            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
-        )
-        for pane in (complete_pane, partial_pane):
-            via_executor = ft._auq_shape(pane, pane)
-            via_shared = ft._auq_form_shape(tp.parse_ask_user_question(pane), pane)
-            assert via_executor == via_shared
-        # And the two panes genuinely exercise both branches.
-        assert ft._auq_shape(complete_pane, complete_pane) is not None
-        assert ft._auq_shape(partial_pane, partial_pane) is None
-
-
-class TestCardHintRoutesThroughThePredicate:
-    """``card_hint`` is exactly ``advertises_free_text`` → FREE_TEXT / NO_FREE_TEXT."""
-
-    @pytest.fixture(autouse=True)
-    def _flag_on_anchor_true(self, monkeypatch):
-        from cctelegram.handlers import free_text as ft
-
-        ft.set_enabled(True)
-        monkeypatch.setattr(ft, "read_surface_anchor", lambda wid: object())
-        yield
-        ft.set_enabled(True)
-
-    def test_licensed_complete_single_select_promises_text(self):
-        from cctelegram.handlers import free_text as ft
-
-        assert (
-            ft.card_hint(
-                ft.SURFACE_AUQ, version="2.1.207", form=_real_form(), window_id=_WID
-            )
-            == ft.HINT_FREE_TEXT
+        monkeypatch.setattr(tm, "capture_pane_cancellation_safe", _capture)
+        monkeypatch.setattr(tm, "pane_current_command", _cmd)
+        monkeypatch.setattr(tm, "find_window_by_id", _find)
+        monkeypatch.setattr(tm, "send_keys", _send)
+        monkeypatch.setattr(
+            auq_source, "peek_surface_anchor_for_window", lambda w: _w5_anchor()
         )
 
-    def test_preview_single_select_points_at_the_buttons(self):
+        calls: list[dict] = []
+
+        def probe(surface, **kw):
+            calls.append(kw)
+            return "no_free_text_surface"  # a phase decline ⇒ the lane bails
+
+        monkeypatch.setattr(ft, "plan_pre_keystroke", probe)
+
+        result = await ft.try_answer(_W5_WID, "my answer", user_turn=None)
+
+        assert result is None  # declined pre-keystroke ⇒ falls through to PR-1
+        assert len(calls) == 1  # the executor consulted THE shared phase
+        assert keys == []  # and sent NOTHING on its verdict
+        # The executor fed the phase its own observation of the same window.
+        assert calls[0]["window_id"] == _W5_WID
+        assert calls[0]["ansi_pane"] == _W5_PANE
+
+    def test_card_hint_routes_through_the_dry_run(self, monkeypatch):
         from cctelegram.handlers import free_text as ft
 
-        assert (
-            ft.card_hint(
-                ft.SURFACE_AUQ,
-                version="2.1.207",
-                form=_real_form(is_free_text=False),
-                window_id=_WID,
-            )
-            == ft.HINT_NO_FREE_TEXT
+        kwargs = dict(
+            version="2.1.207",
+            window_id=_W5_WID,
+            pane_text=_W5_PANE,
+            ansi_pane=_W5_PANE,
         )
-
-    def test_scrolled_incomplete_picker_points_at_the_buttons(self):
-        from cctelegram.handlers import free_text as ft
-
-        assert (
-            ft.card_hint(
-                ft.SURFACE_AUQ,
-                version="2.1.207",
-                form=_real_form(first_number=2, options_complete=False),
-                window_id=_WID,
-            )
-            == ft.HINT_NO_FREE_TEXT
-        )
-
-    def test_anchorless_window_points_at_the_buttons(self, monkeypatch):
-        from cctelegram.handlers import free_text as ft
-
-        monkeypatch.setattr(ft, "read_surface_anchor", lambda wid: None)
-        assert (
-            ft.card_hint(
-                ft.SURFACE_AUQ, version="2.1.207", form=_real_form(), window_id=_WID
-            )
-            == ft.HINT_NO_FREE_TEXT
-        )
-
-    def test_unlicensed_points_at_the_buttons(self):
-        from cctelegram.handlers import free_text as ft
-
-        assert (
-            ft.card_hint(
-                ft.SURFACE_AUQ, version="2.1.99", form=_real_form(), window_id=_WID
-            )
-            == ft.HINT_NO_FREE_TEXT
-        )
+        monkeypatch.setattr(ft, "advertises_free_text", lambda *a, **k: True)
+        assert ft.card_hint(ft.SURFACE_AUQ, **kwargs) == ft.HINT_FREE_TEXT
+        monkeypatch.setattr(ft, "advertises_free_text", lambda *a, **k: False)
+        assert ft.card_hint(ft.SURFACE_AUQ, **kwargs) == ft.HINT_NO_FREE_TEXT
