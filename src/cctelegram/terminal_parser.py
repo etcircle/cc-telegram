@@ -3917,10 +3917,21 @@ _RE_OPTION_ROW_CONTENT: Final = re.compile(r"^\d+\.\s")
 # which is exactly right: the hint proves the input box is live, so the "gate"
 # above it is not the active bottom prompt. No coupling, no split needed.
 _INPUT_PASTE_COLLAPSED_MARKER: Final = "paste again to expand"
+# ``⏸ manual mode on`` (CC 2.1.208/2.1.209) — a ready input box whose status bar
+# is the manual-mode indicator (rig ``inputbox_tall_draft_v2.1.209``). Added to
+# the LEG-3 alphabet ONLY (not ``_READY_STATUS_MARKERS``, the idle alphabet
+# ``pane_looks_idle`` / ``classify_pane_idle_failure`` consume) — the
+# paste-collapse precedent: this widens the delivery gate's readiness proof
+# without asserting the pane is idle. Its absence was the COUPLED alphabet gap in
+# the GH #56 tall-draft repro: leg 3 returned ``no_ready_chrome`` on a
+# manual-mode pane holding a draft, the same false-refusal class as the
+# paste-collapse regression (memory rule: marker-alphabet completeness).
+_INPUT_MANUAL_MODE_MARKER: Final = "manual mode on"
 _INPUT_READY_CHROME_MARKERS: Final = _READY_STATUS_MARKERS + (
     "esc to interrupt",
     "! for shell mode",
     _INPUT_PASTE_COLLAPSED_MARKER,
+    _INPUT_MANUAL_MODE_MARKER,
 )
 # ``· 1 shell ·`` — the background-shell status bar (rig D10).
 _RE_INPUT_READY_SHELL_TOKEN: Final = re.compile(r"·\s*\d+\s+shells?\b")
@@ -3995,11 +4006,92 @@ def _normalize_input_row(row: str) -> str:
     return row
 
 
-def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
-    """Locate the bottom rule-pair and return ``(top, bottom, non-blank rows)``.
+# GH #56: the exactly-one-separator fallback scans UPWARD for the input box's TOP
+# rule when a TALL multi-line draft has pushed it above the ``_CHROME_SCAN_LINES``
+# window (a reply-quoted message renders a ~18-row draft inside the box; the top
+# rule sat outside the 20-line tail and the post-write re-verify concluded
+# ``no_input_box``, withholding Enter and arming the stranded-draft brake). Bounded
+# by this many rows — covers a full 160x50 pane; the gate/brake captures are
+# visible-only (``scrollback_lines=0``), so the bound only protects a future
+# scrollback-carrying caller. A TUI-drift audit surface beside
+# ``clean_ghost_input_text``.
+_INPUT_BOX_TOP_SCAN_LINES: Final = 60
 
-    ``None`` when fewer than two ``──`` rule separators are in the bottom scan
-    window (no rendered input-box bracket).
+# The segment form of the ``· N shell`` status row AFTER splitting on ``·`` (the
+# ``·`` prefix is consumed by the split): the strict status-row grammar honors the
+# leg-3 markers-OR-shell-token rule by including this arm.
+_RE_STATUS_SHELL_SEGMENT: Final = re.compile(r"\b\d+\s+shells?\b")
+
+
+def _is_status_row(line: str) -> bool:
+    """True iff ``line`` is a WHOLE Claude Code ready-status-bar row (GH #56).
+
+    A STRICT full-ROW grammar. The exactly-one-separator fallback in
+    ``_input_box_rows`` uses it to prove the lone in-window separator is the input
+    box's BOTTOM rule: the first non-blank row below a genuine bottom rule is the
+    status bar.
+
+    Derived from the SAME canonical constants leg 3 consumes
+    (``_INPUT_READY_CHROME_MARKERS`` + the shell-token arm — SINGLE source, so the
+    grammar and leg 3's substring alphabet can never drift apart), but it requires
+    the WHOLE row to be chrome rather than merely CONTAIN a marker: each
+    ``·``-delimited segment must reduce to pure chrome glyphs once its markers are
+    removed. A residue carrying any LETTER is prose and fails — so model-controlled
+    prompt content that embeds a marker substring (e.g. an AUQ header carrying
+    ``/effort``, Codex r2's reproduced spoof) no longer qualifies.
+    """
+    s = _normalize_input_row(_strip_ansi(line)).strip()
+    if not s:
+        return False
+    saw_chrome = False
+    for segment in s.split("·"):
+        seg = segment.strip()
+        if not seg:
+            continue
+        residue = seg
+        matched = False
+        for marker in _INPUT_READY_CHROME_MARKERS:
+            if marker in residue:
+                residue = residue.replace(marker, " ")
+                matched = True
+        shell = _RE_STATUS_SHELL_SEGMENT.search(residue)
+        if shell:
+            residue = residue.replace(shell.group(0), " ")
+            matched = True
+        if not matched or any(ch.isalpha() for ch in residue):
+            return False
+        saw_chrome = True
+    return saw_chrome
+
+
+def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
+    """Locate the input-box rule-pair and return ``(top, bottom, non-blank rows)``.
+
+    Two paths (GH #56):
+
+    - **≥2 rule separators in the ``_CHROME_SCAN_LINES`` (20) tail** — byte-identical
+      to the original: the last two ARE the pair. Every existing fixture keeps its
+      exact result.
+    - **Exactly 1** — a tall multi-line draft has pushed the box's TOP rule out of
+      the window; the lone in-window separator is the candidate BOTTOM rule. The
+      fallback fires ONLY on a THREE-PART STRUCTURAL proof (substring markers are
+      spoofable by model-controlled prompt content, so each part kills an
+      independently-reproduced spoof):
+        (a) the FIRST NON-BLANK row below the lone separator FULLMATCHES
+            ``_is_status_row`` (a genuine bottom rule is followed by the status
+            bar — not a picker footer, and not model prose that merely embeds a
+            marker substring);
+        (b) NO row below the lone separator matches the picker option-row shape
+            (Codex r2's "lone separator is a live prompt's TOP rule, ``❯ 1. Yes``
+            below it" shape refuses here even if (a) were spoofed);
+        (c) after an UPWARD scan (bounded by ``_INPUT_BOX_TOP_SCAN_LINES``, NEAREST
+            rule) finds the candidate TOP rule, the FIRST non-blank row below it is
+            a prompt-glyph (``❯``/``!``) row — the box's cursor row is always the
+            first row inside the bracket (a draft that merely CONTAINS a rule-like
+            ``─…`` line pairs with the draft-internal rule → no glyph row below →
+            fail-closed refusal, unchanged from today).
+      Any part failing / no reachable top rule → ``None`` (unchanged fail-closed).
+    - **0** — ``None`` (unchanged).
 
     The returned rows are NBSP-normalized (``_normalize_input_row``) — this is the
     single seam every input-box-lane reader goes through.
@@ -4008,15 +4100,65 @@ def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
     sep_idxs = [
         i for i in range(search_start, len(lines)) if _is_rule_separator(lines[i])
     ]
-    if len(sep_idxs) < 2:
+    if len(sep_idxs) >= 2:
+        top, bottom = sep_idxs[-2], sep_idxs[-1]
+    elif len(sep_idxs) == 1:
+        located = _locate_tall_draft_pair(lines, sep_idxs[0])
+        if located is None:
+            return None
+        top, bottom = located
+    else:
         return None
-    top, bottom = sep_idxs[-2], sep_idxs[-1]
     rows = [
         stripped
         for i in range(top + 1, bottom)
         if (stripped := _normalize_input_row(lines[i]).strip())
     ]
     return top, bottom, rows
+
+
+def _locate_tall_draft_pair(lines: list[str], bottom: int) -> tuple[int, int] | None:
+    """The GH #56 exactly-one-separator fallback: prove ``bottom`` is the input
+    box's bottom rule and scan UPWARD for its top rule. See ``_input_box_rows``.
+
+    ``lines`` are already ANSI-stripped by the callers, but each candidate row is
+    re-stripped / whitespace-trimmed before the full-row and option-row matches
+    (defensive, r3 P3).
+    """
+    # (a) The first non-blank row below the lone separator must BE a status bar.
+    first_below = next(
+        (lines[i] for i in range(bottom + 1, len(lines)) if lines[i].strip()),
+        None,
+    )
+    if first_below is None or not _is_status_row(first_below):
+        return None
+
+    # (b) No picker option-row may sit below the lone separator (a live picker's
+    #     body would — the presumed bottom rule would then be the prompt's TOP).
+    for i in range(bottom + 1, len(lines)):
+        if _RE_INPUT_OPTION_ROW.match(_normalize_input_row(lines[i]).strip()):
+            return None
+
+    # (c) The NEAREST rule separator above (bounded) is the candidate TOP rule, and
+    #     the first non-blank row inside the bracket must be a prompt-glyph row.
+    lower = max(0, bottom - _INPUT_BOX_TOP_SCAN_LINES)
+    top = next(
+        (i for i in range(bottom - 1, lower - 1, -1) if _is_rule_separator(lines[i])),
+        None,
+    )
+    if top is None:
+        return None
+    first_inside = next(
+        (
+            stripped
+            for i in range(top + 1, bottom)
+            if (stripped := _normalize_input_row(lines[i]).strip())
+        ),
+        None,
+    )
+    if first_inside is None or first_inside[0] not in _INPUT_PROMPT_GLYPHS:
+        return None
+    return top, bottom
 
 
 def _prompt_row_content(rows: list[str]) -> str | None:

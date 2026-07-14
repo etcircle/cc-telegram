@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.209 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│               Welcome back Emiliyan!               │ Ask Claude to create a new app or clone a repository                                                    │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                              │
+│                      ▝▜█████▛▘                     │ Fixed /model and other dialogs being blocked in `claude agents` background sessions (reverts an overly… │
+│                        ▘▘ ▝▝                       │ Added screen reader mode: opt-in plain-text rendering for screen reader users. Run `claude --ax-screen… │
+│   Opus 4.8 (1M context) with me… · Claude Max ·    │ Added `vimInsertModeRemaps` setting: map two-key insert-mode sequences like `jj` to Escape in vim mode  │
+│   em.tanev@gmail.com's Organization                │ /release-notes for more                                                                                 │
+│         /private/tmp/ccrig-gh56-1784016686         │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 3 MCP servers need authentication · run /mcp
+
+ ▎ Extended through July 19
+ ▎ We're extending Claude Fable 5 access on all paid plans, as well as keeping Claude Code’s weekly rate limits 50% higher, through July 19.
+ ▎
+ ▎ As before, you can use up to half of your weekly usage limit on Fable 5. After that, you can keep using Fable 5 with usage credits, or switch to another
+ ▎ model to keep working within your remaining limits.
+ ▎
+ ▎ More details here: https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ [Pasted text #1]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  paste again to expand

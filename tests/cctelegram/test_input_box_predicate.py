@@ -580,3 +580,245 @@ def test_agreement_predicate_and_classifier_never_disagree() -> None:
 
 def test_indeterminate_reasons_are_a_subset_of_the_leg_names() -> None:
     assert tp.INPUT_BOX_INDETERMINATE_REASONS <= tp.INPUT_BOX_FAILURE_REASONS
+
+
+# ── GH #56: the tall multi-line draft fallback (exactly-1-separator scan) ──
+#
+# A reply-quoted message renders a ~18-row draft INSIDE the input box, pushing the
+# box's TOP rule above the 20-line `_CHROME_SCAN_LINES` window. Only the bottom
+# rule is in view, so the original `_input_box_rows` returned None and the delivery
+# gate's POST-WRITE re-verify concluded `no_input_box` — Enter withheld, the
+# stranded-draft brake armed, the NEXT message refused too (a topic wedge on the
+# owner's dominant gesture). The fallback scans UPWARD for the top rule under a
+# three-part structural proof; the coupled fix adds `⏸ manual mode on` to leg 3's
+# alphabet (the rig fixture's only status row).
+
+_TALL_DRAFT = "inputbox_tall_draft_v2.1.209.txt"
+_TALL_DRAFT_ANSI = "inputbox_tall_draft_v2.1.209.ansi.txt"
+_TALL_DRAFT_CLEARED = "inputbox_tall_draft_cleared_v2.1.209.txt"
+
+
+@pytest.mark.parametrize("name", [_TALL_DRAFT, _TALL_DRAFT_ANSI])
+def test_tall_reply_quoted_draft_is_a_READY_input_box(name: str) -> None:
+    """RED-first: today `classify_input_box_failure` returns `no_input_box` on this
+    real rig capture (the top rule at line 30 is outside the 20-line window); the
+    fallback flips it to a fully-ready box. Plain AND ANSI captures agree."""
+    pane = _pane(name)
+    # The fixture genuinely has the tall shape — top rule far above, one in-window
+    # separator — otherwise this pin is vacuous.
+    assert "[Telegram reply context]" in tp._strip_ansi(pane)
+    assert tp.pane_input_box_present(pane) is True
+    assert tp.classify_input_box_failure(pane) is None
+    # The brake's release proof reads the SAME rows: the box is FOUND and its input
+    # row is non-empty (False, never None — None would mean "box not found").
+    assert tp.pane_input_row_empty(pane) is False
+
+
+def test_tall_draft_cleared_capture_releases_the_brake() -> None:
+    """The brake-release twin: after the draft is cleared the input row is provably
+    empty (True), so `clear_window_stranded_draft`'s only proof holds."""
+    pane = _pane(_TALL_DRAFT_CLEARED)
+    assert tp.pane_input_row_empty(pane) is True
+    assert tp.pane_input_box_present(pane) is True
+
+
+def test_the_manual_mode_marker_is_in_the_leg3_alphabet_not_the_idle_one() -> None:
+    """The coupled alphabet fix, pinned BOTH ways: `manual mode on` is a leg-3
+    ready marker (so the tall-draft box passes) but is NOT in the idle-status
+    alphabet (a manual-mode pane holding a draft is not "idle" for /update /
+    /cost — the paste-collapse precedent)."""
+    assert "manual mode on" in tp._INPUT_READY_CHROME_MARKERS
+    assert "manual mode on" not in tp._READY_STATUS_MARKERS
+
+
+def test_a_manual_mode_status_bar_passes_leg3_with_a_draft_present() -> None:
+    """The direct leg-3 pin: a normal 2-separator box whose ONLY status marker is
+    `⏸ manual mode on`, holding a draft, is a ready input box (before the addition,
+    leg 3 returned `no_ready_chrome` — the same false-refusal class as the
+    paste-collapse regression)."""
+    rule = "─" * 40
+    pane = f"  prose above\n{rule}\n❯ my drafted reply\n{rule}\n  ⏸ manual mode on\n"
+    assert tp.classify_input_box_failure(pane) is None
+    assert tp.pane_input_box_present(pane) is True
+
+
+# ── The three-part structural proof: two reproduced spoofs must STILL refuse ──
+
+
+def _tall(draft_rows: list[str], status_row: str, below_extra: str = "") -> str:
+    """A synthetic pane whose TOP rule is pushed out of the 20-line window by a
+    tall draft (so exactly ONE separator is in the window). Mirrors the rig
+    fixture's geometry."""
+    rule = "─" * 40
+    pad = "\n".join(f"  filler line {i}" for i in range(6))
+    body = "\n".join(draft_rows)
+    tail = f"\n{below_extra}" if below_extra else ""
+    return f"{pad}\n{rule}\n{body}\n{rule}\n  {status_row}{tail}\n"
+
+
+def test_spoof_lone_separator_is_a_live_prompts_TOP_rule_STILL_refuses() -> None:
+    """Codex r2 (b): the lone in-window separator is a LIVE PROMPT's top rule with
+    the picker body `❯ 1. Yes` below it — no numbered row may sit below the
+    presumed bottom rule."""
+    draft = ["❯ a stale draft above"] + [f"  draft cont {i}" for i in range(18)]
+    pane = _tall(
+        draft,
+        "❯ 1. Yes",
+        below_extra="    2. No\n  Enter to select · Esc to cancel",
+    )
+    assert tp.pane_input_box_present(pane) is False
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+def test_the_option_row_below_the_lone_separator_guard_is_load_bearing() -> None:
+    """Part (b) in isolation: even when the first-below row IS a status bar
+    (spoofing part (a)), a picker option row further below refuses."""
+    draft = ["❯ a stale draft above"] + [f"  draft cont {i}" for i in range(18)]
+    pane = _tall(draft, "esc to interrupt", below_extra="  ❯ 1. Yes\n    2. No")
+    assert tp.pane_input_box_present(pane) is False
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+def test_spoof_effort_header_substring_marker_STILL_refuses() -> None:
+    """Codex r2 (a): a header below the lone separator CONTAINS `/effort` (a leg-3
+    substring-alphabet hit), but the STRICT full-row grammar rejects it — the whole
+    row must BE a status bar, not merely embed a marker."""
+    draft = ["❯ a stale draft above"] + [f"  draft cont {i}" for i in range(18)]
+    pane = _tall(draft, "Which /effort level do you want? Choose one:")
+    # Sanity: the leg-3 substring alphabet WOULD hit `/effort` (the spoof's premise).
+    assert any(m in "Which /effort level" for m in tp._INPUT_READY_CHROME_MARKERS)
+    # The strict grammar is what refuses it.
+    assert tp._is_status_row("Which /effort level do you want? Choose one:") is False
+    assert tp.pane_input_box_present(pane) is False
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+def test_a_draft_containing_a_rule_like_line_still_refuses_fail_closed() -> None:
+    """Disclosed residual: a reply-quote of terminal output that CONTAINS a `─…`
+    line makes the upward scan pair with the draft-internal rule → no glyph row
+    directly below it → fail-closed refusal, exactly as today."""
+    draft = [
+        "❯ pasted some terminal output:",
+        "  " + "─" * 40,  # a rule-like line INSIDE the draft
+        "  and here is more of the pasted output continuing below the rule",
+    ] + [f"  draft cont {i}" for i in range(16)]
+    pane = _tall(draft, "⏸ manual mode on")
+    assert tp.pane_input_box_present(pane) is False
+    assert tp.classify_input_box_failure(pane) == "no_input_box"
+
+
+# ── The STRONG corpus pin: every EXISTING fixture's classification is unchanged ──
+#
+# The fallback only fires when there is EXACTLY ONE separator in the 20-line
+# window, so it cannot disturb the ≥2 path. This bakes the pre-change
+# classification of every existing corpus fixture (the 2.1.209 fixtures are new /
+# changing, so they are excluded) and asserts byte-exact equality — a stronger pin
+# than refused-vs-passed.
+_BASELINE_CLASSIFICATIONS = {
+    "auq-baseline-pane.txt": "no_input_box",
+    "auq_4option_160x50_v2.1.198.txt": "no_input_box",
+    "auq_after_answer_t0_v2.1.207.txt": None,
+    "auq_after_answer_t1_v2.1.207.txt": None,
+    "auq_after_answer_t30_v2.1.207.txt": None,
+    "auq_after_answer_t5_v2.1.207.txt": None,
+    "auq_before_answer_v2.1.207.txt": "no_input_box",
+    "auq_freetext_overflow_v2.1.207.txt": "no_input_box",
+    "auq_freetext_row_selected_pretype_v2.1.207.ansi.txt": "no_input_box",
+    "auq_freetext_row_typed_large_v2.1.207.ansi.txt": "no_input_box",
+    "auq_freetext_row_typed_v2.1.207.ansi.txt": "prompt_row_is_option",
+    "auq_freetext_typed_identical_label_v2.1.207.ansi.txt": "prompt_row_is_option",
+    "auq_longlabel_160x50_v2.1.198.txt": "no_input_box",
+    "auq_multi_picker_v2.1.207.txt": "no_input_box",
+    "auq_multiq_q1_pane.txt": "prompt_row_is_option",
+    "auq_multiq_q2_after_pick_pane.txt": "prompt_row_is_option",
+    "auq_multiq_submit_pane.txt": "no_input_box",
+    "auq_multiselect_2_toggled_tmux_capture.txt": "prompt_row_is_option",
+    "auq_multiselect_compressed_long_cursor_only_tmux_capture.txt": "no_input_box",
+    "auq_multiselect_fresh_tmux_capture.txt": "no_input_box",
+    "auq_multiselect_long_scrolled_toggled_S500.txt": "no_input_box",
+    "auq_multiselect_ready_to_submit_tmux_capture.txt": "no_input_box",
+    "auq_multiselect_review_cursor_cancel.txt": "no_input_box",
+    "auq_multiselect_review_cursor_submit.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor1_S500.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor2_S500.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor3_S500.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor4_S500.txt": "no_input_box",
+    "auq_single_long_scrolled_cursor5_S500.txt": "no_input_box",
+    "auq_single_picker_v2.1.207.txt": "prompt_row_is_option",
+    "auq_single_select_with_affordances_pane.txt": "no_input_box",
+    "auq_stale_tabheader_over_live_picker_S500.txt": "no_input_box",
+    "control_gitrepo_branch_no_label_v2.1.207.txt": None,
+    "cost_overlay_d_v2.1.206.txt": "no_input_box",
+    "cost_overlay_live_v2.1.206.txt": "no_input_box",
+    "cost_overlay_w_v2.1.206.txt": "no_input_box",
+    "decision_negative_quoted_scrollback_v2.1.200.txt": None,
+    "decision_switch_model_v2.1.200.txt": "no_input_box",
+    "decision_trust_folder_postdown_v2.1.204.txt": "no_input_box",
+    "decision_trust_folder_postup_v2.1.204.txt": "no_input_box",
+    "decision_trust_folder_v2.1.200.txt": "no_input_box",
+    "decision_trust_folder_v2.1.204.txt": "no_input_box",
+    "detailed_transcript_full_v2.1.206.txt": "no_input_box",
+    "epm_after_approve_t0_v2.1.207.txt": None,
+    "epm_after_approve_t1_v2.1.207.txt": None,
+    "epm_after_approve_t30_idle_v2.1.207.txt": None,
+    "epm_after_approve_t5_v2.1.207.txt": None,
+    "epm_before_approve_v2.1.207.txt": "no_input_box",
+    "epm_plan_label_after_clear_v2.1.207.txt": None,
+    "epm_plan_label_persists_next_turn_v2.1.207.txt": None,
+    "epm_v2170_ctrl_plus_g.txt": "no_input_box",
+    "folder_trust_arrival_plain_v2.1.206.txt": "no_input_box",
+    "folder_trust_arrival_plain_v2.1.207.txt": "no_input_box",
+    "gate_epm_v2.1.207.txt": "no_input_box",
+    "gate_permission_v2.1.207.txt": "no_input_box",
+    "gate_workflow_v2.1.207.txt": "no_input_box",
+    "gh43_bg_shell_frame.txt": None,
+    "idle_frame_plain_v2.1.206.txt": None,
+    "idle_ghost_input_row_v2.1.206.txt": None,
+    "idle_real_draft_input_row_v2.1.206.txt": None,
+    "inputbox_at_overlay_v2.1.207.txt": "completion_overlay",
+    "inputbox_bashmode_draft_v2.1.207.txt": None,
+    "inputbox_bashmode_empty_v2.1.207.txt": None,
+    "inputbox_bgshell_v2.1.207.txt": None,
+    "inputbox_busy_thinking_v2.1.207.txt": None,
+    "inputbox_busy_tool_v2.1.207.txt": None,
+    "inputbox_draft_typed_v2.1.207.txt": None,
+    "inputbox_idle_v2.1.207.txt": None,
+    "inputbox_manual_mode_v2.1.207.txt": None,
+    "inputbox_multiline_draft_v2.1.207.txt": None,
+    "inputbox_paste_collapsed_reverted_v2.1.207.txt": None,
+    "inputbox_paste_collapsed_v2.1.207.txt": None,
+    "inputbox_slash_exact_clear_v2.1.207.txt": "completion_overlay",
+    "inputbox_slash_overlay_v2.1.207.txt": "completion_overlay",
+    "inputbox_slash_with_arg_v2.1.207.txt": None,
+    "inputbox_tasklist_footer_v2.1.207.txt": None,
+    "inputbox_tasks_mode_v2.1.207.txt": "tasks_mode",
+    "inputbox_wrapped_draft_v2.1.207.txt": None,
+    "overlay_cost_modal_v2.1.207.txt": "no_input_box",
+    "permission_bash_v2.1.190.txt": "no_input_box",
+    "permission_negative_prose_v2.1.190.txt": "no_input_box",
+    "permission_webfetch_advance_v2.1.190.txt": None,
+    "permission_webfetch_bgshells_v2.1.190.txt": "no_input_box",
+    "permission_webfetch_v2.1.190.txt": "no_input_box",
+    "permission_write_long_v2.1.190.txt": "no_input_box",
+    "permission_write_long_visible_v2.1.190.txt": "no_input_box",
+    "scrollback_full_with_live_auq_v2.1.206.txt": "prompt_row_is_option",
+    "settings_select_model_v2.1.200.txt": "no_input_box",
+    "settings_warning_v2170.txt": "no_input_box",
+    "shell_after_esc_v2.1.207.txt": "no_input_box",
+    "status_busy_160x50_v2.1.198.txt": None,
+    "switch_model_live_v2.1.207.txt": "no_input_box",
+    "trust_after_accept_t0_v2.1.207.txt": None,
+    "trust_after_accept_t5_v2.1.207.txt": None,
+    "trust_before_answer_v2.1.207.txt": "no_input_box",
+    "unknown_blocking_confirm_switch_model_v2.1.197.txt": "no_input_box",
+    "usage_overlay_live_v2.1.206.txt": "no_input_box",
+    "workflow_dynamic_launch_v2.1.190.txt": "no_input_box",
+    "workflow_dynamic_launch_visible_v2.1.190.txt": "no_input_box",
+    "workflow_negative_prose_v2.1.190.txt": "no_input_box",
+}
+
+
+def test_existing_corpus_classifications_are_unchanged() -> None:
+    for name, expected in _BASELINE_CLASSIFICATIONS.items():
+        assert (FIXTURES / name).exists(), name  # baseline must not go stale
+        assert tp.classify_input_box_failure(_pane(name)) == expected, name

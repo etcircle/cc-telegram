@@ -85,6 +85,10 @@ def _make_tmux(
     # MagicMock attribute would return a truthy ``locked()`` and trip the
     # reject-if-held branch, so hand out a real (free) asyncio.Lock.
     tmux.window_send_lock = MagicMock(return_value=asyncio.Lock())
+    # GH #56: a bare MagicMock ``window_has_stranded_draft`` returns a truthy Mock,
+    # which would silently route /esc into the braked draft-clear mode. These
+    # fakes exercise the UNBRAKED single-Escape path, so pin it False.
+    tmux.window_has_stranded_draft = MagicMock(return_value=False)
     window = MagicMock()
     window.window_id = "@1"
     tmux.find_window_by_id = AsyncMock(return_value=window)

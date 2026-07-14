@@ -44,6 +44,7 @@ from telegram import (
     BotCommandScopeChatAdministrators,
     BotCommandScopeChatMember,
     BotCommandScopeDefault,
+    Message,
     Update,
 )
 from telegram.constants import ChatAction
@@ -474,6 +475,19 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             update.message, "⏳ Action in progress — try again in a second"
         )
         return
+
+    # GH #56: on a window under the stranded-draft brake, /esc becomes the
+    # draft-CLEAR gesture instead of a single interrupt-Escape. Rig 2.1.209: a
+    # single Escape never clears a draft (it only dismisses the ctrl+g hint); TWO
+    # rapid Escapes do. But the brake can be armed over an EMPTY box (a
+    # commit_unknown whose Enter actually landed, a post-Enter cancellation, or a
+    # user who already cleared/submitted in the terminal), and a double-Escape into
+    # an empty busy box would interrupt the active turn — so the pane must PROVE a
+    # non-empty input box before any key (Codex r1 P1-2).
+    if tmux_manager.window_has_stranded_draft(w.window_id):
+        await _esc_clear_braked_draft(update.message, w.window_id, lock)
+        return
+
     async with lock:
         # Send Escape control character (no enter)
         sent = await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
@@ -481,6 +495,93 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update.message, "❌ Failed to send — window may be gone")
         return
     await safe_reply(update.message, "⎋ Sent Escape")
+
+
+# GH #56 braked-/esc draft-clear timings (2.1.209 TUI empirics — a TUI-drift audit
+# surface beside ``clean_ghost_input_text``). Two Escapes ~0.15s apart FULLY clear
+# a draft; two ~1s apart do NOT (the confirmation lapses between presses), so the
+# double-press must be one bot-side action. It is a RECOVERY gesture — fail-safe
+# (worst case the box stays uncleared and the brake stays up, never a wrong
+# commit) — so it needs no version-license table.
+_ESC_CLEAR_GAP_S = 0.15
+_ESC_CLEAR_SETTLE_S = 0.4
+
+
+async def _esc_bounded_capture(window_id: str) -> str | None:
+    """One bounded, cancellation-safe pane capture for the braked-/esc clear mode.
+
+    Returns ``None`` on the capture DEADLINE (an indeterminate frame — the caller
+    fails closed). A genuine caller/shutdown cancellation PROPAGATES (only
+    ``asyncio.TimeoutError`` is classified — the /cost precedent).
+    """
+    try:
+        return await asyncio.wait_for(
+            tmux_manager.capture_pane_cancellation_safe(window_id),
+            timeout=POST_SEND_CAPTURE_DEADLINE_S,
+        )
+    except asyncio.TimeoutError:
+        return None
+
+
+async def _esc_clear_braked_draft(
+    message: Message, window_id: str, lock: asyncio.Lock
+) -> None:
+    """Clear a stranded draft on a braked window with a bot-side double-Escape.
+
+    Under the window send lock (all Telegram I/O AFTER release — the lock is a
+    leaf): ONE bounded capture, then a three-way branch on the pane proof —
+
+      - box present AND its input row provably NON-empty → send Escape twice
+        rapidly, settle, re-capture, and release the brake ONLY on a fresh
+        ``pane_input_row_empty`` True (the same positive proof the send-path
+        self-heal uses);
+      - the input row is already provably empty → NO keys; release the brake on
+        that existing proof;
+      - anything else (indeterminate frame, a live blocking prompt, box-proof
+        failure) → NO keys, KEEP the brake (Esc on folder-trust KILLS Claude — a
+        braked pane that doesn't prove a held draft gets zero keystrokes).
+
+    The capture→key race (a prompt drawn after the final capture) is the same one
+    tmux round-trip every dispatch path accepts.
+    """
+    reply: str
+    async with lock:
+        pane = await _esc_bounded_capture(window_id)
+        box_present = terminal_parser.pane_input_box_present(pane)
+        row_empty = terminal_parser.pane_input_row_empty(pane)
+
+        if box_present and row_empty is False:
+            ok1 = await tmux_manager.send_keys(window_id, "\x1b", enter=False)
+            await asyncio.sleep(_ESC_CLEAR_GAP_S)
+            ok2 = await tmux_manager.send_keys(window_id, "\x1b", enter=False)
+            if not (ok1 and ok2):
+                reply = SEND_FAILED_TEXT
+            else:
+                await asyncio.sleep(_ESC_CLEAR_SETTLE_S)
+                pane2 = await _esc_bounded_capture(window_id)
+                if terminal_parser.pane_input_row_empty(pane2) is True:
+                    tmux_manager.clear_window_stranded_draft(
+                        window_id, reason="/esc double-escape cleared the box"
+                    )
+                    reply = "🧹 Input box cleared — resend your message."
+                else:
+                    reply = (
+                        "Couldn't confirm the input box cleared — check the window "
+                        "(/screenshot). This topic is still holding the earlier "
+                        "message; resend once the box is empty."
+                    )
+        elif row_empty is True:
+            tmux_manager.clear_window_stranded_draft(
+                window_id, reason="/esc found the input box already clear"
+            )
+            reply = "✅ The input box is already clear — resend your message."
+        else:
+            reply = (
+                "Couldn't confirm a draft to clear (the terminal may be busy or "
+                "showing a prompt). Nothing was sent; check the window "
+                "(/screenshot), then resend once the input box is empty."
+            )
+    await safe_reply(message, reply)
 
 
 async def file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

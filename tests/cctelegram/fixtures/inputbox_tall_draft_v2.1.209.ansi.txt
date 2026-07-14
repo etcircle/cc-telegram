@@ -1,0 +1,50 @@
+
+[38;5;174m╭───[39m [38;5;174mClaude Code[39m [38;5;246mv2.1.209[39m [38;5;174m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[39m                                                    [2m[38;5;174m│[0m [1m[38;5;174mTips for getting started[0m                                                                                [38;5;174m│
+│[39m               [1mWelcome back Emiliyan![0m               [2m[38;5;174m│[0m Ask Claude to create a new app or clone a repository                                                    [38;5;174m│
+│[39m                                                    [2m[38;5;174m│[0m [38;5;174m───────────────────────────────────────────────────────────────────────────────────────────────────────[39m [38;5;174m│
+│[39m                      [38;5;174m ▐[48;5;16m▛███▜[49m▌[39m                      [2m[38;5;174m│[0m [1m[38;5;174mWhat's new[0m                                                                                              [38;5;174m│
+│[39m                      [38;5;174m▝▜[48;5;16m█████[49m▛▘[39m                     [2m[38;5;174m│[0m Fixed /model and other dialogs being blocked in `claude agents` background sessions (reverts an overly… [38;5;174m│
+│[39m                      [38;5;174m  ▘▘ ▝▝  [39m                     [2m[38;5;174m│[0m Added screen reader mode: opt-in plain-text rendering for screen reader users. Run `claude --ax-screen… [38;5;174m│
+│[39m   [38;5;246mOpus 4.8 (1M context) with me… · Claude Max · [39m   [2m[38;5;174m│[0m Added `vimInsertModeRemaps` setting: map two-key insert-mode sequences like `jj` to Escape in vim mode  [38;5;174m│
+│[39m   [38;5;246mem.tanev@gmail.com's Organization[39m                [2m[38;5;174m│[0m [3m[38;5;246m/release-notes for more[0m                                                                                 [38;5;174m│
+│[39m         [38;5;246m/private/tmp/ccrig-gh56-1784016686[39m         [2m[38;5;174m│[0m                                                                                                         [38;5;174m│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+[39m [38;5;220m⚠[39m [38;5;220m3 MCP servers need authentication[38;5;246m · run /mcp[39m
+
+ [38;5;174m▎[39m [38;5;174mExtended through July 19[39m
+ [38;5;174m▎[39m We're extending Claude Fable 5 access on all paid plans, as well as keeping Claude Code’s weekly rate limits 50% higher, through July 19.
+ [38;5;174m▎[39m
+ [38;5;174m▎[39m As before, you can use up to half of your weekly usage limit on Fable 5. After that, you can keep using Fable 5 with usage credits, or switch to another
+ [38;5;174m▎[39m model to keep working within your remaining limits.
+ [38;5;174m▎[39m
+ [38;5;174m▎[39m More details here: [94m]8;id=1iz7s2z;https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access\https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access[39m]8;;\
+
+
+
+
+
+
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [Telegram reply context]
+  The user is replying to an earlier message in this same topic.
+  Treat the quoted text below as the context the user responds to.
+  Do not re-answer the quoted message; answer the new user message.
+  Keep the earlier decision in mind and stay consistent with it.
+  Preserve any file paths, ids, and option numbers exactly.
+  Referenced message: assistant
+  From: Claude
+  Telegram message id: 48291
+  Reply to message id: 48277
+  Claude session: 3f9c2a10-7b4e-4d21-9a8c-1e6f0b7d5c42
+  <<<QUOTE_48291>>>
+  Here are the three options for the migration path forward.
+  Option 1 keeps postgres, option 2 moves everything to sqlite,
+  and option 3 is a hybrid keeping postgres for writes only.
+  <<<END_QUOTE_48291>>>
+  [User message]
+  this
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on[39m

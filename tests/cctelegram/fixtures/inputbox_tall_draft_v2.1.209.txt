@@ -1,0 +1,50 @@
+
+╭─── Claude Code v2.1.209 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                │
+│               Welcome back Emiliyan!               │ Ask Claude to create a new app or clone a repository                                                    │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                              │
+│                      ▝▜█████▛▘                     │ Fixed /model and other dialogs being blocked in `claude agents` background sessions (reverts an overly… │
+│                        ▘▘ ▝▝                       │ Added screen reader mode: opt-in plain-text rendering for screen reader users. Run `claude --ax-screen… │
+│   Opus 4.8 (1M context) with me… · Claude Max ·    │ Added `vimInsertModeRemaps` setting: map two-key insert-mode sequences like `jj` to Escape in vim mode  │
+│   em.tanev@gmail.com's Organization                │ /release-notes for more                                                                                 │
+│         /private/tmp/ccrig-gh56-1784016686         │                                                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 3 MCP servers need authentication · run /mcp
+
+ ▎ Extended through July 19
+ ▎ We're extending Claude Fable 5 access on all paid plans, as well as keeping Claude Code’s weekly rate limits 50% higher, through July 19.
+ ▎
+ ▎ As before, you can use up to half of your weekly usage limit on Fable 5. After that, you can keep using Fable 5 with usage credits, or switch to another
+ ▎ model to keep working within your remaining limits.
+ ▎
+ ▎ More details here: https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ [Telegram reply context]
+  The user is replying to an earlier message in this same topic.
+  Treat the quoted text below as the context the user responds to.
+  Do not re-answer the quoted message; answer the new user message.
+  Keep the earlier decision in mind and stay consistent with it.
+  Preserve any file paths, ids, and option numbers exactly.
+  Referenced message: assistant
+  From: Claude
+  Telegram message id: 48291
+  Reply to message id: 48277
+  Claude session: 3f9c2a10-7b4e-4d21-9a8c-1e6f0b7d5c42
+  <<<QUOTE_48291>>>
+  Here are the three options for the migration path forward.
+  Option 1 keeps postgres, option 2 moves everything to sqlite,
+  and option 3 is a hybrid keeping postgres for writes only.
+  <<<END_QUOTE_48291>>>
+  [User message]
+  this
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on

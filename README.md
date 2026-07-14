@@ -173,10 +173,13 @@ is ever replayed silently.
 Because the bot types the text first and only then presses Enter, a prompt that
 appears in between leaves your message sitting *unsent* in the terminal's input
 box. When that happens you are told so, and the topic is braked: further messages
-are refused until you clear the input box in the terminal (`Esc`, or `Ctrl+U`),
-so the next message can never be appended to the stranded one and submit both at
-once. `/esc` sends that Escape for you — but if Claude is mid-run it will also
-interrupt the run. The brake lifts by itself as soon as the bot sees an empty
+are refused until the input box is cleared, so the next message can never be
+appended to the stranded one and submit both at once. To clear it, press Escape
+**twice quickly** in the window (a single Escape does not clear a multi-line
+draft on current Claude Code, and Ctrl+U only kills one line) — or just send
+`/esc`, which on a braked topic performs exactly that double-Escape for you,
+after first checking that a draft is actually there (so it never interrupts a
+running turn). The brake lifts by itself as soon as the bot sees an empty
 input box again. In the rarer case where the final Enter itself fails, the bot
 says plainly that the message *may or may not* have been submitted — check the
 window with `/screenshot` before resending.
@@ -256,7 +259,7 @@ These commands belong to cc-telegram and are never forwarded to Claude:
 | `/start` | Show the short introduction and explain how to begin. |
 | `/history` | Browse this topic's session history. |
 | `/screenshot` | Capture the tmux pane as a PNG. |
-| `/esc` | Send Escape to interrupt Claude. |
+| `/esc` | Send Escape to interrupt Claude — or, on a topic braked by a stranded draft, clear the input box with a bot-side double-Escape. |
 | `/usage` | Read Claude Code's usage and limits from the TUI overlay. If the session is busy, replies with a bridge-side snapshot (context usage plus cached limits) instead of a dead end. |
 | `/cost` | Alias of `/usage` — same overlay, same busy-path snapshot. |
 | `/update` | Update Claude Code and restart this topic's idle session in place; `/update all` restarts every idle session. Owner only. |

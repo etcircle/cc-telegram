@@ -443,6 +443,9 @@ def _make_bot_tmux(
 ) -> tuple[MagicMock, list[bool]]:
     tmux = MagicMock()
     tmux.window_send_lock = MagicMock(return_value=lock)
+    # GH #56: pin the stranded-draft brake off so /esc stays on the UNBRAKED
+    # single-Escape path (a bare MagicMock attribute is truthy).
+    tmux.window_has_stranded_draft = MagicMock(return_value=False)
     window = MagicMock()
     window.window_id = "@1"
     tmux.find_window_by_id = AsyncMock(return_value=window)

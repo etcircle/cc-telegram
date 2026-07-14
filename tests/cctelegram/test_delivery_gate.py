@@ -487,7 +487,11 @@ async def test_prompt_appearing_between_write_and_final_capture_withholds_enter(
     # Esc / Ctrl-U have surface-specific semantics (Esc on folder-trust KILLS
     # Claude).
     assert "was NOT submitted" in result.message
-    assert "Esc" not in result.message
+    # GH #56: the remedy is now HONEST — a single Escape / Ctrl+U does NOT clear a
+    # draft on 2.1.209; two rapid Escapes do (and /esc performs that safely on a
+    # braked window). The copy still offers no unconditional auto-cleanup.
+    assert "twice" in result.message.lower()
+    assert "Ctrl+U" not in result.message
 
 
 @pytest.mark.asyncio
@@ -1261,6 +1265,24 @@ def test_copy_is_actionable_per_reason() -> None:
     assert "line breaks are fine" in delivery.REFUSAL_COPY["control_chars"]
     assert "Esc" in delivery.REFUSAL_COPY["tasks_mode"]
     assert "@" in delivery.REFUSAL_COPY["completion_overlay"]
+
+
+def test_draft_clear_copy_tells_the_truth_gh56() -> None:
+    """GH #56: a single Escape / Ctrl+U does NOT clear a draft on 2.1.209; two
+    rapid Escapes do (and /esc performs that safely on a braked window). The
+    stranded_draft + draft_written copy must advertise the double-press and must
+    NOT claim a single Escape or Ctrl+U clears the box."""
+    for reason in (delivery.REASON_STRANDED_DRAFT, delivery.REASON_REVERIFY_FAILED):
+        copy = delivery.REFUSAL_COPY[reason]
+        assert "twice" in copy.lower(), reason
+        assert "/esc" in copy, reason
+        assert "Ctrl+U" not in copy, reason
+    # commit_unknown KEEPS its screenshot-first guidance (the Enter may already
+    # have landed — a double-Escape could interrupt the resulting turn) and
+    # mentions /esc only CONDITIONALLY.
+    cu = delivery.REFUSAL_COPY[delivery.REASON_ENTER_FAILED]
+    assert "/screenshot" in cu
+    assert "if you still see your text" in cu.lower()
 
 
 def test_quarantine_copy_is_the_exact_shipped_constant() -> None:
