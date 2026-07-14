@@ -535,7 +535,24 @@ Additional modules:
                                 line via a single O_APPEND os.write, always exits 0.
 
 Handler modules (handlers/):
-  message_sender.py   ─ safe_reply/safe_edit/safe_send + rate_limit_send
+  message_sender.py   ─ safe_reply/safe_edit/safe_send + rate_limit_send.
+                        CLASSIFIED SEND-path MarkdownV2→plain fallback (GH #55):
+                        on the message-CREATING paths (send_with_fallback /
+                        safe_reply / safe_send / topic_send's formatted branch)
+                        the plain re-send fires ONLY when the content provably
+                        did not deliver — a pre-network conversion raise (hoisted
+                        OUT of the network try) or a BadRequest server rejection
+                        (`_plain_fallback_eligible`, an isinstance-BadRequest test
+                        — NEVER a NetworkError-family test: PTB 22.7 makes
+                        BadRequest+TimedOut subclass NetworkError). A transient
+                        (TimedOut/NetworkError) leaves delivery AMBIGUOUS, so it
+                        logs "no plain fallback — delivery ambiguous or
+                        retry-ineligible" and returns None / (None, OTHER) rather
+                        than re-sending a duplicate (Telegram often delivers the
+                        formatted message while the client times out). safe_reply
+                        RE-RAISES the non-eligible failure. The EDIT lane
+                        (safe_edit / topic_edit) deliberately KEEPS the broad
+                        fallback — an edit can never mint a second message.
   output_prefs.py     ─ Per-user output-verbosity resolution (plan v4 PR-1):
                         frozen OutputPrefs snapshot per recipient, layering
                         "stored user override > EXPLICITLY-set legacy env
