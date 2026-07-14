@@ -5,6 +5,21 @@ format conversion and fallback to plain text on failure.
 
 Uses telegramify-markdown for MarkdownV2 formatting.
 
+Classified SEND-path fallback (GH #55): on the message-CREATING paths
+(``send_with_fallback`` / ``safe_reply`` / ``safe_send`` / ``topic_send``'s
+formatted branch) the MarkdownV2→plain re-send fires for exactly ONE failure
+class — the formatted content was provably NOT delivered: either the
+conversion itself raised (pre-network) or Telegram returned ``BadRequest``
+(server rejected the request). A transient (``TimedOut`` / ``NetworkError``)
+leaves delivery AMBIGUOUS — Telegram frequently delivers the formatted
+message while the client gives up waiting — so a plain re-send would mint the
+owner-observed duplicate; it (and every other class: ``Forbidden``, unknown)
+therefore logs and returns None/``(None, OTHER)`` instead of re-sending. The
+EDIT paths (``safe_edit`` / ``topic_edit``) deliberately KEEP the broad
+plain retry: an edit can never mint a second message (its worst case is
+overwriting a delivered formatted edit with a plain twin), and the caller
+recreation discipline owns transients there.
+
 Functions:
   - send_with_fallback: Send with formatting → plain text fallback
   - send_photo: Photo sending (single or media group)
@@ -120,6 +135,22 @@ def _ensure_formatted(text: str) -> str:
     return convert_markdown(text)
 
 
+def _plain_fallback_eligible(exc: BaseException) -> bool:
+    """True iff the plain-text RE-SEND may fire for this formatted-send failure.
+
+    ONLY a server-side rejection (``BadRequest``) qualifies: the request
+    provably did not deliver, so a re-send cannot duplicate. ``TimedOut`` /
+    ``NetworkError`` leave delivery AMBIGUOUS — a re-send risks the
+    owner-observed duplicate (GH #55) — and every other class (``Forbidden``,
+    unknown) would fail identically as plain. NOTE (PTB 22.7, pinned):
+    ``BadRequest`` subclasses ``NetworkError`` (and so does ``TimedOut``), so
+    this MUST be an ``isinstance``-``BadRequest`` test, never a
+    NetworkError-family test — a NetworkError-family test would swallow every
+    transient right back into the fallback.
+    """
+    return isinstance(exc, BadRequest)
+
+
 PARSE_MODE = "MarkdownV2"
 
 
@@ -137,27 +168,49 @@ async def send_with_fallback(
 
     Returns the sent Message on success, None on failure.
     RetryAfter is re-raised for caller handling.
+
+    The plain re-send fires only when the MarkdownV2 conversion raised
+    (pre-network) or Telegram returned ``BadRequest`` (server rejection) — a
+    transient leaves delivery ambiguous and logs + returns None instead of
+    re-sending a duplicate (GH #55).
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
+    # Conversion is hoisted OUT of the network try: a conversion failure is a
+    # legitimate fallback trigger (nothing reached Telegram), and separating
+    # it from send failures keeps the eligibility test unambiguous.
     try:
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=_ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        )
-    except RetryAfter:
-        raise
+        formatted: str | None = _ensure_formatted(text)
     except Exception:
+        logger.warning("MarkdownV2 conversion failed; sending plain", exc_info=True)
+        formatted = None
+    if formatted is not None:
         try:
             return await bot.send_message(
-                chat_id=chat_id, text=strip_sentinels(text), **kwargs
+                chat_id=chat_id,
+                text=formatted,
+                parse_mode=PARSE_MODE,
+                **kwargs,
             )
         except RetryAfter:
             raise
-        except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
-            return None
+        except Exception as exc:
+            if not _plain_fallback_eligible(exc):
+                logger.error(
+                    "Failed to send message to %d: %r — no plain fallback — "
+                    "delivery ambiguous or retry-ineligible",
+                    chat_id,
+                    exc,
+                )
+                return None
+    try:
+        return await bot.send_message(
+            chat_id=chat_id, text=strip_sentinels(text), **kwargs
+        )
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send message to {chat_id}: {e}")
+        return None
 
 
 async def send_photo(
@@ -243,24 +296,43 @@ async def send_document(
 
 
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
-    """Reply with formatting, falling back to plain text on failure."""
+    """Reply with formatting, falling back to plain text on failure.
+
+    The plain re-send fires only on a conversion failure or a ``BadRequest``
+    server rejection; a transient (``TimedOut`` / ``NetworkError``) is logged
+    and RE-RAISED unchanged (delivery ambiguous — never a duplicate re-send;
+    GH #55). The terminal double-failure path also raises, as before.
+    """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     try:
-        return await message.reply_text(
-            _ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        )
-    except RetryAfter:
-        raise
+        formatted: str | None = _ensure_formatted(text)
     except Exception:
+        logger.warning("MarkdownV2 conversion failed; sending plain", exc_info=True)
+        formatted = None
+    if formatted is not None:
         try:
-            return await message.reply_text(strip_sentinels(text), **kwargs)
+            return await message.reply_text(
+                formatted,
+                parse_mode=PARSE_MODE,
+                **kwargs,
+            )
         except RetryAfter:
             raise
-        except Exception as e:
-            logger.error(f"Failed to reply: {e}")
-            raise
+        except Exception as exc:
+            if not _plain_fallback_eligible(exc):
+                logger.error(
+                    "Failed to reply: %r — no plain fallback — "
+                    "delivery ambiguous or retry-ineligible",
+                    exc,
+                )
+                raise
+    try:
+        return await message.reply_text(strip_sentinels(text), **kwargs)
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to reply: {e}")
+        raise
 
 
 async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
@@ -290,28 +362,47 @@ async def safe_send(
     message_thread_id: int | None = None,
     **kwargs: Any,
 ) -> None:
-    """Send message with formatting, falling back to plain text on failure."""
+    """Send message with formatting, falling back to plain text on failure.
+
+    The plain re-send fires only on a conversion failure or a ``BadRequest``
+    server rejection; a transient leaves delivery ambiguous and logs +
+    returns instead of re-sending a duplicate (GH #55). The terminal shape is
+    still "log, return None" (today's double-failure contract).
+    """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     if message_thread_id is not None:
         kwargs.setdefault("message_thread_id", message_thread_id)
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=_ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        )
-    except RetryAfter:
-        raise
+        formatted: str | None = _ensure_formatted(text)
     except Exception:
+        logger.warning("MarkdownV2 conversion failed; sending plain", exc_info=True)
+        formatted = None
+    if formatted is not None:
         try:
             await bot.send_message(
-                chat_id=chat_id, text=strip_sentinels(text), **kwargs
+                chat_id=chat_id,
+                text=formatted,
+                parse_mode=PARSE_MODE,
+                **kwargs,
             )
+            return
         except RetryAfter:
             raise
-        except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
+        except Exception as exc:
+            if not _plain_fallback_eligible(exc):
+                logger.error(
+                    "Failed to send message to %d: %r — no plain fallback — "
+                    "delivery ambiguous or retry-ineligible",
+                    chat_id,
+                    exc,
+                )
+                return
+    try:
+        await bot.send_message(chat_id=chat_id, text=strip_sentinels(text), **kwargs)
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send message to {chat_id}: {e}")
 
 
 async def safe_answer(
@@ -499,8 +590,12 @@ async def topic_send(
     Returns the sent ``Message`` (or ``None`` on failure) and a
     ``TopicSendOutcome`` so callers can decide whether to fall back
     (DM, repair, retry). When ``plain=False`` MarkdownV2 is attempted first,
-    then plain text. When ``plain=True`` (e.g. raw terminal capture for the
-    interactive UI) only the plain-text path is used.
+    then plain text — but ONLY when the formatted content provably did not
+    deliver (a conversion failure or a ``BadRequest`` server rejection); a
+    transient classifies ``OTHER`` and returns ``(None, OTHER)`` WITHOUT a
+    plain re-send, since delivery is ambiguous and a re-send risks the
+    owner-observed duplicate (GH #55). When ``plain=True`` (e.g. raw terminal
+    capture for the interactive UI) only the plain-text path is used.
     ``RetryAfter`` is re-raised so the worker's flood-control logic still owns
     rate-limit handling.
     """
@@ -545,32 +640,53 @@ async def topic_send(
                 op, user_id, chat_id, thread_id, window_id, outcome, "send", exc
             )
             return None, outcome
+    # Conversion is hoisted OUT of the network try (GH #55): a conversion
+    # failure is a legitimate fallback trigger (nothing reached Telegram), so
+    # the plain send below becomes the FIRST network attempt and nothing can
+    # duplicate.
     try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=_ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        )
-        _log_topic_outcome(
-            op, user_id, chat_id, thread_id, window_id, TopicSendOutcome.OK, "send"
-        )
-        _record(sent)
-        return sent, TopicSendOutcome.OK
-    except RetryAfter:
-        raise
-    except Exception as exc:
-        outcome = _classify_bad_request(exc)
-        # Topic-shaped failures will not improve by stripping markdown.
-        if outcome in (
-            TopicSendOutcome.TOPIC_NOT_FOUND,
-            TopicSendOutcome.TOPIC_CLOSED,
-            TopicSendOutcome.FORBIDDEN,
-        ):
-            _log_topic_outcome(
-                op, user_id, chat_id, thread_id, window_id, outcome, "send", exc
+        formatted: str | None = _ensure_formatted(text)
+    except Exception:
+        logger.warning("MarkdownV2 conversion failed; sending plain", exc_info=True)
+        formatted = None
+    if formatted is not None:
+        try:
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=formatted,
+                parse_mode=PARSE_MODE,
+                **kwargs,
             )
-            return None, outcome
+            _log_topic_outcome(
+                op, user_id, chat_id, thread_id, window_id, TopicSendOutcome.OK, "send"
+            )
+            _record(sent)
+            return sent, TopicSendOutcome.OK
+        except RetryAfter:
+            raise
+        except Exception as exc:
+            outcome = _classify_bad_request(exc)
+            # Topic-shaped failures will not improve by stripping markdown.
+            # (Kept exactly as before — these ARE BadRequest subclasses, so
+            # this early-return must precede the eligibility gate below.)
+            if outcome in (
+                TopicSendOutcome.TOPIC_NOT_FOUND,
+                TopicSendOutcome.TOPIC_CLOSED,
+                TopicSendOutcome.FORBIDDEN,
+            ):
+                _log_topic_outcome(
+                    op, user_id, chat_id, thread_id, window_id, outcome, "send", exc
+                )
+                return None, outcome
+            # GH #55: only a server-side ``BadRequest`` rejection may re-send
+            # as plain — a transient (``TimedOut`` / ``NetworkError``,
+            # classified ``OTHER``) leaves delivery ambiguous, so a re-send
+            # risks the owner-observed duplicate. Never re-send it.
+            if not _plain_fallback_eligible(exc):
+                _log_topic_outcome(
+                    op, user_id, chat_id, thread_id, window_id, outcome, "send", exc
+                )
+                return None, outcome
     try:
         sent = await bot.send_message(
             chat_id=chat_id, text=strip_sentinels(text), **kwargs
@@ -614,6 +730,12 @@ async def topic_edit(
     BOTH are supplied — that's how ``_convert_status_to_content`` repurposes
     a status row into the first content part. Plain edits to an existing
     message keep the row as-is.
+
+    Unlike the SEND paths (GH #55), the edit lane deliberately KEEPS the broad
+    MarkdownV2→plain retry: an edit can never mint a second message (its worst
+    case is overwriting a delivered formatted edit with a plain twin), and the
+    caller recreation discipline owns transients (a non-OK edit is not treated
+    as permission to re-send here).
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     record_role_change = role is not None and content_type is not None
