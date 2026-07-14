@@ -118,18 +118,23 @@ async def test_text_on_a_live_surface_is_refused(
 
 
 @pytest.mark.asyncio
-async def test_switch_model_refuses_although_the_parser_is_blind_to_it(
+async def test_switch_model_refuses_regardless_of_the_detector(
     scenario: ScenarioHarness,
 ) -> None:
-    """The M4 pin. ``Switch model?`` is footer-less, so the Decision detector
-    returns None even with the flags ON — a NEGATIVE gate ("no known prompt
-    matched") would type into it and Enter would switch the model + save it as
-    the default. The POSITIVE gate refuses regardless."""
+    """The M4 pin, re-based for GH #52. ``Switch model?`` was footer-less and the
+    Decision detector used to be BLIND to it (the M4 hazard: a NEGATIVE "no known
+    prompt matched" gate would type into it and Enter would switch the model + save
+    it as the default). GH #52 now DETECTS it as a footerless Decision with the
+    flags ON — but the delivery gate is POSITIVE input-box evidence and never
+    consults ``_active_ui_patterns``, so it refuses REGARDLESS of the detector."""
     pane = BLOCKING_PANES["switch_model"]
     terminal_parser.set_permission_prompts_enabled(True)
     terminal_parser.set_decision_cards_enabled(True)
     try:
-        assert terminal_parser.extract_interactive_content(pane) is None
+        # GH #52: the detector now names it Decision (flags ON) — the gate refusal
+        # below is INDEPENDENT of that (it is positive input-box proof).
+        content = terminal_parser.extract_interactive_content(pane)
+        assert content is not None and content.name == "Decision"
         wid = _bind(scenario, pane=pane)
         route = (scenario.user_id, 42, wid)
 

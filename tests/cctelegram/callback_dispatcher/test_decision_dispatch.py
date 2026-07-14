@@ -273,6 +273,66 @@ def test_classify_advance_empty_capture_fails_closed() -> None:
     assert cbi._classify_decision_advance("   \n\n  ", "decision:abc") is False
 
 
+# ── GH #52 confirm-side: only a proven-FOOTERED form / no-residue confirms ──
+
+_MODAL_RULE = "▔" * 80
+_FOOTERLESS_PANE = (
+    f"{_MODAL_RULE}\n   Switch model?\n   body line\n\n"
+    "   ❯ 1. Yes, switch\n     2. No, go back\n"
+)
+_FOOTERED_TWIN = _FOOTERLESS_PANE + " Enter to confirm · Esc to cancel\n"
+
+
+def test_footered_mint_then_footerless_reparse_is_commit_unconfirmed() -> None:
+    """r5 P1(a): the SAME footered prompt captured mid-redraw WITHOUT its footer
+    re-parses FOOTERLESS → a variant-distinct form that MUST NOT confirm. Only a
+    proven-FOOTERED live form may establish a "different form" resolution."""
+    footered = tp.parse_generic_decision(_FOOTERED_TWIN)
+    assert footered is not None
+    assert tp.decision_variant_of(footered) == tp.DECISION_VARIANT_FOOTERED
+    footered_fp = tp.decision_prompt_fingerprint(footered)
+    # The post-Enter pane re-parses FOOTERLESS (footer dropped mid-redraw).
+    footerless = tp.parse_generic_decision(_FOOTERLESS_PANE)
+    assert footerless is not None
+    assert tp.decision_variant_of(footerless) == tp.DECISION_VARIANT_FOOTERLESS
+    assert cbi._classify_decision_advance(_FOOTERLESS_PANE, footered_fp) is False
+
+
+def test_footered_mint_then_folder_trust_minus_footer_is_commit_unconfirmed() -> None:
+    """r5 P1(b) — a REAL fixture, not a synthetic ▔ form: a footer-dropped frame of a
+    ``─``-ruled folder-trust prompt fails the strict footerless parser entirely
+    (extractor None), but its still-standing terminal option block IS DECISION
+    RESIDUE → commit_unconfirmed, never a false ``dispatched``."""
+    ft = (_FX / "folder_trust_arrival_plain_v2.1.207.txt").read_text()
+    ft_nofooter = "\n".join(
+        line for line in ft.split("\n") if "Enter to confirm" not in line
+    )
+    assert tp.extract_interactive_content(ft_nofooter) is None
+    assert tp.has_decision_residue(ft_nofooter) is True
+    assert cbi._classify_decision_advance(ft_nofooter, "decision:whatever") is False
+
+
+def test_different_proven_footered_form_confirms_dispatched() -> None:
+    """A DIFFERENT proven-FOOTERED Decision form on the confirm pane (the committed
+    prompt resolved and a new footered one raised within the settle) → dispatched."""
+    trust = tp.parse_generic_decision(_TRUST)
+    assert trust is not None
+    committed_fp = tp.decision_prompt_fingerprint(trust)
+    # A DIFFERENT footered form (different options) is now on the pane.
+    assert cbi._classify_decision_advance(_FOOTERED_TWIN, committed_fp) is True
+
+
+def test_no_residue_pane_confirms_dispatched() -> None:
+    """A confirm pane with NO Decision residue (input box restored, no footer, no
+    terminal option block) → the committed prompt is positively gone → dispatched."""
+    restored = (
+        _FX / "decision_footerless_neg_inputbox_restored_v2.1.207.txt"
+    ).read_text()
+    assert tp.extract_interactive_content(restored) is None
+    assert tp.has_decision_residue(restored) is False
+    assert cbi._classify_decision_advance(restored, "decision:whatever") is True
+
+
 def test_parse_nav_payload_suffixed_and_legacy() -> None:
     """Round-4 guardrail 1: ``(window_id, gen)`` parses BEFORE the window is used.
 

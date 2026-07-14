@@ -772,6 +772,13 @@ _BASELINE_CLASSIFICATIONS = {
     "cost_overlay_d_v2.1.206.txt": "no_input_box",
     "cost_overlay_live_v2.1.206.txt": "no_input_box",
     "cost_overlay_w_v2.1.206.txt": "no_input_box",
+    # GH #52 footerless-Decision fixtures — a live footerless prompt REPLACES the
+    # input box (no_input_box), and the post-commit restored box is deliverable
+    # (None). Flag-independent: the delivery gate never consults the Decision flag.
+    "decision_footerless_neg_inputbox_restored_v2.1.207.txt": None,
+    "decision_footerless_neg_model_picker_v2.1.207.txt": "no_input_box",
+    "decision_footerless_switchmodel_scrollback_v2.1.207.txt": "no_input_box",
+    "decision_footerless_switchmodel_v2.1.207.txt": "no_input_box",
     "decision_negative_quoted_scrollback_v2.1.200.txt": None,
     "decision_switch_model_v2.1.200.txt": "no_input_box",
     "decision_trust_folder_postdown_v2.1.204.txt": "no_input_box",
