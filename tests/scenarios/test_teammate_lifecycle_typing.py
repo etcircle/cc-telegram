@@ -1422,3 +1422,240 @@ async def test_item1_normal_bind_floor_reduces_to_spawned_ts_minus_eps(
     snap = route_runtime.snapshot(route)
     assert snap.typing_eligible is False
     assert snap.background_agents == ()
+
+
+# ── GH #59: a teammate's OWN run_in_background Bash launch is sidechain-only ──
+#
+# The T1.2 structured background-Bash lane reads only the PARENT transcript, so a
+# bound teammate that launches a background bash (a long pytest suite) then PARKS
+# went typing/🟡 dark for the whole post-park run — the bash ran unseen while the
+# teammate stem key was (correctly) tombstoned by the park (GH #46). The fix
+# records the SAME bare bash key from the run-state-authoritative teammate
+# sidechain; the EXISTING parent queue-op close + the 2 h is_background TTL close
+# it, and the teammate PARK closes ONLY the stem key, so the bash key survives.
+
+from pathlib import Path as _Path  # noqa: E402
+
+_GH59_FIXTURE = (
+    _Path(__file__).resolve().parent.parent
+    / "cctelegram"
+    / "fixtures"
+    / "teammate_sidechain_bash_v2.1.211.jsonl"
+)
+# The incident sidechain stem == fixture agentId; normalized key drops "agent-".
+_GH59_STEM = "avis2-backend-7041d9b743d26f2e"
+_GH59_NAME = "vis2-backend"
+_GH59_BASH_KEY = "bgbnvxcbx"
+
+
+def _gh59_fixture_entries() -> list[dict]:
+    import json as _json
+
+    return [
+        _json.loads(line)
+        for line in _GH59_FIXTURE.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def _queue_op_close_entry(task_id: str, entry_ts: str) -> dict:
+    """The INCIDENT's busy-parent ``queue-operation``/``enqueue`` close shape
+    (parent transcript line 428, CC 2.1.211): the ``<task-notification>`` rides
+    a TOP-LEVEL ``content`` string on a ``type:"queue-operation"`` entry — no
+    ``message`` — which ``transcript_parser`` SYNTHESIZES into the same
+    ``lifecycle_only`` user-text entry (``utils.is_task_notification`` gated),
+    so the parent lane extracts its ``<task-id>`` into ``rec.completed`` → a
+    PARENT unconditional tombstone."""
+    return {
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "timestamp": entry_ts,
+        "sessionId": _SID,
+        "content": (
+            "<task-notification>\n"
+            f"<task-id>{task_id}</task-id>\n"
+            "<tool-use-id>toolu_bgbash01</tool-use-id>\n"
+            f"<output-file>/tmp/tasks/{task_id}.output</output-file>\n"
+            "<status>completed</status>\n"
+            '<summary>Background command "Run full agent suite in background" '
+            "completed (exit code 0)</summary>\n"
+            "</task-notification>"
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_gh59_incident_e2e_unregistered_bash_survives_park(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """T5: the INCIDENT end-to-end via the UNREGISTERED path (rec is None — the
+    logs showed vis2-backend was unregistered, the in-memory registry not being
+    restart-reconciled). The sidechain appears (no spawn parsed) → its OWN bash
+    launch → PARK → (typing STAYS on because the bash key survives) → parent
+    queue-op close → typing drops. RED against unmodified code at the
+    "typing stays on after park" assertion (pre-fix the launch was never recorded,
+    so the park's stem tombstone left the route dark)."""
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+
+    # UNREGISTERED teammate sidechain (legacy → feed_run_state True). Register at
+    # EOF, then the OWN background-Bash launch batch appears.
+    sc = sub_dir / f"agent-{_GH59_STEM}.jsonl"
+    sc.write_text("")
+    await mon.check_sidechain_updates({_SID})  # register at EOF
+    with open(sc, "a") as f:
+        import json as _json
+
+        for e in _gh59_fixture_entries():
+            f.write(_json.dumps(e) + "\n")
+    await mon.check_sidechain_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    assert _GH59_BASH_KEY in act[_SID].launched  # the fix records the bash key
+    await bot_module.apply_sidechain_activity(act)
+
+    # Both the stem key (via ticks) and the bash key (via launched) lift typing.
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True
+    assert _GH59_BASH_KEY in snap.background_agents
+
+    # PARK — the teammate reports idle; the park (ts NEWER than the stem's last
+    # sidechain write) tombstones ONLY the stem key (GH #46).
+    _append(
+        [
+            _park_entry(
+                _GH59_NAME, "2026-07-16T19:32:46.000Z", "2026-07-16T19:32:46.000Z"
+            )
+        ]
+    )
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+
+    # THE RED ASSERTION: the bash key SURVIVES the park → typing STAYS on.
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True
+    assert snap.background_agents == (_GH59_BASH_KEY,)
+
+    # PARENT QUEUE-OP CLOSE — the incident's actual close shape: the bash's
+    # <task-notification> lands as a busy-parent queue-operation/enqueue entry
+    # (the parser synthesizes the lifecycle_only user-text entry) and tombstones
+    # the bash key (source=PARENT, unconditional) → typing drops.
+    _append([_queue_op_close_entry(_GH59_BASH_KEY, "2026-07-16T19:43:22.797Z")])
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_gh59_registered_spawn_bind_bash_survives_park(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """T5 variant: the REGISTERED spawn→bind path. A teammate is spawned + bound,
+    launches its OWN background bash on the BOUND sidechain (feed_run_state True
+    for the bound current_key), then parks — the bash key survives the park."""
+    import os
+    import time
+
+    route = await _bind_idle_route(scenario)
+    mon, sub_dir, _append = _make_hybrid_monitor(tmp_path)
+
+    # Spawn + bind: pre-discover the stem at EOF, then the spawn registers + binds.
+    spawn_ts = time.time() - 30
+    sc = sub_dir / f"agent-{_GH59_STEM}.jsonl"
+    sc.write_text(
+        __import__("json").dumps(
+            {
+                "type": "assistant",
+                "message": {"content": []},
+                "timestamp": _iso_utc(spawn_ts + 0.01),
+            }
+        )
+        + "\n"
+    )
+    os.utime(sc, (spawn_ts + 0.01, spawn_ts + 0.01))
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+
+    _append(_spawn_pair(_GH59_NAME, _iso_utc(spawn_ts)))
+    await mon.check_for_updates({_SID})
+    await mon.check_sidechain_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    assert mon._teammate_registry[_SID][_GH59_NAME].current_key == _GH59_STEM
+
+    # The bound teammate launches its OWN background bash (structured meta).
+    launch = {
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "tool_use_id": "toolu_bgbash01",
+                    "type": "tool_result",
+                    "content": "Command running in background with ID: bgbnvxcbx.",
+                    "is_error": False,
+                }
+            ]
+        },
+        "sessionId": _SID,
+        "isSidechain": True,
+        "agentId": _GH59_STEM,
+        "timestamp": _iso_utc(spawn_ts + 5),
+        "toolUseResult": {
+            "stdout": "",
+            "stderr": "",
+            "interrupted": False,
+            "backgroundTaskId": _GH59_BASH_KEY,
+        },
+    }
+    with open(sc, "a") as f:
+        f.write(__import__("json").dumps(launch) + "\n")
+    await mon.check_sidechain_updates({_SID})
+    act = mon.pop_sidechain_activity()
+    assert _GH59_BASH_KEY in act[_SID].launched  # bound → feed_run_state True
+    await bot_module.apply_sidechain_activity(act)
+    assert _GH59_BASH_KEY in route_runtime.snapshot(route).background_agents
+
+    # PARK — closes the stem only; the bash key survives → typing stays on.
+    _append([_park_entry(_GH59_NAME, _iso_utc(spawn_ts + 60), _iso_utc(spawn_ts + 60))])
+    await mon.check_for_updates({_SID})
+    await bot_module.apply_sidechain_activity(mon.pop_sidechain_activity())
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is True
+    assert snap.background_agents == (_GH59_BASH_KEY,)
+
+
+@pytest.mark.asyncio
+async def test_gh59_fanout_same_tick_close_and_launch_nets_idle(
+    scenario: ScenarioHarness,
+) -> None:
+    """T4 (ordering 1): a SAME-tick close+launch — the fan-out always applies
+    launched BEFORE completed, so the key is born tombstoned-in-effect → idle."""
+    route = await _bind_idle_route(scenario)
+    await bot_module.apply_sidechain_activity(
+        {
+            _SID: ParentSidechainActivity(
+                launched={_GH59_BASH_KEY}, completed={_GH59_BASH_KEY}
+            )
+        }
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
+
+
+@pytest.mark.asyncio
+async def test_gh59_fanout_earlier_tick_close_then_launch_noops(
+    scenario: ScenarioHarness,
+) -> None:
+    """T4 (ordering 2): a close applied in an EARLIER tick tombstones the key;
+    a later launch NO-OPS against the tombstone → idle."""
+    route = await _bind_idle_route(scenario)
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(completed={_GH59_BASH_KEY})}
+    )
+    await bot_module.apply_sidechain_activity(
+        {_SID: ParentSidechainActivity(launched={_GH59_BASH_KEY})}
+    )
+    snap = route_runtime.snapshot(route)
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()

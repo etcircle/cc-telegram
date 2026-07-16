@@ -3580,6 +3580,47 @@ class SessionMonitor:
                     elif tick.max_end_turn_ts is None or ts > tick.max_end_turn_ts:
                         tick.max_end_turn_ts = ts
 
+            # GH #59: a teammate's OWN ``run_in_background`` Bash launch is
+            # sidechain-only — the T1.2 structured background-Bash lane
+            # (``:3044``) reads only the PARENT transcript, so a bound teammate
+            # that launches a background bash (a long pytest suite) then PARKS
+            # went typing/🟡 dark for the whole post-park run (the park tombstones
+            # the teammate STEM key per GH #46, but nothing recorded the bash).
+            # Record the SAME bare bash key here, from a run-state-AUTHORITATIVE
+            # teammate sidechain (the ``feed_run_state`` gate this block already
+            # rides — unregistered legacy OR registered-bound ``current_key``;
+            # registered-unbound/ambiguous and the Workflow display loop pass
+            # feed_run_state=False and never reach here). The launch id == the
+            # ``<task-notification>`` close id, so the EXISTING parent queue-op
+            # close lane + the 2 h ``is_background`` TTL close it; the teammate
+            # park closes only the stem key, so the bash key deliberately
+            # SURVIVES the park (the incident's need). Scope: ``tool_name in
+            # (None, "Bash")`` keeps the Bash scope where the parser KNOWS the
+            # tool AND admits the unknowable result-before-use shape
+            # (``tool_name=None``), while a KNOWN non-Bash tool_result carrying a
+            # ``backgroundTaskId``-shaped field is refused; STRUCTURED-ONLY (never
+            # prose) via ``backgroundTaskId`` presence. The PARENT lane at
+            # ``:3044`` is NOT touched (its stricter ``tool_name == "Bash"`` gate
+            # stays byte-identical).
+            from .handlers.response_builder import (
+                background_bash_task_id_from_meta,
+            )
+
+            activity = self._parent_activity(parent_session_id)
+            for entry in parsed_entries:
+                if entry.content_type != "tool_result":
+                    continue
+                if entry.tool_name not in (None, "Bash"):
+                    continue
+                bash_task_id = background_bash_task_id_from_meta(entry.tool_result_meta)
+                if bash_task_id:
+                    activity.launched.add(normalize_background_agent_key(bash_task_id))
+                    logger.info(
+                        "teammate-sidechain bash launch recorded key=%s stem=%s",
+                        bash_task_id,
+                        sc_file.stem,
+                    )
+
         # Sidechain blocks are always emitted (keep-alive above is
         # already unconditional); display gating is PER-RECIPIENT via
         # output_prefs (subagent_cards / tool_activity) in the
