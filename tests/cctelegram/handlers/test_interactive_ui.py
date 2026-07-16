@@ -5775,3 +5775,463 @@ class TestForgetDoesNotReleaseLedgerRows:
             )
         finally:
             ledger.reset_for_tests()
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestInteractiveSendAmbiguousRetry:
+    """GH: interactive-card fresh-send ambiguous (OTHER) → ONE inline retry.
+
+    A client-side read timeout classifies ``TopicSendOutcome.OTHER`` while
+    Telegram often ACTUALLY delivered the card (GH #55 ambiguity class). The
+    old branch treated every ``sent is None`` as PROVEN failure, posting the
+    duplicate 🔔 attention card and orphaning the delivered card (dead nav
+    buttons). The fix: on ``OTHER`` only, sleep + re-issue the IDENTICAL
+    ``topic_send`` once, inside the same route-locked invocation. Every other
+    outcome is byte-identical to today.
+    """
+
+    _WINDOW = "@5"
+    _USER = 1
+    _THREAD = 42
+
+    def _sequencer(self, outcomes):
+        """Return (fake_topic_send, calls). ``outcomes`` is an iterable of
+        either ``(sent_or_None, TopicSendOutcome)`` tuples or Exceptions to
+        raise on that attempt."""
+        calls: list[dict] = []
+        it = iter(outcomes)
+
+        async def fake_topic_send(
+            bot, *, op, user_id, chat_id, thread_id, window_id, text, **kw
+        ):
+            kb = kw.get("reply_markup")
+            # Snapshot the callback-data STRINGS at call time — a same-object
+            # `is` comparison after the fact would be tautological; the
+            # snapshot pins that the bytes on the wire were identical for
+            # both attempts even if the keyboard were rebuilt or mutated.
+            cb_snapshot = (
+                None
+                if kb is None
+                else [[btn.callback_data for btn in row] for row in kb.inline_keyboard]
+            )
+            calls.append(
+                {
+                    "op": op,
+                    "text": text,
+                    "reply_markup": kb,
+                    "callback_data": cb_snapshot,
+                    "kw": kw,
+                }
+            )
+            try:
+                result = next(it)
+            except StopIteration:  # pragma: no cover - defensive
+                raise AssertionError(
+                    f"topic_send called {len(calls)} times — more than the "
+                    f"{len(calls) - 1} outcomes provided"
+                )
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        return fake_topic_send, calls
+
+    async def _drive_settings(
+        self,
+        mock_bot,
+        pane: str,
+        fake_topic_send,
+        *,
+        attention_outcome=None,
+        attention_mock=None,
+        sleep_mock=None,
+    ):
+        """Drive ``handle_interactive_ui`` over a Settings pane with a patched
+        ``topic_send`` sequencer and a patched ``asyncio.sleep`` + attention.
+
+        Returns ``(result, attention_mock, sleep_mock)``. A raising drive
+        (e.g. a RetryAfter sequencer) propagates the raise — callers that need
+        the mocks AFTER the raise must pre-create and pass them in (T7's
+        fold: the mock must SURVIVE the raise so "attention was never called"
+        is assertable).
+        """
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        if attention_outcome is None:
+            attention_outcome = TopicSendOutcome.OK
+
+        mock_window = MagicMock()
+        mock_window.window_id = self._WINDOW
+        if attention_mock is None:
+            attention_mock = AsyncMock(return_value=attention_outcome)
+        if sleep_mock is None:
+            sleep_mock = AsyncMock()
+
+        with (
+            patch("cctelegram.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("cctelegram.handlers.interactive_ui.session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+            patch(
+                "cctelegram.handlers.interactive_ui.topic_send",
+                side_effect=fake_topic_send,
+            ),
+            patch(
+                "cctelegram.handlers.interactive_ui.attention.notify_waiting",
+                side_effect=attention_mock,
+            ),
+            patch(
+                "cctelegram.handlers.interactive_ui.asyncio.sleep",
+                side_effect=sleep_mock,
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.get_display_name.return_value = "topic-name"
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic-name"
+
+            result = await handle_interactive_ui(
+                mock_bot,
+                user_id=self._USER,
+                window_id=self._WINDOW,
+                thread_id=self._THREAD,
+            )
+        return result, attention_mock, sleep_mock
+
+    @pytest.mark.asyncio
+    async def test_t1_ambiguous_then_retry_success(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """T1: (None, OTHER) then a Message → NO attention card, surface
+        recorded, mode latched, return True; EXACTLY two identical sends; the
+        retry sleep uses ``_INTERACTIVE_SEND_RETRY_DELAY_S``."""
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.interactive_ui import has_interactive_surface
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 4242
+        fake, calls = self._sequencer(
+            [(None, TopicSendOutcome.OTHER), (sent_msg, TopicSendOutcome.OK)]
+        )
+        result, attention_mock, sleep_mock = await self._drive_settings(
+            mock_bot, sample_pane_settings, fake
+        )
+
+        assert result is True
+        # EXACTLY two sends (drift pin: identical text + reply_markup).
+        assert len(calls) == 2, f"expected 2 sends, got {len(calls)}"
+        assert calls[0]["text"] == calls[1]["text"]
+        assert calls[0]["reply_markup"] is calls[1]["reply_markup"]
+        # No duplicate 🔔 attention card.
+        attention_mock.assert_not_awaited()
+        # Surface recorded + mode latched.
+        assert has_interactive_surface(self._USER, self._THREAD) is True
+        assert iui._interactive_mode.get((self._USER, self._THREAD)) == self._WINDOW
+        # The retry slept the retry constant.
+        assert any(
+            c.args == (iui._INTERACTIVE_SEND_RETRY_DELAY_S,)
+            for c in sleep_mock.await_args_list
+        ), (
+            "retry must await asyncio.sleep(_INTERACTIVE_SEND_RETRY_DELAY_S); "
+            f"awaited: {sleep_mock.await_args_list}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_t2_ambiguous_then_ambiguous(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """T2: both (None, OTHER) → attention card EXACTLY once, return False,
+        no surface, no third send, no DM (OTHER is not topic-shaped)."""
+        from cctelegram.handlers.interactive_ui import has_interactive_surface
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        fake, calls = self._sequencer(
+            [(None, TopicSendOutcome.OTHER), (None, TopicSendOutcome.OTHER)]
+        )
+        with patch(
+            "cctelegram.handlers.interactive_ui._notify_waiting_dm",
+            new_callable=AsyncMock,
+        ) as dm_mock:
+            result, attention_mock, _sleep = await self._drive_settings(
+                mock_bot, sample_pane_settings, fake
+            )
+
+        assert result is False
+        assert len(calls) == 2, f"expected exactly 2 sends, got {len(calls)}"
+        attention_mock.assert_awaited_once()
+        assert has_interactive_surface(self._USER, self._THREAD) is False
+        dm_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_t3_definitive_first_attempt_no_retry(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """T3: a definitive first-attempt outcome (TOPIC_CLOSED) → ONE send
+        only, no retry sleep, attention card + DM guard byte-identical to
+        today."""
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        fake, calls = self._sequencer([(None, TopicSendOutcome.TOPIC_CLOSED)])
+        with patch(
+            "cctelegram.handlers.interactive_ui._notify_waiting_dm",
+            new_callable=AsyncMock,
+        ) as dm_mock:
+            result, attention_mock, sleep_mock = await self._drive_settings(
+                mock_bot,
+                sample_pane_settings,
+                fake,
+                attention_outcome=TopicSendOutcome.TOPIC_CLOSED,
+            )
+
+        assert result is False
+        assert len(calls) == 1, f"definitive outcome must not retry: {len(calls)}"
+        attention_mock.assert_awaited_once()
+        # No retry sleep fired.
+        assert not any(
+            c.args == (iui._INTERACTIVE_SEND_RETRY_DELAY_S,)
+            for c in sleep_mock.await_args_list
+        )
+        # Topic-shaped definitive + non-OK attention → DM escalation (today).
+        dm_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_t4_ambiguous_then_definitive_uses_retry_outcome_for_dm(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """T4: (None, OTHER) then (None, TOPIC_CLOSED) → attention once; the DM
+        trio check uses the RETRY outcome (TOPIC_CLOSED is topic-shaped)."""
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        fake, calls = self._sequencer(
+            [(None, TopicSendOutcome.OTHER), (None, TopicSendOutcome.TOPIC_CLOSED)]
+        )
+        with patch(
+            "cctelegram.handlers.interactive_ui._notify_waiting_dm",
+            new_callable=AsyncMock,
+        ) as dm_mock:
+            result, attention_mock, _sleep = await self._drive_settings(
+                mock_bot,
+                sample_pane_settings,
+                fake,
+                attention_outcome=TopicSendOutcome.TOPIC_CLOSED,
+            )
+
+        assert result is False
+        assert len(calls) == 2
+        attention_mock.assert_awaited_once()
+        # The DM guard reads the RETRY's outcome (TOPIC_CLOSED), so it fires.
+        dm_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_t5_regression_success_first_send(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """T5a: a successful first send suppresses the attention card, one
+        call only, no retry sleep."""
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.interactive_ui import has_interactive_surface
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 555
+        fake, calls = self._sequencer([(sent_msg, TopicSendOutcome.OK)])
+        result, attention_mock, sleep_mock = await self._drive_settings(
+            mock_bot, sample_pane_settings, fake
+        )
+
+        assert result is True
+        assert len(calls) == 1
+        attention_mock.assert_not_awaited()
+        assert has_interactive_surface(self._USER, self._THREAD) is True
+        assert not any(
+            c.args == (iui._INTERACTIVE_SEND_RETRY_DELAY_S,)
+            for c in sleep_mock.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_t5_first_send_retryafter_propagates(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """T5b: a ``RetryAfter`` from the FIRST send still propagates (never
+        swallowed into the ambiguous-retry path)."""
+        from telegram.error import RetryAfter
+
+        from cctelegram.handlers.interactive_ui import has_interactive_surface
+
+        fake, calls = self._sequencer([RetryAfter(3)])
+        with pytest.raises(RetryAfter):
+            await self._drive_settings(mock_bot, sample_pane_settings, fake)
+
+        assert len(calls) == 1
+        assert has_interactive_surface(self._USER, self._THREAD) is False
+
+    @pytest.mark.asyncio
+    async def test_t6_gate_card_retry_keeps_identical_callback_data(
+        self, mock_bot: AsyncMock
+    ):
+        """T6: for a gate card (Decision), the retry send carries the SAME
+        callback data — no re-mint / generation rotation between attempts."""
+        import re
+        from pathlib import Path
+
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+        from cctelegram.terminal_parser import set_decision_cards_enabled
+
+        pane = (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "decision_trust_folder_v2.1.200.txt"
+        ).read_text()
+
+        sent_msg = MagicMock()
+        sent_msg.message_id = 6060
+        fake, calls = self._sequencer(
+            [(None, TopicSendOutcome.OTHER), (sent_msg, TopicSendOutcome.OK)]
+        )
+        set_decision_cards_enabled(True)
+        try:
+            # The fixture ACTUALLY parses as a Decision gate (not some other
+            # UI that happened to mint a keyboard) — asserted while the flag
+            # is ON, i.e. under the same detector state the render ran with.
+            content = iui.extract_interactive_content(pane)
+            assert content is not None and content.name == "Decision"
+            result, attention_mock, _sleep = await self._drive_settings(
+                mock_bot, pane, fake
+            )
+        finally:
+            set_decision_cards_enabled(False)
+
+        assert result is True
+        assert len(calls) == 2
+        assert calls[0]["text"] == calls[1]["text"]
+        # Callback-data strings SNAPSHOTTED AT CALL TIME are equal across both
+        # sends (non-tautological: the snapshot would differ if the retry
+        # re-minted, rotated, or mutated the keyboard between attempts).
+        cb0 = calls[0]["callback_data"]
+        cb1 = calls[1]["callback_data"]
+        assert cb0 is not None and cb0 == cb1
+        # Gate render → the raw nav callbacks carry the nav-generation suffix
+        # (`aq:*:<window>:g<gen>`), and it is the SAME generation on both
+        # attempts — pinning "THIS retry invocation does not re-mint/rotate".
+        flat0 = [d for row in cb0 for d in row]
+        nav_suffixes = {
+            d.rsplit(":", 1)[-1]
+            for d in flat0
+            if d.startswith("aq:") and re.search(r":g\d+$", d)
+        }
+        assert nav_suffixes, f"expected gate nav-generation suffixes, got {flat0}"
+        assert len(nav_suffixes) == 1, (
+            f"nav-generation suffix must be uniform within one render: {nav_suffixes}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_t7_retry_attempt_retryafter_propagates(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """T7: (None, OTHER) then the retry RAISES ``RetryAfter`` → propagates
+        out of ``handle_interactive_ui`` (helper must not catch it); NO
+        attention card, NO DM, NO surface recorded, no mode latch beyond the
+        existing first-attempt-RetryAfter shape."""
+        from telegram.error import RetryAfter
+
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.interactive_ui import has_interactive_surface
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        fake, calls = self._sequencer([(None, TopicSendOutcome.OTHER), RetryAfter(3)])
+        # Pre-create the attention mock OUTSIDE the drive so it SURVIVES the
+        # raise: an implementation that caught the retry's RetryAfter, posted
+        # the attention card, then re-raised would otherwise still pass.
+        attention_mock = AsyncMock(return_value=TopicSendOutcome.OK)
+        with patch(
+            "cctelegram.handlers.interactive_ui._notify_waiting_dm",
+            new_callable=AsyncMock,
+        ) as dm_mock:
+            with pytest.raises(RetryAfter):
+                await self._drive_settings(
+                    mock_bot,
+                    sample_pane_settings,
+                    fake,
+                    attention_mock=attention_mock,
+                )
+
+        assert len(calls) == 2
+        # The attention card was NEVER posted — the RetryAfter propagated
+        # before (and instead of) the definitive-failure handling.
+        attention_mock.assert_not_awaited()
+        # Same shape as a first-attempt RetryAfter: nothing latched or recorded.
+        assert has_interactive_surface(self._USER, self._THREAD) is False
+        assert (self._USER, self._THREAD) not in iui._interactive_mode
+        dm_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_t8_orphan_nav_is_window_keyed_preexisting_class(self):
+        """T8 (accepted-behavior pin): a non-gate orphan card's window-keyed nav
+        callback dispatches to whatever live surface the window currently owns —
+        IDENTICAL to any pre-existing stray/historical card.
+        ``assert_nav_dispatchable`` never consults the tapped message's id, so
+        the both-delivered orphan adds ONE more instance of an EXISTING class,
+        it does not widen per-tap semantics.
+        """
+        from cctelegram.handlers import interactive_ui as iui
+
+        # A LATER AUQ render recorded the route's surface (points at the newer
+        # card). The orphan (unrecorded) card and any pre-existing stray card
+        # are both physical messages in the same window.
+        iui._interactive_msgs[(42, 7)] = 12345  # the LATER card's id
+        iui.set_interactive_mode(42, "@0", 7)
+
+        fake_window = MagicMock()
+        fake_window.window_id = "@0"
+        live_picker = (
+            "Pick.\n"
+            "\n"
+            "❯ 1. A\n"
+            "  2. B\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+
+        def _query():
+            q = AsyncMock()
+            q.answer = AsyncMock()
+            return q
+
+        with (
+            patch.object(
+                iui.tmux_manager,
+                "find_window_by_id",
+                new_callable=AsyncMock,
+                return_value=fake_window,
+            ),
+            patch.object(
+                iui.tmux_manager,
+                "capture_pane",
+                new_callable=AsyncMock,
+                return_value=live_picker,
+            ),
+        ):
+            # A tap that (conceptually) came from the ORPHAN card.
+            q_orphan = _query()
+            q_orphan.message = MagicMock()
+            q_orphan.message.message_id = 99999  # the orphan's id
+            r_orphan = await iui.assert_nav_dispatchable(q_orphan, 42, 7, "@0")
+
+            # A tap from a PRE-EXISTING stray/historical card (different id).
+            q_stray = _query()
+            q_stray.message = MagicMock()
+            q_stray.message.message_id = 88888
+            r_stray = await iui.assert_nav_dispatchable(q_stray, 42, 7, "@0")
+
+        # Both dispatch to the CURRENT live surface (the window) — identically,
+        # regardless of which message id tapped. No widening: the orphan is the
+        # same class as the stray.
+        assert r_orphan is fake_window
+        assert r_stray is fake_window
+        assert r_orphan is r_stray
+        q_orphan.answer.assert_not_called()
+        q_stray.answer.assert_not_called()

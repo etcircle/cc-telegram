@@ -38,7 +38,13 @@ from pathlib import Path
 
 from typing import Any
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyParameters,
+)
 
 from ..config import config
 from ..markdown_v2 import convert_markdown, render_expandable_quote_untruncated
@@ -172,6 +178,13 @@ _auq_context_post_pending: dict[str, _AuqContextPendingClaim] = {}
 # claims for the same window. This is NOT crash recovery — restart
 # drops pending claims entirely (the dict is module-level state).
 _PENDING_CLAIM_TTL_SECONDS = 60.0
+
+# GH: interactive-card fresh-send ambiguous-outcome retry. A client-side read
+# timeout classifies ``TopicSendOutcome.OTHER`` while Telegram often ACTUALLY
+# delivered the card (GH #55 ambiguity class). On OTHER only, the fresh-send
+# branch sleeps this long, then re-issues ONE byte-identical ``topic_send``
+# inside the same route-locked invocation (never re-render / re-mint / rotate).
+_INTERACTIVE_SEND_RETRY_DELAY_S = 2.0
 
 
 def _pending_claim_clock() -> float:
@@ -4305,8 +4318,34 @@ async def handle_interactive_ui(
             if anchor_id is not None:
                 anchor = ReplyParameters(message_id=anchor_id)
         interactive_session_id = session_id_for_window(window_id)
-        if anchor is not None:
-            sent, send_outcome = await topic_send(
+
+        async def _send_interactive_card() -> tuple[Message | None, TopicSendOutcome]:
+            # Factored so the ambiguous-outcome retry re-issues a
+            # BYTE-IDENTICAL send: same text / keyboard / anchor / kwargs.
+            # THIS retry invocation performs no re-render / re-mint / rotation
+            # (identical callback bytes ⇒ both cards, if both land, fully work
+            # while the prompt is live); a CONCURRENT render can still rotate
+            # the gate generation pre-lock, degrading the retry card's nav to
+            # the "Card refreshed" toast — the plan's accepted scope.
+            # ``RetryAfter`` is re-raised by ``topic_send(plain=True)`` and
+            # MUST propagate — this helper never catches it.
+            if anchor is not None:
+                return await topic_send(
+                    bot,
+                    op="interactive",
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    window_id=window_id,
+                    text=text,
+                    plain=True,
+                    reply_markup=keyboard,
+                    reply_parameters=anchor,
+                    role="tool",
+                    content_type="tool_use",
+                    session_id=interactive_session_id,
+                )
+            return await topic_send(
                 bot,
                 op="interactive",
                 user_id=user_id,
@@ -4316,26 +4355,36 @@ async def handle_interactive_ui(
                 text=text,
                 plain=True,
                 reply_markup=keyboard,
-                reply_parameters=anchor,
                 role="tool",
                 content_type="tool_use",
                 session_id=interactive_session_id,
             )
-        else:
-            sent, send_outcome = await topic_send(
-                bot,
-                op="interactive",
-                user_id=user_id,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                window_id=window_id,
-                text=text,
-                plain=True,
-                reply_markup=keyboard,
-                role="tool",
-                content_type="tool_use",
-                session_id=interactive_session_id,
+
+        sent, send_outcome = await _send_interactive_card()
+        # GH: AMBIGUOUS failure — a client-side read timeout (~5.005s, PTB 22.7
+        # default) classifies ``OTHER`` while Telegram often ACTUALLY delivered
+        # the card (the GH #55 ambiguity class; ``RetryAfter`` is re-raised
+        # upstream and never reaches this branch, and every
+        # ``TOPIC_NOT_FOUND`` / ``TOPIC_CLOSED`` / ``FORBIDDEN`` / other
+        # classified outcome is server-definitive). Treating it as a PROVEN
+        # failure posted the duplicate 🔔 attention card AND orphaned the
+        # delivered card (its ``aq:*`` nav taps fail ``has_interactive_surface``
+        # → dead buttons; the poller's pre-stored hash never re-renders). So on
+        # ``OTHER`` only, sleep + re-issue the IDENTICAL send ONCE, still inside
+        # this route-locked invocation (the lock already serializes interactive
+        # sends/renders — no concurrent interactive send can interleave). Retry
+        # success flows into the existing success path; a second ambiguous /
+        # definitive outcome falls through to today's attention-card handling
+        # (which then reads the RETRY's ``send_outcome`` for the DM trio check).
+        if sent is None and send_outcome is TopicSendOutcome.OTHER:
+            logger.info(
+                "interactive send ambiguous (outcome=OTHER) window=%s — one "
+                "inline retry in %ss",
+                window_id,
+                _INTERACTIVE_SEND_RETRY_DELAY_S,
             )
+            await asyncio.sleep(_INTERACTIVE_SEND_RETRY_DELAY_S)
+            sent, send_outcome = await _send_interactive_card()
         if sent is None:
             # Topic send failed — still mark interactive mode (prevents
             # per-poll retry spam) and try the topic-first attention
