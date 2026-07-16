@@ -85,6 +85,6 @@ docs/plans/
 /20260527_165944_36eead
 
 # Local Claude Code configuration — stays on disk for the agent, never on GitHub
-# (owner decision 2026-07-16; CLAUDE.md untracked via git rm --cached same day)
+# (owner decision 2026-07-16; CLAUDE.md + the whole .claude/ untracked via git rm --cached)
 CLAUDE.md
-.claude/settings.json
+.claude/
