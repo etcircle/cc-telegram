@@ -130,6 +130,72 @@ def _teammate_tag_completion(s: str, start: int) -> int:
     return -1
 
 
+def _resync_past_envelope(s: str, start: int) -> int:
+    """Guarded resync past ONE body-shape-failed teammate envelope (GH #57).
+
+    A real agent-teams finish batches the teammate's final REPORT envelope +
+    the PARK envelope into ONE parent entry, report first — so the trailing
+    park (the key's ONLY close signal) sat behind a markdown-body envelope the
+    r3 scanner ``break``ed on. On a body-shape failure — (a) a non-``{`` body,
+    (b) a ``{``-leading but undecodable body, (c) a decoded fragment with no
+    structural close after it — the caller calls this to skip past the failed
+    envelope's OWN close and continue, instead of stopping enumeration.
+
+    ``start`` is the current opener's completing-``>`` index + 1 (for case (c)
+    too — the search is over the raw text, independent of the failed decode):
+
+    1. Find the first **LINE-ANCHORED** ``</teammate-message>`` at index
+       ``>= start`` — "line-anchored" = preceded by ``\\n`` (covers ``\\r\\n``).
+       None → return ``-1`` (caller ``break``s; fail-closed = today's behavior,
+       incl. a close that lies BEYOND the byte bound). The line-anchored
+       requirement is DELIBERATELY narrower than the valid-envelope path's
+       same-line close (``_teammate_tag_completion`` / the whitespace-only gap
+       below): it relies on the CC renderer invariant that the close tag is
+       emitted on its OWN line — verified 213/213 line-anchored, 0 mid-line,
+       across the full local transcript corpus (~400 session files, survey
+       2026-07-16), plus the incident entry and the v2.1.197 fixture. A
+       RENDERER-DRIFT AUDIT SURFACE: a hypothetical same-line-closed report
+       resyncs onto the NEXT envelope's close, where the ownership guard fires
+       (a line-anchored opener sits between) → hard break → ``[]``, fail-closed.
+    2. **Close-ownership guard (Codex r1 P2-1, r2-broadened):** if ANY
+       ``_TEAMMATE_OPEN_RE`` match — the scanner's FULL unanchored opener
+       grammar, at ANY column (line-anchored, indented, or mid-line) — occurs
+       at an index ``>= start`` and ``<`` the close found in (1), the current
+       envelope never closed before another opener appeared (structurally
+       broken) → return ``-1`` (caller ``break``s). Accepted fail-dark residual
+       (GH #57): a markdown body that MENTIONS the literal opener token
+       ``<teammate-message`` (quoted/fenced/indented/mid-prose) hard-breaks the
+       resync and a genuine trailing park is lost — the same class as a quoted
+       close in a fence, and strictly the safe direction (matches the scanner's
+       own opener recognition, per Codex r2). A mid-line CLOSE mention costs
+       nothing to skip and is NOT guarded (asymmetry is deliberate — an opener
+       signals a crossed envelope boundary, a close does not).
+    3. Return ``close_idx + len(_TEAMMATE_CLOSE_TAG)``; the caller sets ``pos``
+       there and continues the opener search. Nothing is trusted after a
+       resync: the next envelope must still pass the FULL structural gauntlet.
+    """
+    # (1) first line-anchored close at index >= start.
+    close_idx = -1
+    search_from = start
+    while True:
+        c = s.find(_TEAMMATE_CLOSE_TAG, search_from)
+        if c < 0:
+            break
+        if c >= 1 and s[c - 1] == "\n":
+            close_idx = c
+            break
+        search_from = c + 1
+    if close_idx < 0:
+        return -1  # no line-anchored close (incl. beyond-bound) — fail closed
+    # (2) close-ownership guard — the FIRST opener at >= start decides (any
+    # earlier one means the current envelope never closed before it).
+    om = _TEAMMATE_OPEN_RE.search(s, start)
+    if om is not None and om.start() < close_idx:
+        return -1  # a crossed envelope boundary — fail closed (r2-broadened)
+    # (3) resume past this envelope's own close.
+    return close_idx + len(_TEAMMATE_CLOSE_TAG)
+
+
 def teammate_envelope_payloads(text: str) -> list[Any]:
     """The SINGLE bounded teammate-envelope scanner (GH #46 review P2/r2 —
     predicate/parser structural parity by construction).
@@ -153,14 +219,35 @@ def teammate_envelope_payloads(text: str) -> list[Any]:
     envelope (a teammate summary quoting the tag parses correctly); (iv) the
     structural close tag must follow the decoded JSON end (+ optional
     whitespace) within the bound. Enumeration continues after each close (one
-    entry can carry MULTIPLE envelopes — review P1) and STOPS at the first
-    structurally-invalid envelope — including a non-JSON body (no reliable
-    resync point without re-introducing quote-blind close matching; earlier
-    valid payloads are kept). ACCEPTED consequence (r2/r3, disclosed): an
-    envelope whose body is not IMMEDIATELY a decodable JSON object — e.g. a
-    markdown teammate report — classifies as genuine-user (unknown shape =
-    human, the pre-GH#46 behavior; fail direction toward never suppressing a
-    real human turn). Bound math is BYTES: the char pre-slice caps encode cost
+    entry can carry MULTIPLE envelopes — review P1).
+
+    GH #57 — GUARDED RESYNC on a body-shape failure (supersedes the r3
+    stop-on-invalid rule): a real agent-teams finish batches the teammate's
+    final markdown REPORT envelope + the JSON PARK envelope into ONE entry,
+    report first — so the r3 ``break`` at the report dropped the trailing park
+    (the key's ONLY close signal → a 2 h strand). On a body-shape failure —
+    (a) a body not IMMEDIATELY starting ``{`` (the markdown report; the
+    incident shape), (b) a ``{``-leading but undecodable body (a report opening
+    ``{status}: all checks complete`` — Codex r1 P2-3, NOT corruption-only), or
+    (c) a payload that decodes but has no structural close after it (the
+    decoded fragment is DISCARDED, never appended) — the scanner runs
+    ``_resync_past_envelope`` (a line-anchored close + a full-grammar
+    opener-before-close ownership guard) and CONTINUES; only when that returns
+    ``-1`` (no line-anchored close, or a crossed envelope boundary) does it
+    hard-``break``. Every OTHER failure keeps the fail-closed ``break``
+    byte-identical: the byte-0 head-anchor miss, an opening tag that never
+    completes (quote-aware ``-1``), and any close/bound truncation the resync
+    surfaces as ``-1``. After a resync nothing is trusted — the next envelope
+    passes the FULL structural gauntlet, so foreign JSON lying BETWEEN
+    envelopes is still never borrowed. ACCEPTED consequences (GH #57,
+    disclosed): a markdown body that MENTIONS the literal opener token
+    ``<teammate-message`` hard-breaks the resync (ownership guard) → a genuine
+    trailing park is lost (fail-dark, same class as a quoted close in a fence);
+    and the resync relies on the CC renderer emitting the close tag on its own
+    line (213/213 line-anchored, survey 2026-07-16 — a RENDERER-DRIFT AUDIT
+    SURFACE in ``_resync_past_envelope``). A predicate on a report+park entry
+    is now True — CORRECT: it IS a teammate delivery, and its park closes the
+    key. Bound math is BYTES: the char pre-slice caps encode cost
     (chars >= 1 byte each), the byte slice enforces the bound, and the scan
     runs on the decode of the TRUNCATED bytes; ``errors="replace"`` keeps a
     lone surrogate / split trailing char from raising.
@@ -190,16 +277,36 @@ def teammate_envelope_payloads(text: str) -> list[Any]:
         while j0 < len(s) and s[j0] in " \t\r\n":
             j0 += 1
         if j0 >= len(s) or s[j0] != "{":
-            break  # non-JSON body / nothing after the tag — fail closed
+            # GH #57 case (a): non-JSON body (a markdown report) — the incident
+            # shape. Guarded resync past this envelope's own close, then
+            # continue; -1 keeps today's fail-closed break.
+            nxt = _resync_past_envelope(s, gt + 1)
+            if nxt < 0:
+                break
+            pos = nxt
+            continue
         try:
             payload, jend = decoder.raw_decode(s, j0)
         except ValueError:
-            break  # undecodable payload — unknown shape ⇒ genuine-user
+            # GH #57 case (b): a {-leading but undecodable body (a report
+            # opening `{status}: …`) — guarded resync (NOT corruption-only).
+            nxt = _resync_past_envelope(s, gt + 1)
+            if nxt < 0:
+                break
+            pos = nxt
+            continue
         k = jend
         while k < len(s) and s[k] in " \t\r\n":
             k += 1
         if not s.startswith(_TEAMMATE_CLOSE_TAG, k):
-            break  # no structural close right after the payload — fail closed
+            # GH #57 case (c): payload decoded but no structural close follows
+            # (a report opening with a JSON-looking fragment then prose) — the
+            # decoded fragment is DISCARDED (never appended), guarded resync.
+            nxt = _resync_past_envelope(s, gt + 1)
+            if nxt < 0:
+                break
+            pos = nxt
+            continue
         payloads.append(payload)
         pos = k + len(_TEAMMATE_CLOSE_TAG)
     return payloads
@@ -220,8 +327,13 @@ def is_teammate_message(text: str) -> bool:
     Fail-closed to genuine-user on ANY drift: a longer first line, a leading
     BOM/space, a malformed tag name delimiter, an opening tag that never
     completes (quote-aware), a close token only inside quoted attribute text,
-    a non-JSON body, or an envelope not complete within the
-    ``TEAMMATE_ENVELOPE_SCAN_BYTES`` BYTE bound.
+    or an envelope not complete within the ``TEAMMATE_ENVELOPE_SCAN_BYTES``
+    BYTE bound. GH #57: a report+park entry — a markdown-report envelope
+    followed by the JSON park envelope — now classifies machine-initiated
+    (the scanner's guarded resync skips the report body and yields the park),
+    which is CORRECT: it IS a teammate delivery. A markdown-ONLY entry (no
+    valid JSON envelope reachable through the resync) still yields ``[]`` →
+    genuine-user (standing doctrine).
     """
     return bool(teammate_envelope_payloads(text))
 

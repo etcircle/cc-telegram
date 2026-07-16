@@ -22,6 +22,7 @@ import pytest
 from cctelegram import route_runtime, transcript_event_adapter
 from cctelegram.route_runtime import RunState
 from cctelegram.session_monitor import TranscriptEvent
+from cctelegram.utils import parse_iso_timestamp
 
 
 def _event(
@@ -299,3 +300,61 @@ def test_assistant_text_is_never_teammate_stamped():
     )
     assert out is not None
     assert out.is_teammate_notification is False
+
+
+# ── GH #57: composed report+park stamp + tombstone preservation ─────────
+
+_MIXED_REPORT_PARK_TEXT = (
+    "Another Claude session sent a message:\n"
+    '<teammate-message teammate_id="aw1a-sat" color="purple" '
+    'summary="Re-run already done — S1–S5 all PASS">\n'
+    "## Re-run status\n"
+    "\n"
+    "All checks complete.\n"
+    "</teammate-message>\n"
+    '<teammate-message teammate_id="aw1a-sat" color="purple">\n'
+    '{"type":"idle_notification","from":"aw1a-sat",'
+    '"timestamp":"2026-07-16T03:37:46.169Z","idleReason":"available"}\n'
+    "</teammate-message>\n"
+    "\n"
+    "This came from another Claude session working with you as part of a team.\n"
+)
+
+_BG_KEY = "a1b2c3d4e5f6a7b89"
+
+
+async def test_mixed_report_park_event_stamps_teammate_and_preserves_tombstone():
+    """GH #57 composed (Codex P3-5): a mixed report+park parent user-text entry
+    drives the REAL adapter → ``is_teammate_notification`` True (the scanner's
+    guarded resync skips the markdown report body and yields the JSON park), and
+    it is NOT a task-notification. Ingesting that event into route_runtime with
+    an existing background-agent done tombstone PRESERVES the tombstone — the
+    machine-initiated branch, NOT the genuine-user reset (the GH #46 (A)
+    amplifier the incident re-entered through this shape)."""
+    evt = transcript_event_adapter.to_lifecycle_event(
+        _user_text_event(_MIXED_REPORT_PARK_TEXT)
+    )
+    assert evt is not None
+    assert evt.is_teammate_notification is True
+    assert evt.is_task_notification is False
+
+    # Establish an idle route carrying a done-tombstoned background key.
+    end_ts = parse_iso_timestamp("2026-06-10T12:00:00Z")
+    assert end_ts is not None
+    idle = transcript_event_adapter.to_lifecycle_event(
+        _event(
+            role="assistant",
+            block_type="text",
+            stop_reason="end_turn",
+            timestamp="2026-06-10T12:00:00Z",
+        )
+    )
+    assert idle is not None
+    await route_runtime.ingest_transcript_event(ROUTE_A, idle)
+    await route_runtime.mark_background_agent_activity(ROUTE_A, _BG_KEY, end_ts + 50)
+    await route_runtime.mark_background_agent_done(ROUTE_A, _BG_KEY)
+    assert _BG_KEY in route_runtime._state[ROUTE_A].background_agents_done
+
+    # The machine-initiated teammate event must NOT reset the tombstone.
+    await route_runtime.ingest_transcript_event(ROUTE_A, evt)
+    assert _BG_KEY in route_runtime._state[ROUTE_A].background_agents_done

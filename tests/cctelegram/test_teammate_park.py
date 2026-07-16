@@ -27,7 +27,11 @@ from cctelegram.handlers.response_builder import (
     is_teammate_message,
     parse_teammate_idle_notifications,
 )
-from cctelegram.utils import TEAMMATE_ENVELOPE_SCAN_BYTES, parse_iso_timestamp
+from cctelegram.utils import (
+    TEAMMATE_ENVELOPE_SCAN_BYTES,
+    parse_iso_timestamp,
+    teammate_envelope_payloads,
+)
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -363,13 +367,15 @@ def test_parse_present_but_unparseable_timestamp():
     assert parsed[0].park_ts_unparseable is True
 
 
-def test_parse_non_json_body_stops_enumeration():
-    """Codex r3 P1 pinned semantics: the payload must start IMMEDIATELY after
-    the tag completion, so a brace-less non-JSON body is structurally invalid
-    and STOPS enumeration — the SAME stop-on-invalid rule as the
-    undecodable-payload case (consistent, conservative); a later valid
-    envelope in the same entry is not reached. The old free-ranging find
-    CROSSED the boundary and borrowed the second envelope's JSON."""
+def test_parse_non_json_body_skips_to_next_envelope():
+    """GH #57 (INVERTS the r3 ``..._stops_enumeration``): a brace-less non-JSON
+    body (case (a) — the markdown-report shape) now runs the GUARDED RESYNC and
+    CONTINUES, so a later valid park envelope in the same entry IS reached. The
+    resync skips past the report envelope's OWN line-anchored close (no opener
+    lies between → ownership guard passes) and yields the ``peer-two`` park;
+    predicate True. (The r3 stop-on-invalid rule dropped the trailing park —
+    the incident. Foreign JSON BETWEEN envelopes is still never borrowed:
+    ``test_json_search_never_crosses_envelope_boundary`` stays green.)"""
     text = (
         "Another Claude session sent a message:\n"
         '<teammate-message teammate_id="x">\nnot json at all\n</teammate-message>\n'
@@ -379,8 +385,11 @@ def test_parse_non_json_body_stops_enumeration():
         '"timestamp":"2026-07-09T00:00:00Z"}\n'
         "</teammate-message>\n\ntrailing prose"
     )
-    assert parse_teammate_idle_notifications(text) == []
-    assert is_teammate_message(text) is False
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer-two"
+    assert parsed[0].park_ts == parse_iso_timestamp("2026-07-09T00:00:00Z")
+    assert is_teammate_message(text) is True
 
 
 def test_json_search_never_crosses_envelope_boundary():
@@ -435,11 +444,12 @@ def test_broken_opener_never_borrows_close_tags_gt():
     assert parse_teammate_idle_notifications(text) == []
 
 
-def test_parse_undecodable_first_envelope_stops_enumeration():
-    """r2 documented degradation: an UNDECODABLE JSON payload (raw_decode
-    raises) has no reliable envelope end, so enumeration STOPS — a later valid
-    envelope in the same entry is not reached (fail-closed; real envelopes are
-    machine-generated JSON, so this shape requires corruption)."""
+def test_parse_undecodable_first_envelope_skips_to_next_envelope():
+    """GH #57 (INVERTS the r2 ``..._stops_enumeration``, Codex r3 P2): a
+    ``{``-leading but UNDECODABLE body (case (b) — raw_decode raises) now runs
+    the guarded resync and CONTINUES, so the trailing ``peer-two`` park IS
+    yielded and the predicate is True. This is the in-place twin of the
+    brace-leading case-(b) test ``test_brace_leading_report_body_resyncs``."""
     text = (
         "Another Claude session sent a message:\n"
         '<teammate-message teammate_id="x">\n{broken json,,,\n</teammate-message>\n'
@@ -448,6 +458,331 @@ def test_parse_undecodable_first_envelope_stops_enumeration():
         '{"type":"idle_notification","from":"peer-two",'
         '"timestamp":"2026-07-09T00:00:00Z"}\n'
         "</teammate-message>\n\ntrailing prose"
+    )
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer-two"
+    assert parsed[0].park_ts == parse_iso_timestamp("2026-07-09T00:00:00Z")
+    assert is_teammate_message(text) is True
+
+
+# ── GH #57: guarded-resync past a report envelope (report+park entries) ───
+
+
+def test_incident_report_then_park_yields_the_park():
+    """GH #57 incident shape (near-verbatim, real entry 2026-07-16): the
+    teammate ``aw1a-sat`` finished with ONE parent entry carrying TWO envelopes
+    — a markdown REPORT (multi-line body, blank lines, backticks, a ``summary=``
+    attribute), then the JSON ``idle_notification`` PARK (the key's ONLY close
+    signal). The r3 scanner broke at the report and dropped the park → a 2 h
+    strand. The guarded resync now skips the report and yields exactly the
+    park."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="aw1a-sat" color="purple" '
+        'summary="Re-run already done — S1–S5 all PASS">\n'
+        "## Re-run status\n"
+        "\n"
+        "All checks complete. Details:\n"
+        "\n"
+        "```\n"
+        "S1 PASS\n"
+        "S2 PASS\n"
+        "```\n"
+        "\n"
+        "Nothing further needed.\n"
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="aw1a-sat" color="purple">\n'
+        '{"type":"idle_notification","from":"aw1a-sat",'
+        '"timestamp":"2026-07-16T03:37:46.169Z","idleReason":"available"}\n'
+        "</teammate-message>\n"
+        "\n"
+        "This came from another Claude session working with you as part of a "
+        "team.\n"
+    )
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "aw1a-sat"
+    assert parsed[0].park_ts == parse_iso_timestamp("2026-07-16T03:37:46.169Z")
+    assert parsed[0].park_ts_unparseable is False
+    assert is_teammate_message(text) is True
+
+
+def test_ownership_guard_unclosed_report_swallows_no_park():
+    """GH #57 / Codex P2-1 repro (verbatim): an UNCLOSED markdown envelope, then
+    envelope y (park), then envelope z (park). The resync from the unclosed
+    report finds y's line-anchored close, but y's opener sits BETWEEN the
+    report's start and that close — a crossed envelope boundary → the ownership
+    guard hard-breaks; z is NOT yielded (fail-closed)."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "a markdown report with no close of its own\n"
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-y",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="z">\n'
+        '{"type":"idle_notification","from":"peer-z",'
+        '"timestamp":"2026-07-09T00:00:01Z"}\n'
+        "</teammate-message>"
+    )
+    assert parse_teammate_idle_notifications(text) == []
+    assert is_teammate_message(text) is False
+
+
+def test_ownership_guard_r2_indented_and_midline_openers():
+    """GH #57 / Codex r2 P2: the ownership guard uses the scanner's FULL
+    unanchored opener grammar, so (i) an INDENTED y-opener and (ii) a MID-LINE
+    ``report <teammate-message …>`` y-opener between the unclosed report and the
+    next line-anchored close BOTH hard-break the resync → ``[]`` / False."""
+    indented = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "unclosed markdown report\n"
+        '  <teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-y",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    midline = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "unclosed markdown report\n"
+        'report <teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-y",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    for text in (indented, midline):
+        assert parse_teammate_idle_notifications(text) == []
+        assert is_teammate_message(text) is False
+
+
+def test_same_line_close_report_then_park_fails_closed():
+    """GH #57 / Codex P2-2 (renderer-drift audit surface): a report envelope
+    whose close is SAME-LINE (``report </teammate-message>``, not line-anchored)
+    followed by a park envelope. The resync ignores the same-line close and
+    resyncs onto the PARK's line-anchored close, but the park's opener sits
+    between → the ownership guard fires → ``[]`` (pinned fail-closed residual;
+    verified 213/213 line-anchored across the corpus, so this shape is
+    hypothetical)."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "a report ending on its own line </teammate-message>\n"
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-y",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    assert parse_teammate_idle_notifications(text) == []
+    assert is_teammate_message(text) is False
+
+
+def test_brace_leading_report_body_resyncs():
+    """GH #57 / Codex P2-3a: a body that LEADS with ``{`` but is not valid JSON
+    (``{status}: all checks complete`` — a legitimate report, raw_decode raises)
+    runs the case-(b) guarded resync; the trailing park IS yielded."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "{status}: all checks complete\n"
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-two",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer-two"
+    assert is_teammate_message(text) is True
+
+
+def test_decoded_fragment_then_prose_discards_fragment():
+    """GH #57 / Codex P2-3c: a body ``{"a": 1} more prose`` decodes a fragment
+    but has NO structural close after it → case (c): the decoded fragment is
+    DISCARDED (never appended), the resync skips past the envelope's own close,
+    and ONLY the trailing park is yielded."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        '{"a": 1} more prose after the fragment\n'
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-two",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer-two"
+    assert is_teammate_message(text) is True
+
+
+def test_markdown_only_entry_is_genuine_user():
+    """GH #57 doctrine pin: a markdown-ONLY entry (a report envelope with a
+    line-anchored close and NO JSON envelope after it) yields ``[]`` / False —
+    no valid JSON envelope is reachable through the resync, so it stays
+    genuine-user (never suppressing a real human turn)."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "just a markdown report, no park follows\n"
+        "</teammate-message>\n\ntrailing prose"
+    )
+    assert parse_teammate_idle_notifications(text) == []
+    assert is_teammate_message(text) is False
+
+
+def test_resync_close_never_appears_fails_closed():
+    """GH #57: an unclosed markdown body with NO later line-anchored close (and
+    no later opener) → the resync returns -1 → hard break → ``[]``."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "an unterminated markdown report with no close tag anywhere"
+    )
+    assert parse_teammate_idle_notifications(text) == []
+    assert is_teammate_message(text) is False
+
+
+def test_midline_close_mention_in_body_is_skipped():
+    """GH #57 item 10: a MID-LINE ``</teammate-message>`` mention in the body
+    (not line-anchored) is skipped by the resync's line-anchored close search;
+    it resyncs onto the report's REAL line-anchored close, then yields the park.
+    (The asymmetry vs the opener guard is deliberate — a close costs nothing to
+    skip, an opener signals a crossed envelope boundary.)"""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "a report mentioning </teammate-message> mid-line then more prose\n"
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-two",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer-two"
+    assert is_teammate_message(text) is True
+
+
+def test_crlf_through_the_resync_path():
+    """GH #57 / Codex r2 P3: the close search and the ownership guard agree on
+    CRLF. (i) a CRLF markdown report + CRLF close + park yields the park (the
+    ``\\r\\n`` close is line-anchored — the char before ``<`` is ``\\n``); (ii) a
+    CRLF unclosed report + nested opener + later park fails closed."""
+    ok = (
+        "Another Claude session sent a message:\r\n"
+        '<teammate-message teammate_id="report">\r\n'
+        "a crlf markdown report\r\n"
+        "</teammate-message>\r\n"
+        '<teammate-message teammate_id="y">\r\n'
+        '{"type":"idle_notification","from":"peer-two",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\r\n'
+        "</teammate-message>"
+    )
+    parsed = parse_teammate_idle_notifications(ok)
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer-two"
+    assert is_teammate_message(ok) is True
+
+    guarded = (
+        "Another Claude session sent a message:\r\n"
+        '<teammate-message teammate_id="report">\r\n'
+        "a crlf unclosed report\r\n"
+        '<teammate-message teammate_id="y">\r\n'
+        '{"type":"idle_notification","from":"peer-y",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\r\n'
+        "</teammate-message>"
+    )
+    assert parse_teammate_idle_notifications(guarded) == []
+    assert is_teammate_message(guarded) is False
+
+
+def test_prior_payload_continuity_and_chained_resync():
+    """GH #57 / Codex r2 P3 (asserted on the DIRECT scanner return, r3): a valid
+    envelope A → a case-(c) fragment envelope B → a valid envelope Z yields
+    exactly ``[A, Z]`` (prior payloads kept, the failed one skipped); and TWO
+    consecutive body-failure envelopes before a valid park still yields the
+    park (repeated resync progress)."""
+    a_z = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="a">\n'
+        '{"type":"idle_notification","from":"peer-a",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="b">\n'
+        '{"frag": 1} then prose, no close after the fragment\n'
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="z">\n'
+        '{"type":"idle_notification","from":"peer-z",'
+        '"timestamp":"2026-07-09T00:00:01Z"}\n'
+        "</teammate-message>"
+    )
+    payloads = teammate_envelope_payloads(a_z)
+    assert len(payloads) == 2
+    assert [p["from"] for p in payloads] == ["peer-a", "peer-z"]
+
+    two_failures = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="r1">\n'
+        "first markdown report, non-JSON\n"
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="r2">\n'
+        "{still not valid json,,,\n"
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-two",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    parsed = parse_teammate_idle_notifications(two_failures)
+    assert len(parsed) == 1
+    assert parsed[0].name == "peer-two"
+
+
+def test_known_residual_quoted_close_in_fence_yields_crafted_payload():
+    """GH #57 accepted residual: a report body containing a LINE-ANCHORED
+    ``</teammate-message>`` (a fenced example) resyncs early onto that quoted
+    close; a subsequent CRAFTED complete envelope's payload is then yielded.
+    Bounded by the full structural gauntlet + the runtime TEAMMATE ts-gates;
+    worst case a one-leg-early tombstone (fail-dark). Pinned as KNOWN."""
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "here is how the close tag looks in a fenced block:\n"
+        "```\n"
+        "</teammate-message>\n"
+        "```\n"
+        '<teammate-message teammate_id="crafted">\n'
+        '{"type":"idle_notification","from":"crafted-name",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
+    )
+    parsed = parse_teammate_idle_notifications(text)
+    assert len(parsed) == 1
+    assert parsed[0].name == "crafted-name"
+    assert is_teammate_message(text) is True
+
+
+def test_resync_close_beyond_byte_bound_fails_closed():
+    """GH #57 item 12: a non-JSON first envelope whose line-anchored close lies
+    BEYOND the byte bound is invisible to the truncated scan → the resync finds
+    no close → ``[]``."""
+    pad = "x" * (TEAMMATE_ENVELOPE_SCAN_BYTES + 10)
+    text = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="report">\n'
+        "report body " + pad + "\n"
+        "</teammate-message>\n"
+        '<teammate-message teammate_id="y">\n'
+        '{"type":"idle_notification","from":"peer-two",'
+        '"timestamp":"2026-07-09T00:00:00Z"}\n'
+        "</teammate-message>"
     )
     assert parse_teammate_idle_notifications(text) == []
     assert is_teammate_message(text) is False

@@ -545,13 +545,35 @@ literal `</teammate-message>` INSIDE a JSON string no longer terminates the
 envelope — a teammate summary quoting the tag now parses correctly; and the
 structural close tag must follow the decoded JSON end (+ optional whitespace)
 within the bound. Predicate-True now IMPLIES a decodable payload + structural
-close — predicate/parser divergence is dead by construction. ACCEPTED
-consequence (disclosed): an envelope whose body is not IMMEDIATELY a decodable
-JSON object (e.g. a markdown teammate report) classifies as genuine-user
-(unknown shape = human — the pre-GH#46 behavior); enumeration STOPS at the
-first structurally-invalid envelope — including a non-JSON body (the r3 pinned
-stop-on-invalid rule, consistent with the undecodable case; earlier valid
-payloads kept). **Fix (B)
+close — predicate/parser divergence is dead by construction. **GH #57 (Codex
+r1-r3) — GUARDED RESYNC on a body-shape failure (supersedes the r3
+stop-on-invalid rule):** a real agent-teams finish batches the teammate's
+final markdown REPORT envelope + the JSON PARK envelope into ONE parent entry,
+report first — so the r3 `break` at the report body dropped the trailing park
+(the key's ONLY close signal → a 2 h strand, the #57 incident). On a
+body-shape failure — (a) a body not IMMEDIATELY starting `{` (the markdown
+report), (b) a `{`-leading but undecodable body (a report opening `{status}:
+…` — NOT corruption-only), or (c) a payload that decodes but has no structural
+close after it (the decoded fragment DISCARDED, never appended) — the scanner
+runs `_resync_past_envelope` and CONTINUES: it finds the failed envelope's OWN
+line-anchored `</teammate-message>` (relies on the CC renderer emitting the
+close on its own line — 213/213 line-anchored across the corpus, survey
+2026-07-16, a renderer-drift audit surface) and applies a close-ownership
+guard — if the scanner's FULL unanchored opener grammar matches ANYWHERE
+(line-anchored, indented, or mid-line) between the failed envelope's start and
+that close, the envelope never closed before another opener appeared →
+hard-`break` fail-closed (r2-broadened). Only then does enumeration resume;
+after a resync nothing is trusted (the next envelope passes the FULL
+structural gauntlet), so foreign JSON BETWEEN envelopes is still never
+borrowed. Every OTHER failure keeps the fail-closed `break` byte-identical:
+head-anchor miss, opening-tag-never-completes, close/bound truncation. A
+report+park entry now classifies machine-initiated — CORRECT (it IS a teammate
+delivery; the park closes the key AND stops the GH #46 (A) tombstone-reset
+amplifier). Disclosed residuals: a markdown body that MENTIONS the literal
+opener token `<teammate-message` hard-breaks the resync (ownership guard) → a
+genuine trailing park is lost (fail-dark, same class as a quoted close in a
+fence); and a markdown-ONLY entry (no reachable JSON envelope) still yields
+`[]` → genuine-user (standing doctrine). **Fix (B)
 — the park-close lane:** `response_builder.parse_teammate_idle_notifications`
 (PLURAL — one parent entry can carry MULTIPLE envelopes, real-data verified;
 the second envelope of the live 15:56:55Z entry names the teammate whose park
