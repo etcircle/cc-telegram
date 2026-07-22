@@ -869,8 +869,19 @@ def test_the_baked_baseline_covers_the_whole_fixture_directory() -> None:
         _TALL_DRAFT_ANSI,
         _TALL_DRAFT_CLEARED,
     }
+    # GH #60: the fully-dim ghost fixtures + a fresh normal-intensity draft —
+    # newly introduced and deliberately FLIPPED (or pinned) in
+    # test_gh60_ghost_delivery_gate.py, so they are excluded here like the GH #56
+    # set rather than baked into the "unchanged corpus" baseline above.
+    gh60_fixtures = {
+        "inputbox_ghost_prose_v2.1.215.ansi.txt",
+        "inputbox_ghost_slash_clear_synthetic_v2.1.215.ansi.txt",
+        "inputbox_ghost_at_word_synthetic_v2.1.215.ansi.txt",
+        "inputbox_ghost_numbered_synthetic_v2.1.215.ansi.txt",
+        "inputbox_real_draft_v2.1.217.ansi.txt",
+    }
     on_disk = {p.name for p in FIXTURES.glob("*.txt")}
-    assert on_disk == set(_BASELINE_CLASSIFICATIONS) | gh56_fixtures
+    assert on_disk == set(_BASELINE_CLASSIFICATIONS) | gh56_fixtures | gh60_fixtures
 
 
 # ── GH #56 r1 fold (Codex P1): the strict segment-FULLMATCH status-row grammar ──

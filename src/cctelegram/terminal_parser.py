@@ -4819,21 +4819,27 @@ def clean_ghost_input_text(ansi_text: str | None) -> str:
         A capture with no input row / no ANSI passes through equivalently
         (ANSI-stripping is then a no-op).
 
-    EMPIRICAL BASIS (FIXTURE-PINNED on CC 2.1.206 — a documented TUI-drift
-    audit surface, alongside the /update ``pane_command_is_claude`` A.0 note):
-    dim is EXCLUSIVELY the ghost suggestion on this version. Probed live, both
-    input-row-with-real-text states render the typed text at DEFAULT intensity
-    with NO SGR-2: a draft typed WHILE Claude runs
-    (``ESC[38;5;246m❯ ESC[39m<text>``) and the SAME draft at rest after the
+    EMPIRICAL BASIS (FIXTURE-PINNED on CC 2.1.206 AND re-pinned on CC 2.1.217 —
+    a documented TUI-drift audit surface, alongside the /update
+    ``pane_command_is_claude`` A.0 note): dim is EXCLUSIVELY the ghost suggestion
+    on these versions. Probed live, every input-row-with-real-text state renders
+    the typed text at DEFAULT intensity with NO SGR-2: a draft typed WHILE Claude
+    runs (``ESC[38;5;246m❯ ESC[39m<text>``), the SAME draft at rest after the
     turn ended (``ESC[39m❯ <text>`` —
-    ``fixtures/idle_real_draft_input_row_v2.1.206.txt``), vs the ghost
-    (``ESC[39m❯ ESC[2m<text>ESC[0m`` —
-    ``fixtures/idle_ghost_input_row_v2.1.206.txt``). A FUTURE CC version that
-    renders a queued/real draft dim would make this blanking unsafe — the
-    failure mode is blanking a genuine draft and letting /cost type over it —
-    which is exactly why the fixture pin + this drift note exist: re-verify
-    both captures on the next TUI-drift audit before trusting the SGR-2
-    discriminator on a new version.
+    ``fixtures/idle_real_draft_input_row_v2.1.206.txt``), and a fresh 2.1.217
+    normal-intensity draft (``fixtures/inputbox_real_draft_v2.1.217.ansi.txt``),
+    vs the ghost (``ESC[39m❯ ESC[2m<text>ESC[0m`` —
+    ``fixtures/idle_ghost_input_row_v2.1.206.txt`` and the GH #60 dim-ghost
+    fixtures). This helper is EMPIRICAL, not a proof: it establishes "every
+    visible post-glyph char is SGR-2 dim", and the rendering convention
+    "dim ⇔ ghost" is fixture-pinned per version — say "empirically-identified
+    ghost", never "provably ghost". A FUTURE CC version that renders a
+    queued/real draft dim would make this blanking unsafe — the failure mode is
+    blanking a genuine draft and then letting an arbitrary payload be typed over
+    it: /cost would type into it (the original bug) AND the GH #60 delivery gate
+    would DELIVER the payload over it. That is exactly why the fixture pins + this
+    drift note exist: re-verify the ghost + real-draft captures on the next
+    TUI-drift audit before trusting the SGR-2 discriminator on a new version.
 
     Pure, stdlib-only, leaf-safe. ``pane_looks_idle`` /
     ``classify_pane_idle_failure`` are BYTE-UNTOUCHED — the pre-clean is applied
@@ -5716,12 +5722,20 @@ def classify_input_box_failure(
     that a picker owns: a picker that stole the keystrokes shows ITS label, not
     our text, and legs 1/3 refuse it regardless.
 
-    Tolerates an ANSI capture (escapes are stripped locally) so the caller may
-    pass either form.
+    Tolerates an ANSI capture: escapes are stripped locally via
+    ``clean_ghost_input_text``, which ALSO blanks a fully-dim (SGR-2) ghost
+    suggestion in the input row to a bare ``❯`` (GH #60). A plain ``_strip_ansi``
+    read a fully-dim ``/clear`` / ``@word`` / ``N. …`` ghost as typed text and
+    leg 5 / leg 2 refused every send — a self-sustaining topic wedge (the ghost
+    only clears when someone types, and the gate prevented all typing). A real
+    draft (normal intensity) or ANY dim/normal MIX is left untouched — the
+    empirically-identified-ghost SGR-2 discriminator, fail-closed (see
+    ``clean_ghost_input_text`` for the empirical basis + the TUI-drift audit
+    note). A capture with no ESC bytes is byte-identical to a bare strip.
     """
     if not pane_text:
         return "capture_empty"
-    lines = _strip_ansi(pane_text).split("\n")
+    lines = clean_ghost_input_text(pane_text).split("\n")
 
     # (1) The structural input-box bracket.
     located = _input_box_rows(lines)
@@ -5853,6 +5867,12 @@ def pane_input_box_present(
     **flag-independent by construction** — the display kill-switches
     (``CC_TELEGRAM_PERMISSION_PROMPTS`` / ``CC_TELEGRAM_DECISION_CARDS``) can
     never reopen the hole.
+
+    Tolerates an ANSI capture and blanks a fully-dim (SGR-2) ghost suggestion in
+    the input row before the legs run (GH #60 — a ``/word`` / ``@word`` / ``N. …``
+    ghost otherwise wedged the gate; the empirically-identified-ghost SGR-2 basis
+    + drift note live on ``clean_ghost_input_text``). A real / mixed-intensity
+    draft is untouched, fail-closed.
 
     Deliberately NOT asserted: no-active-run, background-shell absence, and
     input-row emptiness (see the module comment above).

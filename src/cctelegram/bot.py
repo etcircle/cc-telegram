@@ -513,10 +513,16 @@ async def _esc_bounded_capture(window_id: str) -> str | None:
     Returns ``None`` on the capture DEADLINE (an indeterminate frame — the caller
     fails closed). A genuine caller/shutdown cancellation PROPAGATES (only
     ``asyncio.TimeoutError`` is classified — the /cost precedent).
+
+    Captured WITH ANSI (GH #60): ``pane_input_row_empty`` /
+    ``pane_input_box_present`` ghost-clean internally, so a fully-dim ghost
+    suggestion in the box reads as EMPTY and the braked-``/esc`` path takes the
+    keyless already-clear release instead of firing a pointless double-Escape
+    (Esc does not clear a ghost) and stranding the brake.
     """
     try:
         return await asyncio.wait_for(
-            tmux_manager.capture_pane_cancellation_safe(window_id),
+            tmux_manager.capture_pane_cancellation_safe(window_id, with_ansi=True),
             timeout=POST_SEND_CAPTURE_DEADLINE_S,
         )
     except asyncio.TimeoutError:

@@ -53,6 +53,7 @@ class _Pane:
         self.cmd = cmd
         self.sent: list[tuple[str, bool, bool]] = []
         self.capture_calls = 0
+        self.with_ansi_calls: list[bool] = []
         # A callable fired right AFTER each literal write (to script a race).
         self.on_write = None
 
@@ -63,9 +64,18 @@ class _Pane:
         self, window_id: str, with_ansi: bool = False, scrollback_lines: int = 0
     ) -> str | None:
         self.capture_calls += 1
+        self.with_ansi_calls.append(with_ansi)
         if len(self.captures) > 1:
-            return self.captures.pop(0)
-        return self.captures[0]
+            value = self.captures.pop(0)
+        else:
+            value = self.captures[0]
+        # FAKE HONESTY (GH #60 P1): a real ``capture_pane`` returns the ANSI form
+        # only when the caller asks for it. The delivery gate always requests
+        # ``with_ansi=True``, so a ghost frame reaches the classifier as ANSI; a
+        # ``with_ansi=False`` caller would get the ANSI-stripped plain form.
+        if value is None or with_ansi:
+            return value
+        return tp._strip_ansi(value)
 
     async def pane_current_command(self, window_id: str) -> str | None:
         return self.cmd

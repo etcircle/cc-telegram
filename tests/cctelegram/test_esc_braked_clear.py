@@ -20,6 +20,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cctelegram import terminal_parser as tp
+
 _FIXTURES = Path(__file__).parent / "fixtures"
 SEND_FAILED_TEXT = "❌ Failed to send — window may be gone"
 
@@ -58,7 +60,23 @@ def _make_tmux(
         tmux.send_keys = AsyncMock(side_effect=send_results)
     else:
         tmux.send_keys = AsyncMock(return_value=send_results)
-    tmux.capture_pane_cancellation_safe = AsyncMock(side_effect=list(captures or []))
+
+    # FAKE HONESTY (GH #60 P1): honor ``with_ansi`` so the braked-/esc test can go
+    # RED pre-fix. ``_esc_bounded_capture`` currently captures WITHOUT ANSI, so a
+    # ghost frame would arrive ANSI-stripped (a non-empty draft → the double-Escape
+    # fires and the brake is never released); after fix #2 it requests
+    # ``with_ansi=True`` and the ANSI ghost cleans to an empty row (keyless
+    # release). The existing plain-text fixtures carry no ESC bytes, so stripping
+    # is a no-op for them.
+    queue = list(captures or [])
+
+    def _capture(window_id: str, with_ansi: bool = False, scrollback_lines: int = 0):
+        value = queue.pop(0)
+        if value is None or with_ansi:
+            return value
+        return tp._strip_ansi(value)
+
+    tmux.capture_pane_cancellation_safe = AsyncMock(side_effect=_capture)
     return tmux
 
 
@@ -179,3 +197,31 @@ async def test_braked_indeterminate_capture_sends_nothing_and_keeps_the_brake() 
     tmux.send_keys.assert_not_awaited()
     tmux.clear_window_stranded_draft.assert_not_called()
     assert "nothing was sent" in _reply_text(safe_reply).lower()
+
+
+# ── BRAKED + a fully-DIM ghost suggestion (GH #60): ANSI capture cleans it ──
+
+
+_GHOST_PROSE = "inputbox_ghost_prose_v2.1.215.ansi.txt"  # real dim ghost, ANSI
+
+
+@pytest.mark.asyncio
+async def test_braked_ghost_only_pane_releases_keylessly_with_ansi_capture() -> None:
+    """GH #60 braked-``/esc`` half (RED pre-fix): a window whose box holds only a
+    fully-dim GHOST suggestion must take the ALREADY-CLEAR branch — no Escape, brake
+    released — because ``_esc_bounded_capture`` captures WITH ANSI so
+    ``pane_input_row_empty``'s internal ``clean_ghost_input_text`` sees the ghost.
+    Pre-fix (plain capture) the ghost reads as a non-empty draft: a pointless
+    double-Escape fires (Esc does not clear a ghost) and the brake never releases."""
+    # Two copies survive the pre-fix double-Escape re-capture without an IndexError.
+    tmux = _make_tmux(braked=True, captures=[_pane(_GHOST_PROSE), _pane(_GHOST_PROSE)])
+    safe_reply, tmux = await _run_esc(tmux)
+
+    tmux.send_keys.assert_not_awaited()
+    tmux.clear_window_stranded_draft.assert_called_once()
+    assert "already clear" in _reply_text(safe_reply).lower()
+
+    # Every ``_esc_bounded_capture`` await must request the ANSI form (fix #2).
+    assert tmux.capture_pane_cancellation_safe.await_count >= 1
+    for call in tmux.capture_pane_cancellation_safe.await_args_list:
+        assert call.kwargs.get("with_ansi") is True

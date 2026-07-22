@@ -1,0 +1,25 @@
+  backend's chat [38;5;153mStreamingResponse[39m sets [1mno [38;5;153mX-Accel-Buffering: no[39m header[0m (only [38;5;153mX-Run-Id[39m).
+  3. With buffering on and no bypass header, nginx [1mholds the small keepalive chunks[0m, so the browser experiences extended byte-silence across those gaps → the
+  connection dies client-side → [38;5;153mreader.read()[39m throws [38;5;153mTypeError[39m → [1m"network error" toast[0m, and the un-reconciled optimistic turn vanishes on reload ("reset").
+
+  nginx logs nothing (it thinks it's just buffering a healthy upstream); the backend logs nothing (it's happily writing keepalives into nginx's buffer) — which
+  is exactly the silence I found on both sides.
+
+  [1mHonest caveat:[0m the [3mspecific[0m 10:19 turn's backend logs were rotated out by my ISS-323 redeploy restart (12:26), so this is by-elimination + config proof, not a
+  captured log line of that exact turn. But every alternative is affirmatively ruled out, and the buffering gap is real and standard.
+
+  [1mThe fix (in-repo, low-risk, standard)[0m
+
+  Add [1m[38;5;153mX-Accel-Buffering: no[0m to both chat [38;5;153mStreamingResponse[39m headers ([38;5;153mendpoints.py:1100[39m and [38;5;153m:1120[39m). This tells nginx to bypass [38;5;153mproxy_buffering[39m for that response,
+  so the 15s keepalives reach the browser immediately and the connection stays demonstrably alive across silent gaps. No infra change needed; it's a
+  per-response header nginx already honors.
+
+  Secondary (optional, separate): promote the env-only 240s no-progress watchdog ([38;5;153mCODEX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS[39m) to DB+Admin per your settings rule —
+  though it's not implicated here.
+
+  Want me to implement the header fix now (Opus worktree + Codex review, then surgical deploy), and update the ISS-328 entry with this root cause?
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [2mask @reviewer[0m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle) · ← for agents[39m
