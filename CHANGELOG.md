@@ -4,6 +4,31 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.2] — 2026-07-22
+
+The "a ghost can't wedge your topic" release. One fix, found live: a topic suddenly refused
+every message — including `/clear` itself — with "an autocomplete overlay is open in the
+terminal", when nothing had been typed at all.
+
+### Fixed
+- **A dim ghost suggestion no longer wedges the delivery gate (GH #60).** Claude Code ≥2.1.206
+  renders a contextual *ghost suggestion* in the empty input row (fully dim, SGR-2). After a
+  session wound down, CC suggested `/clear` — and the delivery gate, which strips ANSI colors
+  before reading the row, saw a bare `/clear` "draft" and treated it as an armed autocomplete
+  overlay. Every send was refused pre-write, and since the ghost only disappears when someone
+  types, the refusal was self-sustaining until manual terminal intervention. Prose-shaped ghosts
+  always passed (which is why this hid for months); any ghost shaped like a bare `/command`, a
+  trailing `@word`, or a numbered `1. …` row wedged.
+  - The gate's input-box classifier now runs the same SGR-2 ghost-blanking pre-clean the
+    stranded-draft release probe already used: a row whose entire post-prompt text is dim blanks
+    to an empty row; a real draft or any dim/normal mix is untouched (fail-closed). The
+    "real drafts are never dim" empirical basis is re-pinned on a fresh CC 2.1.217 rig capture.
+  - The braked-`/esc` recovery path now captures with ANSI, so a brake held up by a ghost-only
+    input box releases keylessly instead of firing a pointless double-Escape and staying stuck.
+  - Pinned by the verbatim incident row, real + disclosed-synthetic ghost fixtures, a
+    transaction-level delivery test, and a classification-equivalence sweep over the full
+    127-fixture pane corpus (zero drift).
+
 ## [0.4.1] — 2026-07-14
 
 The "your reply-quoted message actually sends" release. Three fixes, all found in live use of
