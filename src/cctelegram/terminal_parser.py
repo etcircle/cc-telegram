@@ -4413,6 +4413,14 @@ _READY_STATUS_MARKERS = (
     "bypass permissions on",
     "accept edits on",
     "plan mode on",
+    # GH #62 (CC 2.1.238): the mode table gained two more permission modes, both
+    # rendered exactly like the three above (``<indicator> on``). Their absence
+    # here made an ``auto``/``dontAsk`` pane read as mid-redraw, so ``/update``
+    # deferred and ``/cost`` refused there — the same class as the labelled-rule
+    # bug. Binary table (``SUu``): ``auto`` ⇒ ``auto mode``, ``dontAsk`` ⇒
+    # ``don't ask`` (ASCII apostrophe), both with the ``⏵⏵`` symbol.
+    "auto mode on",
+    "don't ask on",
 )
 
 
@@ -5230,13 +5238,16 @@ _INPUT_READY_CHROME_MARKERS: Final = _READY_STATUS_MARKERS + (
     _INPUT_PASTE_COLLAPSED_MARKER,
     _INPUT_MANUAL_MODE_MARKER,
 )
-# ``· 1 shell ·`` — the background-shell status bar (rig D10). ASCII digits
-# only (GH #56 r3 audit — ``\d`` is Unicode-wide, and this token is ACCEPT-side
-# chrome proof; CC renders ASCII). The refusal-side traps
-# (``_RE_INPUT_OPTION_ROW`` / ``_RE_OPTION_ROW_CONTENT``) and the idle-lane
-# bg-shells parsers deliberately KEEP ``\d``: there, wider matching is the
-# fail-closed direction (more refusals / more /update deferrals).
-_RE_INPUT_READY_SHELL_TOKEN: Final = re.compile(r"·\s*[0-9]+\s+shells?\b")
+# ``· 1 shell ·`` / ``· 1 monitor ·`` — the background-TASKS status bar (rig
+# D10; renamed from ``_RE_INPUT_READY_SHELL_TOKEN`` in GH #62 because CC 2.1.238
+# splits the same slot into shells AND monitors: the composer emits
+# ``1 shell, 1 monitor`` / a bare ``2 monitors``, so a monitor-only pane carried
+# no leg-3 proof at all). ASCII digits only (GH #56 r3 audit — ``\d`` is
+# Unicode-wide, and this token is ACCEPT-side chrome proof; CC renders ASCII).
+# The refusal-side traps (``_RE_INPUT_OPTION_ROW`` / ``_RE_OPTION_ROW_CONTENT``)
+# and the idle-lane bg-shells parsers deliberately KEEP ``\d``: there, wider
+# matching is the fail-closed direction (more refusals / more /update deferrals).
+_RE_INPUT_READY_TASK_TOKEN: Final = re.compile(r"·\s*[0-9]+\s+(?:shells?|monitors?)\b")
 
 # Leg 4 — the Enter-stealing background-tasks mode (rig §5 finding 1). One
 # ``Down`` at an empty box while a background shell exists arms a mode where
@@ -5363,16 +5374,32 @@ _INPUT_BOX_TOP_SCAN_LINES: Final = 60
 # THE GRAMMAR (whole-row, anchored; every ``·``-split segment must be consumed):
 #
 #   ROW := EXCLUSIVE | BAR
-#   EXCLUSIVE := "paste again to expand" | "! for shell mode"      (the WHOLE row)
-#   BAR  := [MODE] [· SHELL] [· EFFORT-PAIR] [· HINT]*
-#           …requiring MODE or ≥1 HINT (a bare shell/effort row is not a status bar)
+#   EXCLUSIVE := "paste again to expand" | "! for shell mode" | "Pasting…"
+#                                                                (the WHOLE row)
+#   BAR  := [MODE] [· PR-LINK] [· TASKS [· ↓ to view]] [· MEMORIES]
+#           [· EFFORT-PAIR] [· HINT]*
+#           …requiring MODE or ≥1 HINT — a row of ONLY typed slots (a bare
+#           ``1 shell``, ``PR #309``, ``2 monitors``, ``12 memories recalled``)
+#           is NOT a status bar (GH #62 §Design 2: the acceptance condition is
+#           deliberately UNCHANGED, so the new slots widen nothing on their own).
 #
 #   MODE       — AT MOST ONE, never two, never repeated.
-#   SHELL      — ASCII ONLY: ``[0-9]+ shell(s)[ still running]`` (``[0-9]``, NEVER
-#                ``\d``, which is Unicode-wide — the ``١ shell`` spoof).
+#   PR-LINK    — the footer PR/MR link: ``PR #<n>`` / ``MR !<n>``.
+#   TASKS      — the background-tasks summary; explicit renderer VARIANTS, never a
+#                generic join (GH #62 — see ``_RE_STATUS_TASKS``). ASCII ONLY
+#                (``[0-9]``, NEVER ``\d``, which is Unicode-wide — the ``١ shell``
+#                spoof).
+#   ↓ to view  — emitted by the TASKS component itself, so it is consumed ONLY as
+#                the segment IMMEDIATELY following an ``ultraplan`` tasks segment
+#                (one consume-cursor step, never a free hint).
+#   MEMORIES   — ``<n> memor(y|ies) recalled``.
 #   EFFORT-PAIR— the spinner + ``/effort`` as TWO consecutive segments, both or
-#                neither (a bare ``/effort`` never validates).
-#   HINT       — from a FIXED set, each AT MOST ONCE.
+#                neither (a bare ``/effort`` never validates). LEGACY (≤2.1.217):
+#                2.1.238 has no such pair, but the grammar is deliberately
+#                version-AGNOSTIC — it must accept 2.1.209 and 2.1.238 bars
+#                simultaneously (GH #62 §Design 5).
+#   HINT       — from a FIXED set (plus the two regex-CLASS members
+#                ``_RE_STATUS_AGENTS`` / ``_RE_STATUS_DRAFTS``), each AT MOST ONCE.
 #
 # THE EXCLUSIVE forms are WHOLE-ROW alternatives, so they are structurally unable
 # to combine with a mode bar (the r4 P1a spoof ``⏸ manual mode on · paste again to
@@ -5402,55 +5429,189 @@ _INPUT_BOX_TOP_SCAN_LINES: Final = 60
 #
 # ACCEPTED COST: a real status bar whose SHAPE is outside this grammar still fails
 # CLOSED — the tall-draft fallback does not fire on that pane, i.e. exactly today's
-# shipped behavior (refuse), never a wrong commit.
+# shipped behavior (refuse), never a wrong commit. The GH #62 alphabet extension
+# ships four DISCLOSED residuals of exactly that fail-closed kind:
+#
+#   (1) The hint tail stays ORDER-FREE and at-most-once, so an IMPOSSIBLE hint
+#       COMBINATION (two hints the renderer's branches can never emit together) is
+#       accepted. Encoding the renderer's branch-compatibility matrix out of a
+#       MINIFIED binary read would buy ≈0 safety by the r5 argument above (a
+#       spoofer who can print an impossible combo can equally print a fully valid
+#       bar) while risking a FALSE REFUSAL — a topic wedge — wherever that read is
+#       wrong. The grammar's purpose here is precision against false refusals.
+#   (2) The EFFORT-PAIR (≤2.1.217) coexists with the 2.1.238 slots, so a
+#       cross-VERSION mixture validates. Same ≈0-safety argument; the grammar is
+#       deliberately version-agnostic.
+#   (3) DEFAULT CHORDS ONLY. The hint literals are the shipped keybindings
+#       (``esc``/``ctrl+t``/``ctrl+c``/…). A user who REBINDS them, the IDE
+#       ``⧉`` footer indicator, user ``footerLinksRegexes`` labels and a custom
+#       ``statusLine`` row all fall outside the grammar and degrade to today's
+#       fail-closed refusal.
+#   (4) ``Press <key> again to exit/detach`` (a sub-second, rebindable-chord
+#       whole-row transient) is NOT in the exclusive set — it lands in the
+#       delivery gate's BOUNDED indeterminate retry instead.
+#
+# ALPHABET PROVENANCE (GH #62, CC 2.1.238): the forms below are read off the
+# renderer in the plaintext JS bundle at
+# ``~/.local/share/claude/versions/2.1.238`` — the mode table (``SUu``: indicator
+# text ⇒ symbol), the tasks composer (``F4t``), the tasks component (``BHs``, which
+# appends ``· ↓ to view`` iff ``xCl`` — exactly one ultraplan), the agents counter,
+# the memories/feedback-draft/PR-auth pieces, and the shared pluralizer
+# ``wt(n, sg, pl = sg + "s") { return n === 1 ? sg : pl }`` — cross-checked against
+# 8 live 2026-08-21 bars and two isolated-rig captures. A count is bound
+# singular/plural ONLY where that snippet PROVES the ``n === 1`` conditional;
+# everything else keeps the looser ``[0-9]+`` with a comment naming the unproven
+# shape (never a guessed tightening).
 _STATUS_ROW_EXCLUSIVE: Final = frozenset(
     {
         "paste again to expand",  # the paste-collapse hint REPLACES the bar
         "! for shell mode",  # bash mode
+        # CC 2.1.238: an early ``return`` in the footer component, exactly like
+        # the two above — while a large paste is being consumed the whole bar is
+        # replaced by this one row (U+2026, the real ellipsis CHARACTER).
+        "Pasting…",
     }
 )
-# AT MOST ONE per row. Each mode text is BOUND to the glyph it is actually OBSERVED
-# with (r6) — the earlier form cross-producted glyph × text and accepted pairings CC
-# never renders (``⏸ bypass permissions on``, ``⏵⏵ manual mode on``). Be clear-eyed
-# about what that fold buys: ~nothing in SAFETY (anyone who can print the mispaired
-# glyph can equally print the correctly-paired one, which MUST be accepted), so the
-# delta is ≈0 — it is a tightening for CORRECTNESS and reviewability, not a hazard
-# fix.
+# AT MOST ONE per row. Each mode text is BOUND to the glyph it renders with — the
+# pre-r6 form cross-producted glyph × text and accepted pairings CC never emits
+# (``⏸ bypass permissions on``, ``⏵⏵ manual mode on``). Be clear-eyed about what
+# that binding buys: ~nothing in SAFETY (anyone who can print the mispaired glyph
+# can equally print the correctly-paired one, which MUST be accepted), so the delta
+# is ≈0 — it is a tightening for CORRECTNESS and reviewability, not a hazard fix.
 #
-#   bypass permissions on  ⇒ ``⏵⏵`` ONLY  (live panes + corpus)
-#   manual mode on         ⇒ ``⏸``  ONLY  (the 2.1.209 tall-draft rig fixture)
-#   accept edits on / plan mode on ⇒ glyph UNOBSERVED ⇒ EITHER glyph accepted.
+# GH #62 replaces r6's "glyph UNOBSERVED ⇒ either glyph" hedge with the BINARY
+# TABLE. CC 2.1.238's ``SUu`` maps every permission mode to its indicator text AND
+# its symbol constant (``lMr`` = U+23F8 ``⏸``, ``Fdt`` = U+23F5 U+23F5 ``⏵⏵``):
 #
-# That last line is a DELIBERATE completeness-over-tightness choice: guessing a
-# glyph for the two unobserved modes would re-create exactly the r4 false-refusal
-# cliff on a real pane (a user in accept-edits mode with a tall draft would wedge).
-# A rig capture of those two modes would let us bind them — until then, either
-# glyph. It adds no recombination power (still exactly ONE mode segment per row).
+#   default            ⇒ ``manual mode``        ⏸
+#   plan               ⇒ ``plan mode``          ⏸
+#   acceptEdits        ⇒ ``accept edits``       ⏵⏵
+#   bypassPermissions  ⇒ ``bypass permissions`` ⏵⏵
+#   dontAsk            ⇒ ``don't ask``          ⏵⏵   (ASCII apostrophe)
+#   auto               ⇒ ``auto mode``          ⏵⏵
+#
+# The footer appends `` on`` and, when the cycle chord is live, `` (shift+tab to
+# cycle)``. So ``accept edits on`` / ``plan mode on`` are no longer "either glyph":
+# the table binds them, which closes r6's cross-product WITHOUT the false-refusal
+# risk that guessing would have carried.
 _RE_STATUS_MODE: Final = re.compile(
     r"(?:"
-    r"⏵⏵[ ]+bypass permissions on"
-    r"|⏸[ ]+manual mode on"
-    r"|(?:⏵⏵|⏸)[ ]+(?:accept edits on|plan mode on)"
-    r")"
+    r"⏸[ ]+(?:manual mode|plan mode)"
+    r"|⏵⏵[ ]+(?:accept edits|bypass permissions|don't ask|auto mode)"
+    r")[ ]+on"
     r"(?:[ ]+\(shift\+tab to cycle\))?"
 )
-# ASCII digits ONLY (``\d`` is Unicode-wide — the r3 ``١ shell`` spoof).
-_RE_STATUS_SHELL: Final = re.compile(r"[0-9]+[ ]+shells?(?:[ ]+still[ ]+running)?")
+
+# ── The COUNTED forms ────────────────────────────────────────────────────────
+#
+# CC pluralizes through ONE shared helper,
+# ``wt(n, sg, pl = sg + "s") { return n === 1 ? sg : pl }``, so wherever the
+# composer snippet shows that call (or the equivalent inline ``n === 1 ? … : …``)
+# the singular/plural is PROVEN and gets bound: ``1 shell`` and ``2 shells``
+# validate, ``1 shells`` and ``2 shell`` do NOT. ASCII digits ONLY — ``\d`` is
+# Unicode-wide (the r3 ``١ shell`` spoof) — and ASCII spaces only, written ``[ ]``
+# so a ``\s`` can never creep back in.
+_STATUS_COUNT_ONE: Final = "1"
+_STATUS_COUNT_MANY: Final = "(?:[2-9]|[1-9][0-9]+)"
+
+
+def _counted(singular: str, plural: str) -> str:
+    """``1 <singular>`` | ``<n≥2> <plural>`` as REGEX SOURCE (not a pattern).
+
+    Both arguments are regex fragments whose spaces are already written ``[ ]``
+    (the GH #56 byte discipline — this lane never uses ``\\s``).
+    """
+    return f"(?:{_STATUS_COUNT_ONE}[ ]{singular}|{_STATUS_COUNT_MANY}[ ]{plural})"
+
+
+_STATUS_SHELLS: Final = _counted("shell", "shells")
+_STATUS_MONITORS: Final = _counted("monitor", "monitors")
+# The TASKS segment. The composer (``F4t``) is a switch over the ONE task type all
+# live tasks share, so the families are ALTERNATIVES — never a generic join. Only
+# the shell/monitor pair is comma-joined (``i.join(", ")``, shells first), and a
+# MIXED-type list collapses to the ``<n> background task(s)`` fallback. Modelling a
+# generic ``<family>(, <family>)*`` join would accept rows CC cannot render
+# (``1 shell, 1 team``), which is precisely the recombination class the r1-r5
+# rounds kept re-opening.
+_RE_STATUS_TASKS: Final = re.compile(
+    "(?:"
+    # local_bash: shells[, monitors] — or monitors alone when there are no shells.
+    f"{_STATUS_SHELLS}(?:,[ ]{_STATUS_MONITORS})?"
+    f"|{_STATUS_MONITORS}"
+    # LEGACY (≤2.1.217) — the pre-drift ``_RE_STATUS_SHELL`` suffix form. NOT a
+    # 2.1.238 composer output; kept as a version-compat alternative like the effort
+    # pair, and deliberately WITHOUT the monitor join (the two never co-render).
+    f"|{_STATUS_SHELLS}[ ]still[ ]running"
+    # in_process_teammate / local_agent
+    f"|{_counted('team', 'teams')}"
+    f"|{_counted('local[ ]agent', 'local[ ]agents')}"
+    # remote_agent — the single-ultraplan phases (``wB`` = U+25C6 ◆ for
+    # ``plan_ready``; ``PR`` = U+25C7 ◇ for the other two), then the plural
+    # remote-agent forms, all ◇-prefixed.
+    "|◆[ ]ultraplan[ ]ready|◇[ ]ultraplan[ ]needs[ ]your[ ]input|◇[ ]ultraplan"
+    f"|◇[ ]{_counted('remote[ ]dynamic[ ]workflow', 'remote[ ]dynamic[ ]workflows')}"
+    f"|◇[ ]{_counted('cloud[ ]session', 'cloud[ ]sessions')}"
+    # local_workflow
+    f"|{_counted('background[ ]dynamic[ ]workflow', 'background[ ]dynamic[ ]workflows')}"
+    # monitor_mcp / monitor_ws
+    f"|{_counted('Artifact[ ]comment[ ]monitor', 'Artifact[ ]comment[ ]monitors')}"
+    # mcp_task — ``job`` is the ``tengu_copper_thistle`` spelling of the SAME slot.
+    f"|{_counted('MCP[ ](?:task|job)', 'MCP[ ](?:task|job)s')}"
+    # the mixed-type fallback
+    f"|{_counted('background[ ]task', 'background[ ]tasks')}"
+    # dream / auto_mode_scan — uncounted literals
+    "|dreaming|auto-mode[ ]scan"
+    ")"
+)
+# Emitted by the TASKS component itself (``BHs``) immediately after the tasks text,
+# and ONLY when the list is exactly one ultraplan remote agent (``xCl``). It is
+# therefore consumed as a COUPLED cursor step, never as a free hint — a standalone
+# ``↓ to view``, or one trailing a non-ultraplan tasks segment, is unknown text.
+_STATUS_TASKS_VIEW_HINT: Final = "↓ to view"
+# The footer PR/MR link (``hKl``: prefix ``PR``/``MR`` + label ``#<n>``/``!<n>``).
+_RE_STATUS_PRLINK: Final = re.compile(r"(?:PR[ ]#|MR[ ]!)[0-9]+")
+# ``<n> memor(y|ies) recalled`` — ``wt(n, "memory", "memories")``, PROVEN.
+_RE_STATUS_MEMORIES: Final = re.compile(f"{_counted('memory', 'memories')}[ ]recalled")
 _RE_STATUS_EFFORT_SPINNER: Final = re.compile(r"[◐◑◒◓][ ]+(?:low|medium|high|xhigh)")
 _STATUS_EFFORT_TAIL: Final = "/effort"
-# Each AT MOST ONCE; order-free (see the grammar note above).
+# The agents counter (``c_n``): ``← for agents``, ``← <n> agent(s)`` or
+# ``← <n> done``. COUNT SHAPE UNPROVEN — the pluralizer runs on the RAW count while
+# the DISPLAYED number is clamped (``n > 99 ? "99+" : n``), so the rendered
+# digits↔noun pair is not a plain ``n === 1`` over the visible token, and ``done``
+# is never pluralized at all. Per the GH #62 proof discipline that keeps the looser
+# ``[0-9]+``/``99+`` form rather than a guessed binding.
+_RE_STATUS_AGENTS: Final = re.compile(
+    r"←[ ](?:for[ ]agents|(?:[0-9]+|99\+)[ ](?:agents?|done))"
+)
+# ``<n> feedback draft(s)`` — ``wt(n, "feedback draft")``, PROVEN. The composer
+# appends it INSIDE the hint tail, so it is a tail member, not a typed slot.
+_RE_STATUS_DRAFTS: Final = re.compile(_counted("feedback[ ]draft", "feedback[ ]drafts"))
+# Sentinel keys for the two regex-CLASS tail members, so at-most-once membership is
+# tracked in the SAME ``seen`` set as the literals. NUL can never be a real segment
+# (a match is required before the key is ever added), so they cannot collide.
+_STATUS_TAIL_AGENTS_KEY: Final = "\x00agents"
+_STATUS_TAIL_DRAFTS_KEY: Final = "\x00drafts"
+# Each AT MOST ONCE; order-free (see the grammar note above). ``← for agents`` is
+# NOT here — it folded into ``_RE_STATUS_AGENTS`` with its counted siblings.
 _STATUS_ROW_HINTS: Final = frozenset(
     {
         "esc to interrupt",
         "ctrl+t to hide tasks",
         "ctrl+t to show tasks",
-        "← for agents",
         "↓ to manage",
         "? for shortcuts",
         # The tasks-mode bar is a REAL status bar; accepting it lets the box be
         # located so leg 4 can refuse it precisely as ``tasks_mode`` (a positive
         # hazard) instead of the blunt ``no_input_box``.
         "Enter to view tasks",
+        # CC 2.1.238 tail members (default chords — see ACCEPTED COST (3)).
+        "esc to return to team lead",
+        "/tasks to see subagents",
+        "/diff to hide diff",
+        "Enter to view memories",
+        "ctrl+c to copy",
+        "gh auth login for PR status",
+        "install gh for PR status",
     }
 )
 
@@ -5459,11 +5620,17 @@ def _is_status_row(line: str) -> bool:
     """True iff ``line`` is a WHOLE Claude Code ready-status-bar row (GH #56).
 
     The canonical ordered grammar documented above: an EXCLUSIVE standalone form,
-    or a BAR of ``[MODE] · [SHELL] · [EFFORT-PAIR] · [HINT…]`` with at-most-once
-    membership, ASCII-only digits and spaces, no empty segments, and every segment
-    consumed. The exactly-one-separator fallback in ``_input_box_rows`` uses it to
-    prove the lone in-window separator is the input box's BOTTOM rule: the first
-    non-blank row below a genuine bottom rule is the status bar.
+    or a BAR of ``[MODE] · [PR-LINK] · [TASKS [· ↓ to view]] · [MEMORIES] ·
+    [EFFORT-PAIR] · [HINT…]`` with at-most-once membership, ASCII-only digits and
+    spaces, no empty segments, and every segment consumed. The
+    exactly-one-separator fallback in ``_input_box_rows`` uses it to prove the lone
+    in-window separator is the input box's BOTTOM rule: the first non-blank row
+    below a genuine bottom rule is the status bar.
+
+    The typed slots are consumed by a single forward CURSOR in renderer order; the
+    remaining segments are the order-free hint TAIL. Acceptance is unchanged from
+    GH #56 — ``has_mode or bool(seen)`` — so a row of only typed slots is never a
+    status bar, however many of them CC would render.
     """
     s = _strip_ansi(line).strip(" \t\r\n")
     if not s:
@@ -5479,7 +5646,20 @@ def _is_status_row(line: str) -> bool:
     has_mode = bool(segs) and _RE_STATUS_MODE.fullmatch(segs[0]) is not None
     if has_mode:
         i = 1
-    if i < len(segs) and _RE_STATUS_SHELL.fullmatch(segs[i]):
+    if i < len(segs) and _RE_STATUS_PRLINK.fullmatch(segs[i]):
+        i += 1
+    if i < len(segs) and (tasks := _RE_STATUS_TASKS.fullmatch(segs[i])) is not None:
+        i += 1
+        # ``↓ to view`` is part of the TASKS component's own output and only for a
+        # single ultraplan — so it is consumable ONLY here, immediately after such
+        # a segment.
+        if (
+            "ultraplan" in tasks.group(0)
+            and i < len(segs)
+            and segs[i] == _STATUS_TASKS_VIEW_HINT
+        ):
+            i += 1
+    if i < len(segs) and _RE_STATUS_MEMORIES.fullmatch(segs[i]):
         i += 1
     if (
         i + 1 < len(segs)
@@ -5490,11 +5670,20 @@ def _is_status_row(line: str) -> bool:
 
     seen: set[str] = set()
     for seg in segs[i:]:
-        if seg not in _STATUS_ROW_HINTS or seg in seen:
-            return False  # unknown text, a repeat, or an out-of-place segment
-        seen.add(seg)
+        if seg in _STATUS_ROW_HINTS:
+            key = seg
+        elif _RE_STATUS_AGENTS.fullmatch(seg):
+            key = _STATUS_TAIL_AGENTS_KEY
+        elif _RE_STATUS_DRAFTS.fullmatch(seg):
+            key = _STATUS_TAIL_DRAFTS_KEY
+        else:
+            return False  # unknown text or an out-of-place segment
+        if key in seen:
+            return False  # a repeat
+        seen.add(key)
 
-    # A bare shell / effort row is not a status bar.
+    # A row of only typed slots (a bare shell/effort/PR link/memory count) is not a
+    # status bar.
     return has_mode or bool(seen)
 
 
@@ -5757,7 +5946,7 @@ def classify_input_box_failure(
     below = "\n".join(lines[bottom + 1 :])
     if not (
         any(marker in below for marker in _INPUT_READY_CHROME_MARKERS)
-        or _RE_INPUT_READY_SHELL_TOKEN.search(below)
+        or _RE_INPUT_READY_TASK_TOKEN.search(below)
     ):
         return "no_ready_chrome"
 
