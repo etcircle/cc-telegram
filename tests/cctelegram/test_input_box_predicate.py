@@ -811,6 +811,10 @@ _BASELINE_CLASSIFICATIONS = {
     "inputbox_busy_tool_v2.1.207.txt": None,
     "inputbox_draft_typed_v2.1.207.txt": None,
     "inputbox_idle_v2.1.207.txt": None,
+    # GH #62: the 2.1.238 idle rig capture. Deliverable BEFORE the change too (a
+    # normal 2-separator box, so `_is_status_row` is never consulted) — it is baked
+    # here as the negative control for the tall-draft twin below.
+    "inputbox_idle_v2.1.238.txt": None,
     "inputbox_manual_mode_v2.1.207.txt": None,
     "inputbox_multiline_draft_v2.1.207.txt": None,
     "inputbox_paste_collapsed_reverted_v2.1.207.txt": None,
@@ -822,6 +826,12 @@ _BASELINE_CLASSIFICATIONS = {
     "inputbox_slash_exact_clear_v2.1.207.txt": "completion_overlay",
     "inputbox_slash_overlay_v2.1.207.txt": "completion_overlay",
     "inputbox_slash_with_arg_v2.1.207.txt": None,
+    # GH #62 — THE REGRESSION PIN, baked with its POST-fix classification. Before
+    # the alphabet extension this real 2.1.238 capture classified `no_input_box`
+    # (the `⏵⏵ auto mode on (shift+tab to cycle)` bar was outside the grammar), so
+    # the tall-draft fallback fail-closed and the topic wedged. Its own explicit
+    # flip test is `test_gh62_tall_draft_2_1_238_is_a_READY_input_box`.
+    "inputbox_tall_draft_v2.1.238.txt": None,
     "inputbox_tasklist_footer_v2.1.207.txt": None,
     "inputbox_tasks_mode_v2.1.207.txt": "tasks_mode",
     "inputbox_wrapped_draft_v2.1.207.txt": None,
@@ -863,7 +873,11 @@ def test_the_baked_baseline_covers_the_whole_fixture_directory() -> None:
     tall-draft 2.1.209 GH #56 fixtures are the only exclusions — they are the
     fixtures this change deliberately FLIPS / newly-introduces with their own
     explicit pins above (`inputbox_paste_collapsed_v2.1.209.txt` is NOT flipped
-    — it classified deliverable pre-change too — so it is BAKED, r2 fold P3)."""
+    — it classified deliverable pre-change too — so it is BAKED, r2 fold P3).
+
+    The two GH #62 2.1.238 captures are BAKED rather than excluded: their
+    post-fix classification is the stable one this suite pins going forward, and
+    the tall-draft twin additionally carries its own explicit flip test."""
     gh56_fixtures = {
         _TALL_DRAFT,
         _TALL_DRAFT_ANSI,
@@ -977,6 +991,22 @@ _LIVE_BOT_ROWS = [
     "· ctrl+t to hide tasks · ← for agents",
     "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
     "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+    # GH #62 — the SAME completeness lesson, one CC minor later. Sampled from the
+    # owner's live panes 2026-08-21 on real CC 2.1.238 (8 DISTINCT bars across
+    # four sessions, four samples each). FIVE of the eight were REFUSED by the
+    # 2.1.209-pinned grammar: `auto mode on` was not a mode text at all, `PR #309`
+    # and `1 shell, 1 monitor` were not slots, and a bare `1 monitor` had no form
+    # (the other three bypass-permissions rows were already accepted). Two of the
+    # refused bars wedged real topics that day.
+    "⏵⏵ auto mode on (shift+tab to cycle)",
+    "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · PR #309 · ← for agents "
+    "· ↓ to manage",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt "
+    "· ← for agents · ↓ to manage",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage",
+    "⏵⏵ bypass permissions on · 1 monitor · ← for agents · ↓ to manage",
+    "⏵⏵ bypass permissions on · 1 shell, 1 monitor · ← for agents · ↓ to manage",
 ]
 
 # The DISTINCT real status rows the non-circular corpus sweep derives (the
@@ -997,11 +1027,15 @@ _REAL_CORPUS_STATUS_ROWS = [
 
 
 @pytest.mark.parametrize("row", _LIVE_BOT_ROWS)
-def test_the_three_live_bot_rows_are_accepted(row: str) -> None:
-    """THE COMPLETENESS PIN (provenance: sampled from the running bot's panes
-    2026-07-14). Row 1 carries `ctrl+t to hide tasks`, which NO fixture contains —
-    under r4's enumeration it was REFUSED, fail-closing the tall-draft fallback on
-    the owner's busiest windows."""
+def test_the_live_bot_rows_are_accepted(row: str) -> None:
+    """THE COMPLETENESS PIN (provenance: sampled from the running bot's panes —
+    2026-07-14 on CC 2.1.208/2.1.209, 2026-08-21 on CC 2.1.238). The 2.1.209 row 1
+    carries `ctrl+t to hide tasks`, which NO fixture contains; the 2.1.238 rows
+    carry `auto mode on`, `PR #309` and `1 shell, 1 monitor`. Each generation of
+    this list contains rows the grammar of the generation before it REFUSED
+    (5 of the 8 sampled 2.1.238 bars), fail-closing the tall-draft fallback on
+    the owner's busiest windows — which is exactly why this pin is LIVE-sampled
+    and not fixture-derived (GH #56 r5, GH #62)."""
     assert tp._is_status_row(row) is True, row
     # And it works end-to-end: a tall draft under this status bar delivers.
     pane = _lone_sep_pane(row)
@@ -1107,14 +1141,62 @@ def test_spoof_glyph_soup_prefix_refuses() -> None:
     assert tp._is_status_row("⏵◐⏸/effort") is False
 
 
+# One REPRESENTATIVE string per regex-CLASS grammar member (GH #62). The regex
+# members can't be enumerated, so the lockstep is pinned on a representative of
+# each: a new marker landing in leg 3 that no representative covers fails direction
+# (a), and every representative leg 3 does NOT carry shows up in the explicit
+# `not_in_leg3` set below.
+_GRAMMAR_REGEX_CLASS_REPRESENTATIVES = {
+    # `_RE_STATUS_TASKS` — one per composer family (`F4t`).
+    "1 shell, 1 monitor",
+    "2 monitors",
+    "2 shells still running",
+    "1 team",
+    "3 local agents",
+    "◆ ultraplan ready",
+    "◇ ultraplan needs your input",
+    "◇ ultraplan",
+    "◇ 2 remote dynamic workflows",
+    "◇ 1 cloud session",
+    "1 background dynamic workflow",
+    "4 Artifact comment monitors",
+    "1 MCP task",
+    "2 MCP jobs",
+    "7 background tasks",
+    "dreaming",
+    "auto-mode scan",
+    # the tasks component's own coupled suffix
+    "↓ to view",
+    # `_RE_STATUS_PRLINK` / `_RE_STATUS_MEMORIES`
+    "PR #309",
+    "MR !12",
+    "12 memories recalled",
+    # `_RE_STATUS_AGENTS` / `_RE_STATUS_DRAFTS` (hint-tail members)
+    "← for agents",
+    "← 3 agents",
+    "← 99+ done",
+    "1 feedback draft",
+}
+
+
 def _grammar_vocabulary() -> set[str]:
-    """Every literal token the canonical grammar can consume."""
+    """Every literal token the canonical grammar can consume, plus one
+    representative per regex-class member."""
     return (
         set(tp._STATUS_ROW_EXCLUSIVE)
         | set(tp._STATUS_ROW_HINTS)
         | {tp._STATUS_EFFORT_TAIL}
-        | {"bypass permissions on", "accept edits on", "plan mode on", "manual mode on"}
+        | {
+            "bypass permissions on",
+            "accept edits on",
+            "plan mode on",
+            "manual mode on",
+            # GH #62 (CC 2.1.238 `SUu` table)
+            "auto mode on",
+            "don't ask on",
+        }
         | {"shift+tab to cycle"}
+        | _GRAMMAR_REGEX_CLASS_REPRESENTATIVES
     )
 
 
@@ -1128,10 +1210,19 @@ def test_the_grammar_and_leg3_alphabet_stay_in_lockstep() -> None:
 
     (b) The grammar tokens that leg 3's alphabet does NOT carry are an EXPLICIT,
         pinned set. That divergence is FAIL-CLOSED, not a hazard: a row made only
-        of such tokens would let the fallback LOCATE the box, and leg 3 would then
-        refuse the pane as `no_ready_chrome` — a refusal, never a wrong commit.
-        (In practice they only ever appear alongside a mode bar, which leg 3 does
-        carry — e.g. the live `… · ctrl+t to hide tasks · ← for agents` row.)
+        of such tokens lets the fallback LOCATE the box, and leg 3 then refuses the
+        pane as `no_ready_chrome` — a refusal, never a wrong commit. It is
+        asserted BEHAVIOURALLY in
+        `test_a_grammar_only_singleton_row_still_refuses_fail_closed`, so the
+        divergence is measured rather than assumed away. (In practice these tokens
+        appear alongside a mode bar, which leg 3 does carry — e.g. the live
+        `… · ctrl+t to hide tasks · ← for agents` row.)
+
+        NOTE the two lanes are deliberately DIFFERENT SHAPES: this direction
+        compares against the substring marker TUPLE only, while leg 3 also accepts
+        `_RE_INPUT_READY_TASK_TOKEN` (`· <n> shells?/monitors?`). So several tasks
+        representatives listed here are in fact leg-3-reachable inside a real bar;
+        listing them keeps the set an honest superset of the grammar-only tokens.
     """
     vocab = _grammar_vocabulary()
     uncovered_markers = {
@@ -1143,20 +1234,71 @@ def test_the_grammar_and_leg3_alphabet_stay_in_lockstep() -> None:
         v for v in vocab if not any(m in v for m in tp._INPUT_READY_CHROME_MARKERS)
     }
     assert not_in_leg3 == {
+        # GH #56
         "ctrl+t to hide tasks",
         "ctrl+t to show tasks",
         "Enter to view tasks",
+        # GH #62 — the new hint-tail literals …
+        "esc to return to team lead",
+        "/tasks to see subagents",
+        "/diff to hide diff",
+        "Enter to view memories",
+        "ctrl+c to copy",
+        "gh auth login for PR status",
+        "install gh for PR status",
+        # … the new whole-row exclusive form …
+        "Pasting…",
+        # … the typed slots (PR link, memories) …
+        "PR #309",
+        "MR !12",
+        "12 memories recalled",
+        # … the tasks families and the coupled view hint …
+        "1 shell, 1 monitor",
+        "2 monitors",
+        "2 shells still running",
+        "1 team",
+        "3 local agents",
+        "◆ ultraplan ready",
+        "◇ ultraplan needs your input",
+        "◇ ultraplan",
+        "◇ 2 remote dynamic workflows",
+        "◇ 1 cloud session",
+        "1 background dynamic workflow",
+        "4 Artifact comment monitors",
+        "1 MCP task",
+        "2 MCP jobs",
+        "7 background tasks",
+        "dreaming",
+        "auto-mode scan",
+        "↓ to view",
+        # … and the counted hint-tail members (`← for agents` IS in leg 3).
+        "← 3 agents",
+        "← 99+ done",
+        "1 feedback draft",
     }
 
 
-def test_every_real_status_row_the_grammar_accepts_also_satisfies_leg3() -> None:
-    """The load-bearing property, asserted BEHAVIOURALLY on the real rows: a row the
-    grammar accepts must not be one leg 3 would then reject — otherwise the fallback
-    would locate a box only for leg 3 to refuse the pane."""
+def test_every_REAL_status_row_the_grammar_accepts_also_satisfies_leg3() -> None:
+    """The property that actually holds, asserted BEHAVIOURALLY on the REAL rows.
+
+    GH #62 RETRACTS the stronger claim this test used to carry ("every bar the
+    grammar accepts satisfies leg 3"): it is FALSE, and was already false before —
+    a row built only of grammar-only vocabulary (`ctrl+t to hide tasks`, and after
+    GH #62 also `/diff to hide diff`, `ctrl+c to copy`, a bare `1 feedback
+    draft`, …) is accepted by the grammar and rejected by leg 3.
+
+    The shipped contract is the FAIL-CLOSED DIVERGENCE, unchanged: such a row lets
+    the fallback LOCATE the box and leg 3 then refuses the pane as
+    `no_ready_chrome` — a refusal, never a wrong commit (pinned in
+    `test_a_grammar_only_singleton_row_still_refuses_fail_closed`).
+
+    What this test pins is the load-bearing part: every row we have actually
+    OBSERVED on a real pane carries a mode marker or a leg-3-covered hint, so the
+    fallback and leg 3 agree on reality."""
 
     def _below_marker_ok(row: str) -> bool:
         return any(m in row for m in tp._INPUT_READY_CHROME_MARKERS) or bool(
-            tp._RE_INPUT_READY_SHELL_TOKEN.search("· " + row)
+            tp._RE_INPUT_READY_TASK_TOKEN.search("· " + row)
         )
 
     for row in _LIVE_BOT_ROWS + _REAL_CORPUS_STATUS_ROWS:
@@ -1201,13 +1343,17 @@ def test_r3_recombination_spoofs_refuse_through_the_full_predicates(
     assert tp.classify_input_box_failure(empty_pane) == "no_input_box"
 
 
-def test_the_shell_token_is_ascii_only() -> None:
+def test_the_task_token_is_ascii_only() -> None:
     """`\\d` is UNICODE-wide — an Arabic-Indic `١ shell` must never read as the
-    shell-count token, in the template OR in leg 3's substring arm."""
+    task-count token, in the template OR in leg 3's substring arm. GH #62 widened
+    that arm to monitors, so both nouns are pinned."""
     assert tp._is_status_row("١ shell") is False
     assert tp._is_status_row("⏵⏵ bypass permissions on · 1 shell") is True
-    assert tp._RE_INPUT_READY_SHELL_TOKEN.search("· ١ shell") is None
-    assert tp._RE_INPUT_READY_SHELL_TOKEN.search("· 1 shell") is not None
+    assert tp._RE_INPUT_READY_TASK_TOKEN.search("· ١ shell") is None
+    assert tp._RE_INPUT_READY_TASK_TOKEN.search("· 1 shell") is not None
+    assert tp._RE_INPUT_READY_TASK_TOKEN.search("· ١ monitor") is None
+    assert tp._RE_INPUT_READY_TASK_TOKEN.search("· 1 monitor") is not None
+    assert tp._RE_INPUT_READY_TASK_TOKEN.search("· 2 monitors") is not None
 
 
 # ── GH #56 r4 fold (Codex P1, FIFTH round of the same class): WHOLE-ROW
@@ -1280,8 +1426,13 @@ def test_the_exclusive_forms_are_rows_not_segments() -> None:
     and the bash-mode indicator REPLACE the whole status bar, so they are modelled
     as WHOLE-ROW alternatives — never as segments a bar can also carry. Mutual
     exclusion is therefore unrepresentable, not a rule to enforce."""
-    # They are exclusive-row forms …
-    assert tp._STATUS_ROW_EXCLUSIVE == {"paste again to expand", "! for shell mode"}
+    # They are exclusive-row forms … (GH #62 adds CC 2.1.238's `Pasting…`, which
+    # is an early `return` in the footer component exactly like the other two).
+    assert tp._STATUS_ROW_EXCLUSIVE == {
+        "paste again to expand",
+        "! for shell mode",
+        "Pasting…",
+    }
     # … and they are NOT reachable as a segment of a composed BAR.
     assert not (tp._STATUS_ROW_EXCLUSIVE & tp._STATUS_ROW_HINTS)
     for exclusive in tp._STATUS_ROW_EXCLUSIVE:
@@ -1359,7 +1510,7 @@ def test_the_two_separator_path_never_consults_the_status_row_predicate(
     assert checked >= 40
 
 
-# ── GH #56 r6 fold: mode GLYPHS are BOUND to their mode TEXT ─────────────────
+# ── GH #56 r6 fold, COMPLETED by GH #62: mode GLYPHS are BOUND to their TEXT ──
 #
 # The r5 MODE segment cross-producted glyph × text, so it accepted pairings CC
 # never renders (`⏸ bypass permissions on`, `⏵⏵ manual mode on`). Clear-eyed about
@@ -1367,6 +1518,22 @@ def test_the_two_separator_path_never_consults_the_status_row_predicate(
 # glyph can equally print the correctly-paired one, which MUST be accepted), so the
 # delta is ≈0 — it is a tightening for CORRECTNESS and reviewability, not a hazard
 # fix. Nothing else about the grammar changed.
+#
+# r6 could only bind the two OBSERVED pairs and left `accept edits on` /
+# `plan mode on` on EITHER glyph (guessing would have risked a false-refusal
+# wedge). GH #62 reads the whole table off the CC 2.1.238 binary (`SUu`: mode ⇒
+# indicator text + symbol constant), so every pair is now bound from a source, not
+# from a fixture we happen to hold — and the two new modes (`auto`, `dontAsk`)
+# arrive already bound.
+
+_BOUND_MODE_PAIRS = [
+    ("⏸", "manual mode on"),
+    ("⏸", "plan mode on"),
+    ("⏵⏵", "accept edits on"),
+    ("⏵⏵", "bypass permissions on"),
+    ("⏵⏵", "don't ask on"),
+    ("⏵⏵", "auto mode on"),
+]
 
 
 @pytest.mark.parametrize(
@@ -1378,12 +1545,22 @@ def test_the_two_separator_path_never_consults_the_status_row_predicate(
         "⏵⏵ manual mode on (shift+tab to cycle)",
         # …and a mispaired mode cannot be laundered by a valid hint tail.
         "⏸ bypass permissions on · ← for agents",
+        # GH #62 — the two pairs r6 deliberately left loose are now BOUND, so
+        # their cross-products refuse too.
+        "⏸ accept edits on",
+        "⏸ accept edits on (shift+tab to cycle)",
+        "⏵⏵ plan mode on",
+        "⏵⏵ plan mode on (shift+tab to cycle)",
+        # …as do the two new modes on the wrong glyph.
+        "⏸ auto mode on",
+        "⏸ don't ask on",
     ],
 )
 def test_mispaired_mode_glyphs_refuse_through_the_full_predicates(row: str) -> None:
-    """CC binds each mode text to one glyph: `bypass permissions on` renders with
-    `⏵⏵` (live panes + corpus), `manual mode on` with `⏸` (the 2.1.209 rig
-    fixture). The cross-product pairings are refused."""
+    """CC binds each mode text to one glyph — read off the 2.1.238 `SUu` table
+    (`lMr` = U+23F8 `⏸` for `default`/`plan`, `Fdt` = U+23F5 U+23F5 `⏵⏵` for
+    `acceptEdits`/`bypassPermissions`/`dontAsk`/`auto`). The cross-product
+    pairings are refused."""
     assert tp._is_status_row(row) is False, row
     pane = _lone_sep_pane(row)
     assert tp.classify_input_box_failure(pane) is not None, row
@@ -1393,38 +1570,315 @@ def test_mispaired_mode_glyphs_refuse_through_the_full_predicates(row: str) -> N
     assert tp.pane_input_row_empty(empty_pane) is not True, row
 
 
-@pytest.mark.parametrize(
-    "row",
-    [
-        "⏵⏵ bypass permissions on",
-        "⏵⏵ bypass permissions on (shift+tab to cycle)",
-        "⏸ manual mode on",
-        "⏸ manual mode on · ? for shortcuts · ← for agents",
-    ],
-)
-def test_correctly_paired_modes_are_still_accepted(row: str) -> None:
-    """The binding must not cost completeness on the OBSERVED pairings."""
-    assert tp._is_status_row(row) is True, row
+@pytest.mark.parametrize(("glyph", "text"), _BOUND_MODE_PAIRS)
+def test_correctly_paired_modes_are_still_accepted(glyph: str, text: str) -> None:
+    """The binding must not cost completeness on ANY table pairing — the whole
+    point of reading the table instead of guessing. Each pair is accepted bare,
+    with the cycle parenthetical, and carrying a hint tail."""
+    assert tp._is_status_row(f"{glyph} {text}") is True
+    assert tp._is_status_row(f"{glyph} {text} (shift+tab to cycle)") is True
+    assert tp._is_status_row(f"{glyph} {text} · ? for shortcuts · ← for agents") is True
+    # Still AT MOST ONE mode segment per row.
+    assert tp._is_status_row(f"{glyph} {text} · ⏸ manual mode on") is False
+
+
+# ── GH #62: the CC 2.1.238 status-bar drift ──────────────────────────────────
+#
+# Two live incidents 2026-08-21 (windows @2/@3): a reply-quoted Telegram message
+# rendered a TALL draft, the delivery gate's post-write re-verify took the GH #56
+# exactly-one-separator fallback, and leg (a) refused because the pane's bar was
+# `⏵⏵ auto mode on (shift+tab to cycle)` — a mode the 2.1.209-pinned grammar did
+# not know. Enter withheld → stranded-draft brake → topic WEDGE.
+#
+# The alphabet is extended from the RENDERER, not from the fixtures: the 2.1.238
+# mode table (`SUu`), the tasks composer (`F4t`), the tasks component (`BHs`) and
+# the shared pluralizer `wt(n, sg, pl = sg + "s")` in the plaintext JS bundle at
+# `~/.local/share/claude/versions/2.1.238`, cross-checked against 8 live bars and
+# two isolated-rig captures. A count is bound singular/plural ONLY where that
+# snippet PROVES the `n === 1` conditional (everything below), never guessed.
+
+_TALL_DRAFT_238 = "inputbox_tall_draft_v2.1.238.txt"
+_IDLE_238 = "inputbox_idle_v2.1.238.txt"
+
+
+def test_gh62_tall_draft_2_1_238_is_a_READY_input_box() -> None:
+    """THE REGRESSION PIN. This real 2.1.238 rig capture classified `no_input_box`
+    before the alphabet extension — the exact shape that wedged two live topics.
+    Post-fix it is a fully-ready box, and the brake's release proof reads the SAME
+    rows: box FOUND, input row non-empty (False, never None)."""
+    pane = _pane(_TALL_DRAFT_238)
+    # The fixture genuinely has the tall shape — a >18-row draft inside the box,
+    # so exactly ONE separator is in the 20-line window. Otherwise this is vacuous.
+    lines = tp._strip_ansi(pane).split("\n")
+    start = max(0, len(lines) - tp._CHROME_SCAN_LINES)
+    seps = [i for i in range(start, len(lines)) if tp._is_rule_separator(lines[i])]
+    assert len(seps) == 1
+    assert "quoted line twelve" in tp._strip_ansi(pane)
+
+    assert tp.pane_input_box_present(pane) is True
+    assert tp.classify_input_box_failure(pane) is None
+    assert tp.pane_input_row_empty(pane) is False
+
+
+def test_gh62_the_idle_2_1_238_capture_is_the_negative_control() -> None:
+    """The same session with an EMPTY box: a normal 2-separator pane (so the
+    fallback never fires), deliverable, and its input row provably empty — the
+    brake-release twin."""
+    pane = _pane(_IDLE_238)
+    assert tp.classify_input_box_failure(pane) is None
+    assert tp.pane_input_box_present(pane) is True
+    assert tp.pane_input_row_empty(pane) is True
+
+
+def test_gh62_the_2_1_238_captures_need_no_rule_separator_change() -> None:
+    """`_RE_RULE_SEPARATOR` is deliberately NOT extended (GH #62 §Design 7),
+    pinned on the real captures: every input-box rule in both 2.1.238 fixtures
+    already satisfies `_is_rule_separator`, so the box is located on the
+    UNCHANGED regex.
+
+    PROVENANCE NOTE: the 2.1.238 capture set carries PURE-dash rules only — no
+    labelled (plan-slug / effort-titled) top rule was captured on this version.
+    The labelled form therefore stays pinned by the 2.1.207 fixtures in
+    `test_a_labeled_top_rule_is_still_an_input_box`, and this test asserts only
+    what the 2.1.238 captures actually contain."""
+    for name in (_IDLE_238, _TALL_DRAFT_238):
+        lines = tp._strip_ansi(_pane(name)).split("\n")
+        located = tp._input_box_rows(lines)
+        assert located is not None, name
+        top, bottom, _rows = located
+        assert tp._is_rule_separator(lines[top]), name
+        assert tp._is_rule_separator(lines[bottom]), name
+        # Pure dashes on this version — the labelled arm is not exercised here.
+        assert set(lines[top].strip()) == {"─"}, name
+        assert set(lines[bottom].strip()) == {"─"}, name
+
+
+# A mode-carrying prefix, so the typed-slot vectors below are tested as they
+# actually render — the acceptance condition is UNCHANGED (`has_mode or seen`), so
+# a row of ONLY typed slots is still not a status bar (pinned separately).
+_M238 = "⏵⏵ auto mode on"
 
 
 @pytest.mark.parametrize(
     "row",
     [
-        "⏵⏵ accept edits on",
-        "⏸ accept edits on",
-        "⏵⏵ plan mode on",
-        "⏸ plan mode on",
-        "⏵⏵ accept edits on (shift+tab to cycle)",
-        "⏸ plan mode on (shift+tab to cycle)",
+        # local_bash — `o === 1 ? "1 shell" : `${o} shells`` + the comma join with
+        # the monitors half; monitors alone when there are no shells.
+        f"{_M238} · 1 shell, 1 monitor",
+        f"{_M238} · 2 shells, 3 monitors",
+        f"{_M238} · 2 monitors",
+        f"{_M238} · 1 monitor",
+        # the LEGACY (<=2.1.217) suffix form, kept as a version-compat alternative
+        f"{_M238} · 2 shells still running",
+        f"{_M238} · 1 shell still running",
+        # the footer PR/MR link (`hKl`: prefix + `#<n>` / `!<n>`)
+        f"{_M238} · PR #309",
+        f"{_M238} · MR !12",
+        # the two modes CC 2.1.238 added
+        "⏵⏵ auto mode on",
+        "⏵⏵ don't ask on",
+        "⏵⏵ auto mode on (shift+tab to cycle)",
+        # the agents counter (`← for agents` / `← <n> agent(s)` / `← <n> done`)
+        "← 3 agents",
+        "← 1 agent",
+        "← 99+ done",
+        "← 99+ agents",
+        # memories (`wt(n, "memory", "memories")`)
+        f"{_M238} · 12 memories recalled",
+        f"{_M238} · 1 memory recalled",
+        # the remaining tasks families
+        f"{_M238} · ◆ ultraplan ready",
+        f"{_M238} · ◇ ultraplan needs your input",
+        f"{_M238} · ◇ ultraplan",
+        f"{_M238} · 1 team",
+        f"{_M238} · 3 local agents",
+        f"{_M238} · ◇ 2 remote dynamic workflows",
+        f"{_M238} · ◇ 1 cloud session",
+        f"{_M238} · 1 background dynamic workflow",
+        f"{_M238} · 4 Artifact comment monitors",
+        f"{_M238} · 1 MCP task",
+        f"{_M238} · 2 MCP jobs",
+        f"{_M238} · 7 background tasks",
+        f"{_M238} · dreaming",
+        f"{_M238} · auto-mode scan",
+        # the whole-ROW paste transient
+        "Pasting…",
+        # the new hint-tail members, incl. the feedback-draft regex class
+        "← for agents · 1 feedback draft",
+        "← for agents · 3 feedback drafts",
+        f"{_M238} · esc to return to team lead",
+        f"{_M238} · /tasks to see subagents",
+        f"{_M238} · /diff to hide diff",
+        f"{_M238} · Enter to view memories",
+        f"{_M238} · ctrl+c to copy",
+        f"{_M238} · gh auth login for PR status",
+        f"{_M238} · install gh for PR status",
     ],
 )
-def test_unobserved_modes_accept_EITHER_glyph_the_disclosed_choice(row: str) -> None:
-    """DISCLOSED completeness-over-tightness choice: the `accept edits on` /
-    `plan mode on` glyph decoration is UNOBSERVED (no rig capture, no fixture), and
-    guessing one would re-create exactly the r4 false-refusal cliff on a real pane
-    (a user in accept-edits mode with a tall draft would wedge). So EITHER glyph is
-    accepted until a rig capture lets us bind them. It adds no recombination power —
-    still exactly ONE mode segment per row."""
+def test_gh62_the_new_2_1_238_vocabulary_is_accepted(row: str) -> None:
+    """Every form the extension adds, accepted — and accepted END-TO-END at the
+    leg that actually wedged: the tall-draft fallback LOCATES the input box under
+    this status bar instead of returning `None`.
+
+    The pane's final classification is then either fully deliverable, or leg 3's
+    `no_ready_chrome` for a row built only of grammar-only vocabulary — the
+    FAIL-CLOSED divergence pinned in
+    `test_a_grammar_only_singleton_row_still_refuses_fail_closed`. Nothing else
+    may come back."""
     assert tp._is_status_row(row) is True, row
-    # Still at-most-once: two modes never combine, whatever their glyphs.
-    assert tp._is_status_row(f"{row} · ⏸ manual mode on") is False
+    pane = _lone_sep_pane(row)
+    assert tp._input_box_rows(tp._strip_ansi(pane).split("\n")) is not None, row
+    assert tp.classify_input_box_failure(pane) in (None, "no_ready_chrome"), row
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # RECOMBINATION across families — the composer is a SWITCH over the one
+        # shared task type, so only the shell/monitor pair is ever comma-joined.
+        f"{_M238} · 1 shell, 1 team",
+        f"{_M238} · 1 shell, 2 shells",
+        f"{_M238} · dreaming, 1 MCP task",
+        f"{_M238} · ◆ ultraplan ready, auto-mode scan",
+        f"{_M238} · 1 shell,, 1 monitor",
+        f"{_M238} · 1 shell, and stuff",
+        # the LEGACY suffix form never joins monitors (the two never co-render)
+        f"{_M238} · 1 shell still running, 1 monitor",
+        # the ultraplan phase GLYPHS are bound (◆ = plan_ready, ◇ = the rest)
+        f"{_M238} · ◇ ultraplan ready",
+        f"{_M238} · ◆ ultraplan needs your input",
+        f"{_M238} · ◆ ultraplan",
+        # COUNT SHAPES — bound wherever the `n === 1` conditional is proven
+        f"{_M238} · 1 monitors",
+        f"{_M238} · 2 monitor",
+        f"{_M238} · 1 shells",
+        f"{_M238} · 2 shell",
+        f"{_M238} · 1 memories recalled",
+        f"{_M238} · 2 memory recalled",
+        f"{_M238} · 1 teams",
+        f"{_M238} · 2 MCP job",
+        "← for agents · 1 feedback drafts",
+        "← for agents · 2 feedback draft",
+        # PROSE / residue around a valid token
+        f"{_M238} · PR # 309",
+        f"{_M238} · PR #309 is ready to merge",
+        f"{_M238} · MR #12",
+        f"{_M238} · ← 3 agents are working",
+        f"{_M238} · 12 memories",
+        # REPEATS — the regex-class tail members are at-most-once too
+        "← for agents · ← 3 agents",
+        "← 3 agents · ← 99+ done",
+        "← for agents · 1 feedback draft · 2 feedback drafts",
+        # TYPED SLOTS ALONE are not a status bar (acceptance is UNCHANGED)
+        "PR #309",
+        "MR !12",
+        "2 monitors",
+        "1 shell, 1 monitor",
+        "12 memories recalled",
+        "1 background task",
+        "◆ ultraplan ready",
+        # UNICODE digits — `[0-9]`, never `\\d`, in every new numeric template
+        f"{_M238} · ١ shell, ١ monitor",
+        f"{_M238} · ٢ monitors",
+        f"{_M238} · ١٢ memories recalled",
+        f"{_M238} · PR #٣٠٩",
+        "← ٣ agents",
+        f"{_M238} · ١ feedback draft",
+    ],
+)
+def test_gh62_recombinations_and_bad_count_shapes_refuse(row: str) -> None:
+    """The r3 refusal family extended to the new vocabulary, driven END-TO-END:
+    the grammar refuses the row, the gate refuses the pane, and the
+    stale-empty-`❯` geometry never yields a keyless brake release."""
+    assert tp._is_status_row(row) is False, row
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) is not None, row
+    assert tp.pane_input_box_present(pane) is False, row
+    rule = "─" * 40
+    empty_pane = "  filler\n" + rule + "\n❯\n" + ("\n" * 20) + rule + f"\n  {row}\n"
+    assert tp.pane_input_row_empty(empty_pane) is not True, row
+
+
+# ── `↓ to view` is COUPLED to the tasks slot, not a free hint ────────────────
+#
+# The tasks component (`BHs`) emits `· ↓ to view` itself, immediately after the
+# tasks text, and ONLY when `xCl` holds (the list is exactly one ultraplan remote
+# agent). Modelling it as a free hint would let it float anywhere in the tail; it
+# is consumed as ONE cursor step instead.
+
+
+@pytest.mark.parametrize(
+    "tasks",
+    ["◆ ultraplan ready", "◇ ultraplan needs your input", "◇ ultraplan"],
+)
+def test_gh62_view_hint_is_accepted_immediately_after_an_ultraplan_slot(
+    tasks: str,
+) -> None:
+    assert tp._is_status_row(f"{_M238} · {tasks} · ↓ to view") is True
+    # …and it stays optional (the coupling never becomes a requirement).
+    assert tp._is_status_row(f"{_M238} · {tasks}") is True
+    # …and the tail still works after it.
+    assert tp._is_status_row(f"{_M238} · {tasks} · ↓ to view · ← for agents") is True
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # standalone — never a free hint
+        "↓ to view",
+        f"{_M238} · ↓ to view",
+        # after a NON-ultraplan tasks slot
+        f"{_M238} · 1 shell · ↓ to view",
+        f"{_M238} · 7 background tasks · ↓ to view",
+        # not IMMEDIATELY after the ultraplan slot
+        f"{_M238} · ◇ ultraplan · ← for agents · ↓ to view",
+        # repeated
+        f"{_M238} · ◇ ultraplan · ↓ to view · ↓ to view",
+    ],
+)
+def test_gh62_view_hint_refuses_anywhere_else(row: str) -> None:
+    assert tp._is_status_row(row) is False, row
+    pane = _lone_sep_pane(row)
+    assert tp.pane_input_box_present(pane) is False, row
+
+
+# ── The grammar ↔ leg-3 divergence is FAIL-CLOSED (r2-P2-1 fold) ─────────────
+#
+# GH #56's v2 claim "every accepted bar satisfies leg 3" was FALSE and is
+# RETRACTED. Rows built only of grammar-only vocabulary ARE accepted by the
+# grammar and are NOT covered by leg 3's alphabet. The shipped contract is that
+# this divergence is a REFUSAL, never a wrong commit — asserted here rather than
+# assumed away.
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "ctrl+t to hide tasks",  # pre-existing (GH #56)
+        "/diff to hide diff",
+        "ctrl+c to copy",
+        "Enter to view memories",
+        "/tasks to see subagents",
+        "esc to return to team lead",
+        "gh auth login for PR status",
+        "1 feedback draft",  # the bare regex-class member
+        "← 3 agents",  # the counted agents form (`← for agents` IS in leg 3)
+        "Pasting…",  # the new whole-row exclusive form
+    ],
+)
+def test_a_grammar_only_singleton_row_still_refuses_fail_closed(row: str) -> None:
+    """The grammar ACCEPTS the row (so the fallback locates the box) and leg 3 then
+    refuses the pane as `no_ready_chrome` — an INDETERMINATE reason, so the
+    delivery gate retries the capture and then refuses. Fail-closed: a refusal,
+    never a wrong commit.
+
+    NOT asserted here, deliberately: `pane_input_row_empty` is a DIFFERENT
+    predicate (the stranded-draft brake's release proof) and never consults leg 3
+    — on such a pane it correctly reports the box as located and empty, which is
+    the right answer, not a spoof. The r1-r4 spoof tests assert the no-release
+    property because there the grammar REFUSES the row outright."""
+    assert tp._is_status_row(row) is True, row
+    pane = _lone_sep_pane(row)
+    assert tp.classify_input_box_failure(pane) == "no_ready_chrome", row
+    assert "no_ready_chrome" in tp.INPUT_BOX_INDETERMINATE_REASONS
+    assert tp.pane_input_box_present(pane) is False, row
