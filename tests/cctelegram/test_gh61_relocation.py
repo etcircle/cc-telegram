@@ -28,7 +28,7 @@ import pytest
 from cctelegram import session_monitor as sm
 from cctelegram.handlers.response_builder import TeammateIdle
 from cctelegram.monitor_state import TrackedSession
-from cctelegram.session_monitor import SessionMonitor
+from cctelegram.session_monitor import SessionMonitor, _TeammateRec
 
 SID = "f30c7b09-relocated-session"
 ORIG_CWD = "/Users/tester/dev-workspaces/di-copilot"
@@ -149,6 +149,46 @@ class TestIncidentRepro:
         assert await monitor.scan_projects(set()) == []
 
 
+# ── offset validation is a LINE-BOUNDARY proof ───────────────────────────────
+
+
+class TestOffsetValidation:
+    """``_check_offset_against_file`` must prove a JSONL LINE boundary — a bare
+    ``{`` test passes on every nested object inside a line, which would accept a
+    mid-line offset and resume the read mid-object."""
+
+    def _file(self, tmp_path) -> tuple[Path, bytes]:
+        line1 = json.dumps({"a": {"nested": 1}}).encode() + b"\n"
+        line2 = json.dumps({"b": 2}).encode() + b"\n"
+        p = tmp_path / "s.jsonl"
+        p.write_bytes(line1 + line2)
+        return p, line1
+
+    def test_zero_eof_and_newline_preceded_brace_are_valid(self, tmp_path):
+        p, line1 = self._file(tmp_path)
+        size = p.stat().st_size
+        assert sm._check_offset_against_file(p, 0).valid is True
+        assert sm._check_offset_against_file(p, size).valid is True
+        assert sm._check_offset_against_file(p, len(line1)).valid is True
+
+    def test_a_nested_brace_mid_object_is_INVALID(self, tmp_path):
+        p, _ = self._file(tmp_path)
+        mid = p.read_bytes().index(b'{"nested"')
+        assert p.read_bytes()[mid : mid + 1] == b"{"  # a bare-'{' test would pass
+        assert sm._check_offset_against_file(p, mid).valid is False
+
+    def test_a_negative_offset_is_INVALID(self, tmp_path):
+        p, _ = self._file(tmp_path)
+        assert sm._check_offset_against_file(p, -1).valid is False
+
+    def test_past_eof_is_invalid_and_a_missing_file_does_not_exist(self, tmp_path):
+        p, _ = self._file(tmp_path)
+        past = sm._check_offset_against_file(p, p.stat().st_size + 1)
+        assert (past.exists, past.valid) == (True, False)
+        gone = sm._check_offset_against_file(tmp_path / "nope.jsonl", 0)
+        assert (gone.exists, gone.valid) == (False, False)
+
+
 # ── 2. single-winner dedup ───────────────────────────────────────────────────
 
 
@@ -235,6 +275,47 @@ class TestDuplicateCandidateDedup:
             await monitor.scan_projects({SID})
 
         assert sum("project dirs" in r.getMessage() for r in caplog.records) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_duplicate_set_that_reappears_warns_again(
+        self, monitor, tmp_path, caplog
+    ):
+        """Two → ZERO (the id disappears entirely) → the SAME two again: the
+        cache entry must be dropped whenever the id has <= 1 candidates, not
+        only when it has exactly one, or the identical reappearance is silent."""
+        stale = _project(tmp_path, ORIG_DIR) / f"{SID}.jsonl"
+        fresh = _project(tmp_path, WORKTREE_DIR) / f"{SID}.jsonl"
+        _write_jsonl(stale, [_entry("a")])
+        _write_jsonl(fresh, [_entry("b")])
+
+        with caplog.at_level("WARNING"):
+            await monitor.scan_projects({SID})
+            stale.unlink()
+            fresh.unlink()  # the id vanishes from the scan ENTIRELY
+            await monitor.scan_projects({SID})
+            assert monitor._duplicate_scan_candidates == {}
+            _write_jsonl(stale, [_entry("a")])
+            _write_jsonl(fresh, [_entry("b")])
+            await monitor.scan_projects({SID})
+
+        assert sum("project dirs" in r.getMessage() for r in caplog.records) == 2
+
+    @pytest.mark.asyncio
+    async def test_parent_teardown_drops_the_rate_limit_caches(self, monitor, tmp_path):
+        stale = _project(tmp_path, ORIG_DIR) / f"{SID}.jsonl"
+        fresh = _project(tmp_path, WORKTREE_DIR) / f"{SID}.jsonl"
+        _write_jsonl(stale, [_entry("a")])
+        _write_jsonl(fresh, [_entry("b")])
+        _track(monitor, fresh, 0)
+        await monitor.scan_projects({SID})
+        assert SID in monitor._duplicate_scan_candidates
+        monitor._relocation_defer_warned.add(SID)
+
+        # The startup stale-session sweep is one of the parent-teardown seams.
+        await monitor._cleanup_all_stale_sessions()
+
+        assert SID not in monitor._duplicate_scan_candidates
+        assert SID not in monitor._relocation_defer_warned
 
 
 # ── 3. stale index entries must not suppress the glob branch ─────────────────
@@ -737,23 +818,39 @@ class TestSidechainRelocation:
         assert "avis2-backend-7041d9b743d26f2e" in activity.teammate_parks
 
     @pytest.mark.asyncio
-    async def test_characterization_reset_to_zero_replays_a_historical_end_turn(
-        self, monitor, tmp_path
+    async def test_characterization_reset_to_zero_tombstones_a_live_key(
+        self, monitor, tmp_path, monkeypatch
     ):
-        """DISCLOSED, ADJUDICATED fail-dark residual: a reset-to-0 replay folds a
-        HISTORICAL end_turn into the tick, so a genuinely live resumed key can be
-        tombstoned when the parent's resume signal sits behind the parent's valid
-        offset and is not replayed. Chosen deliberately over EOF (which loses the
-        CLOSE and strands typing ON for the 2 h TTL — this repo's historically
-        recurring bug class). Pinned so a future change that flips the direction
-        is caught."""
+        """DISCLOSED, ADJUDICATED fail-dark residual, driven through the REAL
+        ``bot.apply_sidechain_activity`` fan-out onto a seeded route.
+
+        A reset-to-0 replay folds a HISTORICAL end_turn into the tick. The
+        parent's resume signal sits behind the parent's VALID offset and is
+        therefore NOT replayed, so the runtime record carries no
+        ``resumed_event_ts`` and the SIDECHAIN done gate fails CLOSED — the key
+        is tombstoned even though the SAME tick replayed strictly NEWER
+        activity for it (``BgDoneSource.SIDECHAIN`` has the resume gate but,
+        unlike ``TEAMMATE``, NO stale-vs-activity gate).
+
+        Chosen deliberately over EOF, which loses the CLOSE instead and strands
+        typing ON for the 2 h TTL — this repo's historically recurring bug
+        class ("false dark is annoying, false typing after completion is the
+        historical bug class here"). **This test goes RED if a stale-vs-activity
+        gate is ever added to the SIDECHAIN done source** — which is the point:
+        such a change flips the adjudicated direction and must be a decision,
+        not a drive-by.
+        """
+        from cctelegram import bot as bot_module
+        from cctelegram import route_runtime
+        from cctelegram.route_runtime import RunState, TranscriptLifecycleEvent
+
         entries = [
             _sc_entry(
                 "leg 1 finished",
                 stop_reason="end_turn",
-                ts="2026-08-20T20:00:00.000Z",
+                ts="2026-08-20T20:00:00.000Z",  # HISTORICAL
             ),
-            _sc_entry("leg 2 still working", ts="2026-08-20T22:30:00.000Z"),
+            _sc_entry("leg 2 still working", ts="2026-08-20T22:30:00.000Z"),  # NEWER
         ]
         old_path, new_path, (old_sc, new_sc) = self._relocate(tmp_path, entries)
         _track(monitor, old_path, 0)
@@ -762,9 +859,142 @@ class TestSidechainRelocation:
 
         await monitor.check_for_updates({SID})
         await monitor.check_sidechain_updates({SID})
-
-        tick = monitor.pop_sidechain_activity()[SID].ticks["a61"]
+        activity = monitor.pop_sidechain_activity()
+        tick = activity[SID].ticks["a61"]
         assert tick.saw_end_of_turn is True  # the historical end_turn is replayed
+
+        route: route_runtime.Route = (1, 42, "@7")
+        route_runtime.reset_for_tests()
+        try:
+            # A route that is idle on its own transcript, with a LIVE background
+            # key (the agent is genuinely still working).
+            await route_runtime.ingest_transcript_event(
+                route,
+                TranscriptLifecycleEvent(
+                    role="assistant",
+                    block_type="text",
+                    tool_use_id=None,
+                    tool_name=None,
+                    stop_reason="end_turn",
+                    timestamp=100.0,
+                ),
+            )
+            await route_runtime.seed_idle_and_mark_background_agent_launched(
+                route, "a61"
+            )
+            assert route_runtime.snapshot(route).typing_eligible is True
+
+            async def fake_find(session_id: str):
+                return [(1, "@7", 42)]
+
+            monkeypatch.setattr(
+                bot_module.session_manager, "find_users_for_session", fake_find
+            )
+            await bot_module.apply_sidechain_activity(activity)
+
+            snap = route_runtime.snapshot(route)
+            assert "a61" in route_runtime._state[route].background_agents_done
+            assert snap.background_agents == ()
+            assert snap.typing_eligible is False
+            assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+        finally:
+            route_runtime.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_teammate_name_stays_dark_through_the_replay(
+        self, monitor, tmp_path
+    ):
+        """Item 3: a sticky-AMBIGUOUS registered name feeds NO run-state — and a
+        relocation replay must not become a back door for it. Display is
+        unaffected (the Fix-5 discipline)."""
+        stem = "avis2-backend-7041d9b743d26f2e"
+        proj_old = _project(tmp_path, ORIG_DIR)
+        proj_new = _project(tmp_path, WORKTREE_DIR)
+        old_path = proj_old / f"{SID}.jsonl"
+        new_path = proj_new / f"{SID}.jsonl"
+        _write_jsonl(new_path, [_entry("parent")])
+        old_sc = proj_old / SID / "subagents" / f"agent-{stem}.jsonl"
+        new_sc = proj_new / SID / "subagents" / f"agent-{stem}.jsonl"
+        _write_jsonl(
+            new_sc,
+            [
+                _sc_entry("a", ts="2026-08-20T22:00:00.000Z"),
+                _sc_entry("b", stop_reason="end_turn", ts="2026-08-20T22:30:00.000Z"),
+            ],
+        )
+        _track(monitor, old_path, 0)
+        key = f"sub:{SID}:agent-{stem}"
+        _track_sub(monitor, key, old_sc, 0)
+        # A REGISTERED name that arbitration left sticky-ambiguous: no
+        # current_key, so no candidate is the ONE feeder.
+        monitor._teammate_registry[SID] = {
+            "vis2-backend": _TeammateRec(
+                name="vis2-backend",
+                teammate_id=None,
+                spawn_generation=1,
+                spawned_ts=0.0,
+                current_key=None,
+                ambiguous=True,
+            )
+        }
+
+        await monitor.check_for_updates({SID})
+        msgs = await monitor.check_sidechain_updates({SID})
+
+        assert msgs, "display still runs"
+        assert monitor.pop_sidechain_activity().get(SID) is None
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_stale_park_cannot_tombstone_past_newer_activity(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """The shipped GH #46 r2 TEAMMATE stale-vs-activity gate still arbitrates
+        after a relocation replay: a REDELIVERED park strictly OLDER than the
+        key's own newer activity keeps the teammate LIVE."""
+        from cctelegram import bot as bot_module
+        from cctelegram import route_runtime
+        from cctelegram.route_runtime import TranscriptLifecycleEvent
+
+        agent_key = "avis2-backend-7041d9b743d26f2e"
+        # One replayed tick: the key's OWN newer activity plus a redelivered
+        # park stamped BEFORE it (the fan-out applies activity, then parks).
+        activity = {
+            SID: sm.ParentSidechainActivity(
+                ticks={agent_key: sm.SidechainTick(max_event_ts=500.0)},
+                teammate_parks={agent_key: (200.0, False)},
+            )
+        }
+        route: route_runtime.Route = (1, 42, "@7")
+        route_runtime.reset_for_tests()
+        try:
+            await route_runtime.ingest_transcript_event(
+                route,
+                TranscriptLifecycleEvent(
+                    role="assistant",
+                    block_type="text",
+                    tool_use_id=None,
+                    tool_name=None,
+                    stop_reason="end_turn",
+                    timestamp=100.0,
+                ),
+            )
+            await route_runtime.seed_idle_and_mark_background_agent_launched(
+                route, agent_key
+            )
+
+            async def fake_find(session_id: str):
+                return [(1, "@7", 42)]
+
+            monkeypatch.setattr(
+                bot_module.session_manager, "find_users_for_session", fake_find
+            )
+            await bot_module.apply_sidechain_activity(activity)
+
+            snap = route_runtime.snapshot(route)
+            assert agent_key in snap.background_agents  # NOT tombstoned
+            assert snap.typing_eligible is True
+        finally:
+            route_runtime.reset_for_tests()
 
 
 # ── 7c. parser-carry lockstep at BOTH granularities ──────────────────────────
@@ -908,6 +1138,65 @@ class TestStagedCommit:
         assert tracked is not None and tracked.file_path == str(new_path)
         rec = monitor.state.get_session(key)
         assert rec is not None and rec.file_path == str(new_sc)
+
+    @pytest.mark.asyncio
+    async def test_an_unstattable_new_parent_file_DEFERS_the_whole_sync(
+        self, monitor, tmp_path, caplog
+    ):
+        """An unstattable new parent file has NO knowable EOF. Committing the
+        path while keeping an unvalidated offset would CONSUME the
+        path-difference retry trigger and leave a poisoned offset: once the file
+        became readable, an offset past its EOF would fall into the ORDINARY
+        truncation path, reset to 0 and replay the whole parent — the flood the
+        EOF-never-0 rule forbids. So the sync DEFERS: nothing is committed, one
+        rate-limited WARNING, and the surviving difference retries."""
+        proj_old = _project(tmp_path, ORIG_DIR)
+        proj_new = _project(tmp_path, WORKTREE_DIR)
+        old_path = proj_old / f"{SID}.jsonl"
+        new_path = proj_new / f"{SID}.jsonl"  # deliberately NOT created yet
+        old_sc = proj_old / SID / "subagents" / "agent-a61.jsonl"
+        new_sc = proj_new / SID / "subagents" / "agent-a61.jsonl"
+        _write_jsonl(new_sc, [_sc_entry("x", ts="2026-08-20T22:00:00.000Z")])
+        _track(monitor, old_path, 4_000_000)
+        key = f"sub:{SID}:agent-a61"
+        _track_sub(monitor, key, old_sc, 4242)
+        monitor._pending_tools[SID] = {"toolu_p": object()}
+        monitor._pending_tools[key] = {"toolu_s": object()}
+        monitor._file_mtimes[SID] = 7.0
+        old_wf = proj_old / SID / "subagents" / "workflows" / "wf_run61"
+        monitor._open_workflow_brackets[SID] = {
+            "task61": sm._WorkflowBracket(
+                wf_dir=old_wf, last_seen_mtime=0.0, launch_wall=0.0
+            )
+        }
+
+        tracked = monitor.state.get_session(SID)
+        assert tracked is not None
+        with caplog.at_level("WARNING"):
+            for _ in range(3):  # the live seam retries at 1 Hz
+                await monitor._sync_relocated_session(tracked, new_path)
+
+        # ZERO mutations, and the path is NOT synced.
+        assert tracked.file_path == str(old_path)
+        assert tracked.last_byte_offset == 4_000_000
+        rec = monitor.state.get_session(key)
+        assert rec is not None
+        assert rec.file_path == str(old_sc)
+        assert rec.last_byte_offset == 4242
+        assert monitor._pending_tools.keys() == {SID, key}
+        assert monitor._file_mtimes[SID] == 7.0
+        assert monitor._open_workflow_brackets[SID]["task61"].wf_dir == old_wf
+        assert sum("deferring" in r.getMessage() for r in caplog.records) == 1
+
+        # Once the file is readable the retry applies the FULL sync.
+        _write_jsonl(new_path, [_entry("parent")])
+        await monitor._sync_relocated_session(tracked, new_path)
+
+        assert tracked.file_path == str(new_path)
+        assert tracked.last_byte_offset == new_path.stat().st_size  # EOF, never 0
+        assert SID not in monitor._pending_tools  # moved ⇒ carry cleared
+        assert monitor.state.get_session(key).file_path == str(new_sc)
+        assert SID not in monitor._relocation_defer_warned
 
     def test_the_commit_assigns_the_parent_file_path_last(self):
         """Source pin (r5 P2-2): the parent ``file_path`` is the sync's retry

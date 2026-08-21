@@ -498,30 +498,32 @@ class _OffsetCheck:
 
 
 def _check_offset_against_file(path: Path, offset: int) -> _OffsetCheck:
-    """Size + line-start validation of ``offset`` against ``path``.
+    """Size + LINE-BOUNDARY validation of ``offset`` against ``path``.
 
     Relocation preserves bytes, so the stored offset normally lands exactly on
-    a line start in the NEW file. ``valid`` requires the file to exist, the
-    offset to be within it, and the byte AT the offset to start a JSONL line
-    (``{``) or to be EOF (a line start by construction) — the same guard
-    ``_read_new_lines`` applies mid-poll. Binary read: the offset is a BYTE
-    position, never a text cookie.
+    a line start in the NEW file. ``valid`` requires the file to exist and the
+    offset to be a genuine JSONL LINE BOUNDARY: 0, exactly EOF, or a ``{``
+    whose PRECEDING byte is ``\\n``. The preceding-newline half is load-bearing
+    — a bare ``{`` test passes on every nested object inside a line, which
+    would accept a mid-line offset as valid and resume the read mid-object. A
+    negative offset is invalid (never "trivially 0"). Binary read: the offset
+    is a BYTE position, never a text cookie.
     """
     try:
         size = path.stat().st_size
     except OSError:
         return _OffsetCheck(exists=False, valid=False, size=0)
-    if offset > size:
+    if offset < 0 or offset > size:
         return _OffsetCheck(exists=True, valid=False, size=size)
-    if offset <= 0:
+    if offset == 0 or offset == size:
         return _OffsetCheck(exists=True, valid=True, size=size)
     try:
         with open(path, "rb") as f:
-            f.seek(offset)
-            first = f.read(1)
+            f.seek(offset - 1)
+            pair = f.read(2)
     except OSError:
         return _OffsetCheck(exists=True, valid=False, size=size)
-    return _OffsetCheck(exists=True, valid=first in (b"", b"{"), size=size)
+    return _OffsetCheck(exists=True, valid=pair == b"\n{", size=size)
 
 
 def _rebase_under(path: Path, old_root: Path | None, new_root: Path) -> Path:
@@ -808,8 +810,15 @@ class SessionMonitor:
         # GH #61: per-id candidate SET last warned about by
         # ``_dedupe_scan_candidates`` — the duplicate WARNING fires when the set
         # first appears or CHANGES, never on every 1 s scan while it is
-        # unchanged. Dropped for an id whose duplicates resolve to one file.
+        # unchanged. Dropped as soon as the id has <= 1 candidate (INCLUDING
+        # zero — a vanished duplicate set that later REAPPEARS identically must
+        # warn again) and at every parent-teardown seam.
         self._duplicate_scan_candidates: dict[str, frozenset[str]] = {}
+        # GH #61: session_ids whose relocation sync is currently DEFERRED
+        # (the new parent file is unstattable). Rate-limits the deferral
+        # WARNING — the live seam retries at 1 Hz. Discarded on the first
+        # successful sync and at every parent-teardown seam.
+        self._relocation_defer_warned: set[str] = set()
         # GH #44 (successor of Wave A's parent-set): per-parent, per-tick
         # background-agent signals — sidechain ticks (key + max event ts +
         # saw_end_of_turn) populated by ``check_sidechain_updates``
@@ -2732,7 +2741,12 @@ class SessionMonitor:
         * PARENT offset: relocation preserves bytes, so a VALIDATED offset is
           kept. An INVALID one moves to EOF, **never 0** — parent content
           blocks are real per-message Telegram sends, so a reset-to-0 on a
-          multi-MB parent is a genuine message flood.
+          multi-MB parent is a genuine message flood. An UNSTATTABLE new parent
+          file DEFERS the entire sync (nothing is committed, one rate-limited
+          WARNING): EOF is unknowable there, and committing the path while
+          keeping an unvalidated offset would CONSUME the retry trigger and
+          leave a poisoned offset that the ordinary truncation path would later
+          reset to 0 — exactly the flood this rule forbids.
         * SIDECHAIN records: each record's own ``file_path`` is re-rooted
           under the new tree REGARDLESS of the validation outcome, then ONE
           uniform rule — VALIDATED ⇒ offset and parser carry both kept
@@ -2778,17 +2792,35 @@ class SessionMonitor:
         old_dir = old_path.parent if old_path is not None else None
         new_dir = new_path.parent
 
-        logger.info("session relocated: %s -> %s", tracked.file_path, new_path)
-
         # ── stage: parent offset ──
         parent_check = await asyncio.to_thread(
             _check_offset_against_file, new_path, tracked.last_byte_offset
         )
+        if not parent_check.exists:
+            # The NEW parent file is unstattable, so EOF is unknowable — DEFER
+            # the whole sync (commit NOTHING). Committing the path while
+            # keeping an unvalidated offset would CONSUME the path-difference
+            # retry trigger and leave a poisoned offset: once the file became
+            # readable, an offset past its EOF would fall into the ORDINARY
+            # truncation path, reset to 0, and replay the entire parent — the
+            # message flood the EOF-never-0 rule exists to prevent. The
+            # difference survives, so the next tick / next startup retries.
+            if session_id not in self._relocation_defer_warned:
+                self._relocation_defer_warned.add(session_id)
+                logger.warning(
+                    "relocated session %s: %s is unreadable — deferring the "
+                    "relocation sync (will retry)",
+                    session_id[:8],
+                    new_path,
+                )
+            return
+        self._relocation_defer_warned.discard(session_id)
+
+        logger.info("session relocated: %s -> %s", tracked.file_path, new_path)
+
         planned_parent_offset = tracked.last_byte_offset
         clear_parent_carry = False
-        if parent_check.valid:
-            pass
-        elif parent_check.exists:
+        if not parent_check.valid:
             planned_parent_offset = parent_check.size
             clear_parent_carry = True
             logger.warning(
@@ -2799,16 +2831,6 @@ class SessionMonitor:
                 tracked.last_byte_offset,
                 new_path,
                 parent_check.size,
-            )
-        else:
-            # Unstattable NEW parent file: EOF is unknowable, so keep the
-            # offset (and, in lockstep, the carry) — the normal poll's own
-            # truncation guard still applies once the file is readable.
-            logger.warning(
-                "relocated session %s: cannot validate offset against %s "
-                "— keeping the stored offset",
-                session_id[:8],
-                new_path,
             )
 
         # ── stage: sidechain records (key, path, offset, clear_carry) ──
@@ -3009,13 +3031,22 @@ class SessionMonitor:
         is the lexicographically larger path, purely for determinism.
 
         The WARNING is rate-limited per id on candidate-SET change (r2 P2-4):
-        a persistent stale leftover must not warn on every 1 s scan.
+        a persistent stale leftover must not warn on every 1 s scan. The cache
+        entry is dropped as soon as the id has <= 1 candidate — INCLUDING zero
+        (an id absent from this scan entirely), so a duplicate set that
+        disappears and later REAPPEARS identically warns again.
         """
-        sessions: list[SessionInfo] = []
-        for session_id, paths in candidates.items():
-            unique = list(dict.fromkeys(str(p) for p in paths))
-            if len(unique) == 1:
+        uniques = {
+            session_id: list(dict.fromkeys(str(p) for p in paths))
+            for session_id, paths in candidates.items()
+        }
+        for session_id in list(self._duplicate_scan_candidates):
+            if len(uniques.get(session_id, ())) <= 1:
                 self._duplicate_scan_candidates.pop(session_id, None)
+
+        sessions: list[SessionInfo] = []
+        for session_id, unique in uniques.items():
+            if len(unique) == 1:
                 sessions.append(
                     SessionInfo(session_id=session_id, file_path=Path(unique[0]))
                 )
@@ -4116,6 +4147,10 @@ class SessionMonitor:
                 # tool_use carry + stall tracking must not outlive it.
                 self._pending_tools.pop(session_id, None)
                 self._unparseable_stalls.pop(session_id, None)
+                # GH #61: the scan/relocation rate-limit caches are per-id
+                # observation state — they must not outlive the session either.
+                self._duplicate_scan_candidates.pop(session_id, None)
+                self._relocation_defer_warned.discard(session_id)
                 self._remove_sidechains_for_parent(session_id)
 
         # Defensive sweep: drop any sidechain trackers whose parent isn't
@@ -4212,6 +4247,10 @@ class SessionMonitor:
                 # tool_use carry + stall tracking must not outlive it.
                 self._pending_tools.pop(session_id, None)
                 self._unparseable_stalls.pop(session_id, None)
+                # GH #61: the scan/relocation rate-limit caches are per-id
+                # observation state — they must not outlive the session either.
+                self._duplicate_scan_candidates.pop(session_id, None)
+                self._relocation_defer_warned.discard(session_id)
                 self._remove_sidechains_for_parent(session_id)
             self.state.save_if_dirty()
 
