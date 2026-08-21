@@ -4,6 +4,37 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.3] — 2026-08-21
+
+The "a new Claude Code can't wedge your quoted replies" release. One fix, found live twice in a
+single day: a reply-quoted (or any tall multi-line) message was typed into the terminal but never
+submitted, and the topic wedged behind the stranded-draft brake — the same *symptom* 0.4.1 fixed,
+back with a different cause.
+
+### Fixed
+- **The delivery gate's status-bar grammar is re-derived for Claude Code 2.1.238 (GH #62).**
+  The tall-draft fallback proves the input box by matching the status bar below it against a
+  whole-row whitelist grammar, and that grammar's alphabet was pinned on CC 2.1.209–2.1.217.
+  CC 2.1.238 rewrote most of the footer — new permission modes (`auto mode on`, now the
+  fresh-session default, and `don't ask on`), monitor counts (`1 shell, 1 monitor`, a bare
+  `2 monitors`), the current-PR footer link (`PR #309`), memories/feedback-draft counters and a
+  batch of new hints — so every tall draft on an ordinary pane was refused with Enter withheld.
+  Short messages kept working, which is why only quoted replies wedged.
+  - The alphabet is now derived from the CC binary's **own footer renderer** (the versioned
+    install ships its JS bundle in plaintext), not from pane sampling: mode texts are bound to
+    their real glyphs from the mode table, the tasks slot models the composer's exact variants
+    (only the shell/monitor pair comma-joins; mixed task families collapse to
+    `N background task(s)`), and counts are bound singular/plural only where the composer's
+    `n === 1` conditional proves it.
+  - Coupled alphabet fixes: `auto mode on` / `don't ask on` join the idle alphabet (so `/update`
+    and `/cost` work on those panes), and leg 3's shell token widens to monitors.
+  - Pinned by fresh 2.1.238 rig fixtures (the failing capture flips to deliverable), all eight
+    live-sampled status bars, and a recombination/count-shape refusal corpus; zero behavior
+    change across the entire pre-2.1.238 fixture corpus.
+  - Known limits (all fail-closed refusals, never wrong commits): rebound keybinding chords, the
+    IDE `⧉` footer indicator, user-configured footer links, and custom `statusLine` rows remain
+    outside the grammar.
+
 ## [0.4.2] — 2026-07-22
 
 The "a ghost can't wedge your topic" release. One fix, found live: a topic suddenly refused
