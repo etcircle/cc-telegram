@@ -2688,7 +2688,7 @@ class SessionMonitor:
             return None
         return max(matches, key=_relocation_candidate_rank)
 
-    async def reconcile_relocated_paths(self) -> None:
+    async def reconcile_relocated_paths(self) -> set[str]:
         """Re-point every tracked parent whose JSONL has MOVED (GH #61).
 
         The STARTUP seam of the relocation sync, called from ``bot.post_init``
@@ -2698,11 +2698,20 @@ class SessionMonitor:
         reconciler runs before the first ``check_for_updates``. Both then see
         already-synced paths.
 
+        Returns the set of session_ids whose sync **DEFERRED** (empty when
+        none). The caller MUST skip those sessions in the pending-tools replay:
+        a deferred record still points at the OLD path, which may be READABLE
+        and STALE, and seeding from it is affirmative wrong state with no
+        clearing path — see ``bot._replay_pending_tools_at_startup``. A
+        per-session RAISE counts as deferred too (the sync did not complete, so
+        the path is equally unproven).
+
         Per-session failures are logged and skipped; a relocation that is not
         reconciled here is re-detected by the live seam in
         ``check_for_updates`` (the trigger is the path DIFFERENCE, which
         survives).
         """
+        deferred: set[str] = set()
         for session_id, tracked in list(self.state.tracked_sessions.items()):
             # Sidechain records are re-rooted by their PARENT's sync — they are
             # never resolvable by an id-glob of their own.
@@ -2715,19 +2724,23 @@ class SessionMonitor:
                 if current is None or str(current) == tracked.file_path:
                     continue
                 if not await self._sync_relocated_session(tracked, current):
-                    # DEFERRED (unstattable new file). Fail-safe here: this seam
-                    # reads no transcript itself, and the only downstream
-                    # startup consumer — ``bot.post_init``'s pending-tools
-                    # replay — reads ``tracked.file_path`` (still the OLD path,
-                    # which either exists or parses to nothing) and consumes NO
-                    # byte offset. The live seam retries at 1 Hz.
+                    # DEFERRED (unstattable new file): the record still points
+                    # at the OLD path, which may be READABLE and STALE, so the
+                    # caller must not replay pending tools from it. This seam
+                    # itself reads no transcript and consumes no byte offset;
+                    # the live seam retries at 1 Hz.
+                    deferred.add(session_id)
                     continue
             except Exception as e:  # never break startup
+                # An incomplete sync leaves the path equally unproven — treat it
+                # as deferred so the replay skips it (fail-safe direction).
+                deferred.add(session_id)
                 logger.warning(
                     "relocation reconcile failed for session %s: %s",
                     session_id[:8],
                     e,
                 )
+        return deferred
 
     async def _sync_relocated_session(
         self, tracked: TrackedSession, new_path: Path

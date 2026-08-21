@@ -459,9 +459,15 @@ class TestStartupSeam:
         ``monitor.start()`` (whose loop runs the startup BUSY reconciler)."""
         src = Path("src/cctelegram/bot.py").read_text()
         body = src[src.index("async def post_init(") :]
-        reconcile_idx = body.index("await monitor.reconcile_relocated_paths()")
-        replay_idx = body.index("route_runtime.parse_pending_tools_from_jsonl")
+        reconcile_idx = body.index(
+            "deferred_relocations = await monitor.reconcile_relocated_paths()"
+        )
+        replay_idx = body.index(
+            "await _replay_pending_tools_at_startup(monitor, deferred_relocations)"
+        )
         start_idx = body.index("monitor.start()")
+        # The replay both FOLLOWS the reconcile and consumes ITS result — the
+        # skip must key on the DEFERRAL, never on a path heuristic.
         assert reconcile_idx < replay_idx < start_idx
 
     @pytest.mark.asyncio
@@ -527,6 +533,163 @@ class TestStartupSeam:
         brackets = monitor._open_workflow_brackets.get(SID, {})
         assert "task61" in brackets
         assert brackets["task61"].wf_dir == wf_dir
+
+    @pytest.mark.asyncio
+    async def test_a_startup_deferral_skips_that_session_in_the_replay(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """A DEFERRED startup sync must skip that session's pending-tool replay.
+
+        The old-path-missing case fails safe on its own (``OSError`` ⇒ ``{}``),
+        but a READABLE STALE leftover does not: it can hold an unresolved
+        AskUserQuestion ``tool_use`` whose ``tool_result`` exists only in the
+        relocated copy. Seeding from it sets WAITING_ON_USER; the next
+        successful sync then finds an already-VALID EOF offset, so the result is
+        never replayed, and pane-idle reconciliation deliberately cannot clear a
+        transcript-set WAITING_ON_USER — a false "🔔 Waiting on you" with no
+        clearing path. Skipping leaves the route UNSEEDED, which is the
+        documented post-restart degradation.
+
+        Driven through the REAL seams: ``reconcile_relocated_paths`` →
+        ``bot._replay_pending_tools_at_startup`` → ``check_for_updates``.
+        """
+        from cctelegram import bot as bot_module
+        from cctelegram import route_runtime
+        from cctelegram.route_runtime import RunState
+
+        auq_use = {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_auq",
+                        "name": "AskUserQuestion",
+                        "input": {},
+                    }
+                ],
+            },
+            "sessionId": SID,
+            "timestamp": "2026-08-20T22:00:00.000Z",
+        }
+        auq_result = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_auq",
+                        "content": "answered",
+                    }
+                ],
+            },
+            "sessionId": SID,
+            "timestamp": "2026-08-20T22:00:05.000Z",
+        }
+        # The STALE leftover: readable, and its AUQ still looks unresolved.
+        old_path = _project(tmp_path, ORIG_DIR) / f"{SID}.jsonl"
+        _write_jsonl(old_path, [auq_use])
+        # The relocated copy carries the RESULT.
+        new_path = _project(tmp_path, WORKTREE_DIR) / f"{SID}.jsonl"
+        _write_jsonl(new_path, [auq_use, auq_result])
+        _track(monitor, old_path, old_path.stat().st_size)
+        # A second, NON-relocated session with its own open tool — the skip must
+        # be PER-SESSION, not global.
+        other_sid = "other-session-not-relocated"
+        other_path = _project(tmp_path, WORKTREE_DIR) / f"{other_sid}.jsonl"
+        _write_jsonl(
+            other_path,
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_task",
+                                "name": "Task",
+                                "input": {},
+                            }
+                        ],
+                    },
+                    "sessionId": other_sid,
+                    "timestamp": "2026-08-20T22:00:00.000Z",
+                }
+            ],
+        )
+        _track(monitor, other_path, 0, sid=other_sid)
+
+        # The new file is transiently unstattable at STARTUP only.
+        real_check = sm._check_offset_against_file
+        transient = {"fail": True}
+
+        def _flaky(path, offset):
+            if transient["fail"] and Path(path) == new_path:
+                return sm._OffsetCheck(exists=False, valid=False, size=0)
+            return real_check(path, offset)
+
+        monkeypatch.setattr(sm, "_check_offset_against_file", _flaky)
+
+        route: route_runtime.Route = (1, 42, "@7")
+        other_route: route_runtime.Route = (1, 43, "@8")
+        route_runtime.reset_for_tests()
+        try:
+
+            async def fake_find(session_id: str):
+                if session_id == SID:
+                    return [(1, "@7", 42)]
+                if session_id == other_sid:
+                    return [(1, "@8", 43)]
+                return []
+
+            monkeypatch.setattr(
+                bot_module.session_manager, "find_users_for_session", fake_find
+            )
+
+            deferred = await monitor.reconcile_relocated_paths()
+            assert deferred == {SID}
+            seeded = await bot_module._replay_pending_tools_at_startup(
+                monitor, deferred
+            )
+
+            # The relocated session seeded NOTHING — no false WAITING.
+            assert route not in route_runtime._state
+            assert (
+                route_runtime.snapshot(route).run_state is not RunState.WAITING_ON_USER
+            )
+            # …while the untouched session still replayed (per-session skip).
+            assert seeded == 1
+            assert (
+                route_runtime.snapshot(other_route).run_state is RunState.RUNNING_TOOL
+            )
+
+            # The transient clears: the live seam syncs on the next tick. The
+            # stored offset is a genuine line boundary in the byte-preserving
+            # relocated copy, so it is KEPT (never EOF-jumped, never reset) and
+            # the AUQ tool_result the stale copy lacked is delivered normally.
+            transient["fail"] = False
+            msgs = await monitor.check_for_updates({SID})
+
+            tracked = monitor.state.get_session(SID)
+            assert tracked is not None
+            assert tracked.file_path == str(new_path)
+            assert tracked.last_byte_offset == new_path.stat().st_size
+            assert any("answered" in m.text for m in msgs)
+            assert (
+                route_runtime.snapshot(route).run_state is not RunState.WAITING_ON_USER
+            )
+
+            # …and fresh activity processes normally.
+            with open(new_path, "a") as f:
+                f.write(json.dumps(_entry("brand new line")) + "\n")
+            msgs = await monitor.check_for_updates({SID})
+
+            assert [m.text for m in msgs] == ["brand new line"]
+        finally:
+            route_runtime.reset_for_tests()
 
 
 # ── 6. open Workflow brackets are re-pointed ─────────────────────────────────
