@@ -474,6 +474,73 @@ class SessionInfo:
     file_path: Path
 
 
+def _relocation_candidate_rank(path: Path) -> tuple[float, str]:
+    """Sort key for picking ONE winner among same-id JSONL candidates (GH #61).
+
+    Newest ``st_mtime`` wins (CC's relocation is a MOVE, so any loser is a
+    stale leftover); the lexicographically larger path breaks a tie purely for
+    determinism. An unstattable candidate ranks below every readable one.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = -1.0
+    return (mtime, str(path))
+
+
+@dataclass(frozen=True)
+class _OffsetCheck:
+    """Validation of a stored byte offset against a (relocated) file (GH #61)."""
+
+    exists: bool
+    valid: bool
+    size: int
+
+
+def _check_offset_against_file(path: Path, offset: int) -> _OffsetCheck:
+    """Size + line-start validation of ``offset`` against ``path``.
+
+    Relocation preserves bytes, so the stored offset normally lands exactly on
+    a line start in the NEW file. ``valid`` requires the file to exist, the
+    offset to be within it, and the byte AT the offset to start a JSONL line
+    (``{``) or to be EOF (a line start by construction) — the same guard
+    ``_read_new_lines`` applies mid-poll. Binary read: the offset is a BYTE
+    position, never a text cookie.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return _OffsetCheck(exists=False, valid=False, size=0)
+    if offset > size:
+        return _OffsetCheck(exists=True, valid=False, size=size)
+    if offset <= 0:
+        return _OffsetCheck(exists=True, valid=True, size=size)
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            first = f.read(1)
+    except OSError:
+        return _OffsetCheck(exists=True, valid=False, size=size)
+    return _OffsetCheck(exists=True, valid=first in (b"", b"{"), size=size)
+
+
+def _rebase_under(path: Path, old_root: Path | None, new_root: Path) -> Path:
+    """Re-root ``path``'s ``old_root``-relative tail under ``new_root``.
+
+    A sidechain record's stored path and an open bracket's ``wf_dir`` both live
+    under the parent JSONL's directory (``<sid>/subagents/…``), so a parent
+    relocation moves them by the same re-rooting. A path that is not under
+    ``old_root`` is returned unchanged (it is then validated on its own terms).
+    """
+    if old_root is None or old_root == new_root:
+        return path
+    try:
+        tail = path.relative_to(old_root)
+    except ValueError:
+        return path
+    return new_root / tail
+
+
 @dataclass
 class TranscriptEvent:
     """A lifecycle event derived from one parsed JSONL block.
@@ -738,6 +805,11 @@ class SessionMonitor:
         # stored in the value and resets the entry when it moves). Popped on
         # skip, on offset progress, and at every session-cleanup site.
         self._unparseable_stalls: dict[str, tuple[int, float, int]] = {}
+        # GH #61: per-id candidate SET last warned about by
+        # ``_dedupe_scan_candidates`` — the duplicate WARNING fires when the set
+        # first appears or CHANGES, never on every 1 s scan while it is
+        # unchanged. Dropped for an id whose duplicates resolve to one file.
+        self._duplicate_scan_candidates: dict[str, frozenset[str]] = {}
         # GH #44 (successor of Wave A's parent-set): per-parent, per-tick
         # background-agent signals — sidechain ticks (key + max event ts +
         # saw_end_of_turn) populated by ``check_sidechain_updates``
@@ -2591,6 +2663,207 @@ class SessionMonitor:
         )
         return True
 
+    def _resolve_tracked_jsonl(self, session_id: str) -> Path | None:
+        """Locate a tracked session's CURRENT JSONL by id-glob (GH #61).
+
+        The same ``*/{session_id}.jsonl`` resolution ``scan_projects``'s
+        id-bypass and ``session.py:1026`` already rely on, arbitrated by the
+        SAME single-winner rule as the scan. Blocking (glob + stat) — call it
+        through ``asyncio.to_thread``.
+        """
+        try:
+            matches = list(self.projects_path.glob(f"*/{session_id}.jsonl"))
+        except OSError:
+            return None
+        if not matches:
+            return None
+        return max(matches, key=_relocation_candidate_rank)
+
+    async def reconcile_relocated_paths(self) -> None:
+        """Re-point every tracked parent whose JSONL has MOVED (GH #61).
+
+        The STARTUP seam of the relocation sync, called from ``bot.post_init``
+        STRICTLY BEFORE the pending-tools replay — hydration-time is too late
+        GLOBALLY: the replay reads ``tracked.file_path`` before
+        ``monitor.start()`` ever creates the monitor task, and the startup BUSY
+        reconciler runs before the first ``check_for_updates``. Both then see
+        already-synced paths.
+
+        Per-session failures are logged and skipped; a relocation that is not
+        reconciled here is re-detected by the live seam in
+        ``check_for_updates`` (the trigger is the path DIFFERENCE, which
+        survives).
+        """
+        for session_id, tracked in list(self.state.tracked_sessions.items()):
+            # Sidechain records are re-rooted by their PARENT's sync — they are
+            # never resolvable by an id-glob of their own.
+            if tracked.parent_session_id is not None:
+                continue
+            try:
+                current = await asyncio.to_thread(
+                    self._resolve_tracked_jsonl, session_id
+                )
+                if current is None or str(current) == tracked.file_path:
+                    continue
+                await self._sync_relocated_session(tracked, current)
+            except Exception as e:  # never break startup
+                logger.warning(
+                    "relocation reconcile failed for session %s: %s",
+                    session_id[:8],
+                    e,
+                )
+
+    async def _sync_relocated_session(
+        self, tracked: TrackedSession, new_path: Path
+    ) -> None:
+        """Re-point a relocated session's tracking state to its NEW tree.
+
+        Claude Code relocates a transcript (an ``EnterWorktree`` moves it to a
+        project dir keyed on the new cwd, ``ExitWorktree`` moves it BACK), so
+        this is sync-on-DIFFERENCE, not one-time. FIVE consumers derive
+        directories from ``tracked.file_path`` (the ``check_sidechain_updates``
+        root, three ``subagents/`` joins, the startup BUSY reconciler), so
+        without the sync sidechain/teammate tailing stays dead even once
+        discovery is fixed.
+
+        Semantics (relocation-scoped ONLY — the non-relocation ``/clear``
+        truncation reset-to-0 in ``_read_new_lines`` is byte-untouched):
+
+        * PARENT offset: relocation preserves bytes, so a VALIDATED offset is
+          kept. An INVALID one moves to EOF, **never 0** — parent content
+          blocks are real per-message Telegram sends, so a reset-to-0 on a
+          multi-MB parent is a genuine message flood.
+        * SIDECHAIN records: each record's own ``file_path`` is re-rooted
+          under the new tree REGARDLESS of the validation outcome, then ONE
+          uniform rule — VALIDATED ⇒ offset and parser carry both kept
+          (the backlog replays through the normal per-key digest card, the
+          same shape as any post-kickstart resume); NOT VALIDATED (invalid
+          offset OR missing file) ⇒ offset → 0 AND carry → cleared TOGETHER
+          (they describe the same causal cursor: a preserved offset with a
+          cleared carry would parse a known non-Bash tool_result as
+          ``tool_name=None``, which the GH #59 lane admits → a false
+          background-Bash key). Records are never DELETED (the
+          ``_record_teammate_park`` stem lookup resolves through them).
+          The parent/sidechain asymmetry (parent invalid → EOF, sidechain
+          invalid → 0) is deliberate: their display costs differ.
+          ADJUDICATED fail-dark residual of the reset-to-0 branch: a replayed
+          HISTORICAL end_turn can tombstone a genuinely live resumed key when
+          the parent's resume signal sits behind the parent's valid offset and
+          is not replayed. The alternative (EOF) loses the CLOSE instead and
+          strands typing ON for the 2 h TTL — this repo's historically
+          recurring bug class. Doctrine decides it: false dark is annoying,
+          false typing after completion is the bug class here.
+        * Parser carry (``_pending_tools``) moves in LOCKSTEP with the offset
+          at BOTH granularities; the observation caches (``_file_mtimes``,
+          ``_unparseable_stalls``) are cleared for the parent and every
+          relocated sidechain key regardless.
+        * Open ``_WorkflowBracket``s cache ``wf_dir`` directly (heartbeats and
+          the Fix-5 display enumeration walk it, not ``tracked.file_path``), so
+          each is re-rooted too — and set to ``None`` when the recomputed dir
+          does not exist, an already-documented never-heartbeats shape that
+          ages out from ``launch_wall``. Leaving it would keep walking the OLD
+          tree, which may still exist as a stale leftover.
+
+        Every change is computed on the staged plans below and applied in ONE
+        no-await commit with the parent ``file_path`` assignment LAST: the
+        sync's trigger is the path DIFFERENCE, so a raise before the commit
+        leaves it intact and the whole sync simply re-runs (no partial
+        "consumed" state can strand). Persistence is best-effort —
+        ``MonitorState.save`` swallows ``OSError`` and logs ERROR; in-process
+        correctness lives in the in-memory state and the next process
+        re-converges from the still-different persisted path.
+        """
+        session_id = tracked.session_id
+        old_path = Path(tracked.file_path) if tracked.file_path else None
+        old_dir = old_path.parent if old_path is not None else None
+        new_dir = new_path.parent
+
+        logger.info("session relocated: %s -> %s", tracked.file_path, new_path)
+
+        # ── stage: parent offset ──
+        parent_check = await asyncio.to_thread(
+            _check_offset_against_file, new_path, tracked.last_byte_offset
+        )
+        planned_parent_offset = tracked.last_byte_offset
+        clear_parent_carry = False
+        if parent_check.valid:
+            pass
+        elif parent_check.exists:
+            planned_parent_offset = parent_check.size
+            clear_parent_carry = True
+            logger.warning(
+                "relocated session %s offset %d invalid against %s (size %d) "
+                "— resuming at EOF (never 0: a parent reset would re-send the "
+                "whole transcript)",
+                session_id[:8],
+                tracked.last_byte_offset,
+                new_path,
+                parent_check.size,
+            )
+        else:
+            # Unstattable NEW parent file: EOF is unknowable, so keep the
+            # offset (and, in lockstep, the carry) — the normal poll's own
+            # truncation guard still applies once the file is readable.
+            logger.warning(
+                "relocated session %s: cannot validate offset against %s "
+                "— keeping the stored offset",
+                session_id[:8],
+                new_path,
+            )
+
+        # ── stage: sidechain records (key, path, offset, clear_carry) ──
+        planned_subs: list[tuple[str, str, int, bool]] = []
+        for key, rec in list(self.state.tracked_sessions.items()):
+            if rec.parent_session_id != session_id:
+                continue
+            rec_path = _rebase_under(Path(rec.file_path), old_dir, new_dir)
+            check = await asyncio.to_thread(
+                _check_offset_against_file, rec_path, rec.last_byte_offset
+            )
+            if check.valid:
+                planned_subs.append((key, str(rec_path), rec.last_byte_offset, False))
+            else:
+                planned_subs.append((key, str(rec_path), 0, True))
+
+        # ── stage: open Workflow brackets ──
+        planned_brackets: list[tuple[str, Path | None]] = []
+        for task_id, bracket in self._open_workflow_brackets.get(
+            session_id, {}
+        ).items():
+            if bracket.wf_dir is None:
+                continue
+            rebased = _rebase_under(bracket.wf_dir, old_dir, new_dir)
+            exists = await asyncio.to_thread(rebased.is_dir)
+            planned_brackets.append((task_id, rebased if exists else None))
+
+        # ── commit: no await past this point; parent file_path LAST ──
+        for key, path_str, offset, clear_carry in planned_subs:
+            rec = self.state.get_session(key)
+            if rec is None:
+                continue
+            rec.file_path = path_str
+            rec.last_byte_offset = offset
+            if clear_carry:
+                self._pending_tools.pop(key, None)
+            self._file_mtimes.pop(key, None)
+            self._unparseable_stalls.pop(key, None)
+            self.state.update_session(rec)
+
+        brackets = self._open_workflow_brackets.get(session_id, {})
+        for task_id, wf_dir in planned_brackets:
+            bracket = brackets.get(task_id)
+            if bracket is not None:
+                bracket.wf_dir = wf_dir
+
+        if clear_parent_carry:
+            self._pending_tools.pop(session_id, None)
+        self._file_mtimes.pop(session_id, None)
+        self._unparseable_stalls.pop(session_id, None)
+        tracked.last_byte_offset = planned_parent_offset
+        tracked.file_path = str(new_path)
+        self.state.update_session(tracked)
+        self.state.save_if_dirty()
+
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
         cwds = set()
@@ -2602,16 +2875,38 @@ class SessionMonitor:
                 cwds.add(w.cwd)
         return cwds
 
-    async def scan_projects(self) -> list[SessionInfo]:
-        """Scan projects that have active tmux windows."""
+    async def scan_projects(self, active_session_ids: set[str]) -> list[SessionInfo]:
+        """Scan projects that have active tmux windows.
+
+        GH #61: a candidate whose stem is in ``active_session_ids`` (the
+        ``session_map``-derived set both callers already hold) is accepted
+        WITHOUT the cwd filter — a session bound in ``session_map`` is
+        monitored wherever its JSONL lives, the same invariant
+        ``session.py``'s ``*/{session_id}.jsonl`` glob already implements.
+        The cwd filter is a COST/SCOPE bound (don't stat+parse every
+        historical project dir each poll), NOT authorization: both callers
+        re-filter by their own session-id sets anyway. The bypass is checked
+        BEFORE the ``read_cwd_from_jsonl`` fallback, so it adds no per-poll
+        full-file reads.
+
+        The return carries AT MOST ONE ``SessionInfo`` per session_id: a
+        mid-relocation (or stale-leftover) duplicate would otherwise be
+        processed twice against ONE shared offset/path. See
+        ``_dedupe_scan_candidates``.
+        """
         active_cwds = await self._get_active_cwds()
-        if not active_cwds:
+        # A transient/empty tmux cwd enumeration must not blank the BOUND
+        # sessions (r2 P2-3): with a non-empty bound-id set the scan proceeds
+        # and the bypass still discovers them; the cwd-filtered branch simply
+        # matches nothing this tick.
+        if not active_cwds and not active_session_ids:
             return []
 
-        sessions = []
+        # session_id -> candidate paths (deduped to a single winner below).
+        candidates: dict[str, list[Path]] = {}
 
         if not self.projects_path.exists():
-            return sessions
+            return []
 
         for project_dir in self.projects_path.iterdir():
             if not project_dir.is_dir():
@@ -2644,15 +2939,14 @@ class SessionMonitor:
                         if norm_pp not in active_cwds:
                             continue
 
-                        indexed_ids.add(session_id)
                         file_path = Path(full_path)
+                        # r1 P1-2: only claim the id for the indexed branch when
+                        # the indexed ``fullPath`` actually EXISTS — a stale
+                        # index entry (the relocated shape) must fall through to
+                        # the glob branch below, where the id-bypass applies.
                         if file_path.exists():
-                            sessions.append(
-                                SessionInfo(
-                                    session_id=session_id,
-                                    file_path=file_path,
-                                )
-                            )
+                            indexed_ids.add(session_id)
+                            candidates.setdefault(session_id, []).append(file_path)
 
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug(f"Error reading index {index_file}: {e}")
@@ -2664,6 +2958,14 @@ class SessionMonitor:
                     if session_id in indexed_ids:
                         continue
 
+                    # GH #61: a session_map-bound id bypasses the cwd filter
+                    # (and the read_cwd_from_jsonl fallback below it) — the
+                    # first ``cwd`` in a relocated JSONL still names the
+                    # ORIGINAL directory, which is no longer any pane's cwd.
+                    if session_id in active_session_ids:
+                        candidates.setdefault(session_id, []).append(jsonl_file)
+                        continue
+
                     # Determine project_path for this file
                     file_project_path = original_path
                     if not file_project_path:
@@ -2671,6 +2973,10 @@ class SessionMonitor:
                             read_cwd_from_jsonl, jsonl_file
                         )
                     if not file_project_path:
+                        # LOSSY LAST RESORT: Claude Code maps '/', '-' AND '.'
+                        # all to '-', so this is non-invertible and can never
+                        # reconstruct a path containing '-' or '.'. Kept as the
+                        # final fallback only; do NOT widen it.
                         dir_name = project_dir.name
                         if dir_name.startswith("-"):
                             file_project_path = dir_name.replace("-", "/")
@@ -2683,15 +2989,50 @@ class SessionMonitor:
                     if norm_fp not in active_cwds:
                         continue
 
-                    sessions.append(
-                        SessionInfo(
-                            session_id=session_id,
-                            file_path=jsonl_file,
-                        )
-                    )
+                    candidates.setdefault(session_id, []).append(jsonl_file)
             except OSError as e:
                 logger.debug(f"Error scanning jsonl files in {project_dir}: {e}")
 
+        return self._dedupe_scan_candidates(candidates)
+
+    def _dedupe_scan_candidates(
+        self, candidates: dict[str, list[Path]]
+    ) -> list[SessionInfo]:
+        """Collapse the scan's candidates to AT MOST ONE ``SessionInfo`` per id.
+
+        Mid-relocation (or with a stale leftover copy) the SAME session id can
+        surface from TWO project dirs. ``check_for_updates`` would then process
+        both against ONE shared offset/path and the AUQ hydrate is
+        last-write-wins, so the arbitration belongs HERE — both callers inherit
+        it by construction. The winner is the newest ``st_mtime`` (CC's
+        relocation is a MOVE, so the loser is a stale leftover); the tie-break
+        is the lexicographically larger path, purely for determinism.
+
+        The WARNING is rate-limited per id on candidate-SET change (r2 P2-4):
+        a persistent stale leftover must not warn on every 1 s scan.
+        """
+        sessions: list[SessionInfo] = []
+        for session_id, paths in candidates.items():
+            unique = list(dict.fromkeys(str(p) for p in paths))
+            if len(unique) == 1:
+                self._duplicate_scan_candidates.pop(session_id, None)
+                sessions.append(
+                    SessionInfo(session_id=session_id, file_path=Path(unique[0]))
+                )
+                continue
+            winner = max((Path(u) for u in unique), key=_relocation_candidate_rank)
+            seen = frozenset(unique)
+            if self._duplicate_scan_candidates.get(session_id) != seen:
+                self._duplicate_scan_candidates[session_id] = seen
+                logger.warning(
+                    "session %s found in %d project dirs (%s) — using the "
+                    "newest-mtime file %s",
+                    session_id[:8],
+                    len(unique),
+                    sorted(unique),
+                    winner,
+                )
+            sessions.append(SessionInfo(session_id=session_id, file_path=winner))
         return sessions
 
     async def _read_new_lines(
@@ -2819,7 +3160,7 @@ class SessionMonitor:
         new_messages = []
 
         # Scan projects to get available session files
-        sessions = await self.scan_projects()
+        sessions = await self.scan_projects(active_session_ids)
 
         # Only process sessions that are in session_map
         for session_info in sessions:
@@ -2846,6 +3187,14 @@ class SessionMonitor:
                     self._file_mtimes[session_info.session_id] = current_mtime
                     logger.info(f"Started tracking session: {session_info.session_id}")
                     continue
+
+                # GH #61: the relocation sync runs at the TOP of the block,
+                # BEFORE the unchanged-file mtime shortcut below — that
+                # shortcut can ``continue`` past every later seam, so a QUIET
+                # relocated file would never be re-pointed. The sync persists
+                # itself (update_session + save_if_dirty) before any continue.
+                if tracked.file_path != str(session_info.file_path):
+                    await self._sync_relocated_session(tracked, session_info.file_path)
 
                 # Check mtime + file size to see if file has changed
                 try:
@@ -3999,7 +4348,7 @@ class SessionMonitor:
         # otherwise silently skip hydration even though the JSONL is
         # discoverable on disk.
         try:
-            sessions = await self.scan_projects()
+            sessions = await self.scan_projects(set(current_map.values()))
         except Exception as e:
             logger.warning("AUQ hydrate: scan_projects failed: %s", e)
             return

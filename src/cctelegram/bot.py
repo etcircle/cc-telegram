@@ -2434,6 +2434,14 @@ async def post_init(application: Application) -> None:
     # projected RUNNING (typing + 🟡 Busy) after the parent's end-of-turn.
     monitor.set_subagent_activity_callback(apply_sidechain_activity)
 
+    # GH #61: re-point any session whose transcript RELOCATED while the bot was
+    # down (an EnterWorktree moves the JSONL to a project dir keyed on the new
+    # cwd). This MUST run before every consumer of ``tracked.file_path``: the
+    # pending-tools replay below reads it directly, and the startup BUSY
+    # reconciler derives the ``subagents/`` tree from it inside the monitor task
+    # started further down.
+    await monitor.reconcile_relocated_paths()
+
     # Replay tool_use/tool_result pairs from each tracked parent JSONL so
     # tools that were open at the moment of bot shutdown (most painfully,
     # long-running sub-agent Task calls) are visible to route_runtime

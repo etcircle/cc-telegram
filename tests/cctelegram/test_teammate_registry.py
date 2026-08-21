@@ -207,7 +207,7 @@ async def test_prose_spawn_without_meta_warns_and_does_not_register(
         TrackedSession(session_id="parent-sid", file_path=str(pj), last_byte_offset=0)
     )
 
-    async def _scan():
+    async def _scan(_active_ids=None):
         return [SessionInfo(session_id="parent-sid", file_path=pj)]
 
     mon.scan_projects = _scan  # type: ignore[method-assign]
@@ -288,7 +288,7 @@ def _setup_parent(monitor, tmp_path, parent_sid: str = PARENT):
         )
     )
 
-    async def _scan():
+    async def _scan(_active_ids=None):
         return [SessionInfo(session_id=parent_sid, file_path=parent_jsonl)]
 
     monitor.scan_projects = _scan  # type: ignore[method-assign]
