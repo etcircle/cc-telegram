@@ -2714,7 +2714,14 @@ class SessionMonitor:
                 )
                 if current is None or str(current) == tracked.file_path:
                     continue
-                await self._sync_relocated_session(tracked, current)
+                if not await self._sync_relocated_session(tracked, current):
+                    # DEFERRED (unstattable new file). Fail-safe here: this seam
+                    # reads no transcript itself, and the only downstream
+                    # startup consumer — ``bot.post_init``'s pending-tools
+                    # replay — reads ``tracked.file_path`` (still the OLD path,
+                    # which either exists or parses to nothing) and consumes NO
+                    # byte offset. The live seam retries at 1 Hz.
+                    continue
             except Exception as e:  # never break startup
                 logger.warning(
                     "relocation reconcile failed for session %s: %s",
@@ -2724,8 +2731,15 @@ class SessionMonitor:
 
     async def _sync_relocated_session(
         self, tracked: TrackedSession, new_path: Path
-    ) -> None:
+    ) -> bool:
         """Re-point a relocated session's tracking state to its NEW tree.
+
+        Returns **True** when the sync COMMITTED, **False** when it DEFERRED —
+        an EXPLICIT signal, never sentinel-by-logging: a deferred sync leaves
+        the record pointing at the OLD path with an unvalidated offset, so the
+        caller must skip the session entirely for that tick (see the live seam
+        in ``check_for_updates``). Returning ``None`` either way is exactly what
+        let the deferral fall through into the normal stat/read path.
 
         Claude Code relocates a transcript (an ``EnterWorktree`` moves it to a
         project dir keyed on the new cwd, ``ExitWorktree`` moves it BACK), so
@@ -2743,7 +2757,8 @@ class SessionMonitor:
           blocks are real per-message Telegram sends, so a reset-to-0 on a
           multi-MB parent is a genuine message flood. An UNSTATTABLE new parent
           file DEFERS the entire sync (nothing is committed, one rate-limited
-          WARNING): EOF is unknowable there, and committing the path while
+          WARNING, ``False`` returned so the caller skips the session for that
+          tick): EOF is unknowable there, and committing the path while
           keeping an unvalidated offset would CONSUME the retry trigger and
           leave a poisoned offset that the ordinary truncation path would later
           reset to 0 — exactly the flood this rule forbids.
@@ -2813,7 +2828,7 @@ class SessionMonitor:
                     session_id[:8],
                     new_path,
                 )
-            return
+            return False
         self._relocation_defer_warned.discard(session_id)
 
         logger.info("session relocated: %s -> %s", tracked.file_path, new_path)
@@ -2885,6 +2900,7 @@ class SessionMonitor:
         tracked.file_path = str(new_path)
         self.state.update_session(tracked)
         self.state.save_if_dirty()
+        return True
 
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
@@ -2921,14 +2937,19 @@ class SessionMonitor:
         # sessions (r2 P2-3): with a non-empty bound-id set the scan proceeds
         # and the bypass still discovers them; the cwd-filtered branch simply
         # matches nothing this tick.
+        #
+        # EVERY return path goes through ``_dedupe_scan_candidates`` — an early
+        # return that skipped it would let the duplicate-warning cache survive a
+        # scan that observed ZERO candidates, so an identical recurrence would
+        # never re-warn.
         if not active_cwds and not active_session_ids:
-            return []
+            return self._dedupe_scan_candidates({})
 
         # session_id -> candidate paths (deduped to a single winner below).
         candidates: dict[str, list[Path]] = {}
 
         if not self.projects_path.exists():
-            return []
+            return self._dedupe_scan_candidates({})
 
         for project_dir in self.projects_path.iterdir():
             if not project_dir.is_dir():
@@ -3225,7 +3246,20 @@ class SessionMonitor:
                 # relocated file would never be re-pointed. The sync persists
                 # itself (update_session + save_if_dirty) before any continue.
                 if tracked.file_path != str(session_info.file_path):
-                    await self._sync_relocated_session(tracked, session_info.file_path)
+                    synced = await self._sync_relocated_session(
+                        tracked, session_info.file_path
+                    )
+                    if not synced:
+                        # DEFERRED: the record still points at the OLD path with
+                        # an UNVALIDATED offset, so the whole per-session block
+                        # is skipped this tick — zero stats, zero reads, zero
+                        # offset mutations. Falling through would hand that
+                        # offset to ``_read_new_lines`` against the NEW file,
+                        # where an offset past EOF takes the ordinary truncation
+                        # path and replays the parent — the flood the deferral
+                        # exists to prevent. The path difference survives, so
+                        # the next 1 Hz tick retries.
+                        continue
 
                 # Check mtime + file size to see if file has changed
                 try:

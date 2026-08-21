@@ -301,6 +301,49 @@ class TestDuplicateCandidateDedup:
         assert sum("project dirs" in r.getMessage() for r in caplog.records) == 2
 
     @pytest.mark.asyncio
+    async def test_a_missing_projects_root_still_sweeps_the_warn_cache(
+        self, monitor, tmp_path, caplog
+    ):
+        """EVERY return path out of ``scan_projects`` must sweep: an early
+        return that skipped ``_dedupe_scan_candidates`` let the cache survive a
+        scan that observed ZERO candidates, so an identical recurrence was
+        silent."""
+        root = tmp_path / "projects"
+        stale = _project(tmp_path, ORIG_DIR) / f"{SID}.jsonl"
+        fresh = _project(tmp_path, WORKTREE_DIR) / f"{SID}.jsonl"
+        _write_jsonl(stale, [_entry("a")])
+        _write_jsonl(fresh, [_entry("b")])
+
+        with caplog.at_level("WARNING"):
+            await monitor.scan_projects({SID})
+            root.rename(tmp_path / "projects-away")  # the root vanishes
+            assert await monitor.scan_projects({SID}) == []
+            assert monitor._duplicate_scan_candidates == {}
+            (tmp_path / "projects-away").rename(root)  # …and comes back
+            await monitor.scan_projects({SID})
+
+        assert sum("project dirs" in r.getMessage() for r in caplog.records) == 2
+
+    @pytest.mark.asyncio
+    async def test_the_empty_cwds_early_return_also_sweeps_the_warn_cache(
+        self, monitor, tmp_path, caplog
+    ):
+        stale = _project(tmp_path, ORIG_DIR) / f"{SID}.jsonl"
+        fresh = _project(tmp_path, WORKTREE_DIR) / f"{SID}.jsonl"
+        _write_jsonl(stale, [_entry("a")])
+        _write_jsonl(fresh, [_entry("b")])
+
+        with caplog.at_level("WARNING"):
+            await monitor.scan_projects({SID})
+            _patch_cwds(monitor, set())
+            assert await monitor.scan_projects(set()) == []  # the other early return
+            assert monitor._duplicate_scan_candidates == {}
+            _patch_cwds(monitor, {str(Path(WORKTREE_CWD))})
+            await monitor.scan_projects({SID})
+
+        assert sum("project dirs" in r.getMessage() for r in caplog.records) == 2
+
+    @pytest.mark.asyncio
     async def test_parent_teardown_drops_the_rate_limit_caches(self, monitor, tmp_path):
         stale = _project(tmp_path, ORIG_DIR) / f"{SID}.jsonl"
         fresh = _project(tmp_path, WORKTREE_DIR) / f"{SID}.jsonl"
@@ -1197,6 +1240,66 @@ class TestStagedCommit:
         assert SID not in monitor._pending_tools  # moved ⇒ carry cleared
         assert monitor.state.get_session(key).file_path == str(new_sc)
         assert SID not in monitor._relocation_defer_warned
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_sync_skips_the_ENTIRE_per_session_block_that_tick(
+        self, monitor, tmp_path, caplog, monkeypatch
+    ):
+        """Through the REAL ``check_for_updates`` — the isolation of the unit
+        test above is exactly what hid this.
+
+        A deferral must ``continue`` past the whole per-session block: the
+        record still points at the OLD path with an UNVALIDATED offset, so
+        falling through hands that offset to ``_read_new_lines`` against the
+        NEW file. A transient stat failure inside the sync's validation
+        followed by a succeeding stat in the normal path is enough — the
+        offset lands past EOF, the ORDINARY truncation path resets it to 0 and
+        the parent replays in full, while the WARNING claimed "deferring"."""
+        entries = [_entry("old one"), _entry("old two"), _entry("old three")]
+        new_path = _project(tmp_path, WORKTREE_DIR) / f"{SID}.jsonl"
+        _write_jsonl(new_path, entries)
+        old_path = _project(tmp_path, ORIG_DIR) / f"{SID}.jsonl"
+        poisoned = new_path.stat().st_size + 10_000
+        _track(monitor, old_path, poisoned)
+
+        # A TRANSIENT stat failure inside the sync's validation only; every
+        # later stat (the normal path's) succeeds.
+        real_check = sm._check_offset_against_file
+        transient = {"fail": True}
+
+        def _flaky(path, offset):
+            if transient["fail"] and Path(path) == new_path:
+                return sm._OffsetCheck(exists=False, valid=False, size=0)
+            return real_check(path, offset)
+
+        monkeypatch.setattr(sm, "_check_offset_against_file", _flaky)
+
+        with caplog.at_level("WARNING"):
+            msgs = await monitor.check_for_updates({SID})
+
+        assert msgs == [], "a deferred session must not be read at all"
+        tracked = monitor.state.get_session(SID)
+        assert tracked is not None
+        assert tracked.file_path == str(old_path)  # path difference intact
+        assert tracked.last_byte_offset == poisoned  # NOT reset, NOT EOF
+        assert SID not in monitor._file_mtimes  # not even stat-cached
+        assert sum("deferring" in r.getMessage() for r in caplog.records) == 1
+
+        # The next tick: the file is readable again → sync + normal processing.
+        transient["fail"] = False
+        msgs = await monitor.check_for_updates({SID})
+
+        tracked = monitor.state.get_session(SID)
+        assert tracked is not None
+        assert tracked.file_path == str(new_path)
+        assert tracked.last_byte_offset == new_path.stat().st_size  # EOF, never 0
+        assert msgs == []
+
+        with open(new_path, "a") as f:
+            f.write(json.dumps(_entry("brand new line")) + "\n")
+        msgs = await monitor.check_for_updates({SID})
+
+        assert [m.text for m in msgs] == ["brand new line"]
 
     def test_the_commit_assigns_the_parent_file_path_last(self):
         """Source pin (r5 P2-2): the parent ``file_path`` is the sync's retry
