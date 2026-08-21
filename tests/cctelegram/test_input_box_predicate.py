@@ -993,10 +993,11 @@ _LIVE_BOT_ROWS = [
     "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
     # GH #62 — the SAME completeness lesson, one CC minor later. Sampled from the
     # owner's live panes 2026-08-21 on real CC 2.1.238 (8 DISTINCT bars across
-    # four sessions, four samples each). Every one of these was REFUSED by the
+    # four sessions, four samples each). FIVE of the eight were REFUSED by the
     # 2.1.209-pinned grammar: `auto mode on` was not a mode text at all, `PR #309`
-    # and `1 shell, 1 monitor` were not slots, and a bare `1 monitor` had no form.
-    # Two of them wedged real topics that day.
+    # and `1 shell, 1 monitor` were not slots, and a bare `1 monitor` had no form
+    # (the other three bypass-permissions rows were already accepted). Two of the
+    # refused bars wedged real topics that day.
     "⏵⏵ auto mode on (shift+tab to cycle)",
     "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
     "⏵⏵ bypass permissions on (shift+tab to cycle) · PR #309 · ← for agents "
@@ -1031,9 +1032,10 @@ def test_the_live_bot_rows_are_accepted(row: str) -> None:
     2026-07-14 on CC 2.1.208/2.1.209, 2026-08-21 on CC 2.1.238). The 2.1.209 row 1
     carries `ctrl+t to hide tasks`, which NO fixture contains; the 2.1.238 rows
     carry `auto mode on`, `PR #309` and `1 shell, 1 monitor`. Each generation of
-    this list was REFUSED by the grammar of the generation before it, fail-closing
-    the tall-draft fallback on the owner's busiest windows — which is exactly why
-    this pin is LIVE-sampled and not fixture-derived (GH #56 r5, GH #62)."""
+    this list contains rows the grammar of the generation before it REFUSED
+    (5 of the 8 sampled 2.1.238 bars), fail-closing the tall-draft fallback on
+    the owner's busiest windows — which is exactly why this pin is LIVE-sampled
+    and not fixture-derived (GH #56 r5, GH #62)."""
     assert tp._is_status_row(row) is True, row
     # And it works end-to-end: a tall draft under this status bar delivers.
     pane = _lone_sep_pane(row)
