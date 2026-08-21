@@ -52,7 +52,7 @@ def _setup_parent(monitor, tmp_path, parent_sid: str = PARENT):
 
     # scan_projects shells out to tmux for active cwds — stub it like the
     # existing check_for_updates tests do.
-    async def _scan():
+    async def _scan(_active_ids=None):
         return [SessionInfo(session_id=parent_sid, file_path=parent_jsonl)]
 
     monitor.scan_projects = _scan  # type: ignore[method-assign]
@@ -1082,7 +1082,7 @@ async def test_two_parents_each_with_open_bracket_both_emit(
     parent_a_jsonl, sub_a = _setup_parent(monitor, tmp_path, parent_sid="parent-a")
     parent_b_jsonl, sub_b = _setup_parent(monitor, tmp_path, parent_sid="parent-b")
 
-    async def _scan():
+    async def _scan(_active_ids=None):
         return [
             SessionInfo(session_id="parent-a", file_path=parent_a_jsonl),
             SessionInfo(session_id="parent-b", file_path=parent_b_jsonl),
@@ -1368,7 +1368,7 @@ async def test_wf_dir_none_closing_bracket_pops_even_without_toplevel_subagents_
         )
     )
 
-    async def _scan():
+    async def _scan(_active_ids=None):
         return [SessionInfo(session_id=PARENT, file_path=parent_jsonl)]
 
     monitor.scan_projects = _scan  # type: ignore[method-assign]

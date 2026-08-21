@@ -391,7 +391,7 @@ class TestEventCallback:
         )
 
     def _patch_scan(self, monitor, session_id: str, jsonl_file):
-        async def _scan():
+        async def _scan(_active_ids=None):
             return [SessionInfo(session_id=session_id, file_path=jsonl_file)]
 
         monitor.scan_projects = _scan  # type: ignore[method-assign]
@@ -1150,7 +1150,7 @@ class TestAuqCacheHydration:
         _write_jsonl(jsonl, [_auq_tool_use_entry("auq_hydrate")])
         sessions = [SessionInfo(session_id="sid-1", file_path=jsonl)]
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return sessions
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1176,7 +1176,7 @@ class TestAuqCacheHydration:
         jsonl = tmp_path / "subagent.jsonl"
         _write_jsonl(jsonl, [_auq_tool_use_entry("auq_sub")])
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id="sub:parent-abc:agent-xyz", file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1199,7 +1199,7 @@ class TestAuqCacheHydration:
         # now). Must not raise, must not hydrate.
         from cctelegram.handlers import interactive_ui
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return []
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1348,7 +1348,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("auq_done"), _tool_result_entry("auq_done")],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1384,7 +1384,7 @@ class TestAuqCacheClearOnSessionChange:
         jsonl = tmp_path / "session.jsonl"
         _write_jsonl(jsonl, [_auq_tool_use_entry("auq_pending")])
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1426,7 +1426,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("auq_done"), _tool_result_entry("auq_done")],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=cur, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1470,7 +1470,7 @@ class TestAuqCacheClearOnSessionChange:
         jsonl = tmp_path / "session.jsonl"
         _write_jsonl(jsonl, [])
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1512,7 +1512,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("other"), _tool_result_entry("other")],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1549,7 +1549,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("other"), _tool_result_entry("other")],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1587,7 +1587,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("other"), _tool_result_entry("other")],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1664,7 +1664,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("auq_far"), _tool_result_entry("auq_far"), *padding],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1719,7 +1719,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("auq_old"), _tool_result_entry("auq_old")],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1773,7 +1773,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("auq_done"), _tool_result_entry("auq_done")],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1835,7 +1835,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("auq_done"), _tool_result_entry("auq_done")],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -1887,7 +1887,7 @@ class TestAuqCacheClearOnSessionChange:
             [_auq_tool_use_entry("auq_old"), _tool_result_entry("auq_old")],
         )
 
-        async def fake_scan_projects():
+        async def fake_scan_projects(_active_ids=None):
             return [SessionInfo(session_id=sid, file_path=jsonl)]
 
         monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
@@ -2009,7 +2009,7 @@ class TestToolResultMetaPlumbing:
         )
 
     def _patch_scan(self, monitor, session_id: str, jsonl_file):
-        async def _scan():
+        async def _scan(_active_ids=None):
             return [SessionInfo(session_id=session_id, file_path=jsonl_file)]
 
         monitor.scan_projects = _scan  # type: ignore[method-assign]

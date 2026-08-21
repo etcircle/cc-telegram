@@ -52,7 +52,7 @@ def _setup_parent(monitor, tmp_path, parent_sid: str = PARENT):
         )
     )
 
-    async def _scan():
+    async def _scan(_active_ids=None):
         return [SessionInfo(session_id=parent_sid, file_path=parent_jsonl)]
 
     monitor.scan_projects = _scan  # type: ignore[method-assign]

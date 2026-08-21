@@ -2232,6 +2232,61 @@ def _build_startup_gc_liveness_predicate(
     return _predicate
 
 
+async def _replay_pending_tools_at_startup(
+    monitor: SessionMonitor, deferred_relocations: set[str]
+) -> int:
+    """Seed ``route_runtime.open_tools`` from each tracked parent JSONL.
+
+    Replays tool_use/tool_result pairs so tools that were open at the moment of
+    bot shutdown (most painfully, long-running sub-agent ``Task`` calls) are
+    visible to route_runtime immediately. Without this, ``open_tools`` is empty
+    after restart and routes stay IDLE_CLEARED until the parent emits a fresh
+    event — for an in-flight Task that means no typing indicator for the entire
+    sub-agent runtime, since sub-agents write to a separate JSONL.
+
+    GH #61: a session whose relocation sync DEFERRED is SKIPPED — it still
+    points at the OLD path, which may be READABLE and STALE (a leftover copy at
+    the pre-relocation location). **The trade, stated explicitly:** skipping
+    leaves the route unseeded, which is the documented post-restart degradation
+    — run-state repopulates from fresh transcript activity once the live seam's
+    1 Hz retry syncs the path. Seeding from the stale copy is instead
+    AFFIRMATIVE WRONG STATE with no clearing path: an unresolved
+    AskUserQuestion ``tool_use`` in the old copy whose ``tool_result`` exists
+    only in the relocated copy seeds WAITING_ON_USER, the successful sync then
+    finds an already-valid EOF offset so the result is never replayed, and pane
+    idle reconciliation deliberately cannot clear a transcript-set
+    WAITING_ON_USER — a false "🔔 Waiting on you" until some unrelated
+    transcript event. The skip keys on the DEFERRAL, never on a path heuristic.
+
+    Returns the number of routes seeded (logging included).
+    """
+    seeded_routes = 0
+    for sid, tracked in monitor.state.tracked_sessions.items():
+        if sid in deferred_relocations:
+            logger.info(
+                "Skipping startup pending-tool replay for session %s "
+                "(relocation sync deferred — its stored path may be stale)",
+                sid[:8],
+            )
+            continue
+        pending = await asyncio.to_thread(
+            route_runtime.parse_pending_tools_from_jsonl, tracked.file_path
+        )
+        if not pending:
+            continue
+        active = await session_manager.find_users_for_session(sid)
+        for user_id, wid, thread_id in active:
+            route: route_runtime.Route = (user_id, thread_id or 0, wid)
+            route_runtime.seed_open_tools(route, pending)
+            seeded_routes += 1
+    if seeded_routes:
+        logger.info(
+            "Replayed pending tool state for %d route(s) at startup",
+            seeded_routes,
+        )
+    return seeded_routes
+
+
 async def post_init(application: Application) -> None:
     global \
         session_monitor, \
@@ -2434,30 +2489,15 @@ async def post_init(application: Application) -> None:
     # projected RUNNING (typing + 🟡 Busy) after the parent's end-of-turn.
     monitor.set_subagent_activity_callback(apply_sidechain_activity)
 
-    # Replay tool_use/tool_result pairs from each tracked parent JSONL so
-    # tools that were open at the moment of bot shutdown (most painfully,
-    # long-running sub-agent Task calls) are visible to route_runtime
-    # immediately. Without this, ``open_tools`` is empty after restart
-    # and routes stay IDLE_CLEARED until the parent emits a fresh event —
-    # for an in-flight Task that means no typing indicator for the entire
-    # sub-agent runtime, since sub-agents write to a separate JSONL.
-    seeded_routes = 0
-    for sid, tracked in monitor.state.tracked_sessions.items():
-        pending = await asyncio.to_thread(
-            route_runtime.parse_pending_tools_from_jsonl, tracked.file_path
-        )
-        if not pending:
-            continue
-        active = await session_manager.find_users_for_session(sid)
-        for user_id, wid, thread_id in active:
-            route: route_runtime.Route = (user_id, thread_id or 0, wid)
-            route_runtime.seed_open_tools(route, pending)
-            seeded_routes += 1
-    if seeded_routes:
-        logger.info(
-            "Replayed pending tool state for %d route(s) at startup",
-            seeded_routes,
-        )
+    # GH #61: re-point any session whose transcript RELOCATED while the bot was
+    # down (an EnterWorktree moves the JSONL to a project dir keyed on the new
+    # cwd). This MUST run before every consumer of ``tracked.file_path``: the
+    # pending-tools replay below reads it directly, and the startup BUSY
+    # reconciler derives the ``subagents/`` tree from it inside the monitor task
+    # started further down. The returned set names the sessions whose sync
+    # DEFERRED — the replay must skip exactly those (see the helper).
+    deferred_relocations = await monitor.reconcile_relocated_paths()
+    await _replay_pending_tools_at_startup(monitor, deferred_relocations)
 
     monitor.start()
     session_monitor = monitor

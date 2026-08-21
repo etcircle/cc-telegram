@@ -360,7 +360,7 @@ def _make_hybrid_monitor(tmp_path):
         )
     )
 
-    async def _scan():
+    async def _scan(_active_ids=None):
         return [SessionInfo(session_id=_SID, file_path=parent_jsonl)]
 
     mon.scan_projects = _scan  # type: ignore[method-assign]
