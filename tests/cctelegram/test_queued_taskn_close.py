@@ -27,7 +27,7 @@ from cctelegram.route_runtime import (
     NotificationClearReason,
     TranscriptLifecycleEvent,
 )
-from cctelegram.session import ClaudeSession, SessionManager
+from cctelegram.session import SessionManager
 from cctelegram.session_monitor import SessionInfo, SessionMonitor, TranscriptEvent
 from cctelegram.transcript_event_adapter import to_lifecycle_event
 from cctelegram.transcript_parser import TranscriptParser
@@ -597,12 +597,10 @@ async def test_lifecycle_only_never_in_get_recent_messages(tmp_path):
     )
     sm = SessionManager()
 
-    async def _resolve(window_id):
-        return ClaudeSession(
-            session_id="s", summary="", message_count=0, file_path=str(jsonl)
-        )
+    async def _resolve_path(window_id):
+        return str(jsonl)
 
-    sm.resolve_session_for_window = _resolve  # type: ignore[method-assign]
+    sm.resolve_session_path_for_window = _resolve_path  # type: ignore[method-assign]
     messages, count = await sm.get_recent_messages("@0")
 
     assert count == 2

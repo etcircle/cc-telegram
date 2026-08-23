@@ -31,9 +31,6 @@ async def test_same_session_quote_renders_normally() -> None:
         session_id="sess-current",
     )
 
-    current_session = MagicMock()
-    current_session.session_id = "sess-current"
-
     with (
         patch.object(inbound_module, "extract_reply_context", return_value=ctx),
         patch.object(
@@ -47,11 +44,12 @@ async def test_same_session_quote_renders_normally() -> None:
             "resolve_window_for_thread",
             return_value="@0",
         ),
+        # P1: the comparison now reads the window's current session id via the
+        # read-only in-memory peek, not the transcript-parsing resolver.
         patch.object(
-            bot_module.session_manager,
-            "resolve_session_for_window",
-            new_callable=AsyncMock,
-            return_value=current_session,
+            inbound_module,
+            "peek_session_id_for_window",
+            return_value="sess-current",
         ),
         patch.object(bot_module.config, "reply_context_enabled", True),
         patch.object(bot_module.config, "reply_context_cross_session_enabled", True),
@@ -73,9 +71,6 @@ async def test_cross_session_quote_renders_with_marker_by_default() -> None:
         session_id="sess-OLD",
     )
 
-    current_session = MagicMock()
-    current_session.session_id = "sess-NEW"
-
     with (
         patch.object(inbound_module, "extract_reply_context", return_value=ctx),
         patch.object(
@@ -89,11 +84,11 @@ async def test_cross_session_quote_renders_with_marker_by_default() -> None:
             "resolve_window_for_thread",
             return_value="@0",
         ),
+        # P1: current session id via the read-only in-memory peek.
         patch.object(
-            bot_module.session_manager,
-            "resolve_session_for_window",
-            new_callable=AsyncMock,
-            return_value=current_session,
+            inbound_module,
+            "peek_session_id_for_window",
+            return_value="sess-NEW",
         ),
         patch.object(bot_module.config, "reply_context_enabled", True),
         patch.object(bot_module.config, "reply_context_cross_session_enabled", True),
@@ -116,9 +111,6 @@ async def test_kill_switch_restores_silent_drop() -> None:
         session_id="sess-OLD",
     )
 
-    current_session = MagicMock()
-    current_session.session_id = "sess-NEW"
-
     with (
         patch.object(inbound_module, "extract_reply_context", return_value=ctx),
         patch.object(
@@ -132,11 +124,11 @@ async def test_kill_switch_restores_silent_drop() -> None:
             "resolve_window_for_thread",
             return_value="@0",
         ),
+        # P1: current session id via the read-only in-memory peek.
         patch.object(
-            bot_module.session_manager,
-            "resolve_session_for_window",
-            new_callable=AsyncMock,
-            return_value=current_session,
+            inbound_module,
+            "peek_session_id_for_window",
+            return_value="sess-NEW",
         ),
         patch.object(bot_module.config, "reply_context_enabled", True),
         patch.object(bot_module.config, "reply_context_cross_session_enabled", False),
@@ -207,11 +199,11 @@ async def test_unknown_session_treats_as_non_stale() -> None:
             "resolve_window_for_thread",
             return_value="@0",
         ),
+        # P1: current session id via the read-only in-memory peek.
         patch.object(
-            bot_module.session_manager,
-            "resolve_session_for_window",
-            new_callable=AsyncMock,
-            return_value=MagicMock(session_id="sess-current"),
+            inbound_module,
+            "peek_session_id_for_window",
+            return_value="sess-current",
         ),
         patch.object(bot_module.config, "reply_context_enabled", True),
         patch.object(bot_module.config, "reply_context_cross_session_enabled", True),

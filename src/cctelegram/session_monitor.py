@@ -488,6 +488,29 @@ def _relocation_candidate_rank(path: Path) -> tuple[float, str]:
     return (mtime, str(path))
 
 
+def select_relocation_winner(candidates: list[Path]) -> Path | None:
+    """Pick ONE winner among same-id JSONL candidates (GH #61 arbitration).
+
+    The SINGLE arbitration contract, shared by the monitor's scan dedupe
+    (``_dedupe_scan_candidates``) and ``SessionManager``'s cold-start
+    path-resolver fallback (P1 of the monitor head-of-line-stall fix), so both
+    resolve a relocated session to the SAME file. Dedupes by string path.
+
+    SINGLETON FAST-PATH: exactly one unique candidate returns WITHOUT a stat —
+    byte-identical to the pre-share singleton branch, so the 1 s scan pays NO
+    filesystem I/O for the overwhelmingly common one-candidate case. Only the
+    multi-candidate case ranks by ``_relocation_candidate_rank`` (newest
+    ``st_mtime`` wins, lexical path tie-break, an unstattable candidate ranked
+    below every readable one). Returns ``None`` for an empty candidate set.
+    """
+    unique = list(dict.fromkeys(str(p) for p in candidates))
+    if not unique:
+        return None
+    if len(unique) == 1:
+        return Path(unique[0])
+    return max((Path(u) for u in unique), key=_relocation_candidate_rank)
+
+
 @dataclass(frozen=True)
 class _OffsetCheck:
     """Validation of a stored byte offset against a (relocated) file (GH #61)."""
@@ -903,6 +926,29 @@ class SessionMonitor:
     def set_bot(self, bot: Any) -> None:
         """Store a bot reference for hydrate-time AUQ context upgrades."""
         self._bot = bot
+
+    def tracked_path_for_session(self, session_id: str) -> str | None:
+        """The monitor's tracked JSONL path for a PARENT session id.
+
+        A pure in-memory dict read of ``tracked_sessions[sid].file_path`` — NO
+        file open, NO parse — so ``SessionManager.resolve_session_path_for_window``
+        can answer the per-message hot path without touching the (multi-MB)
+        transcript. The path is USUALLY the GH #61 relocation-arbitrated winner
+        (``_sync_relocated_session`` repoints it on relocation), but it is NOT a
+        guaranteed invariant: ``register_session`` and
+        ``updater.reassociate_routing`` can seed a plain build path, and a
+        relocation is stale until the next scan repoints the record. The caller
+        therefore STAT-checks this result and falls back to the shared
+        ``select_relocation_winner`` arbitration when it does not exist.
+
+        Returns ``None`` when the session is not (yet) tracked or its record
+        carries no path; the caller then takes the cold-start fallback. Only
+        the parent record is consulted (sidechains are keyed ``sub:<sid>:…``).
+        """
+        rec = self.state.get_session(session_id)
+        if rec is None or not rec.file_path:
+            return None
+        return rec.file_path
 
     def set_event_callback(
         self, callback: Callable[[TranscriptEvent], Awaitable[None]]
@@ -3080,23 +3126,23 @@ class SessionMonitor:
 
         sessions: list[SessionInfo] = []
         for session_id, unique in uniques.items():
-            if len(unique) == 1:
-                sessions.append(
-                    SessionInfo(session_id=session_id, file_path=Path(unique[0]))
-                )
-                continue
-            winner = max((Path(u) for u in unique), key=_relocation_candidate_rank)
-            seen = frozenset(unique)
-            if self._duplicate_scan_candidates.get(session_id) != seen:
-                self._duplicate_scan_candidates[session_id] = seen
-                logger.warning(
-                    "session %s found in %d project dirs (%s) — using the "
-                    "newest-mtime file %s",
-                    session_id[:8],
-                    len(unique),
-                    sorted(unique),
-                    winner,
-                )
+            # Winner-selection is the SHARED contract (select_relocation_winner);
+            # only the duplicate-warning gating stays local to the monitor.
+            winner = select_relocation_winner([Path(u) for u in unique])
+            if winner is None:
+                continue  # empty set — defensive; the scan never yields empties
+            if len(unique) > 1:
+                seen = frozenset(unique)
+                if self._duplicate_scan_candidates.get(session_id) != seen:
+                    self._duplicate_scan_candidates[session_id] = seen
+                    logger.warning(
+                        "session %s found in %d project dirs (%s) — using the "
+                        "newest-mtime file %s",
+                        session_id[:8],
+                        len(unique),
+                        sorted(unique),
+                        winner,
+                    )
             sessions.append(SessionInfo(session_id=session_id, file_path=winner))
         return sessions
 

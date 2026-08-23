@@ -60,7 +60,7 @@ from . import artifacts, decision_token, pane_signals, usage_cache
 from ..config import config
 from ..delivery import DeliveryResult
 from ..markdown_v2 import convert_markdown
-from ..session import session_manager
+from ..session import peek_session_id_for_window, session_manager
 from ..terminal_parser import extract_bash_output, is_interactive_ui
 from ..tmux_manager import tmux_manager
 from ..transcribe import transcribe_voice
@@ -467,12 +467,12 @@ async def _apply_reply_context(
     if reply_ctx is None:
         return text, False
     reply_ctx = await reply_context_mod.resolve(reply_ctx, message.chat.id)
-    current_sid = None
+    # The stale-quote check needs only the window's CURRENT session id, which is
+    # the in-memory session_map mirror — NOT the transcript. Use the read-only
+    # id peek (P1) instead of resolve_session_for_window, which parsed the whole
+    # JSONL just to hand back the same id.
     bound_wid = session_manager.resolve_window_for_thread(user_id, thread_id)
-    if bound_wid is not None:
-        current_session = await session_manager.resolve_session_for_window(bound_wid)
-        if current_session is not None:
-            current_sid = current_session.session_id
+    current_sid = peek_session_id_for_window(bound_wid)
     stale_quote = (
         reply_ctx.session_id is not None
         and current_sid is not None

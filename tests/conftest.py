@@ -1133,6 +1133,21 @@ def scenario(
 
     monkeypatch.setattr(_real_sm, "resolve_session_for_window", _resolve_session_stub)
 
+    # P1: the per-message / per-second hot paths now resolve the session PATH
+    # (not the full ClaudeSession). The real resolver would glob a tmp app_dir
+    # and, finding nothing, CLEAR window_states[*].session_id mid-scenario — the
+    # exact nuke this stub prevents. Return "" (the pre-P1 file_path value) so
+    # every migrated caller takes its no-usable-path branch without I/O.
+    async def _resolve_session_path_stub(window_id: str) -> str | None:
+        state = _real_sm.window_states.get(window_id)
+        if not state or not state.session_id:
+            return None
+        return ""
+
+    monkeypatch.setattr(
+        _real_sm, "resolve_session_path_for_window", _resolve_session_path_stub
+    )
+
     user_data: dict[str, Any] = {}
     context = make_context(bot=fake_bot, user_data=user_data)
     return ScenarioHarness(

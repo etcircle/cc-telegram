@@ -159,7 +159,7 @@ class TestAdaptivePaneCapture:
             patch.object(status_polling.time, "monotonic", side_effect=fake_monotonic),
             patch.object(
                 status_polling.session_manager,
-                "resolve_session_for_window",
+                "resolve_session_path_for_window",
                 new_callable=AsyncMock,
                 return_value=None,
             ),

@@ -109,7 +109,7 @@ async def _tick(mock_bot, pane_text: str | None = None) -> None:
         patch.object(status_polling, "enqueue_status_update", AsyncMock()),
         patch.object(
             status_polling.session_manager,
-            "resolve_session_for_window",
+            "resolve_session_path_for_window",
             AsyncMock(return_value=None),
         ),
     ):
