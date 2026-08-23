@@ -2454,9 +2454,10 @@ async def post_init(application: Application) -> None:
     monitor = SessionMonitor()
 
     # P1 (monitor head-of-line-stall fix): wire the path-only resolver to the
-    # monitor's authoritative, relocation-arbitrated tracked-path record so the
-    # per-message hot path resolves a window's JSONL path with NO transcript
-    # read. Mirrors monitor.set_bot / auq_source.set_jsonl_cache_getter.
+    # monitor's tracked-path record so the per-message hot path resolves a
+    # window's JSONL path with NO transcript read. The tracked path is
+    # stat-checked-then-arbitrated by the resolver (not a trusted invariant).
+    # Mirrors monitor.set_bot / auq_source.set_jsonl_cache_getter.
     session_manager.set_tracked_path_getter(monitor.tracked_path_for_session)
 
     async def message_callback(msg: NewMessage) -> None:

@@ -393,12 +393,13 @@ class SessionManager:
     # History: originally added in 5afc111, erroneously removed in 26cb81f,
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
-    # P1 (monitor head-of-line-stall fix): the monitor's authoritative
-    # tracked-path lookup, injected once at startup via
-    # ``set_tracked_path_getter``. Lets ``resolve_session_path_for_window``
-    # answer the per-message hot path from the monitor's relocation-arbitrated
-    # record with NO transcript read. Not serialized (compare/repr off); it is
-    # a runtime wiring hook, not persistent state.
+    # P1 (monitor head-of-line-stall fix): the monitor's tracked-path lookup,
+    # injected once at startup via ``set_tracked_path_getter``. Lets
+    # ``resolve_session_path_for_window`` answer the per-message hot path from
+    # the monitor's tracked record with NO transcript read. The record is
+    # stat-checked-then-arbitrated by the resolver, NOT a trusted invariant (see
+    # ``set_tracked_path_getter``). Not serialized (compare/repr off); it is a
+    # runtime wiring hook, not persistent state.
     _tracked_path_getter: Callable[[str], str | None] | None = field(
         default=None, compare=False, repr=False
     )
@@ -407,13 +408,18 @@ class SessionManager:
         self._load_state()
 
     def set_tracked_path_getter(self, getter: Callable[[str], str | None]) -> None:
-        """Wire the monitor's authoritative tracked-path lookup (P1).
+        """Wire the monitor's tracked-path lookup (P1).
 
         Injected once from ``bot._run_bot`` after the monitor is created
         (mirrors ``monitor.set_bot`` / ``auq_source.set_jsonl_cache_getter``),
         so ``SessionManager`` keeps NO import-time dependency on
         ``session_monitor``. ``getter(session_id)`` returns the monitor's
-        relocation-arbitrated JSONL path or ``None`` (not yet tracked).
+        tracked JSONL path (USUALLY the relocation winner, but NOT a guaranteed
+        invariant — see ``tracked_path_for_session``) or ``None`` (not yet
+        tracked). The resolver STAT-checks the result and, on miss, falls back
+        to the shared arbitration; the two non-arbitrated writers
+        (``register_session`` call sites) commit the winner at the SOURCE so a
+        stale loser never becomes the tracked record in the first place.
         """
         self._tracked_path_getter = getter
 
@@ -1261,6 +1267,24 @@ class SessionManager:
             return str(winner)
         return None
 
+    def _window_identity_holds(
+        self, window_id: str, captured_sid: str, captured_cwd: str
+    ) -> bool:
+        """True iff the window STILL binds the (session_id, cwd) we resolved for.
+
+        The IDENTITY GATE for ``resolve_session_path_for_window``: every return
+        that could follow an await re-checks it, because ``load_session_map``
+        can swap the window to a DIFFERENT session while a lookup is in flight.
+        Returning the old session's path then writes the old file's size as the
+        new session's read offset, reads the old transcript via
+        ``get_recent_messages``, or publishes the old session's context on the
+        new one — so a mismatch DECLINES (returns ``None``) rather than hands
+        back a foreign path, and also blocks the missing-file clear from wiping
+        the swapped-in binding.
+        """
+        current = self.get_window_state(window_id)
+        return current.session_id == captured_sid and current.cwd == captured_cwd
+
     async def resolve_session_path_for_window(self, window_id: str) -> str | None:
         """Resolve a window to its session's JSONL PATH — NO read, NO parse (P1).
 
@@ -1274,54 +1298,69 @@ class SessionManager:
         Resolves window → session_id from the in-memory ``session_map``
         (``window_states``), then returns the monitor's tracked path when it
         STAT-confirms as existing (the steady-state common case — one cheap
-        stat, kept on the hot path). A stale / nonexistent tracked path (e.g.
-        seeded by ``register_session`` / ``updater.reassociate_routing``, or an
-        as-yet-unrepointed relocation) falls through to the shared relocation
-        arbitration over the build-path ∪ glob candidates (off-thread; rare).
-        Returns ``None`` — and, matching ``resolve_session_for_window``, clears
-        the window's stale binding — when no existing file is found anywhere.
+        stat, kept on the hot path, NO glob). The two non-arbitrated writers
+        (``register_session`` call sites in ``inbound_telegram`` and
+        ``updater.reassociate_routing``) commit the arbitration WINNER at the
+        source, so an existing tracked path is genuinely the winner. A missing
+        tracked path (not yet tracked, or a MOVED relocation) falls through to
+        the shared relocation arbitration over the build-path ∪ glob candidates
+        (off-thread; rare). Returns ``None`` — and, matching
+        ``resolve_session_for_window``, clears the window's stale binding — when
+        no existing file is found anywhere.
+
+        IDENTITY INVARIANT: NO path is returned after an await without a fresh
+        ``_window_identity_holds`` check, so a mid-resolve session swap never
+        hands back a foreign path (wrong offset / foreign transcript / foreign
+        context) nor clears the swapped-in binding.
         """
         state = self.get_window_state(window_id)
         if not state.session_id or not state.cwd:
             return None
 
-        # Capture BEFORE any await: load_session_map can swap this window to a
-        # different session mid-resolve, and the missing-file clear below must
-        # compare against these captured values (never clear a swapped-in one).
+        # Capture BEFORE any await: load_session_map mutates window_states in
+        # place, so every post-lookup decision compares against these snapshots.
         captured_sid = state.session_id
         captured_cwd = state.cwd
 
-        # Fast path: the monitor's tracked record. NOT a guaranteed-arbitrated
-        # invariant (see tracked_path_for_session), so STAT it — an existing
-        # tracked path is used directly (one cheap stat on the hot path); a
-        # stale / nonexistent one falls through to arbitration, closing the
-        # stale-usage / wrong-offset window without a full glob on the hot path.
+        # Fast path: the monitor's tracked record, stat-checked. INLINE stat (no
+        # await ⇒ no swap window here); the writers commit the winner, so an
+        # existing single tracked path is correct without a glob. The identity
+        # gate is applied uniformly on the return regardless (audit invariant).
         getter = self._tracked_path_getter
         if getter is not None:
             tracked = getter(captured_sid)
             if tracked:
                 try:
                     Path(tracked).stat()
-                    return tracked
+                    tracked_exists = True
                 except OSError:
-                    pass  # stale / nonexistent — fall through to arbitration
+                    tracked_exists = False  # stale / nonexistent → arbitration
+                if tracked_exists:
+                    if self._window_identity_holds(
+                        window_id, captured_sid, captured_cwd
+                    ):
+                        return tracked
+                    return None  # swapped mid-resolve — decline, never foreign
 
-        # Cold-start / stale-fast-path fallback (session not yet tracked, or its
+        # Cold-start / moved-relocation fallback (session not yet tracked, or its
         # tracked path no longer exists). Off-thread so the glob over many
         # project dirs never blocks the event loop.
         winner = await asyncio.to_thread(
             self._cold_start_session_path, captured_sid, captured_cwd
         )
+
+        # POST-AWAIT IDENTITY GATE (covers both the success return AND the
+        # missing-file clear): a mid-await swap must neither return the OLD
+        # session's winner for the NEW session nor clear the NEW binding.
+        if not self._window_identity_holds(window_id, captured_sid, captured_cwd):
+            return None
+
         if winner is not None:
             return winner
 
-        # No existing file anywhere. COMPARE-AND-CLEAR: only clear if the window
-        # STILL points at the same (session_id, cwd) we resolved. If
-        # load_session_map swapped it during the await, clearing would wipe the
-        # NEW session's binding and silently drop its delivery — so leave it.
-        current = self.get_window_state(window_id)
-        if current.session_id == captured_sid and current.cwd == captured_cwd:
-            self._clear_missing_session_state(window_id, current)
+        # No existing file anywhere and the window still binds this session —
+        # clear the stale binding (parity with resolve_session_for_window).
+        self._clear_missing_session_state(window_id, self.get_window_state(window_id))
         return None
 
     # --- User window offset management ---

@@ -3,8 +3,10 @@
 Covers ``SessionManager.resolve_session_path_for_window`` and the shared
 ``session_monitor.select_relocation_winner`` arbitration:
 
-  - the hot path returns the monitor's authoritative tracked path with NO
-    transcript open / parse / glob (cost independent of transcript size);
+  - the hot path returns the monitor's tracked path after a single cheap stat
+    (NO transcript open / parse, NO glob — cost independent of transcript size);
+  - every return after an await is IDENTITY-GATED: a mid-resolve session swap
+    never hands back a foreign path nor clears the swapped-in binding;
   - the cold-start fallback arbitrates over ALL same-id candidates (build-path
     AND glob) via the shared helper — newest mtime wins, lexical tie-break,
     an unstattable candidate loses — never short-circuiting on the direct path;
@@ -431,3 +433,104 @@ async def test_cold_winner_vanish_rearbitrates_remaining(
 
     # No getter → straight to the cold fallback.
     assert await sm.resolve_session_path_for_window("@0") == str(other)
+
+
+# ── Codex r5 fold: success-branch swap guard + source-side arbitration ────
+
+
+@pytest.mark.asyncio
+async def test_swap_during_cold_resolve_does_not_return_foreign_path(
+    sm: SessionManager,
+) -> None:
+    """A swap A->B during cold resolution where A yields a NON-None winner must
+    NOT return A's path for B (identity gate on the SUCCESS branch — Codex
+    BLOCKING 1). The caller idiom then writes NO offset for B."""
+    sm.window_states["@0"] = WindowState(session_id="sess-A", cwd="/proj-a")
+    a_winner = "/data/sess-A.jsonl"
+
+    def _swap_then_win(session_id: str, cwd: str) -> str:
+        # load_session_map swaps the window A->B mid-await, then A resolves.
+        st = sm.window_states["@0"]
+        st.session_id = "sess-B"
+        st.cwd = "/proj-b"
+        return a_winner
+
+    sm._cold_start_session_path = _swap_then_win  # type: ignore[method-assign]
+
+    result = await sm.resolve_session_path_for_window("@0")
+    assert result is None  # declined — never A's path for B
+    assert result != a_winner
+
+    # Caller-level check: the `if session_path:` guard means B gets no offset.
+    if result:  # pragma: no cover - result is None
+        sm.update_user_window_offset(999, "@0", 123)
+    assert sm.user_window_offsets == {}
+
+    # The swapped-in B binding is intact (the clear is identity-gated too).
+    assert sm.window_states["@0"].session_id == "sess-B"
+    assert sm.window_states["@0"].cwd == "/proj-b"
+    assert sm._save_calls["n"] == 0  # type: ignore[attr-defined]
+
+
+def test_monitor_resolve_tracked_jsonl_picks_newer(projects: Path) -> None:
+    """The shared arbitration both register-writers now route through picks the
+    NEWER of two same-id copies (Codex BLOCKING 2 source fix)."""
+    from cctelegram.session_monitor import SessionMonitor
+
+    d1 = projects / "-a"
+    d1.mkdir()
+    older = d1 / "sid-T.jsonl"
+    older.write_text("{}\n")
+    d2 = projects / "-b"
+    d2.mkdir()
+    newer = d2 / "sid-T.jsonl"
+    newer.write_text("{}\n")
+    os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+
+    monitor = SessionMonitor(projects_path=projects, state_file=projects / "m.json")
+    assert monitor._resolve_tracked_jsonl("sid-T") == newer
+
+
+@pytest.mark.asyncio
+async def test_reassociate_commits_winner_and_resolution_yields_it(
+    sm: SessionManager, projects: Path
+) -> None:
+    """``updater.reassociate_routing`` given a STALE build path while a NEWER
+    relocated copy exists commits the WINNER (not the stale build path), so a
+    later resolution yields the winner (Codex BLOCKING 2 source fix)."""
+    from cctelegram.handlers.updater import reassociate_routing
+    from cctelegram.session_monitor import SessionMonitor
+
+    build_dir = projects / SessionManager._encode_cwd("/proj")
+    build_dir.mkdir(parents=True)
+    stale = build_dir / "sid-U.jsonl"
+    stale.write_text("{}\n")  # the build path — stale loser
+    reloc_dir = projects / "-relocated"
+    reloc_dir.mkdir()
+    newer = reloc_dir / "sid-U.jsonl"
+    newer.write_text('{"x": 1}\n')  # the relocation winner
+    os.utime(stale, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+
+    sm.window_states["@0"] = WindowState(session_id="sid-U", cwd="/proj")
+    monitor = SessionMonitor(projects_path=projects, state_file=projects / "m.json")
+
+    await reassociate_routing(
+        sm,
+        monitor,
+        "@0",
+        "sid-U",
+        settle_interval_s=0.01,
+        settle_max_wait_s=0.1,
+    )
+
+    rec = monitor.state.get_session("sid-U")
+    assert rec is not None
+    assert rec.file_path == str(newer)  # committed the winner, not the build path
+    assert rec.last_byte_offset == newer.stat().st_size  # offset on the WINNER
+
+    # And the resolver's fast path (via the monitor getter) yields the winner —
+    # never the existing-but-stale build path.
+    sm.set_tracked_path_getter(monitor.tracked_path_for_session)
+    assert await sm.resolve_session_path_for_window("@0") == str(newer)
