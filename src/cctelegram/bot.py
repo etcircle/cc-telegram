@@ -1566,6 +1566,9 @@ async def _build_context_footer(
     from .handlers.topic_title import format_max, format_tokens
     from .transcript_parser import read_latest_usage
 
+    # DEFERRED to P2: read_latest_usage still does a synchronous whole-file
+    # readlines() on the event loop (mtime+size-cached). Off-loading it belongs
+    # with P2's concurrency work — do NOT off-thread it here.
     latest = read_latest_usage(session_path)
     if latest is None:
         return None

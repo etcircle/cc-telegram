@@ -55,14 +55,14 @@ def sm(monkeypatch: pytest.MonkeyPatch) -> SessionManager:
 
 @pytest.mark.asyncio
 async def test_tracked_path_returned_no_glob_no_parse(
-    sm: SessionManager, monkeypatch: pytest.MonkeyPatch
+    sm: SessionManager, projects: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A wired tracked-path getter answers with NO cold-start fallback and NO
-    ``_get_session_direct`` parse — the whole point of P1."""
+    """An EXISTING tracked path answers with NO cold-start fallback and NO
+    ``_get_session_direct`` parse — the hot path pays only the single stat."""
+    live = projects / "live-sid-A.jsonl"
+    live.write_text("{}\n")
     sm.window_states["@0"] = WindowState(session_id="sid-A", cwd="/proj")
-    sm.set_tracked_path_getter(
-        lambda sid: "/live/dir/sid-A.jsonl" if sid == "sid-A" else None
-    )
+    sm.set_tracked_path_getter(lambda sid: str(live) if sid == "sid-A" else None)
 
     def _boom_cold(*_a: object, **_k: object) -> None:
         raise AssertionError("cold-start fallback must not run on the hot path")
@@ -73,7 +73,7 @@ async def test_tracked_path_returned_no_glob_no_parse(
     monkeypatch.setattr(sm, "_cold_start_session_path", _boom_cold)
     monkeypatch.setattr(sm, "_get_session_direct", _boom_direct)
 
-    assert await sm.resolve_session_path_for_window("@0") == "/live/dir/sid-A.jsonl"
+    assert await sm.resolve_session_path_for_window("@0") == str(live)
 
 
 @pytest.mark.asyncio
@@ -101,17 +101,23 @@ async def test_hot_path_independent_of_transcript_size(
 
 
 @pytest.mark.asyncio
-async def test_relocated_tracked_path_returns_new_path(sm: SessionManager) -> None:
+async def test_relocated_tracked_path_returns_new_path(
+    sm: SessionManager, projects: Path
+) -> None:
     """After a relocation the monitor repoints its record; the SAME unchanged
-    window binding then resolves to the NEW path (GH #61 arbitration lives in
-    the monitor, and the resolver simply trusts it)."""
+    window binding then resolves to the NEW (existing) path. Both are real
+    files, so the stat-checked fast path returns each directly."""
+    old = projects / "old-sid-A.jsonl"
+    new = projects / "new-worktree-sid-A.jsonl"
+    old.write_text("{}\n")
+    new.write_text("{}\n")
     sm.window_states["@0"] = WindowState(session_id="sid-A", cwd="/proj")
-    location = {"path": "/old/sid-A.jsonl"}
+    location = {"path": str(old)}
     sm.set_tracked_path_getter(lambda sid: location["path"])
 
-    assert await sm.resolve_session_path_for_window("@0") == "/old/sid-A.jsonl"
-    location["path"] = "/new/worktree/sid-A.jsonl"  # monitor relocation sync
-    assert await sm.resolve_session_path_for_window("@0") == "/new/worktree/sid-A.jsonl"
+    assert await sm.resolve_session_path_for_window("@0") == str(old)
+    location["path"] = str(new)  # monitor relocation sync repoints the record
+    assert await sm.resolve_session_path_for_window("@0") == str(new)
 
 
 @pytest.mark.asyncio
@@ -237,3 +243,191 @@ async def test_get_session_direct_memoizes_on_mtime_size(
     s3 = await sm._get_session_direct("sid-M", "/proj")
     assert s3 is not None and s3.summary == "second"
     assert opens["n"] == 2
+
+
+def test_lru_evicts_oldest_at_capacity() -> None:
+    """The 65th distinct entry evicts the OLDEST (Codex fold 5)."""
+    from cctelegram.session import _SESSION_DIRECT_CACHE_MAX, _remember_session_direct
+
+    _session_direct_cache.clear()
+    for i in range(_SESSION_DIRECT_CACHE_MAX):
+        _remember_session_direct(f"/p/{i}", (i, i), None)
+    assert len(_session_direct_cache) == _SESSION_DIRECT_CACHE_MAX
+    assert "/p/0" in _session_direct_cache  # still present at capacity
+
+    _remember_session_direct("/p/new", (999, 999), None)  # one past capacity
+    assert len(_session_direct_cache) == _SESSION_DIRECT_CACHE_MAX
+    assert "/p/0" not in _session_direct_cache  # oldest evicted
+    assert "/p/new" in _session_direct_cache
+
+
+@pytest.mark.asyncio
+async def test_lru_hit_promotion_via_get_session_direct(
+    sm: SessionManager, projects: Path
+) -> None:
+    """A cache HIT in ``_get_session_direct`` PROMOTES the entry (move_to_end),
+    so a later insertion evicts a colder entry instead — the promoted one
+    survives (Codex fold 5)."""
+    from cctelegram.session import _SESSION_DIRECT_CACHE_MAX, _remember_session_direct
+
+    _session_direct_cache.clear()
+    proj = projects / SessionManager._encode_cwd("/proj")
+    proj.mkdir(parents=True)
+    f = proj / "keep.jsonl"
+    f.write_text(json.dumps({"type": "summary", "summary": "keep"}) + "\n")
+
+    assert await sm._get_session_direct("keep", "/proj") is not None
+    fkey = str(f)
+    assert fkey in _session_direct_cache
+
+    # Fill to capacity; keep's entry is now the OLDEST.
+    for i in range(_SESSION_DIRECT_CACHE_MAX - 1):
+        _remember_session_direct(f"/dummy/{i}", (i, i), None)
+    assert len(_session_direct_cache) == _SESSION_DIRECT_CACHE_MAX
+
+    # Cache HIT on keep → promoted to most-recent (unchanged file).
+    assert await sm._get_session_direct("keep", "/proj") is not None
+
+    # One more entry evicts the now-oldest dummy, NOT the promoted keep.
+    _remember_session_direct("/dummy/new", (999, 999), None)
+    assert fkey in _session_direct_cache  # promoted → survived
+    assert "/dummy/0" not in _session_direct_cache  # oldest evicted
+
+
+# ── Codex fold-round: fast-path stat, swap safety, re-arbitration ─────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_path",
+    [
+        "/gone/register-seeded/sid-S.jsonl",  # register_session build path
+        "/gone/updater-reassoc/sid-S.jsonl",  # updater.reassociate_routing path
+    ],
+)
+async def test_stale_tracked_path_falls_to_arbitration(
+    sm: SessionManager, projects: Path, stale_path: str
+) -> None:
+    """A tracked path that does NOT exist (a non-arbitrated build path seeded by
+    register_session / updater reassociation) fails the fast-path stat and
+    falls through to arbitration, which resolves the REAL on-disk file."""
+    proj = projects / SessionManager._encode_cwd("/proj")
+    proj.mkdir(parents=True)
+    real = proj / "sid-S.jsonl"
+    real.write_text("{}\n")
+    sm.window_states["@0"] = WindowState(session_id="sid-S", cwd="/proj")
+    sm.set_tracked_path_getter(lambda sid: stale_path)
+
+    assert await sm.resolve_session_path_for_window("@0") == str(real)
+
+
+@pytest.mark.asyncio
+async def test_relocation_during_delay_resolves_newer_copy(
+    sm: SessionManager, projects: Path
+) -> None:
+    """A same-id relocation while delivery is delayed: the tracked record still
+    names the pre-move (now gone) path → fast-path stat fails → arbitration
+    picks the NEWER of the on-disk same-id copies."""
+    stale_dir = projects / SessionManager._encode_cwd("/proj")
+    stale_dir.mkdir(parents=True)
+    stale = stale_dir / "sid-R.jsonl"
+    stale.write_text("{}\n")
+
+    moved_dir = projects / "-relocated"
+    moved_dir.mkdir()
+    moved = moved_dir / "sid-R.jsonl"
+    moved.write_text("{}\n")
+
+    os.utime(stale, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(moved, ns=(2_000_000_000, 2_000_000_000))  # newer
+
+    sm.window_states["@0"] = WindowState(session_id="sid-R", cwd="/proj")
+    # The tracked record points at a path that no longer exists (pre-move).
+    sm.set_tracked_path_getter(lambda sid: "/gone/pre-move/sid-R.jsonl")
+
+    assert await sm.resolve_session_path_for_window("@0") == str(moved)
+
+
+@pytest.mark.asyncio
+async def test_swap_during_cold_resolve_does_not_clear_new_session(
+    sm: SessionManager,
+) -> None:
+    """If ``load_session_map`` swaps the window to a DIFFERENT session while the
+    off-thread cold resolution is awaiting, the missing-file cleanup must NOT
+    clear the new session's binding (compare-and-clear — Codex fold 1)."""
+    sm.window_states["@0"] = WindowState(session_id="sess-A", cwd="/proj-a")
+
+    def _swap_then_miss(session_id: str, cwd: str) -> None:
+        # Simulate the concurrent load_session_map swap A -> B mid-await, then
+        # report "no file found" for the (now-superseded) session A.
+        st = sm.window_states["@0"]
+        st.session_id = "sess-B"
+        st.cwd = "/proj-b"
+        return None
+
+    sm._cold_start_session_path = _swap_then_miss  # type: ignore[method-assign]
+
+    assert await sm.resolve_session_path_for_window("@0") is None
+    st = sm.window_states["@0"]
+    assert st.session_id == "sess-B"  # NOT cleared
+    assert st.cwd == "/proj-b"
+    assert sm._save_calls["n"] == 0  # type: ignore[attr-defined]
+
+
+def test_singleton_arbitration_performs_no_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single candidate returns WITHOUT a stat — the 1 s scan pays no
+    filesystem I/O for the common one-candidate case (Codex fold 3)."""
+    only = tmp_path / "only.jsonl"  # need not exist
+
+    stat_calls = {"n": 0}
+    real_stat = Path.stat
+
+    def _spy(self: Path, *a: object, **k: object) -> object:
+        stat_calls["n"] += 1
+        return real_stat(self, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", _spy)
+
+    assert select_relocation_winner([only]) == only
+    assert stat_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cold_winner_vanish_rearbitrates_remaining(
+    sm: SessionManager, projects: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the ranked cold winner disappears between ranking and the confirming
+    stat, the fallback re-arbitrates the REMAINING candidates rather than
+    returning None (Codex fold 4)."""
+    d1 = projects / "-p1"
+    d1.mkdir()
+    winner_file = d1 / "sid-V.jsonl"
+    winner_file.write_text("{}\n")
+
+    d2 = projects / "-p2"
+    d2.mkdir()
+    other = d2 / "sid-V.jsonl"
+    other.write_text("{}\n")
+
+    os.utime(winner_file, ns=(3_000_000_000, 3_000_000_000))  # ranks first
+    os.utime(other, ns=(1_000_000_000, 1_000_000_000))
+
+    # cwd encodes to a dir with no file, so the build-path candidate is inert.
+    sm.window_states["@0"] = WindowState(session_id="sid-V", cwd="/no-such")
+
+    real_stat = Path.stat
+    seen = {"n": 0}
+
+    def _spy(self: Path, *a: object, **k: object) -> object:
+        if str(self) == str(winner_file):
+            seen["n"] += 1
+            if seen["n"] >= 2:  # ranking stat OK; the confirming stat vanishes
+                raise FileNotFoundError(str(winner_file))
+        return real_stat(self, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", _spy)
+
+    # No getter → straight to the cold fallback.
+    assert await sm.resolve_session_path_for_window("@0") == str(other)

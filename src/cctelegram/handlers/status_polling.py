@@ -987,6 +987,10 @@ async def update_status_message(
     # resolve_session_for_window parsed the whole transcript here per window.
     session_path = await session_manager.resolve_session_path_for_window(window_id)
     if session_path:
+        # DEFERRED to P2: read_latest_usage still does a synchronous whole-file
+        # readlines() on the event loop (mtime+size-cached, so only on change).
+        # Less frequent than the per-message parse P1 removed; off-loading it
+        # belongs with P2's concurrency work — do NOT off-thread it here.
         latest = read_latest_usage(session_path)
         if latest is not None:
             route_runtime.update_context_usage(route, latest.tokens, latest.model)

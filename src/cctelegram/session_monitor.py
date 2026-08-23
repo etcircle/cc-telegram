@@ -494,14 +494,20 @@ def select_relocation_winner(candidates: list[Path]) -> Path | None:
     The SINGLE arbitration contract, shared by the monitor's scan dedupe
     (``_dedupe_scan_candidates``) and ``SessionManager``'s cold-start
     path-resolver fallback (P1 of the monitor head-of-line-stall fix), so both
-    resolve a relocated session to the SAME file. Dedupes by string path, then
-    ranks by ``_relocation_candidate_rank`` (newest ``st_mtime`` wins, lexical
-    path tie-break, an unstattable candidate ranked below every readable one).
-    Returns ``None`` for an empty candidate set.
+    resolve a relocated session to the SAME file. Dedupes by string path.
+
+    SINGLETON FAST-PATH: exactly one unique candidate returns WITHOUT a stat —
+    byte-identical to the pre-share singleton branch, so the 1 s scan pays NO
+    filesystem I/O for the overwhelmingly common one-candidate case. Only the
+    multi-candidate case ranks by ``_relocation_candidate_rank`` (newest
+    ``st_mtime`` wins, lexical path tie-break, an unstattable candidate ranked
+    below every readable one). Returns ``None`` for an empty candidate set.
     """
     unique = list(dict.fromkeys(str(p) for p in candidates))
     if not unique:
         return None
+    if len(unique) == 1:
+        return Path(unique[0])
     return max((Path(u) for u in unique), key=_relocation_candidate_rank)
 
 
@@ -922,14 +928,18 @@ class SessionMonitor:
         self._bot = bot
 
     def tracked_path_for_session(self, session_id: str) -> str | None:
-        """The monitor's authoritative JSONL path for a PARENT session id.
+        """The monitor's tracked JSONL path for a PARENT session id.
 
-        The monitor owns "where this session's JSONL lives now" — its
-        ``tracked_sessions[sid].file_path`` is the GH #61 relocation-arbitrated
-        winner, repointed by ``_sync_relocated_session`` on every relocation.
-        A pure in-memory dict read — NO file open, NO parse — so
-        ``SessionManager.resolve_session_path_for_window`` can answer the
-        per-message hot path without touching the (multi-MB) transcript.
+        A pure in-memory dict read of ``tracked_sessions[sid].file_path`` — NO
+        file open, NO parse — so ``SessionManager.resolve_session_path_for_window``
+        can answer the per-message hot path without touching the (multi-MB)
+        transcript. The path is USUALLY the GH #61 relocation-arbitrated winner
+        (``_sync_relocated_session`` repoints it on relocation), but it is NOT a
+        guaranteed invariant: ``register_session`` and
+        ``updater.reassociate_routing`` can seed a plain build path, and a
+        relocation is stale until the next scan repoints the record. The caller
+        therefore STAT-checks this result and falls back to the shared
+        ``select_relocation_winner`` arbitration when it does not exist.
 
         Returns ``None`` when the session is not (yet) tracked or its record
         carries no path; the caller then takes the cold-start fallback. Only

@@ -48,10 +48,12 @@ logger = logging.getLogger(__name__)
 # ── _get_session_direct memoization (P1: monitor head-of-line-stall fix) ──
 # The remaining ``_get_session_direct`` consumers (directory browser / session
 # picker) re-list the same JSONL files and would otherwise re-parse an unchanged
-# multi-MB transcript on every render. Memoize on ``(st_mtime_ns, st_size)`` —
-# the same invalidation ``transcript_parser.read_latest_usage`` uses — keyed by
-# the resolved file path. Bounded to a small LRU so a long-running bot browsing
-# many directories can't grow it without limit.
+# multi-MB transcript on every render. Memoize on ``(st_mtime_ns, st_size)``
+# keyed by the resolved file path. Mirrors the mtime+size invalidation IDEA of
+# ``transcript_parser.read_latest_usage`` — but NOT its exact key: that cache
+# uses float ``st_mtime``; this one uses integer ``st_mtime_ns`` (finer, no
+# float rounding). Bounded to a small LRU so a long-running bot browsing many
+# directories can't grow it without limit.
 _SESSION_DIRECT_CACHE_MAX = 64
 _session_direct_cache: "OrderedDict[str, tuple[tuple[int, int], ClaudeSession | None]]" = OrderedDict()
 
@@ -1077,9 +1079,9 @@ class SessionManager:
 
         # Memoize on (st_mtime_ns, st_size) keyed by the resolved path (P1):
         # the summary/count consumers re-list the same files, so an unchanged
-        # transcript must not be re-parsed. Same invalidation read_latest_usage
-        # uses. A stat failure here means the file vanished between the exists()
-        # check and now — fall through to the read, which returns None.
+        # transcript must not be re-parsed. A stat failure here means the file
+        # vanished between the exists() check and now — fall through to the read,
+        # which returns None.
         cache_path = str(file_path)
         try:
             st = file_path.stat()
@@ -1240,14 +1242,24 @@ class SessionManager:
         if build is not None:
             candidates.append(build)
         candidates.extend(config.claude_projects_path.glob(f"*/{session_id}.jsonl"))
-        winner = select_relocation_winner(candidates)
-        if winner is None:
-            return None
-        try:
-            winner.stat()
-        except OSError:
-            return None
-        return str(winner)
+
+        # Re-arbitrate the REMAINING candidates whenever the ranked winner
+        # disappears between ranking and the confirming stat: a single vanished
+        # copy must never strand a resolution that another same-id candidate can
+        # still satisfy. Returns the first winner that stat-confirms; ``None``
+        # only when EVERY candidate is gone.
+        remaining = list(candidates)
+        while remaining:
+            winner = select_relocation_winner(remaining)
+            if winner is None:
+                return None
+            try:
+                winner.stat()
+            except OSError:
+                remaining = [p for p in remaining if p != winner]
+                continue
+            return str(winner)
+        return None
 
     async def resolve_session_path_for_window(self, window_id: str) -> str | None:
         """Resolve a window to its session's JSONL PATH — NO read, NO parse (P1).
@@ -1260,38 +1272,56 @@ class SessionManager:
         (monitor head-of-line-stall incident).
 
         Resolves window → session_id from the in-memory ``session_map``
-        (``window_states``), then returns the MONITOR's authoritative tracked
-        path (already GH #61 relocation-arbitrated) with no file I/O. Cold-start
-        — session in the map but not yet tracked — falls back to the shared
-        relocation arbitration over the build-path + glob candidates
-        (off-thread; rare). Returns ``None`` — and, matching
-        ``resolve_session_for_window``, clears the window's stale binding — when
-        no existing file is found anywhere.
+        (``window_states``), then returns the monitor's tracked path when it
+        STAT-confirms as existing (the steady-state common case — one cheap
+        stat, kept on the hot path). A stale / nonexistent tracked path (e.g.
+        seeded by ``register_session`` / ``updater.reassociate_routing``, or an
+        as-yet-unrepointed relocation) falls through to the shared relocation
+        arbitration over the build-path ∪ glob candidates (off-thread; rare).
+        Returns ``None`` — and, matching ``resolve_session_for_window``, clears
+        the window's stale binding — when no existing file is found anywhere.
         """
         state = self.get_window_state(window_id)
         if not state.session_id or not state.cwd:
             return None
 
-        # Primary hot path: the monitor's relocation-arbitrated tracked path.
-        # Trusted WITHOUT a stat — the monitor repoints it on every relocation
-        # and validates it via its own offset checks; a stat here would put file
-        # I/O back on the exact path this fix removes it from.
+        # Capture BEFORE any await: load_session_map can swap this window to a
+        # different session mid-resolve, and the missing-file clear below must
+        # compare against these captured values (never clear a swapped-in one).
+        captured_sid = state.session_id
+        captured_cwd = state.cwd
+
+        # Fast path: the monitor's tracked record. NOT a guaranteed-arbitrated
+        # invariant (see tracked_path_for_session), so STAT it — an existing
+        # tracked path is used directly (one cheap stat on the hot path); a
+        # stale / nonexistent one falls through to arbitration, closing the
+        # stale-usage / wrong-offset window without a full glob on the hot path.
         getter = self._tracked_path_getter
         if getter is not None:
-            tracked = getter(state.session_id)
+            tracked = getter(captured_sid)
             if tracked:
-                return tracked
+                try:
+                    Path(tracked).stat()
+                    return tracked
+                except OSError:
+                    pass  # stale / nonexistent — fall through to arbitration
 
-        # Cold-start fallback (session not yet tracked). Off-thread so the glob
-        # over many project dirs never blocks the event loop.
+        # Cold-start / stale-fast-path fallback (session not yet tracked, or its
+        # tracked path no longer exists). Off-thread so the glob over many
+        # project dirs never blocks the event loop.
         winner = await asyncio.to_thread(
-            self._cold_start_session_path, state.session_id, state.cwd
+            self._cold_start_session_path, captured_sid, captured_cwd
         )
         if winner is not None:
             return winner
 
-        # No existing file anywhere — reproduce the missing-file state clear.
-        self._clear_missing_session_state(window_id, state)
+        # No existing file anywhere. COMPARE-AND-CLEAR: only clear if the window
+        # STILL points at the same (session_id, cwd) we resolved. If
+        # load_session_map swapped it during the await, clearing would wipe the
+        # NEW session's binding and silently drop its delivery — so leave it.
+        current = self.get_window_state(window_id)
+        if current.session_id == captured_sid and current.cwd == captured_cwd:
+            self._clear_missing_session_state(window_id, current)
         return None
 
     # --- User window offset management ---
