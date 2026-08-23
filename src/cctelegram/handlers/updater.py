@@ -444,16 +444,6 @@ async def reassociate_routing(
     file_path = session_mgr._build_session_file_path(tracked_sid, ws.cwd)
     if file_path is None:
         return
-    # BLOCKING-2 source fix: commit the ARBITRATED winner among same-id copies,
-    # not a possibly-stale build path. The build path can lose to a newer
-    # relocated copy; writing it would make the resolver's stat-and-return hand
-    # back a stale loser. Route through the monitor's shared arbitration
-    # (``_resolve_tracked_jsonl`` == the ``select_relocation_winner`` rule), and
-    # settle the EOF on the WINNER so the registered offset matches the file we
-    # commit. None (no on-disk copy yet) keeps the build path at offset 0.
-    winner = await asyncio.to_thread(monitor._resolve_tracked_jsonl, tracked_sid)
-    if winner is not None:
-        file_path = winner
     settled_eof = await _settled_file_size(
         file_path, interval_s=settle_interval_s, max_wait_s=settle_max_wait_s
     )

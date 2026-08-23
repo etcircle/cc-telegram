@@ -417,9 +417,8 @@ class SessionManager:
         tracked JSONL path (USUALLY the relocation winner, but NOT a guaranteed
         invariant — see ``tracked_path_for_session``) or ``None`` (not yet
         tracked). The resolver STAT-checks the result and, on miss, falls back
-        to the shared arbitration; the two non-arbitrated writers
-        (``register_session`` call sites) commit the winner at the SOURCE so a
-        stale loser never becomes the tracked record in the first place.
+        to the shared arbitration; an existing-but-stale tracked path is an
+        ACCEPTED display-only residual (see ``resolve_session_path_for_window``).
         """
         self._tracked_path_getter = getter
 
@@ -1298,15 +1297,22 @@ class SessionManager:
         Resolves window → session_id from the in-memory ``session_map``
         (``window_states``), then returns the monitor's tracked path when it
         STAT-confirms as existing (the steady-state common case — one cheap
-        stat, kept on the hot path, NO glob). The two non-arbitrated writers
-        (``register_session`` call sites in ``inbound_telegram`` and
-        ``updater.reassociate_routing``) commit the arbitration WINNER at the
-        source, so an existing tracked path is genuinely the winner. A missing
-        tracked path (not yet tracked, or a MOVED relocation) falls through to
-        the shared relocation arbitration over the build-path ∪ glob candidates
-        (off-thread; rare). Returns ``None`` — and, matching
-        ``resolve_session_for_window``, clears the window's stale binding — when
-        no existing file is found anywhere.
+        stat, kept on the hot path, NO glob). A missing tracked path (not yet
+        tracked, or a MOVED relocation) falls through to the shared relocation
+        arbitration over the build-path ∪ glob candidates (off-thread; rare).
+        Returns ``None`` — and, matching ``resolve_session_for_window``, clears
+        the window's stale binding — when no existing file is found anywhere.
+
+        ACCEPTED RESIDUAL (explicit adjudication): when a session has BOTH a
+        stale-but-readable tracked path AND a newer relocated copy on disk — only
+        possible from a non-arbitrated writer (``register_session`` call sites)
+        or the narrow intra-scan relocation window — the stat-and-return can
+        transiently hand back the STALE path. This is DISPLAY / history / context
+        / usage / per-user-read-offset only — NEVER the monitor's delivery cursor
+        — and it self-heals on the monitor's next ~1s scan (which re-arbitrates
+        and repoints the tracked record). Closing it at the writer source was
+        adjudicated out of P1 (each writer fix spawned a fresh race) and deferred
+        to P2; the hot path stays a single cheap stat with no glob.
 
         IDENTITY INVARIANT: NO path is returned after an await without a fresh
         ``_window_identity_holds`` check, so a mid-resolve session swap never
@@ -1323,9 +1329,13 @@ class SessionManager:
         captured_cwd = state.cwd
 
         # Fast path: the monitor's tracked record, stat-checked. INLINE stat (no
-        # await ⇒ no swap window here); the writers commit the winner, so an
-        # existing single tracked path is correct without a glob. The identity
-        # gate is applied uniformly on the return regardless (audit invariant).
+        # await ⇒ no swap window here) and NO glob — the single-copy steady state
+        # is correct as-is. ACCEPTED RESIDUAL (adjudicated, see docstring): if a
+        # stale-but-readable tracked path coexists with a newer relocated copy,
+        # this stat-and-return yields the stale one — DISPLAY/history-only, never
+        # the delivery cursor, self-heals on the monitor's next ~1s scan; source
+        # arbitration is deferred to P2. The identity gate is applied uniformly
+        # on the return regardless (audit invariant).
         getter = self._tracked_path_getter
         if getter is not None:
             tracked = getter(captured_sid)

@@ -1756,18 +1756,6 @@ async def _create_and_bind_window(
             if _bot_module.session_monitor is not None:
                 file_path = session_mgr._build_session_file_path(track_sid, track_cwd)
                 if file_path is not None:
-                    # BLOCKING-2 source fix: register the ARBITRATED winner among
-                    # same-id copies, not a possibly-stale build path, so the
-                    # tracked record the resolver trusts is genuinely the
-                    # relocation winner. Route through the monitor's shared
-                    # arbitration (== the select_relocation_winner rule); None
-                    # (no on-disk copy yet, e.g. a fresh session not yet flushed)
-                    # keeps the build path. Offset is computed on the CHOSEN file.
-                    winner = await asyncio.to_thread(
-                        _bot_module.session_monitor._resolve_tracked_jsonl, track_sid
-                    )
-                    if winner is not None:
-                        file_path = winner
                     # Resume: skip pre-existing transcript history. New
                     # sessions: read from the start so the seed message and
                     # first reply are picked up.
