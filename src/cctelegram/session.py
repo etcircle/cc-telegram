@@ -27,10 +27,10 @@ import json
 import logging
 import re
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import aiofiles
@@ -43,6 +43,28 @@ from .transcript_parser import TranscriptParser
 from .utils import app_dir, atomic_write_json
 
 logger = logging.getLogger(__name__)
+
+
+# ── _get_session_direct memoization (P1: monitor head-of-line-stall fix) ──
+# The remaining ``_get_session_direct`` consumers (directory browser / session
+# picker) re-list the same JSONL files and would otherwise re-parse an unchanged
+# multi-MB transcript on every render. Memoize on ``(st_mtime_ns, st_size)`` —
+# the same invalidation ``transcript_parser.read_latest_usage`` uses — keyed by
+# the resolved file path. Bounded to a small LRU so a long-running bot browsing
+# many directories can't grow it without limit.
+_SESSION_DIRECT_CACHE_MAX = 64
+_session_direct_cache: "OrderedDict[str, tuple[tuple[int, int], ClaudeSession | None]]" = OrderedDict()
+
+
+def _remember_session_direct(
+    path: str, cache_key: tuple[int, int], result: "ClaudeSession | None"
+) -> None:
+    """Store a ``_get_session_direct`` result under an LRU bound (P1)."""
+    cache = _session_direct_cache
+    cache[path] = (cache_key, result)
+    cache.move_to_end(path)
+    while len(cache) > _SESSION_DIRECT_CACHE_MAX:
+        cache.popitem(last=False)
 
 
 # ── The GH #50 delivery gate: bounds + sentinels ─────────────────────────
@@ -369,9 +391,29 @@ class SessionManager:
     # History: originally added in 5afc111, erroneously removed in 26cb81f,
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
+    # P1 (monitor head-of-line-stall fix): the monitor's authoritative
+    # tracked-path lookup, injected once at startup via
+    # ``set_tracked_path_getter``. Lets ``resolve_session_path_for_window``
+    # answer the per-message hot path from the monitor's relocation-arbitrated
+    # record with NO transcript read. Not serialized (compare/repr off); it is
+    # a runtime wiring hook, not persistent state.
+    _tracked_path_getter: Callable[[str], str | None] | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self._load_state()
+
+    def set_tracked_path_getter(self, getter: Callable[[str], str | None]) -> None:
+        """Wire the monitor's authoritative tracked-path lookup (P1).
+
+        Injected once from ``bot._run_bot`` after the monitor is created
+        (mirrors ``monitor.set_bot`` / ``auq_source.set_jsonl_cache_getter``),
+        so ``SessionManager`` keeps NO import-time dependency on
+        ``session_monitor``. ``getter(session_id)`` returns the monitor's
+        relocation-arbitrated JSONL path or ``None`` (not yet tracked).
+        """
+        self._tracked_path_getter = getter
 
     def _save_state(self) -> None:
         state: dict[str, Any] = {
@@ -1033,6 +1075,23 @@ class SessionManager:
             else:
                 return None
 
+        # Memoize on (st_mtime_ns, st_size) keyed by the resolved path (P1):
+        # the summary/count consumers re-list the same files, so an unchanged
+        # transcript must not be re-parsed. Same invalidation read_latest_usage
+        # uses. A stat failure here means the file vanished between the exists()
+        # check and now — fall through to the read, which returns None.
+        cache_path = str(file_path)
+        try:
+            st = file_path.stat()
+            cache_key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            cache_key = None
+        if cache_key is not None:
+            cached = _session_direct_cache.get(cache_path)
+            if cached is not None and cached[0] == cache_key:
+                _session_direct_cache.move_to_end(cache_path)
+                return cached[1]
+
         # Single pass: read file once, extract summary + count messages
         summary = ""
         last_user_msg = ""
@@ -1064,12 +1123,15 @@ class SessionManager:
         if not summary:
             summary = last_user_msg[:50] if last_user_msg else "Untitled"
 
-        return ClaudeSession(
+        result = ClaudeSession(
             session_id=session_id,
             summary=summary,
             message_count=message_count,
             file_path=str(file_path),
         )
+        if cache_key is not None:
+            _remember_session_direct(cache_path, cache_key, result)
+        return result
 
     # --- Directory session listing ---
 
@@ -1134,6 +1196,102 @@ class SessionManager:
         state.session_id = ""
         state.cwd = ""
         self._save_state()
+        return None
+
+    def _clear_missing_session_state(self, window_id: str, state: WindowState) -> None:
+        """Reproduce ``resolve_session_for_window``'s missing-file side effect.
+
+        The pre-P1 resolver cleared a window's stale session binding whenever
+        ``_get_session_direct`` found no file. The path-only resolver preserves
+        that: when NEITHER the monitor's tracked path NOR the cold-start
+        arbitration yields an EXISTING file, the dead binding is cleared so
+        callers stop chasing a session id whose JSONL is gone (e.g. after a
+        ``/clear`` or an out-of-band delete).
+        """
+        logger.warning(
+            "Session file no longer exists for window_id %s (sid=%s, cwd=%s)",
+            window_id,
+            state.session_id,
+            state.cwd,
+        )
+        state.session_id = ""
+        state.cwd = ""
+        self._save_state()
+
+    def _cold_start_session_path(self, session_id: str, cwd: str) -> str | None:
+        """Cold-start fallback for ``resolve_session_path_for_window`` (P1).
+
+        Runs only when the monitor has not yet tracked the session (rare, so
+        its glob is off the steady-state hot path). Arbitrates over ALL same-id
+        candidates — the build-path AND every ``*/<sid>.jsonl`` glob match,
+        NEVER short-circuiting on the direct path existing — through the SHARED
+        ``select_relocation_winner`` helper, so a relocated session resolves to
+        the SAME file the monitor would pick. Returns the winner's path only
+        when it names an EXISTING file (a nonexistent build-path winner ⇒ the
+        session file is gone ⇒ ``None`` ⇒ the caller clears state). Synchronous
+        blocking I/O — the caller runs it off-thread.
+        """
+        # Lazy import keeps SessionManager free of an import-time dependency on
+        # session_monitor (which lazily imports session in return).
+        from .session_monitor import select_relocation_winner
+
+        candidates: list[Path] = []
+        build = self._build_session_file_path(session_id, cwd)
+        if build is not None:
+            candidates.append(build)
+        candidates.extend(config.claude_projects_path.glob(f"*/{session_id}.jsonl"))
+        winner = select_relocation_winner(candidates)
+        if winner is None:
+            return None
+        try:
+            winner.stat()
+        except OSError:
+            return None
+        return str(winner)
+
+    async def resolve_session_path_for_window(self, window_id: str) -> str | None:
+        """Resolve a window to its session's JSONL PATH — NO read, NO parse (P1).
+
+        The per-message / per-second hot path only needs the file PATH (to stat
+        for a read offset, or to hand to ``read_latest_usage`` / the JSONL
+        reader), never the summary + ``message_count`` that
+        ``_get_session_direct`` computes by parsing the ENTIRE (multi-MB)
+        transcript — which serialized the monitor loop and starved every topic
+        (monitor head-of-line-stall incident).
+
+        Resolves window → session_id from the in-memory ``session_map``
+        (``window_states``), then returns the MONITOR's authoritative tracked
+        path (already GH #61 relocation-arbitrated) with no file I/O. Cold-start
+        — session in the map but not yet tracked — falls back to the shared
+        relocation arbitration over the build-path + glob candidates
+        (off-thread; rare). Returns ``None`` — and, matching
+        ``resolve_session_for_window``, clears the window's stale binding — when
+        no existing file is found anywhere.
+        """
+        state = self.get_window_state(window_id)
+        if not state.session_id or not state.cwd:
+            return None
+
+        # Primary hot path: the monitor's relocation-arbitrated tracked path.
+        # Trusted WITHOUT a stat — the monitor repoints it on every relocation
+        # and validates it via its own offset checks; a stat here would put file
+        # I/O back on the exact path this fix removes it from.
+        getter = self._tracked_path_getter
+        if getter is not None:
+            tracked = getter(state.session_id)
+            if tracked:
+                return tracked
+
+        # Cold-start fallback (session not yet tracked). Off-thread so the glob
+        # over many project dirs never blocks the event loop.
+        winner = await asyncio.to_thread(
+            self._cold_start_session_path, state.session_id, state.cwd
+        )
+        if winner is not None:
+            return winner
+
+        # No existing file anywhere — reproduce the missing-file state clear.
+        self._clear_missing_session_state(window_id, state)
         return None
 
     # --- User window offset management ---
@@ -1799,15 +1957,17 @@ class SessionManager:
     ) -> tuple[list[dict], int]:
         """Get user/assistant messages for a window's session.
 
-        Resolves window → session, then reads the JSONL.
+        Resolves window → session PATH, then reads the JSONL. Uses the
+        path-only resolver (P1): this method reads the JSONL itself, so the
+        preliminary full parse ``resolve_session_for_window`` did was redundant.
         Supports byte range filtering via start_byte/end_byte.
         Returns (messages, total_count).
         """
-        session = await self.resolve_session_for_window(window_id)
-        if not session or not session.file_path:
+        session_path = await self.resolve_session_path_for_window(window_id)
+        if not session_path:
             return [], 0
 
-        file_path = Path(session.file_path)
+        file_path = Path(session_path)
         if not file_path.exists():
             return [], 0
 

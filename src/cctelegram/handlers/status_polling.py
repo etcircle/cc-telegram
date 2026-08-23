@@ -982,9 +982,12 @@ async def update_status_message(
     # (``bot._build_context_footer``) routes through the same cache so the
     # 1M-cap latch is shared. read_latest_usage is mtime+size-cached so a 1Hz
     # poller doesn't re-scan unchanged files.
-    session = await session_manager.resolve_session_for_window(window_id)
-    if session and session.file_path:
-        latest = read_latest_usage(session.file_path)
+    # Path-only resolver (P1): this 1 Hz/window path only needs the JSONL PATH
+    # for read_latest_usage (itself mtime+size-cached); the pre-P1
+    # resolve_session_for_window parsed the whole transcript here per window.
+    session_path = await session_manager.resolve_session_path_for_window(window_id)
+    if session_path:
+        latest = read_latest_usage(session_path)
         if latest is not None:
             route_runtime.update_context_usage(route, latest.tokens, latest.model)
         else:

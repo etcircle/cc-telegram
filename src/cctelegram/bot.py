@@ -1559,14 +1559,14 @@ async def _build_context_footer(
     if not window_id:
         return None
 
-    session = await session_manager.resolve_session_for_window(window_id)
-    if session is None or not session.file_path:
+    session_path = await session_manager.resolve_session_path_for_window(window_id)
+    if not session_path:
         return None
 
     from .handlers.topic_title import format_max, format_tokens
     from .transcript_parser import read_latest_usage
 
-    latest = read_latest_usage(session.file_path)
+    latest = read_latest_usage(session_path)
     if latest is None:
         return None
 
@@ -1871,10 +1871,12 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             )
             if handled:
                 # Update user's read offset
-                session = await session_manager.resolve_session_for_window(wid)
-                if session and session.file_path:
+                session_path = await session_manager.resolve_session_path_for_window(
+                    wid
+                )
+                if session_path:
                     try:
-                        file_size = Path(session.file_path).stat().st_size
+                        file_size = Path(session_path).stat().st_size
                         session_manager.update_user_window_offset(
                             user_id, wid, file_size
                         )
@@ -2070,11 +2072,15 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await _maybe_offer_artifacts(bot, user_id, wid, thread_id, msg.text)
 
         # Update user's read offset to current file position
-        # This marks these messages as "read" for this user
-        session = await session_manager.resolve_session_for_window(wid)
-        if session and session.file_path:
+        # This marks these messages as "read" for this user.
+        # Path-only resolver (P1): the pre-P1 resolve_session_for_window parsed
+        # the ENTIRE (multi-MB) transcript here on EVERY delivered message,
+        # serializing the monitor loop and starving every topic. We only need
+        # the file size for the offset — never the summary/count.
+        session_path = await session_manager.resolve_session_path_for_window(wid)
+        if session_path:
             try:
-                file_size = Path(session.file_path).stat().st_size
+                file_size = Path(session_path).stat().st_size
                 session_manager.update_user_window_offset(user_id, wid, file_size)
             except OSError:
                 pass
@@ -2443,6 +2449,12 @@ async def post_init(application: Application) -> None:
         logger.info("Pre-filled global rate limiter bucket")
 
     monitor = SessionMonitor()
+
+    # P1 (monitor head-of-line-stall fix): wire the path-only resolver to the
+    # monitor's authoritative, relocation-arbitrated tracked-path record so the
+    # per-message hot path resolves a window's JSONL path with NO transcript
+    # read. Mirrors monitor.set_bot / auq_source.set_jsonl_cache_getter.
+    session_manager.set_tracked_path_getter(monitor.tracked_path_for_session)
 
     async def message_callback(msg: NewMessage) -> None:
         await handle_new_message(msg, application.bot)

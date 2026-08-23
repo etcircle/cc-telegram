@@ -14,7 +14,6 @@ from __future__ import annotations
 import pytest
 
 from cctelegram import bot, route_runtime
-from cctelegram.session import ClaudeSession
 from cctelegram.transcript_parser import LatestUsage
 
 USER_ID = 1
@@ -27,18 +26,13 @@ def _install_usage(
 ) -> None:
     """Wire ``_build_context_footer`` deps so it observes ``tokens``.
 
-    Patches ``session_manager.resolve_session_for_window`` (module global on
-    ``bot``) and ``transcript_parser.read_latest_usage`` (imported inside the
+    Patches ``session_manager.resolve_session_path_for_window`` (module global
+    on ``bot``) and ``transcript_parser.read_latest_usage`` (imported inside the
     function) so the footer reads ``tokens`` without touching disk.
     """
 
-    async def _fake_resolve(window_id: str) -> ClaudeSession:
-        return ClaudeSession(
-            session_id="sess",
-            summary="",
-            message_count=0,
-            file_path="/tmp/does-not-matter.jsonl",
-        )
+    async def _fake_resolve_path(window_id: str) -> str:
+        return "/tmp/does-not-matter.jsonl"
 
     def _fake_read_latest_usage(jsonl_path: str) -> LatestUsage | None:
         if tokens is None:
@@ -46,7 +40,7 @@ def _install_usage(
         return LatestUsage(tokens=tokens, model=model)
 
     monkeypatch.setattr(
-        bot.session_manager, "resolve_session_for_window", _fake_resolve
+        bot.session_manager, "resolve_session_path_for_window", _fake_resolve_path
     )
     monkeypatch.setattr(
         "cctelegram.transcript_parser.read_latest_usage", _fake_read_latest_usage

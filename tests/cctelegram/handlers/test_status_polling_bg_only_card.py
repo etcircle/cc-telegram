@@ -225,7 +225,7 @@ async def test_full_tick_posts_on_capture_skipped_tick(mock_bot):
         patch.object(status_polling, "enqueue_status_update", AsyncMock()),
         patch.object(
             status_polling.session_manager,
-            "resolve_session_for_window",
+            "resolve_session_path_for_window",
             AsyncMock(return_value=None),
         ),
     ):
