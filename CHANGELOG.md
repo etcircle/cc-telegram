@@ -4,6 +4,20 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.5] — 2026-08-24
+
+The "your AskUserQuestion details show up before the picker again" release.
+
+### Fixed
+- **AUQ context card ("📋 … full details") now posts BEFORE the picker card again (regression from the
+  monitor head-of-line fix).** Removing the ~5 s per-tick transcript parse restored the status poller to a
+  true ~1 Hz on large sessions, which exposed a first-publish race: the poller grabbed a fresh
+  AskUserQuestion pane before it settled, the context source bailed, and the picker card published before
+  the details card (which then landed below it). The first picker publish of a fresh AUQ is now deferred
+  until the context source resolves, so details and picker emit together (details first) in one send. The
+  deferral is bounded by a monotonic per-route counter that is only cleared by a real publish or the
+  interactive-clear lifecycle — never reset by a transient pane frame — so the card can never be suppressed.
+
 ## [0.4.4] — 2026-08-24
 
 The "the bridge runs on Linux/WSL again" release.
