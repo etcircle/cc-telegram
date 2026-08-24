@@ -4719,7 +4719,10 @@ def _clear_skip_reason(
 
 
 def _ctx_state_attributable_to(
-    window_id: str, tool_use_id: str, context_fingerprint: str | None
+    window_id: str,
+    tool_use_id: str,
+    context_fingerprint: str | None,
+    side_file_absent: bool,
 ) -> bool:
     """Is the window's AUQ context-card state THIS AUQ's (or id-less legacy)?
 
@@ -4741,8 +4744,26 @@ def _ctx_state_attributable_to(
         identity at all and is therefore unattributable-legacy.
 
     A ``pretool:`` marker matching NEITHER our id nor our fingerprint is left
-    alone: it is a successor's freshly-written entry, and never popping a
-    successor's state is the hard invariant here.
+    alone WHILE A SIDE FILE EXISTS: it is a successor's freshly-written entry,
+    and never popping a successor's state is the hard invariant here.
+
+    ``side_file_absent`` licenses the one case that carve-out would otherwise
+    strand. With the side file GONE the fingerprint is unrecoverable, so an
+    id-less ``pretool:`` marker could never be matched — yet it CANNOT belong to
+    a live successor, by the caller's own gate: ``live_id`` resolution is
+    SIDE-FILE-FIRST, so if a live successor AUQ-C existed at decision time its
+    side file would exist, ``live_id`` would have resolved to C ≠ A, and the
+    parity gate would have SKIPPED all teardown — this cleanup would be
+    unreachable. In the licensed state with no side file, an id-less
+    ``pretool:`` marker is therefore A's own or stale legacy, and retiring it is
+    safe. When a side file IS present the fingerprint is recoverable and MUST be
+    checked, so today's carve-out stands unchanged.
+
+    DISCLOSED residual (same class as ``auq_source.remove_side_file_if_id``, and
+    closed the same way — it is not): the PreToolUse hook is an independent
+    PROCESS, so it can write C's side file between the caller's in-lock
+    ``live_id`` read and this pop. No in-bot lock can serialize that; the cost is
+    one re-postable details card, not a wrong dispatch.
     """
     record = _auq_context_msgs.get(window_id)
     if record is not None and record.tool_use_id:
@@ -4752,6 +4773,8 @@ def _ctx_state_attributable_to(
         if marker in (tool_use_id, f"pretool:{tool_use_id}"):
             return True
         if context_fingerprint and marker == f"pretool:{context_fingerprint[:16]}":
+            return True
+        if side_file_absent and marker.startswith("pretool:"):
             return True
         return marker.startswith("form:")
     return record is not None
@@ -4796,7 +4819,12 @@ def _narrow_auq_cleanup_locked(window_id: str, tool_use_id: str) -> None:
          ``remember_ask_tool_input`` see ``prior_id=None`` and skip its
          rotation cleanup — without (3) a later AUQ's 📋 card is suppressed by
          the surviving marker and a form-sourced record is upgraded in place
-         with the later question's text.
+         with the later question's text. Attribution is
+         ``_ctx_state_attributable_to``, which takes BOTH the pre-unlink
+         fingerprint and whether the side file was absent — with no side file
+         the fingerprint is unrecoverable, but the caller's side-file-FIRST
+         ``live_id`` gate proves no live successor exists in that state (see
+         that function's docstring for the full argument).
 
     Explicitly NOT ``forget_ask_tool_input`` (its MessageDisplay teardown would
     delete a successor EPM's plan-body / prose dedup markers) and NOT
@@ -4806,17 +4834,24 @@ def _narrow_auq_cleanup_locked(window_id: str, tool_use_id: str) -> None:
     """
     session_id = session_id_for_window(window_id)
     context_fingerprint: str | None = None
+    # No session ⇒ nothing readable, which is the same state ``live_id``
+    # resolution saw when it fell through to the meta / replay cache.
+    side_file_absent = True
     if session_id:
         # ONE torn-free read before the unlink: the hook-first ctx marker is
         # keyed on this record's source_fingerprint, not on any tool_use_id.
         recovery = auq_source.read_side_file_for_recovery(session_id)
-        if recovery is not None and recovery.tool_use_id == tool_use_id:
-            context_fingerprint = recovery.source_fingerprint
+        if recovery is not None:
+            side_file_absent = False
+            if recovery.tool_use_id == tool_use_id:
+                context_fingerprint = recovery.source_fingerprint
         auq_source.remove_side_file_if_id(session_id, tool_use_id)
     if _last_auq_tool_use_id.get(window_id) == tool_use_id:
         _last_auq_tool_use_id.pop(window_id, None)
         _last_completed_ask_tool_input.pop(window_id, None)
-    if _ctx_state_attributable_to(window_id, tool_use_id, context_fingerprint):
+    if _ctx_state_attributable_to(
+        window_id, tool_use_id, context_fingerprint, side_file_absent
+    ):
         had_marker = _auq_context_posted.pop(window_id, None) is not None
         had_record = _auq_context_msgs.pop(window_id, None) is not None
         if had_marker or had_record:

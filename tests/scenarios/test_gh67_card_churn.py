@@ -1082,6 +1082,103 @@ async def test_narrow_cleanup_runs_with_the_side_file_already_gone(
 
 
 @pytest.mark.asyncio
+async def test_hook_first_ctx_state_retired_when_the_side_file_is_already_gone(
+    scenario: ScenarioHarness,
+) -> None:
+    """The masked cross-product: HOOK-FIRST ctx state (an id-less
+    ``pretool:<fingerprint>`` marker + a record with no tool_use_id) × a side
+    file that is ALREADY GONE × a cleanup licensed through ``meta.tool_use_id``.
+
+    The fingerprint is unrecoverable in that state, so the successor-protection
+    carve-out would strand A's marker + record and poison AUQ-C. It is SAFE to
+    retire them, by the caller's own gate: ``live_id`` resolution is
+    side-file-FIRST, so a live successor would have made ``live_id`` resolve to
+    C ≠ A and the parity gate would have skipped ALL teardown — this branch is
+    unreachable while a successor is live.
+    """
+    wid = await _seed_auq_then_replacement(
+        scenario, replacement_pane=_exitplan_pane(), hook_first=True
+    )
+    marker = interactive_ui._auq_context_posted[wid]
+    assert marker.startswith("pretool:")
+    assert interactive_ui._auq_context_msgs[wid].tool_use_id is None
+    a_ctx_msg_ids = interactive_ui._auq_context_msgs[wid].message_ids
+    _side_file_path().unlink()
+    assert (
+        interactive_ui._interactive_msg_meta[(scenario.user_id, _THREAD_ID)].tool_use_id
+        == "toolu_A"
+    ), "the licence comes from the published meta once the side file is gone"
+
+    await _parent_tool_result(
+        scenario,
+        tool_name="AskUserQuestion",
+        tool_use_id="toolu_A",
+        timestamp=_now_iso(-30),
+    )
+
+    assert _has_surface(scenario), "the EPM replacement is still protected"
+    assert interactive_ui._auq_context_posted.get(wid) is None, (
+        "an id-less pretool: marker with NO side file cannot belong to a live "
+        "successor — leaving it suppresses the next AUQ's details card"
+    )
+    assert interactive_ui._auq_context_msgs.get(wid) is None
+
+    edits_before = {
+        s.kwargs["message_id"]
+        for s in scenario.bot.sent
+        if s.method == "edit_message_text"
+    }
+    scenario.tmux.set_pane(wid, _picker_pane_c())
+    _write_side_file(_TOOL_INPUT_C, tool_use_id="toolu_C")
+    assert await _render(scenario, wid)
+
+    assert interactive_ui._auq_context_posted.get(wid) is not None, (
+        "AUQ-C must receive its OWN details card"
+    )
+    c_ctx = interactive_ui._auq_context_msgs.get(wid)
+    assert c_ctx is not None and c_ctx.message_ids != a_ctx_msg_ids
+    edits_after = {
+        s.kwargs["message_id"]
+        for s in scenario.bot.sent
+        if s.method == "edit_message_text"
+    }
+    assert not (set(a_ctx_msg_ids) & (edits_after - edits_before))
+
+
+@pytest.mark.asyncio
+async def test_present_side_file_with_a_foreign_fingerprint_pops_nothing(
+    scenario: ScenarioHarness,
+) -> None:
+    """The CONTROL for the licence above: with a side file PRESENT the
+    fingerprint IS recoverable and must be checked, so a ``pretool:`` marker
+    minted from DIFFERENT content is left alone — the successor-protection
+    carve-out is unchanged."""
+    wid = await _seed_auq_then_replacement(
+        scenario, replacement_pane=_exitplan_pane(), hook_first=True
+    )
+    marker = interactive_ui._auq_context_posted[wid]
+    # Same occurrence id (so the cleanup is still licensed) but DIFFERENT
+    # content, so the recovered fingerprint cannot match the minted marker.
+    _write_side_file(_TOOL_INPUT_C, tool_use_id="toolu_A")
+    recovery = auq_source.read_side_file_for_recovery(_SESSION_ID)
+    assert recovery is not None
+    assert marker != f"pretool:{recovery.source_fingerprint[:16]}"
+
+    await _parent_tool_result(
+        scenario,
+        tool_name="AskUserQuestion",
+        tool_use_id="toolu_A",
+        timestamp=_now_iso(-30),
+    )
+
+    assert not _side_file_path().exists(), "the id-guarded unlink still fired"
+    assert interactive_ui._auq_context_posted.get(wid) == marker, (
+        "a recoverable, NON-matching fingerprint means the marker is not ours"
+    )
+    assert interactive_ui._auq_context_msgs.get(wid) is not None
+
+
+@pytest.mark.asyncio
 async def test_restart_reconciler_after_narrow_cleanup_releases_nothing(
     scenario: ScenarioHarness, tmp_path
 ) -> None:
