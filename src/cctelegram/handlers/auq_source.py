@@ -1237,6 +1237,50 @@ def unlink_for_session(session_id: str) -> None:
         )
 
 
+def remove_side_file_if_id(session_id: str, tool_use_id: str) -> bool:
+    """Unlink ``session_id``'s side file ONLY if it still carries ``tool_use_id``.
+
+    The identity-guarded half of GH #67's NARROW cleanup: an AUQ-A resolution
+    arriving after a DIFFERENT surface replaced A's card must retire A's side
+    file (a retained live one holds ``side_file_live_for_window``'s preserve
+    branch open and hands the startup reconciler a positive-proof match) without
+    the broad ``forget_ask_tool_input`` teardown. Returns True iff a file was
+    unlinked. An unknown/empty stored id never matches — the caller's id must be
+    positively confirmed, never assumed.
+
+    Disclosed residual (GH #67 r6 P2-2): the re-read narrows but cannot CLOSE
+    the cross-PROCESS race against the PreToolUse hook's atomic rename — the
+    hook is an independent process under ``forceSyncExecution`` that no in-bot
+    lock can serialize. A read-A → hook-writes-B → unlink sequence can delete a
+    successor's side file; the whole side-file machinery is optional by
+    construction, so that lands on the documented fallback paths, and it is
+    strictly narrower than the pre-fix broad unlink, which deleted it with
+    certainty plus the MessageDisplay + ledger collateral.
+    """
+    if not session_id or not tool_use_id:
+        return False
+    path = _pretool_side_file_path(session_id)
+    if path is None:
+        return False
+    record = _read_pretool_side_file(session_id)
+    if record is None or not record.tool_use_id:
+        return False
+    if record.tool_use_id != tool_use_id:
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        logger.debug(
+            "Pretool side file id-guarded unlink for session=%s failed: %s",
+            session_id,
+            e,
+        )
+        return False
+    return True
+
+
 def forget_for_window(window_id: str) -> None:
     """Evict the in-memory record for ``window_id`` and unlink its current side file.
 

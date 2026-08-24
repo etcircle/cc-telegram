@@ -4,6 +4,31 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.7] — 2026-08-24
+
+The "your approval card stops blinking at you" release.
+
+### Fixed
+- **A live approval card no longer churns (send → delete → resend) while Claude narrates
+  (GH #67).** Any parent block reaching the bridge tore down the topic's interactive card, the
+  poller re-detected the unchanged pane and republished it, and each delete re-posted the phantom
+  "🔔 needs a decision" card — a loop that ran for as long as the prompt stayed up. The teardown is
+  now conditioned on what the delivered block actually proves: a pane-detected Permission /
+  Workflow / Decision gate has no transcript resolution event at all, so a narration block never
+  clears it (only the existing absent-streak tombstone does), and a backlog block that predates the
+  published card is ignored. A genuine AskUserQuestion / ExitPlanMode `tool_result` still clears
+  its own surface immediately, including one that raced a slow card send.
+- **A stale AskUserQuestion answer can no longer damage the AUQ that replaced it.** An older AUQ's
+  `tool_result` (or its ~60 s AFK auto-resolve) arriving while a newer prompt is live used to
+  unlink the new prompt's PreToolUse side file and release the window's action-ledger rows — dead
+  buttons and a false "Action already received" for the rest of that prompt's life. Both teardown
+  paths are now identity-gated: a resolution proven to belong to a different prompt is skipped, and
+  one whose card a different surface has replaced retires only its own state.
+- **Honest churn logging.** The poller's "content changed — refreshing keyboard" line now
+  distinguishes a genuine content change from a re-publish after an external clear, and a parent
+  block arriving without a transcript timestamp is warned about once per topic (it makes the
+  stale-block check fail open for that topic).
+
 ## [0.4.6] — 2026-08-24
 
 The "two topics can browse directories at the same time" release.

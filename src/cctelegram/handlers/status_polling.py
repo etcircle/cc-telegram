@@ -1169,10 +1169,18 @@ async def update_status_message(
             # concurrent tick on the same route doesn't fire a duplicate
             # publish, then refresh via ``handle_interactive_ui`` (which
             # edits the existing Telegram card in place).
+            prior_ui_hash = _last_published_ui_hash.get(route)
             _last_published_ui_hash[route] = ui_hash
+            # GH #67 Fix 4: an ABSENT prior hash is a re-publish after an
+            # external clear (the seam teardown / a dispatcher pop), not a
+            # content change — logging both as "content changed" hid the churn
+            # loop's actual driver.
             logger.debug(
-                "Interactive UI content changed (user=%d, window=%s, thread=%s) — "
+                "Interactive UI republish (%s) (user=%d, window=%s, thread=%s) — "
                 "refreshing keyboard",
+                "prior=None: re-publish after external clear"
+                if prior_ui_hash is None
+                else "hash differs: genuine content change",
                 user_id,
                 window_id,
                 thread_id,

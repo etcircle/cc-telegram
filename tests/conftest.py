@@ -904,6 +904,10 @@ def _reset_all_handler_state() -> None:
     auq_source.set_jsonl_cache_getter(
         lambda wid: interactive_ui._last_completed_ask_tool_input.get(wid)
     )
+    # GH #67: the one-per-route timestamp-less-block WARNING guard. Keyed by
+    # (user, thread, window) — all of which repeat across scenarios — so a leak
+    # would silently suppress the warning a later test asserts on.
+    bot_module._TIMESTAMPLESS_BLOCK_WARNED.clear()
     _reset_aggregator()
     _reset_status_polling()
     _reset_session_manager()
