@@ -4,6 +4,24 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.6] — 2026-08-24
+
+The "two topics can browse directories at the same time" release.
+
+### Fixed
+- **Directory/session picker state is now keyed per topic, so a picker open in one topic no longer
+  displaces another topic's pending picker (GH #66).** Pending-picker state moved from a flat
+  per-user slot to a per-thread map, letting multiple topics browse concurrently. The stale-topic
+  mismatch machinery this displacement required is gone with it; a missing/invalid entry remains
+  the restart-orphan signal.
+- **Same-topic window creation race can no longer kill the winning window (GH #63 §2b).** An abort
+  may kill a created window only when it is neither the topic's current bound window nor the live
+  pending owner's window, decided atomically inside the same ownership critical section the abort
+  uses — never a separate peek-then-kill.
+- **An expired/orphaned picker card now disables itself** — tapping it (or `/start`) edits the card
+  to an inert "picker expired — send a message here to reopen" notice instead of a popup-only
+  reject.
+
 ## [0.4.5] — 2026-08-24
 
 The "your AskUserQuestion details show up before the picker again" release.
