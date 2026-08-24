@@ -4,6 +4,20 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.4] — 2026-08-24
+
+The "the bridge runs on Linux/WSL again" release.
+
+### Fixed
+- **Linux/WSL: delivery gate now accepts the `claude` executable-name shape tmux reports on Linux
+  (`/proc/<pid>/comm`), not just the macOS version-string process title; `node` stays excluded
+  (GH #63).** On Linux, tmux derives `pane_current_command` from the executable name, so the
+  running TUI reports `claude` rather than a version string like `2.1.201`; the fail-closed
+  delivery gate therefore refused every send, making the bridge unusable on Linux/WSL. The
+  `pane_command_is_claude` proof-of-life predicate now accepts the `claude` binary name (and a
+  full path via its basename) alongside the version shape. `node` remains excluded on purpose —
+  any Node program would match it, reopening the hazard the gate exists for.
+
 ## [0.4.3] — 2026-08-21
 
 The "a new Claude Code can't wedge your quoted replies" release. One fix, found live twice in a

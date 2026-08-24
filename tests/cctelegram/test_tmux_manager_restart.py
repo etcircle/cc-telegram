@@ -65,8 +65,10 @@ class TestPaneCommandIsClaude:
             ("vim", False),  # the user "checking the window" (P1-B)
             ("python", False),
             ("ssh", False),
-            ("node", False),
-            ("claude", False),
+            ("node", False),  # any Node program would match — never proof
+            ("claude", True),  # Linux/WSL: /proc comm reports the binary name
+            ("/home/u/.local/bin/claude", True),  # full path → basename
+            ("claude-wrapper", False),  # exact binary name only
             ("2.1", False),  # not a full version triplet
             ("", False),
             (None, False),
