@@ -272,29 +272,46 @@ def pane_command_is_shell(cmd: str | None) -> bool:
     return base in _KNOWN_SHELLS
 
 
-# The A.0 empirical contract (CC 2.1.20x): while the Claude Code TUI runs,
-# ``pane_current_command`` reports its VERSION STRING (e.g. "2.1.201") — never
-# "claude" or "node". A version-led token; a suffix ("2.1.201-beta") is
-# tolerated, a LEADING name ("v2.1.201", "claude 2.1.201") never is.
+# The A.0 empirical contract on macOS (CC 2.1.20x): while the Claude Code TUI
+# runs, ``pane_current_command`` reports its VERSION STRING (e.g. "2.1.201") as
+# the process title — never "claude" or "node" on that platform. A version-led
+# token; a suffix ("2.1.201-beta") is tolerated, a LEADING name ("v2.1.201",
+# "claude 2.1.201") never is.
 # VERSION-DRIFT RESIDUAL (fail-closed by design): if a future CC changes the
 # reported shape, quarantined sends keep REFUSING — recoverable via a /update
 # rerun, a window recreate, or a bot restart. The next TUI-drift audit must
 # re-verify this predicate alongside the shell set above.
+#
+# LINUX / WSL2 (CC 2.1.241 native binary, tmux 3.4): tmux on Linux derives
+# ``pane_current_command`` from ``/proc/<pid>/comm`` — the EXECUTABLE NAME,
+# not the process title — so the TUI reports "claude", never a version
+# string. The binary name is not absolute proof — any executable named
+# ``claude`` (or a process that rewrites its comm) would match — but it is the
+# same trusted managed-pane signal the quarantine already relies on: the bot
+# itself launched ``claude`` in this window, and nothing else is installed
+# under that name here. Accepted alongside the version shape on that basis.
+# "node" stays excluded on purpose: any Node program would match it.
 _RE_CLAUDE_VERSION_CMD = re.compile(r"\d+\.\d+\.\d+\S*")
+_CLAUDE_BINARY_NAMES = frozenset({"claude"})
 
 
 def pane_command_is_claude(cmd: str | None) -> bool:
     """True iff ``cmd`` is POSITIVE proof the Claude Code TUI owns the pane.
 
-    Strictly the version-string shape (r2 P1-B) — "not a shell" is NOT proof
-    of life: a user checking a stranded window may be running vim / python /
-    ssh there, and typing user text + Enter into those is the exact hazard the
-    quarantine exists to stop. Used by the quarantined send-seam re-check AND
-    the post-relaunch confirmation poll.
+    Two shapes count (r2 P1-B + Linux): the version string macOS reports as
+    the process title, or the ``claude`` executable name Linux/WSL reports
+    from ``/proc/<pid>/comm``. "Not a shell" is NOT proof of life: a user
+    checking a stranded window may be running vim / python / ssh there, and
+    typing user text + Enter into those is the exact hazard the quarantine
+    exists to stop. Used by the quarantined send-seam re-check AND the
+    post-relaunch confirmation poll.
     """
     if not cmd:
         return False
-    return _RE_CLAUDE_VERSION_CMD.fullmatch(cmd.strip()) is not None
+    token = cmd.strip()
+    if _RE_CLAUDE_VERSION_CMD.fullmatch(token) is not None:
+        return True
+    return os.path.basename(token) in _CLAUDE_BINARY_NAMES
 
 
 @dataclass
