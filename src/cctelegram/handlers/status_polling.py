@@ -83,6 +83,7 @@ from . import (
 )
 from .message_sender import topic_send
 from .interactive_ui import (
+    FirstPublishCtxGate,
     clear_interactive_msg,
     get_interactive_window,
     handle_interactive_ui,
@@ -108,6 +109,19 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 # backlogged, we prefer rendering late-ish context before the picker when it can
 # finish quickly, then proceed anyway on timeout.
 FIRST_PICKER_CONTENT_DRAIN_TIMEOUT = 2.0
+
+# AUQ details-after-picker regression: on the poller's FIRST publish for a route,
+# the pane / PreToolUse side file may not have settled, so the 📋 details card
+# would bail (ctx unresolved) while the picker still publishes — stranding the
+# details card to a later tick (details-after-picker). We DEFER the first picker
+# publish for up to this many CONSECUTIVE defer ticks (~1 s each) waiting for ctx
+# to resolve, then publish anyway (fail open) so a genuinely ctx-less AUQ is never
+# stranded. The defer state is a PLAIN route-level consecutive-defer counter (see
+# ``_auq_first_publish_defer``): every defer tick increments it and no per-tick
+# pane signal can reset it, so it is bounded against ALL churn (ANSI, parse-state
+# flap, render-hash) by construction and always reaches this cap. Fresh-per-card is
+# guaranteed by publish/resolve CLEARING the counter, not by an identity key.
+AUQ_FIRST_PUBLISH_CTX_SETTLE_TICKS = 3
 
 # Watchdog interval for adaptive pane capture. The 1Hz loop still ticks
 # every second so stale-binding cleanup and idle-clear delay processing
@@ -203,6 +217,37 @@ _last_pane_capture: dict[tuple[int, int, str], float] = {}
 # and Claude Code buffers the new tool_use JSONL line until the user answers,
 # so the JSONL-driven dispatch can't recover until after the fact.
 _last_published_ui_hash: dict[tuple[int, int, str], str] = {}
+
+# AUQ details-after-picker regression: per-route first-publish deferral state — a
+# PLAIN consecutive-defer count, ``route -> int``, under ONE invariant.
+#
+# THE MONOTONIC INVARIANT: the entry only ever INCREMENTS (on a defer tick) or is
+# CLEARED. It is CLEARED **only** by a definitive lifecycle event:
+#   (1) an actual picker PUBLISH — any first-publish tick where the card is sent,
+#       fail-open OR ctx-resolved (the ``is_auq_first_publish and published`` clear
+#       in ``update_status_message``); and
+#   (2) the interactive-clear callback / teardown (``_on_interactive_clear`` and
+#       ``clear_route_caches_for_topic`` — resolution / topic close / route unbind).
+# It is NEVER reset, lowered, or popped by ANY per-tick PANE read — not by
+# ``ui_content is None``, not by a parse flap, not by a render-hash/identity change,
+# not by "AUQ not visible this frame." Every one of the five prior holes came from a
+# per-tick condition zeroing the count; keep this the whole fix. Do NOT re-introduce
+# an identity key, a per-tick regenerate/pop, or any pane-derived reset.
+#
+# Why this is BOUNDED by construction: because the count only goes up or is cleared
+# by a real publish/lifecycle event, it ALWAYS reaches
+# ``AUQ_FIRST_PUBLISH_CTX_SETTLE_TICKS`` in bounded ticks → ALWAYS fails open →
+# NEVER suppresses. A transient None/flap frame leaves the count untouched (it
+# persists and resumes climbing). A leaked/stale count (AUQ vanished without a
+# clear) is SELF-LIMITING: the NEXT card finds a high count and fails open EARLY — a
+# bounded, one-card ordering imperfection, the OPPOSITE of suppression. So
+# correctness does NOT depend on the clear being perfectly reliable; only on the
+# count never being LOWERED by a pane read.
+#
+# Fresh-per-card holds because the first-publish gate fires ONCE PER CARD (a
+# multi-question AUQ navigates Q1→Q2 inside the one published card via the refresh
+# branch, never a second first-publish) and publish/resolve clears the count.
+_auq_first_publish_defer: dict[tuple[int, int, str], int] = {}
 
 # Hysteresis on the clear path for in-interactive routes. A single 1Hz poll
 # that lands during a Claude Code redraw frame can come up empty even while
@@ -361,6 +406,7 @@ def clear_route_caches_for_topic(user_id: int, thread_id_or_0: int) -> None:
     caches = (
         _last_pane_capture,
         _last_published_ui_hash,
+        _auq_first_publish_defer,
         _absent_streak,
         _prev_run_state,
         _bg_only_card_posted,
@@ -679,6 +725,18 @@ def _on_interactive_clear(
     happen entirely between polls, so the cleanup window collapses.
     """
     if window_id is None:
+        # A resolution BEFORE any first publish fires this callback with no window
+        # (interactive mode is only set on publish). Best-effort clear of any
+        # in-flight first-publish defer count for this (user, thread) — 1 topic = 1
+        # window, so at most one entry. Correctness does NOT hinge on this: the
+        # monotonic count self-limits (a missed clear only makes the next card fail
+        # open EARLY, never suppresses).
+        for key in [
+            k
+            for k in _auq_first_publish_defer
+            if k[0] == user_id and k[1] == thread_id_or_0
+        ]:
+            _auq_first_publish_defer.pop(key, None)
         return
     _absent_streak.pop((user_id, thread_id_or_0, window_id), None)
     # PR-1 (A3-FIX, PRIMARY EPM-anchor clear): the bot.py tool_result EPM
@@ -694,6 +752,9 @@ def _on_interactive_clear(
     # post-clear repaint); the update-loop clear paths already drop this hash, so
     # this is redundant-but-safe for AUQ/EPM and load-bearing only for Decision.
     _last_published_ui_hash.pop((user_id, thread_id_or_0, window_id), None)
+    # AUQ details-after-picker: drop any in-flight first-publish defer state so a
+    # rebound / re-raised surface starts its settle window fresh.
+    _auq_first_publish_defer.pop((user_id, thread_id_or_0, window_id), None)
 
 
 register_clear_callback(_on_interactive_clear)
@@ -932,6 +993,17 @@ async def update_status_message(
     # normally already True (the mode-ended reconciliation above already cleared
     # the bit on any window-mismatch tick).
     should_capture = should_capture or route_runtime.snapshot(route).interactive_pending
+    # AUQ details-after-picker: while a FIRST-publish deferral is ACTIVE for this
+    # route, force a capture every tick so the retry runs at the 1 Hz poll cadence
+    # (the deferral window is bounded by AUQ_FIRST_PUBLISH_CTX_SETTLE_TICKS). The
+    # route is NOT in interactive mode during deferral (no card published yet), so
+    # without this nudge the WATCHDOG_INTERVAL gate would stall the retry to ~10 s.
+    # The entry exists ONLY between consecutive deferral ticks — the branch below
+    # drops it the moment the sequence ends (publish / AUQ gone / different UI), so
+    # the nudge can never keep capturing after the card exists (F2). A published
+    # route also has ``is_first_publish_for_route`` False, so it can never re-add
+    # the entry; the two states are mutually exclusive.
+    should_capture = should_capture or route in _auq_first_publish_defer
 
     if not should_capture:
         # Cleanup-only path: stale-binding cleanup already ran above
@@ -1317,14 +1389,90 @@ async def update_status_message(
         # the route waits for same-route content to drain; refreshes must stay
         # fast so Q2→Q3 transitions do not stall every poll.
         is_first_publish_for_route = route not in _last_published_ui_hash
-        _last_published_ui_hash[route] = _ui_render_hash(
+        new_ui_hash = _ui_render_hash(
             window_id, pane_text, ui_content, ansi_text=pane_ansi
         )
+        # AUQ details-after-picker: on the FIRST publish for a route, the 📋
+        # details ctx source may not have settled yet, so publishing the picker
+        # now would strand the details card to a later tick. While under the
+        # settle cap, pass a gate that lets handle_interactive_ui DEFER the picker
+        # (send nothing this tick) so a later tick emits BOTH cards in order. AUQ
+        # only — EPM / Permission / Workflow / Decision have no such ctx bail and
+        # must publish immediately. After the cap we stop passing a gate and the
+        # picker publishes ctx-less anyway (fail open).
+        #
+        # The settle count is a PLAIN route-level consecutive-defer counter under a
+        # single MONOTONIC invariant (see the ``_auq_first_publish_defer``
+        # docstring): the entry only ever INCREMENTS (on a defer tick) or is CLEARED
+        # by a definitive lifecycle event — an actual picker PUBLISH (here) or the
+        # interactive-clear / teardown seam. NO per-tick PANE read ever lowers it
+        # (not ``ui_content is None``, not a parse flap, not a render-hash/identity
+        # change). We READ it here (never pop-per-tick); that is what makes the
+        # counter bounded against ALL churn — it always climbs to the cap and fails
+        # open, and a transient None/flap frame simply leaves it to resume climbing.
+        # Every one of the five prior holes came from a per-tick condition zeroing
+        # the count; do NOT re-introduce one.
+        defer_count = _auq_first_publish_defer.get(route, 0)
+        is_auq_first_publish = (
+            is_first_publish_for_route and ui_content.name == "AskUserQuestion"
+        )
+        may_defer = (
+            is_auq_first_publish and defer_count < AUQ_FIRST_PUBLISH_CTX_SETTLE_TICKS
+        )
+        # Store the hash before the await so a concurrent tick on the same route
+        # sees it and skips a duplicate publish. On a deferrable tick we DON'T
+        # store yet: the deferred tick sends nothing, so it must re-enter as a
+        # first publish next tick to retry the ctx-gated publish. (The narrow
+        # concurrency window this opens can at most produce a duplicate DEFERRAL —
+        # no card is sent — and handle_interactive_ui's own per-route lock still
+        # serializes the eventual publish/edit, so no duplicate card.)
+        if not may_defer:
+            _last_published_ui_hash[route] = new_ui_hash
+        gate = FirstPublishCtxGate() if may_defer else None
+        # Drain queued same-route content before the first picker so content
+        # lands above the card. Run it on every first-publish tick (including
+        # deferrable ones) so the ctx-resolved publishing tick has already
+        # drained; it is best-effort, bounded, and idempotent on an empty queue.
         if is_first_publish_for_route:
             await _drain_content_queue_before_first_picker_publish(route)
         published = await handle_interactive_ui(
-            bot, user_id, window_id, thread_id, from_poller=True
+            bot,
+            user_id,
+            window_id,
+            thread_id,
+            from_poller=True,
+            first_publish_ctx_gate=gate,
         )
+        if gate is not None and gate.deferred:
+            # Ctx not resolvable yet on the first publish — nothing was sent.
+            # INCREMENT the monotonic count and retry next tick; the hash was
+            # intentionally not stored, so this stays a first publish.
+            _auq_first_publish_defer[route] = defer_count + 1
+            logger.info(
+                "AUQ first-publish deferred (ctx unresolved) route=%s "
+                "defer_count=%d cap=%d",
+                route,
+                defer_count + 1,
+                AUQ_FIRST_PUBLISH_CTX_SETTLE_TICKS,
+            )
+            return
+        # Not deferred: published (ctx resolved or an at-cap fail-open), or a
+        # non-deferring outcome. On the deferrable path the hash was not stored
+        # pre-await — store it now that the publish actually happened (or failed
+        # non-deferrably) so subsequent ticks are treated as refreshes.
+        if may_defer:
+            _last_published_ui_hash[route] = new_ui_hash
+        # CLEAR the monotonic count on an actual AUQ-first-publish PUBLISH (the
+        # definitive lifecycle event) — this is the ONLY per-tick site that lowers
+        # it, and it fires ONLY when the picker card was sent for a first-publish
+        # AUQ (``published`` True). A non-AUQ / already-published tick leaves the
+        # entry untouched, and a failed send (``published`` False) also leaves it
+        # (the route's hash is now stored, so it cannot re-defer; the leftover count
+        # is inert and is cleared by the interactive-clear / teardown seam). Because
+        # the count is monotonic, even a missed clear only makes the NEXT card fail
+        # open EARLY (bounded) — never suppresses.
+        if is_auq_first_publish and published:
+            _auq_first_publish_defer.pop(route, None)
         # SET (d): first-render dispatch. Promote RUNNING → WAITING_ON_USER +
         # repaint only on a real surface publish. `published` gates on
         # handle_interactive_ui's return — which is True only when a card was

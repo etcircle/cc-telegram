@@ -187,6 +187,32 @@ _PENDING_CLAIM_TTL_SECONDS = 60.0
 _INTERACTIVE_SEND_RETRY_DELAY_S = 2.0
 
 
+@dataclass
+class FirstPublishCtxGate:
+    """Mutable in/out signal for the poller's first-publish ctx-settle gate.
+
+    The 1 Hz status poller detects a fresh AskUserQuestion on its FIRST
+    transient frame, where the pane / PreToolUse side file may not have settled
+    yet, so ``resolve_auq_source_for_render`` bails (``ctx_source is None``) and
+    the 📋 details card is skipped. Because the details card and the picker are
+    emitted by the SAME ``handle_interactive_ui`` call, publishing the picker on
+    that first bail tick strands the details card to a LATER tick — the user
+    sees the picker first and the details after (the AUQ details-after-picker
+    regression the P1 cadence change reopened).
+
+    When the poller passes this gate (ONLY on the FIRST publish for a route, and
+    ONLY while under the settle cap), ``handle_interactive_ui`` DEFERS the
+    picker for a tick instead of publishing ctx-less: it sets ``deferred = True``
+    and returns without sending. The poller retries next tick; once ctx resolves
+    the first publish emits both cards in order (details, then picker). After the
+    cap the poller stops passing the gate and the picker publishes anyway (fail
+    open), so a genuinely ctx-less AUQ is never stranded. Every non-poller caller
+    passes ``None`` and is unchanged.
+    """
+
+    deferred: bool = False
+
+
 def _pending_claim_clock() -> float:
     """Monotonic-clock hook for tests to override.
 
@@ -3668,6 +3694,7 @@ async def handle_interactive_ui(
     from_poller: bool = False,
     tmux_mgr=None,
     session_mgr=None,
+    first_publish_ctx_gate: FirstPublishCtxGate | None = None,
 ) -> bool:
     """Capture terminal and send interactive UI content to user.
 
@@ -4158,6 +4185,34 @@ async def handle_interactive_ui(
                         source=ctx_source,
                         claim_token=claim_token,
                     )
+
+            # AUQ details-after-picker regression: on the poller's FIRST publish
+            # for this route the pane / PreToolUse side file may not have settled,
+            # so the ctx (📋 full-descriptions) source bailed (``ctx_source is
+            # None``) and the details card was skipped just above. Publishing the
+            # picker NOW would strand the details card to a LATER tick
+            # (details-after-picker). DEFER this tick — fail-open and bounded by
+            # the poller's settle cap — so a later tick, once ctx resolves, emits
+            # BOTH cards in order from one call. Only the poller passes a gate, and
+            # only on a first, under-cap publish; every other caller (bot.py JSONL
+            # dispatch, callback re-renders) has ``first_publish_ctx_gate=None`` and
+            # is unchanged. Placed AFTER the ctx-post attempt (a no-op when
+            # ``ctx_source is None``) and BEFORE the staleness gate / live-prose /
+            # picker send below, so a deferred tick sends nothing at all. Scoped to
+            # AskUserQuestion by construction (this whole block is AUQ-only);
+            # ExitPlanMode's plan body posts via ``_maybe_post_epm_plan`` below,
+            # which does not depend on this ctx-source bail, so EPM never defers.
+            if first_publish_ctx_gate is not None and ctx_source is None:
+                first_publish_ctx_gate.deferred = True
+                logger.info(
+                    "AUQ first-publish DEFERRED (ctx unresolved): window=%s "
+                    "from_poller=%s source_tag=%s decision=%s",
+                    window_id,
+                    from_poller,
+                    source_tag,
+                    render_source.decision,
+                )
+                return False
 
         # Staleness gate (Wave A, Bug A): if the persisted msg id was
         # for a different session, treat the entry as stale and re-send.

@@ -39,6 +39,7 @@ def _clear_interactive_state():
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
+    status_polling._auq_first_publish_defer.clear()
     status_polling._absent_streak.clear()
     status_polling._prev_run_state.clear()
     route_runtime.reset_for_tests()
@@ -47,6 +48,7 @@ def _clear_interactive_state():
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
+    status_polling._auq_first_publish_defer.clear()
     status_polling._absent_streak.clear()
     status_polling._prev_run_state.clear()
     route_runtime.reset_for_tests()
@@ -85,7 +87,12 @@ class TestStatusPollerSettingsDetection:
             )
 
             mock_handle_ui.assert_called_once_with(
-                mock_bot, 1, window_id, 42, from_poller=True
+                mock_bot,
+                1,
+                window_id,
+                42,
+                from_poller=True,
+                first_publish_ctx_gate=None,
             )
 
     @pytest.mark.asyncio
@@ -132,7 +139,12 @@ class TestStatusPollerSettingsDetection:
             mock_get_queue.assert_called_once_with((1, 42, window_id))
             content_queue.join.assert_awaited_once()
             mock_handle_ui.assert_awaited_once_with(
-                mock_bot, 1, window_id, 42, from_poller=True
+                mock_bot,
+                1,
+                window_id,
+                42,
+                from_poller=True,
+                first_publish_ctx_gate=None,
             )
             assert events == ["join", "render"]
 
@@ -166,6 +178,8 @@ class TestStatusPollerSettingsDetection:
             )
 
             mock_get_queue.assert_not_called()
+            # Refresh path (already in interactive mode) uses the 1028-branch
+            # call site, which passes NO ctx-settle gate — refreshes never defer.
             mock_handle_ui.assert_awaited_once_with(
                 mock_bot, 1, window_id, 42, from_poller=True
             )
@@ -251,7 +265,12 @@ class TestStatusPollerSettingsDetection:
 
             content_queue.join.assert_awaited_once()
             mock_handle_ui.assert_awaited_once_with(
-                mock_bot, 1, window_id, 42, from_poller=True
+                mock_bot,
+                1,
+                window_id,
+                42,
+                from_poller=True,
+                first_publish_ctx_gate=None,
             )
 
     @pytest.mark.asyncio
