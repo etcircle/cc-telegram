@@ -17,11 +17,15 @@ Covers the plan's unit matrix:
 """
 
 import json
+import time
+from pathlib import Path
 
 import pytest
 
+from cctelegram.handlers import auq_source
 from cctelegram.handlers import interactive_ui as iui
 from cctelegram.session_monitor import SessionInfo, SessionMonitor
+from cctelegram.utils import app_dir
 
 
 _USER = 7
@@ -550,6 +554,80 @@ class TestClearConditionDecisionTable:
         )
         assert iui._auq_context_posted.get(_WID) is None
         assert iui._last_completed_ask_tool_input.get(_WID) is None
+
+
+# ── remove_side_file_if_id: the re-read-before-unlink guard ───────────────
+
+
+class TestRemoveSideFileIfId:
+    """The identity guard is a RE-READ at call time, not a cached decision.
+
+    The window it narrows is the cross-PROCESS one against the PreToolUse
+    hook's atomic rename (disclosed, not closed) — so the helper must read the
+    stored id ITSELF immediately before unlinking, never trust a caller's
+    earlier peek.
+    """
+
+    _SESSION = "77777777-7777-4777-8777-777777777777"
+
+    def _write(self, tool_use_id: str) -> Path:
+        pending = app_dir() / "auq_pending"
+        pending.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = pending / f"{self._SESSION}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "session_id": self._SESSION,
+                    "tool_use_id": tool_use_id,
+                    "written_at": time.time(),
+                    "tool_input": {
+                        "questions": [
+                            {
+                                "question": "Q?",
+                                "multiSelect": False,
+                                "options": [{"label": "One", "description": "d"}],
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        return path
+
+    def test_unlinks_on_a_matching_id(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        path = self._write("toolu_A")
+        assert auq_source.remove_side_file_if_id(self._SESSION, "toolu_A") is True
+        assert not path.exists()
+
+    def test_id_replaced_on_disk_after_the_callers_read_is_not_unlinked(
+        self, tmp_path, monkeypatch
+    ):
+        """The successor-protection case: the caller peeked A, the hook then
+        atomically replaced the file with B's record. The re-read sees B and
+        REFUSES — a blind unlink would delete the successor's provenance."""
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        path = self._write("toolu_A")
+        peeked = auq_source.peek_side_file_tool_use_id(self._SESSION)
+        assert peeked == "toolu_A"
+        self._write("toolu_B")  # the hook, in another process
+
+        assert auq_source.remove_side_file_if_id(self._SESSION, peeked or "") is False
+        assert path.exists()
+        assert auq_source.peek_side_file_tool_use_id(self._SESSION) == "toolu_B"
+
+    def test_empty_stored_id_never_matches(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        path = self._write("")
+        assert auq_source.remove_side_file_if_id(self._SESSION, "toolu_A") is False
+        assert path.exists()
+
+    def test_missing_file_and_empty_args_are_no_ops(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        assert auq_source.remove_side_file_if_id(self._SESSION, "toolu_A") is False
+        assert auq_source.remove_side_file_if_id("", "toolu_A") is False
+        assert auq_source.remove_side_file_if_id(self._SESSION, "") is False
 
 
 # ── 12. NewMessage.timestamp plumbing at the PARENT emit site ─────────────

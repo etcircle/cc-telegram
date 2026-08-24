@@ -44,12 +44,14 @@ from cctelegram.handlers import (
     auq_ledger,
     auq_source,
     interactive_ui,
+    pick_token,
     status_polling,
 )
-from cctelegram.session_monitor import NewMessage
+from cctelegram.handlers.callback_data import CB_ASK_PICK
+from cctelegram.session_monitor import NewMessage, SessionInfo, SessionMonitor
 from cctelegram.tmux_manager import tmux_manager as real_tmux
 from cctelegram.utils import app_dir
-from tests.conftest import ScenarioHarness
+from tests.conftest import ScenarioHarness, make_update_callback
 
 pytestmark = pytest.mark.scenario
 
@@ -641,23 +643,37 @@ async def test_stale_explicit_resolution_spares_the_new_auq(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hook_first", [True, False], ids=["hook_first", "jsonl_cache"])
 async def test_auq_a_to_auq_b_replacement_restamps_birth(
-    scenario: ScenarioHarness,
+    scenario: ScenarioHarness, hook_first: bool
 ) -> None:
     """A consecutive AUQ-A → AUQ-B in-place replacement is a NEW logical
     surface (identity, not just kind): an A-era block newer than A's birth but
-    older than B's re-stamp does NOT clear B."""
+    older than B's re-stamp does NOT clear B.
+
+    ``hook_first`` is the NORMAL production shape — the PreToolUse side file
+    exists before the picker renders and Claude Code buffers the AUQ `tool_use`
+    in JSONL until the answer, so ``_last_auq_tool_use_id`` is UNSET. Stamping
+    the meta from that cache alone left both cards carrying `tool_use_id=None`,
+    the identity re-stamp never fired, and A-era narration cleared B.
+    """
     wid = _bind(scenario, _picker_pane())
-    interactive_ui.remember_ask_tool_input(wid, _TOOL_INPUT_A, "toolu_A")
+    if not hook_first:
+        interactive_ui.remember_ask_tool_input(wid, _TOOL_INPUT_A, "toolu_A")
     _write_side_file(_TOOL_INPUT_A, tool_use_id="toolu_A")
     assert await _render(scenario, wid)
     born_a = _born_at(scenario)
+    assert _meta(scenario).tool_use_id == "toolu_A", (
+        "the published meta must carry the AUTHORITATIVE side-file identity"
+    )
 
     scenario.tmux.set_pane(wid, _picker_pane_c())
-    interactive_ui.remember_ask_tool_input(wid, _TOOL_INPUT_C, "toolu_B")
+    if not hook_first:
+        interactive_ui.remember_ask_tool_input(wid, _TOOL_INPUT_C, "toolu_B")
     _write_side_file(_TOOL_INPUT_C, tool_use_id="toolu_B")
     assert await _render(scenario, wid)
     born_b = _born_at(scenario)
+    assert _meta(scenario).tool_use_id == "toolu_B"
     assert born_b > born_a, "an AUQ identity change must RE-STAMP surface_born_at"
 
     mid = born_a + (born_b - born_a) / 2
@@ -708,6 +724,47 @@ async def test_clear_queued_behind_a_replacement_decides_on_the_new_surface(
 
 
 @pytest.mark.asyncio
+async def test_clear_queued_behind_a_gate_to_auq_replacement_proceeds(
+    scenario: ScenarioHarness, gate_on
+) -> None:
+    """The mirror ordering: the queued clear was enqueued against a GATE (which
+    would veto it) and acquires the lock after an AUQ replaced it. Deciding on
+    the pre-replacement meta would wrongly PRESERVE the AUQ; the locked
+    re-derivation clears it."""
+    wid = _bind(scenario, _load("permission_bash_v2.1.190.txt"))
+    assert await _render(scenario, wid)
+    assert _meta(scenario).surface_kind == "Permission"
+    ikey = (scenario.user_id, _THREAD_ID)
+
+    lock = interactive_ui._get_route_lock(scenario.user_id, _THREAD_ID)
+    await lock.acquire()
+    try:
+        task = asyncio.create_task(
+            _parent_text(scenario, "Done — moving on.", timestamp=_now_iso())
+        )
+        await _wait_until_lock_contended(lock)
+        # The AUQ replaces the gate while the clear waits for the lock; its
+        # birth predates the block, so nothing vetoes.
+        interactive_ui._interactive_msg_meta[ikey] = interactive_ui._InteractiveMsgMeta(
+            msg_id=interactive_ui._interactive_msgs[ikey],
+            window_id=wid,
+            session_id=_SESSION_ID,
+            tool_use_id="toolu_A",
+            created_at=_now_iso(-60),
+            surface_kind="AskUserQuestion",
+            surface_born_at=_now_iso(-60),
+        )
+    finally:
+        lock.release()
+    await task
+
+    assert not _has_surface(scenario), (
+        "the gate veto belonged to the surface the refresh REPLACED — the "
+        "locked re-derivation must decide on the AUQ that owns the card now"
+    )
+
+
+@pytest.mark.asyncio
 async def test_resolution_bypass_refused_against_a_replacement(
     scenario: ScenarioHarness,
 ) -> None:
@@ -754,16 +811,37 @@ async def test_resolution_bypass_refused_against_a_replacement(
 
 
 async def _seed_auq_then_replacement(
-    scenario: ScenarioHarness, *, replacement_pane: str, gate_flag: bool = False
+    scenario: ScenarioHarness,
+    *,
+    replacement_pane: str,
+    gate_flag: bool = False,
+    hook_first: bool = True,
 ) -> str:
-    """Publish AUQ-A's card (side file + ctx state), then replace it in place."""
+    """Publish AUQ-A's card (side file + ctx state), then replace it in place.
+
+    ``hook_first`` (the default, and the NORMAL production shape) skips the
+    ``remember_ask_tool_input`` preload: the JSONL `tool_use` is still buffered,
+    so `_last_auq_tool_use_id` is unset, the ctx record carries NO tool_use_id
+    and the ctx marker is `pretool:<source_fingerprint[:16]>`.
+    """
     wid = _bind(scenario, _picker_pane())
-    interactive_ui.remember_ask_tool_input(wid, _TOOL_INPUT_A, "toolu_A")
+    if not hook_first:
+        interactive_ui.remember_ask_tool_input(wid, _TOOL_INPUT_A, "toolu_A")
     _write_side_file(_TOOL_INPUT_A, tool_use_id="toolu_A")
     assert await _render(scenario, wid)
-    assert interactive_ui._auq_context_posted.get(wid) is not None, (
+    marker = interactive_ui._auq_context_posted.get(wid)
+    assert marker is not None, (
         "AUQ-A's 📋 context card must be posted for the retirement assertions"
     )
+    if hook_first:
+        recovery = auq_source.read_side_file_for_recovery(_SESSION_ID)
+        assert recovery is not None
+        assert marker == f"pretool:{recovery.source_fingerprint[:16]}", (
+            "the hook-first marker is keyed on the side file's SOURCE "
+            "FINGERPRINT, not on any tool_use_id — the shape the narrow "
+            "cleanup's attribution must recognise"
+        )
+        assert interactive_ui._auq_context_msgs[wid].tool_use_id is None
     if gate_flag:
         terminal_parser.set_permission_prompts_enabled(True)
     scenario.tmux.set_pane(wid, replacement_pane)
@@ -882,6 +960,280 @@ async def test_non_afk_resolution_behind_decision_replacement_spares_dcp_rows(
 
 
 @pytest.mark.asyncio
+async def test_afk_behind_gate_replacement_does_only_the_narrow_cleanup(
+    scenario: ScenarioHarness,
+) -> None:
+    """The 7e2 sibling sub-shape: AFK-behind-GATE. The gate card is never popped
+    or converted, only A's own state is retired, and the generic seam that runs
+    next is stopped by the GATE veto (not by the timestamp veto), so a FRESH
+    block ts can't clear it either."""
+    wid = await _seed_auq_then_replacement(
+        scenario,
+        replacement_pane=_load("permission_bash_v2.1.190.txt"),
+        gate_flag=True,
+    )
+    assert _meta(scenario).surface_kind == "Permission"
+    edits_before = len(
+        [s for s in scenario.bot.sent if s.method == "edit_message_text"]
+    )
+
+    auq_ledger.record(
+        "decision:fpGate:1",
+        state="accepted",
+        user_id=scenario.user_id,
+        window_id=wid,
+        full_fingerprint="cc" * 20,
+        option_number=1,
+        option_label="Yes",
+    )
+    auq_ledger.record("decision:fpGate:1", state="dispatched")
+
+    await _parent_tool_result(
+        scenario,
+        tool_name="AskUserQuestion",
+        tool_use_id="toolu_A",
+        timestamp=_now_iso(),  # FRESH — only the gate veto can stop this
+        text="No response after 60s — the user may be away from keyboard.",
+        tool_result_meta={"answers": {}},
+    )
+
+    assert _has_surface(scenario), "a gate card is never converted or cleared"
+    assert (
+        len([s for s in scenario.bot.sent if s.method == "edit_message_text"])
+        == edits_before
+    ), "no ⏰ late-answer conversion of the gate card"
+    assert not _side_file_path().exists()
+    row = auq_ledger.lookup("decision:fpGate:1")
+    assert row is not None and row.state == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_non_afk_resolution_behind_epm_replacement_spares_the_plan_marker(
+    scenario: ScenarioHarness,
+) -> None:
+    """The 7e2 sibling sub-shape: a NON-AFK AUQ-A tool_result behind an EPM-B
+    leaves B equally intact — B's plan-body dedup marker survives (no
+    ``forget_ask_tool_input``) and the generic seam's KIND-MATCH refuses the
+    resolution bypass, so the stale block takes the timestamp veto."""
+    wid = await _seed_auq_then_replacement(scenario, replacement_pane=_exitplan_pane())
+    assert _meta(scenario).surface_kind == "ExitPlanMode"
+    born = _born_at(scenario)
+    md_capture.msg_display_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+    md_capture.record_epm_plan_shown_live(
+        _SESSION_ID, norm_hash="planhash67c", shown_at=time.time()
+    )
+    auq_ledger.record(
+        "rh:fpA:1",
+        state="accepted",
+        user_id=scenario.user_id,
+        window_id=wid,
+        full_fingerprint="dd" * 20,
+        option_number=1,
+        option_label="A) Ship now",
+    )
+    auq_ledger.record("rh:fpA:1", state="dispatched")
+
+    await _parent_tool_result(
+        scenario,
+        tool_name="AskUserQuestion",
+        tool_use_id="toolu_A",
+        timestamp=_iso(born - timedelta(seconds=30)),
+    )
+
+    assert _has_surface(scenario), "the EPM replacement survives the stale block"
+    assert not _side_file_path().exists()
+    assert md_capture.was_epm_plan_shown_live(_SESSION_ID, "planhash67c") is True
+    row = auq_ledger.lookup("rh:fpA:1")
+    assert row is not None and row.state == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_narrow_cleanup_runs_with_the_side_file_already_gone(
+    scenario: ScenarioHarness,
+) -> None:
+    """The cleanup licence is the SAME positive proof the parity gate uses, not
+    a stricter side-file-specific one. With A's side file already unlinked (an
+    earlier teardown, the startup GC, a `/clear` race) the identity still
+    resolves from the published meta — so the cleanup must still retire A's
+    replay + context state instead of reporting ``narrow`` and cleaning
+    nothing, which would leave that state to poison the next AUQ."""
+    wid = await _seed_auq_then_replacement(
+        scenario, replacement_pane=_exitplan_pane(), hook_first=False
+    )
+    _side_file_path().unlink()
+    assert (
+        interactive_ui._interactive_msg_meta[(scenario.user_id, _THREAD_ID)].tool_use_id
+        == "toolu_A"
+    ), "the identity survives on the published meta"
+    assert interactive_ui._auq_context_posted.get(wid) is not None
+
+    await _parent_tool_result(
+        scenario,
+        tool_name="AskUserQuestion",
+        tool_use_id="toolu_A",
+        timestamp=_now_iso(-30),
+    )
+
+    assert _has_surface(scenario), "the EPM replacement is still protected"
+    assert interactive_ui._last_auq_tool_use_id.get(wid) is None
+    assert interactive_ui._last_completed_ask_tool_input.get(wid) is None
+    assert interactive_ui._auq_context_posted.get(wid) is None
+    assert interactive_ui._auq_context_msgs.get(wid) is None
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciler_after_narrow_cleanup_releases_nothing(
+    scenario: ScenarioHarness, tmp_path
+) -> None:
+    """Continuation (ii): a restart after the narrow cleanup finds NO A side
+    file, so the startup reconciler's positive-proof branch can't fire and the
+    replacement Decision's ``dcp:`` rows survive the restart.
+
+    Drives the REAL reconciler (``SessionMonitor._hydrate_ask_tool_input_cache``)
+    over a JSONL that carries A's tool_use AND its tool_result — the exact shape
+    that WOULD license ``release_window`` if A's side file were still there.
+    """
+    wid = await _seed_auq_then_replacement(
+        scenario,
+        replacement_pane=_load("permission_bash_v2.1.190.txt"),
+        gate_flag=True,
+    )
+    auq_ledger.record(
+        "decision:fpB:1",
+        state="accepted",
+        user_id=scenario.user_id,
+        window_id=wid,
+        full_fingerprint="ee" * 20,
+        option_number=1,
+        option_label="Yes",
+    )
+    auq_ledger.record("decision:fpB:1", state="dispatched")
+
+    await _parent_tool_result(
+        scenario,
+        tool_name="AskUserQuestion",
+        tool_use_id="toolu_A",
+        timestamp=_now_iso(-30),
+    )
+    assert not _side_file_path().exists()
+
+    jsonl = tmp_path / f"{_SESSION_ID}.jsonl"
+    jsonl.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in (
+                {
+                    "type": "assistant",
+                    "sessionId": _SESSION_ID,
+                    "cwd": "/repo",
+                    "timestamp": "2026-08-24T12:00:00.000Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_A",
+                                "name": "AskUserQuestion",
+                                "input": _TOOL_INPUT_A,
+                            }
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "sessionId": _SESSION_ID,
+                    "cwd": "/repo",
+                    "timestamp": "2026-08-24T12:00:30.000Z",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_A",
+                                "content": "Answered.",
+                            }
+                        ]
+                    },
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monitor = SessionMonitor(
+        projects_path=tmp_path / "projects",
+        state_file=tmp_path / "monitor_state.json",
+    )
+
+    async def _scan(_active_ids=None):
+        return [SessionInfo(session_id=_SESSION_ID, file_path=jsonl)]
+
+    monitor.scan_projects = _scan  # type: ignore[method-assign]
+    await monitor._hydrate_ask_tool_input_cache({wid: _SESSION_ID})
+
+    row = auq_ledger.lookup("decision:fpB:1")
+    assert row is not None and row.state == "dispatched", (
+        "with A's side file already retired the reconciler has no positive "
+        "proof to act on — it must not broadly release the window"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unreleased_row_answers_action_already_received(
+    scenario: ScenarioHarness,
+) -> None:
+    """7e5, the disclosed cost asserted through the REAL callback: A's
+    dispatched row is never released by the narrow cleanup, so a same-day
+    byte-identical AUQ re-tap answers "Action already received" instead of
+    dispatching. Bounded by the ledger's 24h read retention."""
+    wid = await _seed_auq_then_replacement(scenario, replacement_pane=_exitplan_pane())
+    fingerprint = "ff" * 20
+    entry = pick_token.PickTokenEntry(
+        window_id=wid,
+        user_id=scenario.user_id,
+        thread_id=_THREAD_ID,
+        fingerprint=fingerprint,
+        option_number=1,
+        option_label="A) Ship now",
+        is_review_submit=False,
+        expires_at=time.monotonic() + 300.0,
+        source_kind="pane",
+        source_fingerprint="sfp",
+        row_generation=1,
+    )
+    token = pick_token.mint(entry)
+    route_hash = auq_ledger.make_route_hash(scenario.user_id, _THREAD_ID, wid)
+    ledger_key = auq_ledger.make_ledger_key(route_hash, fingerprint[:8], 1)
+    auq_ledger.record(
+        ledger_key,
+        state="accepted",
+        user_id=scenario.user_id,
+        window_id=wid,
+        full_fingerprint=fingerprint,
+        option_number=1,
+        option_label="A) Ship now",
+    )
+    auq_ledger.record(ledger_key, state="dispatched")
+
+    await _parent_tool_result(
+        scenario,
+        tool_name="AskUserQuestion",
+        tool_use_id="toolu_A",
+        timestamp=_now_iso(-30),
+    )
+
+    update = make_update_callback(
+        f"{CB_ASK_PICK}{route_hash}:{fingerprint[:8]}:1:{token}",
+        thread_id=_THREAD_ID,
+        user_id=scenario.user_id,
+    )
+    await bot_module.callback_handler(update, scenario.context)
+
+    update.callback_query.answer.assert_awaited()
+    assert update.callback_query.answer.await_args.args[0] == (
+        "Action already received: A) Ship now"
+    ), "the un-released dispatched row is the DISCLOSED cost of the narrow cleanup"
+
+
+@pytest.mark.asyncio
 async def test_unknown_parity_behind_a_replacement_cleans_nothing(
     scenario: ScenarioHarness,
 ) -> None:
@@ -912,13 +1264,21 @@ async def test_unknown_parity_behind_a_replacement_cleans_nothing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hook_first", [True, False], ids=["hook_first", "jsonl_cache"])
 async def test_narrow_cleanup_retires_a_s_replay_and_context_state(
-    scenario: ScenarioHarness,
+    scenario: ScenarioHarness, hook_first: bool
 ) -> None:
     """7e4: after the narrow cleanup a later AUQ-C must not resolve through A's
     stale replay caches, must get its OWN 📋 context card, and must never
-    upgrade A's historical context message with C's text."""
-    wid = await _seed_auq_then_replacement(scenario, replacement_pane=_exitplan_pane())
+    upgrade A's historical context message with C's text.
+
+    Both marker shapes: the hook-first `pretool:<source_fingerprint>` (the
+    normal production one, which carries no tool_use_id anywhere) and the
+    JSONL-cache `<tool_use_id>`.
+    """
+    wid = await _seed_auq_then_replacement(
+        scenario, replacement_pane=_exitplan_pane(), hook_first=hook_first
+    )
     a_ctx_msg_ids = interactive_ui._auq_context_msgs[wid].message_ids
 
     await _parent_tool_result(

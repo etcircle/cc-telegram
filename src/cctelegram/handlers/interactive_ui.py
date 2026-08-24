@@ -4367,7 +4367,7 @@ async def handle_interactive_ui(
                     msg_id=existing_msg_id,
                     window_id=window_id,
                     session_id=session_id_for_window(window_id) or "",
-                    tool_use_id=_last_auq_tool_use_id.get(window_id),
+                    tool_use_id=_current_auq_tool_use_id(window_id),
                     surface_kind=content.name,
                 )
                 # The interactive card edit landed in the topic. The
@@ -4530,7 +4530,7 @@ async def handle_interactive_ui(
             msg_id=sent.message_id,
             window_id=window_id,
             session_id=interactive_session_id or "",
-            tool_use_id=_last_auq_tool_use_id.get(window_id),
+            tool_use_id=_current_auq_tool_use_id(window_id),
             surface_kind=content.name,
         )
         _interactive_mode[ikey] = window_id
@@ -4607,6 +4607,33 @@ def _parse_aware_iso(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _peek_side_file_auq_id(window_id: str | None) -> str | None:
+    """The window session's live PreToolUse side-file ``tool_use_id``, if any.
+
+    The AUTHORITATIVE occurrence identity in the HOOK-FIRST shape — which is the
+    normal production one: the hook writes the side file BEFORE the picker
+    renders, while ``_last_auq_tool_use_id`` stays unset until the JSONL
+    ``tool_use`` flushes at resolution.
+    """
+    if not window_id:
+        return None
+    session_id = session_id_for_window(window_id)
+    if not session_id:
+        return None
+    return auq_source.peek_side_file_tool_use_id(session_id) or None
+
+
+def _current_auq_tool_use_id(window_id: str) -> str | None:
+    """The AUQ identity to STAMP on a publish — side file FIRST, then the cache.
+
+    Stamping from ``_last_auq_tool_use_id`` alone left every hook-first card
+    with ``tool_use_id=None``, so a consecutive AUQ-A→AUQ-B in-place
+    replacement never satisfied the ``surface_born_at`` re-stamp rule and A-era
+    narration could clear B. Same side-file-first priority the parity checks use.
+    """
+    return _peek_side_file_auq_id(window_id) or _last_auq_tool_use_id.get(window_id)
+
+
 def _live_auq_tool_use_id(
     window_id: str | None, meta: "_InteractiveMsgMeta | None"
 ) -> str | None:
@@ -4618,12 +4645,9 @@ def _live_auq_tool_use_id(
     Returns None when no identity is knowable — every caller treats that as
     "unknown", never as a mismatch.
     """
-    if window_id:
-        session_id = session_id_for_window(window_id)
-        if session_id:
-            side_id = auq_source.peek_side_file_tool_use_id(session_id)
-            if side_id:
-                return side_id
+    side_id = _peek_side_file_auq_id(window_id)
+    if side_id:
+        return side_id
     if meta is not None and meta.tool_use_id:
         return meta.tool_use_id
     if window_id:
@@ -4694,15 +4718,30 @@ def _clear_skip_reason(
     return None
 
 
-def _ctx_state_attributable_to(window_id: str, tool_use_id: str) -> bool:
+def _ctx_state_attributable_to(
+    window_id: str, tool_use_id: str, context_fingerprint: str | None
+) -> bool:
     """Is the window's AUQ context-card state THIS AUQ's (or id-less legacy)?
 
-    The record's own ``tool_use_id`` is the explicit authority; the marker
-    string is the fallback (``<tool_use_id>`` or ``pretool:<tool_use_id>`` for
-    an id-carrying source, ``form:<fingerprint>`` for the pane-derived one,
-    which carries no identity at all and is therefore unattributable-legacy).
-    A ``pretool:`` marker that does NOT match is left alone: it cannot be told
-    apart from a successor's freshly-written entry, and never popping a
+    Three attribution shapes, because the marker's identity depends on which
+    source minted it:
+
+      * ``_ContextMsgRecord.tool_use_id`` — the explicit authority, but only the
+        JSONL-sourced (``dict_via_jsonl``) shape has one;
+      * the marker string — ``<tool_use_id>`` for that same JSONL source, and
+        ``pretool:<source_fingerprint[:16]>`` for the HOOK-FIRST source, which
+        is the normal production shape and carries NO tool_use_id at all.
+        ``context_fingerprint`` is that AUQ's own side-file
+        ``source_fingerprint``, read through
+        ``auq_source.read_side_file_for_recovery`` — the SAME
+        ``_canonical_dict_fingerprint`` digest the render seam mints from
+        (mint/validate parity: a divergent digest here would silently never
+        match);
+      * ``form:<fingerprint>`` — the pane-derived fallback, which carries no
+        identity at all and is therefore unattributable-legacy.
+
+    A ``pretool:`` marker matching NEITHER our id nor our fingerprint is left
+    alone: it is a successor's freshly-written entry, and never popping a
     successor's state is the hard invariant here.
     """
     record = _auq_context_msgs.get(window_id)
@@ -4712,16 +4751,20 @@ def _ctx_state_attributable_to(window_id: str, tool_use_id: str) -> bool:
     if marker is not None:
         if marker in (tool_use_id, f"pretool:{tool_use_id}"):
             return True
+        if context_fingerprint and marker == f"pretool:{context_fingerprint[:16]}":
+            return True
         return marker.startswith("form:")
     return record is not None
 
 
 def _auq_identity_positively_matches(window_id: str, tool_use_id: str | None) -> bool:
-    """Does the live side file POSITIVELY prove ``tool_use_id`` is the live AUQ?
+    """Does the live SIDE FILE positively prove ``tool_use_id`` is the live AUQ?
 
-    Both ids must be non-empty and equal. Unknown parity is NOT a match — the
-    narrow cleanup it gates is only safe when the resolution is proven to be
-    the one whose state is being retired.
+    Both ids must be non-empty and equal. Deliberately narrower than the
+    explicit branch's ``live_id`` proof: this gates the AFK path, where an
+    unknown parity is a documented fail-CLOSED choice (pre-fix that path would
+    have converted the card AND cleaned broadly, so declining both is the
+    conservative branch).
     """
     if not tool_use_id:
         return False
@@ -4741,7 +4784,10 @@ def _narrow_auq_cleanup_locked(window_id: str, tool_use_id: str) -> None:
       1. the side file, via ``auq_source.remove_side_file_if_id`` (required —
          a retained live one strands the replacement card's absent-streak
          tombstone behind ``side_file_live_for_window`` and arms the startup
-         reconciler's broad ``release_window``);
+         reconciler's broad ``release_window``). Its record is read ONCE BEFORE
+         the unlink, so step 3 still has this AUQ's context fingerprint; a
+         missing side file simply makes the unlink a no-op and leaves steps 2
+         and 3 to run against the proven id;
       2. the two window-keyed AUQ replay caches, only while they still hold
          THIS id (leaving them recreates the stale-next-AUQ incident, and with
          the side file gone a later AUQ would resolve through the stale
@@ -4759,12 +4805,18 @@ def _narrow_auq_cleanup_locked(window_id: str, tool_use_id: str) -> None:
     ledger rows therefore stay un-released — a disclosed ≤24h degradation.
     """
     session_id = session_id_for_window(window_id)
+    context_fingerprint: str | None = None
     if session_id:
+        # ONE torn-free read before the unlink: the hook-first ctx marker is
+        # keyed on this record's source_fingerprint, not on any tool_use_id.
+        recovery = auq_source.read_side_file_for_recovery(session_id)
+        if recovery is not None and recovery.tool_use_id == tool_use_id:
+            context_fingerprint = recovery.source_fingerprint
         auq_source.remove_side_file_if_id(session_id, tool_use_id)
     if _last_auq_tool_use_id.get(window_id) == tool_use_id:
         _last_auq_tool_use_id.pop(window_id, None)
         _last_completed_ask_tool_input.pop(window_id, None)
-    if _ctx_state_attributable_to(window_id, tool_use_id):
+    if _ctx_state_attributable_to(window_id, tool_use_id, context_fingerprint):
         had_marker = _auq_context_posted.pop(window_id, None) is not None
         had_record = _auq_context_msgs.pop(window_id, None) is not None
         if had_marker or had_record:
@@ -4798,6 +4850,13 @@ async def apply_auq_tool_result_teardown(
         identity-guarded cleanup (unknown parity cleans nothing).
       * ``full`` — kind "AskUserQuestion" or None with parity not
         proven-mismatched: today's teardown, byte-identical.
+
+    The cleanup licence is the SAME positive-identity proof the parity gate
+    above rejects on — ``tool_use_id == live_id``, both known, with ``live_id``
+    resolved side-file-first then meta then replay cache. Requiring a matching
+    SIDE FILE specifically would report ``narrow`` yet clean NOTHING whenever the
+    side file is already gone, leaving this AUQ's replay + context state to
+    poison the next one.
     """
     ikey = (user_id, thread_id or 0)
     lock = _get_route_lock(user_id, thread_id)
@@ -4815,8 +4874,7 @@ async def apply_auq_tool_result_teardown(
             return "stale_auq_resolution"
         stored_kind = meta.surface_kind if meta is not None else None
         if stored_kind is not None and stored_kind != "AskUserQuestion":
-            if _auq_identity_positively_matches(window_id, tool_use_id):
-                assert tool_use_id is not None
+            if tool_use_id and live_id and tool_use_id == live_id:
                 _narrow_auq_cleanup_locked(window_id, tool_use_id)
             logger.debug(
                 "AUQ tool_result teardown narrowed reason=surface_replaced "
