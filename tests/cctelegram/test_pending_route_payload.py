@@ -8,24 +8,23 @@ must be rejected without acting on or deleting the active pending owner.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from cctelegram import delivery
 from telegram import CallbackQuery, User
 
 from cctelegram import bot as bot_module
+from cctelegram import delivery
+from cctelegram.callback_dispatcher import bash as dispatcher_bash
 from cctelegram.callback_dispatcher import directory as dispatcher_directory
 from cctelegram.callback_dispatcher import effort as dispatcher_effort
 from cctelegram.callback_dispatcher import history as dispatcher_history
 from cctelegram.callback_dispatcher import interactive as dispatcher_interactive
 from cctelegram.callback_dispatcher import screenshot as dispatcher_screenshot
-from cctelegram.callback_dispatcher import bash as dispatcher_bash
 from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram.handlers.callback_data import (
     CB_DIR_BIND_EXISTING,
@@ -39,21 +38,17 @@ from cctelegram.handlers.callback_data import (
     CB_SESSION_SELECT,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
-    CB_WIN_NEW,
 )
 from cctelegram.handlers.directory_browser import (
-    BROWSE_DIRS_KEY,
-    BROWSE_PAGE_KEY,
-    BROWSE_PATH_KEY,
-    BROWSE_UNBOUND_COUNT_KEY,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
+    ensure_picker_entry,
+    picker_entry,
 )
-from cctelegram.session import ClaudeSession
 
 
 @contextmanager
@@ -125,30 +120,32 @@ def _replay_attachment(path: Path) -> bot_module.AggregatorReplayAttachment:
 
 
 def _pending_user_data(path: Path, *, thread_id: int = 10) -> dict[str, object]:
-    return {
-        STATE_KEY: STATE_BROWSING_DIRECTORY,
-        "_pending_thread_id": thread_id,
-        "_pending_thread_text": "hello",
-        "_pending_thread_attachments": [_attachment(path)],
-        "_selected_path": "/tmp/selected",
-    }
+    """User-data holding a single thread's picker entry (GH #66 per-thread key)."""
+    user_data: dict[str, object] = {}
+    ensure_picker_entry(user_data, thread_id).update(
+        {
+            STATE_KEY: STATE_BROWSING_DIRECTORY,
+            "_pending_thread_text": "hello",
+            "_pending_thread_attachments": [_attachment(path)],
+            "_selected_path": "/tmp/selected",
+        }
+    )
+    return user_data
 
 
 def test_clear_pending_route_payload_deletes_cancelled_files(tmp_path: Path):
     payload = tmp_path / "cancelled.jpg"
     payload.write_bytes(b"image")
     user_data = _pending_user_data(payload)
-    user_data["_ignored_stale_thread_ids"] = [99]
 
-    attachments = bot_module._clear_pending_route_payload(user_data, delete_files=True)
+    attachments = bot_module._clear_pending_route_payload(
+        user_data, 10, delete_files=True
+    )
 
     assert attachments == [_attachment(payload)]
     assert not payload.exists()
-    assert "_pending_thread_id" not in user_data
-    assert "_pending_thread_text" not in user_data
-    assert "_pending_thread_attachments" not in user_data
-    assert "_selected_path" not in user_data
-    assert "_ignored_stale_thread_ids" not in user_data
+    # GH #66: dropping the entry clears the whole per-thread bundle.
+    assert picker_entry(user_data, 10) is None
 
 
 def test_clear_pending_route_payload_preserves_files_for_successful_flush(
@@ -158,11 +155,13 @@ def test_clear_pending_route_payload_preserves_files_for_successful_flush(
     payload.write_bytes(b"image")
     user_data = _pending_user_data(payload)
 
-    attachments = bot_module._clear_pending_route_payload(user_data, delete_files=False)
+    attachments = bot_module._clear_pending_route_payload(
+        user_data, 10, delete_files=False
+    )
 
     assert attachments == [_attachment(payload)]
     assert payload.exists()
-    assert "_pending_thread_attachments" not in user_data
+    assert picker_entry(user_data, 10) is None
 
 
 def _make_topic_closed_update(*, thread_id: int = 10) -> MagicMock:
@@ -207,11 +206,7 @@ async def test_topic_close_unbound_matching_pending_file_deletes_and_clears_stat
     mock_get_window.assert_called_once_with(1, 10)
     mock_clear.assert_not_called()
     assert not payload.exists()
-    assert STATE_KEY not in context.user_data
-    assert BROWSE_PATH_KEY not in context.user_data
-    assert "_pending_thread_attachments" not in context.user_data
-    assert "_pending_thread_text" not in context.user_data
-    assert "_pending_thread_id" not in context.user_data
+    assert picker_entry(context.user_data, 10) is None
 
 
 @pytest.mark.asyncio
@@ -256,10 +251,7 @@ async def test_topic_close_bound_matching_pending_attachments_deletes_and_clears
     mock_unbind.assert_called_once_with(1, 10)
     mock_clear.assert_awaited_once_with(1, 10, context.bot, context.user_data)
     assert not payload.exists()
-    assert STATE_KEY not in context.user_data
-    assert "_pending_thread_attachments" not in context.user_data
-    assert "_pending_thread_text" not in context.user_data
-    assert "_pending_thread_id" not in context.user_data
+    assert picker_entry(context.user_data, 10) is None
 
 
 @pytest.mark.asyncio
@@ -286,10 +278,12 @@ async def test_topic_close_different_thread_preserves_active_pending_payload(
 
     mock_clear.assert_not_called()
     assert payload.exists()
-    assert context.user_data[STATE_KEY] == STATE_BROWSING_DIRECTORY
-    assert context.user_data["_pending_thread_id"] == 99
-    assert context.user_data["_pending_thread_text"] == "hello"
-    assert context.user_data["_pending_thread_attachments"] == [_attachment(payload)]
+    # GH #66: closing thread 10 leaves thread 99's per-topic entry untouched.
+    entry = picker_entry(context.user_data, 99)
+    assert entry is not None
+    assert entry[STATE_KEY] == STATE_BROWSING_DIRECTORY
+    assert entry["_pending_thread_text"] == "hello"
+    assert entry["_pending_thread_attachments"] == [_attachment(payload)]
 
 
 def _make_callback_update(data: str, *, thread_id: int = 10) -> MagicMock:
@@ -321,7 +315,8 @@ def _make_real_callback_query(*, user_id: int = 1) -> tuple[CallbackQuery, User]
 async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() -> None:
     query, user = _make_real_callback_query()
     context = MagicMock()
-    context.user_data = {"_pending_thread_id": 10, "_pending_thread_text": "hello"}
+    context.user_data = {}
+    ensure_picker_entry(context.user_data, 10)["_pending_thread_text"] = "hello"
 
     with (
         patch.object(
@@ -367,8 +362,7 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
     edited_text = safe_edit.await_args.args[1]
     assert "Claude session didn't register in time" in edited_text
     assert "unmonitored tmux window was cleaned up" in edited_text
-    assert "_pending_thread_id" not in context.user_data
-    assert "_pending_thread_text" not in context.user_data
+    assert picker_entry(context.user_data, 10) is None
     answer.assert_awaited_once_with("Hook timeout", show_alert=False)
 
 
@@ -403,18 +397,18 @@ async def _assert_hook_wait_timeout(
             new_callable=AsyncMock,
             side_effect=_StopAfterWait,
         ) as wait_for_map,
+        pytest.raises(_StopAfterWait),
     ):
-        with pytest.raises(_StopAfterWait):
-            await bot_module._create_and_bind_window(
-                query,
-                context,
-                user,
-                "/repo",
-                pending_thread_id=None,
-                tmux_mgr=bot_module.tmux_manager,
-                session_mgr=bot_module.session_manager,
-                resume_session_id=resume_session_id,
-            )
+        await bot_module._create_and_bind_window(
+            query,
+            context,
+            user,
+            "/repo",
+            pending_thread_id=None,
+            tmux_mgr=bot_module.tmux_manager,
+            session_mgr=bot_module.session_manager,
+            resume_session_id=resume_session_id,
+        )
 
     wait_for_map.assert_awaited_once_with("@42", timeout=expected_timeout)
 
@@ -447,7 +441,8 @@ async def test_hook_timeout_default_resume_without_override() -> None:
 async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
     query, user = _make_real_callback_query()
     context = MagicMock()
-    context.user_data = {"_pending_thread_id": 10, "_pending_thread_text": "hello"}
+    context.user_data = {}
+    ensure_picker_entry(context.user_data, 10)["_pending_thread_text"] = "hello"
 
     with (
         patch.object(
@@ -498,7 +493,8 @@ async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_windo
 ):
     query, user = _make_real_callback_query()
     context = MagicMock()
-    context.user_data = {"_pending_thread_id": 10}
+    context.user_data = {}
+    ensure_picker_entry(context.user_data, 10)
     window_state = SimpleNamespace(session_id="", cwd="", window_name="")
 
     with (
@@ -671,23 +667,6 @@ def _make_text_update(*, thread_id: int = 99, text: str = "topic b text") -> Mag
     return update
 
 
-def _cross_topic_picker_user_data(
-    stale_file: Path, *, stale_state: str, thread_id: int = 10
-) -> dict[str, object]:
-    user_data = _pending_user_data(stale_file, thread_id=thread_id)
-    user_data[STATE_KEY] = stale_state
-    if stale_state == STATE_BROWSING_DIRECTORY:
-        user_data[BROWSE_PATH_KEY] = "/old/topic-a"
-        user_data[BROWSE_PAGE_KEY] = 7
-        user_data[BROWSE_DIRS_KEY] = ["old-dir"]
-        user_data[BROWSE_UNBOUND_COUNT_KEY] = 3
-    elif stale_state == STATE_SELECTING_WINDOW:
-        user_data[UNBOUND_WINDOWS_KEY] = ["old-window"]
-    elif stale_state == STATE_SELECTING_SESSION:
-        user_data[SESSIONS_KEY] = ["old-session"]
-    return user_data
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "callback_data", [CB_DIR_CANCEL, CB_SESSION_CANCEL, CB_WIN_CANCEL]
@@ -699,12 +678,13 @@ async def test_picker_cancel_clears_pending_attachments_and_deletes_file(
     payload.write_bytes(b"data")
     context = MagicMock()
     context.user_data = _pending_user_data(payload, thread_id=10)
+    _entry = picker_entry(context.user_data, 10)
     if callback_data == CB_SESSION_CANCEL:
-        context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
-        context.user_data[SESSIONS_KEY] = []
+        _entry[STATE_KEY] = STATE_SELECTING_SESSION
+        _entry[SESSIONS_KEY] = []
     elif callback_data == CB_WIN_CANCEL:
-        context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-        context.user_data[UNBOUND_WINDOWS_KEY] = []
+        _entry[STATE_KEY] = STATE_SELECTING_WINDOW
+        _entry[UNBOUND_WINDOWS_KEY] = []
     update = _make_callback_update(callback_data, thread_id=10)
 
     with (
@@ -715,9 +695,8 @@ async def test_picker_cancel_clears_pending_attachments_and_deletes_file(
         await bot_module.callback_handler(update, context)
 
     assert not payload.exists()
-    assert "_pending_thread_attachments" not in context.user_data
-    assert "_pending_thread_text" not in context.user_data
-    assert "_pending_thread_id" not in context.user_data
+    # GH #66: cancel drops this thread's whole picker entry.
+    assert picker_entry(context.user_data, 10) is None
     mock_safe_edit.assert_awaited_once()
     update.callback_query.answer.assert_awaited_once()
 
@@ -730,7 +709,8 @@ async def test_stale_session_picker_mismatch_preserves_pending_attachments(
     payload.write_bytes(b"data")
     context = MagicMock()
     context.user_data = _pending_user_data(payload, thread_id=10)
-    context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+    picker_entry(context.user_data, 10)[STATE_KEY] = STATE_SELECTING_SESSION
+    # GH #66: the callback lands on thread 99, which owns NO picker entry.
     update = _make_callback_update(CB_SESSION_NEW, thread_id=99)
 
     with (
@@ -740,14 +720,15 @@ async def test_stale_session_picker_mismatch_preserves_pending_attachments(
     ):
         await bot_module.callback_handler(update, context)
 
+    # Thread 10's picker entry is untouched by a thread-99 callback.
     assert payload.exists()
-    assert context.user_data["_pending_thread_attachments"] == [_attachment(payload)]
-    assert context.user_data["_pending_thread_text"] == "hello"
-    assert context.user_data["_pending_thread_id"] == 10
+    entry = picker_entry(context.user_data, 10)
+    assert entry is not None
+    assert entry["_pending_thread_attachments"] == [_attachment(payload)]
+    assert entry["_pending_thread_text"] == "hello"
     mock_create.assert_not_called()
-    update.callback_query.answer.assert_awaited_once_with(
-        "Stale picker (topic mismatch)", show_alert=True
-    )
+    # Self-heal on the orphaned card (no popup string).
+    update.callback_query.answer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -768,6 +749,7 @@ async def test_stale_directory_browser_callbacks_preserve_pending_attachments(
     payload.write_bytes(b"data")
     context = MagicMock()
     context.user_data = _pending_user_data(payload, thread_id=10)
+    # GH #66: the callback lands on thread 99, which owns NO picker entry.
     update = _make_callback_update(callback_data, thread_id=99)
 
     with (
@@ -777,134 +759,15 @@ async def test_stale_directory_browser_callbacks_preserve_pending_attachments(
     ):
         await bot_module.callback_handler(update, context)
 
+    # Thread 10's picker entry is untouched by a thread-99 callback.
     assert payload.exists()
-    assert context.user_data["_pending_thread_attachments"] == [_attachment(payload)]
-    assert context.user_data["_pending_thread_text"] == "hello"
-    assert context.user_data["_pending_thread_id"] == 10
-    mock_safe_edit.assert_not_called()
-    update.callback_query.answer.assert_awaited_once_with(
-        "Stale browser (topic mismatch)", show_alert=True
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "stale_state",
-    [
-        STATE_BROWSING_DIRECTORY,
-        STATE_SELECTING_WINDOW,
-        STATE_SELECTING_SESSION,
-    ],
-)
-async def test_photo_from_new_topic_clears_cross_topic_picker_state_and_opens_picker(
-    tmp_path: Path, stale_state: str
-):
-    stale_file = tmp_path / "topic-a-photo.bin"
-    stale_file.write_bytes(b"stale")
-    context = MagicMock()
-    context.user_data = _cross_topic_picker_user_data(
-        stale_file, stale_state=stale_state, thread_id=10
-    )
-    update = _make_photo_update(thread_id=99)
-    media_dir = tmp_path / "images"
-
-    with (
-        _patch_both("_IMAGES_DIR", media_dir),
-        _patch_both("is_user_allowed", return_value=True),
-        patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(
-            bot_module.session_manager, "get_window_for_thread", return_value=None
-        ),
-        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
-        _patch_both(
-            "build_directory_browser",
-            return_value=("picker", MagicMock(), ["new-dir"]),
-        ) as mock_build_picker,
-        _patch_both("safe_reply", new_callable=AsyncMock) as mock_reply,
-    ):
-        await bot_module.photo_handler(update, context)
-
-    assert not stale_file.exists()
-    assert context.user_data["_pending_thread_id"] == 99
-    assert context.user_data[STATE_KEY] == STATE_BROWSING_DIRECTORY
-    assert context.user_data[BROWSE_PATH_KEY] == str(bot_module.config.browse_root)
-    assert context.user_data[BROWSE_PAGE_KEY] == 0
-    assert context.user_data[BROWSE_DIRS_KEY] == ["new-dir"]
-    assert context.user_data[BROWSE_UNBOUND_COUNT_KEY] == 0
-    assert "_pending_thread_text" not in context.user_data
-    assert "_selected_path" not in context.user_data
-    assert UNBOUND_WINDOWS_KEY not in context.user_data
-    assert SESSIONS_KEY not in context.user_data
-    pending_attachments = context.user_data["_pending_thread_attachments"]
-    assert len(pending_attachments) == 1
-    pending_path = Path(pending_attachments[0].path)
-    assert pending_path.parent == media_dir
-    assert pending_path.exists()
-    assert pending_attachments[0].caption == "new caption"
-    mock_build_picker.assert_called_once_with(
-        str(bot_module.config.browse_root), unbound_count=0
-    )
-    mock_reply.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "stale_state",
-    [
-        STATE_BROWSING_DIRECTORY,
-        STATE_SELECTING_WINDOW,
-        STATE_SELECTING_SESSION,
-    ],
-)
-async def test_document_from_new_topic_clears_cross_topic_picker_state_and_opens_picker(
-    tmp_path: Path, stale_state: str
-):
-    stale_file = tmp_path / "topic-a-doc.bin"
-    stale_file.write_bytes(b"stale")
-    context = MagicMock()
-    context.user_data = _cross_topic_picker_user_data(
-        stale_file, stale_state=stale_state, thread_id=10
-    )
-    update = _make_document_update(thread_id=99)
-    media_dir = tmp_path / "files"
-
-    with (
-        _patch_both("_FILES_DIR", media_dir),
-        _patch_both("is_user_allowed", return_value=True),
-        patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(
-            bot_module.session_manager, "get_window_for_thread", return_value=None
-        ),
-        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
-        _patch_both(
-            "build_directory_browser",
-            return_value=("picker", MagicMock(), ["new-dir"]),
-        ) as mock_build_picker,
-        _patch_both("safe_reply", new_callable=AsyncMock) as mock_reply,
-    ):
-        await bot_module.document_handler(update, context)
-
-    assert not stale_file.exists()
-    assert context.user_data["_pending_thread_id"] == 99
-    assert context.user_data[STATE_KEY] == STATE_BROWSING_DIRECTORY
-    assert context.user_data[BROWSE_PATH_KEY] == str(bot_module.config.browse_root)
-    assert context.user_data[BROWSE_PAGE_KEY] == 0
-    assert context.user_data[BROWSE_DIRS_KEY] == ["new-dir"]
-    assert context.user_data[BROWSE_UNBOUND_COUNT_KEY] == 0
-    assert "_pending_thread_text" not in context.user_data
-    assert "_selected_path" not in context.user_data
-    assert UNBOUND_WINDOWS_KEY not in context.user_data
-    assert SESSIONS_KEY not in context.user_data
-    pending_attachments = context.user_data["_pending_thread_attachments"]
-    assert len(pending_attachments) == 1
-    pending_path = Path(pending_attachments[0].path)
-    assert pending_path.parent == media_dir
-    assert pending_path.exists()
-    assert pending_attachments[0].caption == "new caption"
-    mock_build_picker.assert_called_once_with(
-        str(bot_module.config.browse_root), unbound_count=0
-    )
-    mock_reply.assert_awaited_once()
+    entry = picker_entry(context.user_data, 10)
+    assert entry is not None
+    assert entry["_pending_thread_attachments"] == [_attachment(payload)]
+    assert entry["_pending_thread_text"] == "hello"
+    # The dead thread-99 card self-heals (edit + answer, no popup string).
+    mock_safe_edit.assert_awaited_once()
+    update.callback_query.answer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -943,7 +806,9 @@ async def test_unbound_photo_caption_reply_context_is_stashed_rendered(
         mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
         await bot_module.photo_handler(update, context)
 
-    pending_attachments = context.user_data["_pending_thread_attachments"]
+    pending_attachments = picker_entry(context.user_data, 99)[
+        "_pending_thread_attachments"
+    ]
     assert len(pending_attachments) == 1
     caption = pending_attachments[0].caption
     assert "[Telegram reply context]" in caption
@@ -989,7 +854,9 @@ async def test_unbound_document_caption_reply_context_is_stashed_rendered(
         mock_resolve.side_effect = lambda reply_ctx, _chat_id: reply_ctx
         await bot_module.document_handler(update, context)
 
-    pending_attachments = context.user_data["_pending_thread_attachments"]
+    pending_attachments = picker_entry(context.user_data, 99)[
+        "_pending_thread_attachments"
+    ]
     assert len(pending_attachments) == 1
     caption = pending_attachments[0].caption
     assert "[Telegram reply context]" in caption
@@ -1046,7 +913,9 @@ async def test_unbound_photo_media_group_caption_guard_avoids_duplicate_context(
 
     captions = [
         attachment.caption
-        for attachment in context.user_data["_pending_thread_attachments"]
+        for attachment in picker_entry(context.user_data, 99)[
+            "_pending_thread_attachments"
+        ]
     ]
     assert len(captions) == 2
     assert captions[0].count("[Telegram reply context]") == 1
@@ -1102,7 +971,9 @@ async def test_unbound_document_media_group_caption_guard_avoids_duplicate_conte
 
     captions = [
         attachment.caption
-        for attachment in context.user_data["_pending_thread_attachments"]
+        for attachment in picker_entry(context.user_data, 99)[
+            "_pending_thread_attachments"
+        ]
     ]
     assert len(captions) == 2
     assert captions[0].count("[Telegram reply context]") == 1
@@ -1190,157 +1061,12 @@ async def test_bound_document_caption_still_uses_apply_reply_context(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("callback_data", "expected_answer"),
-    [
-        (f"{CB_DIR_SELECT}0", "Stale browser (topic mismatch)"),
-        (CB_DIR_UP, "Stale browser (topic mismatch)"),
-        (f"{CB_DIR_PAGE}1", "Stale browser (topic mismatch)"),
-        (CB_DIR_CANCEL, "Stale browser (topic mismatch)"),
-        (CB_DIR_BIND_EXISTING, "Stale browser (topic mismatch)"),
-        (f"{CB_SESSION_SELECT}0", "Stale picker (topic mismatch)"),
-        (CB_SESSION_NEW, "Stale picker (topic mismatch)"),
-        (CB_SESSION_CANCEL, "Stale picker (topic mismatch)"),
-        (f"{CB_WIN_BIND}0", "Stale picker (topic mismatch)"),
-        (CB_WIN_NEW, "Stale picker (topic mismatch)"),
-        (CB_WIN_CANCEL, "Stale picker (topic mismatch)"),
-    ],
-)
-async def test_replaced_topic_stale_callback_does_not_clear_new_photo_payload(
-    tmp_path: Path, callback_data: str, expected_answer: str
-):
-    stale_file = tmp_path / "topic-a-photo.bin"
-    stale_file.write_bytes(b"stale")
-    context = MagicMock()
-    context.user_data = _cross_topic_picker_user_data(
-        stale_file, stale_state=STATE_BROWSING_DIRECTORY, thread_id=10
-    )
-    media_dir = tmp_path / "images"
-
-    with (
-        _patch_both("_IMAGES_DIR", media_dir),
-        _patch_both("is_user_allowed", return_value=True),
-        patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(
-            bot_module.session_manager, "get_window_for_thread", return_value=None
-        ),
-        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
-        _patch_both(
-            "build_directory_browser",
-            return_value=("picker", MagicMock(), ["new-dir"]),
-        ),
-        _patch_both("safe_reply", new_callable=AsyncMock),
-    ):
-        await bot_module.photo_handler(_make_photo_update(thread_id=99), context)
-
-    assert not stale_file.exists()
-    pending_attachments = context.user_data["_pending_thread_attachments"]
-    assert len(pending_attachments) == 1
-    pending_path = Path(pending_attachments[0].path)
-    assert pending_path.exists()
-
-    stale_callback = _make_callback_update(callback_data, thread_id=10)
-    with (
-        _patch_both("is_user_allowed", return_value=True),
-        patch.object(bot_module.session_manager, "set_group_chat_id"),
-        _patch_both("safe_reply", new_callable=AsyncMock) as mock_reply,
-        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
-        _patch_both("_create_and_bind_window", new_callable=AsyncMock) as mock_create,
-    ):
-        await bot_module.callback_handler(stale_callback, context)
-
-    stale_callback.callback_query.answer.assert_awaited_once_with(
-        expected_answer, show_alert=True
-    )
-    mock_reply.assert_not_called()
-    mock_edit.assert_not_called()
-    mock_create.assert_not_called()
-    assert context.user_data["_pending_thread_id"] == 99
-    assert context.user_data["_pending_thread_attachments"] == pending_attachments
-    assert pending_path.exists()
-
-
-@pytest.mark.asyncio
-async def test_text_replaced_topic_stale_cancel_does_not_clear_new_text_photo_payload(
-    tmp_path: Path,
-):
-    stale_file = tmp_path / "topic-a-pending.bin"
-    stale_file.write_bytes(b"stale")
-    context = MagicMock()
-    context.user_data = _cross_topic_picker_user_data(
-        stale_file, stale_state=STATE_BROWSING_DIRECTORY, thread_id=10
-    )
-    media_dir = tmp_path / "images"
-
-    with (
-        _patch_both("_IMAGES_DIR", media_dir),
-        _patch_both("is_user_allowed", return_value=True),
-        patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(
-            bot_module.session_manager, "get_window_for_thread", return_value=None
-        ),
-        _patch_both("_apply_reply_context", new_callable=AsyncMock) as apply_reply,
-        _patch_both("_list_unbound_windows", new_callable=AsyncMock, return_value=[]),
-        _patch_both(
-            "build_directory_browser",
-            return_value=("picker", MagicMock(), ["new-dir"]),
-        ),
-        _patch_both("safe_reply", new_callable=AsyncMock),
-    ):
-        apply_reply.side_effect = lambda _message, _user_id, _thread_id, text: (
-            text,
-            False,
-        )
-        await bot_module.text_handler(
-            _make_text_update(thread_id=99, text="topic b text"), context
-        )
-        await bot_module.photo_handler(_make_photo_update(thread_id=99), context)
-
-    assert not stale_file.exists()
-    assert context.user_data["_pending_thread_id"] == 99
-    assert context.user_data["_pending_thread_text"] == "topic b text"
-    assert context.user_data["_ignored_stale_thread_ids"] == [10]
-    pending_attachments = context.user_data["_pending_thread_attachments"]
-    assert len(pending_attachments) == 1
-    pending_path = Path(pending_attachments[0].path)
-    assert pending_path.parent == media_dir
-    assert pending_path.exists()
-
-    stale_callback = _make_callback_update(CB_DIR_CANCEL, thread_id=10)
-    with (
-        _patch_both("is_user_allowed", return_value=True),
-        patch.object(bot_module.session_manager, "set_group_chat_id"),
-        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
-        _patch_both("safe_reply", new_callable=AsyncMock) as mock_reply,
-        _patch_both("safe_edit", new_callable=AsyncMock) as mock_edit,
-        _patch_both("_create_and_bind_window", new_callable=AsyncMock) as mock_create,
-    ):
-        await bot_module.callback_handler(stale_callback, context)
-
-    stale_callback.callback_query.answer.assert_awaited_once_with(
-        "Stale browser (topic mismatch)", show_alert=True
-    )
-    mock_reply.assert_not_called()
-    mock_edit.assert_not_called()
-    mock_create.assert_not_called()
-    mock_bind.assert_not_called()
-    assert context.user_data["_pending_thread_id"] == 99
-    assert context.user_data["_pending_thread_text"] == "topic b text"
-    assert context.user_data["_pending_thread_attachments"] == pending_attachments
-    assert pending_path.exists()
-
-
-@pytest.mark.asyncio
 async def test_dir_confirm_without_pending_owner_rejects_without_create_or_bind(
     tmp_path: Path,
 ):
     context = MagicMock()
-    context.user_data = {
-        STATE_KEY: STATE_BROWSING_DIRECTORY,
-        BROWSE_PATH_KEY: str(tmp_path),
-        BROWSE_DIRS_KEY: [],
-        BROWSE_UNBOUND_COUNT_KEY: 0,
-    }
+    # GH #66: no picker entry for thread 10 → "no pending owner".
+    context.user_data = {}
     update = _make_callback_update(CB_DIR_CONFIRM, thread_id=10)
 
     with (
@@ -1361,9 +1087,8 @@ async def test_dir_confirm_without_pending_owner_rejects_without_create_or_bind(
     ):
         await bot_module.callback_handler(update, context)
 
-    update.callback_query.answer.assert_awaited_once_with(
-        "Stale browser (topic mismatch)", show_alert=True
-    )
+    # Self-heal (no popup); no session lookup, create, or bind.
+    update.callback_query.answer.assert_awaited_once()
     mock_list_sessions.assert_not_called()
     mock_create_and_bind.assert_not_called()
     mock_create_window.assert_not_called()
@@ -1375,10 +1100,8 @@ async def test_session_new_without_pending_owner_does_not_recover_from_topic(
     tmp_path: Path,
 ):
     context = MagicMock()
-    context.user_data = {
-        STATE_KEY: STATE_SELECTING_SESSION,
-        "_selected_path": str(tmp_path),
-    }
+    # GH #66: no picker entry for thread 10 → "no pending owner".
+    context.user_data = {}
     update = _make_callback_update(CB_SESSION_NEW, thread_id=10)
 
     with (
@@ -1394,9 +1117,7 @@ async def test_session_new_without_pending_owner_does_not_recover_from_topic(
     ):
         await bot_module.callback_handler(update, context)
 
-    update.callback_query.answer.assert_awaited_once_with(
-        "Stale picker (topic mismatch)", show_alert=True
-    )
+    update.callback_query.answer.assert_awaited_once()
     mock_create_and_bind.assert_not_called()
     mock_create_window.assert_not_called()
     mock_bind.assert_not_called()
@@ -1405,11 +1126,8 @@ async def test_session_new_without_pending_owner_does_not_recover_from_topic(
 @pytest.mark.asyncio
 async def test_session_select_without_pending_owner_rejects(tmp_path: Path):
     context = MagicMock()
-    context.user_data = {
-        STATE_KEY: STATE_SELECTING_SESSION,
-        SESSIONS_KEY: [ClaudeSession("sid", "summary", 1, str(tmp_path / "s.jsonl"))],
-        "_selected_path": str(tmp_path),
-    }
+    # GH #66: no picker entry for thread 10 → "no pending owner".
+    context.user_data = {}
     update = _make_callback_update(f"{CB_SESSION_SELECT}0", thread_id=10)
 
     with (
@@ -1420,9 +1138,7 @@ async def test_session_select_without_pending_owner_rejects(tmp_path: Path):
     ):
         await bot_module.callback_handler(update, context)
 
-    update.callback_query.answer.assert_awaited_once_with(
-        "Stale picker (topic mismatch)", show_alert=True
-    )
+    update.callback_query.answer.assert_awaited_once()
     mock_create.assert_not_called()
     mock_bind.assert_not_called()
 
@@ -1432,17 +1148,17 @@ async def test_session_new_double_click_after_pending_owner_cleared_is_rejected(
     tmp_path: Path,
 ):
     context = MagicMock()
-    context.user_data = {
-        STATE_KEY: STATE_SELECTING_SESSION,
-        "_pending_thread_id": 10,
-        "_selected_path": str(tmp_path),
-    }
+    context.user_data = {}
+    ensure_picker_entry(context.user_data, 10).update(
+        {STATE_KEY: STATE_SELECTING_SESSION, "_selected_path": str(tmp_path)}
+    )
     first_update = _make_callback_update(CB_SESSION_NEW, thread_id=10)
     second_update = _make_callback_update(CB_SESSION_NEW, thread_id=10)
 
     async def clear_pending_after_first_click(
         *_args: object, **_kwargs: object
     ) -> None:
+        # Simulate the bind draining this thread's picker entry.
         context.user_data.clear()
 
     with (
@@ -1455,9 +1171,8 @@ async def test_session_new_double_click_after_pending_owner_cleared_is_rejected(
         await bot_module.callback_handler(second_update, context)
 
     mock_create.assert_awaited_once()
-    second_update.callback_query.answer.assert_awaited_once_with(
-        "Stale picker (topic mismatch)", show_alert=True
-    )
+    # Second click finds no entry → self-heal (no popup string).
+    second_update.callback_query.answer.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1476,10 +1191,11 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
         await bot_module.callback_handler(cancel_update, context)
 
     assert not payload.exists()
-    assert "_pending_thread_attachments" not in context.user_data
+    # GH #66: cancel dropped this thread's whole picker entry (payload deleted).
+    assert picker_entry(context.user_data, 10) is None
 
-    context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-    context.user_data[UNBOUND_WINDOWS_KEY] = ["window-1"]
+    # A later window-picker bind on the same thread finds NO entry, so it
+    # self-heals and forwards nothing — the cancelled media can never reach tmux.
     bind_update = _make_callback_update(f"{CB_WIN_BIND}0", thread_id=10)
     window = MagicMock()
     window.window_id = "window-1"
@@ -1508,11 +1224,10 @@ async def test_cancelled_pending_media_is_not_forwarded_on_later_bind(tmp_path: 
     mock_bind.assert_not_called()
     mock_find.assert_not_called()
     mock_list_unbound.assert_not_called()
-    mock_edit.assert_not_called()
     mock_replay.assert_not_called()
-    bind_update.callback_query.answer.assert_awaited_once_with(
-        "Stale picker (topic mismatch)", show_alert=True
-    )
+    # Self-heal edits the dead card and answers (no popup string).
+    mock_edit.assert_awaited_once()
+    bind_update.callback_query.answer.assert_awaited_once()
 
 
 def _make_create_query() -> MagicMock:
@@ -1542,7 +1257,7 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
 
     async def replace_owner_during_hook_wait(*_args: object, **_kwargs: object) -> bool:
         context.user_data = _pending_user_data(new_payload, thread_id=99)
-        context.user_data["_pending_thread_text"] = "topic 99 text"
+        picker_entry(context.user_data, 99)["_pending_thread_text"] = "topic 99 text"
         return True
 
     with (
@@ -1590,11 +1305,10 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
     assert "stale" in edit_text
     assert "newly-created tmux window was cleaned up" in edit_text
     query.answer.assert_awaited_once_with("Stale picker", show_alert=False)
-    assert context.user_data["_pending_thread_id"] == 99
-    assert context.user_data["_pending_thread_text"] == "topic 99 text"
-    assert context.user_data["_pending_thread_attachments"] == [
-        _attachment(new_payload)
-    ]
+    _entry99 = picker_entry(context.user_data, 99)
+    assert _entry99 is not None
+    assert _entry99["_pending_thread_text"] == "topic 99 text"
+    assert _entry99["_pending_thread_attachments"] == [_attachment(new_payload)]
     assert new_payload.exists()
 
 
@@ -1608,8 +1322,9 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
     new_payload.write_bytes(b"new")
     context = MagicMock()
     context.user_data = _pending_user_data(old_payload, thread_id=10)
-    context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-    context.user_data[UNBOUND_WINDOWS_KEY] = ["@0"]
+    picker_entry(context.user_data, 10).update(
+        {STATE_KEY: STATE_SELECTING_WINDOW, UNBOUND_WINDOWS_KEY: ["@0"]}
+    )
     update = _make_callback_update(f"{CB_WIN_BIND}0", thread_id=10)
     window = MagicMock()
     window.window_id = "@0"
@@ -1619,7 +1334,7 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
         tmux_mgr: object, session_mgr: object
     ) -> list[tuple[str, str, str]]:
         context.user_data = _pending_user_data(new_payload, thread_id=99)
-        context.user_data["_pending_thread_text"] = "topic 99 text"
+        picker_entry(context.user_data, 99)["_pending_thread_text"] = "topic 99 text"
         return [("@0", "existing-window", str(tmp_path))]
 
     with (
@@ -1644,15 +1359,14 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
 
     mock_bind.assert_not_called()
     mock_replay.assert_not_called()
-    mock_edit.assert_not_called()
-    update.callback_query.answer.assert_awaited_once_with(
-        "Stale picker (topic mismatch)", show_alert=True
-    )
-    assert context.user_data["_pending_thread_id"] == 99
-    assert context.user_data["_pending_thread_text"] == "topic 99 text"
-    assert context.user_data["_pending_thread_attachments"] == [
-        _attachment(new_payload)
-    ]
+    # GH #66: the entry vanished during the async re-check → self-heal (edit +
+    # answer), so no bind or flush of the superseded thread-99 payload.
+    mock_edit.assert_awaited_once()
+    update.callback_query.answer.assert_awaited_once()
+    _entry99 = picker_entry(context.user_data, 99)
+    assert _entry99 is not None
+    assert _entry99["_pending_thread_text"] == "topic 99 text"
+    assert _entry99["_pending_thread_attachments"] == [_attachment(new_payload)]
     assert new_payload.exists()
 
 
@@ -1675,9 +1389,10 @@ async def test_flush_pending_route_payload_owner_mismatch_preserves_new_payload(
     assert delivered is None
     mock_replay.assert_not_called()
     mock_clear_route.assert_not_called()
-    assert user_data["_pending_thread_id"] == 99
-    assert user_data["_pending_thread_text"] == "hello"
-    assert user_data["_pending_thread_attachments"] == [_attachment(payload)]
+    _entry99 = picker_entry(user_data, 99)
+    assert _entry99 is not None
+    assert _entry99["_pending_thread_text"] == "hello"
+    assert _entry99["_pending_thread_attachments"] == [_attachment(payload)]
     assert payload.exists()
 
 
@@ -1763,9 +1478,7 @@ async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_clea
     query.answer.assert_awaited_once_with(
         "Created; first message not delivered", show_alert=True
     )
-    assert "_pending_thread_text" not in context.user_data
-    assert "_pending_thread_attachments" not in context.user_data
-    assert "_pending_thread_id" not in context.user_data
+    assert picker_entry(context.user_data, 10) is None
     assert not payload.exists()
 
 
@@ -1789,8 +1502,9 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
     payload.write_bytes(b"data")
     context = MagicMock()
     context.user_data = _pending_user_data(payload, thread_id=10)
-    context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-    context.user_data[UNBOUND_WINDOWS_KEY] = ["@0"]
+    picker_entry(context.user_data, 10).update(
+        {STATE_KEY: STATE_SELECTING_WINDOW, UNBOUND_WINDOWS_KEY: ["@0"]}
+    )
     update = _make_callback_update(f"{CB_WIN_BIND}0", thread_id=10)
     window = MagicMock()
     window.window_id = "@0"
@@ -1840,9 +1554,7 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
     update.callback_query.answer.assert_awaited_once_with(
         "Bound; first message not delivered", show_alert=True
     )
-    assert "_pending_thread_text" not in context.user_data
-    assert "_pending_thread_attachments" not in context.user_data
-    assert "_pending_thread_id" not in context.user_data
+    assert picker_entry(context.user_data, 10) is None
     assert not payload.exists()
 
 
@@ -1854,8 +1566,9 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
     payload.write_bytes(b"data")
     context = MagicMock()
     context.user_data = _pending_user_data(payload, thread_id=10)
-    context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-    context.user_data[UNBOUND_WINDOWS_KEY] = ["@0"]
+    picker_entry(context.user_data, 10).update(
+        {STATE_KEY: STATE_SELECTING_WINDOW, UNBOUND_WINDOWS_KEY: ["@0"]}
+    )
     update = _make_callback_update(f"{CB_WIN_BIND}0", thread_id=10)
     window = MagicMock()
     window.window_id = "@0"
@@ -1898,9 +1611,7 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
     edit_text = mock_edit.await_args.args[1]
     assert edit_text == "✅ Bound to window `existing-window`\n\nFirst message sent."
     update.callback_query.answer.assert_awaited_once_with("Bound", show_alert=False)
-    assert "_pending_thread_text" not in context.user_data
-    assert "_pending_thread_attachments" not in context.user_data
-    assert "_pending_thread_id" not in context.user_data
+    assert picker_entry(context.user_data, 10) is None
     assert payload.exists()
 
 
@@ -1930,15 +1641,21 @@ async def test_pending_replay_STOPS_at_the_first_refused_split(
     for path in paths:
         path.write_bytes(b"data")
     context = MagicMock()
-    context.user_data = {
-        "_pending_thread_id": 10,
-        "_pending_thread_text": "hello",
-        "_pending_thread_attachments": [
-            bot_module.PendingAttachment(str(paths[0]), "caption one", media_groups[0]),
-            bot_module.PendingAttachment(str(paths[1]), "", media_groups[1]),
-            bot_module.PendingAttachment(str(paths[2]), "caption two", media_groups[2]),
-        ],
-    }
+    context.user_data = {}
+    ensure_picker_entry(context.user_data, 10).update(
+        {
+            "_pending_thread_text": "hello",
+            "_pending_thread_attachments": [
+                bot_module.PendingAttachment(
+                    str(paths[0]), "caption one", media_groups[0]
+                ),
+                bot_module.PendingAttachment(str(paths[1]), "", media_groups[1]),
+                bot_module.PendingAttachment(
+                    str(paths[2]), "caption two", media_groups[2]
+                ),
+            ],
+        }
+    )
     route = (1, 10, "@0")
 
     with (
@@ -1967,7 +1684,5 @@ async def test_pending_replay_STOPS_at_the_first_refused_split(
     assert str(paths[0]) in first_send
     assert str(paths[1]) in first_send
     assert str(paths[2]) not in first_send
-    assert "_pending_thread_text" not in context.user_data
-    assert "_pending_thread_attachments" not in context.user_data
-    assert "_pending_thread_id" not in context.user_data
+    assert picker_entry(context.user_data, 10) is None
     assert all(not path.exists() for path in paths)

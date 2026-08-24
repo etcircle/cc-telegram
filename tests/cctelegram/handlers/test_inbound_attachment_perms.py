@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cctelegram.handlers import inbound_telegram as inbound_module
+from cctelegram.handlers.directory_browser import picker_entry
 
 
 def _mode(path: Path) -> int:
@@ -211,7 +212,7 @@ async def test_photo_download_lands_at_0600(tmp_path: Path) -> None:
             for p in patches:
                 p.stop()
 
-    pending = context.user_data["_pending_thread_attachments"]
+    pending = picker_entry(context.user_data, 99)["_pending_thread_attachments"]
     downloaded = Path(pending[0].path)
     assert downloaded.exists()
     assert _mode(downloaded) == 0o600
@@ -233,7 +234,7 @@ async def test_document_download_lands_at_0600(tmp_path: Path) -> None:
             for p in patches:
                 p.stop()
 
-    pending = context.user_data["_pending_thread_attachments"]
+    pending = picker_entry(context.user_data, 99)["_pending_thread_attachments"]
     downloaded = Path(pending[0].path)
     assert downloaded.exists()
     assert _mode(downloaded) == 0o600
@@ -262,7 +263,7 @@ async def test_photo_download_succeeds_when_chmod_raises(
             for p in patches:
                 p.stop()
 
-    pending = context.user_data["_pending_thread_attachments"]
+    pending = picker_entry(context.user_data, 99)["_pending_thread_attachments"]
     downloaded = Path(pending[0].path)
     assert downloaded.exists()
     assert any(r.levelno == logging.WARNING for r in caplog.records)

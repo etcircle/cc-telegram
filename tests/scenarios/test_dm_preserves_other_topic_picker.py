@@ -25,9 +25,10 @@ from cctelegram.handlers.directory_browser import (
     STATE_KEY,
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
+    ensure_picker_entry,
+    picker_entry,
 )
 from tests.conftest import ScenarioHarness, make_update_text
-
 
 pytestmark = pytest.mark.scenario
 
@@ -49,11 +50,12 @@ async def test_dm_text_mid_picker_preserves_other_topics_flow(
     """Text with thread_id=None rejects WITHOUT touching topic A's pending state."""
     payload = tmp_path / "pending-photo.jpg"
     payload.write_bytes(b"image")
-    scenario.user_data.update(
+    entry = ensure_picker_entry(scenario.user_data, 42)
+    assert entry is not None
+    entry.update(
         {
             STATE_KEY: picker_state,
             BROWSE_PATH_KEY: "/tmp/browse",
-            "_pending_thread_id": 42,
             "_pending_thread_text": "hello from topic A",
             "_pending_thread_attachments": [
                 inbound_module.PendingAttachment(str(payload), "caption", None)
@@ -69,15 +71,14 @@ async def test_dm_text_mid_picker_preserves_other_topics_flow(
     reply_text = update.message.reply_text.await_args.args[0]
     assert "named topic" in reply_text
 
-    # Topic A's picker flow is fully intact — state, text, AND files.
-    assert scenario.user_data[STATE_KEY] == picker_state
-    assert scenario.user_data["_pending_thread_id"] == 42
-    assert scenario.user_data["_pending_thread_text"] == "hello from topic A"
-    assert scenario.user_data["_pending_thread_attachments"] == [
+    # Topic A's per-thread picker entry is fully intact — state, text, AND files.
+    entry = picker_entry(scenario.user_data, 42)
+    assert entry is not None
+    assert entry[STATE_KEY] == picker_state
+    assert entry["_pending_thread_text"] == "hello from topic A"
+    assert entry["_pending_thread_attachments"] == [
         inbound_module.PendingAttachment(str(payload), "caption", None)
     ]
     assert payload.exists()
-    # Topic A was NOT marked as a stale thread.
-    assert 42 not in scenario.user_data.get("_ignored_stale_thread_ids", [])
     # Nothing was forwarded to tmux.
     assert scenario.tmux.sent_keys == []

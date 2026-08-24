@@ -28,15 +28,12 @@ from cctelegram.handlers.callback_data import checked_callback_data  # noqa: F40
 
 from cctelegram.handlers.directory_browser import (  # noqa: E402
     STATE_KEY,
-    clear_browse_state,
+    picker_entry,
 )
 from cctelegram.callback_dispatcher.registry import lookup  # noqa: E402
 from cctelegram.handlers.inbound_telegram import (  # noqa: E402
-    _clear_pending_route_payload,
     _get_thread_id,
-    _is_ignored_stale_thread_id,
     _pending_owner_matches,
-    _pending_thread_id,
 )
 
 STALE_CALLBACK_TEXT = "This button is stale for this topic — refresh the picker."
@@ -240,43 +237,27 @@ def window_lease(
     )
 
 
-async def _answer_stale_pending_thread_mismatch(
-    query: Any,
-    user_data: dict | None,
-    callback_thread_id: int | None,
-    answer_text: str,
-    *,
-    clear_picker_state: bool = False,
-) -> None:
-    """Answer a pending-thread mismatch without deleting newer replacement media."""
-    if not _is_ignored_stale_thread_id(user_data, callback_thread_id):
-        if clear_picker_state:
-            clear_browse_state(user_data)
-        if user_data is not None:
-            _clear_pending_route_payload(user_data, delete_files=True)
-    await safe_answer(query, answer_text, show_alert=True)
-
-
-_PICKER_STALE_TOPIC_MISMATCH = "topic_mismatch"
-
-
 def _validate_pending_picker_callback(
     user_data: dict | None,
     callback_thread_id: int | None,
     expected_states: tuple[str, ...],
 ) -> tuple[bool, int | None, str | None]:
-    """Validate that a picker callback still owns the pending topic route."""
+    """Validate that a picker callback still owns its topic's pending route.
+
+    GH #66: picker state is keyed per (user, thread), so a callback validates
+    against ITS OWN thread's picker entry — cross-topic mismatch is impossible
+    by construction (the old ``topic_mismatch`` outcome is gone). A missing
+    entry or a wrong-state entry is the restart-orphan / stale-card signal the
+    caller self-heals (directory.py part D).
+    """
     if user_data is None:
         return False, None, "missing_user_data"
-    current_state = user_data.get(STATE_KEY)
-    if current_state not in expected_states:
-        return False, None, "wrong_state"
-    pending_tid = _pending_thread_id(user_data)
-    if pending_tid is None:
-        return False, None, "missing_pending_owner"
-    if callback_thread_id != pending_tid:
-        return False, pending_tid, _PICKER_STALE_TOPIC_MISMATCH
-    return True, pending_tid, None
+    entry = picker_entry(user_data, callback_thread_id)
+    if entry is None:
+        return False, None, "missing_entry"
+    if entry.get(STATE_KEY) not in expected_states:
+        return False, callback_thread_id, "wrong_state"
+    return True, callback_thread_id, None
 
 
 async def _answer_invalid_pending_picker_callback(query: Any, answer_text: str) -> None:

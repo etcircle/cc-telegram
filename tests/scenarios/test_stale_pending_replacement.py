@@ -1,14 +1,10 @@
-"""Scenario: second unbound topic replaces the first's pending payload.
+"""Scenario: concurrent unbound-topic pickers coexist per thread (GH #66).
 
-When user_data has a directory browser in flight for thread A and a new
-unbound text arrives for thread B, the bot must:
-  - clear thread A's pending payload (files deleted, browse state dropped),
-  - record thread A in the ``_ignored_stale_thread_ids`` set so a late
-    picker callback from A is answered as stale *without* nuking thread B's
-    fresh pending payload (``bot.py:273-303``),
-  - install fresh browser state for thread B.
-
-Pre-fix: a late cancel from thread A would delete thread B's attachment.
+Pre-GH #66 the picker payload was a single per-USER slot, so a second unbound
+topic REPLACED the first's pending payload and the first's card orphaned. Under
+per-(user, thread) keying each topic owns its own picker entry, so two topics
+mid-picker at the same time both keep their own text/state, and a cancel in one
+topic never touches the other's payload.
 """
 
 from __future__ import annotations
@@ -20,40 +16,46 @@ from cctelegram.handlers.callback_data import CB_DIR_CANCEL
 from cctelegram.handlers.directory_browser import (
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    picker_entry,
 )
 from tests.conftest import ScenarioHarness, make_update_callback, make_update_text
-
 
 pytestmark = pytest.mark.scenario
 
 
 @pytest.mark.asyncio
-async def test_new_unbound_text_replaces_owner_and_marks_old_stale(
+async def test_two_topics_pickers_coexist_without_displacement(
     scenario: ScenarioHarness,
 ) -> None:
     # Topic A: user is browsing for a directory after sending "first".
     update_a = make_update_text("first", thread_id=42)
     await bot_module.text_handler(update_a, scenario.context)
-    assert scenario.user_data["_pending_thread_id"] == 42
-    assert scenario.user_data["_pending_thread_text"] == "first"
+    entry_a = picker_entry(scenario.user_data, 42)
+    assert entry_a is not None
+    assert entry_a["_pending_thread_text"] == "first"
 
-    # Topic B arrives with a new unbound text — should take over.
+    # Topic B arrives with a new unbound text — it opens its OWN picker and
+    # must NOT displace topic A (GH #66).
     update_b = make_update_text("second", thread_id=43, message_id=200)
     await bot_module.text_handler(update_b, scenario.context)
 
-    assert scenario.user_data["_pending_thread_id"] == 43
-    assert scenario.user_data["_pending_thread_text"] == "second"
-    assert scenario.user_data[STATE_KEY] == STATE_BROWSING_DIRECTORY
-    # Thread A's id is remembered as stale so its leftover callbacks don't clobber B.
-    assert 42 in scenario.user_data.get("_ignored_stale_thread_ids", [])
+    entry_b = picker_entry(scenario.user_data, 43)
+    assert entry_b is not None
+    assert entry_b["_pending_thread_text"] == "second"
+    assert entry_b[STATE_KEY] == STATE_BROWSING_DIRECTORY
+
+    # Topic A is fully intact — no displacement.
+    entry_a = picker_entry(scenario.user_data, 42)
+    assert entry_a is not None
+    assert entry_a["_pending_thread_text"] == "first"
+    assert entry_a[STATE_KEY] == STATE_BROWSING_DIRECTORY
 
 
 @pytest.mark.asyncio
-async def test_stale_cancel_from_replaced_topic_preserves_new_payload(
+async def test_cancel_in_one_topic_preserves_the_other_topics_payload(
     scenario: ScenarioHarness,
 ) -> None:
-    """A cancel from thread A (now stale) must NOT clear thread B's pending payload."""
-    # Replay the replacement sequence.
+    """A cancel in topic A must NOT clear topic B's pending payload."""
     await bot_module.text_handler(
         make_update_text("first", thread_id=42), scenario.context
     )
@@ -61,14 +63,15 @@ async def test_stale_cancel_from_replaced_topic_preserves_new_payload(
         make_update_text("second", thread_id=43, message_id=200),
         scenario.context,
     )
-    assert scenario.user_data["_pending_thread_id"] == 43
 
-    # Late cancel callback fires from the OLD topic (thread 42).
+    # Cancel callback fires from topic A (thread 42).
     cancel_update = make_update_callback(CB_DIR_CANCEL, thread_id=42)
     await bot_module.callback_handler(cancel_update, scenario.context)
 
-    # Thread B's payload survives.
-    assert scenario.user_data["_pending_thread_id"] == 43
-    assert scenario.user_data["_pending_thread_text"] == "second"
-    # The stale cancel was acknowledged.
+    # Topic A's entry is gone; topic B's payload survives untouched.
+    assert picker_entry(scenario.user_data, 42) is None
+    entry_b = picker_entry(scenario.user_data, 43)
+    assert entry_b is not None
+    assert entry_b["_pending_thread_text"] == "second"
+    # The cancel was acknowledged.
     cancel_update.callback_query.answer.assert_awaited()

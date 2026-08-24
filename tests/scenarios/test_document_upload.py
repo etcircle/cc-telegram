@@ -9,6 +9,7 @@ the handler stack is real.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,7 +17,6 @@ import pytest
 from cctelegram import bot as bot_module
 from cctelegram.handlers import inbound_telegram as inbound_module
 from tests.conftest import ScenarioHarness, _make_message, _make_user
-
 
 pytestmark = pytest.mark.scenario
 
@@ -35,7 +35,7 @@ def _make_document_update(
     document.file_name = file_name
     document.file_unique_id = "uid42"
 
-    async def _download(dest: Any) -> Any:  # noqa: ANN001 — MagicMock signature
+    async def _download(dest: Any) -> Any:
         if download_dest is None:
             Path(dest).write_bytes(b"\x00")
         else:
@@ -60,10 +60,6 @@ def _make_document_update(
     update.effective_chat = msg.chat
     update.effective_message = msg
     return update
-
-
-# Patch type annotation reference
-from typing import Any  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -111,10 +107,13 @@ async def test_document_in_unbound_topic_stashes_as_pending(
     # Browser shown.
     update.message.reply_text.assert_awaited()
     assert "reply_markup" in update.message.reply_text.await_args.kwargs
-    # Attachment recorded in user_data.
-    attachments = scenario.user_data.get("_pending_thread_attachments")
+    # Attachment recorded in THIS thread's per-topic picker entry (GH #66).
+    from cctelegram.handlers.directory_browser import picker_entry
+
+    entry = picker_entry(scenario.user_data, 42)
+    assert entry is not None
+    attachments = entry.get("_pending_thread_attachments")
     assert attachments and len(attachments) == 1
-    assert scenario.user_data["_pending_thread_id"] == 42
 
 
 @pytest.mark.asyncio

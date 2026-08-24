@@ -21,18 +21,19 @@ from cctelegram.callback_dispatcher import (
     execute,
     parse,
 )
+from cctelegram.handlers import auq_ledger, auq_source, pick_token
 from cctelegram.handlers.callback_data import (
     CB_ASK_PICK,
     CB_DIR_CONFIRM,
     CB_DIR_SELECT,
     CB_KEYS_PREFIX,
 )
-from cctelegram.handlers import auq_ledger, auq_source, pick_token
 from cctelegram.handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PATH_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    ensure_picker_entry,
 )
 from cctelegram.terminal_parser import resolve_ask_form
 from tests.conftest import render_cursor
@@ -360,12 +361,15 @@ async def test_stale_callback_does_not_break_directory_executor(
 
     query.answer = stale_answer  # type: ignore[method-assign]
     ctx = _ctx(query, user_id=1)
-    ctx.context.user_data = {
-        STATE_KEY: STATE_BROWSING_DIRECTORY,
-        "_pending_thread_id": 10,
-        BROWSE_PATH_KEY: str(root),
-        BROWSE_DIRS_KEY: [f"dir-{idx}" for idx in range(4)],
-    }
+    # GH #66: picker state lives in this thread's (id 10) per-topic entry.
+    ctx.context.user_data = {}
+    ensure_picker_entry(ctx.context.user_data, 10).update(
+        {
+            STATE_KEY: STATE_BROWSING_DIRECTORY,
+            BROWSE_PATH_KEY: str(root),
+            BROWSE_DIRS_KEY: [f"dir-{idx}" for idx in range(4)],
+        }
+    )
     authorized = authorize_initial(parse(query.data.encode()), ctx)
     safe_edit = AsyncMock()
     monkeypatch.setattr("cctelegram.callback_dispatcher.directory.safe_edit", safe_edit)
@@ -373,6 +377,29 @@ async def test_stale_callback_does_not_break_directory_executor(
     await execute(authorized, _adapters(FakeSessionManager(), FakeTmuxManager()))
 
     safe_edit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_restart_orphan_picker_tap_self_heals_the_dead_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GH #66 part D: a picker tap with NO entry (bot-restart orphan) edits the
+    dead card to the expired message with the keyboard stripped, instead of a
+    bare popup — so the next message opens a fresh picker."""
+    from cctelegram.callback_dispatcher.directory import PICKER_EXPIRED_TEXT
+
+    query = FakeQuery(f"{CB_DIR_SELECT}0")
+    ctx = _ctx(query, user_id=1)
+    ctx.context.user_data = {}  # in-memory picker state was lost on restart
+    authorized = authorize_initial(parse(query.data.encode()), ctx)
+    safe_edit = AsyncMock()
+    monkeypatch.setattr("cctelegram.callback_dispatcher.directory.safe_edit", safe_edit)
+
+    await execute(authorized, _adapters(FakeSessionManager(), FakeTmuxManager()))
+
+    safe_edit.assert_awaited_once_with(query, PICKER_EXPIRED_TEXT, reply_markup=None)
+    # Acknowledged with a plain answer (no "topic mismatch" popup).
+    assert query.answers == [(None, None)]
 
 
 @pytest.mark.asyncio
@@ -395,18 +422,21 @@ async def test_stale_callback_does_not_break_dir_confirm_no_sessions_path(
     class _StaleAnsweringQuery(FakeQuery):
         async def answer(
             self, text: str | None = None, show_alert: bool | None = None
-        ) -> None:  # noqa: D401
+        ) -> None:
             raise BadRequest(
                 "Query is too old and response timeout expired or query id is invalid"
             )
 
     query = _StaleAnsweringQuery(CB_DIR_CONFIRM)
     ctx = _ctx(query, user_id=1)
-    ctx.context.user_data = {
-        STATE_KEY: STATE_BROWSING_DIRECTORY,
-        "_pending_thread_id": 10,
-        BROWSE_PATH_KEY: str(root),
-    }
+    # GH #66: picker state lives in this thread's (id 10) per-topic entry.
+    ctx.context.user_data = {}
+    ensure_picker_entry(ctx.context.user_data, 10).update(
+        {
+            STATE_KEY: STATE_BROWSING_DIRECTORY,
+            BROWSE_PATH_KEY: str(root),
+        }
+    )
     authorized = authorize_initial(parse(query.data.encode()), ctx)
 
     # Stub safe_edit + _create_and_bind_window's success path through the
