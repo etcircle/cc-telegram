@@ -176,6 +176,11 @@ async def test_auq_tool_result_forgets_before_card_clear(
     clear_interactive_msg, so a raise in the card clear cannot orphan the side
     file — which would otherwise strand a DEAD card via the status_polling
     side_file_live_for_session gate (the uptime half of the dead-card class).
+
+    GH #67 Fix 2b moved the explicit branch's teardown DECISION into
+    ``interactive_ui.apply_auq_tool_result_teardown`` (a route-locked critical
+    section), so the forget is observed on ``interactive_ui`` rather than on the
+    ``bot`` module's re-export. The ORDERING invariant is unchanged.
     """
     wid = scenario.add_window(window_name="repo", cwd="/repo")
     scenario.bind_thread(
@@ -201,7 +206,7 @@ async def test_auq_tool_result_forgets_before_card_clear(
         order.append("clear")
         raise RuntimeError("simulated Telegram clear failure")
 
-    monkeypatch.setattr(bot_module, "forget_ask_tool_input", tracking_forget)
+    monkeypatch.setattr(interactive_ui, "forget_ask_tool_input", tracking_forget)
     monkeypatch.setattr(bot_module, "clear_interactive_msg", raising_clear)
 
     try:

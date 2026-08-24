@@ -318,19 +318,22 @@ async def test_afk_snapshot_id_mismatch_falls_back_to_side_file() -> None:
 
 
 @pytest.mark.asyncio
-async def test_afk_snapshot_both_mistrusted_text_only() -> None:
-    """Cache AND side file both id-mismatched → snap=None → generic text-only
-    notice (no Question line, no keyboard)."""
+async def test_afk_snapshot_absent_sources_text_only() -> None:
+    """No cache and no side file → snap=None → generic text-only notice (no
+    Question line, no keyboard).
+
+    GH #67 Fix 2b narrowed the reachable shape of this pin: an id-MISMATCHED
+    side file no longer reaches the snapshot at all — the stale-AFK guard
+    declines the conversion outright (a stale older AUQ's AFK result must not
+    convert the newer live card), which the scenario floor pins. The surviving
+    snap=None path is the one where no identity is knowable anywhere, so the
+    parity guard passes as unknown and the snapshot finds no source.
+    """
     _seed_window_session()
     interactive_ui.set_interactive_mode(USER_ID, WID, THREAD_ID)
     interactive_ui._interactive_msgs[(USER_ID, THREAD_ID)] = 777
-    interactive_ui.remember_ask_tool_input(WID, _TOOL_INPUT, "toolu_STALE")
-    _write_side_file(_TOOL_INPUT, tool_use_id="toolu_ALSO_STALE")
     bot = _RecordingBot()
-    try:
-        await _convert(bot)
-    finally:
-        (app_dir() / "auq_pending" / f"{SESSION_ID}.json").unlink(missing_ok=True)
+    await _convert(bot)
 
     assert len(bot.edits) == 1
     text = bot.edits[0]["text"]

@@ -326,6 +326,17 @@ class _InteractiveMsgMeta:
     session_id: str
     tool_use_id: str | None
     created_at: str  # ISO 8601 UTC
+    # GH #67 Fix 1 — provenance + causality of the CURRENT logical surface.
+    # ``surface_kind`` is the published ``InteractiveUIContent.name``;
+    # ``surface_born_at`` is the birth stamp of the current logical surface,
+    # PRESERVED across same-surface refreshes (a Q2→Q3 AUQ advance is one
+    # surface) and RE-STAMPED when the surface identity changes. Deliberately
+    # NOT ``created_at``, which is message-lifetime metadata preserved across
+    # every refresh. Both optional: an old ``interactive_state.json`` (or a
+    # test seeding ``_interactive_msgs`` without a sidecar) loads them as
+    # ``None`` and the conditional clear then fails OPEN to today's teardown.
+    surface_kind: str | None = None
+    surface_born_at: str | None = None  # ISO 8601 UTC
 
     def to_dict(self) -> dict[str, str | int | None]:
         return {
@@ -334,6 +345,8 @@ class _InteractiveMsgMeta:
             "session_id": self.session_id,
             "tool_use_id": self.tool_use_id,
             "created_at": self.created_at,
+            "surface_kind": self.surface_kind,
+            "surface_born_at": self.surface_born_at,
         }
 
     @classmethod
@@ -360,12 +373,18 @@ class _InteractiveMsgMeta:
             return None
         tool_use_id_raw = d.get("tool_use_id")
         tool_use_id = str(tool_use_id_raw) if isinstance(tool_use_id_raw, str) else None
+        kind_raw = d.get("surface_kind")
+        born_raw = d.get("surface_born_at")
         return cls(
             msg_id=msg_id,
             window_id=window_id_raw,
             session_id=str(d.get("session_id") or ""),
             tool_use_id=tool_use_id,
             created_at=str(d.get("created_at", "")),
+            surface_kind=kind_raw if isinstance(kind_raw, str) and kind_raw else None,
+            surface_born_at=(
+                born_raw if isinstance(born_raw, str) and born_raw else None
+            ),
         )
 
 
@@ -835,20 +854,27 @@ def _set_interactive_msg(
     window_id: str,
     session_id: str,
     tool_use_id: str | None,
+    surface_kind: str | None = None,
 ) -> None:
     """Write-through: update ``_interactive_msgs`` + sidecar + persist.
 
     Call inside the route-lock-held section. ``session_id`` may be ""
     (e.g., SessionStart hook hasn't fired yet for a new window);
     hydrate normalizes None vs "" on read.
+
+    A fresh send is always a NEW logical surface, so ``surface_born_at`` is
+    stamped here unconditionally (GH #67 Fix 1).
     """
     _interactive_msgs[ikey] = msg_id
+    now_iso = datetime.now(UTC).isoformat()
     _interactive_msg_meta[ikey] = _InteractiveMsgMeta(
         msg_id=msg_id,
         window_id=window_id,
         session_id=session_id,
         tool_use_id=tool_use_id,
-        created_at=datetime.now(UTC).isoformat(),
+        created_at=now_iso,
+        surface_kind=surface_kind,
+        surface_born_at=now_iso,
     )
     _persist_interactive_state()
 
@@ -867,6 +893,7 @@ def _refresh_interactive_msg_meta(
     window_id: str,
     session_id: str,
     tool_use_id: str | None,
+    surface_kind: str | None = None,
 ) -> None:
     """Refresh sidecar metadata without resetting ``created_at``.
 
@@ -876,16 +903,43 @@ def _refresh_interactive_msg_meta(
     a previously pane-only render. ``created_at`` is preserved when
     the sidecar entry already exists (the same card is being
     refreshed, not freshly sent).
+
+    GH #67 Fix 1 — the ``surface_born_at`` re-stamp rule is surface
+    IDENTITY, not just kind: re-stamp when there is no prior stamp, when the
+    surface KIND changed (a gate→AUQ in-place replacement is a NEW logical
+    surface), or when the kind is "AskUserQuestion" and BOTH the stored and
+    the freshly-resolved tool_use_id are known and DIFFER (a consecutive
+    AUQ-A→AUQ-B replacement). A Q2→Q3 advance within one AUQ keeps its stamp.
+    ``tool_use_id`` is only overwritten when the caller resolved one — an
+    id revealed late (Claude Code buffers the AUQ ``tool_use`` in JSONL until
+    the answer) must not be erased by a later refresh that can't see it.
     """
     existing = _interactive_msg_meta.get(ikey)
-    created_at = existing.created_at if existing else datetime.now(UTC).isoformat()
+    now_iso = datetime.now(UTC).isoformat()
+    created_at = existing.created_at if existing else now_iso
+    prior_born = existing.surface_born_at if existing else None
+    prior_kind = existing.surface_kind if existing else None
+    prior_tool_use_id = existing.tool_use_id if existing else None
+    resolved_tool_use_id = tool_use_id if tool_use_id else prior_tool_use_id
+    restamp = (
+        prior_born is None
+        or prior_kind != surface_kind
+        or (
+            surface_kind == "AskUserQuestion"
+            and bool(prior_tool_use_id)
+            and bool(tool_use_id)
+            and prior_tool_use_id != tool_use_id
+        )
+    )
     _interactive_msgs[ikey] = msg_id
     _interactive_msg_meta[ikey] = _InteractiveMsgMeta(
         msg_id=msg_id,
         window_id=window_id,
         session_id=session_id,
-        tool_use_id=tool_use_id,
+        tool_use_id=resolved_tool_use_id,
         created_at=created_at,
+        surface_kind=surface_kind,
+        surface_born_at=now_iso if restamp else prior_born,
     )
     _persist_interactive_state()
 
@@ -1020,6 +1074,8 @@ def hydrate_interactive_state(session_mgr) -> None:
                     session_id=rec.session_id,
                     tool_use_id=rec.tool_use_id,
                     created_at=rec.created_at,
+                    surface_kind=rec.surface_kind,
+                    surface_born_at=rec.surface_born_at,
                 )
                 state_mutated_any = True
                 old_marker = ctx_markers.get(old_window_id)
@@ -4312,6 +4368,7 @@ async def handle_interactive_ui(
                     window_id=window_id,
                     session_id=session_id_for_window(window_id) or "",
                     tool_use_id=_last_auq_tool_use_id.get(window_id),
+                    surface_kind=content.name,
                 )
                 # The interactive card edit landed in the topic. The
                 # separate "🔔 waiting for input" attention card is
@@ -4474,6 +4531,7 @@ async def handle_interactive_ui(
             window_id=window_id,
             session_id=interactive_session_id or "",
             tool_use_id=_last_auq_tool_use_id.get(window_id),
+            surface_kind=content.name,
         )
         _interactive_mode[ikey] = window_id
         # See note above: the interactive card landed in the topic, so
@@ -4512,6 +4570,268 @@ _TOMBSTONE_TEXT = (
 )
 
 
+# ── GH #67: conditional interactive-card clear ───────────────────────────────
+
+
+@dataclass(frozen=True)
+class ClearCondition:
+    """The delivered block's RAW facts, carried into the locked clear.
+
+    Deliberately carries NO derived booleans: the gate veto, the timestamp
+    veto AND the matching-resolution parity are all computed UNDER the
+    already-held per-route lock, against the LOCKED-IN post-replacement meta.
+    A seam-side "read the kind, then separately await the clear" is TOCTOU-racy
+    against a concurrent poller refresh replacing the surface (gate→AUQ or
+    AUQ→gate) in the lock-acquisition window.
+    """
+
+    block_timestamp: str | None
+    content_type: str | None
+    tool_name: str | None
+    tool_use_id: str | None
+
+
+def _parse_aware_iso(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 stamp, returning None unless it is timezone-AWARE.
+
+    A naive stamp cannot be ordered against ``surface_born_at`` (always UTC)
+    without guessing its zone, so it reads as unparseable and the veto fails
+    OPEN to today's unconditional clear.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _live_auq_tool_use_id(
+    window_id: str | None, meta: "_InteractiveMsgMeta | None"
+) -> str | None:
+    """The route's CURRENT AUQ identity, live side file first.
+
+    The side file is minted by the PreToolUse hook BEFORE the picker renders,
+    while ``_last_auq_tool_use_id`` is commonly stale (Claude Code buffers the
+    AUQ ``tool_use`` line in JSONL until the answer), so the side file wins.
+    Returns None when no identity is knowable — every caller treats that as
+    "unknown", never as a mismatch.
+    """
+    if window_id:
+        session_id = session_id_for_window(window_id)
+        if session_id:
+            side_id = auq_source.peek_side_file_tool_use_id(session_id)
+            if side_id:
+                return side_id
+    if meta is not None and meta.tool_use_id:
+        return meta.tool_use_id
+    if window_id:
+        return _last_auq_tool_use_id.get(window_id) or None
+    return None
+
+
+def _is_matching_resolution(
+    cond: ClearCondition,
+    meta: "_InteractiveMsgMeta | None",
+    window_id: str | None,
+) -> bool:
+    """Does this block RESOLVE the surface currently on the card?
+
+    A qualifying resolution bypasses the timestamp veto (never the gate veto —
+    gates have no transcript resolution event): ``surface_born_at`` is minted
+    only after the awaited Telegram send completes, so a terminal answer during
+    a slow send yields a genuine tool_result whose transcript ts predates the
+    stamp, and vetoing it would preserve an already-resolved card.
+
+    Requires the KIND-MATCH — the stored ``surface_kind`` must equal the
+    tool_name's own surface (None = the legacy fail-open shape) — so AUQ-A's
+    result can never bypass the veto against an EPM/gate that replaced A in
+    place. For AskUserQuestion results ONLY it additionally requires id-parity
+    against the POST-replacement identity; ExitPlanMode stores no per-instance
+    identity, so an EPM result's parity is the kind-match alone.
+    """
+    if cond.content_type != "tool_result":
+        return False
+    if cond.tool_name not in ("AskUserQuestion", "ExitPlanMode"):
+        return False
+    stored_kind = meta.surface_kind if meta is not None else None
+    if stored_kind is not None and stored_kind != cond.tool_name:
+        return False
+    if cond.tool_name == "AskUserQuestion":
+        live_id = _live_auq_tool_use_id(window_id, meta)
+        if cond.tool_use_id and live_id and cond.tool_use_id != live_id:
+            # Proven to belong to an OLDER AUQ — not a resolution of the live
+            # surface, so it takes the ordinary timestamp veto instead.
+            return False
+    return True
+
+
+def _clear_skip_reason(
+    cond: ClearCondition,
+    meta: "_InteractiveMsgMeta | None",
+    window_id: str | None,
+) -> str | None:
+    """Machine reason to SKIP the clear, or None to proceed. Under the lock.
+
+    Every missing / unparseable input fails OPEN (returns None → clear), so a
+    restart onto an old state file, or a test seeding ``_interactive_msgs``
+    without a sidecar, degrades to today's unconditional teardown.
+    """
+    stored_kind = meta.surface_kind if meta is not None else None
+    if stored_kind in _GATE_RENDER_NAMES:
+        # Pane-detected gates have no transcript resolution event, so a
+        # non-interactive block proves nothing about them. They are cleared by
+        # the absent-streak tombstone, finalize_decision_dispatch, /clear,
+        # rotation or teardown.
+        return "pane_surface"
+    if _is_matching_resolution(cond, meta, window_id):
+        return None
+    block_ts = _parse_aware_iso(cond.block_timestamp)
+    born_ts = _parse_aware_iso(meta.surface_born_at if meta is not None else None)
+    if block_ts is not None and born_ts is not None and block_ts < born_ts:
+        return "stale_block"
+    return None
+
+
+def _ctx_state_attributable_to(window_id: str, tool_use_id: str) -> bool:
+    """Is the window's AUQ context-card state THIS AUQ's (or id-less legacy)?
+
+    The record's own ``tool_use_id`` is the explicit authority; the marker
+    string is the fallback (``<tool_use_id>`` or ``pretool:<tool_use_id>`` for
+    an id-carrying source, ``form:<fingerprint>`` for the pane-derived one,
+    which carries no identity at all and is therefore unattributable-legacy).
+    A ``pretool:`` marker that does NOT match is left alone: it cannot be told
+    apart from a successor's freshly-written entry, and never popping a
+    successor's state is the hard invariant here.
+    """
+    record = _auq_context_msgs.get(window_id)
+    if record is not None and record.tool_use_id:
+        return record.tool_use_id == tool_use_id
+    marker = _auq_context_posted.get(window_id)
+    if marker is not None:
+        if marker in (tool_use_id, f"pretool:{tool_use_id}"):
+            return True
+        return marker.startswith("form:")
+    return record is not None
+
+
+def _auq_identity_positively_matches(window_id: str, tool_use_id: str | None) -> bool:
+    """Does the live side file POSITIVELY prove ``tool_use_id`` is the live AUQ?
+
+    Both ids must be non-empty and equal. Unknown parity is NOT a match — the
+    narrow cleanup it gates is only safe when the resolution is proven to be
+    the one whose state is being retired.
+    """
+    if not tool_use_id:
+        return False
+    session_id = session_id_for_window(window_id)
+    if not session_id:
+        return False
+    side_id = auq_source.peek_side_file_tool_use_id(session_id)
+    return bool(side_id) and side_id == tool_use_id
+
+
+def _narrow_auq_cleanup_locked(window_id: str, tool_use_id: str) -> None:
+    """Retire ONLY the resolved AUQ's own identity-guarded state. Under the lock.
+
+    Runs when a resolution is proven to belong to an AUQ whose card a DIFFERENT
+    surface has since replaced. Three identity-guarded steps and nothing else:
+
+      1. the side file, via ``auq_source.remove_side_file_if_id`` (required —
+         a retained live one strands the replacement card's absent-streak
+         tombstone behind ``side_file_live_for_window`` and arms the startup
+         reconciler's broad ``release_window``);
+      2. the two window-keyed AUQ replay caches, only while they still hold
+         THIS id (leaving them recreates the stale-next-AUQ incident, and with
+         the side file gone a later AUQ would resolve through the stale
+         dispatch-trusted ``jsonl_cache`` path);
+      3. this AUQ's context-card marker + record, because (2) makes the next
+         ``remember_ask_tool_input`` see ``prior_id=None`` and skip its
+         rotation cleanup — without (3) a later AUQ's 📋 card is suppressed by
+         the surviving marker and a form-sourced record is upgraded in place
+         with the later question's text.
+
+    Explicitly NOT ``forget_ask_tool_input`` (its MessageDisplay teardown would
+    delete a successor EPM's plan-body / prose dedup markers) and NOT
+    ``auq_ledger.release_window`` (window-scoped, so it would unmask a
+    replacement Decision's ``dcp:`` single-use rows). The resolved AUQ's own
+    ledger rows therefore stay un-released — a disclosed ≤24h degradation.
+    """
+    session_id = session_id_for_window(window_id)
+    if session_id:
+        auq_source.remove_side_file_if_id(session_id, tool_use_id)
+    if _last_auq_tool_use_id.get(window_id) == tool_use_id:
+        _last_auq_tool_use_id.pop(window_id, None)
+        _last_completed_ask_tool_input.pop(window_id, None)
+    if _ctx_state_attributable_to(window_id, tool_use_id):
+        had_marker = _auq_context_posted.pop(window_id, None) is not None
+        had_record = _auq_context_msgs.pop(window_id, None) is not None
+        if had_marker or had_record:
+            _persist_interactive_state()
+
+
+async def apply_auq_tool_result_teardown(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    *,
+    tool_use_id: str | None,
+) -> str:
+    """Decide + perform the explicit AUQ ``tool_result`` teardown. GH #67 Fix 2b.
+
+    The seam in ``bot.handle_new_message`` fired ``forget_ask_tool_input`` +
+    ``auq_ledger.release_window`` on ANY parent AUQ tool_result. A STALE one
+    (an older AUQ's answer arriving late while a NEWER AUQ is live) then
+    unlinked the new AUQ's side file — killing free-text / dispatch / liveness
+    provenance — and released the window's ledger rows, unmasking the
+    dispatched-but-unresolved single-use brake.
+
+    The decision runs in a small per-route-lock critical section (the same
+    atomicity discipline as the generic seam) over two gates, and returns the
+    machine reason for the caller's logging:
+
+      * ``stale_auq_resolution`` — the block's id and the live AUQ identity are
+        both known and DIFFER: skip ALL teardown.
+      * ``narrow`` — a NON-AUQ surface owns the card, so the broad teardown is
+        skipped; a parity-PROVEN resolution performs only the narrow
+        identity-guarded cleanup (unknown parity cleans nothing).
+      * ``full`` — kind "AskUserQuestion" or None with parity not
+        proven-mismatched: today's teardown, byte-identical.
+    """
+    ikey = (user_id, thread_id or 0)
+    lock = _get_route_lock(user_id, thread_id)
+    async with lock:
+        meta = _interactive_msg_meta.get(ikey)
+        live_id = _live_auq_tool_use_id(window_id, meta)
+        if tool_use_id and live_id and tool_use_id != live_id:
+            logger.debug(
+                "AUQ tool_result teardown skipped reason=stale_auq_resolution "
+                "user=%d thread=%s window=%s",
+                user_id,
+                thread_id,
+                window_id,
+            )
+            return "stale_auq_resolution"
+        stored_kind = meta.surface_kind if meta is not None else None
+        if stored_kind is not None and stored_kind != "AskUserQuestion":
+            if _auq_identity_positively_matches(window_id, tool_use_id):
+                assert tool_use_id is not None
+                _narrow_auq_cleanup_locked(window_id, tool_use_id)
+            logger.debug(
+                "AUQ tool_result teardown narrowed reason=surface_replaced "
+                "kind=%s user=%d thread=%s window=%s",
+                stored_kind,
+                user_id,
+                thread_id,
+                window_id,
+            )
+            return "narrow"
+        forget_ask_tool_input(window_id)
+        auq_ledger.release_window(window_id)
+        return "full"
+
+
 async def clear_interactive_msg(
     user_id: int,
     bot: Bot | None = None,
@@ -4520,7 +4840,8 @@ async def clear_interactive_msg(
     session_mgr=None,
     tombstone: bool = False,
     tombstone_text: str | None = None,
-) -> None:
+    clear_condition: ClearCondition | None = None,
+) -> bool:
     """Clear the tracked interactive single-card surface for this route.
 
     State mutations under the route lock (snapshot + drop), Telegram
@@ -4545,6 +4866,17 @@ async def clear_interactive_msg(
     pop, pick-token / Decision-token teardown, the ``_fire_clear``
     lifecycle callback, keyboard removal, plain-text edit mode, shielding
     — is byte-identical. ``None`` (the default) = current behavior.
+
+    ``clear_condition`` (GH #67 Fix 2): the delivered block's RAW facts. When
+    given, the gate veto / matching-resolution parity / timestamp veto are
+    derived UNDER this function's own route lock, immediately before the
+    Phase-1 pop, and a vetoed clear returns False having mutated nothing. The
+    conditional ``forget_ask_tool_input`` then runs INSIDE the locked Phase-1
+    (the caller no longer forgets after the await returns), so a poller publish
+    of a successor surface in the lock-release window can never lose its side
+    file to the old block's teardown. ``None`` (every other caller — the poller
+    tombstone, ``/clear``, topic teardown, the dispatchers) is byte-identical
+    unconditional behavior. Returns whether the card was cleared.
     """
     if session_mgr is None:
         session_mgr = session_manager
@@ -4553,6 +4885,21 @@ async def clear_interactive_msg(
     # ── Phase 1: snapshot + drop state under lock ──────────────────
     lock = _get_route_lock(user_id, thread_id)
     async with lock:
+        meta = _interactive_msg_meta.get(ikey)
+        condition_window_id = _interactive_mode.get(ikey) or (
+            meta.window_id if meta is not None else None
+        )
+        if clear_condition is not None:
+            skip_reason = _clear_skip_reason(clear_condition, meta, condition_window_id)
+            if skip_reason is not None:
+                logger.debug(
+                    "Interactive clear skipped reason=%s user=%d thread=%s window=%s",
+                    skip_reason,
+                    user_id,
+                    thread_id,
+                    condition_window_id,
+                )
+                return False
         single_msg_id = _clear_interactive_msg(ikey)
         # P2.2: capture the active window for this route BEFORE popping
         # ``_interactive_mode`` so we can scope token pruning correctly.
@@ -4578,6 +4925,15 @@ async def clear_interactive_msg(
             # routes through here via ``clear_topic_state``).
             decision_token.teardown_route(user_id, thread_id, cleared_window_id)
 
+        if clear_condition is not None:
+            # GH #67 Fix 2: the conditional forget runs INSIDE this locked
+            # Phase-1 (the seam used to call it after the await returned), so a
+            # successor surface published by the poller in the lock-release
+            # window can never lose its side file to the old block's teardown.
+            forget_window_id = cleared_window_id or condition_window_id
+            if forget_window_id:
+                forget_ask_tool_input(forget_window_id)
+
     logger.debug(
         "Clear interactive: user=%d thread=%s single=%s",
         user_id,
@@ -4592,7 +4948,7 @@ async def clear_interactive_msg(
     _fire_clear(user_id, thread_id or 0, cleared_window_id)
 
     if bot is None:
-        return
+        return True
 
     chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
 
@@ -4634,6 +4990,7 @@ async def clear_interactive_msg(
     await attention.dismiss_if_kind(
         bot, user_id=user_id, thread_id=thread_id, kind="interactive_ui"
     )
+    return True
 
 
 async def finalize_decision_dispatch(
@@ -4812,6 +5169,38 @@ async def convert_interactive_msg_to_late_answer(
     # ── Phase 1: ONE critical section, no awaits between steps ────────
     lock = _get_route_lock(user_id, thread_id)
     async with lock:
+        # (0) GH #67 Fix 2b: two causality guards BEFORE the Phase-1 pop.
+        meta = _interactive_msg_meta.get(ikey)
+        live_id = _live_auq_tool_use_id(window_id, meta)
+        if expected_tool_use_id and live_id and expected_tool_use_id != live_id:
+            # The stale AFK result of an OLDER AUQ must not convert the newer
+            # live card. Nothing is cleaned: the live AUQ owns all of it.
+            logger.debug(
+                "AFK_CONVERT skipped reason=stale_afk user=%d thread=%s window=%s",
+                user_id,
+                thread_id,
+                window_id,
+            )
+            return
+        stored_kind = meta.surface_kind if meta is not None else None
+        if stored_kind is not None and stored_kind != "AskUserQuestion":
+            # A gate / EPM / Settings card replaced the AUQ in place — it is
+            # NEVER popped or edited into a late-answer card. Only a
+            # POSITIVELY parity-proven resolution retires the replaced AUQ's
+            # own state; unknown parity cleans nothing (the deliberate
+            # fail-closed branch protecting the replacement card).
+            if _auq_identity_positively_matches(window_id, expected_tool_use_id):
+                assert expected_tool_use_id is not None
+                _narrow_auq_cleanup_locked(window_id, expected_tool_use_id)
+            logger.debug(
+                "AFK_CONVERT declined reason=surface_replaced kind=%s user=%d "
+                "thread=%s window=%s",
+                stored_kind,
+                user_id,
+                thread_id,
+                window_id,
+            )
+            return
         # (1) snapshot BEFORE forget_ask_tool_input drops the cache + side file.
         snap = _trusted_afk_snapshot(window_id, expected_tool_use_id)
         # (2) the exact clear_interactive_msg Phase-1 mirror.

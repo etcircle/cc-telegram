@@ -72,7 +72,6 @@ from .handlers.directory_browser import (
     clear_all_picker_entries,
 )
 from .handlers import output_prefs
-from .handlers.auq_ledger import release_window as auq_ledger_release_window
 from .handlers.cleanup import clear_topic_state, disable_all_picker_cards
 from .handlers.dashboard import clear_dashboards_in_thread, dashboard_command
 from .handlers.history import send_history
@@ -120,10 +119,11 @@ from .handlers.inbound_telegram import (  # noqa: F401
     voice_handler,
 )
 from .handlers.interactive_ui import (
+    ClearCondition,
+    apply_auq_tool_result_teardown,
     clear_interactive_mode,
     clear_interactive_msg,
     convert_interactive_msg_to_late_answer,
-    forget_ask_tool_input,
     handle_interactive_ui,
     has_interactive_surface,
     maybe_upgrade_auq_context_message,
@@ -1538,6 +1538,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 _TURN_END_STOP_REASONS = frozenset({"end_turn", "stop_sequence"})
 
+# GH #67 Fix 4: routes already warned about a timestamp-less parent block. Every
+# real Claude Code transcript entry carries a timestamp, so a None here means a
+# parser regression upstream of the causality veto — which degrades that route
+# to per-block clears. One WARNING per route surfaces it without spamming the
+# log; the set is bounded by the routes the process has seen.
+_TIMESTAMPLESS_BLOCK_WARNED: set[tuple[int, int, str]] = set()
+
+
+def _warn_once_on_timestampless_block(
+    user_id: int, thread_id: int | None, window_id: str, msg: NewMessage
+) -> None:
+    """WARN once per route when a parent block reaches the clear seam with no ts."""
+    if msg.timestamp is not None:
+        return
+    key = (user_id, thread_id or 0, window_id)
+    if key in _TIMESTAMPLESS_BLOCK_WARNED:
+        return
+    _TIMESTAMPLESS_BLOCK_WARNED.add(key)
+    logger.warning(
+        "Parent block reached the interactive-clear seam with timestamp=None "
+        "(user=%d thread=%s window=%s type=%s) — the stale-block veto fails "
+        "OPEN for this route; every real transcript entry carries a timestamp, "
+        "so this indicates a transcript-parser regression.",
+        user_id,
+        thread_id,
+        window_id,
+        msg.content_type,
+    )
+
 
 async def _build_context_footer(
     user_id: int, thread_id: int | None, window_id: str
@@ -1951,9 +1980,15 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                     session_mgr=session_manager,
                 )
             else:
-                # Non-AFK (genuine answer / Esc rejection): today's teardown,
-                # byte-identical — both calls at their exact prior positions.
-                forget_ask_tool_input(wid)
+                # Non-AFK (genuine answer / Esc rejection). GH #67 Fix 2b: the
+                # teardown DECISION now runs inside a per-route-lock critical
+                # section in ``interactive_ui`` (id-parity + surface-kind), so a
+                # STALE tool_result can no longer unlink a NEWER live AUQ's side
+                # file or release the window's ledger rows. Kind
+                # "AskUserQuestion"/None with parity not proven-mismatched keeps
+                # today's teardown byte-identical — both calls at their exact
+                # prior positions inside that helper.
+                #
                 # Wave 2 fix 3b (P1-1 placement): tombstone this window's
                 # action-ledger rows ONLY here — the AUQ ``tool_result`` is the
                 # positive resolution proof. The ledger key is content-derived
@@ -1973,7 +2008,12 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 # release in ``session_monitor``. WINDOW-scoped: a
                 # double-`--resume` sibling window's unresolved card keeps its
                 # rows.
-                auq_ledger_release_window(wid)
+                await apply_auq_tool_result_teardown(
+                    user_id,
+                    thread_id,
+                    wid,
+                    tool_use_id=msg.tool_use_id,
+                )
 
         # Any non-interactive message from the PARENT means the interaction is
         # complete — delete the UI card. ``has_interactive_surface`` is the bool
@@ -1996,11 +2036,29 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # a parent non-interactive block (subagent_key is None) after a
         # bypassPermissions auto-resolution still legitimately tears the card
         # down — that is the regression-pinned case.
+        #
+        # GH #67 Fix 2/3: the teardown is now CONDITIONED on the delivered
+        # block's raw facts. The clear itself derives the gate veto (a
+        # pane-detected gate has no transcript resolution event, so a
+        # non-interactive block proves nothing about it — the sustained-churn
+        # trigger), the matching-resolution parity and the timestamp veto under
+        # its own route lock, and owns the conditional
+        # ``forget_ask_tool_input`` inside that locked Phase-1. Every missing /
+        # unparseable fact fails OPEN to the pre-#67 unconditional clear.
         if msg.subagent_key is None and has_interactive_surface(user_id, thread_id):
+            _warn_once_on_timestampless_block(user_id, thread_id, wid, msg)
             await clear_interactive_msg(
-                user_id, bot, thread_id, session_mgr=session_manager
+                user_id,
+                bot,
+                thread_id,
+                session_mgr=session_manager,
+                clear_condition=ClearCondition(
+                    block_timestamp=msg.timestamp,
+                    content_type=msg.content_type,
+                    tool_name=msg.tool_name,
+                    tool_use_id=msg.tool_use_id,
+                ),
             )
-            forget_ask_tool_input(wid)
 
         # Per-recipient legacy tool-call suppression — the faithful
         # CC_TELEGRAM_SHOW_TOOL_CALLS=false mapping (plan v4 §4): drops ALL

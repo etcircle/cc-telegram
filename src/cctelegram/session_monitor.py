@@ -642,6 +642,13 @@ class NewMessage:
     # sidechain emit site deliberately stays None (conversion is
     # parent-gated in bot.py anyway).
     tool_result_meta: dict[str, Any] | None = None
+    # GH #67 Fix 3: the JSONL entry-level ``timestamp`` (ISO-8601 UTC),
+    # propagated from ``ParsedEntry.timestamp`` at the PARENT emit site. The
+    # interactive-clear seam orders it against the published surface's
+    # ``surface_born_at`` so a STALE backlog block predating the surface can't
+    # tear it down. Every real transcript entry carries one; a None degrades
+    # that route to the pre-#67 unconditional clear (and is WARNING-logged).
+    timestamp: str | None = None
 
 
 def filter_live_prose_duplicates(messages: list[NewMessage]) -> list[NewMessage]:
@@ -3747,6 +3754,7 @@ class SessionMonitor:
                             message_id=entry.message_id,
                             block_origin=entry.block_origin,
                             tool_result_meta=entry.tool_result_meta,
+                            timestamp=entry.timestamp,
                         )
                     )
                     logger.info(
