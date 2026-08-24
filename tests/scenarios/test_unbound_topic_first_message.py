@@ -3,15 +3,14 @@
 When a user sends text in a topic with no ``thread_bindings`` entry, the bot
 must:
   - reply with the directory browser keyboard,
-  - stash the text in ``_pending_thread_text`` so it can be flushed once the
-    user picks a directory,
-  - record ``_pending_thread_id`` so callbacks know which thread owns the
+  - stash the text in this thread's picker entry (``_pending_thread_text``) so
+    it can be flushed once the user picks a directory,
+  - key the entry by thread id (GH #66) so callbacks know which thread owns the
     pending payload.
 
-A separate scenario (``test_stale_pending_replacement``) covers the case
-where a *second* unbound topic shows up while the first still has a pending
-payload — the bot must replace ownership without leaking the prior thread's
-file attachments.
+A separate scenario (``test_stale_pending_replacement``) covers the case where
+a *second* unbound topic shows up while the first still has a pending payload —
+GH #66: the two coexist as independent per-thread entries (no displacement).
 """
 
 from __future__ import annotations
@@ -23,9 +22,9 @@ from cctelegram.handlers.directory_browser import (
     BROWSE_PATH_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    picker_entry,
 )
 from tests.conftest import ScenarioHarness, make_update_text
-
 
 pytestmark = pytest.mark.scenario
 
@@ -42,11 +41,12 @@ async def test_unbound_topic_text_opens_browser_and_stashes_text(
     update.message.reply_text.assert_awaited()
     sent_kwargs = update.message.reply_text.await_args.kwargs
     assert "reply_markup" in sent_kwargs
-    # Pending payload is stashed for the directory pick.
-    assert scenario.user_data["_pending_thread_id"] == 42
-    assert scenario.user_data["_pending_thread_text"] == "hello claude"
-    assert scenario.user_data[STATE_KEY] == STATE_BROWSING_DIRECTORY
-    assert BROWSE_PATH_KEY in scenario.user_data
+    # Pending payload is stashed in THIS thread's per-topic picker entry (GH #66).
+    entry = picker_entry(scenario.user_data, 42)
+    assert entry is not None
+    assert entry["_pending_thread_text"] == "hello claude"
+    assert entry[STATE_KEY] == STATE_BROWSING_DIRECTORY
+    assert BROWSE_PATH_KEY in entry
     # No tmux send_keys: nothing is forwarded until the directory is picked.
     assert scenario.tmux.sent_keys == []
 

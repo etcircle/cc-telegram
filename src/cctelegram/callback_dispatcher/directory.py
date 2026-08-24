@@ -46,6 +46,7 @@ from cctelegram.handlers.directory_browser import (
     clear_browse_state,
     clear_session_picker_state,
     clear_window_picker_state,
+    picker_entry,
 )
 from cctelegram.handlers.inbound_telegram import (
     _clear_pending_route_payload,
@@ -59,13 +60,17 @@ from cctelegram.handlers.message_sender import safe_edit
 from . import safe_answer
 
 from . import (
-    _answer_invalid_pending_picker_callback,
     _validate_pending_picker_callback,
     revalidate_before_mutation,
     window_lease,
 )
 
 logger = logging.getLogger(__name__)
+
+# GH #66 part D: shown when a picker callback lands on a card whose in-memory
+# state is gone (bot restart) or has moved on (stale scrollback button). Editing
+# the dead card self-heals it — the next message opens a fresh picker.
+PICKER_EXPIRED_TEXT = "This picker expired — send a message here to open a new one."
 
 
 async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
@@ -82,9 +87,12 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
     async def reject_stale_window_callback(window_id: str) -> bool:
         return await lease.reject_stale_window(window_id)
 
+    def _entry() -> dict | None:
+        """This callback's own thread picker entry (GH #66)."""
+        return picker_entry(context.user_data, cb_thread_id)
+
     async def reject_invalid_pending_picker(
         expected_states: tuple[str, ...],
-        answer_text: str,
     ) -> tuple[bool, int | None]:
         ok, pending_tid, _reason = _validate_pending_picker_callback(
             context.user_data,
@@ -93,16 +101,21 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         )
         if ok:
             return False, pending_tid
-        await _answer_invalid_pending_picker_callback(query, answer_text)
+        # GH #66 part D: restart-orphan (entry gone) or stale scrollback button
+        # (wrong state) — disable the dead card instead of a bare popup so the
+        # next message opens a fresh picker.
+        await safe_edit(query, PICKER_EXPIRED_TEXT, reply_markup=None)
+        await safe_answer(query)
         return True, pending_tid
 
     # Directory browser handlers
     if data.startswith(CB_DIR_SELECT):
         stale, pending_tid = await reject_invalid_pending_picker(
-            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
+            (STATE_BROWSING_DIRECTORY,)
         )
         if stale:
             return
+        entry = _entry()
         # callback_data contains index, not dir name (to avoid 64-byte limit)
         try:
             idx = int(data[len(CB_DIR_SELECT) :])
@@ -111,9 +124,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             return
 
         # Look up dir name from cached subdirs
-        cached_dirs: list[str] = (
-            context.user_data.get(BROWSE_DIRS_KEY, []) if context.user_data else []
-        )
+        cached_dirs: list[str] = entry.get(BROWSE_DIRS_KEY, []) if entry else []
         if idx < 0 or idx >= len(cached_dirs):
             await safe_answer(
                 query, "Directory list changed, please refresh", show_alert=True
@@ -123,9 +134,7 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
 
         default_path = str(Path.cwd())
         current_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
+            entry.get(BROWSE_PATH_KEY, default_path) if entry else default_path
         )
         new_path = (Path(current_path) / subdir_name).resolve()
 
@@ -143,63 +152,55 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             user.id,
             pending_tid,
         )
-        if context.user_data is not None:
-            context.user_data[BROWSE_PATH_KEY] = new_path_str
-            context.user_data[BROWSE_PAGE_KEY] = 0
+        if entry is not None:
+            entry[BROWSE_PATH_KEY] = new_path_str
+            entry[BROWSE_PAGE_KEY] = 0
 
-        unbound_count = (
-            context.user_data.get(BROWSE_UNBOUND_COUNT_KEY, 0)
-            if context.user_data
-            else 0
-        )
+        unbound_count = entry.get(BROWSE_UNBOUND_COUNT_KEY, 0) if entry else 0
         msg_text, keyboard, subdirs = build_directory_browser(
             new_path_str, unbound_count=unbound_count
         )
-        if context.user_data is not None:
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        if entry is not None:
+            entry[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await safe_answer(query)
 
     elif data == CB_DIR_UP:
         stale, _pending_tid = await reject_invalid_pending_picker(
-            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
+            (STATE_BROWSING_DIRECTORY,)
         )
         if stale:
             return
+        entry = _entry()
         default_path = str(Path.cwd())
         current_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
+            entry.get(BROWSE_PATH_KEY, default_path) if entry else default_path
         )
         current = Path(current_path).resolve()
         parent = current.parent
         # No restriction - allow navigating anywhere
 
         parent_path = str(parent)
-        if context.user_data is not None:
-            context.user_data[BROWSE_PATH_KEY] = parent_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
+        if entry is not None:
+            entry[BROWSE_PATH_KEY] = parent_path
+            entry[BROWSE_PAGE_KEY] = 0
 
-        unbound_count = (
-            context.user_data.get(BROWSE_UNBOUND_COUNT_KEY, 0)
-            if context.user_data
-            else 0
-        )
+        unbound_count = entry.get(BROWSE_UNBOUND_COUNT_KEY, 0) if entry else 0
         msg_text, keyboard, subdirs = build_directory_browser(
             parent_path, unbound_count=unbound_count
         )
-        if context.user_data is not None:
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        if entry is not None:
+            entry[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await safe_answer(query)
 
     elif data.startswith(CB_DIR_PAGE):
         stale, _pending_tid = await reject_invalid_pending_picker(
-            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
+            (STATE_BROWSING_DIRECTORY,)
         )
         if stale:
             return
+        entry = _entry()
         try:
             pg = int(data[len(CB_DIR_PAGE) :])
         except ValueError:
@@ -207,41 +208,33 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             return
         default_path = str(Path.cwd())
         current_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
+            entry.get(BROWSE_PATH_KEY, default_path) if entry else default_path
         )
-        if context.user_data is not None:
-            context.user_data[BROWSE_PAGE_KEY] = pg
+        if entry is not None:
+            entry[BROWSE_PAGE_KEY] = pg
 
-        unbound_count = (
-            context.user_data.get(BROWSE_UNBOUND_COUNT_KEY, 0)
-            if context.user_data
-            else 0
-        )
+        unbound_count = entry.get(BROWSE_UNBOUND_COUNT_KEY, 0) if entry else 0
         msg_text, keyboard, subdirs = build_directory_browser(
             current_path, pg, unbound_count=unbound_count
         )
-        if context.user_data is not None:
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        if entry is not None:
+            entry[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await safe_answer(query)
 
     elif data == CB_DIR_CONFIRM:
         stale, pending_thread_id = await reject_invalid_pending_picker(
-            (STATE_BROWSING_DIRECTORY,),
-            "Stale browser (topic mismatch)",
+            (STATE_BROWSING_DIRECTORY,)
         )
         if stale:
             return
+        entry = _entry()
         default_path = str(Path.cwd())
         selected_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
+            entry.get(BROWSE_PATH_KEY, default_path) if entry else default_path
         )
 
-        clear_browse_state(context.user_data)
+        clear_browse_state(entry)
 
         # Check for existing sessions in this directory
         sessions = await session_manager.list_sessions_for_directory(selected_path)
@@ -249,15 +242,17 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             query,
             context,
             pending_thread_id,
-            "Stale browser (topic mismatch)",
+            PICKER_EXPIRED_TEXT,
         ):
             return
         if sessions:
-            # Show session picker — store state for later
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
-                context.user_data[SESSIONS_KEY] = sessions
-                context.user_data["_selected_path"] = selected_path
+            # Show session picker — store state for later. Re-resolve the entry:
+            # ``revalidate_before_mutation`` proved this thread still owns it.
+            entry = _entry()
+            if entry is not None:
+                entry[STATE_KEY] = STATE_SELECTING_SESSION
+                entry[SESSIONS_KEY] = sessions
+                entry["_selected_path"] = selected_path
             text, keyboard = build_session_picker(sessions)
             await safe_edit(query, text, reply_markup=keyboard)
             await safe_answer(query)
@@ -276,45 +271,41 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
 
     elif data == CB_DIR_CANCEL:
         stale, _pending_tid = await reject_invalid_pending_picker(
-            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
+            (STATE_BROWSING_DIRECTORY,)
         )
         if stale:
             return
-        clear_browse_state(context.user_data)
-        if context.user_data is not None:
-            _clear_pending_route_payload(context.user_data, delete_files=True)
+        # Dropping the entry clears browse chrome + payload + files together.
+        _clear_pending_route_payload(context.user_data, cb_thread_id, delete_files=True)
         await safe_edit(query, "Cancelled")
         await safe_answer(query, "Cancelled")
 
     # Session picker: resume existing session
     elif data.startswith(CB_SESSION_SELECT):
         stale, pending_tid = await reject_invalid_pending_picker(
-            (STATE_SELECTING_SESSION,), "Stale picker (topic mismatch)"
+            (STATE_SELECTING_SESSION,)
         )
         if stale:
             return
+        entry = _entry()
         try:
             idx = int(data[len(CB_SESSION_SELECT) :])
         except ValueError:
             await safe_answer(query, "Invalid data")
             return
 
-        cached_sessions = (
-            context.user_data.get(SESSIONS_KEY, []) if context.user_data else []
-        )
+        cached_sessions = entry.get(SESSIONS_KEY, []) if entry else []
         if idx < 0 or idx >= len(cached_sessions):
             await safe_answer(query, "Session not found")
             return
 
         session = cached_sessions[idx]
         selected_path = (
-            context.user_data.get("_selected_path", str(Path.cwd()))
-            if context.user_data
-            else str(Path.cwd())
+            entry.get("_selected_path", str(Path.cwd())) if entry else str(Path.cwd())
         )
-        clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_selected_path", None)
+        clear_session_picker_state(entry)
+        if entry is not None:
+            entry.pop("_selected_path", None)
 
         await _create_and_bind_window(
             query,
@@ -329,18 +320,17 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
 
     elif data == CB_SESSION_NEW:
         stale, pending_tid = await reject_invalid_pending_picker(
-            (STATE_SELECTING_SESSION,), "Stale picker (topic mismatch)"
+            (STATE_SELECTING_SESSION,)
         )
         if stale:
             return
+        entry = _entry()
         selected_path = (
-            context.user_data.get("_selected_path", str(Path.cwd()))
-            if context.user_data
-            else str(Path.cwd())
+            entry.get("_selected_path", str(Path.cwd())) if entry else str(Path.cwd())
         )
-        clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_selected_path", None)
+        clear_session_picker_state(entry)
+        if entry is not None:
+            entry.pop("_selected_path", None)
 
         await _create_and_bind_window(
             query,
@@ -354,32 +344,29 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
 
     elif data == CB_SESSION_CANCEL:
         stale, _pending_tid = await reject_invalid_pending_picker(
-            (STATE_SELECTING_SESSION,), "Stale picker (topic mismatch)"
+            (STATE_SELECTING_SESSION,)
         )
         if stale:
             return
-        clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            _clear_pending_route_payload(context.user_data, delete_files=True)
+        _clear_pending_route_payload(context.user_data, cb_thread_id, delete_files=True)
         await safe_edit(query, "Cancelled")
         await safe_answer(query, "Cancelled")
 
     # Window picker: bind existing window
     elif data.startswith(CB_WIN_BIND):
         stale, _pending_tid = await reject_invalid_pending_picker(
-            (STATE_SELECTING_WINDOW,), "Stale picker (topic mismatch)"
+            (STATE_SELECTING_WINDOW,)
         )
         if stale:
             return
+        entry = _entry()
         try:
             idx = int(data[len(CB_WIN_BIND) :])
         except ValueError:
             await safe_answer(query, "Invalid data")
             return
 
-        cached_windows: list[str] = (
-            context.user_data.get(UNBOUND_WINDOWS_KEY, []) if context.user_data else []
-        )
+        cached_windows: list[str] = entry.get(UNBOUND_WINDOWS_KEY, []) if entry else []
         if idx < 0 or idx >= len(cached_windows):
             await safe_answer(
                 query, "Window list changed, please retry", show_alert=True
@@ -419,14 +406,14 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             (STATE_SELECTING_WINDOW,),
         )
         if not ok:
-            await _answer_invalid_pending_picker_callback(
-                query,
-                "Stale picker (topic mismatch)",
-            )
+            # GH #66 part D: the entry vanished during the async re-checks above
+            # (bot restart / cancel) — self-heal the dead card.
+            await safe_edit(query, PICKER_EXPIRED_TEXT, reply_markup=None)
+            await safe_answer(query)
             return
 
         display = w.window_name
-        clear_window_picker_state(context.user_data)
+        clear_window_picker_state(_entry())
         session_manager.bind_thread(
             user.id, thread_id, selected_wid, window_name=display
         )
@@ -465,12 +452,13 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
     # Window picker: new session → transition to directory browser
     elif data == CB_WIN_NEW:
         stale, pending_tid = await reject_invalid_pending_picker(
-            (STATE_SELECTING_WINDOW,), "Stale picker (topic mismatch)"
+            (STATE_SELECTING_WINDOW,)
         )
         if stale:
             return
-        # Preserve pending thread info, clear only picker state
-        clear_window_picker_state(context.user_data)
+        entry = _entry()
+        # Preserve pending thread info, clear only picker chrome.
+        clear_window_picker_state(entry)
         unbound_count = len(
             await _list_unbound_windows(adapters.tmux_manager, adapters.session_manager)
         )
@@ -485,22 +473,23 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             user.id,
             pending_tid,
         )
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
-            context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+        if entry is not None:
+            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            entry[BROWSE_PATH_KEY] = start_path
+            entry[BROWSE_PAGE_KEY] = 0
+            entry[BROWSE_DIRS_KEY] = subdirs
+            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await safe_answer(query)
 
     # Directory browser: opt-in pivot to window picker
     elif data == CB_DIR_BIND_EXISTING:
         stale, _pending_tid = await reject_invalid_pending_picker(
-            (STATE_BROWSING_DIRECTORY,), "Stale browser (topic mismatch)"
+            (STATE_BROWSING_DIRECTORY,)
         )
         if stale:
             return
+        entry = _entry()
         unbound = await _list_unbound_windows(
             adapters.tmux_manager, adapters.session_manager
         )
@@ -510,22 +499,20 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         msg_text, keyboard, win_ids = build_window_picker(unbound)
         # Swap state from browse → picker. Keep pending thread/text/attachments
         # so the bind handler can flush them once a window is chosen.
-        clear_browse_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-            context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
+        clear_browse_state(entry)
+        if entry is not None:
+            entry[STATE_KEY] = STATE_SELECTING_WINDOW
+            entry[UNBOUND_WINDOWS_KEY] = win_ids
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await safe_answer(query)
 
     # Window picker: cancel
     elif data == CB_WIN_CANCEL:
         stale, _pending_tid = await reject_invalid_pending_picker(
-            (STATE_SELECTING_WINDOW,), "Stale picker (topic mismatch)"
+            (STATE_SELECTING_WINDOW,)
         )
         if stale:
             return
-        clear_window_picker_state(context.user_data)
-        if context.user_data is not None:
-            _clear_pending_route_payload(context.user_data, delete_files=True)
+        _clear_pending_route_payload(context.user_data, cb_thread_id, delete_files=True)
         await safe_edit(query, "Cancelled")
         await safe_answer(query, "Cancelled")

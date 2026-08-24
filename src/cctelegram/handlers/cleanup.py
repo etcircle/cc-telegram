@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from telegram import Bot
+from telegram.error import TelegramError
 
 from .. import md_capture, route_runtime
 from ..session import session_id_for_window, session_manager
@@ -28,6 +29,12 @@ from . import (
     usage_cache,
 )
 from .dashboard import clear_dashboards_in_thread
+from .directory_browser import (
+    CARD_CHAT_ID_KEY,
+    CARD_MSG_ID_KEY,
+    drop_picker_entry,
+    picker_entries,
+)
 from .inbound_aggregator import aggregator_clear_route
 from .interactive_ui import clear_interactive_msg
 from .message_queue import (
@@ -53,6 +60,41 @@ def _delete_pending_attachment_files(attachments: list[Any]) -> None:
             Path(path).unlink(missing_ok=True)
         except OSError as e:
             logger.debug("failed to delete pending attachment %s: %s", path, e)
+
+
+async def _disable_picker_card(bot: Bot | None, entry: dict[str, Any]) -> None:
+    """Edit a thread's recorded picker card to an inert self-heal message.
+
+    GH #66 part D: a torn-down entry (topic close / /start) leaves its Telegram
+    card looking live until tapped; disabling it here removes the stale keyboard.
+    Best-effort — a failed edit never blocks teardown.
+    """
+    card_chat_id = entry.get(CARD_CHAT_ID_KEY)
+    card_msg_id = entry.get(CARD_MSG_ID_KEY)
+    if bot is None or not card_chat_id or not card_msg_id:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=card_chat_id,
+            message_id=card_msg_id,
+            text="Picker closed — send a message here to reopen.",
+            reply_markup=None,
+        )
+    except TelegramError as e:
+        logger.debug("failed to disable picker card: %s", e)
+
+
+async def disable_all_picker_cards(
+    bot: Bot | None, user_data: dict[str, Any] | None
+) -> None:
+    """Disable every recorded picker card for this user (a /start global reset).
+
+    GH #66 (Codex Q5): ``clear_all_picker_entries`` drops the entries but their
+    cards would otherwise stay live-looking until each is tapped. Call this BEFORE
+    the clear so the coordinates are still available.
+    """
+    for entry in picker_entries(user_data):
+        await _disable_picker_card(bot, entry)
 
 
 async def clear_topic_state(
@@ -196,12 +238,15 @@ async def clear_topic_state(
 
     clear_route_caches_for_topic(user_id, thread_id or 0)
 
-    # Clear pending thread state from user_data
+    # Clear this thread's pending picker entry from user_data (GH #66: per-thread
+    # keyed, so closing this topic never touches another topic's in-flight entry).
     if user_data is not None:
-        if user_data.get("_pending_thread_id") == thread_id:
-            attachments = list(user_data.get("_pending_thread_attachments") or [])
+        entry = drop_picker_entry(user_data, thread_id)
+        if entry is not None:
             if drop_pending:
-                _delete_pending_attachment_files(attachments)
-            user_data.pop("_pending_thread_id", None)
-            user_data.pop("_pending_thread_text", None)
-            user_data.pop("_pending_thread_attachments", None)
+                _delete_pending_attachment_files(
+                    list(entry.get("_pending_thread_attachments") or [])
+                )
+            # GH #66 part D: disable the orphaned picker card so a stale button
+            # tapped after the topic closed edits to a self-heal message.
+            await _disable_picker_card(bot, entry)

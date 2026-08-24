@@ -24,6 +24,8 @@ from cctelegram.handlers.directory_browser import (
     STATE_KEY,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
+    ensure_picker_entry,
+    picker_entry,
 )
 
 
@@ -198,11 +200,12 @@ async def test_stale_interactive_key_rejected_after_topic_rebound_or_unbound(
 @pytest.mark.asyncio
 async def test_window_picker_rejects_window_that_became_bound_after_render():
     update = _make_callback_update(f"{CB_WIN_BIND}0")
-    context = _make_context(
+    context = _make_context()
+    # GH #66: picker state lives in THIS thread's per-topic entry.
+    ensure_picker_entry(context.user_data, 10).update(
         {
             STATE_KEY: STATE_SELECTING_WINDOW,
             UNBOUND_WINDOWS_KEY: ["@0"],
-            "_pending_thread_id": 10,
             "_pending_thread_text": "hello",
         }
     )
@@ -239,18 +242,16 @@ async def test_window_picker_rejects_window_that_became_bound_after_render():
     mock_bind.assert_not_called()
     mock_safe_edit.assert_not_called()
     mock_replay.assert_not_called()
-    assert context.user_data[UNBOUND_WINDOWS_KEY] == ["@0"]
+    assert picker_entry(context.user_data, 10)[UNBOUND_WINDOWS_KEY] == ["@0"]
 
 
 @pytest.mark.asyncio
 async def test_window_picker_bind_without_pending_owner_rejects_before_tmux_lookup():
+    # GH #66: "no pending owner" now means this thread has NO picker entry, so
+    # the callback self-heals (edits the dead card + answers) BEFORE any tmux
+    # lookup, bind, or flush.
     update = _make_callback_update(f"{CB_WIN_BIND}0")
-    context = _make_context(
-        {
-            STATE_KEY: STATE_SELECTING_WINDOW,
-            UNBOUND_WINDOWS_KEY: ["@0"],
-        }
-    )
+    context = _make_context()
     window = MagicMock()
     window.window_id = "@0"
     window.window_name = "unbound-window"
@@ -271,19 +272,17 @@ async def test_window_picker_bind_without_pending_owner_rejects_before_tmux_look
             new_callable=AsyncMock,
             return_value=[("@0", "unbound-window", "/tmp")],
         ) as mock_list_unbound,
-        patch.object(bot_module, "safe_edit", new_callable=AsyncMock) as mock_safe_edit,
         patch.object(
             bot_module, "aggregator_replay_payload", new_callable=AsyncMock
         ) as mock_replay,
     ):
         await bot_module.callback_handler(update, context)
 
-    update.callback_query.answer.assert_awaited_once_with(
-        "Stale picker (topic mismatch)", show_alert=True
-    )
+    # The stale callback was acknowledged (self-heal answer, no popup string).
+    update.callback_query.answer.assert_awaited()
     mock_find.assert_not_called()
     mock_list_unbound.assert_not_called()
     mock_bind.assert_not_called()
-    mock_safe_edit.assert_not_called()
     mock_replay.assert_not_called()
-    assert context.user_data[UNBOUND_WINDOWS_KEY] == ["@0"]
+    # No entry existed for this thread, so none was created.
+    assert picker_entry(context.user_data, 10) is None

@@ -54,29 +54,111 @@ UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
 
+# GH #66: picker state is keyed per (user, thread), not per user. PTB
+# ``user_data`` is one dict per user shared across every topic, so a single
+# flat set of picker keys let a picker opened in topic B steal topic A's slot
+# and orphan A's card. ``_PENDING_PICKERS_KEY`` holds a per-thread child map
+# ``{thread_id: entry}``; every picker key above (STATE_KEY, BROWSE_*,
+# UNBOUND_WINDOWS_KEY, SESSIONS_KEY) plus the pending payload keys owned by
+# ``inbound_telegram`` live inside THIS thread's entry. The thread id is the
+# map key, so there is no ``_pending_thread_id`` sub-key — presence of an entry
+# IS ownership.
+_PENDING_PICKERS_KEY = "_pending_pickers"
 
-def clear_browse_state(user_data: dict | None) -> None:
-    """Clear directory browsing state keys from user_data."""
+# GH #66 (part D): a picker card's Telegram coordinates, stored in the thread's
+# entry so a teardown of that entry (topic close) can disable the orphaned card.
+CARD_CHAT_ID_KEY = "_card_chat_id"
+CARD_MSG_ID_KEY = "_card_msg_id"
+
+
+def picker_entry(user_data: dict | None, thread_id: int | None) -> dict | None:
+    """Return this thread's picker entry, or None when absent."""
+    if user_data is None or thread_id is None:
+        return None
+    pickers = user_data.get(_PENDING_PICKERS_KEY)
+    if not isinstance(pickers, dict):
+        return None
+    entry = pickers.get(thread_id)
+    return entry if isinstance(entry, dict) else None
+
+
+def ensure_picker_entry(user_data: dict | None, thread_id: int | None) -> dict | None:
+    """Return this thread's picker entry, creating it (and the parent map) if absent.
+
+    ``setdefault`` semantics at BOTH levels (Codex Q2): a sibling thread's entry
+    is never replaced, so initializing one topic's picker cannot wipe another's.
+    Returns None when there is no ``user_data`` or thread to key on.
+    """
+    if user_data is None or thread_id is None:
+        return None
+    pickers = user_data.get(_PENDING_PICKERS_KEY)
+    if not isinstance(pickers, dict):
+        pickers = {}
+        user_data[_PENDING_PICKERS_KEY] = pickers
+    entry = pickers.get(thread_id)
+    if not isinstance(entry, dict):
+        entry = {}
+        pickers[thread_id] = entry
+    return entry
+
+
+def drop_picker_entry(user_data: dict | None, thread_id: int | None) -> dict | None:
+    """Pop and return this thread's picker entry (only this thread's; None if absent)."""
+    if user_data is None or thread_id is None:
+        return None
+    pickers = user_data.get(_PENDING_PICKERS_KEY)
+    if not isinstance(pickers, dict):
+        return None
+    entry = pickers.pop(thread_id, None)
+    if not pickers:
+        # Keep ``user_data`` tidy once the last thread's picker is gone.
+        user_data.pop(_PENDING_PICKERS_KEY, None)
+    return entry if isinstance(entry, dict) else None
+
+
+def picker_entries(user_data: dict | None) -> list[dict]:
+    """Return every thread's picker entry for this user (order-preserving)."""
+    if user_data is None:
+        return []
+    pickers = user_data.get(_PENDING_PICKERS_KEY)
+    if not isinstance(pickers, dict):
+        return []
+    return [entry for entry in pickers.values() if isinstance(entry, dict)]
+
+
+def clear_all_picker_entries(user_data: dict | None) -> None:
+    """Drop EVERY thread's picker entry for this user (a global /start reset)."""
     if user_data is not None:
-        user_data.pop(STATE_KEY, None)
-        user_data.pop(BROWSE_PATH_KEY, None)
-        user_data.pop(BROWSE_PAGE_KEY, None)
-        user_data.pop(BROWSE_DIRS_KEY, None)
-        user_data.pop(BROWSE_UNBOUND_COUNT_KEY, None)
+        user_data.pop(_PENDING_PICKERS_KEY, None)
 
 
-def clear_window_picker_state(user_data: dict | None) -> None:
-    """Clear window picker state keys from user_data."""
-    if user_data is not None:
-        user_data.pop(STATE_KEY, None)
-        user_data.pop(UNBOUND_WINDOWS_KEY, None)
+def clear_browse_state(entry: dict | None) -> None:
+    """Clear directory browsing chrome keys from a thread's picker entry.
+
+    Clears only the picker chrome (state + browse caches); the pending payload
+    keys (text / attachments) are left intact so a browse→picker transition
+    keeps them.
+    """
+    if entry is not None:
+        entry.pop(STATE_KEY, None)
+        entry.pop(BROWSE_PATH_KEY, None)
+        entry.pop(BROWSE_PAGE_KEY, None)
+        entry.pop(BROWSE_DIRS_KEY, None)
+        entry.pop(BROWSE_UNBOUND_COUNT_KEY, None)
 
 
-def clear_session_picker_state(user_data: dict | None) -> None:
-    """Clear session picker state keys from user_data."""
-    if user_data is not None:
-        user_data.pop(STATE_KEY, None)
-        user_data.pop(SESSIONS_KEY, None)
+def clear_window_picker_state(entry: dict | None) -> None:
+    """Clear window picker chrome keys from a thread's picker entry."""
+    if entry is not None:
+        entry.pop(STATE_KEY, None)
+        entry.pop(UNBOUND_WINDOWS_KEY, None)
+
+
+def clear_session_picker_state(entry: dict | None) -> None:
+    """Clear session picker chrome keys from a thread's picker entry."""
+    if entry is not None:
+        entry.pop(STATE_KEY, None)
+        entry.pop(SESSIONS_KEY, None)
 
 
 def build_window_picker(

@@ -11,9 +11,9 @@ Core responsibilities:
     ``bot.create_bot()``. Photo and document handlers also drive the
     media-group bundling path via ``aggregator_offer_{photo,document}``.
   - Pending-route-payload state machine (``_clear_pending_route_payload``,
-    ``_flush_pending_route_payload``, ``_remember_ignored_stale_thread_id``,
-    ``_pending_owner_matches``): stashes text + attachments while an
-    unbound topic is in the directory/session/window picker, and flushes
+    ``_flush_pending_route_payload``, ``_pending_owner_matches``): stashes
+    text + attachments in the thread's per-topic picker entry (GH #66) while
+    an unbound topic is in the directory/session/window picker, and flushes
     them onto the freshly-bound route once the picker commits.
   - Window-creation helpers (``_create_and_bind_window``,
     ``_abort_created_window_after_pending_owner_change``,
@@ -72,14 +72,16 @@ from .directory_browser import (
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
     BROWSE_UNBOUND_COUNT_KEY,
+    CARD_CHAT_ID_KEY,
+    CARD_MSG_ID_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     build_directory_browser,
-    clear_browse_state,
-    clear_session_picker_state,
-    clear_window_picker_state,
+    drop_picker_entry,
+    ensure_picker_entry,
+    picker_entry,
 )
 from .inbound_aggregator import (
     AggregatorReplayAttachment,
@@ -160,84 +162,42 @@ class PendingAttachment:
 
 
 # The provenance facts of a stashed pending TEXT payload (the same reason). Kept
-# in ``user_data`` beside ``_pending_thread_text``.
+# inside this thread's picker entry beside ``_pending_thread_text``.
 _PENDING_TEXT_FACTS_KEY = "_pending_thread_text_facts"
 
 
-_IGNORED_STALE_THREAD_IDS_KEY = "_ignored_stale_thread_ids"
-
-
-def _pending_thread_id(user_data: dict | None) -> int | None:
-    """Return the active pending route thread id, if present."""
-    if user_data is None:
-        return None
-    value = user_data.get("_pending_thread_id")
-    return value if isinstance(value, int) else None
-
-
 def _pending_owner_matches(user_data: dict | None, thread_id: int | None) -> bool:
-    """Return True when ``thread_id`` still owns the active pending payload."""
+    """Return True when ``thread_id`` still owns a live pending picker entry.
+
+    GH #66: ownership is now per-thread — an entry exists in ``_pending_pickers``
+    for exactly the threads that have a picker/payload in flight.
+    """
     if thread_id is None:
         return False
-    return _pending_thread_id(user_data) == thread_id
-
-
-def _remember_ignored_stale_thread_id(
-    user_data: dict | None, thread_id: int | None
-) -> None:
-    """Remember a replaced pending thread whose old picker callbacks are stale."""
-    if user_data is None or thread_id is None:
-        return
-    ignored = set(user_data.get(_IGNORED_STALE_THREAD_IDS_KEY, []) or [])
-    ignored.add(thread_id)
-    user_data[_IGNORED_STALE_THREAD_IDS_KEY] = sorted(ignored)
-
-
-def _forget_ignored_stale_thread_id(
-    user_data: dict | None, thread_id: int | None
-) -> None:
-    """Stop treating ``thread_id`` as a replaced stale pending thread."""
-    if user_data is None or thread_id is None:
-        return
-    ignored = set(user_data.get(_IGNORED_STALE_THREAD_IDS_KEY, []) or [])
-    ignored.discard(thread_id)
-    if ignored:
-        user_data[_IGNORED_STALE_THREAD_IDS_KEY] = sorted(ignored)
-    else:
-        user_data.pop(_IGNORED_STALE_THREAD_IDS_KEY, None)
-
-
-def _is_ignored_stale_thread_id(user_data: dict | None, thread_id: int | None) -> bool:
-    """Return True for old replaced-topic callbacks that must not clear current state."""
-    if user_data is None or thread_id is None:
-        return False
-    return thread_id in set(user_data.get(_IGNORED_STALE_THREAD_IDS_KEY, []) or [])
+    return picker_entry(user_data, thread_id) is not None
 
 
 def _clear_pending_route_payload(
     user_data: dict | None,
+    thread_id: int | None,
     *,
     delete_files: bool,
-    clear_ignored_stale_threads: bool = True,
 ) -> list[PendingAttachment]:
-    """Clear pending unbound-topic payload state and optionally delete files.
+    """Drop ``thread_id``'s whole picker entry and optionally delete its files.
 
-    Pending text/photo/document data lives outside the aggregator while the
-    user is choosing a directory/window/session. Cancel, stale-topic mismatch,
-    and bind failure must clear the whole bundle, not just text, otherwise a
-    later bind can forward media the user already cancelled.
+    Pending text/photo/document data lives inside the thread's picker entry
+    while the user is choosing a directory/window/session. Cancel, bind failure,
+    and the successful-flush clear all drop the entry as a unit (state, browse
+    caches, text, and attachments) — otherwise a later bind could forward media
+    the user already cancelled. GH #66: thread-scoped, so dropping one topic's
+    entry never touches another's.
     """
-    if user_data is None:
+    entry = drop_picker_entry(user_data, thread_id)
+    if entry is None:
         return []
     attachments: list[PendingAttachment] = list(
-        user_data.pop("_pending_thread_attachments", []) or []
+        entry.get("_pending_thread_attachments", []) or []
     )
-    user_data.pop("_pending_thread_id", None)
-    user_data.pop("_pending_thread_text", None)
-    user_data.pop(_PENDING_TEXT_FACTS_KEY, None)
-    user_data.pop("_selected_path", None)
-    if clear_ignored_stale_threads:
-        user_data.pop(_IGNORED_STALE_THREAD_IDS_KEY, None)
     if delete_files:
         for attachment in attachments:
             try:
@@ -254,36 +214,15 @@ def _clear_pending_route_payload_for_thread(
     thread_id: int,
     *,
     delete_files: bool,
-    clear_ignored_stale_threads: bool = True,
 ) -> list[PendingAttachment]:
-    """Clear pending payload only when ``thread_id`` owns it.
+    """Clear ``thread_id``'s pending payload (thread-scoped by construction).
 
-    Topic-close cleanup can race with a newer unbound-topic payload in another
-    thread. Keep all file deletion behind the same payload cleanup helper used
-    by cancel/replacement, but gate it by pending owner so closing an old topic
-    cannot delete the active newer payload.
+    GH #66: with per-thread keying, dropping the entry is already scoped to
+    ``thread_id`` and cannot touch another topic's newer payload, so this is a
+    thin alias over ``_clear_pending_route_payload`` kept for the topic-close
+    call site's readable intent.
     """
-    if _pending_thread_id(user_data) != thread_id:
-        return []
-    _clear_picker_state_for_current_state(user_data)
-    return _clear_pending_route_payload(
-        user_data,
-        delete_files=delete_files,
-        clear_ignored_stale_threads=clear_ignored_stale_threads,
-    )
-
-
-def _clear_picker_state_for_current_state(user_data: dict | None) -> None:
-    """Clear the active picker/browser state based on ``STATE_KEY``."""
-    if user_data is None:
-        return
-    current_state = user_data.get(STATE_KEY)
-    if current_state == STATE_BROWSING_DIRECTORY:
-        clear_browse_state(user_data)
-    elif current_state == STATE_SELECTING_WINDOW:
-        clear_window_picker_state(user_data)
-    elif current_state == STATE_SELECTING_SESSION:
-        clear_session_picker_state(user_data)
+    return _clear_pending_route_payload(user_data, thread_id, delete_files=delete_files)
 
 
 def _delete_pending_attachment_files(attachments: list[PendingAttachment]) -> None:
@@ -295,6 +234,18 @@ def _delete_pending_attachment_files(attachments: list[PendingAttachment]) -> No
             logger.debug(
                 "failed to delete pending attachment %s: %s", attachment.path, e
             )
+
+
+def _remember_picker_card(entry: dict | None, sent: Message | None) -> None:
+    """Record the picker card's Telegram coordinates in the thread's entry.
+
+    GH #66 (part D): stored so a teardown of this entry (topic close) can
+    disable the orphaned card. Best-effort — a missing entry / send is a no-op.
+    """
+    if entry is None or sent is None:
+        return
+    entry[CARD_CHAT_ID_KEY] = sent.chat_id
+    entry[CARD_MSG_ID_KEY] = sent.message_id
 
 
 async def _flush_pending_route_payload(
@@ -317,19 +268,21 @@ async def _flush_pending_route_payload(
     """
     if user_data is not None and not _pending_owner_matches(user_data, route[1]):
         logger.warning(
-            "Refusing to flush pending payload for route %s because pending owner is %s",
+            "Refusing to flush pending payload for route %s because thread %s no "
+            "longer owns a pending picker entry",
             route,
-            _pending_thread_id(user_data),
+            route[1],
         )
         return None
 
-    pending_text = user_data.get("_pending_thread_text") if user_data else None
-    pending_facts = user_data.get(_PENDING_TEXT_FACTS_KEY) if user_data else None
+    entry = picker_entry(user_data, route[1])
+    pending_text = entry.get("_pending_thread_text") if entry else None
+    pending_facts = entry.get(_PENDING_TEXT_FACTS_KEY) if entry else None
     pending_attachments: list[PendingAttachment] = (
-        list(user_data.get("_pending_thread_attachments") or []) if user_data else []
+        list(entry.get("_pending_thread_attachments") or []) if entry else []
     )
     if user_data is not None:
-        _clear_pending_route_payload(user_data, delete_files=False)
+        _clear_pending_route_payload(user_data, route[1], delete_files=False)
 
     if not pending_text and not pending_attachments:
         return None
@@ -548,16 +501,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     media_group_id = update.message.media_group_id
 
     if wid is None:
-        if context.user_data is not None:
-            pending_tid = _pending_thread_id(context.user_data)
-            if pending_tid is not None and pending_tid != thread_id:
-                _clear_picker_state_for_current_state(context.user_data)
-                _clear_pending_route_payload(
-                    context.user_data,
-                    delete_files=True,
-                    clear_ignored_stale_threads=False,
-                )
-                _remember_ignored_stale_thread_id(context.user_data, pending_tid)
+        # GH #66: stash into THIS thread's picker entry. No cross-thread
+        # displacement — another topic's entry is untouched by construction.
+        entry = ensure_picker_entry(context.user_data, thread_id)
         # §2.5: render reply-context before stashing an unbound-topic caption
         # so the later directory/window/session-picker flush preserves the
         # same quote block as the bound aggregator path below. Keep the same
@@ -572,28 +518,21 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # picker's flush in _create_and_bind_window can feed the aggregator
         # for the freshly-bound route. Multiple photos can pile up here
         # while the user navigates the directory browser.
-        if context.user_data is not None:
-            pending_attachments = context.user_data.setdefault(
-                "_pending_thread_attachments", []
-            )
+        if entry is not None:
+            pending_attachments = entry.setdefault("_pending_thread_attachments", [])
             pending_attachments.append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
                 )
             )
-            context.user_data["_pending_thread_id"] = thread_id
-            _forget_ignored_stale_thread_id(context.user_data, thread_id)
 
-        # If the user is already mid-picker (text_handler opened the
-        # directory browser, window picker, or session picker for THIS
-        # topic), stashing the photo is enough — re-emitting the picker
-        # here would stomp on the existing browse/picker state and lose
-        # the user's progress. Mirrors the same-thread guards in
-        # text_handler.
-        if context.user_data is not None:
-            current_state = context.user_data.get(STATE_KEY)
-            pending_tid = context.user_data.get("_pending_thread_id")
-            if pending_tid == thread_id and current_state in (
+            # If the user is already mid-picker (text_handler opened the
+            # directory browser, window picker, or session picker for THIS
+            # topic), stashing the photo is enough — re-emitting the picker
+            # here would stomp on the existing browse/picker state and lose
+            # the user's progress. Mirrors the same-thread guards in
+            # text_handler.
+            if entry.get(STATE_KEY) in (
                 STATE_BROWSING_DIRECTORY,
                 STATE_SELECTING_WINDOW,
                 STATE_SELECTING_SESSION,
@@ -609,13 +548,14 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         msg_text, keyboard, subdirs = build_directory_browser(
             start_path, unbound_count=unbound_count
         )
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
-            context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
-        await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        if entry is not None:
+            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            entry[BROWSE_PATH_KEY] = start_path
+            entry[BROWSE_PAGE_KEY] = 0
+            entry[BROWSE_DIRS_KEY] = subdirs
+            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+        sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        _remember_picker_card(entry, sent)
         return
 
     w = await tmux_manager.find_window_by_id(wid)
@@ -972,16 +912,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     media_group_id = update.message.media_group_id
 
     if wid is None:
-        if context.user_data is not None:
-            pending_tid = _pending_thread_id(context.user_data)
-            if pending_tid is not None and pending_tid != thread_id:
-                _clear_picker_state_for_current_state(context.user_data)
-                _clear_pending_route_payload(
-                    context.user_data,
-                    delete_files=True,
-                    clear_ignored_stale_threads=False,
-                )
-                _remember_ignored_stale_thread_id(context.user_data, pending_tid)
+        # GH #66: stash into THIS thread's picker entry — no cross-thread
+        # displacement of any other topic's in-flight picker.
+        entry = ensure_picker_entry(context.user_data, thread_id)
+        if entry is not None:
             # §2.5: render reply-context before stashing an unbound-topic
             # caption so the later picker flush preserves the same quote block
             # as the bound aggregator path below. Keep the same media-group
@@ -992,21 +926,14 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 caption, has_reply_ctx = await _apply_reply_context(
                     update.message, user.id, thread_id, caption
                 )
-            pending_attachments = context.user_data.setdefault(
-                "_pending_thread_attachments", []
-            )
+            pending_attachments = entry.setdefault("_pending_thread_attachments", [])
             pending_attachments.append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
                 )
             )
-            context.user_data["_pending_thread_id"] = thread_id
-            _forget_ignored_stale_thread_id(context.user_data, thread_id)
 
-        if context.user_data is not None:
-            current_state = context.user_data.get(STATE_KEY)
-            pending_tid = context.user_data.get("_pending_thread_id")
-            if pending_tid == thread_id and current_state in (
+            if entry.get(STATE_KEY) in (
                 STATE_BROWSING_DIRECTORY,
                 STATE_SELECTING_WINDOW,
                 STATE_SELECTING_SESSION,
@@ -1018,13 +945,14 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         msg_text, keyboard, subdirs = build_directory_browser(
             start_path, unbound_count=unbound_count
         )
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
-            context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
-        await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        if entry is not None:
+            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            entry[BROWSE_PATH_KEY] = start_path
+            entry[BROWSE_PAGE_KEY] = 0
+            entry[BROWSE_DIRS_KEY] = subdirs
+            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+        sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        _remember_picker_card(entry, sent)
         return
 
     w = await tmux_manager.find_window_by_id(wid)
@@ -1234,68 +1162,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         update.message, user.id, thread_id, text
     )
 
-    # Ignore text in window picker mode (only for the same thread)
-    if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
-        pending_tid = context.user_data.get("_pending_thread_id")
-        if pending_tid == thread_id:
+    # GH #66: text arriving while THIS thread is mid-picker is a no-op nudge —
+    # the picker owns the topic until it commits or cancels. State lives in the
+    # thread's own picker entry, so a picker in another topic is untouched (no
+    # cross-thread stale-clearing is needed or possible under per-thread keying).
+    _entry = picker_entry(context.user_data, thread_id)
+    if _entry is not None:
+        _picker_state = _entry.get(STATE_KEY)
+        if _picker_state == STATE_SELECTING_WINDOW:
             await safe_reply(
                 update.message,
                 "Please use the window picker above, or tap Cancel.",
             )
             return
-        # Stale picker state from a different thread — clear it
-        stale_thread_id = pending_tid if isinstance(pending_tid, int) else None
-        clear_window_picker_state(context.user_data)
-        _clear_pending_route_payload(
-            context.user_data,
-            delete_files=True,
-            clear_ignored_stale_threads=False,
-        )
-        _remember_ignored_stale_thread_id(context.user_data, stale_thread_id)
-
-    # Ignore text in directory browsing mode (only for the same thread)
-    if (
-        context.user_data
-        and context.user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY
-    ):
-        pending_tid = context.user_data.get("_pending_thread_id")
-        if pending_tid == thread_id:
+        if _picker_state == STATE_BROWSING_DIRECTORY:
             await safe_reply(
                 update.message,
                 "Please use the directory browser above, or tap Cancel.",
             )
             return
-        # Stale browsing state from a different thread — clear it
-        stale_thread_id = pending_tid if isinstance(pending_tid, int) else None
-        clear_browse_state(context.user_data)
-        _clear_pending_route_payload(
-            context.user_data,
-            delete_files=True,
-            clear_ignored_stale_threads=False,
-        )
-        _remember_ignored_stale_thread_id(context.user_data, stale_thread_id)
-
-    # Ignore text in session picker mode (only for the same thread)
-    if (
-        context.user_data
-        and context.user_data.get(STATE_KEY) == STATE_SELECTING_SESSION
-    ):
-        pending_tid = context.user_data.get("_pending_thread_id")
-        if pending_tid == thread_id:
+        if _picker_state == STATE_SELECTING_SESSION:
             await safe_reply(
                 update.message,
                 "Please use the session picker above, or tap Cancel.",
             )
             return
-        # Stale picker state from a different thread — clear it
-        stale_thread_id = pending_tid if isinstance(pending_tid, int) else None
-        clear_session_picker_state(context.user_data)
-        _clear_pending_route_payload(
-            context.user_data,
-            delete_files=True,
-            clear_ignored_stale_threads=False,
-        )
-        _remember_ignored_stale_thread_id(context.user_data, stale_thread_id)
 
     if wid is None:
         # Unbound topic — always show the directory browser. If unbound
@@ -1314,23 +1205,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         msg_text, keyboard, subdirs = build_directory_browser(
             start_path, unbound_count=unbound_count
         )
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
-            context.user_data[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
-            context.user_data["_pending_thread_id"] = thread_id
-            context.user_data["_pending_thread_text"] = text
+        # GH #66: stash into THIS thread's picker entry.
+        entry = ensure_picker_entry(context.user_data, thread_id)
+        if entry is not None:
+            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            entry[BROWSE_PATH_KEY] = start_path
+            entry[BROWSE_PAGE_KEY] = 0
+            entry[BROWSE_DIRS_KEY] = subdirs
+            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+            entry["_pending_thread_text"] = text
             # Carry the OBSERVED provenance across the stash so the pending-bind
             # replay is classified the same way a live offer would be
             # (plan §2.3 [r4 P2-1]).
-            context.user_data[_PENDING_TEXT_FACTS_KEY] = {
+            entry[_PENDING_TEXT_FACTS_KEY] = {
                 "typed_text": True,
                 "reply_context": has_reply_ctx,
             }
-            _forget_ignored_stale_thread_id(context.user_data, thread_id)
-        await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        _remember_picker_card(entry, sent)
         return
 
     # Bound topic — forward to bound window
@@ -1475,6 +1367,39 @@ async def _cleanup_unbound_created_window(
             reason,
         )
         return False
+    # GH #63 §2b (Codex Q1): NEVER kill a window that holds a live/won session.
+    # The bring-up ordering is register(session_map) → pending-owner recheck →
+    # BIND, so a WINNER can be REGISTERED and already running a live Claude in
+    # its pane during the gap BEFORE it is bound. Spare on EITHER proof:
+    #   - BOUND: it appears in the authoritative ``thread_bindings`` (the same
+    #     source ``clear_topic_state`` consults), OR
+    #   - REGISTERED: ``peek_session_id_for_window`` is non-None — SessionStart
+    #     fired, so a live Claude owns the pane and killing it is the exact §2b
+    #     destruction.
+    # Both are read SYNCHRONOUSLY immediately before the kill, so no ``await``
+    # interleaves between this ownership decision and the tmux call. A bare peek
+    # was rejected earlier because "registered" cannot distinguish a winner from
+    # a superseded loser — so this guard deliberately takes the SAFE direction:
+    # it may SPARE a registered-but-superseded LOSER (leaking that unbound tmux
+    # window — a rare, minor resource leak a future janitor could reap) in order
+    # to NEVER kill a registered WINNER (a live session, the actual §2b bug). The
+    # loser-leak is an ACCEPTED residual; reaping it is out of scope here (there
+    # is no clean, atomic way to tell a registered loser from a registered winner
+    # — that is precisely why the bare peek was rejected).
+    is_bound = window_id in {
+        wid for _, _, wid in session_manager.iter_thread_bindings()
+    }
+    is_registered = peek_session_id_for_window(window_id) is not None
+    if is_bound or is_registered:
+        logger.warning(
+            "Skipping cleanup of tmux window %s (%s) after %s: it holds a %s "
+            "session (won or live) — not collateral",
+            window_id,
+            window_name,
+            reason,
+            "bound" if is_bound else "registered",
+        )
+        return True
     try:
         killed = await tmux_mgr.kill_window(window_id)
     except Exception as e:  # pragma: no cover - tmux_manager normally swallows errors
@@ -1517,11 +1442,11 @@ async def _abort_created_window_after_pending_owner_change(
     """Surface a stale picker after a window was created but before binding."""
     logger.warning(
         "Pending owner changed before binding created window %s "
-        "(user=%d, callback_thread=%d, current_owner=%s)",
+        "(user=%d, callback_thread=%d, owner_still_present=%s)",
         created_wid,
         user_id,
         pending_thread_id,
-        _pending_thread_id(user_data),
+        _pending_owner_matches(user_data, pending_thread_id),
     )
     cleanup_note = ""
     show_alert = False
@@ -1576,10 +1501,10 @@ async def _create_and_bind_window(
     ):
         logger.warning(
             "Refusing to create window for stale picker "
-            "(user=%d, callback_thread=%d, current_owner=%s)",
+            "(user=%d, callback_thread=%d, owner_still_present=%s)",
             user.id,
             pending_thread_id,
-            _pending_thread_id(context.user_data),
+            _pending_owner_matches(context.user_data, pending_thread_id),
         )
         await safe_answer(query, "Stale picker", show_alert=True)
         return
@@ -1676,7 +1601,9 @@ async def _create_and_bind_window(
             if context.user_data is not None and _pending_owner_matches(
                 context.user_data, pending_thread_id
             ):
-                _clear_pending_route_payload(context.user_data, delete_files=True)
+                _clear_pending_route_payload(
+                    context.user_data, pending_thread_id, delete_files=True
+                )
             await safe_answer(
                 query,
                 "Hook timeout" if cleanup_ok else "Hook timeout; cleanup failed",
@@ -1740,7 +1667,9 @@ async def _create_and_bind_window(
                 if context.user_data is not None and _pending_owner_matches(
                     context.user_data, pending_thread_id
                 ):
-                    _clear_pending_route_payload(context.user_data, delete_files=True)
+                    _clear_pending_route_payload(
+                        context.user_data, pending_thread_id, delete_files=True
+                    )
                 await safe_answer(query, "Hook timeout")
                 return
 
@@ -1827,5 +1756,7 @@ async def _create_and_bind_window(
             and context.user_data is not None
             and _pending_owner_matches(context.user_data, pending_thread_id)
         ):
-            _clear_pending_route_payload(context.user_data, delete_files=True)
+            _clear_pending_route_payload(
+                context.user_data, pending_thread_id, delete_files=True
+            )
     await safe_answer(query, "Created" if success else "Failed")

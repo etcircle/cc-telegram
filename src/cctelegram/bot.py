@@ -69,11 +69,11 @@ from .callback_dispatcher.screenshot import (
     build_screenshot_keyboard as _build_screenshot_keyboard,
 )
 from .handlers.directory_browser import (
-    clear_browse_state,
+    clear_all_picker_entries,
 )
 from .handlers import output_prefs
 from .handlers.auq_ledger import release_window as auq_ledger_release_window
-from .handlers.cleanup import clear_topic_state
+from .handlers.cleanup import clear_topic_state, disable_all_picker_cards
 from .handlers.dashboard import clear_dashboards_in_thread, dashboard_command
 from .handlers.history import send_history
 from .handlers.inbound_aggregator import (
@@ -93,20 +93,14 @@ from .handlers.inbound_telegram import (  # noqa: F401
     _cleanup_unbound_created_window,
     _clear_pending_route_payload,
     _clear_pending_route_payload_for_thread,
-    _clear_picker_state_for_current_state,
     _create_and_bind_window,
     _delete_pending_attachment_files,
     _FILES_DIR,
     _flush_pending_route_payload,
-    _forget_ignored_stale_thread_id,
     _get_thread_id,
-    _IGNORED_STALE_THREAD_IDS_KEY,
     _IMAGES_DIR,
-    _is_ignored_stale_thread_id,
     _list_unbound_windows,
     _pending_owner_matches,
-    _pending_thread_id,
-    _remember_ignored_stale_thread_id,
     _sanitize_filename_part,
     aggregator_clear_route,
     aggregator_offer_document,
@@ -287,7 +281,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await safe_reply(update.message, "You are not authorized to use this bot.")
         return
 
-    clear_browse_state(context.user_data)
+    # GH #66: /start is a global reset for this user, so drop EVERY topic's
+    # picker entry (not just one thread's). Disable each entry's recorded card
+    # FIRST (Codex Q5 — otherwise its buttons look live until tapped), then
+    # clear. Both are no-ops when no picker is in flight.
+    await disable_all_picker_cards(context.bot, context.user_data)
+    clear_all_picker_entries(context.user_data)
 
     if update.message:
         await safe_reply(

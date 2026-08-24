@@ -20,7 +20,7 @@ Run: `uv run pytest -m scenario -q`.
 
 | Test file | Behavior it asserts |
 | --- | --- |
-| `test_unbound_topic_first_message.py` | First text in an unbound topic opens the directory browser and stashes the text in `_pending_thread_*`. Named topic with dead binding unbinds and warns. |
+| `test_unbound_topic_first_message.py` | First text in an unbound topic opens the directory browser and stashes the text in that thread's per-topic picker entry (`user_data["_pending_pickers"][thread_id]`, GH #66). Named topic with dead binding unbinds and warns. |
 | `test_tool_lifecycle.py` | One tool turn renders as one digest send (after `_finalize_activity_digest`) + one assistant-text send. `tool_use` / `tool_result` never produce direct messages under V2. |
 | `test_interactive_prompt_safety.py` | Wrong-user click on an `aqp:` token is rejected with "Not your card." and does NOT consume the token. Expired / stale-fingerprint clicks refresh the card without sending a digit to tmux. |
 | `test_media_group.py` | Telegram media-group photos coalesce into one bundle; caption rides item 1 only; subsequent items skip the caption to avoid duplication. |
@@ -32,7 +32,7 @@ Run: `uv run pytest -m scenario -q`.
 | `test_slash_command_flush.py` | `forward_command_handler` flushes the per-route aggregator bundle BEFORE forwarding the slash command, preserving arrival order at the pane. |
 | `test_kill_mid_tool_use.py` | `/kill` kills the window, unbinds, runs `clear_topic_state` (no leftover entries in `message_queue` topic-keyed maps), confirms with display name. |
 | `test_clear_mid_stream.py` | `/clear` rotates `session_id` to empty; subsequent `NewMessage` carrying the old session_id no longer routes to this topic. |
-| `test_stale_pending_replacement.py` | A new unbound-topic message takes ownership of `_pending_thread_id`, marks the previous thread as ignored-stale, and a late cancel from the old thread no longer clobbers the new pending payload (`bot.py:273-303`). |
+| `test_stale_pending_replacement.py` | GH #66: two topics mid-picker for the same user COEXIST as independent per-thread entries (no displacement of one by the other), and a cancel in one topic clears only that thread's entry — the other topic's pending payload survives. |
 | `test_screenshot_stale_window.py` | Screenshot keyboard taps against killed / rebound windows are rejected ("Window not found" / "Stale controls") before any tmux keystroke. |
 | `test_topic_rename.py` | Topic rename propagates to `tmux_manager.rename_window` + `session_manager.window_display_names`. Idempotent against same-name renames. |
 | `test_topic_broken_recovery.py` | `probe_topic_liveness` cleans the orphan window when Telegram returns `TOPIC_NOT_FOUND` on the heartbeat. Healthy topics are left alone. |
@@ -45,7 +45,7 @@ which are scenario-overlap candidates.
 
 | Bucket | Files (and why) |
 | --- | --- |
-| **(1) Keep — protected invariants** | `tests/cctelegram/test_route_runtime.py` (parallel-tools / 1M context latch / sidechain replay / WAITING_ON_USER restoration — run-state machine moved here from the deleted `test_busy_indicator.py`), `test_status_polling.py` + `test_status_polling_wave2.py` (typing separation), `test_pending_route_payload.py` (owner replacement + ignored-stale-thread machinery), `test_stale_window_callbacks.py` (ordering: stale rejection before tmux lookup), `test_terminal_parser.py` / `test_transcript_parser.py` (pure parsers — no scenario overlap), `test_message_queue.py` (digest invariants Wave A doesn't yet cover end-to-end), `test_interactive_ui.py` (mint/peek/consume mechanics under sidechain), `test_session_monitor.py` (poll cycle invariants). |
+| **(1) Keep — protected invariants** | `tests/cctelegram/test_route_runtime.py` (parallel-tools / 1M context latch / sidechain replay / WAITING_ON_USER restoration — run-state machine moved here from the deleted `test_busy_indicator.py`), `test_status_polling.py` + `test_status_polling_wave2.py` (typing separation), `test_pending_route_payload.py` (per-thread picker entries + owner-vanish aborts + flush-failure cleanup), `test_stale_window_callbacks.py` (ordering: stale rejection before tmux lookup), `test_terminal_parser.py` / `test_transcript_parser.py` (pure parsers — no scenario overlap), `test_message_queue.py` (digest invariants Wave A doesn't yet cover end-to-end), `test_interactive_ui.py` (mint/peek/consume mechanics under sidechain), `test_session_monitor.py` (poll cycle invariants). |
 | **(2) Replace — scenario overlap; keep for now** | `test_forward_command.py` overlaps with `test_slash_command_flush`. `test_kill_command.py` overlaps with `test_kill_mid_tool_use`. Parts of `test_pending_route_payload.py` overlap with `test_stale_pending_replacement` (but keep for the file-deletion invariants the scenario doesn't cover). |
 | **(3) Delete — incidental coupling** | **None in Wave A.** Wave B/C may revisit after deepening lands. |
 
