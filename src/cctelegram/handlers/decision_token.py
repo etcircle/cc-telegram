@@ -441,7 +441,18 @@ _DECISION_DISPATCH_TABLE: Final[dict[str, frozenset[str]]] = {
     # from the parsed cursor and the pre-Enter verify is the ONLY licence to
     # commit — a failed verify is ``not_advanced``, never extra blind arrows.
     # Digits COMMIT instantly on this surface, so they stay forbidden.
-    "folder-trust": frozenset({"2.1.204", "2.1.206", "2.1.207", "2.1.239", "2.1.241"}),
+    # 2.1.246 licensed from the GH #72 rig
+    # (``decision_trust_folder_v2.1.246_keystrokes.md``, fixtures
+    # ``folder_trust_*_v2.1.246.txt``): the arrival frame diffs EMPTY against
+    # both ``folder_trust_arrival_plain_v2.1.241.txt`` and the .239 twin once the
+    # echoed launch-command lines + cwd path are stripped, and the full E0–E4
+    # battery reproduced identically (arrows move + WRAP, Enter commits the
+    # cursored option, a bare digit commits instantly so digits stay forbidden,
+    # Escape kills the process, and the post-commit pane RETAINS the prompt text
+    # so liveness keys on the pane COMMAND).
+    "folder-trust": frozenset(
+        {"2.1.204", "2.1.206", "2.1.207", "2.1.239", "2.1.241", "2.1.246"}
+    ),
 }
 
 
