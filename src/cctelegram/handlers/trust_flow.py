@@ -3030,9 +3030,10 @@ async def claim_unbound_inbound(
         critical section, so the decision and the mutation are inseparable.
 
     ``stash`` runs INSIDE the lock so a payload can never land in an entry a
-    concurrent teardown already dropped. GH #74: text_handler passes NO stash at
-    all — an unbound topic's text is the knock that opens the picker, so the
-    only callers that hold anything are the attachment handlers.
+    concurrent teardown already dropped. GH #74: an unbound topic's text is the
+    knock that opens the picker — text_handler's stash only scrubs the legacy
+    pre-upgrade text keys (``_drop_legacy_text_payload``) and stores nothing;
+    the only callers that hold a payload are the attachment handlers.
     """
     browser: BrowserPayload | None = None
     for _ in range(2):
