@@ -4,6 +4,17 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.12] — 2026-08-26
+
+### Changed
+- **An unbound topic's first message is a knock, not a payload (GH #74, PR #75).** The text that
+  opens the directory picker is no longer stashed and replayed into the freshly bound window — it
+  only opens the picker, and the picker says so up front. This deletes the whole first-contact
+  noise class (refusal card + alert + "please resend it here" for a trigger message the user never
+  wanted delivered, worst on `--resume` where the TUI takes seconds to paint). Pending
+  ATTACHMENTS still replay after bind; a legacy pre-#74 text stash is scrubbed on access. Built
+  and peer-reviewed on the WSL box (two Codex rounds, both PASS, all findings folded).
+
 ## [0.4.10] — 2026-08-25
 
 ### Added
