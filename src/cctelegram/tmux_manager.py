@@ -1161,6 +1161,36 @@ class TmuxManager:
         )
         return False
 
+    def any_kill_pending(self) -> bool:
+        """True while ANY kill is in flight, for any window id.
+
+        ``create_window`` cannot ask about a specific id: TMUX assigns the id,
+        so the question "is a kill pending for the id I am about to be given?"
+        is unanswerable before the window exists (review r11 P1-A). The sound
+        gate is therefore the global one — while any kill is in flight, the id
+        it targets could be the one tmux hands us next, because ids RESET to
+        ``@0`` when the tmux server restarts.
+        """
+        return any(count > 0 for count in self._kill_pending_windows.values())
+
+    async def await_all_kills_settled(
+        self, *, timeout: float = 10.0, interval: float = 0.05
+    ) -> bool:
+        """DEFER until NO kill is in flight anywhere. True if all settled."""
+        if not self.any_kill_pending():
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(interval)
+            if not self.any_kill_pending():
+                return True
+        logger.warning(
+            "kills still in flight after %.1fs — refusing to create a window "
+            "whose id one of them might target",
+            timeout,
+        )
+        return False
+
     def reset_kill_pending_for_tests(self) -> None:
         """Drop all kill-pending marks (test isolation seam)."""
         self._kill_pending_windows.clear()
@@ -1391,6 +1421,24 @@ class TmuxManager:
         if not path.is_dir():
             return False, f"Not a directory: {work_dir}", "", ""
 
+        # THE ADOPTION GATE, BEFORE tmux new-window (review r11 P1-A). Checking
+        # AFTER creation was not linearizable: the kill's done-callback can
+        # clear the counter on the same event-loop turn on which it killed the
+        # reused id, so the post-hoc branch saw a clean counter and reported
+        # SUCCESS for a window that was already dead. And the id cannot be
+        # checked individually — TMUX assigns it, so the only sound question
+        # before the fact is the global one. tmux ids RESET to @0 on a server
+        # restart, which is exactly how a brand-new window inherits an id a
+        # kill is still aimed at.
+        if not await self.await_all_kills_settled():
+            # Settlement failing is a REFUSAL, never something to proceed past.
+            return (
+                False,
+                "A window is still being closed. Please try again in a moment.",
+                "",
+                "",
+            )
+
         # Create window name, adding suffix if name already exists
         final_window_name = window_name if window_name else path.name
 
@@ -1477,29 +1525,41 @@ class TmuxManager:
         created, _msg, _name, new_wid = result
         if created and new_wid:
             self.clear_window_stranded_draft(new_wid, reason="window newly created")
-            # THE ADOPTION GATE (review r10 P1-B). tmux window ids RESET to @0
-            # when the tmux server restarts, so a brand-new window can be handed
-            # an id a straggler kill is still aimed at — and that kill resolves
-            # its target BY ID inside the worker thread, so it would find THIS
-            # window. Wait for the kill to settle, then verify we survived; a
-            # window that did not is reported honestly rather than handed to a
-            # caller who would bind a topic to a corpse.
-            if self.window_kill_pending(new_wid):
+            # POST-SETTLEMENT POSITIVE VERIFICATION (review r11 P1-A). The gate
+            # above makes a same-tick kill of our id unreachable, but success is
+            # PROVEN here rather than inferred from a counter: one existence
+            # probe against tmux itself.
+            #
+            # ABSENCE MUST BE PROVEN, NOT INFERRED. ``find_window_by_id``
+            # returns None both for "tmux does not have it" and for "the listing
+            # failed" — and reading a failed enumeration as a dead window would
+            # make every creation fail whenever listing hiccups, which is the
+            # fail-closed direction pointing the wrong way. So the refusal
+            # requires a listing that actually WORKED (it returned other
+            # windows) and did not contain ours; an empty or failed listing is
+            # INDETERMINATE and logged, not fatal.
+            self._invalidate_list_cache()
+            listed = await self.list_windows()
+            if listed and not any(w.window_id == new_wid for w in listed):
+                logger.error(
+                    "created window %s is absent from a tmux listing of %d "
+                    "windows — refusing to report success",
+                    new_wid,
+                    len(listed),
+                )
+                return (
+                    False,
+                    "The new window was removed before it could be used. "
+                    "Please try again.",
+                    "",
+                    "",
+                )
+            if not listed:
                 logger.warning(
-                    "newly created window %s has a kill in flight for its id — "
-                    "waiting for it to settle before adoption",
+                    "could not enumerate tmux windows to verify %s — proceeding "
+                    "on the pre-create gate alone",
                     new_wid,
                 )
-                await self.await_kill_settled(new_wid)
-                self._invalidate_list_cache()
-                if await self.find_window_by_id(new_wid) is None:
-                    return (
-                        False,
-                        "The new window was removed by a concurrent teardown. "
-                        "Please try again.",
-                        "",
-                        "",
-                    )
         return result
 
     def _resolve_md_settings(self) -> str:

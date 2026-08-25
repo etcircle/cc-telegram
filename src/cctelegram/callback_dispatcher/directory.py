@@ -428,6 +428,41 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             await safe_answer(query)
             return
 
+        # EVERY PRECONDITION IS RE-VALIDATED AFTER THE WAIT (review r11 P1-B).
+        # The checks above ran BEFORE a wait that can last seconds, and all of
+        # them can go stale inside it: the window can die, another topic can
+        # claim it, and the picker entry can be replaced. Binding the object we
+        # resolved before the wait is binding a stale observation.
+        w = await tmux_manager.find_window_by_id(selected_wid)
+        if not w:
+            display = session_manager.get_display_name(selected_wid)
+            await safe_answer(
+                query, f"Window '{display}' no longer exists", show_alert=True
+            )
+            return
+
+        current_unbound_ids = {
+            wid
+            for wid, _, _ in await _list_unbound_windows(
+                adapters.tmux_manager, adapters.session_manager
+            )
+        }
+        if selected_wid not in current_unbound_ids:
+            await safe_answer(
+                query, "Window is no longer unbound, please retry", show_alert=True
+            )
+            return
+
+        ok, _pending_tid, _reason = _validate_pending_picker_callback(
+            context.user_data,
+            cb_thread_id,
+            (STATE_SELECTING_WINDOW,),
+        )
+        if not ok:
+            await safe_edit(query, PICKER_EXPIRED_TEXT, reply_markup=None)
+            await safe_answer(query)
+            return
+
         display = w.window_name
         clear_window_picker_state(_entry())
         session_manager.bind_thread(

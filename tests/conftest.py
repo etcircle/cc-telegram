@@ -25,6 +25,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -1058,12 +1059,15 @@ def _no_live_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
     2. **The tmux BINARY**, via ``create_subprocess_exec`` AND
        ``create_subprocess_shell`` — how ``capture_pane`` and the pane-command
        probes actually run. Poisoned by argv, accepting ``str``, ``bytes`` and
-       ``PathLike`` program arguments; the shell form scans EVERY token, not
-       just the first, so ``env tmux``, ``command tmux`` and ``true; tmux`` are
-       all refused. Only a ``tmux`` executable is refused, so tests that spawn
-       other subprocesses (the ``md_capture`` appender benchmark spawns a real
-       interpreter) are unaffected, and the tmux suites that patch these same
-       attributes themselves still override us.
+       ``PathLike`` program arguments. The shell form does NOT try to identify
+       which token is in executable position — it tokenizes shell-aware (so
+       ``'tmux'`` quoted counts) and refuses if ANY token names a tmux
+       executable. That deliberately over-blocks: ``echo tmux`` is refused too.
+       For a test guard that is the correct direction — a false refusal is a
+       loud, one-line test fix, while a false pass types into someone's live
+       session. Non-tmux subprocesses are otherwise untouched (the
+       ``md_capture`` appender benchmark spawns a real interpreter), and the
+       tmux suites that patch these same attributes still override us.
 
     What this does NOT cover, stated plainly: a **synchronous** ``subprocess``
     call (``subprocess.run`` / ``Popen``) made from arbitrary code. Fencing that
@@ -1104,10 +1108,25 @@ def _no_live_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
 
     async def _refuse_tmux_shell(cmd: Any, *args: Any, **kwargs: Any) -> Any:
         raw = cmd.decode("utf-8", "replace") if isinstance(cmd, bytes) else str(cmd)
-        # EVERY token, not just the first (review r10 P3-B): `env tmux …`,
-        # `command tmux …` and `true; tmux …` all put the tmux binary somewhere
-        # other than position 0, and each bypassed a first-token-only check.
-        if any(_is_tmux(token) for token in _SHELL_TOKEN_RE.split(raw) if token):
+        # BOTH tokenizers, because neither is sufficient alone (review r11 P3):
+        # ``shlex`` strips QUOTES (``'tmux' list-windows`` runs tmux just as
+        # surely as the bare form) but does NOT split on shell metacharacters,
+        # so ``(tmux list-windows)`` survives as the single token ``(tmux``.
+        # The metacharacter split covers that but cannot see through quotes. So
+        # shlex first, then split every token again on metacharacters, and check
+        # all of them. Unbalanced quotes make shlex raise; falling back to the
+        # metacharacter split alone is the fail-closed direction.
+        try:
+            shlex_tokens = shlex.split(raw, comments=False, posix=True)
+        except ValueError:
+            shlex_tokens = [raw]
+        tokens = [
+            piece
+            for token in shlex_tokens
+            for piece in _SHELL_TOKEN_RE.split(token)
+            if piece
+        ]
+        if any(_is_tmux(token) for token in tokens):
             raise RuntimeError("live tmux blocked in tests")
         return await real_shell(cmd, *args, **kwargs)
 

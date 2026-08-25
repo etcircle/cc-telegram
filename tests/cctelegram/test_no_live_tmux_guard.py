@@ -43,6 +43,10 @@ async def test_the_tmux_binary_is_refused_by_argv() -> None:
         "true; tmux kill-window",
         "echo hi && tmux kill-server",
         "(tmux list-windows)",
+        # Review r11 P3: QUOTED command words run tmux just the same.
+        "'tmux' list-windows",
+        '"tmux" kill-server',
+        "env 'tmux' list-windows",
     ):
         with pytest.raises(RuntimeError, match="live tmux blocked in tests"):
             await asyncio.create_subprocess_shell(shell_cmd)

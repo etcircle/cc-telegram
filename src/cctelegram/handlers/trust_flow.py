@@ -201,6 +201,18 @@ class SliceKind(Enum):
     INDETERMINATE = "indeterminate"
 
 
+class TrustBindRefused(Exception):
+    """A TYPED refusal from the completion bind's adoption gate (review r11 P1-B).
+
+    Raised BEFORE ``bind_thread``, so it is always a clean "nothing happened":
+    no binding, no completion note, and therefore ``bind_committed`` stays False
+    and the caller's existing failure arm runs the guarded cleanup with honest
+    copy. Distinct from an unexpected exception only in intent — the tail's
+    outcome machinery already treats "raised before the bind" as a failure, and
+    this makes that path deliberate rather than incidental.
+    """
+
+
 class CleanupOutcome(Enum):
     """Typed, exhaustive outcome of the guarded created-window cleanup."""
 
@@ -1756,6 +1768,45 @@ def _owner_guard_for(flow: TrustFlow) -> Callable[[], Awaitable[bool]]:
     return _still_owns
 
 
+async def _revalidate_bind_preconditions(flow: TrustFlow, session_mgr: Any) -> None:
+    """Re-prove EVERY precondition after the settlement wait (review r11 P1-B).
+
+    Three questions, all of which could have changed while we were parked:
+
+    1. **Does the window still exist?** A fresh probe, not the stale object we
+       resolved before the wait — binding a topic to a corpse is the exact harm
+       the gate exists to prevent.
+    2. **Is this topic still free?** Exclusivity is re-read: a competing flow or
+       a manual bind may have claimed it, and two topics on one window is a
+       routing corruption (1 topic = 1 window = 1 session).
+    3. **Do we still own the picker?** The generation check runs at the top of
+       the tail, but the wait reopens the window in which a newer generation can
+       take over.
+
+    Raises ``TrustBindRefused``, which lands BEFORE ``bind_thread`` — so it is
+    always a clean nothing-happened and the caller's failure arm owns the copy.
+    """
+    finder = getattr(flow.tmux_mgr, "find_window_by_id", None)
+    if finder is not None and await finder(flow.created_wid) is None:
+        raise TrustBindRefused(
+            f"window {flow.created_wid} no longer exists after the adoption wait"
+        )
+
+    owner = getattr(session_mgr, "get_window_for_thread", None)
+    if owner is not None:
+        bound = owner(flow.user_id, flow.thread_id)
+        if bound is not None and bound != flow.created_wid:
+            raise TrustBindRefused(
+                f"thread {flow.thread_id} was bound to {bound} during the adoption wait"
+            )
+
+    entry = picker_entry(flow.user_data, flow.thread_id)
+    if entry is None or entry.get(TRUST_GENERATION_KEY) != flow.generation:
+        raise TrustBindRefused(
+            "this flow no longer owns the picker after the adoption wait"
+        )
+
+
 async def _settle_committed_but_unfinished_bind(flow: TrustFlow, bot: Any) -> None:
     """Terminalize a flow whose bind COMMITTED but whose tail never finished.
 
@@ -1784,13 +1835,25 @@ async def _settle_committed_but_unfinished_bind(flow: TrustFlow, bot: Any) -> No
         flow.created_wid,
         flow.thread_id,
     )
-    still_bound = binding_is_current_route(flow)
     payload_warning = (
         "\n\n⚠️ Your pending message may not have been delivered — resend it if "
         "you don't see a reply."
     )
-    if still_bound:
+    # THREE arms, not two (review r11 P2). ``binding_is_current_route`` False
+    # conflated "unbound" with "REBOUND to a different live window", and the
+    # unbound copy told a user whose topic is perfectly usable that there is
+    # nothing to send to — false, and the opposite of actionable.
+    current_binding: str | None = None
+    owner = getattr(flow.session_mgr, "get_window_for_thread", None)
+    if owner is not None:
+        current_binding = owner(flow.user_id, flow.thread_id)
+    if current_binding == flow.created_wid:
         body = f"✅ {flow.create_message}\n\nCreated. Send messages here."
+    elif current_binding is not None:
+        body = (
+            f"✅ {flow.create_message}\n\nCreated — and this topic is now bound "
+            "to another session, so messages here go there."
+        )
     else:
         body = (
             f"✅ {flow.create_message}\n\nCreated — but this topic was unbound or "
@@ -1883,9 +1946,20 @@ async def _complete_bind(flow: TrustFlow, bot: Any, session_mgr: Any) -> None:
     # for any in-flight kill to settle; the bind itself stays SYNCHRONOUS and
     # immediately followed by the note, which is what makes `bind_committed`
     # exact.
+    #
+    # EVERY PRECONDITION IS RE-VALIDATED AFTER THE WAIT (review r11 P1-B). The
+    # settlement wait is not instantaneous, and everything checked before it —
+    # the window's existence, this topic's freedom, this flow's ownership of the
+    # picker — can change while we are parked. Ignoring the wait's own boolean
+    # was the same class: a wait that TIMED OUT meant the kill could still land,
+    # which is precisely when binding is least safe.
     kill_gate = getattr(flow.tmux_mgr, "await_kill_settled", None)
-    if kill_gate is not None:
-        await kill_gate(flow.created_wid)
+    if kill_gate is not None and not await kill_gate(flow.created_wid):
+        raise TrustBindRefused(
+            f"a kill for window {flow.created_wid} did not settle — refusing to "
+            "bind a window that may be about to disappear"
+        )
+    await _revalidate_bind_preconditions(flow, session_mgr)
 
     session_mgr.bind_thread(
         flow.user_id, flow.thread_id, flow.created_wid, window_name=flow.window_name
