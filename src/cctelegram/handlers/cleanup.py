@@ -98,15 +98,28 @@ async def disable_all_picker_cards(
         await _disable_picker_card(bot, entry)
 
 
-async def teardown_all_creation_flows(user_id: int, user_data: Any) -> None:
+async def teardown_all_creation_flows(
+    user_id: int,
+    bot: Bot | None = None,
+    user_data: dict[str, Any] | None = None,
+) -> None:
     """GH #65 Fix 6: tear down EVERY topic's creation flow for one user.
 
     The ``/start`` global reset runs this BEFORE ``clear_all_picker_entries`` so
     each flow's window is settled (guarded cleanup) while its entry — the
-    ownership token — is still present.
+    ownership token — is still present. A flow whose COMPLETION WON inside the
+    teardown window is never abandoned half-bound (its retained tail is
+    awaited); the now-BOUND topic then goes through the normal bound-topic
+    teardown, per Fix 6's protocol (review r1 P2-3).
     """
-    del user_data
-    await trust_flow.teardown_all_for_user(user_id)
+    for thread_id in await trust_flow.teardown_all_for_user(user_id):
+        logger.info(
+            "creation flow completed during /start teardown — running the "
+            "bound-topic teardown (user=%d, thread=%d)",
+            user_id,
+            thread_id,
+        )
+        await clear_topic_state(user_id, thread_id, bot, user_data)
 
 
 async def clear_topic_state(

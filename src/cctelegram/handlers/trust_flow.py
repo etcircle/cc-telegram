@@ -22,8 +22,8 @@ Core responsibilities:
     pane COMMAND before any pane TEXT, blank ⇒ indeterminate).
   - ``cleanup_created_window`` — the typed cleanup arbitration whose FRESH
     session-map read is the declared linearization point.
-  - ``decide_unbound_inbound`` — Fix 5's under-the-lock re-read for the three
-    unbound-topic inbound handlers.
+  - ``claim_unbound_inbound`` — Fix 5's ONE-critical-section decide-and-mutate
+    for the three unbound-topic inbound handlers.
   - ``teardown_thread`` / ``shutdown`` — Fix 6's reachable teardown with the
     normative lock choreography.
 
@@ -58,6 +58,10 @@ from ..tmux_manager import pane_command_is_claude, pane_command_is_shell
 from . import auq_ledger, decision_token
 from .callback_data import CB_TRUST_PICK, checked_callback_data
 from .directory_browser import (
+    BROWSE_DIRS_KEY,
+    BROWSE_PAGE_KEY,
+    BROWSE_PATH_KEY,
+    BROWSE_UNBOUND_COUNT_KEY,
     CARD_CHAT_ID_KEY,
     CARD_MSG_ID_KEY,
     STATE_BROWSING_DIRECTORY,
@@ -65,10 +69,17 @@ from .directory_browser import (
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     drop_picker_entry,
+    ensure_picker_entry,
     picker_entry,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _wall() -> float:
+    """The lane's monotonic clock (one seam, so tests can reason about it)."""
+    return time.monotonic()
+
 
 # The creation-flow picker state. Present in the thread's picker entry for
 # exactly as long as this lane OWNS the topic; every unbound-topic inbound
@@ -185,6 +196,13 @@ class TrustFlow:
     trust_deadline: float | None = None
     global_deadline: float = 0.0
     enter_sent_at: float | None = None
+    # When the flow ENTERED ``awaiting_registration`` — stamped on BOTH entry
+    # paths (a dispatch that sent Enter, AND the manual in-tmux answer). The
+    # demotion keys on THIS, not on ``enter_sent_at``: keying on the dispatch
+    # stamp made the demotion unreachable for the manual path (review r1 P1-3),
+    # stranding a flow in ``awaiting_registration`` with a dead card whenever
+    # the user's own answer did not take.
+    awaiting_registration_at: float | None = None
     trust_seen: bool = False
     terminal_committed: bool = False
     wait_task: asyncio.Task[None] | None = None
@@ -220,6 +238,23 @@ def _next_generation() -> int:
 def get_flow(user_id: int, thread_id: int) -> TrustFlow | None:
     """The live flow record for this topic, or None."""
     return _flows.get((user_id, thread_id))
+
+
+def flow_owner_for_thread(thread_id: int | None) -> int | None:
+    """The user_id owning a live creation flow in ``thread_id``, or None.
+
+    The ``tst:`` card lives in a shared forum topic, so ANOTHER allowed user can
+    tap it. Their PTB ``user_data`` is a different dict, so an ownership check
+    keyed on the entry alone would read "expired" and EDIT the owner's card
+    (review r1 P2-4). This gives the callback entry a positive owner to compare
+    against BEFORE it touches any state.
+    """
+    if thread_id is None:
+        return None
+    for (uid, tid), flow in _flows.items():
+        if tid == thread_id and flow.phase in NONTERMINAL_PHASES:
+            return uid
+    return None
 
 
 def flow_task(user_id: int, thread_id: int) -> asyncio.Task[None] | None:
@@ -387,12 +422,15 @@ async def cleanup_created_window(
             reason,
         )
         return CleanupOutcome.SPARED_BOUND
-    # The linearization point. ``peek`` is kept as the pre-#65 (cached) proof so
-    # the guard is a strict superset of Wave-2's.
-    is_registered = (
-        peek_session_id_for_window(window_id) is not None
-        or read_session_id_for_window_fresh(window_id) is not None
-    )
+    # ``peek`` is kept as the pre-#65 (cached) proof so the guard is a strict
+    # superset of Wave-2's; the FRESH read follows it UNCONDITIONALLY and is the
+    # LAST observation before the kill (review r1 P2-1 — a short-circuiting
+    # ``peek(...) or fresh(...)`` would skip the declared linearization point
+    # exactly when the cache happens to be warm). Neither read awaits, so
+    # nothing can interleave between them and the tmux call.
+    cached_sid = peek_session_id_for_window(window_id)
+    fresh_sid = read_session_id_for_window_fresh(window_id)
+    is_registered = cached_sid is not None or fresh_sid is not None
     if is_registered:
         logger.warning(
             "Skipping cleanup of tmux window %s (%s) after %s: it holds a "
@@ -763,7 +801,8 @@ def registration_budget_s(resume: bool = False) -> float:
 
 def note_dispatch_enter_sent(flow: TrustFlow) -> None:
     """Called by the ``tst:`` lane after a transaction that SENT Enter."""
-    flow.enter_sent_at = time.monotonic()
+    flow.enter_sent_at = _wall()
+    flow.awaiting_registration_at = _wall()
     flow.trust_deadline = None
     _rebase_registration_budget(flow, reason="trust dispatch sent Enter")
 
@@ -837,13 +876,18 @@ async def _wait_loop(
                 await render_trust_card(flow, bot, pane_text)
             elif (
                 flow.phase == PHASE_AWAITING_REGISTRATION
-                and flow.enter_sent_at is not None
-                and time.monotonic() - flow.enter_sent_at > TRUST_SETTLE_MARGIN_S
+                and flow.awaiting_registration_at is not None
+                and _wall() - flow.awaiting_registration_at > TRUST_SETTLE_MARGIN_S
             ):
-                # The DOCUMENTED demotion: the Enter did not in fact commit.
+                # The DOCUMENTED demotion: the trust frame is STILL standing
+                # past the settle margin, so whatever moved us to
+                # ``awaiting_registration`` — our Enter, or the user's own
+                # answer in tmux — did not in fact commit. Fresh render, fresh
+                # tokens, back to ``awaiting_trust``.
                 flow.phase = PHASE_AWAITING_TRUST
                 flow.enter_sent_at = None
-                flow.trust_deadline = time.monotonic() + config.trust_prompt_ceiling_s
+                flow.awaiting_registration_at = None
+                flow.trust_deadline = _wall() + config.trust_prompt_ceiling_s
                 await render_trust_card(flow, bot, pane_text)
             elif flow.phase == PHASE_AWAITING_TRUST:
                 if flow.trust_deadline is None:
@@ -856,10 +900,18 @@ async def _wait_loop(
                     flow.created_wid,
                     min_remaining_s=TOKEN_REFRESH_MIN_REMAINING_S,
                 )
-        elif flow.trust_seen and flow.phase == PHASE_AWAITING_TRUST:
-            # The trust prompt disappeared without a dispatch of ours ⇒ the user
-            # answered it in tmux. Fresh registration budget (Fix 1).
+        elif (
+            kind in (SliceKind.RUNNING, SliceKind.OTHER_SURFACE)
+            and flow.trust_seen
+            and flow.phase == PHASE_AWAITING_TRUST
+        ):
+            # The trust prompt is POSITIVELY gone (a running REPL / another
+            # named surface) without a dispatch of ours ⇒ the user answered it
+            # in tmux. Fresh registration budget (Fix 1). An INDETERMINATE slice
+            # is deliberately NOT this signal (review r1 P1-3): a blank or
+            # unreadable capture proves nothing, so it keeps waiting.
             flow.phase = PHASE_AWAITING_REGISTRATION
+            flow.awaiting_registration_at = _wall()
             flow.trust_deadline = None
             _rebase_registration_budget(flow, reason="prompt answered in tmux")
 
@@ -1002,49 +1054,77 @@ async def start_trust_wait(
     cli_version: str | None,
     tmux_mgr: Any,
     session_mgr: Any,
-) -> TrustFlow:
-    """Claim the topic and spawn the classifying WAIT task.
+) -> TrustFlow | None:
+    """Claim the topic ATOMICALLY and spawn the classifying WAIT task.
 
     The caller has ALREADY answered the callback and edited the card to a
     "starting Claude…" state — the ENTIRE wait (including the first hook-timeout
     phase) runs here, so the callback coroutine is never held open for a
     minutes-scale wait.
+
+    **Returns ``None`` when the topic is no longer claimable** (review r1 P1-1).
+    ``_create_and_bind_window`` awaits two Telegram operations after its last
+    owner check, so a concurrent ``/start`` or topic close can clear the picker
+    entry in that window. Installing a flow anyway left it UNREACHABLE: the
+    ENTRY is the ownership token, so every ``tst:`` claim would refuse, neither
+    Trust nor Cancel could reach the flow, and a later registration would bind
+    nothing. The re-validation and the registry write therefore share ONE
+    critical section under the creation lock; the caller runs the guarded abort
+    (kill/spare + the stale-picker edit) on ``None``.
     """
-    entry = picker_entry(user_data, thread_id)
-    generation = _next_generation()
-    if entry is not None:
+    async with creation_lock(user_id, thread_id):
+        entry = picker_entry(user_data, thread_id)
+        if entry is None:
+            logger.warning(
+                "Refusing to start a trust flow for window %s: thread %s no "
+                "longer owns a picker entry",
+                created_wid,
+                thread_id,
+            )
+            return None
+        existing = _flows.get((user_id, thread_id))
+        if existing is not None and existing.phase in NONTERMINAL_PHASES:
+            logger.warning(
+                "Refusing to start a trust flow for window %s: thread %s "
+                "already has a live flow in %s",
+                created_wid,
+                thread_id,
+                existing.phase,
+            )
+            return None
+        generation = _next_generation()
         entry[STATE_KEY] = STATE_AWAITING_TRUST
         entry[TRUST_GENERATION_KEY] = generation
         entry[TRUST_WID_KEY] = created_wid
         entry[TRUST_CLI_VERSION_KEY] = cli_version
-    card_chat_id = entry.get(CARD_CHAT_ID_KEY) if entry else None
-    card_msg_id = entry.get(CARD_MSG_ID_KEY) if entry else None
-    now = time.monotonic()
-    budget = registration_budget_s()
-    flow = TrustFlow(
-        generation=generation,
-        user_id=user_id,
-        thread_id=thread_id,
-        chat_id=chat_id,
-        card_chat_id=card_chat_id,
-        card_msg_id=card_msg_id,
-        created_wid=created_wid,
-        window_name=window_name,
-        selected_path=selected_path,
-        create_message=create_message,
-        resume_id=None,
-        cli_version=cli_version,
-        user_data=user_data,
-        started_at=now,
-        registration_deadline=now + budget,
-        global_deadline=now
-        + max(budget, config.trust_prompt_ceiling_s)
-        + GLOBAL_CEILING_MARGIN_S,
-    )
-    _flows[(user_id, thread_id)] = flow
-    task = asyncio.create_task(_wait_task_body(flow, bot, tmux_mgr, session_mgr))
-    task.add_done_callback(_log_task_result)
-    flow.wait_task = task
+        card_chat_id = entry.get(CARD_CHAT_ID_KEY)
+        card_msg_id = entry.get(CARD_MSG_ID_KEY)
+        now = _wall()
+        budget = registration_budget_s()
+        flow = TrustFlow(
+            generation=generation,
+            user_id=user_id,
+            thread_id=thread_id,
+            chat_id=chat_id,
+            card_chat_id=card_chat_id,
+            card_msg_id=card_msg_id,
+            created_wid=created_wid,
+            window_name=window_name,
+            selected_path=selected_path,
+            create_message=create_message,
+            resume_id=None,
+            cli_version=cli_version,
+            user_data=user_data,
+            started_at=now,
+            registration_deadline=now + budget,
+            global_deadline=now
+            + max(budget, config.trust_prompt_ceiling_s)
+            + GLOBAL_CEILING_MARGIN_S,
+        )
+        _flows[(user_id, thread_id)] = flow
+        task = asyncio.create_task(_wait_task_body(flow, bot, tmux_mgr, session_mgr))
+        task.add_done_callback(_log_task_result)
+        flow.wait_task = task
     logger.info(
         "trust flow started window=%s thread=%s version=%s gen=%d",
         created_wid,
@@ -1172,12 +1252,35 @@ async def finish_cancelled_flow(flow: TrustFlow) -> None:
 
 
 @dataclass(frozen=True)
-class InboundDecision:
-    """What an unbound-topic inbound handler must do, decided UNDER the lock."""
+class BrowserPayload:
+    """A directory-browser render, built BEFORE the ownership critical section.
 
-    kind: Literal["bound", "trust_owned", "picker_owned", "free"]
+    Building it is the last pre-processing await an unbound-topic handler makes
+    (`_list_unbound_windows` + the directory scan), so it must happen OUTSIDE
+    the lock — and therefore before the decision it might feed, never after it.
+    """
+
+    text: str
+    keyboard: Any
+    subdirs: list[str]
+    unbound_count: int
+    start_path: str
+
+
+@dataclass(frozen=True)
+class InboundDecision:
+    """What an unbound-topic inbound handler must do, decided UNDER the lock.
+
+    ``browser`` / ``entry`` are populated for the ``browser`` kind only: the
+    entry was CLAIMED (state + browse caches + stash written) inside the same
+    critical section that decided, so all the caller has left to do is send.
+    """
+
+    kind: Literal["bound", "trust_owned", "picker_owned", "browser"]
     window_id: str | None = None
     picker_state: str | None = None
+    browser: BrowserPayload | None = None
+    entry: dict[str, Any] | None = None
 
 
 TRUST_NUDGE: Final[str] = (
@@ -1186,53 +1289,91 @@ TRUST_NUDGE: Final[str] = (
     "sent as soon as the session is up."
 )
 
+PICKER_NUDGES: Final[dict[str, str]] = {
+    STATE_BROWSING_DIRECTORY: "Please use the directory browser above, or tap Cancel.",
+    STATE_SELECTING_WINDOW: "Please use the window picker above, or tap Cancel.",
+    STATE_SELECTING_SESSION: "Please use the session picker above, or tap Cancel.",
+}
 
-async def decide_unbound_inbound(
+
+async def claim_unbound_inbound(
     user_id: int,
     thread_id: int,
     user_data: dict[str, Any] | None,
     session_mgr: Any,
     *,
-    stash_trust: Callable[[dict[str, Any]], None] | None = None,
-    stash_picker: Callable[[dict[str, Any]], None] | None = None,
+    build_browser: Callable[[], Any] | None = None,
+    browse_start_path: str | None = None,
+    stash: Callable[[dict[str, Any]], None] | None = None,
+    stash_on_picker: bool = True,
 ) -> InboundDecision:
-    """Fix 5: re-read the binding AND the entry state under the creation lock.
+    """Fix 5 — decide AND mutate inside ONE critical section (review r1 P1-2).
 
     Every unbound-topic handler does async pre-processing (reply-context
-    resolution, attachment download) BEFORE it acts, and a creation flow can
-    complete inside that window. Re-reading here — under the lock, immediately
-    before acting — means a binding that appeared falls through to normal bound
-    delivery of THIS payload, an owned creation state stashes + nudges, and no
-    browser rebuild can race a live flow.
+    resolution, attachment download) and, on the browser path, one more await to
+    LIST tmux windows and scan the directory. The pre-fold shape read the
+    ownership state under the lock, RELEASED it, and only then built and wrote
+    the browser — a textbook check-then-act: a binding or a creation flow
+    appearing in that gap was overwritten with browser state, and the payload
+    was stashed into a picker for an already-bound topic (silently discarded).
 
-    ``stash_trust`` / ``stash_picker`` run INSIDE the lock so a payload can
-    never be stashed into an entry a concurrent teardown has already dropped.
-    They are separate because the two states' pre-#65 behaviors differ: photo /
-    document stash in both, while text_handler only nudges for a live picker.
+    So the resolution runs at most TWICE:
+
+      * pass 1 — under the lock, read the binding and the entry. A bound topic
+        or an OWNED entry returns immediately, and no browser is ever built for
+        it (the common case pays nothing).
+      * otherwise the browser is built OUTSIDE the lock (the remaining awaits)…
+      * pass 2 — under the lock AGAIN, re-read both. Anything that appeared in
+        the build window wins; only a still-free topic is CLAIMED, and the claim
+        (state + browse caches + the payload stash) happens in that same
+        critical section, so the decision and the mutation are inseparable.
+
+    ``stash`` runs INSIDE the lock so a payload can never land in an entry a
+    concurrent teardown already dropped. ``stash_on_picker=False`` keeps
+    text_handler's pre-#65 behavior (a text message arriving mid-picker is a
+    nudge, not a stash).
     """
-    async with creation_lock(user_id, thread_id):
-        wid = session_mgr.get_window_for_thread(user_id, thread_id)
-        if wid:
-            return InboundDecision("bound", window_id=wid)
-        entry = picker_entry(user_data, thread_id)
-        if entry is None:
-            return InboundDecision("free")
-        state = entry.get(STATE_KEY)
-        flow = _flows.get((user_id, thread_id))
-        if (
-            state == STATE_AWAITING_TRUST
-            and flow is not None
-            and flow.phase in NONTERMINAL_PHASES
-            and entry.get(TRUST_GENERATION_KEY) == flow.generation
-        ):
-            if stash_trust is not None:
-                stash_trust(entry)
-            return InboundDecision("trust_owned", picker_state=state)
-        if state in _PICKER_CHROME_STATES:
-            if stash_picker is not None:
-                stash_picker(entry)
-            return InboundDecision("picker_owned", picker_state=state)
-        return InboundDecision("free")
+    browser: BrowserPayload | None = None
+    for _ in range(2):
+        async with creation_lock(user_id, thread_id):
+            wid = session_mgr.get_window_for_thread(user_id, thread_id)
+            if wid:
+                return InboundDecision("bound", window_id=wid)
+            entry = picker_entry(user_data, thread_id)
+            state = entry.get(STATE_KEY) if entry is not None else None
+            flow = _flows.get((user_id, thread_id))
+            if (
+                entry is not None
+                and state == STATE_AWAITING_TRUST
+                and flow is not None
+                and flow.phase in NONTERMINAL_PHASES
+                and entry.get(TRUST_GENERATION_KEY) == flow.generation
+            ):
+                if stash is not None:
+                    stash(entry)
+                return InboundDecision("trust_owned", picker_state=state)
+            if entry is not None and state in _PICKER_CHROME_STATES:
+                if stash is not None and stash_on_picker:
+                    stash(entry)
+                return InboundDecision("picker_owned", picker_state=state)
+            if browser is not None or build_browser is None:
+                claimed = ensure_picker_entry(user_data, thread_id)
+                if claimed is not None:
+                    if stash is not None:
+                        stash(claimed)
+                    claimed[STATE_KEY] = STATE_BROWSING_DIRECTORY
+                    if browser is not None:
+                        claimed[BROWSE_PATH_KEY] = browser.start_path
+                        claimed[BROWSE_PAGE_KEY] = 0
+                        claimed[BROWSE_DIRS_KEY] = browser.subdirs
+                        claimed[BROWSE_UNBOUND_COUNT_KEY] = browser.unbound_count
+                    elif browse_start_path is not None:
+                        claimed[BROWSE_PATH_KEY] = browse_start_path
+                        claimed[BROWSE_PAGE_KEY] = 0
+                return InboundDecision("browser", browser=browser, entry=claimed)
+        # Still free: build the browser OUTSIDE the lock, then re-decide.
+        browser = await build_browser()
+    raise AssertionError("unreachable: pass 2 always has a browser")  # pragma: no cover
 
 
 # ── Fix 6: teardown ──────────────────────────────────────────────────────────
@@ -1245,58 +1386,78 @@ async def teardown_thread(
     bot: Any = None,
     user_data: dict[str, Any] | None = None,
     reason: str = "topic teardown",
-) -> None:
+) -> bool:
     """Tear down a live creation flow for this topic (NORMATIVE choreography).
+
+    Returns **True when the flow's COMPLETION WON** — the bind tail ran to the
+    end — so the caller knows to run the normal BOUND-topic teardown on the
+    now-bound topic.
 
     Acquire the creation lock ONLY to capture phase + task identities (+
     generation), RELEASE it BEFORE cancelling or awaiting either task (the WAIT
     terminalizer reacquires that same lock — awaiting it while holding the lock
-    DEADLOCKS), then REACQUIRE and re-check before the final entry drop (a
-    transition to ``completing_bind`` inside the window is honored).
+    DEADLOCKS), then REACQUIRE and re-check. The re-check tests the PHASE, not
+    just identity (review r1 P2-3): a transition to ``completing_bind`` inside
+    the capture→cancel→reacquire window must be HONORED — the retained inner
+    task is awaited rather than abandoned — so the loop runs at most twice.
     """
     del bot, user_data, reason  # the flow record carries its own card + entry
     if thread_id is None:
-        return
+        return False
     key = (user_id, thread_id)
-    async with creation_lock(user_id, thread_id):
-        flow = _flows.get(key)
-        if flow is None:
-            return
-        phase = flow.phase
-        wait_task = flow.wait_task
-        bind_task = flow.bind_task
-        generation = flow.generation
+    completed = False
+    for _ in range(2):
+        async with creation_lock(user_id, thread_id):
+            flow = _flows.get(key)
+            if flow is None:
+                return completed
+            phase = flow.phase
+            wait_task = flow.wait_task
+            bind_task = flow.bind_task
+            generation = flow.generation
 
-    if phase == PHASE_COMPLETING_BIND and bind_task is not None:
-        # Do NOT cancel — the completion tail is a separately-tracked inner task
-        # that is RETAINED and awaited (not a bare ``asyncio.shield``), so the
-        # topic can never be left half-bound. The caller then runs the normal
-        # BOUND-topic teardown on the now-bound topic.
-        try:
-            await bind_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
-    elif wait_task is not None and not wait_task.done():
-        wait_task.cancel()
-        try:
-            await wait_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+        if phase == PHASE_COMPLETING_BIND and bind_task is not None:
+            # Do NOT cancel — the completion tail is a separately-tracked inner
+            # task that is RETAINED and awaited (not a bare ``asyncio.shield``),
+            # so the topic can never be left half-bound.
+            try:
+                await bind_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            completed = True
+        elif wait_task is not None and not wait_task.done():
+            wait_task.cancel()
+            try:
+                await wait_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
-    async with creation_lock(user_id, thread_id):
-        current = _flows.get(key)
-        if current is None or current.generation != generation:
-            return
-        _release_tokens(current)
-        _drop_entry(current)
-        _drop_flow(current)
+        async with creation_lock(user_id, thread_id):
+            current = _flows.get(key)
+            if current is None or current.generation != generation:
+                return completed
+            if not completed and current.phase == PHASE_COMPLETING_BIND:
+                # The transition landed in our window — honor it on pass 2.
+                continue
+            _release_tokens(current)
+            _drop_entry(current)
+            _drop_flow(current)
+            return completed
+    return completed
 
 
-async def teardown_all_for_user(user_id: int, *, user_data: Any = None) -> None:
-    """Tear down EVERY topic's creation flow for one user (the ``/start`` reset)."""
+async def teardown_all_for_user(user_id: int, *, user_data: Any = None) -> list[int]:
+    """Tear down EVERY topic's creation flow for one user (the ``/start`` reset).
+
+    Returns the thread ids whose COMPLETION WON during teardown, so the caller
+    can run the normal bound-topic teardown on each (review r1 P2-3).
+    """
     del user_data
+    completed: list[int] = []
     for uid, tid in [key for key in _flows if key[0] == user_id]:
-        await teardown_thread(uid, tid, reason="/start reset")
+        if await teardown_thread(uid, tid, reason="/start reset"):
+            completed.append(tid)
+    return completed
 
 
 async def shutdown() -> None:

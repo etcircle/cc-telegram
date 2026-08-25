@@ -213,8 +213,12 @@ _RE_ENV_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
 # The POSITIVE Claude proof: a wrapper that reports its OWN version fails this
 # and the card degrades to display-only. The README already requires
 # CLAUDE_COMMAND to exec the real binary; the probe does not trust that.
+# EXACT conformance to the shape the real binary prints (review r1 P3-1): a
+# bare ``N.N.N`` and nothing else before the literal ``(Claude Code)``. A
+# suffixed / prefixed / short version fails closed to display-only rather than
+# licensing keystrokes against an un-characterized build.
 _RE_PROBE_VERSION_LINE: Final[re.Pattern[str]] = re.compile(
-    r"(\d+\.\d+\.\d+\S*)\s+\(Claude Code\)"
+    r"(\d+\.\d+\.\d+)\s+\(Claude Code\)"
 )
 TRUST_VERSION_PROBE_TIMEOUT_S: Final[float] = 5.0
 _PROBE_POLL_INTERVAL_S: Final[float] = 0.25

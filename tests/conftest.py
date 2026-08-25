@@ -137,6 +137,11 @@ class FakeTmux:
     # transaction genuinely closes, and the only way to reach ``draft_written``
     # from the public Telegram seam.
     on_write: Any | None = None
+    # GH #65 review r1 (P1-2): fired at the TOP of ``list_windows``, so a
+    # scenario can script the "a binding / creation flow appears while the
+    # handler is still building the directory browser" race — the one gap the
+    # locked decision has to close.
+    on_list_windows: Any | None = None
     _next_id: int = 0
 
     # ── seeding helpers ────────────────────────────────────────────────
@@ -214,6 +219,9 @@ class FakeTmux:
 
     # ── tmux_manager interface (async) ─────────────────────────────────
     async def list_windows(self) -> list[TmuxWindow]:
+        if self.on_list_windows is not None:
+            hook, self.on_list_windows = self.on_list_windows, None
+            await hook()
         return [self._to_tmux_window(w) for w in self.windows.values()]
 
     async def find_window_by_id(self, window_id: str) -> TmuxWindow | None:

@@ -133,6 +133,10 @@ class _TrustPane:
         # frame is all-blank (alt-screen cleared, welcome not yet painted); a
         # test that models the settled REPL swaps in the idle input box.
         self.post_commit = _POST_ENTER_BLANK
+        # Slows every capture, so a scenario can hold the completion tail
+        # (which captures the pane to deliver the queued first message) IN
+        # FLIGHT while it fires a teardown at it.
+        self.capture_delay = 0.0
 
     def _pane(self) -> str:
         if self.committed is not None:
@@ -160,6 +164,8 @@ class _TrustPane:
         self, window_id: str, with_ansi: bool = False, scrollback_lines: int = 0
     ) -> str:
         del with_ansi, scrollback_lines
+        if self.capture_delay:
+            await asyncio.sleep(self.capture_delay)
         return self._pane() if window_id == self._wid else ""
 
     async def pane_current_command(self, window_id: str) -> str | None:
@@ -200,6 +206,22 @@ async def _open_browser(scenario: ScenarioHarness, text: str = "hello claude") -
 
 async def _confirm_directory(scenario: ScenarioHarness) -> None:
     await _tap(scenario, CB_DIR_CONFIRM)
+
+
+async def _await_phase(
+    scenario: ScenarioHarness, phase: str, *, timeout: float = 3.0
+) -> Any:
+    """Wait until the topic's flow reaches ``phase`` (bounded)."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        flow = trust_flow.get_flow(scenario.user_id, _THREAD)
+        if flow is not None and flow.phase == phase:
+            return flow
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"flow never reached {phase}: "
+        f"{getattr(trust_flow.get_flow(scenario.user_id, _THREAD), 'phase', None)}"
+    )
 
 
 async def _settle(times: int = 12) -> None:
@@ -244,6 +266,51 @@ async def _start_flow(
     await _confirm_directory(scenario)
     await _settle()
     return "@0", pane
+
+
+def _photo_update(scenario: ScenarioHarness) -> Any:
+    """A photo Update whose file the fake bot will "download"."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    photo = MagicMock(name="PhotoSize")
+    photo.file_unique_id = "puid"
+    tg_file = MagicMock()
+
+    async def _download(out_path: Any) -> Any:
+        Path(out_path).write_bytes(b"\x00")
+        return out_path
+
+    tg_file.download_to_drive = AsyncMock(side_effect=_download)
+    photo.get_file = AsyncMock(return_value=tg_file)
+    update = make_update_text("", thread_id=_THREAD)
+    update.message.text = None
+    update.message.photo = [photo]
+    update.message.caption = "look"
+    update.message.media_group_id = None
+    return update
+
+
+def _document_update(scenario: ScenarioHarness) -> Any:
+    from unittest.mock import AsyncMock, MagicMock
+
+    doc = MagicMock(name="Document")
+    doc.file_unique_id = "duid"
+    doc.file_name = "notes.txt"
+    doc.file_size = 10
+    tg_file = MagicMock()
+
+    async def _download(out_path: Any) -> Any:
+        Path(out_path).write_bytes(b"hello")
+        return out_path
+
+    tg_file.download_to_drive = AsyncMock(side_effect=_download)
+    doc.get_file = AsyncMock(return_value=tg_file)
+    update = make_update_text("", thread_id=_THREAD)
+    update.message.text = None
+    update.message.document = doc
+    update.message.caption = "notes"
+    update.message.media_group_id = None
+    return update
 
 
 # ── The issue's regression test ──────────────────────────────────────────────
@@ -659,4 +726,281 @@ async def test_resume_creation_never_enters_the_trust_lane(
     assert scenario.tmux.create_calls[-1].get("defer_launch") is False
     assert scenario.tmux.probe_calls == []
     assert scenario.tmux.launch_calls == []
+    assert trust_flow.get_flow(scenario.user_id, _THREAD) is None
+
+
+# ── Codex review round 1 — the Telegram-seam folds ──────────────────────────
+
+
+class _Racer:
+    """Binds the topic the first time the handler lists tmux windows.
+
+    `_list_unbound_windows` is the LAST await before the directory browser is
+    built, so this reproduces the exact P1-2 window: a binding (or a creation
+    flow) appearing between the ownership decision and the mutation that acts
+    on it. Scripted on the SUBSTRATE (FakeTmux), never on a handler internal.
+    """
+
+    def __init__(self, scenario: ScenarioHarness, wid: str, thread_id: int) -> None:
+        self._scenario = scenario
+        self._wid = wid
+        self._thread_id = thread_id
+        self.fired = False
+
+    async def __call__(self) -> None:
+        self.fired = True
+        self._scenario.bind_thread(
+            self._thread_id,
+            self._wid,
+            display_name="repo",
+            cwd="/repo",
+            session_id="sid-raced",
+        )
+
+
+@pytest.mark.asyncio
+async def test_p1_2_text_binding_during_the_browser_build_delivers_the_payload(
+    scenario: ScenarioHarness,
+) -> None:
+    """P1-2: the decision and the mutation must share ONE critical section.
+
+    Pre-fold `decide_unbound_inbound` released the creation lock and the caller
+    then awaited `_list_unbound_windows`; a binding appearing in that gap was
+    overwritten with browser state and the payload was stashed into a picker
+    for an already-bound topic (silently discarded).
+    """
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.tmux.on_list_windows = _Racer(scenario, wid, _THREAD)
+
+    await bot_module.text_handler(
+        make_update_text("deliver me", thread_id=_THREAD), scenario.context
+    )
+    await aggregator_flush_route((scenario.user_id, _THREAD, wid))
+
+    assert picker_entry(scenario.user_data, _THREAD) is None, (
+        "a bound topic must never be given browser state"
+    )
+    assert scenario.tmux.delivered("deliver me"), scenario.tmux.sent_keys
+
+
+@pytest.mark.asyncio
+async def test_p1_2_photo_binding_during_the_browser_build_delivers_the_payload(
+    scenario: ScenarioHarness,
+) -> None:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.tmux.on_list_windows = _Racer(scenario, wid, _THREAD)
+
+    await bot_module.photo_handler(_photo_update(scenario), scenario.context)
+    await aggregator_flush_route((scenario.user_id, _THREAD, wid))
+
+    assert picker_entry(scenario.user_data, _THREAD) is None, (
+        "a bound topic must never be given browser state"
+    )
+    assert scenario.tmux.written_texts, "the photo must reach the bound route"
+
+
+@pytest.mark.asyncio
+async def test_p1_2_document_binding_during_the_browser_build_delivers_the_payload(
+    scenario: ScenarioHarness,
+) -> None:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.tmux.on_list_windows = _Racer(scenario, wid, _THREAD)
+
+    await bot_module.document_handler(_document_update(scenario), scenario.context)
+    await aggregator_flush_route((scenario.user_id, _THREAD, wid))
+
+    assert picker_entry(scenario.user_data, _THREAD) is None, (
+        "a bound topic must never be given browser state"
+    )
+    assert scenario.tmux.written_texts, "the document must reach the bound route"
+
+
+@pytest.mark.asyncio
+async def test_p1_2_trust_flow_appearing_during_the_browser_build_is_not_overwritten(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same gap, with a CREATION FLOW rather than a binding appearing."""
+    scenario.tmux.probe_version_response = _LICENSED
+    _TrustPane(scenario, "@0").install(monkeypatch)
+
+    started: dict[str, Any] = {}
+
+    async def _start_flow_during_list() -> None:
+        entry = ensure_picker_entry(scenario.user_data, _THREAD)
+        entry[CARD_CHAT_ID_KEY] = scenario.chat_id
+        entry[CARD_MSG_ID_KEY] = 4242
+        started["flow"] = await trust_flow.start_trust_wait(
+            bot=scenario.bot,
+            user_id=scenario.user_id,
+            thread_id=_THREAD,
+            chat_id=scenario.chat_id,
+            user_data=scenario.user_data,
+            created_wid="@0",
+            window_name="repo",
+            selected_path="/repo",
+            create_message="Created",
+            cli_version=_LICENSED,
+            tmux_mgr=scenario.tmux,
+            session_mgr=scenario.session_manager,
+        )
+
+    scenario.add_window(window_id="@0", window_name="repo", cwd="/repo")
+    scenario.tmux.on_list_windows = _start_flow_during_list
+
+    await bot_module.text_handler(
+        make_update_text("queue me", thread_id=_THREAD), scenario.context
+    )
+
+    assert started.get("flow") is not None
+    entry = picker_entry(scenario.user_data, _THREAD)
+    assert entry is not None
+    assert entry[STATE_KEY] == trust_flow.STATE_AWAITING_TRUST, (
+        "a live creation flow must never be overwritten by a browser rebuild"
+    )
+    await trust_flow.teardown_thread(scenario.user_id, _THREAD)
+
+
+@pytest.mark.asyncio
+async def test_p2_2_an_expired_trust_tap_re_renders_the_card(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-2: a stale/expired Trust tap must RE-RENDER, not just answer.
+
+    The prompt is still live and licensed, so the visible button has to come
+    back with a fresh token — answering alone leaves it permanently dead.
+    """
+    await _start_flow(scenario, monkeypatch)
+    live_tap = _trust_button(scenario)
+    stale = f"{CB_TRUST_PICK}t:{'0' * 12}"
+
+    update = await _tap(scenario, stale)
+
+    new_tap = _trust_button(scenario)
+    assert new_tap.startswith(f"{CB_TRUST_PICK}t:")
+    assert new_tap != live_tap, "the expired tap must mint a FRESH token"
+    assert decision_token.peek(new_tap.split(":")[-1]) is not None
+    assert scenario.tmux.sent_keys == [], "an expired tap types nothing"
+    del update
+
+
+@pytest.mark.asyncio
+async def test_p2_4_a_non_owner_tap_never_touches_the_owners_card(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-4: a non-owner tap answers only — no edit, no consume, keyboard intact."""
+    await _start_flow(scenario, monkeypatch)
+    tap = _trust_button(scenario)
+    token = tap.split(":")[-1]
+    edits_before = len(_card_edits(scenario))
+
+    update = make_update_real_callback(
+        tap,
+        bot=scenario.bot,
+        thread_id=_THREAD,
+        user_id=scenario.user_id + 9999,
+        chat_id=scenario.chat_id,
+    )
+    await dispatch_callback(
+        update,
+        scenario.context,
+        _adapters(scenario),
+        is_user_allowed_func=lambda _uid: True,
+    )
+
+    assert len(_card_edits(scenario)) == edits_before, (
+        "a non-owner tap must NEVER edit the owner's card"
+    )
+    assert decision_token.peek(token) is not None, "the owner's token is untouched"
+    assert scenario.tmux.sent_keys == []
+    flow = trust_flow.get_flow(scenario.user_id, _THREAD)
+    assert flow is not None and flow.phase == trust_flow.PHASE_AWAITING_TRUST
+
+
+@pytest.mark.asyncio
+async def test_p2_4_a_non_owner_cancel_never_kills_the_owners_window(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wid, _pane = await _start_flow(scenario, monkeypatch)
+    cancel = next(
+        c for c in _card_keyboards(scenario)[-1] if c.startswith(f"{CB_TRUST_PICK}c:")
+    )
+    edits_before = len(_card_edits(scenario))
+
+    update = make_update_real_callback(
+        cancel,
+        bot=scenario.bot,
+        thread_id=_THREAD,
+        user_id=scenario.user_id + 9999,
+        chat_id=scenario.chat_id,
+    )
+    await dispatch_callback(
+        update,
+        scenario.context,
+        _adapters(scenario),
+        is_user_allowed_func=lambda _uid: True,
+    )
+
+    assert scenario.tmux.kill_calls == [], "a non-owner must never kill the window"
+    assert len(_card_edits(scenario)) == edits_before
+    assert wid in scenario.tmux.windows
+    assert trust_flow.get_flow(scenario.user_id, _THREAD) is not None
+
+
+@pytest.mark.asyncio
+async def test_p2_3_start_during_completing_bind_awaits_and_tears_down_bound(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-3: `/start` must await a retained completion tail, then bound-teardown.
+
+    The flow binds under `/start` rather than being abandoned half-bound, and
+    the now-bound topic goes through the normal bound-topic teardown.
+    """
+    wid, pane = await _start_flow(scenario, monkeypatch)
+    # The prompt is answered and the REPL is up, so the tail's replay of the
+    # queued first message actually lands.
+    pane.post_commit = IDLE_PANE_V2_1_207
+    pane.committed = 1
+    # The session registers, so the very next slice claims ``completing_bind``
+    # and starts the tail; the slow capture holds that tail IN FLIGHT while
+    # ``/start`` fires at it.
+    pane.capture_delay = 0.15
+    scenario._write_session_map_entry(wid, "sid-start-race", "/repo")
+    await _await_phase(scenario, trust_flow.PHASE_COMPLETING_BIND)
+
+    await bot_module.start_command(
+        make_update_text("/start", thread_id=None), scenario.context
+    )
+
+    assert scenario.session_manager.thread_bindings[scenario.user_id][_THREAD] == wid, (
+        "a completion that won must not be abandoned half-bound"
+    )
+    assert any("Send messages here" in t for t in _card_edits(scenario)), (
+        "/start must AWAIT the retained completion tail, not abandon it"
+    )
+    assert scenario.tmux.kill_calls == [], "a bound window is never killed by /start"
+    assert trust_flow.get_flow(scenario.user_id, _THREAD) is None
+    assert picker_entry(scenario.user_data, _THREAD) is None
+
+
+@pytest.mark.asyncio
+async def test_p2_3_topic_close_during_completing_bind_awaits_the_tail(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wid, pane = await _start_flow(scenario, monkeypatch)
+    pane.post_commit = IDLE_PANE_V2_1_207
+    pane.committed = 1
+    pane.capture_delay = 0.15
+    scenario._write_session_map_entry(wid, "sid-close-race", "/repo")
+    await _await_phase(scenario, trust_flow.PHASE_COMPLETING_BIND)
+
+    await bot_module.topic_closed_handler(
+        make_update_topic_closed(thread_id=_THREAD), scenario.context
+    )
+
+    # Completion won inside teardown, so the topic-close path takes its BOUND
+    # branch: the window is killed and the binding removed.
+    assert scenario.tmux.kill_calls == [wid]
+    assert _THREAD not in scenario.session_manager.thread_bindings.get(
+        scenario.user_id, {}
+    )
     assert trust_flow.get_flow(scenario.user_id, _THREAD) is None

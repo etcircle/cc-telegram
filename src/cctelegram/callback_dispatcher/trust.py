@@ -30,7 +30,7 @@ from cctelegram.handlers.callback_data import CB_TRUST_PICK
 from cctelegram.handlers.message_sender import safe_edit
 from cctelegram.tmux_manager import pane_command_is_claude
 
-from . import safe_answer
+from . import WRONG_USER_PICK_TEXT, safe_answer
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,17 @@ async def execute_trust_callback(authorized: Any, adapters: Any) -> None:
     data = authorized.command.data
     thread_id = authorized.ctx.thread_id
     tmux_manager = adapters.tmux_manager
+
+    # OWNER GATE FIRST (review r1 P2-4). The card lives in a shared forum topic,
+    # so another allowed user can tap it — and their PTB ``user_data`` is a
+    # DIFFERENT dict, so every entry-keyed check below would read "expired" and
+    # EDIT THE OWNER'S CARD. A non-owner tap answers the callback and touches
+    # nothing: no edit, no token consume, keyboard intact.
+    owner = trust_flow.flow_owner_for_thread(thread_id)
+    if owner is not None and owner != user.id:
+        logger.info("TRUST_TAP wrong_user user=%d owner=%d", user.id, owner)
+        await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+        return
 
     payload = data[len(CB_TRUST_PICK) :]
     kind, _, rest = payload.partition(":")
@@ -139,17 +150,28 @@ async def _handle_trust(
     flow = claim.flow
 
     peeked = decision_token.peek(token)
+    if peeked is not None and peeked.user_id != user.id:
+        # Belt and braces beside the entry-level owner gate above.
+        await trust_flow.release_dispatch_claim(
+            flow, phase=trust_flow.PHASE_AWAITING_TRUST
+        )
+        await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+        return
     if (
         peeked is None
-        or peeked.user_id != user.id
         or peeked.window_id != flow.created_wid
         or flow.fingerprint is None
         or peeked.fingerprint != flow.fingerprint
     ):
+        # EXPIRED / STALE tap. The prompt itself may well still be live, so a
+        # bare answer would leave the visible button permanently dead — do the
+        # graceful RE-RENDER the dcp:/AUQ expired-tap paths do (fresh capture,
+        # fresh mint when the pane is still a licensed trust frame).
         await trust_flow.release_dispatch_claim(
             flow, phase=trust_flow.PHASE_AWAITING_TRUST
         )
-        await safe_answer(query, TRUST_EXPIRED_TEXT, show_alert=True)
+        await _refresh_trust_card(flow, context, tmux_manager)
+        await safe_answer(query, "↻ Refreshed — tap Trust again.", show_alert=True)
         return
 
     consumed = await decision_token.consume(token, user.id)
@@ -157,12 +179,14 @@ async def _handle_trust(
         await trust_flow.release_dispatch_claim(
             flow, phase=trust_flow.PHASE_AWAITING_TRUST
         )
-        await safe_answer(
-            query,
-            "Action already received."
-            if consumed.outcome == "already_consumed"
-            else TRUST_EXPIRED_TEXT,
-        )
+        if consumed.outcome == "already_consumed":
+            await safe_answer(query, "Action already received.")
+            return
+        if consumed.outcome == "wrong_user":
+            await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+            return
+        await _refresh_trust_card(flow, context, tmux_manager)
+        await safe_answer(query, "↻ Refreshed — tap Trust again.", show_alert=True)
         return
     entry = consumed.entry
 
@@ -187,9 +211,7 @@ async def _handle_trust(
         await trust_flow.release_dispatch_claim(
             flow, phase=trust_flow.PHASE_AWAITING_TRUST
         )
-        await trust_flow.render_trust_card(
-            flow, context.bot, await tmux_manager.capture_pane(flow.created_wid)
-        )
+        await _refresh_trust_card(flow, context, tmux_manager)
         await safe_answer(query, "Window busy; refreshing card.")
         return
 
@@ -199,9 +221,7 @@ async def _handle_trust(
         await trust_flow.release_dispatch_claim(
             flow, phase=trust_flow.PHASE_AWAITING_TRUST
         )
-        await trust_flow.render_trust_card(
-            flow, context.bot, await tmux_manager.capture_pane(flow.created_wid)
-        )
+        await _refresh_trust_card(flow, context, tmux_manager)
         await safe_answer(query, "Action not registered; refreshing card.")
         return
 
@@ -225,6 +245,18 @@ async def _handle_trust(
         query,
         "✅ Trust sent" if outcome.kind == "dispatched" else "Action sent; confirming.",
     )
+
+
+async def _refresh_trust_card(flow: Any, context: Any, tmux_manager: Any) -> None:
+    """Re-capture the pane and re-render the card (a fresh mint when licensed).
+
+    The single re-render seam: an expired/stale tap, a busy send lock, and a
+    pre-commit bail all use it, so a live prompt never ends up behind a dead
+    button. A pane that is no longer a licensed trust frame simply renders the
+    display-only shape.
+    """
+    pane = await tmux_manager.capture_pane(flow.created_wid)
+    await trust_flow.render_trust_card(flow, context.bot, pane)
 
 
 async def _dispatch_trust(

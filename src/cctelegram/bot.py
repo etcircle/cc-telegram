@@ -299,7 +299,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # settled through the guarded cleanup) BEFORE its entry is cleared — the
     # entry is the ownership token, so dropping it first would let a concurrent
     # flow start while the old window still lives.
-    await teardown_all_creation_flows(user.id, context.user_data)
+    await teardown_all_creation_flows(user.id, context.bot, context.user_data)
     await disable_all_picker_cards(context.bot, context.user_data)
     clear_all_picker_entries(context.user_data)
 
