@@ -1,0 +1,50 @@
+
+           Claude Code v2.1.246
+▛█         Fable 5 with high effort · Claude Max
+██▀        /private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-telegram/1256b791-bca4-44d0-b1d9-fa5b5fceb666/scratchpad/rig246/cwd-e3
+
+  Updated to latest. Got 10 features, 34 bugfixes, and 17 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                              ● high · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents                                                                                 /rc connecting…

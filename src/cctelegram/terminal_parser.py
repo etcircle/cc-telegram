@@ -5543,9 +5543,13 @@ _INPUT_BOX_TOP_SCAN_LINES: Final = 60
 #
 # THE GRAMMAR (whole-row, anchored; every ``·``-split segment must be consumed):
 #
-#   ROW := EXCLUSIVE | BAR
+#   ROW := (EXCLUSIVE | BAR) [<spaces> RIGHT-BLOCK]
 #   EXCLUSIVE := "paste again to expand" | "! for shell mode" | "Pasting…"
 #                                                                (the WHOLE row)
+#   RIGHT-BLOCK — CC 2.1.246's right-ALIGNED footer child (the ``/rc`` Remote
+#                Control pill), split off FIRST and parsed independently; it is a
+#                typed slot that NEVER satisfies acceptance on its own. See
+#                ``_RE_STATUS_RIGHT_BLOCK`` (GH #73).
 #   BAR  := [MODE] [· PR-LINK] [· TASKS [· ↓ to view]] [· MEMORIES]
 #           [· EFFORT-PAIR] [· HINT]*
 #           …requiring MODE or ≥1 HINT — a row of ONLY typed slots (a bare
@@ -5785,6 +5789,97 @@ _STATUS_ROW_HINTS: Final = frozenset(
     }
 )
 
+# ── The RIGHT-ALIGNED footer block (GH #73, CC 2.1.246) ──────────────────────
+#
+# CC 2.1.246 shipped Remote Control, whose ``/rc`` pill is the first footer
+# element that is NOT part of the ``·``-joined hint line. It is a SEPARATE flex
+# child, right-aligned on the SAME physical row, so a tmux capture reads
+#
+#   ``  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents   …   /rc``
+#
+# and the segment splitter handed the whole tail ``← for agents   …   /rc`` to the
+# hint fullmatch, which refused → the GH #56 tall-draft fallback took leg (a) →
+# ``no_input_box`` → Enter withheld → stranded-draft brake → topic WEDGE. Exactly
+# the GH #62 class, rig-reproduced at ``inputbox_tall_draft_v2.1.246.txt``.
+#
+# LAYOUT, read off the renderer (byte offsets into the plaintext JS bundle in
+# ``~/.local/share/claude/versions/2.1.246``):
+#
+#   - the footer container (``OPe``, @213055492) is
+#     ``{width: columns, flexDirection: "row", flexWrap: "wrap", paddingX: 2,
+#     columnGap: 1, children: [FooterHintLine, MY]}``;
+#   - the right block (``MY``) is ``{flexShrink: 0, marginLeft: "auto",
+#     flexDirection: "column", alignItems: "flex-end"}`` — hence RIGHT-ALIGNED on
+#     the hint line's row, separated from it by a run of padding spaces.
+#
+# So the row is ``LEFT`` + whitespace + ``RIGHT``, and the two halves are parsed
+# INDEPENDENTLY: the right block is split off FIRST and the remainder goes through
+# the unchanged ROW grammar. Byte-identical for every row without a licensed right
+# block (the split is a no-op unless the tail matches).
+#
+# SPLIT BEFORE THE EXCLUSIVE CHECK — and that is PANE-CONFIRMED, not inferred.
+# ``Pasting…`` / ``paste again to expand`` / ``Press <key> again to exit`` are
+# early ``return``s INSIDE **FooterHintLine** (@213036429), i.e. inside the LEFT
+# child only, so the right block still renders beside them. The rig capture
+# ``inputbox_paste_collapsed_v2.1.246.txt`` holds exactly that row
+# (``paste again to expand`` + a right-aligned ``/rc``).
+#
+# THE ALPHABET, read off the label function (``H``/``dg``, @204455048):
+#
+#     if (error)                 -> "/rc failed"
+#     if (reconnecting)          -> "/rc reconnecting"
+#     if (sessionActive||conn.)  -> "/rc active"
+#     otherwise                  -> "/rc connecting…"     (the real ellipsis)
+#
+# plus the ABBREVIATION (``tO``, @212974312): ``/rc active`` renders as a bare
+# ``/rc`` once the ``rc-active-badge`` notification has been seen 5 times
+# (``Git = 5``) — the shape BOTH 2.1.246 rig windows settled into, so it is the
+# common one, not an edge case. ``connecting…`` / ``active`` / bare ``/rc`` are
+# all pane-captured; ``reconnecting`` / ``failed`` are binary-derived only (no
+# fixture — they are not reachable on demand).
+#
+# The optional ``· Enter to view`` tail is the pill's own child (``gY``,
+# @213055492: ``bridgeSelected && [" · ", Be({chord: "enter", action: "view"})]``).
+# The chord renderer's ``<Key> to <action>`` join and its ``Enter`` label are
+# PROVEN by two literals the grammar already accepts —
+# ``Be({chord:"enter", action:"view tasks"})`` ⇒ ``Enter to view tasks`` and
+# ``Be({chord:"down", action:"manage"})`` ⇒ ``↓ to manage`` — so the composed text
+# is derived, not guessed. It renders only while the pill is keyboard-SELECTED,
+# which a machine-surface pane never is; unobserved, hence no fixture.
+#
+# NON-WIDENING, exactly like every GH #62 typed slot: the right block does NOT
+# contribute to acceptance (``has_mode or ≥1 HINT`` is UNCHANGED), so a row of
+# ONLY the pill still REFUSES. The renderer does permit an empty left half
+# (FooterHintLine's fall-through can render nothing), so that row shape is real —
+# but no capture in any corpus shows it, and accepting it would be the first slot
+# to widen acceptance on its own. It degrades to today's fail-closed refusal.
+#
+# DISCLOSED RESIDUAL: the right block can also carry a hipaa label, the ``cloud``
+# link, the IDE ``⧉`` selection, ``Debug``, the ``tengu_copper_thistle`` PR link
+# and the session-mode suffix (``lB``, @213052244). None of those is licensed here
+# (no capture holds one), so a row carrying them still fails CLOSED — the same
+# treatment residual (3) already gives the ``⧉`` indicator. Widening on a
+# guess is what the GH #56 r4 cliff cost us.
+_RE_STATUS_RIGHT_BLOCK: Final = re.compile(
+    r"[ ]+/rc(?:[ ](?:active|reconnecting|failed|connecting…))?"
+    r"(?:[ ]·[ ]Enter[ ]to[ ]view)?$"
+)
+
+
+def _split_status_right_block(row: str) -> str:
+    """Strip CC 2.1.246's RIGHT-ALIGNED footer block off a status row (GH #73).
+
+    ``row`` is the already-stripped whole row. Returns the LEFT half when the row
+    ends in a licensed right block, else ``row`` UNCHANGED — so every row without
+    one takes a byte-identical path through ``_is_status_row``. The leading
+    ``[ ]+`` is required, so a row that IS only the right block is never reduced to
+    the empty string by this seam (it falls through and refuses as unknown text).
+    """
+    m = _RE_STATUS_RIGHT_BLOCK.search(row)
+    if m is None:
+        return row
+    return row[: m.start()].rstrip(" ")
+
 
 def _is_status_row(line: str) -> bool:
     """True iff ``line`` is a WHOLE Claude Code ready-status-bar row (GH #56).
@@ -5805,6 +5900,13 @@ def _is_status_row(line: str) -> bool:
     s = _strip_ansi(line).strip(" \t\r\n")
     if not s:
         return False
+    # GH #73: CC 2.1.246's RIGHT-ALIGNED footer block is a separate flex child, not
+    # a ``·`` segment — split it off BEFORE anything else (it co-renders with the
+    # EXCLUSIVE forms, which are early returns inside the LEFT child only). A row
+    # WITHOUT one is returned unchanged, so this is a no-op on every older pane.
+    s = _split_status_right_block(s)
+    if not s:
+        return False  # a right-block-only row is not a bar (acceptance unchanged)
     if s in _STATUS_ROW_EXCLUSIVE:
         return True
 
