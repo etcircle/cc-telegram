@@ -1938,6 +1938,16 @@ async def _revalidate_bind_preconditions(flow: TrustFlow, session_mgr: Any) -> N
         raise TrustBindRefused(
             f"window {flow.created_wid} no longer exists after the adoption wait"
         )
+    # POST-LIST PENDING RE-CHECK (review r15 P1-A, the belt). The
+    # start/end-generation match is what actually closes the mid-read race; this
+    # is one cheap synchronous read that also refuses the shape where a kill
+    # registered while we were listing. Both seams are kept because they fail in
+    # opposite directions and the cost here is a dict lookup.
+    if flow.tmux_mgr.window_kill_pending(flow.created_wid):
+        raise TrustBindRefused(
+            f"a kill for window {flow.created_wid} registered while we were "
+            "verifying it — refusing to bind"
+        )
 
     bound = session_mgr.get_window_for_thread(flow.user_id, flow.thread_id)
     if bound is not None and bound != flow.created_wid:

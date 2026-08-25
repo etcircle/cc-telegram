@@ -473,6 +473,11 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
                     }
                     if selected_wid not in current_unbound_ids:
                         refusal = "Window is no longer unbound, please retry"
+                    elif tmux_manager.window_kill_pending(selected_wid):
+                        # RE-CHECKED AFTER the listings too (review r15 P1-A): a
+                        # kill that REGISTERED while we were reading must refuse,
+                        # and the check above ran before those reads.
+                        refusal = "That window is being closed right now, please retry"
                     else:
                         ok, _pending_tid, _reason = _validate_pending_picker_callback(
                             context.user_data,

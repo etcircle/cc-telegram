@@ -1562,21 +1562,12 @@ async def _create_and_bind_window(
             pending_thread_id,
             resume_session_id,
         )
-        if pending_thread_id is not None and not _pending_owner_matches(
-            context.user_data, pending_thread_id
-        ):
-            await _abort_created_window_after_pending_owner_change(
-                query,
-                user_data=context.user_data,
-                user_id=user.id,
-                pending_thread_id=pending_thread_id,
-                tmux_mgr=tmux_mgr,
-                created_wid=created_wid,
-                created_wname=created_wname,
-                resume_session_id=resume_session_id,
-            )
-            return
-
+        # THE FIRST POST-RESERVATION OWNER CHECK IS INSIDE THE PROTECTED
+        # REGION (review r15 P2-A). It sat BEFORE the ``try``, so a raise or a
+        # cancellation in it — or in the abort helper it awaits — left the
+        # reservation with no cleanup owner, which is the very gap the
+        # try/finally exists to close. It is now the first thing the protected
+        # region does.
         if use_trust_lane:
             # THE WHOLE PRE-FLOW PHASE IS COVERED (review r14 P2). Between here
             # and the flow install there are a version probe, a launch and two
@@ -1590,19 +1581,9 @@ async def _create_and_bind_window(
             # settled disposition.
             disposition_settled = False
             try:
-                # GH #65 Fix 0: the window was created in launch-deferred mode, so
-                # the pane is a fresh interactive shell. Probe ITS OWN CLI version
-                # (nonce-delimited, shell-resolution parity, positive
-                # ``(Claude Code)`` proof) and then ALWAYS launch — a probe failure
-                # only makes the trust card display-only, it never blocks a launch.
-                cli_version = await trust_flow.probe_version_and_launch(
-                    created_wid, tmux_mgr
-                )
-                assert pending_thread_id is not None
-                if not _pending_owner_matches(context.user_data, pending_thread_id):
-                    # Settled by the helper (kill + reservation release), so the
-                    # ``finally`` must not repeat it.
-                    disposition_settled = True
+                if pending_thread_id is not None and not _pending_owner_matches(
+                    context.user_data, pending_thread_id
+                ):
                     await _abort_created_window_after_pending_owner_change(
                         query,
                         user_data=context.user_data,
@@ -1613,6 +1594,33 @@ async def _create_and_bind_window(
                         created_wname=created_wname,
                         resume_session_id=resume_session_id,
                     )
+                    disposition_settled = True
+                    return
+                # GH #65 Fix 0: the window was created in launch-deferred mode, so
+                # the pane is a fresh interactive shell. Probe ITS OWN CLI version
+                # (nonce-delimited, shell-resolution parity, positive
+                # ``(Claude Code)`` proof) and then ALWAYS launch — a probe failure
+                # only makes the trust card display-only, it never blocks a launch.
+                cli_version = await trust_flow.probe_version_and_launch(
+                    created_wid, tmux_mgr
+                )
+                assert pending_thread_id is not None
+                if not _pending_owner_matches(context.user_data, pending_thread_id):
+                    await _abort_created_window_after_pending_owner_change(
+                        query,
+                        user_data=context.user_data,
+                        user_id=user.id,
+                        pending_thread_id=pending_thread_id,
+                        tmux_mgr=tmux_mgr,
+                        created_wid=created_wid,
+                        created_wname=created_wname,
+                        resume_session_id=resume_session_id,
+                    )
+                    # AFTER the helper returned (review r15 P2-A). Setting it
+                    # BEFORE the await meant a cancellation INSIDE the helper
+                    # skipped the ``finally``'s recovery — the flag claimed a
+                    # settlement that had not happened yet.
+                    disposition_settled = True
                     return
                 # GH #65 Fix 3: answer the callback + edit the card BEFORE the wait.
                 # The ENTIRE wait (including the first hook-timeout phase) runs in
@@ -1643,11 +1651,6 @@ async def _create_and_bind_window(
                     # inside the two Telegram awaits above (a concurrent /start or
                     # topic close). Installing an ownerless flow would leave it
                     # UNREACHABLE, so abort through the guarded cleanup instead.
-                    #
-                    # That helper ALREADY settles the window and releases the
-                    # reservation, so this exit is accounted for — marking it
-                    # keeps the ``finally`` from cleaning a second time.
-                    disposition_settled = True
                     await _abort_created_window_after_pending_owner_change(
                         query,
                         user_data=context.user_data,
@@ -1658,6 +1661,9 @@ async def _create_and_bind_window(
                         created_wname=created_wname,
                         resume_session_id=resume_session_id,
                     )
+                    # AFTER the helper returned (review r15 P2-A) — it settles
+                    # the window and releases the reservation itself.
+                    disposition_settled = True
                 else:
                     # The flow OWNS the window now; ownership passed from the
                     # reservation to the flow record inside ``start_trust_wait``.
@@ -1894,6 +1900,9 @@ async def _create_and_bind_window(
                             "The new window disappeared before it could be "
                             "bound. Please try again."
                         )
+                    # The pending check runs AFTER the listing (review r15 P1-A):
+                    # a kill that registered while we were listing must refuse,
+                    # and checking before the read would miss it.
                     elif tmux_mgr.window_kill_pending(created_wid):
                         bind_refusal = (
                             "That window is being closed right now. Please try "

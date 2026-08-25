@@ -19,64 +19,131 @@ from typing import Any
 
 
 class AdoptionProtocolMixin:
-    """Mix into any tmux double used with the trust lane."""
+    """Mix into any tmux double used with the trust lane.
 
-    def window_lifecycle_lock(self) -> asyncio.Lock:
-        lock = getattr(self, "_lifecycle_lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._lifecycle_lock = lock
-        return lock
+    The double is FAITHFUL, not permissive (review r15 P2-C). An earlier version
+    answered "nothing is pending, every bound is met, fresh == cached", which
+    made every seam-ordering bug invisible: a test could pass while production
+    read a stale cache or adopted a window with a kill in flight. Here a kill
+    genuinely marks the window pending until its completion callback runs, a
+    killed window genuinely disappears from the FRESH listing while a warm
+    CACHED listing can still show it, and the bounded-op accounting is the real
+    one. Tests that want a specific race still override the single seam they
+    care about.
+    """
+
+    # ── the pending-kill registry ────────────────────────────────────────
+    @property
+    def _pending(self) -> dict[str, int]:
+        pending = getattr(self, "_kill_pending", None)
+        if pending is None:
+            pending = {}
+            self._kill_pending = pending
+        return pending
+
+    @property
+    def _dead(self) -> set[str]:
+        dead = getattr(self, "_dead_windows", None)
+        if dead is None:
+            dead = set()
+            self._dead_windows = dead
+        return dead
 
     def window_kill_pending(self, window_id: str) -> bool:
-        del window_id
-        return False
+        return self._pending.get(window_id, 0) > 0
 
     def any_kill_pending(self) -> bool:
-        return False
+        return any(count > 0 for count in self._pending.values())
 
     async def await_kill_settled(self, window_id: str, **kwargs: Any) -> bool:
-        del window_id, kwargs
-        return True
+        del kwargs
+        for _ in range(200):
+            if not self.window_kill_pending(window_id):
+                return True
+            await asyncio.sleep(0)
+        return False
 
     async def await_all_kills_settled(self, **kwargs: Any) -> bool:
         del kwargs
-        return True
+        for _ in range(200):
+            if not self.any_kill_pending():
+                return True
+            await asyncio.sleep(0)
+        return False
 
-    async def _bounded_lifecycle(self, coro: Any, *, what: str, **kwargs: Any) -> Any:
-        del what, kwargs
-        return await coro
-
-    async def kill_window_locked(self, window_id: str) -> bool:
-        # Delegates so a double that records ``kill_window`` calls keeps working
-        # unchanged — the split is a locking concern, not a behavioural one.
-        return await self.kill_window(window_id)  # type: ignore[attr-defined]
-
+    # ── the two-phase kill ───────────────────────────────────────────────
     def begin_kill_locked(self, window_id: str) -> Any:
-        """Two-phase kill: dispatch under the lock, await outside it.
+        """Register the mark, then dispatch — the production ordering.
 
-        The double has no worker thread, so "dispatch" is just the coroutine and
-        ``finish_kill`` awaits it — the recorded ``kill_window`` call still
-        happens exactly once, at the same point in the sequence.
+        The mark OUTLIVES the dispatch and is cleared by the completion
+        callback, so an adopter checking mid-flight genuinely sees it.
         """
-        return asyncio.ensure_future(self.kill_window(window_id))  # type: ignore[attr-defined]
+        self._pending[window_id] = self._pending.get(window_id, 0) + 1
+
+        async def _run() -> bool:
+            return await self.kill_window(window_id)  # type: ignore[attr-defined]
+
+        inner = asyncio.ensure_future(_run())
+
+        def _clear(fut: "asyncio.Future[bool]") -> None:
+            remaining = self._pending.get(window_id, 0) - 1
+            if remaining > 0:
+                self._pending[window_id] = remaining
+            else:
+                self._pending.pop(window_id, None)
+            if not fut.cancelled() and fut.exception() is None and fut.result():
+                # A CONFIRMED kill makes the window disappear from FRESH reads.
+                self._dead.add(window_id)
+
+        inner.add_done_callback(_clear)
+        return inner
 
     async def finish_kill(self, window_id: str, inner: Any) -> bool:
         del window_id
         return await inner
 
+    # ── the listing seams: fresh and cached are genuinely DIFFERENT ──────
+    async def list_windows(self) -> Any:
+        """The CACHED view — deliberately still shows a killed window.
+
+        This is what makes a non-fresh adoption probe fail a test instead of
+        passing by accident.
+        """
+        return list(getattr(self, "_listing", []) or [])
+
     async def list_windows_fresh(self) -> Any:
-        return await self.list_windows()  # type: ignore[attr-defined]
+        return [
+            w
+            for w in await self.list_windows()
+            if getattr(w, "window_id", None) not in self._dead
+        ]
 
     async def find_window_by_id(self, window_id: str, *, fresh: bool = False) -> Any:
-        del fresh
-        for window in await self.list_windows():  # type: ignore[attr-defined]
+        listing = (
+            await self.list_windows_fresh() if fresh else await self.list_windows()
+        )
+        for window in listing:
             if getattr(window, "window_id", None) == window_id:
                 return window
         return None
 
-    async def list_windows(self) -> Any:
-        # A double that models no windows still satisfies "the listing worked
-        # and did not disprove anything" — absence must be PROVEN, and an empty
-        # listing proves nothing (the r11 P1-A rule).
-        return []
+    # ── the lock + the bounded-op accounting ─────────────────────────────
+    def window_lifecycle_lock(self) -> Any:
+        lock = getattr(self, "_lifecycle_lock", None)
+        if lock is None:
+            # The REAL wrapper, so a double enforces the same per-hold
+            # bounded-op accounting production does (review r15 P2-B/P2-C).
+            from cctelegram.tmux_manager import _LifecycleLock
+
+            lock = _LifecycleLock()
+            self._lifecycle_lock = lock
+        return lock
+
+    async def _bounded_lifecycle(self, coro: Any, *, what: str, **kwargs: Any) -> Any:
+        """The REAL accounting, so a double enforces the ceiling too."""
+        del kwargs
+        lock = self.window_lifecycle_lock()
+        if lock.locked():
+            lock.note_bounded_op()
+        del what
+        return await coro

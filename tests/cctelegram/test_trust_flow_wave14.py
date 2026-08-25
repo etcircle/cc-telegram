@@ -183,48 +183,99 @@ async def _start(
 
 
 @pytest.mark.asyncio
-async def test_a_fresh_probe_publishes_a_snapshot_at_or_above_its_own_floor(
+async def test_a_read_raced_by_an_invalidation_is_never_published(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Under constant invalidation pressure, the probe must still be honest.
+    """A sample taken across an invalidation must be DISCARDED, not stamped.
 
-    The old shape retried a few times and, on exhaustion, returned the LAST
-    REJECTED read WITHOUT caching it — handing back exactly the pre-kill listing
-    the generation guard exists to reject, and publishing nothing for anyone
-    else. The contract is that whatever the caller receives was read at a
-    generation at or above its own floor, and is published under that stamp.
-
-    Here EVERY read is raced by an invalidation, which is precisely the
-    exhaustion case.
+    This test replaces a wave-14 test that PINNED THE DEFECT: it asserted the
+    raced sample was published under its starting generation, on the (wrong)
+    argument that "the read began after the caller's invalidation" implies "the
+    read observed post-invalidation state". It does not — a kill landing WHILE
+    ``_list_windows_direct`` awaits bumps the generation after the start stamp
+    was taken, so the pre-kill sample got published under a stamp the caller's
+    floor accepts. Matching the START and END generations is what closes it.
     """
     from cctelegram.tmux_manager import TmuxWindow, tmux_manager as real_tmux
 
     real_tmux._invalidate_list_cache()
-    started_generations: list[int] = []
+    reads: list[int] = []
+
+    async def _raced_then_settled() -> Any:
+        reads.append(1)
+        if len(reads) == 1:
+            # A kill lands DURING this read: the sample is pre-kill.
+            real_tmux._invalidate_list_cache()
+            return [TmuxWindow(window_id="@doomed", window_name="w", cwd="/x")]
+        # The retry samples the world AFTER the kill.
+        return [TmuxWindow(window_id="@alive", window_name="w", cwd="/y")]
+
+    monkeypatch.setattr(real_tmux, "_list_windows_direct", _raced_then_settled)
+
+    found = await real_tmux.find_window_by_id("@doomed", fresh=True)
+
+    assert found is None, (
+        "a sample taken ACROSS an invalidation was accepted — that is the "
+        "pre-kill corpse the generation guard exists to reject"
+    )
+    assert len(reads) >= 2, "the raced sample must be discarded and re-read"
+    assert real_tmux._list_cache is not None
+    assert "@doomed" not in real_tmux._list_cache, (
+        "the raced sample must never be PUBLISHED for anyone else either"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unstable_listing_refuses_rather_than_return_a_corpse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On exhaustion a freshness-critical probe REFUSES.
+
+    Returning the last rejected read — the wave-13 shape — hands back exactly
+    the observation the guard rejected. A typed refusal is the honest answer.
+    """
+    from cctelegram.tmux_manager import TmuxWindow, tmux_manager as real_tmux
+
+    real_tmux._invalidate_list_cache()
 
     async def _always_raced() -> Any:
-        started_generations.append(real_tmux._invalidation_generation)
-        # A kill lands DURING every read.
         real_tmux._invalidate_list_cache()
-        await asyncio.sleep(0)
-        return [TmuxWindow(window_id="@only", window_name="w", cwd="/x")]
+        return [TmuxWindow(window_id="@doomed", window_name="w", cwd="/x")]
 
     monkeypatch.setattr(real_tmux, "_list_windows_direct", _always_raced)
 
-    floor = real_tmux._invalidation_generation + 1
-    found = await real_tmux.find_window_by_id("@only", fresh=True)
+    with pytest.raises(tmux_mod.ListingUnstable):
+        await real_tmux.find_window_by_id("@doomed", fresh=True)
 
-    assert found is not None, "the probe must return a real observation"
-    assert real_tmux._list_cache is not None, (
-        "the observation must be PUBLISHED, not returned uncached — an uncached "
-        "return is how the rejected snapshot leaked back to the caller"
+    assert real_tmux._list_cache is None, (
+        "nothing may be published from a listing that never settled"
     )
-    assert real_tmux._list_cache_generation >= floor, (
-        f"published snapshot is stamped {real_tmux._list_cache_generation}, "
-        f"below the caller's floor {floor} — it predates its own invalidation"
-    )
-    assert started_generations and started_generations[-1] >= floor, (
-        "the read that produced the answer began before the caller's invalidation"
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_cached_read_still_works_under_the_same_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 1 Hz poller must not start raising because a kill is busy.
+
+    Callers that demand no freshness get their observation back UNPUBLISHED —
+    so a raced sample is never handed to anybody else, and the pollers keep
+    working.
+    """
+    from cctelegram.tmux_manager import TmuxWindow, tmux_manager as real_tmux
+
+    real_tmux._invalidate_list_cache()
+
+    async def _always_raced() -> Any:
+        real_tmux._invalidate_list_cache()
+        return [TmuxWindow(window_id="@w", window_name="w", cwd="/x")]
+
+    monkeypatch.setattr(real_tmux, "_list_windows_direct", _always_raced)
+
+    listed = await real_tmux.list_windows()
+    assert [w.window_id for w in listed] == ["@w"], "the poller still gets an answer"
+    assert real_tmux._list_cache is None, (
+        "…but a raced sample is never published for a fresh caller to accept"
     )
 
 

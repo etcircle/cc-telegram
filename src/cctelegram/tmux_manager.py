@@ -142,7 +142,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# GH #65 review r13.
+# GH #65 review r13/r15.
+# P1-A: how many times a generation-matched refresh retries before giving up.
+# Each attempt only loses to a genuine concurrent invalidation, so a small bound
+# is ample; the surrounding lifecycle timeout bounds the wall clock.
+_LIST_REFRESH_MAX_ATTEMPTS: Final[int] = 5
 # P1-B: every tmux await taken UNDER the window-lifecycle lock is bounded by
 # this, so one wedged tmux operation cannot block the lifecycle of every other
 # window — including a forced trust cleanup or a topic teardown. Generous
@@ -158,6 +162,17 @@ LIFECYCLE_TMUX_TIMEOUT_S: Final[float] = 30.0
 # A new bounded await added under an existing hold MUST be reflected here; the
 # wave-14 pin test recomputes this from the source and fails if it drifts.
 _MAX_BOUNDED_OPS_PER_LIFECYCLE_HOLD: Final[int] = 2
+# When True, exceeding that ceiling RAISES instead of logging. Armed by the test
+# suite so a hold that grows fails loudly rather than silently invalidating the
+# derived kill bound.
+_STRICT_LIFECYCLE_INVARIANTS: bool = False
+
+
+def enable_strict_lifecycle_invariants() -> None:
+    """Make a bounded-ops ceiling breach RAISE (test posture)."""
+    global _STRICT_LIFECYCLE_INVARIANTS
+    _STRICT_LIFECYCLE_INVARIANTS = True
+
 
 # P1-B: how long ``kill_window`` waits to ACQUIRE the lifecycle lock before
 # giving up with an honest failure instead of queueing indefinitely.
@@ -180,6 +195,76 @@ KILL_LOCK_TIMEOUT_S: Final[float] = (
 CREATED_BUT_UNVERIFIED_MESSAGE: Final[str] = (
     "The window was created but could not be verified. Please check tmux."
 )
+
+
+@dataclass
+class _CreateOwnership:
+    """Did the CALLER take ownership of a created window? (review r15 P1-B.)
+
+    A mutable box rather than a local, because the reaping done-callback runs
+    after ``create_window``'s frame may be gone — it must read the flag's final
+    value, not a closed-over snapshot. Set only on the successful-return path,
+    so timeout, cancellation and partial creation all leave the reaper armed.
+    """
+
+    taken_by_caller: bool = False
+
+
+class _LifecycleLock:
+    """The window-lifecycle lock, with per-HOLD bounded-op accounting.
+
+    Review r15 P2-B. The ceiling is about how long ONE acquisition can lawfully
+    last, which is a CUMULATIVE property — two sequential 30 s operations make a
+    60 s hold — not a nesting depth. Counting had to reset when a hold BEGINS
+    and be summarised when it ENDS, so the lock is wrapped rather than handed
+    out raw. It proxies the whole surface the call sites use (``async with``,
+    ``acquire`` / ``release`` for the bounded kill acquisition, and ``locked``).
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.ops_in_hold: int = 0
+        self.ops_high_water: int = 0
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def acquire(self) -> bool:
+        acquired = await self._lock.acquire()
+        self.ops_in_hold = 0
+        return acquired
+
+    def release(self) -> None:
+        self.ops_high_water = max(self.ops_high_water, self.ops_in_hold)
+        self.ops_in_hold = 0
+        self._lock.release()
+
+    def note_bounded_op(self) -> int:
+        """Record one bounded operation against the current hold."""
+        self.ops_in_hold += 1
+        self.ops_high_water = max(self.ops_high_water, self.ops_in_hold)
+        return self.ops_in_hold
+
+    def reset_accounting(self) -> None:
+        self.ops_in_hold = 0
+        self.ops_high_water = 0
+
+    async def __aenter__(self) -> "_LifecycleLock":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self.release()
+
+
+class ListingUnstable(Exception):
+    """A freshness-critical listing could not be sampled without a race.
+
+    Raised when every attempt to read the tmux window list was invalidated
+    mid-read (review r15 P1-A). The alternative — returning the sample anyway —
+    is precisely the pre-kill observation an adopter must never see, so the
+    honest answer is a typed refusal the caller turns into its own copy.
+    """
 
 
 class LifecycleTimeout(Exception):
@@ -572,7 +657,7 @@ class TmuxManager:
         # asyncio.Lock binds to the running loop at construction, and this
         # singleton outlives individual test loops. See the module docstring
         # for the LOCK ORDER rule (this lock is INNERMOST).
-        self._lifecycle_lock: asyncio.Lock | None = None
+        self._lifecycle_lock: _LifecycleLock | None = None
 
     @property
     def server(self) -> libtmux.Server:
@@ -810,31 +895,59 @@ class TmuxManager:
                 and self._list_cache_generation >= min_generation
             ):
                 return self._list_cache
-            # THE REFRESH RUNS INSIDE THE LOCK, and its snapshot is STAMPED
-            # with the generation it STARTED under (review r13 P1-A, completed
-            # in r14 P1-A).
+            # THE REFRESH RUNS INSIDE THE LOCK, and a snapshot is published
+            # ONLY when the generation is unchanged from its START to its END
+            # (review r15 P1-A).
             #
-            # The stamp is what makes this correct, and it makes a retry loop
-            # unnecessary. Generations only increase, and ``min_generation`` was
-            # read before we got here, so the generation current at the start of
-            # this read is always >= the caller's floor — which means the read
-            # itself BEGAN after the invalidation the caller is waiting behind,
-            # and therefore observes tmux after that kill landed. Publishing it
-            # under its true starting generation is honest for everyone else
-            # too: a later caller with a HIGHER floor simply fails the fast-path
-            # comparison and refreshes again, rather than being handed a
-            # snapshot that predates its own invalidation.
+            # The r14 shape stamped the read with its STARTING generation and
+            # published unconditionally. That argument was WRONG, and the r14
+            # test encoded the error: "the read began after the caller's
+            # invalidation" is NOT "the read observed post-invalidation state".
+            # A kill landing WHILE ``_list_windows_direct`` is awaiting bumps the
+            # generation after our start stamp was taken, so the pre-kill sample
+            # got published under a stamp the caller's floor accepts — the exact
+            # corpse the guard exists to reject. Concretely: settlement returns,
+            # a kill registers and releases, an adopter takes the lock while the
+            # kill is still pending, the listing samples the LIVE window, the
+            # kill lands and clears the pending mark, the listing returns the
+            # corpse, and the post-list pending check sees nothing.
             #
-            # The earlier shape discarded a snapshot whose generation moved
-            # mid-read and, on exhaustion, returned that REJECTED observation
-            # uncached — handing back exactly the pre-kill listing the guard
-            # exists to reject. Stamping removes both the retries and that hole.
-            started_at_generation = self._invalidation_generation
-            windows = await self._list_windows_direct()
-            self._list_cache = {w.window_id: w for w in windows if w.window_id}
-            self._list_cache_at = time.monotonic()
-            self._list_cache_generation = started_at_generation
-            return self._list_cache
+            # Matching START and END generations is what actually closes it: an
+            # invalidation anywhere inside the read makes them differ, so the
+            # sample is DISCARDED and retried. On exhaustion a caller that
+            # DEMANDED freshness gets a typed refusal — never the rejected read.
+            # An ordinary (floor-free) caller gets its observation back
+            # UNPUBLISHED, so a raced sample can never be handed to anybody else.
+            windows: list[TmuxWindow] = []
+            for _ in range(_LIST_REFRESH_MAX_ATTEMPTS):
+                started_at_generation = self._invalidation_generation
+                windows = await self._list_windows_direct()
+                if self._invalidation_generation != started_at_generation:
+                    logger.debug(
+                        "tmux listing invalidated mid-read (gen %d -> %d) — "
+                        "discarding the sample and retrying",
+                        started_at_generation,
+                        self._invalidation_generation,
+                    )
+                    continue
+                self._list_cache = {w.window_id: w for w in windows if w.window_id}
+                self._list_cache_at = time.monotonic()
+                self._list_cache_generation = started_at_generation
+                return self._list_cache
+
+            if min_generation > 0:
+                raise ListingUnstable(
+                    f"tmux listing was invalidated during every one of "
+                    f"{_LIST_REFRESH_MAX_ATTEMPTS} attempts; refusing to answer a "
+                    "freshness-critical probe with a sample that may predate the "
+                    "last kill"
+                )
+            logger.warning(
+                "tmux listing raced invalidations %d times — returning an "
+                "UNPUBLISHED observation (no stale snapshot is cached)",
+                _LIST_REFRESH_MAX_ATTEMPTS,
+            )
+            return {w.window_id: w for w in windows if w.window_id}
 
     def _invalidate_list_cache(self) -> int:
         """Drop the list_windows cache after an explicit mutation.
@@ -1310,7 +1423,25 @@ class TmuxManager:
         )
         return False
 
-    def window_lifecycle_lock(self) -> asyncio.Lock:
+    @property
+    def lifecycle_ops_high_water(self) -> int:
+        """Most bounded ops observed under a SINGLE lifecycle-lock hold.
+
+        Review r15 P2-B. The accounting is STRUCTURAL — counted at runtime by
+        ``_bounded_lifecycle`` — because the lexical scan it replaces could only
+        see ``_bounded_lifecycle`` calls textually nested under an ``async with``
+        line: the trust acquisition's op hides inside
+        ``_revalidate_bind_preconditions`` and counted zero, and an aliased
+        acquisition was invisible entirely. The pin test drives each acquisition
+        site and reads this.
+        """
+        return self.window_lifecycle_lock().ops_high_water
+
+    def reset_lifecycle_ops_accounting(self) -> None:
+        """Zero the high-water mark (test seam)."""
+        self.window_lifecycle_lock().reset_accounting()
+
+    def window_lifecycle_lock(self) -> _LifecycleLock:
         """THE lock that serializes kill-registration against adoption.
 
         See the module docstring's LOCK ORDER rule: this lock is INNERMOST —
@@ -1323,7 +1454,7 @@ class TmuxManager:
         # construct — the same argument as ``_list_lock``. Do not insert an
         # ``await`` between these two lines.
         if self._lifecycle_lock is None:
-            self._lifecycle_lock = asyncio.Lock()
+            self._lifecycle_lock = _LifecycleLock()
         return self._lifecycle_lock
 
     def reset_lifecycle_lock_for_tests(self) -> None:
@@ -1347,6 +1478,24 @@ class TmuxManager:
         # argument is evaluated at import and would ignore any later change to
         # the constant (including a test's).
         budget = LIFECYCLE_TMUX_TIMEOUT_S if timeout is None else timeout
+        # STRUCTURAL ACCOUNTING (review r15 P2-B): count the op against the hold
+        # that is actually in force, wherever in the call tree it happens. The
+        # kill bound is DERIVED from this maximum, so a hold that quietly grows
+        # past the declared ceiling must be loud.
+        lock = self.window_lifecycle_lock()
+        if lock.locked():
+            observed = lock.note_bounded_op()
+            if observed > _MAX_BOUNDED_OPS_PER_LIFECYCLE_HOLD:
+                message = (
+                    f"{observed} bounded operations under ONE lifecycle-lock "
+                    f"hold exceeds the declared ceiling of "
+                    f"{_MAX_BOUNDED_OPS_PER_LIFECYCLE_HOLD} — KILL_LOCK_TIMEOUT_S "
+                    "is derived from that ceiling and no longer covers the "
+                    "worst-case lawful hold"
+                )
+                if _STRICT_LIFECYCLE_INVARIANTS:
+                    raise AssertionError(message)
+                logger.error(message)
         try:
             return await asyncio.wait_for(coro, timeout=budget)
         except (TimeoutError, asyncio.TimeoutError) as e:
@@ -1522,9 +1671,10 @@ class TmuxManager:
         """Kill a tmux window by its ID.
 
         Acquires the window-lifecycle lock to REGISTER the kill. A caller that
-        already holds that lock must use :meth:`kill_window_locked` instead —
-        ``asyncio.Lock`` is not reentrant, so calling this under the hold would
-        deadlock.
+        already holds that lock must use the TWO-PHASE pair instead —
+        :meth:`begin_kill_locked` under the hold, :meth:`finish_kill` after
+        releasing it. ``asyncio.Lock`` is not reentrant, so calling this under
+        the hold would deadlock.
         """
         try:
             await asyncio.wait_for(
@@ -1543,18 +1693,6 @@ class TmuxManager:
             inner = self.begin_kill_locked(window_id)
         finally:
             self.window_lifecycle_lock().release()
-        return await self.finish_kill(window_id, inner)
-
-    async def kill_window_locked(self, window_id: str) -> bool:
-        """``kill_window`` for a caller that ALREADY holds the lifecycle lock.
-
-        Review r14 P1-E: the guarded cleanup re-checks ownership and then kills
-        in ONE critical section, so nothing can adopt the window between the
-        check and the kill's registration. The executor call is still awaited
-        OUTSIDE the hold by the caller's ``async with`` exit — the registration
-        is what must be atomic with the check, not the tmux round-trip.
-        """
-        inner = self.begin_kill_locked(window_id)
         return await self.finish_kill(window_id, inner)
 
     def begin_kill_locked(self, window_id: str) -> "asyncio.Future[bool]":
@@ -1721,6 +1859,7 @@ class TmuxManager:
 
         # Create window in thread
         def _create_and_start() -> tuple[bool, str, str, str]:
+            created_wid_for_reap = ""
             session = self.get_or_create_session()
             try:
                 # Create new window
@@ -1730,6 +1869,10 @@ class TmuxManager:
                 )
 
                 wid = window.window_id or ""
+                # From here the WINDOW EXISTS (review r15 P1-B). Any later setup
+                # failure must still report this id, or a real window is created
+                # that nobody can name and therefore nobody can reap.
+                created_wid_for_reap = wid
 
                 # Prevent Claude Code from overriding window name
                 window.set_window_option("allow-rename", "off")
@@ -1767,8 +1910,16 @@ class TmuxManager:
                 )
 
             except Exception as e:
+                # PARTIAL CREATION (review r15 P1-B): if ``new_window`` already
+                # succeeded, the window is REAL even though setup failed, so the
+                # id travels with the failure.
                 logger.error(f"Failed to create window: {e}")
-                return False, f"Failed to create window: {e}", "", ""
+                return (
+                    False,
+                    f"Failed to create window: {e}",
+                    "",
+                    created_wid_for_reap,
+                )
 
         # UNDER THE LIFECYCLE LOCK (review r12 P1-A): the gate re-check, the
         # creation, and the verification listing are ONE critical section, so
@@ -1794,19 +1945,31 @@ class TmuxManager:
                 # no caller, no reservation and no owner. So the inner future
                 # carries a done-callback that outlives our cancellation: if we
                 # have already timed out, it reaps whatever the worker made.
-                timed_out = False
+                # REAP ON "THE CALLER DID NOT TAKE OWNERSHIP" (review r15
+                # P1-B), not on "we timed out". Keying on the timeout missed two
+                # arms: a caller CANCELLATION propagates without ever setting it,
+                # and a setup failure AFTER ``new_window`` succeeded produced a
+                # real window the old empty-id return made unreachable. The flag
+                # is set ONLY on the successful-return path, so timeout,
+                # cancellation and partial creation are all covered by one rule —
+                # and the callback survives our cancellation, so it can still act
+                # after we are gone.
+                ownership = _CreateOwnership()
                 inner = asyncio.ensure_future(asyncio.to_thread(_create_and_start))
 
-                def _reap_if_orphaned(fut: "asyncio.Future[Any]") -> None:
-                    if not timed_out or fut.cancelled():
+                def _reap_unless_owned(fut: "asyncio.Future[Any]") -> None:
+                    if ownership.taken_by_caller or fut.cancelled():
                         return
                     if fut.exception() is not None:
                         return
-                    late_ok, _lm, _ln, late_wid = fut.result()
-                    if not (late_ok and late_wid):
+                    _late_ok, _lm, _ln, late_wid = fut.result()
+                    # Present whenever ``new_window`` succeeded, even if later
+                    # setup failed — that is the partial-creation arm.
+                    if not late_wid:
                         return
                     logger.warning(
-                        "window %s was created AFTER its creation timed out — "
+                        "window %s exists but no caller took ownership of its "
+                        "creation (timeout, cancellation or partial creation) — "
                         "reaping it so it cannot float unowned",
                         late_wid,
                     )
@@ -1814,14 +1977,10 @@ class TmuxManager:
                     # so no adopter can take the window in the meantime.
                     asyncio.ensure_future(self.kill_window(late_wid))
 
-                inner.add_done_callback(_reap_if_orphaned)
-                try:
-                    result = await self._bounded_lifecycle(
-                        asyncio.shield(inner), what="create_window"
-                    )
-                except LifecycleTimeout:
-                    timed_out = True
-                    raise
+                inner.add_done_callback(_reap_unless_owned)
+                result = await self._bounded_lifecycle(
+                    asyncio.shield(inner), what="create_window"
+                )
                 # Invalidate AFTER to_thread returns so the brand-new window is
                 # visible to the next list_windows call from the resume flow.
                 self._invalidate_list_cache()
@@ -1907,6 +2066,10 @@ class TmuxManager:
                             "proceeding on the pre-create gate alone",
                             new_wid,
                         )
+                # THE CALLER IS TAKING OWNERSHIP. Set last, immediately
+                # before handing the result back, so every other exit leaves the
+                # reaper armed.
+                ownership.taken_by_caller = True
                 return result
         except LifecycleTimeout as e:
             logger.error("window creation exceeded its lifecycle bound: %s", e)

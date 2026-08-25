@@ -80,6 +80,9 @@ from cctelegram.handlers import (
 # invariants merely logging, so the lane's safety net was inert in exactly the
 # run where it matters most.
 trust_flow.enable_strict_invariants()
+# GH #65 r15 P2-B: a lifecycle hold that grows past the declared ceiling
+# invalidates the DERIVED kill bound, so make it raise for the whole suite.
+tmux_mod.enable_strict_lifecycle_invariants()
 
 
 # ──────────────────────────────────────────────────────────────────────────
