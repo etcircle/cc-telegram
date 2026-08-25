@@ -36,6 +36,9 @@ _TRUST = (_FIXTURES / "folder_trust_arrival_plain_v2.1.241.txt").read_text()
 _IDLE = (_FIXTURES / "inputbox_idle_v2.1.207.txt").read_text()
 _THREAD = 6161
 _USER = 9090
+# A window id that CANNOT exist on a real tmux server, so even a future
+# regression in an injection seam cannot address a live pane.
+_FAKE_WID = "@fake-trust-test"
 
 
 @pytest.fixture(autouse=True)
@@ -127,6 +130,22 @@ class _Sessions:
                 return wid
         return None
 
+    def peek_session_id_for_window(self, window_id: str) -> str | None:
+        # The INJECTED registered-proof, so a test never seeds the live
+        # ``session_manager.window_states`` to model a registered window.
+        state = self.window_states.get(window_id)
+        return getattr(state, "session_id", None) or None
+
+    def read_session_id_for_window_fresh(self, window_id: str) -> str | None:
+        return self.peek_session_id_for_window(window_id)
+
+    def iter_thread_bindings(self) -> Any:
+        # The INJECTED binding authority. A test must NEVER seed the real
+        # ``session_manager`` to reach a ``SPARED_BOUND``: the completion
+        # tail's replay resolves through it, and a plausible window id
+        # there escapes into the user's REAL tmux server.
+        return [(uid, tid, wid) for uid, tid, wid in self.binds]
+
 
 def _seed(user_data: dict[str, Any]) -> dict[str, Any]:
     entry = ensure_picker_entry(user_data, _THREAD)
@@ -134,6 +153,18 @@ def _seed(user_data: dict[str, Any]) -> dict[str, Any]:
     entry[CARD_CHAT_ID_KEY] = -100
     entry[CARD_MSG_ID_KEY] = 999
     return entry
+
+
+async def _no_replay(route: Any, user_data: Any) -> Any:
+    """A pending-payload replay that goes NOWHERE.
+
+    Injected by every unit test so the completion tail can never
+    reach the live delivery path — which resolves the real
+    ``session_manager`` and the real ``tmux_manager``, and would
+    type into whatever window id the test happened to use.
+    """
+    del route, user_data
+    return None
 
 
 async def _start(
@@ -147,13 +178,14 @@ async def _start(
         chat_id=-100,
         user_data=user_data,
         entry_token=entry.get(ENTRY_TOKEN_KEY) if entry else None,
-        created_wid="@5",
+        created_wid=_FAKE_WID,
         window_name="repo",
         selected_path="/repo",
         create_message="Created",
         cli_version="2.1.241",
         tmux_mgr=tmux,
         session_mgr=sessions,
+        replay=_no_replay,
     )
 
 
@@ -231,7 +263,7 @@ async def test_a_storm_of_taps_cannot_starve_the_teardown() -> None:
 
     assert won is False
     assert trust_flow.get_flow(_USER, _THREAD) is None
-    assert tmux.kill_calls == ["@5"], "the window is still properly settled"
+    assert tmux.kill_calls == [_FAKE_WID], "the window is still properly settled"
     assert picker_entry(user_data, _THREAD) is None
 
 
@@ -276,7 +308,7 @@ async def test_the_teardown_budget_force_settles_it_never_drops_blindly() -> Non
     )
 
     assert won is False
-    assert tmux.kill_calls == ["@5"], (
+    assert tmux.kill_calls == [_FAKE_WID], (
         "the budget's expiry must CLEAN the window, never drop it blind"
     )
     assert trust_flow.get_flow(_USER, _THREAD) is None
@@ -347,7 +379,7 @@ async def test_two_concurrent_teardowns_do_not_drop_beneath_each_other() -> None
     assert flow_alive_during_kill == [flow], (
         "the second teardown must NOT drop the flow beneath the first's kill_window"
     )
-    assert tmux.kill_calls == ["@5"], "and the window is killed exactly once"
+    assert tmux.kill_calls == [_FAKE_WID], "and the window is killed exactly once"
     assert trust_flow.get_flow(_USER, _THREAD) is None
 
 
@@ -385,7 +417,7 @@ async def test_a_teardown_does_not_drop_beneath_the_wait_terminalizer() -> None:
     assert alive == [flow], (
         "teardown must not drop the flow beneath the terminalizer's kill_window"
     )
-    assert tmux.kill_calls == ["@5"]
+    assert tmux.kill_calls == [_FAKE_WID]
     assert trust_flow.get_flow(_USER, _THREAD) is None
 
 
@@ -462,7 +494,7 @@ async def test_wait_keeps_observing_when_its_registration_cas_loses() -> None:
     # honoured, which is the strongest possible proof the observer survived.
     assert flow.phase != trust_flow.PHASE_CANCELLING
     await asyncio.wait_for(wait_task, timeout=5)
-    assert sessions.binds == [(_USER, _THREAD, "@5")], (
+    assert sessions.binds == [(_USER, _THREAD, _FAKE_WID)], (
         "the restored flow must still be observed — its registration binds"
     )
     assert flow.phase == trust_flow.PHASE_TERMINAL
@@ -476,10 +508,13 @@ async def test_wait_keeps_observing_when_its_registration_cas_loses() -> None:
 async def test_a_current_route_binding_delivers_the_pending_payload(
     tmp_path: Path,
 ) -> None:
-    """CURRENT-ROUTE binding: the bind WON, so the payload is DELIVERED and its
-    file survives — this is a completion, not a cancellation."""
-    from cctelegram.session import session_manager
+    """CURRENT-ROUTE binding: the bind WON, so the payload goes to NORMAL BOUND
+    DELIVERY and its file is not deleted — a completion, not a cancellation.
 
+    Everything is INJECTED: the binding authority is the fake session manager
+    (never the live ``session_manager`` singleton), and the replay is a fake, so
+    this test cannot reach a real tmux server even if a seam regresses.
+    """
     payload = tmp_path / "pending.bin"
     payload.write_bytes(b"data")
     user_data: dict[str, Any] = {}
@@ -493,29 +528,50 @@ async def test_a_current_route_binding_delivers_the_pending_payload(
     bot = _Bot()
     tmux = _Tmux(pane=_TRUST)
     sessions = _Sessions()
-    flow = await _start(user_data, tmux=tmux, bot=bot, sessions=sessions)
+    replayed: list[Any] = []
+
+    async def _fake_replay(route: Any, ud: Any) -> Any:
+        # Stands in for the real delivery: records the route and CONSUMES the
+        # entry the way a successful replay does (files kept — delivered).
+        replayed.append((route, dict(ud) if isinstance(ud, dict) else ud))
+        from cctelegram.handlers.directory_browser import drop_picker_entry
+
+        drop_picker_entry(ud, _THREAD)
+        return None
+
+    # THIS route is bound to the window — through the INJECTED authority only.
+    sessions.bind_thread(_USER, _THREAD, _FAKE_WID)
+    flow = await trust_flow.start_trust_wait(
+        bot=bot,
+        user_id=_USER,
+        thread_id=_THREAD,
+        chat_id=-100,
+        user_data=user_data,
+        entry_token=entry[ENTRY_TOKEN_KEY],
+        created_wid=_FAKE_WID,
+        window_name="repo",
+        selected_path="/repo",
+        create_message="Created",
+        cli_version="2.1.241",
+        tmux_mgr=tmux,
+        session_mgr=sessions,
+        replay=_fake_replay,
+    )
     assert flow is not None
     await asyncio.sleep(0.03)
-    # THIS route is bound to the created window.
-    session_manager.thread_bindings.setdefault(_USER, {})[_THREAD] = "@5"
-    sessions.bind_thread(_USER, _THREAD, "@5")
-    try:
-        claim = await trust_flow.claim_for_cancel(
-            _USER, _THREAD, user_data=user_data, card_generation=flow.generation
-        )
-        assert claim.ok
-        outcome = await trust_flow.cancel_flow(flow, bot, tmux)
-    finally:
-        session_manager.thread_bindings.clear()
+
+    claim = await trust_flow.claim_for_cancel(
+        _USER, _THREAD, user_data=user_data, card_generation=flow.generation
+    )
+    assert claim.ok
+    outcome = await trust_flow.cancel_flow(flow, bot, tmux)
 
     assert outcome is trust_flow.CleanupOutcome.SPARED_BOUND
-    assert tmux.kill_calls == []
-    # Routed through the COMPLETION seam, not the cancellation one: the payload
-    # went to normal bound delivery (whether that delivery then succeeds is the
-    # delivery gate's business, and is asserted end-to-end in the scenario
-    # suite, where a real pane makes it succeed).
-    assert sessions.binds[-1] == (_USER, _THREAD, "@5"), sessions.binds
-    assert len(sessions.binds) == 2, "the completion tail ran its own bind"
+    assert tmux.kill_calls == [], "a bound window is never killed"
+    # Routed through the COMPLETION seam: the queued payload went to normal
+    # bound delivery, and a DELIVERED payload's file is never deleted.
+    assert replayed and replayed[0][0] == (_USER, _THREAD, _FAKE_WID), replayed
+    assert payload.exists(), "a DELIVERED payload's file must never be deleted"
     assert not any("Cancelled" in t for t in bot.texts()), bot.texts()
     assert trust_flow.get_flow(_USER, _THREAD) is None
 
@@ -526,9 +582,7 @@ async def test_a_collateral_binding_is_an_honest_cancellation(
 ) -> None:
     """COLLATERAL binding: the window belongs to ANOTHER topic. This flow is
     cancelled, the copy names neither topic as bound, and the undelivered file
-    is cleaned up."""
-    from cctelegram.session import session_manager
-
+    is cleaned up. Injected authority only — the real singleton is untouched."""
     payload = tmp_path / "pending2.bin"
     payload.write_bytes(b"data")
     user_data: dict[str, Any] = {}
@@ -540,19 +594,37 @@ async def test_a_collateral_binding_is_an_honest_cancellation(
     ]
     bot = _Bot()
     tmux = _Tmux(pane=_TRUST)
-    flow = await _start(user_data, tmux=tmux, bot=bot, sessions=_Sessions())
+    sessions = _Sessions()
+
+    async def _must_not_replay(route: Any, ud: Any) -> Any:
+        raise AssertionError("a collateral cancellation must NOT replay")
+
+    # A DIFFERENT topic owns the window.
+    sessions.bind_thread(_USER, _THREAD + 1, _FAKE_WID)
+    flow = await trust_flow.start_trust_wait(
+        bot=bot,
+        user_id=_USER,
+        thread_id=_THREAD,
+        chat_id=-100,
+        user_data=user_data,
+        entry_token=entry[ENTRY_TOKEN_KEY],
+        created_wid=_FAKE_WID,
+        window_name="repo",
+        selected_path="/repo",
+        create_message="Created",
+        cli_version="2.1.241",
+        tmux_mgr=tmux,
+        session_mgr=sessions,
+        replay=_must_not_replay,
+    )
     assert flow is not None
     await asyncio.sleep(0.03)
-    # A DIFFERENT topic owns the window.
-    session_manager.thread_bindings.setdefault(_USER, {})[_THREAD + 1] = "@5"
-    try:
-        claim = await trust_flow.claim_for_cancel(
-            _USER, _THREAD, user_data=user_data, card_generation=flow.generation
-        )
-        assert claim.ok
-        outcome = await trust_flow.cancel_flow(flow, bot, tmux)
-    finally:
-        session_manager.thread_bindings.clear()
+
+    claim = await trust_flow.claim_for_cancel(
+        _USER, _THREAD, user_data=user_data, card_generation=flow.generation
+    )
+    assert claim.ok
+    outcome = await trust_flow.cancel_flow(flow, bot, tmux)
 
     assert outcome is trust_flow.CleanupOutcome.SPARED_BOUND
     assert tmux.kill_calls == [], "another topic's window is never killed"

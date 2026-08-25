@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -45,6 +46,9 @@ _TRUST = (_FIXTURES / "folder_trust_arrival_plain_v2.1.241.txt").read_text()
 _IDLE = (_FIXTURES / "inputbox_idle_v2.1.207.txt").read_text()
 _THREAD = 909
 _USER = 6060
+# A window id that CANNOT exist on a real tmux server, so even a future
+# regression in an injection seam cannot address a live pane.
+_FAKE_WID = "@fake-trust-test"
 
 
 @pytest.fixture(autouse=True)
@@ -136,6 +140,22 @@ class _Sessions:
                 return wid
         return None
 
+    def peek_session_id_for_window(self, window_id: str) -> str | None:
+        # The INJECTED registered-proof, so a test never seeds the live
+        # ``session_manager.window_states`` to model a registered window.
+        state = self.window_states.get(window_id)
+        return getattr(state, "session_id", None) or None
+
+    def read_session_id_for_window_fresh(self, window_id: str) -> str | None:
+        return self.peek_session_id_for_window(window_id)
+
+    def iter_thread_bindings(self) -> Any:
+        # The INJECTED binding authority. A test must NEVER seed the real
+        # ``session_manager`` to reach a ``SPARED_BOUND``: the completion
+        # tail's replay resolves through it, and a plausible window id
+        # there escapes into the user's REAL tmux server.
+        return [(uid, tid, wid) for uid, tid, wid in self.binds]
+
 
 def _entry(user_data: dict[str, Any], thread_id: int = _THREAD) -> dict[str, Any]:
     entry = ensure_picker_entry(user_data, thread_id)
@@ -145,6 +165,18 @@ def _entry(user_data: dict[str, Any], thread_id: int = _THREAD) -> dict[str, Any
     return entry
 
 
+async def _no_replay(route: Any, user_data: Any) -> Any:
+    """A pending-payload replay that goes NOWHERE.
+
+    Injected by every unit test so the completion tail can never
+    reach the live delivery path — which resolves the real
+    ``session_manager`` and the real ``tmux_manager``, and would
+    type into whatever window id the test happened to use.
+    """
+    del route, user_data
+    return None
+
+
 async def _start(
     user_data: dict[str, Any],
     *,
@@ -152,7 +184,7 @@ async def _start(
     bot: Any,
     sessions: Any,
     thread_id: int = _THREAD,
-    wid: str = "@5",
+    wid: str = _FAKE_WID,
 ) -> trust_flow.TrustFlow | None:
     entry = picker_entry(user_data, thread_id)
     return await trust_flow.start_trust_wait(
@@ -169,6 +201,7 @@ async def _start(
         cli_version="2.1.241",
         tmux_mgr=tmux,
         session_mgr=sessions,
+        replay=_no_replay,
     )
 
 
@@ -189,9 +222,9 @@ def test_phase_has_exactly_one_mutator_in_the_module() -> None:
         for line in source.splitlines()
         if "._phase = " in line and not line.strip().startswith("#")
     ]
-    assert assignments == ["flow._phase = to", "flow._phase = PHASE_CANCELLING"], (
-        assignments
-    )
+    # ONE writer, full stop (review r7 P1-B folded ``force_terminal_claim``
+    # into the same seam, so even the forced path no longer writes directly).
+    assert assignments == ["flow._phase = to"], assignments
     # Belt AND braces: the public attribute is READ-ONLY, so a direct write is a
     # type error rather than a convention violation (review r4 P3).
     assert isinstance(trust_flow.TrustFlow.phase, property)
@@ -266,28 +299,33 @@ async def test_a_registration_loses_to_a_cleanup_that_already_claimed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_clearing_the_entry_also_stops_the_flow_in_one_hold() -> None:
-    """The seam invalidates the token AND marks the flow terminal together.
+async def test_clearing_the_entry_settles_the_flow_through_the_full_teardown() -> None:
+    """The clear NEVER terminalizes a live flow itself (review r7 P1-D).
 
-    After it, every actor's CAS fails: no cleanup, no tap, no slice may perform
-    a side effect on a flow whose ownership token is gone.
+    Wave 3 had it CAS ``open → terminal`` and drop, which left the flow's WAIT
+    terminalizer with only bookkeeping to do — no guarded cleanup — so a flow
+    installed in the teardown→clear gap orphaned its tmux window and discarded
+    the queued payload. Discovering ANY live flow now runs the FULL teardown
+    loop, so the window is properly settled before the entry goes.
     """
     user_data: dict[str, Any] = {}
     _entry(user_data)
-    flow = await _start(
-        user_data, tmux=_Tmux(pane=_TRUST), bot=_Bot(), sessions=_Sessions()
-    )
+    tmux = _Tmux(pane=_TRUST)
+    flow = await _start(user_data, tmux=tmux, bot=_Bot(), sessions=_Sessions())
     assert flow is not None
 
-    dropped = await trust_flow.clear_topic_entry(_USER, _THREAD, user_data)
+    await trust_flow.clear_topic_entry(_USER, _THREAD, user_data)
 
-    assert dropped is not None
+    assert tmux.kill_calls == [_FAKE_WID], (
+        "the window must be GUARD-cleaned, not orphaned"
+    )
     assert picker_entry(user_data, _THREAD) is None
+    assert trust_flow.get_flow(_USER, _THREAD) is None
     assert flow.phase == trust_flow.PHASE_TERMINAL
+    # …and nothing can claim it afterwards.
     assert await trust_flow.claim_terminal(flow) is False
     claim = await trust_flow.claim_for_dispatch(_USER, _THREAD, user_data=user_data)
     assert claim.ok is False
-    await trust_flow.teardown_thread(_USER, _THREAD)
 
 
 def test_no_unlocked_entry_pops_remain_in_the_teardown_paths() -> None:
@@ -349,7 +387,7 @@ async def test_teardown_settles_an_in_flight_dispatch_before_acting() -> None:
     assert won is False
     assert released.is_set(), "teardown must CANCEL + AWAIT the claim's owner"
     assert callback.done()
-    assert tmux.kill_calls == ["@5"], "and only THEN settle the window"
+    assert tmux.kill_calls == [_FAKE_WID], "and only THEN settle the window"
     assert trust_flow.get_flow(_USER, _THREAD) is None
 
 
@@ -396,8 +434,6 @@ async def test_a_registration_racing_the_terminalizer_completes_the_bind() -> No
     terminalizer runs the guarded cleanup — which finds the window REGISTERED
     and must hand the flow to the completion tail rather than dropping it.
     """
-    from cctelegram.session import WindowState, session_manager
-
     user_data: dict[str, Any] = {}
     _entry(user_data)
     sessions = _Sessions()
@@ -405,23 +441,21 @@ async def test_a_registration_racing_the_terminalizer_completes_the_bind() -> No
     flow = await _start(user_data, tmux=tmux, bot=_Bot(), sessions=sessions)
     assert flow is not None
     await asyncio.sleep(0.03)
-    session_manager.window_states["@5"] = WindowState(
+    # The registered proof comes from the INJECTED authority — a unit
+    # test never seeds the live ``session_manager``.
+    sessions.window_states[_FAKE_WID] = SimpleNamespace(
         session_id="sid-late", cwd="/repo", window_name="repo"
     )
+    task = flow.wait_task
+    assert task is not None
+    task.cancel()
     try:
-        task = flow.wait_task
-        assert task is not None
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
-        await asyncio.sleep(0.1)
-    finally:
-        session_manager.window_states.pop("@5", None)
-
+        await task
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
+    await asyncio.sleep(0.1)
     assert tmux.kill_calls == [], "a registered window is never killed"
-    assert sessions.binds == [(_USER, _THREAD, "@5")], (
+    assert sessions.binds == [(_USER, _THREAD, _FAKE_WID)], (
         "the terminalizer must hand a SPARED_REGISTERED outcome to the completion tail"
     )
 
@@ -447,7 +481,7 @@ async def test_a_completion_note_is_not_consumed_by_a_later_generation() -> None
     # A LATER generation's teardown must not consume generation 1's note.
     assert (
         trust_flow._consume_completion(
-            (_USER, _THREAD), generation=flow.generation + 99, window_id="@5"
+            (_USER, _THREAD), generation=flow.generation + 99, window_id=_FAKE_WID
         )
         is False
     )
@@ -460,7 +494,7 @@ async def test_a_completion_note_is_not_consumed_by_a_later_generation() -> None
     )
     assert (
         trust_flow._consume_completion(
-            (_USER, _THREAD), generation=flow.generation, window_id="@5"
+            (_USER, _THREAD), generation=flow.generation, window_id=_FAKE_WID
         )
         is True
     )
@@ -476,7 +510,7 @@ async def test_a_preexisting_binding_is_not_read_as_this_flows_completion() -> N
     user_data: dict[str, Any] = {}
     _entry(user_data)
     sessions = _Sessions()
-    sessions.bind_thread(_USER, _THREAD, "@5")  # bound BEFORE the flow installs
+    sessions.bind_thread(_USER, _THREAD, _FAKE_WID)  # bound BEFORE the flow installs
     flow = await _start(
         user_data, tmux=_Tmux(pane=_TRUST), bot=_Bot(), sessions=sessions
     )
@@ -494,7 +528,7 @@ async def test_a_preexisting_binding_is_not_read_as_this_flows_completion() -> N
     won = trust_flow._completion_won(
         _USER,
         _THREAD,
-        observed_wid="@5",
+        observed_wid=_FAKE_WID,
         generation=generation,
         session_mgr=sessions,
     )
@@ -588,7 +622,7 @@ async def test_the_slice_probe_uses_the_cancellation_safe_methods() -> None:
             return self.command
 
     tmux = _Safe(pane=_TRUST)
-    text, command = await trust_flow._probe_pane(tmux, "@5")
+    text, command = await trust_flow._probe_pane(tmux, _FAKE_WID)
 
     assert used == ["capture_safe", "command_safe"], used
     assert text == _TRUST and command == "claude"

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -35,6 +36,9 @@ _TRUST = (_FIXTURES / "folder_trust_arrival_plain_v2.1.241.txt").read_text()
 _IDLE = (_FIXTURES / "inputbox_idle_v2.1.207.txt").read_text()
 _THREAD = 5150
 _USER = 8080
+# A window id shape tmux CANNOT mint, so a seam that regressed to the live
+# ``tmux_manager`` could never resolve it to a real pane.
+_FAKE_WID = "@fake-trust-test"
 
 
 @pytest.fixture(autouse=True)
@@ -102,8 +106,6 @@ class _Sessions:
         return self.registered
 
     def get_window_state(self, window_id: str) -> Any:
-        from types import SimpleNamespace
-
         return self.window_states.setdefault(
             window_id, SimpleNamespace(session_id="", cwd="/repo", window_name="repo")
         )
@@ -124,6 +126,30 @@ class _Sessions:
                 return wid
         return None
 
+    def iter_thread_bindings(self) -> Any:
+        # The INJECTED binding authority — a unit test never reads (or seeds)
+        # the live ``session_manager``.
+        return list(self.binds)
+
+    def peek_session_id_for_window(self, window_id: str) -> str | None:
+        # The INJECTED registered-proof, for the same reason.
+        return getattr(self.window_states.get(window_id), "session_id", None) or None
+
+    def read_session_id_for_window_fresh(self, window_id: str) -> str | None:
+        return self.peek_session_id_for_window(window_id)
+
+
+async def _no_replay(route: Any, user_data: Any) -> Any:
+    """A pending-payload replay that goes NOWHERE.
+
+    Injected by every test so the completion tail can never reach the real
+    delivery path, which resolves the live ``session_manager`` and the live
+    ``tmux_manager`` — and would type the pending payload into whatever window
+    id happened to exist on the developer's default tmux server.
+    """
+    del route, user_data
+    return None
+
 
 def _entry(user_data: dict[str, Any], thread_id: int = _THREAD) -> dict[str, Any]:
     entry = ensure_picker_entry(user_data, thread_id)
@@ -140,7 +166,7 @@ async def _start(
     bot: Any,
     sessions: Any,
     thread_id: int = _THREAD,
-    wid: str = "@5",
+    wid: str = _FAKE_WID,
 ) -> trust_flow.TrustFlow | None:
     entry = picker_entry(user_data, thread_id)
     return await trust_flow.start_trust_wait(
@@ -157,6 +183,7 @@ async def _start(
         cli_version="2.1.241",
         tmux_mgr=tmux,
         session_mgr=sessions,
+        replay=_no_replay,
     )
 
 
@@ -250,7 +277,7 @@ async def test_teardown_cancels_and_awaits_the_claim_owner() -> None:
     assert task.done() and released.is_set(), (
         "the claim's owner must be settled with positive proof"
     )
-    assert tmux.kill_calls == ["@5"]
+    assert tmux.kill_calls == [_FAKE_WID]
     assert trust_flow.get_flow(_USER, _THREAD) is None
     assert picker_entry(user_data, _THREAD) is None
 
@@ -380,7 +407,7 @@ async def test_a_raising_tail_reaches_the_guarded_cleanup() -> None:
     await asyncio.wait_for(task, timeout=3)
 
     assert sessions.binds == []
-    assert tmux.kill_calls == ["@5"], (
+    assert tmux.kill_calls == [_FAKE_WID], (
         "a raising tail must still reach the guarded cleanup"
     )
     assert any("couldn't finish binding" in t for t in bot.texts()), bot.texts()
@@ -487,24 +514,23 @@ async def test_the_wait_task_survives_the_cleanup_under_a_cancel_claim() -> None
 
 @pytest.mark.asyncio
 async def test_a_spared_bound_cancel_leaves_nothing_behind() -> None:
-    from cctelegram.session import session_manager
-
     user_data: dict[str, Any] = {}
     _entry(user_data)
     bot = _Bot()
     tmux = _Tmux(pane=_TRUST)
-    flow = await _start(user_data, tmux=tmux, bot=bot, sessions=_Sessions())
+    sessions = _Sessions()
+    # The window is already BOUND — stated through the INJECTED authority. The
+    # live ``session_manager`` is never seeded: doing so used to route the
+    # completion tail's replay at the real tmux server.
+    sessions.bind_thread(_USER, _THREAD, _FAKE_WID)
+    flow = await _start(user_data, tmux=tmux, bot=bot, sessions=sessions)
     assert flow is not None
     await asyncio.sleep(0.03)
-    session_manager.thread_bindings.setdefault(_USER, {})[_THREAD] = "@5"
-    try:
-        claim = await trust_flow.claim_for_cancel(
-            _USER, _THREAD, user_data=user_data, card_generation=flow.generation
-        )
-        assert claim.ok
-        outcome = await trust_flow.cancel_flow(flow, bot, tmux)
-    finally:
-        session_manager.thread_bindings.clear()
+    claim = await trust_flow.claim_for_cancel(
+        _USER, _THREAD, user_data=user_data, card_generation=flow.generation
+    )
+    assert claim.ok
+    outcome = await trust_flow.cancel_flow(flow, bot, tmux)
 
     assert outcome is trust_flow.CleanupOutcome.SPARED_BOUND
     assert trust_flow.get_flow(_USER, _THREAD) is None, "the flow is dropped"
@@ -518,7 +544,9 @@ async def test_a_spared_bound_cancel_leaves_nothing_behind() -> None:
 
 def test_completion_matching_without_a_generation_fails_closed() -> None:
     assert (
-        trust_flow._completion_won(_USER, _THREAD, observed_wid="@5", generation=None)
+        trust_flow._completion_won(
+            _USER, _THREAD, observed_wid=_FAKE_WID, generation=None
+        )
         is False
     )
 
@@ -531,7 +559,7 @@ async def test_an_expired_baseline_is_not_read_as_absent(
     user_data: dict[str, Any] = {}
     _entry(user_data)
     sessions = _Sessions()
-    sessions.bind_thread(_USER, _THREAD, "@5")
+    sessions.bind_thread(_USER, _THREAD, _FAKE_WID)
     flow = await _start(
         user_data, tmux=_Tmux(pane=_TRUST), bot=_Bot(), sessions=sessions
     )
@@ -545,7 +573,7 @@ async def test_an_expired_baseline_is_not_read_as_absent(
         trust_flow._completion_won(
             _USER,
             _THREAD,
-            observed_wid="@5",
+            observed_wid=_FAKE_WID,
             generation=generation,
             session_mgr=sessions,
         )
@@ -573,7 +601,7 @@ async def test_the_start_sweep_carries_the_generation() -> None:
     # let ANY later teardown consume it.
     assert (
         trust_flow._consume_completion(
-            (_USER, _THREAD), generation=flow.generation, window_id="@5"
+            (_USER, _THREAD), generation=flow.generation, window_id=_FAKE_WID
         )
         is True
     )
@@ -589,8 +617,6 @@ async def test_a_raising_tail_under_cancel_does_not_escape_the_seam() -> None:
     window is left unbound and the caller's abort path takes over. The seam must
     absorb the tail's failure and run the guarded cleanup itself.
     """
-    from cctelegram.session import WindowState, session_manager
-
     user_data: dict[str, Any] = {}
     _entry(user_data)
     bot = _Bot()
@@ -604,18 +630,16 @@ async def test_a_raising_tail_under_cancel_does_not_escape_the_seam() -> None:
     flow = await _start(user_data, tmux=tmux, bot=bot, sessions=sessions)
     assert flow is not None
     await asyncio.sleep(0.03)
-    session_manager.window_states["@5"] = WindowState(
+    # The REGISTERED proof, through the INJECTED authority only.
+    sessions.window_states[_FAKE_WID] = SimpleNamespace(
         session_id="sid-raced", cwd="/repo", window_name="repo"
     )
-    try:
-        claim = await trust_flow.claim_for_cancel(
-            _USER, _THREAD, user_data=user_data, card_generation=flow.generation
-        )
-        assert claim.ok
-        # Must NOT raise out of the seam.
-        outcome = await trust_flow.cancel_flow(flow, bot, tmux)
-    finally:
-        session_manager.window_states.pop("@5", None)
+    claim = await trust_flow.claim_for_cancel(
+        _USER, _THREAD, user_data=user_data, card_generation=flow.generation
+    )
+    assert claim.ok
+    # Must NOT raise out of the seam.
+    outcome = await trust_flow.cancel_flow(flow, bot, tmux)
 
     assert outcome is trust_flow.CleanupOutcome.SPARED_REGISTERED
     assert sessions.binds == [], "the tail genuinely failed"

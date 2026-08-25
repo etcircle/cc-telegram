@@ -1007,6 +1007,40 @@ def _reset_all_handler_state() -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+class _NoLiveTmuxServer:
+    """A libtmux server stand-in that refuses every attribute access."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(
+            f"a test reached the REAL tmux server (libtmux .{name}). Inject a "
+            "fake tmux manager, or request the ``fake_tmux`` fixture — a test "
+            "must never address a live pane."
+        )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POISON the real ``tmux_manager``'s libtmux connection for the whole suite.
+
+    A test that injects a fake into the seam it calls DIRECTLY can still reach
+    the real singleton through a seam it forgot. That is what bit us: a unit
+    test seeded a plausible window id into the live ``session_manager``, the
+    completion tail replayed the pending payload through the REAL
+    ``tmux_manager``, and the keystrokes landed in a live Claude session on the
+    developer's default tmux server.
+
+    Injection is the fix (see ``trust_flow._replay_for``); this is the backstop
+    that makes the CLASS unreachable. It is deliberately placed at the libtmux
+    connection rather than on the manager's methods, because the tmux unit
+    suites legitimately exercise those methods against a patched
+    ``create_subprocess_exec`` — poisoning the methods would break them, while
+    poisoning the connection leaves them untouched. Every window/pane write
+    goes through this object, so nothing that could type into a real pane
+    survives it.
+    """
+    monkeypatch.setattr(_real_tmux, "_server", _NoLiveTmuxServer(), raising=False)
+
+
 @pytest.fixture
 def fake_tmux(monkeypatch: pytest.MonkeyPatch) -> FakeTmux:
     """Replace ``tmux_manager`` singleton methods with a fresh in-memory fake.

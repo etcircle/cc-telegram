@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -45,6 +46,9 @@ from cctelegram.utils import app_dir
 _FIXTURES = Path(__file__).parent / "fixtures"
 _THREAD = 88
 _USER = 5150
+# A window id that CANNOT exist on a real tmux server, so even a future
+# regression in an injection seam cannot address a live pane.
+_FAKE_WID = "@fake-trust-test"
 _TRUST = (_FIXTURES / "folder_trust_arrival_plain_v2.1.241.txt").read_text()
 _IDLE = (_FIXTURES / "inputbox_idle_v2.1.207.txt").read_text()
 _CORPSE = (_FIXTURES / "folder_trust_postesc_t4_plain_v2.1.241.txt").read_text()
@@ -149,6 +153,20 @@ class _StubSessionMgr:
                 return wid
         return None
 
+    def iter_thread_bindings(self) -> Any:
+        # The INJECTED binding authority. A test must NEVER seed the real
+        # ``session_manager`` to reach a ``SPARED_BOUND``: the completion
+        # tail's replay resolves through it, and a plausible window id
+        # there escapes into the user's REAL tmux server.
+        return [(uid, tid, wid) for uid, tid, wid in self.binds]
+
+    def peek_session_id_for_window(self, window_id: str) -> str | None:
+        # The INJECTED registered-proof, for the same reason.
+        return getattr(self.window_states.get(window_id), "session_id", None) or None
+
+    def read_session_id_for_window_fresh(self, window_id: str) -> str | None:
+        return self.peek_session_id_for_window(window_id)
+
 
 def _seed_entry(user_data: dict[str, Any], thread_id: int = _THREAD) -> dict[str, Any]:
     entry = ensure_picker_entry(user_data, thread_id)
@@ -167,7 +185,7 @@ async def _start(
     entry_token: str | None = None,
     thread_id: int = _THREAD,
     user_id: int = _USER,
-    created_wid: str = "@5",
+    created_wid: str = _FAKE_WID,
     card_msg_id: int | None = None,
 ) -> trust_flow.TrustFlow | None:
     entry = picker_entry(user_data, thread_id)
@@ -294,27 +312,23 @@ async def test_p1_b_a_registration_racing_a_cleanup_wins_and_binds() -> None:
     guarded kill returns SPARED_REGISTERED, and the flow must bind + deliver
     rather than terminalize and discard the queued payload.
     """
-    from cctelegram.session import WindowState, session_manager
-
     user_data: dict[str, Any] = {}
     _seed_entry(user_data)
     bot = _StubBot()
     tmux = _StubTmux(pane=_IDLE)  # a running REPL, so the registration budget applies
     session_mgr = _StubSessionMgr()
-    session_manager.window_states["@5"] = WindowState(
+    # The registered proof comes from the INJECTED authority — a unit
+    # test never seeds the live ``session_manager``.
+    session_mgr.window_states[_FAKE_WID] = SimpleNamespace(
         session_id="sid-raced", cwd="/repo", window_name="repo"
     )
-    try:
-        flow = await _start(user_data, tmux=tmux, bot=bot, session_mgr=session_mgr)
-        assert flow is not None
-        task = trust_flow.flow_task(_USER, _THREAD)
-        assert task is not None
-        await asyncio.wait_for(task, timeout=3)
-    finally:
-        session_manager.window_states.pop("@5", None)
-
+    flow = await _start(user_data, tmux=tmux, bot=bot, session_mgr=session_mgr)
+    assert flow is not None
+    task = trust_flow.flow_task(_USER, _THREAD)
+    assert task is not None
+    await asyncio.wait_for(task, timeout=3)
     assert tmux.kill_calls == [], "a registered window is never killed"
-    assert session_mgr.binds == [(_USER, _THREAD, "@5")], (
+    assert session_mgr.binds == [(_USER, _THREAD, _FAKE_WID)], (
         "SPARED_REGISTERED must flip into the COMPLETION tail, not terminalize"
     )
     assert picker_entry(user_data, _THREAD) is None
@@ -418,7 +432,7 @@ async def test_p2_d_a_trust_tap_cannot_claim_dispatching_during_a_cleanup(
     assert task is not None
     await asyncio.wait_for(task, timeout=3)
 
-    assert tmux.kill_calls == ["@5"], "the ceiling expiry must clean up"
+    assert tmux.kill_calls == [_FAKE_WID], "the ceiling expiry must clean up"
     claim = await trust_flow.claim_for_dispatch(_USER, _THREAD, user_data=user_data)
     assert not claim.ok, "no tap may claim a torn-down flow"
 
@@ -488,7 +502,7 @@ async def test_p2_a_a_flow_that_completes_after_the_sweep_snapshot_is_reported()
         bot=_SlowBot(),
         session_mgr=session_a,
         thread_id=thread_a,
-        created_wid="@5",
+        created_wid=_FAKE_WID,
     )
     flow_b = await _start(
         data_b,
@@ -531,7 +545,7 @@ async def test_p2_a_a_cold_teardown_never_mistakes_an_ordinary_binding() -> None
     completion just because it happens to be bound — otherwise ``/start`` would
     run a bound-topic teardown on every ordinary topic."""
     session_mgr = _StubSessionMgr()
-    session_mgr.bind_thread(_USER, _THREAD, "@5")
+    session_mgr.bind_thread(_USER, _THREAD, _FAKE_WID)
 
     won = await trust_flow.teardown_thread(_USER, _THREAD, session_mgr=session_mgr)
 
@@ -653,7 +667,7 @@ async def test_p2_e_ownership_resolves_the_tapped_card_not_the_thread() -> None:
         bot=_StubBot(),
         session_mgr=_StubSessionMgr(),
         user_id=_USER,
-        created_wid="@5",
+        created_wid=_FAKE_WID,
         card_msg_id=111,
     )
     flow_b = await _start(

@@ -27,6 +27,8 @@ from cctelegram.handlers import decision_token, trust_flow
 from cctelegram.utils import app_dir
 
 _FIXTURES = Path(__file__).parent / "fixtures"
+# A window id tmux CANNOT mint, so no seam can address a live pane.
+_FAKE_WID = "@fake-trust-test"
 
 
 def _fx(name: str) -> str:
@@ -327,9 +329,11 @@ def _clean_session_map() -> Any:
 @pytest.mark.asyncio
 async def test_cleanup_kills_an_unowned_window(_clean_session_map: Any) -> None:
     tmux = _KillRecorder()
-    outcome = await trust_flow.cleanup_created_window("@7", "repo", tmux, reason="t")
+    outcome = await trust_flow.cleanup_created_window(
+        _FAKE_WID, "repo", tmux, reason="t"
+    )
     assert outcome is trust_flow.CleanupOutcome.KILLED
-    assert tmux.calls == ["@7"]
+    assert tmux.calls == [_FAKE_WID]
 
 
 @pytest.mark.asyncio
@@ -338,9 +342,11 @@ async def test_registration_before_the_fresh_read_spares(
 ) -> None:
     """The declared LINEARIZATION POINT: a registration observed at/before the
     FRESH session-map read WINS, and no kill is issued."""
-    _write_session_map("@7", "sid-1")
+    _write_session_map(_FAKE_WID, "sid-1")
     tmux = _KillRecorder()
-    outcome = await trust_flow.cleanup_created_window("@7", "repo", tmux, reason="t")
+    outcome = await trust_flow.cleanup_created_window(
+        _FAKE_WID, "repo", tmux, reason="t"
+    )
     assert outcome is trust_flow.CleanupOutcome.SPARED_REGISTERED
     assert tmux.calls == [], "a registered window must never be killed"
 
@@ -362,23 +368,30 @@ async def test_registration_after_the_fresh_read_loses(
             return await super().kill_window(window_id)
 
     tmux = _RegisterDuringKill()
-    outcome = await trust_flow.cleanup_created_window("@7", "repo", tmux, reason="t")
+    outcome = await trust_flow.cleanup_created_window(
+        _FAKE_WID, "repo", tmux, reason="t"
+    )
     assert outcome is trust_flow.CleanupOutcome.KILLED
-    assert tmux.calls == ["@7"]
+    assert tmux.calls == [_FAKE_WID]
 
 
 @pytest.mark.asyncio
 async def test_bound_window_is_spared(_clean_session_map: Any) -> None:
-    from cctelegram.session import session_manager
+    class _Bound:
+        """The INJECTED binding authority.
 
-    session_manager.thread_bindings.setdefault(1, {})[42] = "@7"
-    try:
-        tmux = _KillRecorder()
-        outcome = await trust_flow.cleanup_created_window(
-            "@7", "repo", tmux, reason="t"
-        )
-    finally:
-        session_manager.thread_bindings.clear()
+        A unit test never SEEDS the live ``session_manager``: production seams
+        resolve real bindings against the real ``tmux_manager``, so a plausible
+        window id parked there can escape into the developer's tmux server.
+        """
+
+        def iter_thread_bindings(self) -> Any:
+            return [(1, 42, _FAKE_WID)]
+
+    tmux = _KillRecorder()
+    outcome = await trust_flow.cleanup_created_window(
+        _FAKE_WID, "repo", tmux, reason="t", session_mgr=_Bound()
+    )
     assert outcome is trust_flow.CleanupOutcome.SPARED_BOUND
     assert tmux.calls == []
 
@@ -391,9 +404,11 @@ async def test_kill_failure_is_typed_and_carries_honest_copy(
     _clean_session_map: Any, result: Any
 ) -> None:
     tmux = _KillRecorder(result=result)
-    outcome = await trust_flow.cleanup_created_window("@7", "repo", tmux, reason="t")
+    outcome = await trust_flow.cleanup_created_window(
+        _FAKE_WID, "repo", tmux, reason="t"
+    )
     assert outcome is trust_flow.CleanupOutcome.KILL_FAILED
-    note = trust_flow.cleanup_note(outcome, "repo", "@7")
+    note = trust_flow.cleanup_note(outcome, "repo", _FAKE_WID)
     assert "couldn't close" in note and "check tmux" in note
 
 

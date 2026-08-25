@@ -43,6 +43,9 @@ from cctelegram.utils import app_dir
 _FIXTURES = Path(__file__).parent / "fixtures"
 _THREAD = 77
 _USER = 4242
+# A window id that CANNOT exist on a real tmux server, so even a future
+# regression in an injection seam cannot address a live pane.
+_FAKE_WID = "@fake-trust-test"
 
 
 def _fx(name: str) -> str:
@@ -106,6 +109,8 @@ class _StubSessionMgr:
 
     def __init__(self) -> None:
         self.registered = False
+        self.binds: list[tuple[int, int, str]] = []
+        self.window_states: dict[str, Any] = {}
 
     async def wait_for_session_map_entry(
         self, window_id: str, timeout: float = 5.0, interval: float = 0.5
@@ -113,6 +118,18 @@ class _StubSessionMgr:
         del window_id, timeout
         await asyncio.sleep(interval)
         return self.registered
+
+    def iter_thread_bindings(self) -> Any:
+        # The INJECTED ownership proofs. A unit test must never SEED the live
+        # ``session_manager``: the completion tail's replay resolves through it
+        # and would address a REAL pane on the developer's tmux server.
+        return list(self.binds)
+
+    def peek_session_id_for_window(self, window_id: str) -> str | None:
+        return getattr(self.window_states.get(window_id), "session_id", None) or None
+
+    def read_session_id_for_window_fresh(self, window_id: str) -> str | None:
+        return self.peek_session_id_for_window(window_id)
 
 
 async def _make_flow(
@@ -133,7 +150,7 @@ async def _make_flow(
         thread_id=_THREAD,
         chat_id=-100,
         user_data=user_data,
-        created_wid="@5",
+        created_wid=_FAKE_WID,
         window_name="repo",
         selected_path="/repo",
         create_message="Created window 'repo' at /repo",
@@ -165,7 +182,7 @@ async def test_p1_1_start_refuses_to_install_a_flow_with_no_ownership_token() ->
         thread_id=_THREAD,
         chat_id=-100,
         user_data=user_data,
-        created_wid="@5",
+        created_wid=_FAKE_WID,
         window_name="repo",
         selected_path="/repo",
         create_message="Created",
@@ -289,30 +306,32 @@ async def test_p2_1_the_fresh_session_map_read_is_unconditional() -> None:
     Pre-fold it sat behind ``peek(...) or read_fresh(...)``, so a positive
     CACHED peek short-circuited it and the linearization point never executed.
     """
-    from cctelegram.session import WindowState, session_manager
+    calls: list[str] = []
 
-    calls: list[str | None] = []
-    real = trust_flow.read_session_id_for_window_fresh
+    class _CachedHit:
+        """The INJECTED session authority — the live singleton is never seeded.
 
-    def _counting(window_id: str | None) -> str | None:
-        calls.append(window_id)
-        return real(window_id)
+        A positive CACHED peek is the exact short-circuit condition; the fresh
+        read counts its own calls.
+        """
 
-    # A positive CACHED peek — the exact short-circuit condition.
-    session_manager.window_states["@9"] = WindowState(
-        session_id="sid-cached", cwd="/repo", window_name="repo"
+        def iter_thread_bindings(self) -> Any:
+            return []
+
+        def peek_session_id_for_window(self, window_id: str) -> str | None:
+            del window_id
+            return "sid-cached"
+
+        def read_session_id_for_window_fresh(self, window_id: str) -> str | None:
+            calls.append(window_id)
+            return None
+
+    outcome = await trust_flow.cleanup_created_window(
+        _FAKE_WID, "repo", _StubTmux(), reason="t", session_mgr=_CachedHit()
     )
-    try:
-        trust_flow.read_session_id_for_window_fresh = _counting  # type: ignore[assignment]
-        outcome = await trust_flow.cleanup_created_window(
-            "@9", "repo", _StubTmux(), reason="t"
-        )
-    finally:
-        trust_flow.read_session_id_for_window_fresh = real  # type: ignore[assignment]
-        session_manager.window_states.pop("@9", None)
 
     assert outcome is trust_flow.CleanupOutcome.SPARED_REGISTERED
-    assert calls == ["@9"], "the fresh read must execute even on a positive peek"
+    assert calls == [_FAKE_WID], "the fresh read must execute even on a positive peek"
 
 
 # ── P2-3 ─────────────────────────────────────────────────────────────────────
@@ -446,7 +465,9 @@ async def test_terminalizer_runs_the_guarded_cleanup_on_an_exception() -> None:
     assert task is not None
     await asyncio.wait_for(task, timeout=2)
 
-    assert tmux.kill_calls == ["@5"], "the terminalizer must run the guarded cleanup"
+    assert tmux.kill_calls == [_FAKE_WID], (
+        "the terminalizer must run the guarded cleanup"
+    )
     assert trust_flow.get_flow(_USER, _THREAD) is None
     assert picker_entry(user_data, _THREAD) is None, "the entry is dropped LAST"
     assert bot.edits, "the card must be edited to an honest failure state"
