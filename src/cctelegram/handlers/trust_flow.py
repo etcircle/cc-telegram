@@ -55,7 +55,11 @@ from ..terminal_parser import (
     extract_interactive_content,
     parse_generic_decision,
 )
-from ..tmux_manager import pane_command_is_claude, pane_command_is_shell
+from ..tmux_manager import (
+    LifecycleTimeout,
+    pane_command_is_claude,
+    pane_command_is_shell,
+)
 from . import auq_ledger, decision_token
 from .callback_data import CB_TRUST_PICK, checked_callback_data
 from .directory_browser import (
@@ -373,6 +377,11 @@ class TrustFlow:
 _FlowKey = tuple[int, int]
 
 _flows: dict[_FlowKey, TrustFlow] = {}
+# GH #65 review r13 P1-C — PRE-FLOW WINDOW RESERVATIONS: window_id → the picker
+# entry token that owns it. Ownership begins at CREATION, so the interval
+# between ``create_window`` returning and ``_flows`` receiving the record is not
+# a hole through which another topic can adopt the window.
+_window_reservations: dict[str, str | None] = {}
 # GH #65 review r2 P2-A: a DISCOVERABLE completion record. The WAIT task's
 # terminalizer removes the flow as soon as its bind tail finishes, so a teardown
 # that snapshotted a nonterminal phase and reacquires the lock afterwards finds
@@ -416,6 +425,49 @@ def get_flow(user_id: int, thread_id: int) -> TrustFlow | None:
     return _flows.get((user_id, thread_id))
 
 
+def reserve_window(window_id: str, entry_token_value: str | None) -> None:
+    """Claim a JUST-CREATED window before any flow exists for it (r13 P1-C).
+
+    OWNERSHIP BEGINS AT CREATION, not at flow installation. Between
+    ``create_window`` returning and ``_flows`` receiving the record there is a
+    real interval — the in-pane version probe and a couple of Telegram edits —
+    during which the window exists, is unbound, and belongs to no flow. The
+    directory browser offered it in exactly that window, so another topic could
+    adopt a window this creation was about to use.
+
+    Keyed by the picker entry's identity token so the reservation dies with the
+    entry: ``release_window_reservation`` is called when the flow installs (it
+    takes over ownership) and from the same paths that invalidate the token, so
+    an aborted creation can never leak a permanent reservation.
+    """
+    if not window_id:
+        return
+    _window_reservations[window_id] = entry_token_value
+    logger.debug("trust lane reserved window %s pending flow install", window_id)
+
+
+def release_window_reservation(window_id: str | None) -> None:
+    """Drop a pre-flow reservation (flow installed, or creation aborted)."""
+    if window_id and _window_reservations.pop(window_id, None) is not None:
+        logger.debug("trust lane released the reservation on window %s", window_id)
+
+
+def release_reservations_for_token(entry_token_value: str | None) -> None:
+    """Drop every reservation held under an entry token that just died."""
+    if entry_token_value is None:
+        return
+    for wid in [
+        wid for wid, token in _window_reservations.items() if token == entry_token_value
+    ]:
+        _window_reservations.pop(wid, None)
+        logger.debug("trust lane released reservation on %s (token cleared)", wid)
+
+
+def reset_reservations_for_tests() -> None:
+    """Drop every pre-flow reservation (test isolation seam)."""
+    _window_reservations.clear()
+
+
 def windows_owned_by_live_flows() -> set[str]:
     """Window ids a LIVE creation flow owns — NOT adoptable by anyone else.
 
@@ -429,11 +481,14 @@ def windows_owned_by_live_flows() -> set[str]:
     Closing it HERE closes the race at the source; the trust tail's exclusivity
     re-check is the detector that catches whatever still slips through.
     """
-    return {
+    owned = {
         flow.created_wid
         for flow in _flows.values()
         if flow.created_wid and flow.phase != PHASE_TERMINAL
     }
+    # PRE-FLOW reservations count as ownership too (review r13 P1-C).
+    owned.update(wid for wid in _window_reservations if wid)
+    return owned
 
 
 def flow_owner_for_card(chat_id: int | None, message_id: int | None) -> int | None:
@@ -495,6 +550,7 @@ def reset_for_tests() -> None:
                 task.cancel()
     _flows.clear()
     _locks.clear()
+    _window_reservations.clear()
     _completed_binds.clear()
     _binding_baselines.clear()
     _generation_counter = 0
@@ -2012,22 +2068,34 @@ async def _complete_bind(flow: TrustFlow, bot: Any, session_mgr: Any) -> None:
     # it the gate was check-then-act: a kill could REGISTER after our checks and
     # land after them. The lock is INNERMOST — nothing in here awaits the
     # creation lock or Telegram.
+    #
+    # BOUNDED (review r13 P1-B): the revalidation's tmux probe runs under the
+    # lock, so it carries the same hard bound as every other lifecycle await —
+    # a wedged tmux must not freeze the lifecycle of every other window. Expiry
+    # unwinds out of the ``async with`` (releasing the lock) and converts to
+    # the lane's own typed refusal, which lands BEFORE ``bind_thread``.
     lifecycle = getattr(flow.tmux_mgr, "window_lifecycle_lock", None)
     if lifecycle is not None:
-        async with lifecycle():
-            await _revalidate_bind_preconditions(flow, session_mgr)
-            session_mgr.bind_thread(
-                flow.user_id,
-                flow.thread_id,
-                flow.created_wid,
-                window_name=flow.window_name,
-            )
-            # The bind is DONE. Leave the discoverable note BEFORE the payload
-            # replay so a teardown racing the terminalizer can still learn
-            # completion won even if the replay itself raises (review r2 P2-A).
-            # It stays inside the hold so "bound" and "provably bound" are
-            # committed together.
-            _note_completion(flow)
+        try:
+            async with lifecycle():
+                await _revalidate_bind_preconditions(flow, session_mgr)
+                session_mgr.bind_thread(
+                    flow.user_id,
+                    flow.thread_id,
+                    flow.created_wid,
+                    window_name=flow.window_name,
+                )
+                # The bind is DONE. Leave the discoverable note BEFORE the
+                # payload replay so a teardown racing the terminalizer can still
+                # learn completion won even if the replay itself raises (review
+                # r2 P2-A). It stays inside the hold so "bound" and "provably
+                # bound" are committed together.
+                _note_completion(flow)
+        except LifecycleTimeout as e:
+            raise TrustBindRefused(
+                f"the adoption check for {flow.created_wid} exceeded its "
+                f"lifecycle bound: {e}"
+            ) from e
     else:
         await _revalidate_bind_preconditions(flow, session_mgr)
         session_mgr.bind_thread(
@@ -2611,6 +2679,9 @@ async def start_trust_wait(
             + GLOBAL_CEILING_MARGIN_S,
         )
         _flows[(user_id, thread_id)] = flow
+        # The flow now OWNS the window, so the pre-flow reservation that has
+        # been holding it since creation can be handed over (review r13 P1-C).
+        release_window_reservation(created_wid)
         # PRE-FLOW BASELINE for the completion fallback (review r3 P2-1): if the
         # topic is somehow ALREADY bound to this window, a later binding to it
         # proves nothing about this flow.

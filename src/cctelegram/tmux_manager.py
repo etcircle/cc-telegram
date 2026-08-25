@@ -142,6 +142,38 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# GH #65 review r13.
+# P1-A: how many times a generation-guarded refresh retries before giving the
+# caller an UNCACHED observation. Each attempt only loses to a genuine
+# concurrent invalidation, so a small bound is ample and keeps the list lock's
+# hold finite.
+_LIST_REFRESH_MAX_ATTEMPTS: Final[int] = 3
+# P1-B: every tmux await taken UNDER the window-lifecycle lock is bounded by
+# this, so one wedged tmux operation cannot block the lifecycle of every other
+# window — including a forced trust cleanup or a topic teardown. Generous
+# enough for a real ``new-window`` + Claude launch on a loaded machine.
+LIFECYCLE_TMUX_TIMEOUT_S: Final[float] = 30.0
+# P1-B: how long ``kill_window`` waits to ACQUIRE the lifecycle lock before
+# giving up with an honest failure instead of queueing indefinitely.
+#
+# It MUST exceed ``LIFECYCLE_TMUX_TIMEOUT_S``. Every legitimate holder releases
+# by its own bound, so a kill that waits longer than that bound only ever fails
+# when something is wedged BEYOND the protocol — never merely because a slow
+# but lawful create was in progress. Inverting these two would make a kill
+# spuriously fail during an ordinary busy creation, which is exactly the
+# outcome this bound exists to avoid.
+KILL_LOCK_TIMEOUT_S: Final[float] = LIFECYCLE_TMUX_TIMEOUT_S + 15.0
+
+
+class LifecycleTimeout(Exception):
+    """A tmux operation under the window-lifecycle lock exceeded its bound.
+
+    Typed so every caller can take its own honest refusal arm — and, critically,
+    so the lock is RELEASED on the way out (review r13 P1-B). An unbounded await
+    under this lock would let a single wedged tmux call freeze every other
+    window's lifecycle.
+    """
+
 
 async def capture_pane_pair(
     tmux: Any, window_id: str, scrollback_lines: int = 0
@@ -468,6 +500,15 @@ class TmuxManager:
         # list_windows cache, keyed by window_id for O(1) find_window_by_id.
         self._list_cache: dict[str, TmuxWindow] | None = None
         self._list_cache_at: float = 0.0
+        # GH #65 review r13 P1-A — THE INVALIDATION GENERATION. Bumped by every
+        # ``_invalidate_list_cache``; a refresh may publish its snapshot ONLY if
+        # the generation it started under is still current. Without it, a
+        # refresh already in flight when a kill invalidated could publish its
+        # PRE-KILL snapshot afterwards, and a "fresh" caller waiting on the list
+        # lock would then accept that corpse through the fast path.
+        self._invalidation_generation: int = 0
+        # The generation the PUBLISHED snapshot was started under.
+        self._list_cache_generation: int = 0
         # asyncio.Lock is created lazily inside _ensure_list_cache. The
         # global tmux_manager is constructed at module import (before any
         # event loop exists), and tests may run multiple asyncio.run()
@@ -713,7 +754,9 @@ class TmuxManager:
             return []
         return windows
 
-    async def _ensure_list_cache(self) -> dict[str, TmuxWindow]:
+    async def _ensure_list_cache(
+        self, *, min_generation: int = 0
+    ) -> dict[str, TmuxWindow]:
         """Return the dict-shaped list_windows cache, refreshing if stale.
 
         Lock-protected slow path keeps 8 concurrent gather() callers from
@@ -728,33 +771,77 @@ class TmuxManager:
         # step. Do not insert an ``await`` between these two lines.
         if self._list_lock is None:
             self._list_lock = asyncio.Lock()
+        # ``min_generation`` is the caller's freshness floor (review r13 P1-A): a
+        # snapshot is only acceptable if it was STARTED at or after that
+        # generation. A cached value that predates the caller's invalidation is
+        # exactly the corpse the fresh probe exists to avoid, so the fast path
+        # must respect it too.
         now = time.monotonic()
         if (
             self._list_cache is not None
             and (now - self._list_cache_at) < self._LIST_CACHE_TTL
+            and self._list_cache_generation >= min_generation
         ):
             return self._list_cache
         async with self._list_lock:
+            # Re-check under the lock: a refresh that ran while we queued may
+            # already have published an acceptable snapshot.
             now = time.monotonic()
             if (
                 self._list_cache is not None
                 and (now - self._list_cache_at) < self._LIST_CACHE_TTL
+                and self._list_cache_generation >= min_generation
             ):
                 return self._list_cache
-            windows = await self._list_windows_direct()
-            self._list_cache = {w.window_id: w for w in windows if w.window_id}
-            self._list_cache_at = now
-            return self._list_cache
+            # THE REFRESH RUNS INSIDE THE LOCK, and publishes only if the world
+            # did not move underneath it. A concurrent invalidation (a landed
+            # kill) bumps the generation while we are in ``_list_windows_direct``;
+            # publishing that stale snapshot would resurrect the corpse. We
+            # retry instead — bounded, because each attempt starts from the
+            # generation current at its own start.
+            windows: list[TmuxWindow] = []
+            for _ in range(_LIST_REFRESH_MAX_ATTEMPTS):
+                started_at_generation = self._invalidation_generation
+                windows = await self._list_windows_direct()
+                if self._invalidation_generation != started_at_generation:
+                    logger.debug(
+                        "tmux listing invalidated mid-refresh (gen %d -> %d) — "
+                        "discarding the snapshot and retrying",
+                        started_at_generation,
+                        self._invalidation_generation,
+                    )
+                    continue
+                self._list_cache = {w.window_id: w for w in windows if w.window_id}
+                self._list_cache_at = time.monotonic()
+                self._list_cache_generation = started_at_generation
+                return self._list_cache
+            # Every attempt raced an invalidation. Return the last read WITHOUT
+            # caching it: the caller gets a genuine tmux observation, and no
+            # stale snapshot is published for anybody else.
+            logger.warning(
+                "tmux listing raced invalidations %d times — returning an "
+                "uncached snapshot",
+                _LIST_REFRESH_MAX_ATTEMPTS,
+            )
+            return {w.window_id: w for w in windows if w.window_id}
 
-    def _invalidate_list_cache(self) -> None:
+    def _invalidate_list_cache(self) -> int:
         """Drop the list_windows cache after an explicit mutation.
 
         Always called from async-side code AFTER the libtmux operation has
         returned (i.e. after `await asyncio.to_thread(...)` resolves), so a
         concurrent `list_windows` cannot observe a half-applied state.
+
+        Returns the NEW invalidation generation (review r13 P1-A). Dropping the
+        cache is not enough on its own: a refresh already in flight can publish
+        its pre-mutation snapshot afterwards, and a caller that invalidated in
+        order to get a fresh answer would accept it. The generation lets that
+        caller demand a snapshot started at or after its own invalidation.
         """
         self._list_cache = None
         self._list_cache_at = 0.0
+        self._invalidation_generation += 1
+        return self._invalidation_generation
 
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
@@ -787,9 +874,8 @@ class TmuxManager:
         second stale — long enough to hand an adopter a window a kill has
         already removed. Correctness probes pay the extra tmux round-trip.
         """
-        if fresh:
-            self._invalidate_list_cache()
-        cache = await self._ensure_list_cache()
+        min_generation = self._invalidate_list_cache() if fresh else 0
+        cache = await self._ensure_list_cache(min_generation=min_generation)
         w = cache.get(window_id)
         if w is None:
             logger.debug("Window not found by id: %s", window_id)
@@ -1221,6 +1307,30 @@ class TmuxManager:
         """Drop the lifecycle lock so a new event loop gets a fresh one."""
         self._lifecycle_lock = None
 
+    async def _bounded_lifecycle(
+        self, coro: Any, *, what: str, timeout: float | None = None
+    ) -> Any:
+        """Await a tmux operation under the lifecycle lock, with a hard bound.
+
+        Review r13 P1-B. The lifecycle lock serializes kill-registration against
+        adoption, which means ANY unbounded await inside it is a global stall:
+        one wedged tmux call and no window anywhere can be killed, created or
+        adopted — including the forced trust cleanup and topic teardown that
+        exist to recover from exactly that kind of wedge. Expiry raises
+        ``LifecycleTimeout``, which unwinds out of the ``async with`` and so
+        RELEASES the lock; each caller turns it into its own honest refusal.
+        """
+        # Resolved at CALL time, not bound as a default: a module-level default
+        # argument is evaluated at import and would ignore any later change to
+        # the constant (including a test's).
+        budget = LIFECYCLE_TMUX_TIMEOUT_S if timeout is None else timeout
+        try:
+            return await asyncio.wait_for(coro, timeout=budget)
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            raise LifecycleTimeout(
+                f"{what} exceeded {budget:.0f}s under the window-lifecycle lock"
+            ) from e
+
     def any_kill_pending(self) -> bool:
         """True while ANY kill is in flight, for any window id.
 
@@ -1431,13 +1541,36 @@ class TmuxManager:
         # the lock is what makes "register" and "adopt" mutually exclusive
         # rather than merely ordered. The mark OUTLIVES the hold — it is cleared
         # by the done-callback, long after this block exits.
-        async with self.window_lifecycle_lock():
+        # BOUNDED ACQUISITION (review r13 P1-B). Waiting indefinitely for the
+        # lifecycle lock made a kill hostage to whatever else held it — and a
+        # kill is exactly the operation that must not be blockable, since topic
+        # teardown and forced trust cleanup both run through it. On expiry we
+        # report an honest failure rather than queueing forever.
+        try:
+            await asyncio.wait_for(
+                self.window_lifecycle_lock().acquire(),
+                timeout=KILL_LOCK_TIMEOUT_S,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.error(
+                "could not acquire the window-lifecycle lock within %.0fs to "
+                "kill window %s — reporting failure",
+                KILL_LOCK_TIMEOUT_S,
+                window_id,
+            )
+            return False
+        try:
             self._kill_pending_windows[window_id] = (
                 self._kill_pending_windows.get(window_id, 0) + 1
             )
             inner = asyncio.ensure_future(asyncio.to_thread(_sync_kill))
             inner.add_done_callback(_clear_kill_pending)
+        finally:
+            self.window_lifecycle_lock().release()
         # SHIELDED: our own cancellation must not detach the mark from the work.
+        # The lock is ALREADY RELEASED here — the executor call is deliberately
+        # awaited OUTSIDE it (review r13 P1-B), so a wedged libtmux kill cannot
+        # freeze every other window's lifecycle.
         result = await asyncio.shield(inner)
         self._invalidate_list_cache()
         # Drop the per-window send lock ONLY on a confirmed kill (Wave 3a
@@ -1588,67 +1721,90 @@ class TmuxManager:
         # creation, and the verification listing are ONE critical section, so
         # no kill can register between them. Nothing here awaits the creation
         # lock or Telegram — the lock stays INNERMOST.
-        async with self.window_lifecycle_lock():
-            if self.any_kill_pending():
-                return (
-                    False,
-                    "A window is still being closed. Please try again in a moment.",
-                    "",
-                    "",
-                )
-            result = await asyncio.to_thread(_create_and_start)
-            # Invalidate AFTER to_thread returns so the brand-new window is
-            # visible to the next list_windows call from the resume flow.
-            self._invalidate_list_cache()
-            # GH #50: a window tmux JUST created cannot hold a bot-written draft, so
-            # a brake entry under this id is provably stale. It only exists because
-            # tmux window ids RESET to @0 when the tmux SERVER restarts, and a
-            # launchd-kept bot process outlives that — so an entry armed on the OLD
-            # @0 (whose window died without a kill_window, e.g. with the server)
-            # could otherwise meet a brand-new @0. This is the *second* death proof
-            # of the brake lifecycle; it does not depend on the window being reaped
-            # by us. (It would eventually self-heal anyway, on the first send whose
-            # capture proves the fresh window's input row is empty — but a session
-            # still BOOTING would first refuse a message with the wrong reason.)
-            created, _msg, _name, new_wid = result
-            if created and new_wid:
-                self.clear_window_stranded_draft(new_wid, reason="window newly created")
-                # POST-SETTLEMENT POSITIVE VERIFICATION (review r11 P1-A). The gate
-                # above makes a same-tick kill of our id unreachable, but success is
-                # PROVEN here rather than inferred from a counter: one existence
-                # probe against tmux itself.
-                #
-                # ABSENCE MUST BE PROVEN, NOT INFERRED. ``find_window_by_id``
-                # returns None both for "tmux does not have it" and for "the listing
-                # failed" — and reading a failed enumeration as a dead window would
-                # make every creation fail whenever listing hiccups, which is the
-                # fail-closed direction pointing the wrong way. So the refusal
-                # requires a listing that actually WORKED (it returned other
-                # windows) and did not contain ours; an empty or failed listing is
-                # INDETERMINATE and logged, not fatal.
-                self._invalidate_list_cache()
-                listed = await self.list_windows()
-                if listed and not any(w.window_id == new_wid for w in listed):
-                    logger.error(
-                        "created window %s is absent from a tmux listing of %d "
-                        "windows — refusing to report success",
-                        new_wid,
-                        len(listed),
-                    )
+        # Every tmux await inside the hold is BOUNDED (review r13 P1-B): one
+        # wedged tmux operation must not freeze every other window's lifecycle,
+        # and a kill — which topic teardown and forced trust cleanup both need —
+        # must be able to make progress. Expiry raises ``LifecycleTimeout``,
+        # which RELEASES the lock and lands on the honest refusal below.
+        try:
+            async with self.window_lifecycle_lock():
+                if self.any_kill_pending():
                     return (
                         False,
-                        "The new window was removed before it could be used. "
-                        "Please try again.",
+                        "A window is still being closed. Please try again in a moment.",
                         "",
                         "",
                     )
-                if not listed:
-                    logger.warning(
-                        "could not enumerate tmux windows to verify %s — proceeding "
-                        "on the pre-create gate alone",
-                        new_wid,
+                result = await self._bounded_lifecycle(
+                    asyncio.to_thread(_create_and_start), what="create_window"
+                )
+                # Invalidate AFTER to_thread returns so the brand-new window is
+                # visible to the next list_windows call from the resume flow.
+                self._invalidate_list_cache()
+                # GH #50: a window tmux JUST created cannot hold a bot-written
+                # draft, so a brake entry under this id is provably stale. It
+                # only exists because tmux window ids RESET to @0 when the tmux
+                # SERVER restarts, and a launchd-kept bot process outlives that
+                # — so an entry armed on the OLD @0 (whose window died without a
+                # kill_window, e.g. with the server) could otherwise meet a
+                # brand-new @0. This is the *second* death proof of the brake
+                # lifecycle; it does not depend on the window being reaped by
+                # us. (It would eventually self-heal anyway, on the first send
+                # whose capture proves the fresh window's input row is empty —
+                # but a session still BOOTING would first refuse a message with
+                # the wrong reason.)
+                created, _msg, _name, new_wid = result
+                if created and new_wid:
+                    self.clear_window_stranded_draft(
+                        new_wid, reason="window newly created"
                     )
-            return result
+                    # POST-SETTLEMENT POSITIVE VERIFICATION (review r11 P1-A).
+                    # The gate above makes a same-tick kill of our id
+                    # unreachable, but success is PROVEN here rather than
+                    # inferred from a counter: one existence probe against tmux.
+                    #
+                    # ABSENCE MUST BE PROVEN, NOT INFERRED.
+                    # ``find_window_by_id`` returns None both for "tmux does not
+                    # have it" and for "the listing failed" — and reading a
+                    # failed enumeration as a dead window would make every
+                    # creation fail whenever listing hiccups, which is the
+                    # fail-closed direction pointing the wrong way. So the
+                    # refusal requires a listing that actually WORKED (it
+                    # returned other windows) and did not contain ours; an empty
+                    # or failed listing is INDETERMINATE and logged, not fatal.
+                    self._invalidate_list_cache()
+                    listed = await self._bounded_lifecycle(
+                        self.list_windows(), what="create verification listing"
+                    )
+                    if listed and not any(w.window_id == new_wid for w in listed):
+                        logger.error(
+                            "created window %s is absent from a tmux listing of "
+                            "%d windows — refusing to report success",
+                            new_wid,
+                            len(listed),
+                        )
+                        return (
+                            False,
+                            "The new window was removed before it could be used. "
+                            "Please try again.",
+                            "",
+                            "",
+                        )
+                    if not listed:
+                        logger.warning(
+                            "could not enumerate tmux windows to verify %s — "
+                            "proceeding on the pre-create gate alone",
+                            new_wid,
+                        )
+                return result
+        except LifecycleTimeout as e:
+            logger.error("window creation exceeded its lifecycle bound: %s", e)
+            return (
+                False,
+                "Creating the window took too long. Please check tmux and try again.",
+                "",
+                "",
+            )
 
     def _resolve_md_settings(self) -> str:
         """The bot-managed MessageDisplay settings path, or "" on failure.

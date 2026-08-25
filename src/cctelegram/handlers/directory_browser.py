@@ -135,7 +135,26 @@ def drop_picker_entry(user_data: dict | None, thread_id: int | None) -> dict | N
     if not pickers:
         # Keep ``user_data`` tidy once the last thread's picker is gone.
         user_data.pop(_PENDING_PICKERS_KEY, None)
+    _release_trust_reservations(entry)
     return entry if isinstance(entry, dict) else None
+
+
+def _release_trust_reservations(entry: object) -> None:
+    """Drop any GH #65 pre-flow window reservation held under a dying entry.
+
+    The reservation is keyed by the entry's identity token (review r13 P1-C), so
+    the token dying IS the reservation dying — that is what stops an aborted or
+    superseded creation from holding a window id out of the directory browser's
+    unbound list forever. Imported function-locally to keep this module a leaf.
+    """
+    if not isinstance(entry, dict):
+        return
+    token = entry.get(ENTRY_TOKEN_KEY)
+    if not token:
+        return
+    from cctelegram.handlers import trust_flow
+
+    trust_flow.release_reservations_for_token(token)
 
 
 def picker_entries(user_data: dict | None) -> list[dict]:

@@ -62,7 +62,7 @@ from ..delivery import DeliveryResult
 from ..markdown_v2 import convert_markdown
 from ..session import peek_session_id_for_window, session_manager
 from ..terminal_parser import extract_bash_output, is_interactive_ui
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import LifecycleTimeout, tmux_manager
 from ..transcribe import transcribe_voice
 from ..utils import app_dir
 from . import attention
@@ -1429,6 +1429,10 @@ async def _abort_created_window_after_pending_owner_change(
     resume_session_id: str | None,
 ) -> None:
     """Surface a stale picker after a window was created but before binding."""
+    # The creation is being ABORTED, so the pre-flow reservation must go with it
+    # (review r13 P1-C) — otherwise an aborted creation would hold a window id
+    # out of the directory browser's unbound list forever.
+    trust_flow.release_window_reservation(created_wid)
     logger.warning(
         "Pending owner changed before binding created window %s "
         "(user=%d, callback_thread=%d, owner_still_present=%s)",
@@ -1522,6 +1526,11 @@ async def _create_and_bind_window(
         defer_launch=use_trust_lane,
     )
     if success:
+        # OWNERSHIP BEGINS AT CREATION (GH #65 review r13 P1-C). Registered
+        # BEFORE any probe or Telegram await, so the window is never offered as
+        # "unbound" during the interval between creation and flow install.
+        # Keyed by the entry token, so it dies with the entry.
+        trust_flow.reserve_window(created_wid, creation_entry_token)
         logger.info(
             "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s)",
             created_wname,
@@ -1781,10 +1790,72 @@ async def _create_and_bind_window(
                 )
                 return
 
-            # Thread bind flow: bind thread to newly created window
-            session_mgr.bind_thread(
-                user.id, pending_thread_id, created_wid, window_name=created_wname
-            )
+            # Thread bind flow: bind thread to newly created window.
+            #
+            # THE THIRD ADOPTION SEAM (GH #65 review r13 P1-C). This is the
+            # pre-#65 legacy path — the resume flow, and any creation with the
+            # trust lane disabled — and it bound with NO lifecycle lock, no
+            # fresh existence probe and no exclusivity check, across a hook wait
+            # of many seconds. It now runs the SAME revalidate→commit protocol
+            # as the other two seams. User-visible messaging on the success path
+            # is unchanged (the resume-parity pin stays green); only the new
+            # refusal arm is added.
+            bind_refusal: str | None = None
+            try:
+                async with tmux_mgr.window_lifecycle_lock():
+                    # ABSENCE MUST BE PROVEN, NOT INFERRED — the same rule the
+                    # create-verification uses (review r11 P1-A). A bare None
+                    # also means "the listing failed", and refusing on that
+                    # would break the legacy path whenever enumeration hiccups.
+                    # Only a listing that WORKED and lacks our window proves it
+                    # is gone.
+                    listed = await tmux_mgr._bounded_lifecycle(
+                        tmux_mgr.list_windows(),
+                        what="legacy bind existence probe",
+                    )
+                    proven_absent = bool(listed) and not any(
+                        w.window_id == created_wid for w in listed
+                    )
+                    if proven_absent:
+                        bind_refusal = (
+                            "The new window disappeared before it could be "
+                            "bound. Please try again."
+                        )
+                    elif tmux_mgr.window_kill_pending(created_wid):
+                        bind_refusal = (
+                            "That window is being closed right now. Please try "
+                            "again in a moment."
+                        )
+                    else:
+                        taken_by = [
+                            (uid, tid)
+                            for uid, tid, wid in session_mgr.iter_thread_bindings()
+                            if wid == created_wid
+                            and (uid, tid) != (user.id, pending_thread_id)
+                        ]
+                        if taken_by:
+                            bind_refusal = (
+                                "Another topic just claimed that window. Please "
+                                "try again."
+                            )
+                        else:
+                            session_mgr.bind_thread(
+                                user.id,
+                                pending_thread_id,
+                                created_wid,
+                                window_name=created_wname,
+                            )
+            except LifecycleTimeout as e:
+                logger.error("legacy bind exceeded its lifecycle bound: %s", e)
+                bind_refusal = (
+                    "Binding the window took too long. Please check tmux and try again."
+                )
+            if bind_refusal is not None:
+                trust_flow.release_window_reservation(created_wid)
+                await safe_edit(query, f"⚠️ {bind_refusal}")
+                await safe_answer(query, "Could not bind the window", show_alert=True)
+                return
+            trust_flow.release_window_reservation(created_wid)
 
             status = "Resumed" if resume_session_id else "Created"
 

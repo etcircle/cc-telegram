@@ -15,6 +15,7 @@ from typing import Any
 
 import logging
 from pathlib import Path
+from cctelegram.tmux_manager import LifecycleTimeout
 from cctelegram.handlers.callback_data import (
     CB_DIR_BIND_EXISTING,
     CB_DIR_CANCEL,
@@ -442,41 +443,59 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         refusal: str | None = None
         expired = False
         display = session_manager.get_display_name(selected_wid)
-        async with tmux_manager.window_lifecycle_lock():
-            # FRESH (review r12 P1-B): the 1 s listing cache can be a full
-            # second behind a landed kill, which is exactly the corpse this
-            # probe exists to catch.
-            w = await tmux_manager.find_window_by_id(selected_wid, fresh=True)
-            if not w:
-                refusal = (
-                    f"Window '{session_manager.get_display_name(selected_wid)}' "
-                    "no longer exists"
+        try:
+            async with tmux_manager.window_lifecycle_lock():
+                # FRESH (review r12 P1-B): the 1 s listing cache can be a full
+                # second behind a landed kill, which is exactly the corpse this
+                # probe exists to catch. BOUNDED (review r13 P1-B): no tmux await
+                # under this lock may be unbounded, or one wedged call freezes every
+                # other window's lifecycle.
+                w = await tmux_manager._bounded_lifecycle(
+                    tmux_manager.find_window_by_id(selected_wid, fresh=True),
+                    what="bind-to-existing existence probe",
                 )
-            elif tmux_manager.window_kill_pending(selected_wid):
-                refusal = "That window is being closed right now, please retry"
-            else:
-                current_unbound_ids = {
-                    wid
-                    for wid, _, _ in await _list_unbound_windows(
-                        adapters.tmux_manager, adapters.session_manager
+                if not w:
+                    refusal = (
+                        f"Window '{session_manager.get_display_name(selected_wid)}' "
+                        "no longer exists"
                     )
-                }
-                if selected_wid not in current_unbound_ids:
-                    refusal = "Window is no longer unbound, please retry"
+                elif tmux_manager.window_kill_pending(selected_wid):
+                    refusal = "That window is being closed right now, please retry"
                 else:
-                    ok, _pending_tid, _reason = _validate_pending_picker_callback(
-                        context.user_data,
-                        cb_thread_id,
-                        (STATE_SELECTING_WINDOW,),
-                    )
-                    if not ok:
-                        expired = True
-                    else:
-                        display = w.window_name
-                        clear_window_picker_state(_entry())
-                        session_manager.bind_thread(
-                            user.id, thread_id, selected_wid, window_name=display
+                    current_unbound_ids = {
+                        wid
+                        for wid, _, _ in await tmux_manager._bounded_lifecycle(
+                            _list_unbound_windows(
+                                adapters.tmux_manager, adapters.session_manager
+                            ),
+                            what="bind-to-existing unbound listing",
                         )
+                    }
+                    if selected_wid not in current_unbound_ids:
+                        refusal = "Window is no longer unbound, please retry"
+                    else:
+                        ok, _pending_tid, _reason = _validate_pending_picker_callback(
+                            context.user_data,
+                            cb_thread_id,
+                            (STATE_SELECTING_WINDOW,),
+                        )
+                        if not ok:
+                            expired = True
+                        else:
+                            display = w.window_name
+                            clear_window_picker_state(_entry())
+                            session_manager.bind_thread(
+                                user.id, thread_id, selected_wid, window_name=display
+                            )
+
+        except LifecycleTimeout as e:
+            logger.error("bind-to-existing exceeded its lifecycle bound: %s", e)
+            await safe_answer(
+                query,
+                "That took too long — please check tmux and try again",
+                show_alert=True,
+            )
+            return
 
         if expired:
             await safe_edit(query, PICKER_EXPIRED_TEXT, reply_markup=None)
