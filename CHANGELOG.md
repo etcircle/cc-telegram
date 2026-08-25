@@ -4,6 +4,22 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.11] — 2026-08-26
+
+### Fixed
+- **CC 2.1.246's right-aligned `/rc` status pill no longer wedges delivery (GH #73).** 2.1.246
+  paints a remote-control pill (`/rc connecting…` / `/rc active` / `/rc reconnecting` /
+  `/rc failed`, abbreviating to bare `/rc`, optionally suffixed `· Enter to view`) right-aligned
+  on the SAME row as the status bar. The GH #62 whole-row grammar refused such rows, so the
+  tall-draft recovery leg (GH #56) failed `no_input_box` on panes showing the pill. The grammar
+  now strips a licensed right block — every variant derived from the 2.1.246 binary's own footer
+  composer, never guessed — before classifying the row; acceptance rules are unchanged, a bare
+  `/rc` row alone still refuses (non-widening), rows without a right block are processed
+  byte-identically (pinned), and the leg-3 / idle alphabets are untouched (measured unaffected).
+  Five real rig fixtures including the tall-draft regression pin; 34 new tests. Also verified for
+  GH #70: `← for agents` was already accepted and pinned since GH #62; the custom `statusLine`
+  fail-closed residual is now confirmed against the 2.1.246 source and documented.
+
 ## [0.4.10] — 2026-08-25
 
 ### Added
