@@ -163,6 +163,32 @@ UNBOUND_TEXT_TRIGGER_NOTICE = (
     "After binding, send your prompt._"
 )
 
+# The same fact for text that arrives while a picker or a trust card is ALREADY
+# up: the generic nudges only say "use the card above", which leaves the user to
+# discover on their own that what they typed went nowhere.
+UNBOUND_TEXT_NUDGE_NOTICE = (
+    "_This message won't be sent to Claude. Send your prompt once the topic is bound._"
+)
+
+# Written by a pre-#74 process into a thread's picker entry. Nothing reads them
+# any more, but a picker the user never finishes keeps its entry alive for the
+# lifetime of the process, so the text would sit in ``user_data`` forever.
+_LEGACY_PENDING_TEXT_KEYS = ("_pending_thread_text", "_pending_thread_text_facts")
+
+
+def _drop_legacy_text_payload(entry: dict[str, Any]) -> None:
+    """Migration-on-access: scrub a pre-#74 text stash out of ``entry``.
+
+    Runs INSIDE ``claim_unbound_inbound``'s critical section (it is passed as
+    the ``stash`` hook) and at the head of the attachment stashes, so every
+    inbound that touches an unbound topic's entry cleans it. It touches ONLY the
+    dead keys — attachments, picker state and ownership are left exactly as they
+    were, because an in-flight picker must survive the scrub.
+    """
+    for key in _LEGACY_PENDING_TEXT_KEYS:
+        if entry.pop(key, None) is not None:
+            logger.info("dropped legacy pre-GH#74 pending-text key %s", key)
+
 
 def _pending_owner_matches(user_data: dict | None, thread_id: int | None) -> bool:
     """Return True when ``thread_id`` still owns a live pending picker entry.
@@ -183,12 +209,12 @@ def _clear_pending_route_payload(
 ) -> list[PendingAttachment]:
     """Drop ``thread_id``'s whole picker entry and optionally delete its files.
 
-    Pending text/photo/document data lives inside the thread's picker entry
-    while the user is choosing a directory/window/session. Cancel, bind failure,
-    and the successful-flush clear all drop the entry as a unit (state, browse
-    caches, text, and attachments) — otherwise a later bind could forward media
-    the user already cancelled. GH #66: thread-scoped, so dropping one topic's
-    entry never touches another's.
+    Pending photo/document data lives inside the thread's picker entry while the
+    user is choosing a directory/window/session. Cancel, bind failure, and the
+    successful-flush clear all drop the entry as a unit (state, browse caches,
+    attachments — and any legacy pre-#74 text stash) — otherwise a later bind
+    could forward media the user already cancelled. GH #66: thread-scoped, so
+    dropping one topic's entry never touches another's.
     """
     entry = drop_picker_entry(user_data, thread_id)
     if entry is None:
@@ -552,6 +578,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         def _stash_photo(entry: dict[str, Any]) -> None:
             # §2.8.3 photo-in-unbound-topic: stash the path so the picker's
             # flush can feed the aggregator for the freshly-bound route.
+            _drop_legacy_text_payload(entry)
             entry.setdefault("_pending_thread_attachments", []).append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
@@ -966,6 +993,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
 
         def _stash_document(entry: dict[str, Any]) -> None:
+            _drop_legacy_text_payload(entry)
             entry.setdefault("_pending_thread_attachments", []).append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
@@ -1216,28 +1244,39 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # landed. A binding now always wins — the payload is delivered — and a
         # live picker still gets its own state-specific nudge.
         #
-        # GH #74: NO ``stash``. Unbound-topic text is the knock that opens the
-        # picker, in every ownership state — browser, mid-picker nudge, and
-        # trust-card nudge alike. Nothing is held, so nothing is replayed onto
-        # the fresh binding and there is no payload for the delivery gate to
-        # refuse against a TUI that has not finished rendering.
+        # GH #74: the ``stash`` hook STORES NOTHING. Unbound-topic text is the
+        # knock that opens the picker, in every ownership state — browser,
+        # mid-picker nudge, and trust-card nudge alike — so nothing is replayed
+        # onto the fresh binding and there is no payload for the delivery gate
+        # to refuse against a TUI that has not finished rendering. The hook is
+        # passed only because it is the one callback that runs on the entry
+        # INSIDE the lock, which is where a pre-#74 process's leftover text
+        # stash gets scrubbed.
         decision = await trust_flow.claim_unbound_inbound(
             user.id,
             thread_id,
             context.user_data,
             session_manager,
             build_browser=_build_browser_payload,
+            stash=_drop_legacy_text_payload,
         )
+        # EVERY text reply here says the message is going nowhere. The nudges
+        # alone only point at the card, which leaves the user to discover on
+        # their own that what they typed was discarded.
         if decision.kind == "trust_owned":
-            await safe_reply(update.message, trust_flow.TRUST_NUDGE)
-            return
-        if decision.kind == "picker_owned":
             await safe_reply(
                 update.message,
-                trust_flow.PICKER_NUDGES.get(
-                    decision.picker_state or "",
-                    "Please use the picker above, or tap Cancel.",
-                ),
+                f"{trust_flow.TRUST_NUDGE_TEXT}\n\n{UNBOUND_TEXT_NUDGE_NOTICE}",
+            )
+            return
+        if decision.kind == "picker_owned":
+            nudge = trust_flow.PICKER_NUDGES.get(
+                decision.picker_state or "",
+                "Please use the picker above, or tap Cancel.",
+            )
+            await safe_reply(
+                update.message,
+                f"{nudge}\n\n{UNBOUND_TEXT_NUDGE_NOTICE}",
             )
             return
         if decision.kind == "browser":
@@ -1969,17 +2008,19 @@ async def _create_and_bind_window(
                 # window's very first turn lands on the folder-trust prompt.
                 await safe_edit(
                     query,
-                    f"✅ {message}\n\n{status}, but the first message was not "
-                    f"delivered.\n\n⚠️ {pending_delivered.message}\n\n"
+                    f"✅ {message}\n\n{status}, but the pending attachment was "
+                    f"not delivered.\n\n⚠️ {pending_delivered.message}\n\n"
                     "The pending payload was cleared; please resend it here.",
                 )
                 await safe_answer(
-                    query, f"{status}; first message not delivered", show_alert=True
+                    query,
+                    f"{status}; pending attachment not delivered",
+                    show_alert=True,
                 )
                 return
 
             first_turn_note = (
-                " First message sent."
+                " Pending attachment sent."
                 if pending_delivered is not None and pending_delivered.ok
                 else ""
             )

@@ -1509,11 +1509,11 @@ async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_clea
     )
     mock_clear_route.assert_called_once_with((1, 10, "@0"))
     edit_text = mock_edit.await_args.args[1]
-    assert "Created, but the first message was not delivered" in edit_text
+    assert "Created, but the pending attachment was not delivered" in edit_text
     assert "pending payload was cleared" in edit_text
     assert "please resend" in edit_text
     query.answer.assert_awaited_once_with(
-        "Created; first message not delivered", show_alert=True
+        "Created; pending attachment not delivered", show_alert=True
     )
     assert picker_entry(context.user_data, 10) is None
     assert not payload.exists()
@@ -1594,7 +1594,7 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
     assert "pending payload was cleared" in edit_text
     assert "please resend" in edit_text
     update.callback_query.answer.assert_awaited_once_with(
-        "Bound; first message not delivered", show_alert=True
+        "Bound; pending attachment not delivered", show_alert=True
     )
     assert picker_entry(context.user_data, 10) is None
     assert not payload.exists()
@@ -1656,7 +1656,9 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
         text_provenance=None,
     )
     edit_text = mock_edit.await_args.args[1]
-    assert edit_text == "✅ Bound to window `existing-window`\n\nFirst message sent."
+    assert (
+        edit_text == "✅ Bound to window `existing-window`\n\nPending attachment sent."
+    )
     update.callback_query.answer.assert_awaited_once_with("Bound", show_alert=False)
     assert picker_entry(context.user_data, 10) is None
     assert payload.exists()

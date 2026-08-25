@@ -535,17 +535,17 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             await safe_edit(
                 query,
                 f"✅ Bound to window `{display}`\n\n"
-                "The first message was not delivered.\n\n"
+                "The pending attachment was not delivered.\n\n"
                 f"⚠️ {pending_delivered.message}\n\n"
                 "The pending payload was cleared; please resend it here.",
             )
             await safe_answer(
-                query, "Bound; first message not delivered", show_alert=True
+                query, "Bound; pending attachment not delivered", show_alert=True
             )
             return
 
         first_turn_note = (
-            "\n\nFirst message sent."
+            "\n\nPending attachment sent."
             if pending_delivered is not None and pending_delivered.ok
             else ""
         )

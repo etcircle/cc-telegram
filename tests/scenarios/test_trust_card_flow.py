@@ -478,7 +478,8 @@ async def test_gh74_the_trust_lane_bind_delivers_nothing_for_a_text_knock(
     assert scenario.session_manager.thread_bindings[scenario.user_id][_THREAD] == wid
     assert scenario.tmux.written_texts == [], scenario.tmux.written_texts
     cards = _card_edits(scenario)
-    assert not any("First message sent" in t for t in cards), cards
+    assert not any("message sent" in t.lower() for t in cards), cards
+    assert not any("attachment sent" in t.lower() for t in cards), cards
     assert not any("not delivered" in t for t in cards), cards
     assert any("Send messages here" in t for t in cards), cards
 
@@ -575,6 +576,11 @@ async def test_text_during_awaiting_trust_nudges_without_queueing(
 
     reply = update.message.reply_text.await_args.args[0]
     assert "trust the folder" in reply
+    # The nudge must not promise a delivery that will never happen, and must
+    # say so rather than leaving the user to find out (GH #74).
+    assert "queued" not in reply, reply
+    assert "won't be sent to Claude" in reply, reply
+    assert "once the topic is bound" in reply, reply
     entry = picker_entry(scenario.user_data, _THREAD)
     assert entry is not None
     assert entry[STATE_KEY] == trust_flow.STATE_AWAITING_TRUST

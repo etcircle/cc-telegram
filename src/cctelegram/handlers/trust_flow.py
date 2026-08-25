@@ -2167,13 +2167,13 @@ async def _complete_bind(flow: TrustFlow, bot: Any, session_mgr: Any) -> None:
         await _edit_card(
             flow,
             bot,
-            f"✅ {flow.create_message}\n\nCreated, but the first message was not "
-            f"delivered.\n\n⚠️ {pending.message}\n\n"
+            f"✅ {flow.create_message}\n\nCreated, but the pending attachment was "
+            f"not delivered.\n\n⚠️ {pending.message}\n\n"
             "The pending payload was cleared; please resend it here.",
             None,
         )
     else:
-        note = " First message sent." if pending is not None and pending.ok else ""
+        note = " Pending attachment sent." if pending is not None and pending.ok else ""
         await _edit_card(
             flow,
             bot,
@@ -2974,11 +2974,22 @@ class InboundDecision:
     entry: dict[str, Any] | None = None
 
 
-TRUST_NUDGE: Final[str] = (
+_TRUST_WAIT: Final[str] = (
     "🔐 Claude is waiting for you to trust the folder — tap ✅ on the card "
-    "above, or answer in the tmux window. Your message is queued and will be "
-    "sent as soon as the session is up."
+    "above, or answer in the tmux window."
 )
+
+# The ATTACHMENT lane, where the queue promise is still true: a photo/document
+# arriving while the flow owns the topic IS held and replayed once the bind
+# lands (GH #74 kept that leg alive).
+TRUST_NUDGE: Final[str] = (
+    f"{_TRUST_WAIT} Your message is queued and will be sent as soon as the "
+    "session is up."
+)
+
+# The TEXT lane. GH #74: text is never held, so the queue promise would be a
+# lie. The caller appends its own "this won't be sent" line.
+TRUST_NUDGE_TEXT: Final[str] = _TRUST_WAIT
 
 PICKER_NUDGES: Final[dict[str, str]] = {
     STATE_BROWSING_DIRECTORY: "Please use the directory browser above, or tap Cancel.",
