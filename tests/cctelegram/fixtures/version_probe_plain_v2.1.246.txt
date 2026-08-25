@@ -1,0 +1,50 @@
+printf 'CCTGVERA246\n'; DISABLE_AUTOUPDATER=1 '/private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-telegram/1256b791-bca4-44d0-b1d9-fa5b5fceb666/scratc
+hpad/rig246/cc246/bin/claude' --version; printf 'CCTGVERB246\n'
+felixcardix@Felixs-Mac-mini cwd-v1 % printf 'CCTGVERA246\n'; DISABLE_AUTOUPDATER=1 '/private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-telegram/1256b7
+91-bca4-44d0-b1d9-fa5b5fceb666/scratchpad/rig246/cc246/bin/claude' --version; printf 'CCTGVERB246\n'
+CCTGVERA246
+2.1.246 (Claude Code)
+CCTGVERB246
+felixcardix@Felixs-Mac-mini cwd-v1 %
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

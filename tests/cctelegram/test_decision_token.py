@@ -296,6 +296,22 @@ def test_family_positive_on_the_licensed_v2_1_207_fixture() -> None:
     assert dt.lookup("folder-trust", "9.9.9") is False
 
 
+def test_family_positive_on_the_licensed_v2_1_246_fixture() -> None:
+    """GH #72 (version-pin ↔ fixture-pin parity): the REAL 2.1.246 rig fixture
+    must parse → identify folder-trust → be licensed, and an unknown version must
+    NOT be licensed. Drives the whole chain end-to-end on the fixture (never a
+    synthetic form). The 2.1.246 rig re-characterization
+    (``decision_trust_folder_v2.1.246_keystrokes.md``) found the folder-trust
+    prompt byte-identical to 2.1.241/2.1.239 and the whole E0-E4 keystroke
+    battery unchanged (arrows move + WRAP, Enter commits the cursored option,
+    digits commit instantly), so the family + license carry."""
+    form = parse_generic_decision(_load("folder_trust_arrival_plain_v2.1.246.txt"))
+    assert form is not None
+    assert dt.identify_family(form) == "folder-trust"
+    assert dt.lookup("folder-trust", "2.1.246") is True
+    assert dt.lookup("folder-trust", "9.9.9") is False
+
+
 def test_family_negative_option_tuple_mismatch() -> None:
     form = AskUserQuestionForm(
         current_question_title="Accessing workspace:",

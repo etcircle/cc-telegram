@@ -815,8 +815,18 @@ _BASELINE_CLASSIFICATIONS = {
     "folder_trust_postenter_t1_plain_v2.1.241.txt": "no_input_box",
     "folder_trust_postesc_t4_plain_v2.1.241.txt": "no_input_box",
     "folder_trust_postup_plain_v2.1.241.txt": "no_input_box",
+    # GH #72: the 2.1.246 re-characterization of the SAME surface — identical
+    # shape, so identical classifications.
+    "folder_trust_arrival_plain_v2.1.246.txt": "no_input_box",
+    "folder_trust_e2c_navto2_plain_v2.1.246.txt": "no_input_box",
+    "folder_trust_postdigit2_t2_plain_v2.1.246.txt": "no_input_box",
+    "folder_trust_postdown2_plain_v2.1.246.txt": "no_input_box",
+    "folder_trust_postdown_plain_v2.1.246.txt": "no_input_box",
+    "folder_trust_postesc_t4_plain_v2.1.246.txt": "no_input_box",
+    "folder_trust_postup_plain_v2.1.246.txt": "no_input_box",
     "version_probe_plain_v2.1.239.txt": "no_input_box",
     "version_probe_plain_v2.1.241.txt": "no_input_box",
+    "version_probe_plain_v2.1.246.txt": "no_input_box",
     "gate_epm_v2.1.207.txt": "no_input_box",
     "gate_permission_v2.1.207.txt": "no_input_box",
     "gate_workflow_v2.1.207.txt": "no_input_box",
