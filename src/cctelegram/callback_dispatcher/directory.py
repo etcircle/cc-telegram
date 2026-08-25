@@ -433,41 +433,58 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
         # them can go stale inside it: the window can die, another topic can
         # claim it, and the picker entry can be replaced. Binding the object we
         # resolved before the wait is binding a stale observation.
-        w = await tmux_manager.find_window_by_id(selected_wid)
-        if not w:
-            display = session_manager.get_display_name(selected_wid)
-            await safe_answer(
-                query, f"Window '{display}' no longer exists", show_alert=True
-            )
-            return
+        #
+        # REVALIDATE → COMMIT UNDER THE LIFECYCLE LOCK (review r12 P1-A), so no
+        # kill can REGISTER between the last check and the bind. The lock is
+        # INNERMOST: no Telegram I/O runs inside it, so each arm records a
+        # refusal and the reply is sent AFTER the hold is released. The bind
+        # itself is a synchronous dict write.
+        refusal: str | None = None
+        expired = False
+        display = session_manager.get_display_name(selected_wid)
+        async with tmux_manager.window_lifecycle_lock():
+            # FRESH (review r12 P1-B): the 1 s listing cache can be a full
+            # second behind a landed kill, which is exactly the corpse this
+            # probe exists to catch.
+            w = await tmux_manager.find_window_by_id(selected_wid, fresh=True)
+            if not w:
+                refusal = (
+                    f"Window '{session_manager.get_display_name(selected_wid)}' "
+                    "no longer exists"
+                )
+            elif tmux_manager.window_kill_pending(selected_wid):
+                refusal = "That window is being closed right now, please retry"
+            else:
+                current_unbound_ids = {
+                    wid
+                    for wid, _, _ in await _list_unbound_windows(
+                        adapters.tmux_manager, adapters.session_manager
+                    )
+                }
+                if selected_wid not in current_unbound_ids:
+                    refusal = "Window is no longer unbound, please retry"
+                else:
+                    ok, _pending_tid, _reason = _validate_pending_picker_callback(
+                        context.user_data,
+                        cb_thread_id,
+                        (STATE_SELECTING_WINDOW,),
+                    )
+                    if not ok:
+                        expired = True
+                    else:
+                        display = w.window_name
+                        clear_window_picker_state(_entry())
+                        session_manager.bind_thread(
+                            user.id, thread_id, selected_wid, window_name=display
+                        )
 
-        current_unbound_ids = {
-            wid
-            for wid, _, _ in await _list_unbound_windows(
-                adapters.tmux_manager, adapters.session_manager
-            )
-        }
-        if selected_wid not in current_unbound_ids:
-            await safe_answer(
-                query, "Window is no longer unbound, please retry", show_alert=True
-            )
-            return
-
-        ok, _pending_tid, _reason = _validate_pending_picker_callback(
-            context.user_data,
-            cb_thread_id,
-            (STATE_SELECTING_WINDOW,),
-        )
-        if not ok:
+        if expired:
             await safe_edit(query, PICKER_EXPIRED_TEXT, reply_markup=None)
             await safe_answer(query)
             return
-
-        display = w.window_name
-        clear_window_picker_state(_entry())
-        session_manager.bind_thread(
-            user.id, thread_id, selected_wid, window_name=display
-        )
+        if refusal is not None:
+            await safe_answer(query, refusal, show_alert=True)
+            return
 
         # Replay pending text and/or attachments through the synchronous
         # aggregator helper so §2.8.2 formatting is preserved without

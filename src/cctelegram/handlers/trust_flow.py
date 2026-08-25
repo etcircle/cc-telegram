@@ -416,6 +416,26 @@ def get_flow(user_id: int, thread_id: int) -> TrustFlow | None:
     return _flows.get((user_id, thread_id))
 
 
+def windows_owned_by_live_flows() -> set[str]:
+    """Window ids a LIVE creation flow owns — NOT adoptable by anyone else.
+
+    Review r12 P1-C. A trust-created window is not yet bound (the bind is the
+    LAST step of the tail), so a listing that only subtracts ``thread_bindings``
+    offered it to the directory browser as "unbound" — and another topic could
+    legitimately grab it mid-flow, producing two routes to one window. Ownership
+    by a live flow is the missing third state between "bound" and "free", the
+    same class as the Wave-2 pending-picker ownership.
+
+    Closing it HERE closes the race at the source; the trust tail's exclusivity
+    re-check is the detector that catches whatever still slips through.
+    """
+    return {
+        flow.created_wid
+        for flow in _flows.values()
+        if flow.created_wid and flow.phase != PHASE_TERMINAL
+    }
+
+
 def flow_owner_for_card(chat_id: int | None, message_id: int | None) -> int | None:
     """The user_id owning the creation-flow card at these coordinates, or None.
 
@@ -1771,15 +1791,21 @@ def _owner_guard_for(flow: TrustFlow) -> Callable[[], Awaitable[bool]]:
 async def _revalidate_bind_preconditions(flow: TrustFlow, session_mgr: Any) -> None:
     """Re-prove EVERY precondition after the settlement wait (review r11 P1-B).
 
-    Three questions, all of which could have changed while we were parked:
+    Four questions, all of which could have changed while we were parked:
 
-    1. **Does the window still exist?** A fresh probe, not the stale object we
-       resolved before the wait — binding a topic to a corpse is the exact harm
-       the gate exists to prevent.
-    2. **Is this topic still free?** Exclusivity is re-read: a competing flow or
-       a manual bind may have claimed it, and two topics on one window is a
-       routing corruption (1 topic = 1 window = 1 session).
-    3. **Do we still own the picker?** The generation check runs at the top of
+    1. **Does the window still exist?** A FRESH probe (``fresh=True``), never
+       the 1 s listing cache and never the stale object we resolved before the
+       wait — binding a topic to a corpse is the exact harm the gate exists to
+       prevent, and a cached listing can be a full second behind a landed kill
+       (review r12 P1-B).
+    2. **Is this THREAD still free?** A competing flow or a manual bind may have
+       claimed it.
+    3. **Is this WINDOW still free?** (review r12 P1-C.) Exclusivity has TWO
+       directions and only the first was checked: another topic can bind OUR
+       ``created_wid`` during the settlement wait, which produces two routes to
+       one window — a direct violation of 1 topic = 1 window = 1 session, and
+       invisible to a thread-only check.
+    4. **Do we still own the picker?** The generation check runs at the top of
        the tail, but the wait reopens the window in which a newer generation can
        take over.
 
@@ -1787,10 +1813,17 @@ async def _revalidate_bind_preconditions(flow: TrustFlow, session_mgr: Any) -> N
     always a clean nothing-happened and the caller's failure arm owns the copy.
     """
     finder = getattr(flow.tmux_mgr, "find_window_by_id", None)
-    if finder is not None and await finder(flow.created_wid) is None:
-        raise TrustBindRefused(
-            f"window {flow.created_wid} no longer exists after the adoption wait"
-        )
+    if finder is not None:
+        try:
+            window = await finder(flow.created_wid, fresh=True)
+        except TypeError:
+            # An injected fake without the keyword; the freshness requirement is
+            # a production concern and a fake's listing is never stale.
+            window = await finder(flow.created_wid)
+        if window is None:
+            raise TrustBindRefused(
+                f"window {flow.created_wid} no longer exists after the adoption wait"
+            )
 
     owner = getattr(session_mgr, "get_window_for_thread", None)
     if owner is not None:
@@ -1799,6 +1832,19 @@ async def _revalidate_bind_preconditions(flow: TrustFlow, session_mgr: Any) -> N
             raise TrustBindRefused(
                 f"thread {flow.thread_id} was bound to {bound} during the adoption wait"
             )
+
+    # The OTHER direction of exclusivity (review r12 P1-C).
+    bindings = getattr(session_mgr, "iter_thread_bindings", None)
+    if bindings is not None:
+        for uid, tid, wid in bindings():
+            if wid == flow.created_wid and (uid, tid) != (
+                flow.user_id,
+                flow.thread_id,
+            ):
+                raise TrustBindRefused(
+                    f"window {flow.created_wid} was bound by thread {tid} during "
+                    "the adoption wait"
+                )
 
     entry = picker_entry(flow.user_data, flow.thread_id)
     if entry is None or entry.get(TRUST_GENERATION_KEY) != flow.generation:
@@ -1959,15 +2005,38 @@ async def _complete_bind(flow: TrustFlow, bot: Any, session_mgr: Any) -> None:
             f"a kill for window {flow.created_wid} did not settle — refusing to "
             "bind a window that may be about to disappear"
         )
-    await _revalidate_bind_preconditions(flow, session_mgr)
-
-    session_mgr.bind_thread(
-        flow.user_id, flow.thread_id, flow.created_wid, window_name=flow.window_name
-    )
-    # The bind is DONE. Leave the discoverable note BEFORE the payload replay so
-    # a teardown racing the terminalizer can still learn completion won even if
-    # the replay itself raises (review r2 P2-A).
-    _note_completion(flow)
+    # REVALIDATE → COMMIT AS ONE CRITICAL SECTION (review r12 P1-A). The
+    # settlement wait above ran OUTSIDE the lock (never hold it across a 10 s
+    # wait); the lifecycle lock is taken only for the re-check and the commit,
+    # which are synchronous dict writes plus one probe — a cheap hold. Without
+    # it the gate was check-then-act: a kill could REGISTER after our checks and
+    # land after them. The lock is INNERMOST — nothing in here awaits the
+    # creation lock or Telegram.
+    lifecycle = getattr(flow.tmux_mgr, "window_lifecycle_lock", None)
+    if lifecycle is not None:
+        async with lifecycle():
+            await _revalidate_bind_preconditions(flow, session_mgr)
+            session_mgr.bind_thread(
+                flow.user_id,
+                flow.thread_id,
+                flow.created_wid,
+                window_name=flow.window_name,
+            )
+            # The bind is DONE. Leave the discoverable note BEFORE the payload
+            # replay so a teardown racing the terminalizer can still learn
+            # completion won even if the replay itself raises (review r2 P2-A).
+            # It stays inside the hold so "bound" and "provably bound" are
+            # committed together.
+            _note_completion(flow)
+    else:
+        await _revalidate_bind_preconditions(flow, session_mgr)
+        session_mgr.bind_thread(
+            flow.user_id,
+            flow.thread_id,
+            flow.created_wid,
+            window_name=flow.window_name,
+        )
+        _note_completion(flow)
     _release_tokens(flow)
 
     route = (flow.user_id, flow.thread_id, flow.created_wid)

@@ -352,13 +352,25 @@ async def _list_unbound_windows(
     tmux_mgr: Any,
     session_mgr: Any,
 ) -> list[tuple[str, str, str]]:
-    """Return tmux windows not currently bound to any topic, as (id, name, cwd)."""
+    """Return tmux windows not currently bound to any topic, as (id, name, cwd).
+
+    "Unbound" is NOT the same as "adoptable" (GH #65 review r12 P1-C). A
+    trust-lane creation flow binds its window as the LAST step of its tail, so
+    for the whole life of the flow the window is unbound — and offering it here
+    let another topic legitimately grab it mid-flow, producing two routes to one
+    window. Ownership by a live flow is the third state between "bound" and
+    "free", and excluding it closes that race AT THE SOURCE rather than merely
+    detecting it in the trust tail's exclusivity re-check.
+    """
+    from cctelegram.handlers import trust_flow
+
     all_windows = await tmux_mgr.list_windows()
     bound_ids = {bid for _, _, bid in session_mgr.iter_thread_bindings()}
+    owned_ids = trust_flow.windows_owned_by_live_flows()
     return [
         (w.window_id, w.window_name, w.cwd)
         for w in all_windows
-        if w.window_id not in bound_ids
+        if w.window_id not in bound_ids and w.window_id not in owned_ids
     ]
 
 

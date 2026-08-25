@@ -1011,6 +1011,11 @@ def _reset_all_handler_state() -> None:
     # are loop-bound at first acquire — drop them between tests so a lock
     # created under a previous test's event loop never leaks forward.
     _real_tmux.reset_window_send_locks_for_tests()
+    # GH #65 r12: the window-lifecycle lock is loop-bound at first acquire, for
+    # the same reason the send locks are — drop it so a lock created under a
+    # previous test's event loop never leaks forward.
+    _real_tmux.reset_lifecycle_lock_for_tests()
+    _real_tmux.reset_kill_pending_for_tests()
 
 
 # ──────────────────────────────────────────────────────────────────────────
