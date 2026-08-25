@@ -1,0 +1,288 @@
+"""Execute the GH #65 folder-trust creation-flow callbacks (``tst:`` lane).
+
+Core responsibilities:
+  - ``tst:t:<token>`` — the [✅ Trust this folder] tap: a synchronous state
+    claim under the creation lock, then the SHIPPED ``dcp:`` dispatch
+    transaction (window send lock + reject-if-held, extractor parity,
+    body-inclusive fingerprint identity, a FRESH in-lock license re-read,
+    exact-step nav + motion proof, ``Enter`` as the ONLY commit key,
+    ``auq_action_ledger`` idempotency) with the trust lane's OWN license
+    predicate — the version PROBED in this very pane at creation.
+  - ``tst:c:<generation>`` — the [❌ Cancel] tap: NO keystrokes; the window is
+    KILLED through the typed guard, and a cancel that races a registration is
+    SPARED (the completion tail then wins).
+
+Ownership is PRE-BINDING (the window is created but deliberately not bound
+yet), so the stale-window lease is substituted by the picker-entry claim:
+the entry must exist for THIS thread, carry this flow's generation, and be in
+an acceptable phase — the directory-browser precedent.
+
+Key components: execute_trust_callback().
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from cctelegram.handlers import decision_token, trust_flow
+from cctelegram.handlers.callback_data import CB_TRUST_PICK
+from cctelegram.handlers.message_sender import safe_edit
+from cctelegram.tmux_manager import pane_command_is_claude
+
+from . import safe_answer
+
+logger = logging.getLogger(__name__)
+
+TRUST_EXPIRED_TEXT = "This card expired — send a message here to start a new session."
+TRUST_BUSY_TEXT = "Already being handled."
+
+
+async def execute_trust_callback(authorized: Any, adapters: Any) -> None:
+    context = authorized.ctx.context
+    user = authorized.ctx.user
+    query = authorized.ctx.query
+    data = authorized.command.data
+    thread_id = authorized.ctx.thread_id
+    tmux_manager = adapters.tmux_manager
+
+    payload = data[len(CB_TRUST_PICK) :]
+    kind, _, rest = payload.partition(":")
+
+    if kind == "c":
+        await _handle_cancel(query, context, user, thread_id, rest, tmux_manager)
+        return
+    if kind == "t":
+        await _handle_trust(query, context, user, thread_id, rest, tmux_manager)
+        return
+    logger.info("TRUST_TAP malformed user=%d", user.id)
+    await safe_answer(query, TRUST_EXPIRED_TEXT, show_alert=True)
+
+
+async def _handle_cancel(
+    query: Any,
+    context: Any,
+    user: Any,
+    thread_id: int | None,
+    raw_generation: str,
+    tmux_manager: Any,
+) -> None:
+    claim = await trust_flow.claim_for_cancel(
+        user.id, thread_id, user_data=context.user_data
+    )
+    if not claim.ok or claim.flow is None:
+        if claim.reason == "wrong_state":
+            await safe_answer(query, TRUST_BUSY_TEXT)
+        else:
+            await safe_edit(query, TRUST_EXPIRED_TEXT, reply_markup=None)
+            await safe_answer(query)
+        return
+    flow = claim.flow
+    if raw_generation != str(flow.generation):
+        # A stale scrollback card from an EARLIER creation flow.
+        await trust_flow.release_dispatch_claim(
+            flow, phase=claim.previous_phase or trust_flow.PHASE_AWAITING_TRUST
+        )
+        await safe_edit(query, TRUST_EXPIRED_TEXT, reply_markup=None)
+        await safe_answer(query)
+        return
+
+    outcome = await trust_flow.cancel_flow(flow, context.bot, tmux_manager)
+    if outcome is trust_flow.CleanupOutcome.SPARED_REGISTERED:
+        # The window registered under us: the completion tail WINS — leave the
+        # WAIT task alone (it flips to ``completing_bind`` on its next slice).
+        await trust_flow.release_dispatch_claim(
+            flow, phase=trust_flow.PHASE_AWAITING_REGISTRATION
+        )
+        await safe_answer(query, "Session already started — binding it instead.")
+        return
+    if outcome is trust_flow.CleanupOutcome.SPARED_BOUND:
+        await trust_flow.release_dispatch_claim(
+            flow, phase=trust_flow.PHASE_COMPLETING_BIND
+        )
+        await safe_answer(query, "Already bound.")
+        return
+    await trust_flow.finish_cancelled_flow(flow)
+    await safe_answer(
+        query,
+        "Cancelled"
+        if outcome is trust_flow.CleanupOutcome.KILLED
+        else "Cancelled; cleanup failed",
+        show_alert=outcome is trust_flow.CleanupOutcome.KILL_FAILED,
+    )
+
+
+async def _handle_trust(
+    query: Any,
+    context: Any,
+    user: Any,
+    thread_id: int | None,
+    token: str,
+    tmux_manager: Any,
+) -> None:
+    # GATE 1 of the two-gate contract at the CALLBACK entry (the render mint is
+    # the other): the trust flag ON and no EXPLICIT operator kill switch.
+    if not decision_token.trust_card_dispatch_enabled():
+        await safe_answer(query, "Trust dispatch is disabled — answer in tmux.")
+        return
+
+    claim = await trust_flow.claim_for_dispatch(
+        user.id, thread_id, user_data=context.user_data
+    )
+    if not claim.ok or claim.flow is None:
+        if claim.reason == "wrong_state":
+            await safe_answer(query, TRUST_BUSY_TEXT)
+        else:
+            await safe_edit(query, TRUST_EXPIRED_TEXT, reply_markup=None)
+            await safe_answer(query)
+        return
+    flow = claim.flow
+
+    peeked = decision_token.peek(token)
+    if (
+        peeked is None
+        or peeked.user_id != user.id
+        or peeked.window_id != flow.created_wid
+        or flow.fingerprint is None
+        or peeked.fingerprint != flow.fingerprint
+    ):
+        await trust_flow.release_dispatch_claim(
+            flow, phase=trust_flow.PHASE_AWAITING_TRUST
+        )
+        await safe_answer(query, TRUST_EXPIRED_TEXT, show_alert=True)
+        return
+
+    consumed = await decision_token.consume(token, user.id)
+    if consumed.outcome != "ok" or consumed.entry is None:
+        await trust_flow.release_dispatch_claim(
+            flow, phase=trust_flow.PHASE_AWAITING_TRUST
+        )
+        await safe_answer(
+            query,
+            "Action already received."
+            if consumed.outcome == "already_consumed"
+            else TRUST_EXPIRED_TEXT,
+        )
+        return
+    entry = consumed.entry
+
+    w = await tmux_manager.find_window_by_id(flow.created_wid)
+    if not w:
+        await trust_flow.release_dispatch_claim(
+            flow, phase=trust_flow.PHASE_AWAITING_TRUST
+        )
+        await safe_answer(query, "Window not found", show_alert=True)
+        return
+
+    outcome = await _dispatch_trust(
+        user=user,
+        tmux_manager=tmux_manager,
+        w=w,
+        flow=flow,
+        entry=entry,
+    )
+
+    if outcome is None:
+        # The send lock was held — Enter provably never sent.
+        await trust_flow.release_dispatch_claim(
+            flow, phase=trust_flow.PHASE_AWAITING_TRUST
+        )
+        await trust_flow.render_trust_card(
+            flow, context.bot, await tmux_manager.capture_pane(flow.created_wid)
+        )
+        await safe_answer(query, "Window busy; refreshing card.")
+        return
+
+    if outcome.kind == "not_advanced":
+        # PRE-COMMIT bail: DEMOTE explicitly back to ``awaiting_trust`` with a
+        # fresh render (fresh tokens re-validate against the live pane).
+        await trust_flow.release_dispatch_claim(
+            flow, phase=trust_flow.PHASE_AWAITING_TRUST
+        )
+        await trust_flow.render_trust_card(
+            flow, context.bot, await tmux_manager.capture_pane(flow.created_wid)
+        )
+        await safe_answer(query, "Action not registered; refreshing card.")
+        return
+
+    # ``dispatched`` OR ``commit_unconfirmed``: the Enter WAS sent (addendum r1
+    # P1 — a post-Enter blank frame classifies ``commit_unconfirmed``, never
+    # ``dispatched``). Both end the human trust wait, so both REBASE the
+    # registration budget and enter ``awaiting_registration``; the WAIT task's
+    # documented demotion recovers if the Enter did not in fact commit.
+    trust_flow.note_dispatch_enter_sent(flow)
+    await trust_flow.release_dispatch_claim(
+        flow, phase=trust_flow.PHASE_AWAITING_REGISTRATION
+    )
+    await trust_flow.edit_card_public(
+        flow,
+        context.bot,
+        "✅ Trust sent — starting the session…"
+        if outcome.kind == "dispatched"
+        else "✅ Trust sent (unconfirmed) — checking the window…",
+    )
+    await safe_answer(
+        query,
+        "✅ Trust sent" if outcome.kind == "dispatched" else "Action sent; confirming.",
+    )
+
+
+async def _dispatch_trust(
+    *,
+    user: Any,
+    tmux_manager: Any,
+    w: Any,
+    flow: Any,
+    entry: Any,
+) -> Any:
+    """Lock-acquire (reject-if-held) → the shipped locked pane transaction.
+
+    Returns ``None`` when the send lock was busy (Enter provably never sent).
+    """
+    from cctelegram.handlers import auq_ledger
+
+    from .interactive import (
+        _dispatch_decision_pane_locked,
+        _lock_busy,
+        _window_send_lock,
+    )
+
+    lock = _window_send_lock(tmux_manager, w.window_id)
+    if _lock_busy(lock):
+        if flow.ledger_key is not None:
+            auq_ledger.record(
+                flow.ledger_key, state="not_advanced", failed_reason="lock_busy"
+            )
+        return None
+
+    def _trust_license(family: str, live_cmd: str | None) -> bool:
+        """The trust lane's FRESH in-lock license predicate."""
+        return (
+            family == trust_flow.TRUST_FAMILY
+            and pane_command_is_claude(live_cmd)
+            and bool(flow.cli_version)
+            and decision_token.lookup(trust_flow.TRUST_FAMILY, flow.cli_version or "")
+        )
+
+    if flow.ledger_key is not None:
+        auq_ledger.record(
+            flow.ledger_key,
+            state="accepted",
+            user_id=user.id,
+            window_id=flow.created_wid,
+            full_fingerprint=entry.fingerprint,
+            option_number=entry.option_number,
+            option_label=entry.option_label,
+        )
+    async with lock:
+        return await _dispatch_decision_pane_locked(
+            user=user,
+            tmux_manager=tmux_manager,
+            w=w,
+            window_id=flow.created_wid,
+            minted_fingerprint=entry.fingerprint,
+            option_number=entry.option_number,
+            option_label=entry.option_label,
+            ledger_key=flow.ledger_key,
+            license_check=_trust_license,
+        )

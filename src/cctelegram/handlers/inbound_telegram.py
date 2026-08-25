@@ -56,7 +56,7 @@ from telegram.error import NetworkError
 from telegram.ext import ContextTypes
 
 from .. import delivery, route_runtime
-from . import artifacts, decision_token, pane_signals, usage_cache
+from . import artifacts, decision_token, pane_signals, trust_flow, usage_cache
 from ..config import config
 from ..delivery import DeliveryResult
 from ..markdown_v2 import convert_markdown
@@ -501,9 +501,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     media_group_id = update.message.media_group_id
 
     if wid is None:
-        # GH #66: stash into THIS thread's picker entry. No cross-thread
-        # displacement — another topic's entry is untouched by construction.
-        entry = ensure_picker_entry(context.user_data, thread_id)
         # §2.5: render reply-context before stashing an unbound-topic caption
         # so the later directory/window/session-picker flush preserves the
         # same quote block as the bound aggregator path below. Keep the same
@@ -514,49 +511,66 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             caption, has_reply_ctx = await _apply_reply_context(
                 update.message, user.id, thread_id, caption
             )
-        # §2.8.3 photo-in-unbound-topic: stash the path so the directory
-        # picker's flush in _create_and_bind_window can feed the aggregator
-        # for the freshly-bound route. Multiple photos can pile up here
-        # while the user navigates the directory browser.
-        if entry is not None:
-            pending_attachments = entry.setdefault("_pending_thread_attachments", [])
-            pending_attachments.append(
+
+        def _stash_photo(entry: dict[str, Any]) -> None:
+            # §2.8.3 photo-in-unbound-topic: stash the path so the picker's
+            # flush can feed the aggregator for the freshly-bound route.
+            entry.setdefault("_pending_thread_attachments", []).append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
                 )
             )
 
-            # If the user is already mid-picker (text_handler opened the
-            # directory browser, window picker, or session picker for THIS
-            # topic), stashing the photo is enough — re-emitting the picker
-            # here would stomp on the existing browse/picker state and lose
-            # the user's progress. Mirrors the same-thread guards in
-            # text_handler.
-            if entry.get(STATE_KEY) in (
-                STATE_BROWSING_DIRECTORY,
-                STATE_SELECTING_WINDOW,
-                STATE_SELECTING_SESSION,
-            ):
-                return
-
-        # Always open the directory browser for unbound topics. If
-        # unbound tmux windows exist, the browser surfaces an opt-in
-        # "🖥 Bind existing window" button so the user can pivot to the
-        # window picker — but the directory choice stays primary.
-        unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
-        start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(
-            start_path, unbound_count=unbound_count
+        # GH #65 Fix 5: the download + reply-context resolution above are
+        # AWAITS — a creation flow can complete inside them. Re-read the
+        # binding AND the entry state under the creation lock immediately
+        # before acting.
+        decision = await trust_flow.decide_unbound_inbound(
+            user.id,
+            thread_id,
+            context.user_data,
+            session_manager,
+            stash_trust=_stash_photo,
+            stash_picker=_stash_photo,
         )
-        if entry is not None:
-            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            entry[BROWSE_PATH_KEY] = start_path
-            entry[BROWSE_PAGE_KEY] = 0
-            entry[BROWSE_DIRS_KEY] = subdirs
-            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
-        sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
-        _remember_picker_card(entry, sent)
-        return
+        if decision.kind == "trust_owned":
+            await safe_reply(update.message, trust_flow.TRUST_NUDGE)
+            return
+        if decision.kind == "picker_owned":
+            # Mid-picker: stashing is enough — re-emitting the picker would
+            # stomp on the user's browse progress.
+            return
+        if decision.kind == "free":
+            # GH #66: stash into THIS thread's picker entry. No cross-thread
+            # displacement — another topic's entry is untouched by construction.
+            entry = ensure_picker_entry(context.user_data, thread_id)
+            if entry is not None:
+                _stash_photo(entry)
+
+            # Always open the directory browser for unbound topics. If
+            # unbound tmux windows exist, the browser surfaces an opt-in
+            # "🖥 Bind existing window" button so the user can pivot to the
+            # window picker — but the directory choice stays primary.
+            unbound_count = len(
+                await _list_unbound_windows(tmux_manager, session_manager)
+            )
+            start_path = str(config.browse_root)
+            msg_text, keyboard, subdirs = build_directory_browser(
+                start_path, unbound_count=unbound_count
+            )
+            if entry is not None:
+                entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
+                entry[BROWSE_PATH_KEY] = start_path
+                entry[BROWSE_PAGE_KEY] = 0
+                entry[BROWSE_DIRS_KEY] = subdirs
+                entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+            sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
+            _remember_picker_card(entry, sent)
+            return
+        # The binding appeared while we downloaded: deliver THIS payload
+        # through the normal bound path below instead of a stale picker.
+        assert decision.window_id is not None
+        wid = decision.window_id
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
@@ -912,48 +926,63 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     media_group_id = update.message.media_group_id
 
     if wid is None:
-        # GH #66: stash into THIS thread's picker entry — no cross-thread
-        # displacement of any other topic's in-flight picker.
-        entry = ensure_picker_entry(context.user_data, thread_id)
-        if entry is not None:
-            # §2.5: render reply-context before stashing an unbound-topic
-            # caption so the later picker flush preserves the same quote block
-            # as the bound aggregator path below. Keep the same media-group
-            # guard as the bound path to avoid duplicate quote blocks for
-            # non-caption-bearing album items.
-            has_reply_ctx = False
-            if caption or media_group_id is None:
-                caption, has_reply_ctx = await _apply_reply_context(
-                    update.message, user.id, thread_id, caption
-                )
-            pending_attachments = entry.setdefault("_pending_thread_attachments", [])
-            pending_attachments.append(
+        # §2.5: render reply-context before stashing an unbound-topic caption
+        # so the later picker flush preserves the same quote block as the bound
+        # aggregator path below. Keep the same media-group guard as the bound
+        # path to avoid duplicate quote blocks for non-caption-bearing items.
+        has_reply_ctx = False
+        if caption or media_group_id is None:
+            caption, has_reply_ctx = await _apply_reply_context(
+                update.message, user.id, thread_id, caption
+            )
+
+        def _stash_document(entry: dict[str, Any]) -> None:
+            entry.setdefault("_pending_thread_attachments", []).append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
                 )
             )
 
-            if entry.get(STATE_KEY) in (
-                STATE_BROWSING_DIRECTORY,
-                STATE_SELECTING_WINDOW,
-                STATE_SELECTING_SESSION,
-            ):
-                return
-
-        unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
-        start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(
-            start_path, unbound_count=unbound_count
+        # GH #65 Fix 5: re-read the binding + entry state under the creation
+        # lock after the download / reply-context awaits above.
+        decision = await trust_flow.decide_unbound_inbound(
+            user.id,
+            thread_id,
+            context.user_data,
+            session_manager,
+            stash_trust=_stash_document,
+            stash_picker=_stash_document,
         )
-        if entry is not None:
-            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            entry[BROWSE_PATH_KEY] = start_path
-            entry[BROWSE_PAGE_KEY] = 0
-            entry[BROWSE_DIRS_KEY] = subdirs
-            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
-        sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
-        _remember_picker_card(entry, sent)
-        return
+        if decision.kind == "trust_owned":
+            await safe_reply(update.message, trust_flow.TRUST_NUDGE)
+            return
+        if decision.kind == "picker_owned":
+            return
+        if decision.kind == "free":
+            # GH #66: stash into THIS thread's picker entry — no cross-thread
+            # displacement of any other topic's in-flight picker.
+            entry = ensure_picker_entry(context.user_data, thread_id)
+            if entry is not None:
+                _stash_document(entry)
+
+            unbound_count = len(
+                await _list_unbound_windows(tmux_manager, session_manager)
+            )
+            start_path = str(config.browse_root)
+            msg_text, keyboard, subdirs = build_directory_browser(
+                start_path, unbound_count=unbound_count
+            )
+            if entry is not None:
+                entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
+                entry[BROWSE_PATH_KEY] = start_path
+                entry[BROWSE_PAGE_KEY] = 0
+                entry[BROWSE_DIRS_KEY] = subdirs
+                entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+            sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
+            _remember_picker_card(entry, sent)
+            return
+        assert decision.window_id is not None
+        wid = decision.window_id
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
@@ -1189,30 +1218,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
     if wid is None:
-        # Unbound topic — always show the directory browser. If unbound
-        # tmux windows exist, the browser includes a "🖥 Bind existing
-        # window" opt-in row that pivots to the window picker. We never
-        # auto-default to an existing window's cwd, since that locks the
-        # user into a directory they didn't choose.
-        unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
-        logger.info(
-            "Unbound topic: showing directory browser (user=%d, thread=%d, unbound=%d)",
-            user.id,
-            thread_id,
-            unbound_count,
-        )
-        start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(
-            start_path, unbound_count=unbound_count
-        )
-        # GH #66: stash into THIS thread's picker entry.
-        entry = ensure_picker_entry(context.user_data, thread_id)
-        if entry is not None:
-            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            entry[BROWSE_PATH_KEY] = start_path
-            entry[BROWSE_PAGE_KEY] = 0
-            entry[BROWSE_DIRS_KEY] = subdirs
-            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+
+        def _stash_text(entry: dict[str, Any]) -> None:
             entry["_pending_thread_text"] = text
             # Carry the OBSERVED provenance across the stash so the pending-bind
             # replay is classified the same way a live offer would be
@@ -1221,9 +1228,65 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "typed_text": True,
                 "reply_context": has_reply_ctx,
             }
-        sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
-        _remember_picker_card(entry, sent)
-        return
+
+        # GH #65 Fix 5: ``_apply_reply_context`` above is an AWAIT, so a
+        # creation flow can have completed inside it — re-read the binding AND
+        # the entry state under the creation lock immediately before acting.
+        # ``stash_picker`` is deliberately absent: a text message arriving
+        # mid-picker is a no-op nudge here (the pre-#65 behavior), while a
+        # trust-owned topic queues the text for the post-bind replay.
+        decision = await trust_flow.decide_unbound_inbound(
+            user.id,
+            thread_id,
+            context.user_data,
+            session_manager,
+            stash_trust=_stash_text,
+        )
+        if decision.kind == "trust_owned":
+            await safe_reply(update.message, trust_flow.TRUST_NUDGE)
+            return
+        if decision.kind == "picker_owned":
+            await safe_reply(
+                update.message,
+                "Please use the picker above, or tap Cancel.",
+            )
+            return
+        if decision.kind == "free":
+            # Unbound topic — always show the directory browser. If unbound
+            # tmux windows exist, the browser includes a "🖥 Bind existing
+            # window" opt-in row that pivots to the window picker. We never
+            # auto-default to an existing window's cwd, since that locks the
+            # user into a directory they didn't choose.
+            unbound_count = len(
+                await _list_unbound_windows(tmux_manager, session_manager)
+            )
+            logger.info(
+                "Unbound topic: showing directory browser "
+                "(user=%d, thread=%d, unbound=%d)",
+                user.id,
+                thread_id,
+                unbound_count,
+            )
+            start_path = str(config.browse_root)
+            msg_text, keyboard, subdirs = build_directory_browser(
+                start_path, unbound_count=unbound_count
+            )
+            # GH #66: stash into THIS thread's picker entry.
+            entry = ensure_picker_entry(context.user_data, thread_id)
+            if entry is not None:
+                entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
+                entry[BROWSE_PATH_KEY] = start_path
+                entry[BROWSE_PAGE_KEY] = 0
+                entry[BROWSE_DIRS_KEY] = subdirs
+                entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+                _stash_text(entry)
+            sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
+            _remember_picker_card(entry, sent)
+            return
+        # The binding appeared while we resolved reply-context: deliver THIS
+        # payload through the normal bound path below.
+        assert decision.window_id is not None
+        wid = decision.window_id
 
     # Bound topic — forward to bound window
     w = await tmux_manager.find_window_by_id(wid)
@@ -1358,74 +1421,19 @@ async def _cleanup_unbound_created_window(
     *,
     reason: str = "SessionStart hook timeout",
 ) -> bool:
-    """Best-effort kill of a newly-created window that should not be bound."""
-    if not window_id:
-        logger.error(
-            "Cannot clean up unbound tmux window '%s' after %s because no "
-            "window_id was returned",
-            window_name,
-            reason,
-        )
-        return False
-    # GH #63 §2b (Codex Q1): NEVER kill a window that holds a live/won session.
-    # The bring-up ordering is register(session_map) → pending-owner recheck →
-    # BIND, so a WINNER can be REGISTERED and already running a live Claude in
-    # its pane during the gap BEFORE it is bound. Spare on EITHER proof:
-    #   - BOUND: it appears in the authoritative ``thread_bindings`` (the same
-    #     source ``clear_topic_state`` consults), OR
-    #   - REGISTERED: ``peek_session_id_for_window`` is non-None — SessionStart
-    #     fired, so a live Claude owns the pane and killing it is the exact §2b
-    #     destruction.
-    # Both are read SYNCHRONOUSLY immediately before the kill, so no ``await``
-    # interleaves between this ownership decision and the tmux call. A bare peek
-    # was rejected earlier because "registered" cannot distinguish a winner from
-    # a superseded loser — so this guard deliberately takes the SAFE direction:
-    # it may SPARE a registered-but-superseded LOSER (leaking that unbound tmux
-    # window — a rare, minor resource leak a future janitor could reap) in order
-    # to NEVER kill a registered WINNER (a live session, the actual §2b bug). The
-    # loser-leak is an ACCEPTED residual; reaping it is out of scope here (there
-    # is no clean, atomic way to tell a registered loser from a registered winner
-    # — that is precisely why the bare peek was rejected).
-    is_bound = window_id in {
-        wid for _, _, wid in session_manager.iter_thread_bindings()
-    }
-    is_registered = peek_session_id_for_window(window_id) is not None
-    if is_bound or is_registered:
-        logger.warning(
-            "Skipping cleanup of tmux window %s (%s) after %s: it holds a %s "
-            "session (won or live) — not collateral",
-            window_id,
-            window_name,
-            reason,
-            "bound" if is_bound else "registered",
-        )
-        return True
-    try:
-        killed = await tmux_mgr.kill_window(window_id)
-    except Exception as e:  # pragma: no cover - tmux_manager normally swallows errors
-        logger.error(
-            "Failed to clean up unbound tmux window %s (%s) after %s: %s",
-            window_id,
-            window_name,
-            reason,
-            e,
-        )
-        return False
-    if killed:
-        logger.warning(
-            "Cleaned up unbound tmux window %s (%s) after %s",
-            window_id,
-            window_name,
-            reason,
-        )
-        return True
-    logger.error(
-        "Could not clean up unbound tmux window %s (%s) after %s",
-        window_id,
-        window_name,
-        reason,
+    """Best-effort kill of a newly-created window that should not be bound.
+
+    GH #65 Fix 4: the arbitration itself now lives in
+    ``trust_flow.cleanup_created_window`` with a TYPED outcome
+    (``killed | spared_bound | spared_registered | kill_failed``) and a declared
+    linearization point (the FRESH session-map read). This wrapper preserves the
+    pre-#65 ``bool`` contract for every existing caller byte-for-byte: True for
+    a kill or either SPARE, False only when the kill itself failed.
+    """
+    outcome = await trust_flow.cleanup_created_window(
+        window_id, window_name, tmux_mgr, reason=reason
     )
-    return False
+    return outcome is not trust_flow.CleanupOutcome.KILL_FAILED
 
 
 async def _abort_created_window_after_pending_owner_change(
@@ -1509,8 +1517,21 @@ async def _create_and_bind_window(
         await safe_answer(query, "Stale picker", show_alert=True)
         return
 
+    # GH #65: the creation-flow trust lane covers NON-RESUME creation ONLY. The
+    # resume path keeps today's manual-association fallback byte-identical (its
+    # 15s timeout, its window_state override, its messaging) — pinned by a
+    # resume-timeout parity test. ``lane_enabled()`` is False when
+    # ``CC_TELEGRAM_TRUST_PROMPT_CEILING_S=0`` disables the lane, which also
+    # restores the pre-#65 path exactly.
+    use_trust_lane = (
+        resume_session_id is None
+        and pending_thread_id is not None
+        and trust_flow.lane_enabled()
+    )
     success, message, created_wname, created_wid = await tmux_mgr.create_window(
-        selected_path, resume_session_id=resume_session_id
+        selected_path,
+        resume_session_id=resume_session_id,
+        defer_launch=use_trust_lane,
     )
     if success:
         logger.info(
@@ -1534,6 +1555,50 @@ async def _create_and_bind_window(
                 created_wid=created_wid,
                 created_wname=created_wname,
                 resume_session_id=resume_session_id,
+            )
+            return
+
+        if use_trust_lane:
+            # GH #65 Fix 0: the window was created in launch-deferred mode, so
+            # the pane is a fresh interactive shell. Probe ITS OWN CLI version
+            # (nonce-delimited, shell-resolution parity, positive
+            # ``(Claude Code)`` proof) and then ALWAYS launch — a probe failure
+            # only makes the trust card display-only, it never blocks a launch.
+            cli_version = await trust_flow.probe_version_and_launch(
+                created_wid, tmux_mgr
+            )
+            assert pending_thread_id is not None
+            if not _pending_owner_matches(context.user_data, pending_thread_id):
+                await _abort_created_window_after_pending_owner_change(
+                    query,
+                    user_data=context.user_data,
+                    user_id=user.id,
+                    pending_thread_id=pending_thread_id,
+                    tmux_mgr=tmux_mgr,
+                    created_wid=created_wid,
+                    created_wname=created_wname,
+                    resume_session_id=resume_session_id,
+                )
+                return
+            # GH #65 Fix 3: answer the callback + edit the card BEFORE the wait.
+            # The ENTIRE wait (including the first hook-timeout phase) runs in
+            # the spawned task, which captures stable primitives only — never
+            # the CallbackQuery / CallbackContext objects.
+            await safe_edit(query, f"🚀 {message}\n\nStarting Claude…")
+            await safe_answer(query, "Created")
+            await trust_flow.start_trust_wait(
+                bot=context.bot,
+                user_id=user.id,
+                thread_id=pending_thread_id,
+                chat_id=session_mgr.resolve_chat_id(user.id, pending_thread_id),
+                user_data=context.user_data,
+                created_wid=created_wid,
+                window_name=created_wname,
+                selected_path=selected_path,
+                create_message=message,
+                cli_version=cli_version,
+                tmux_mgr=tmux_mgr,
+                session_mgr=session_mgr,
             )
             return
 

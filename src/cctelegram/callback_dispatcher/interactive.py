@@ -11,7 +11,7 @@ Key components:
 
 from __future__ import annotations
 
-from typing import Any, Literal, cast
+from typing import Any, Callable, Literal, cast
 
 import asyncio
 import logging
@@ -838,6 +838,7 @@ async def _dispatch_decision_pane_locked(
     option_number: int,
     option_label: str,
     ledger_key: str | None,
+    license_check: Callable[[str, str | None], bool] | None = None,
 ) -> _DecisionPaneOutcome:
     """§3 dispatch transaction — the caller holds the window send lock.
 
@@ -846,6 +847,16 @@ async def _dispatch_decision_pane_locked(
     proof) → Enter → confirm → terminal ledger write. NO Telegram I/O. Every gate
     runs BEFORE any keystroke, so a keystroke is NEVER sent to an unlicensed /
     non-matching shape.
+
+    ``license_check`` is the FRESH in-lock license predicate ``(family,
+    live_pane_command) -> bool``. ``None`` = the ``dcp:`` lane's shipped default
+    (``pane_command_is_claude`` AND the pane command itself licensed in the
+    table) — byte-identical behavior for that lane. GH #65's creation-flow trust
+    lane passes its own: ``pane_command_is_claude`` (proof the TUI owns the
+    pane, on BOTH platforms) AND the family is ``folder-trust`` AND the version
+    PROBED in this very pane at creation is licensed — because the pane command
+    can never carry a version on Linux/WSL (``/proc/comm`` reports ``claude``),
+    so the shipped default can never license a tap there.
     """
 
     def _bail_not_advanced(reason: str) -> _DecisionPaneOutcome:
@@ -911,9 +922,15 @@ async def _dispatch_decision_pane_locked(
     # decline before ANY key + an INFO log (post-/update dead taps stay
     # observable).
     live_cmd = await tmux_manager.pane_current_command(window_id)
-    if not pane_command_is_claude(live_cmd) or not decision_token.lookup(
-        family, live_cmd or ""
-    ):
+    licensed = (
+        license_check(family, live_cmd)
+        if license_check is not None
+        else (
+            pane_command_is_claude(live_cmd)
+            and decision_token.lookup(family, live_cmd or "")
+        )
+    )
+    if not licensed:
         logger.info(
             "DECISION dispatch declined: live pane command %r not licensed for "
             "family %s (user=%d window=%s)",

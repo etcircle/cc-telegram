@@ -26,6 +26,7 @@ from . import (
     notify_source,
     pane_signals,
     pick_intent,
+    trust_flow,
     usage_cache,
 )
 from .dashboard import clear_dashboards_in_thread
@@ -97,6 +98,17 @@ async def disable_all_picker_cards(
         await _disable_picker_card(bot, entry)
 
 
+async def teardown_all_creation_flows(user_id: int, user_data: Any) -> None:
+    """GH #65 Fix 6: tear down EVERY topic's creation flow for one user.
+
+    The ``/start`` global reset runs this BEFORE ``clear_all_picker_entries`` so
+    each flow's window is settled (guarded cleanup) while its entry — the
+    ownership token — is still present.
+    """
+    del user_data
+    await trust_flow.teardown_all_for_user(user_id)
+
+
 async def clear_topic_state(
     user_id: int,
     thread_id: int,
@@ -123,6 +135,15 @@ async def clear_topic_state(
     from .inbound_telegram import _cancel_bash_capture
 
     _cancel_bash_capture(user_id, thread_id)
+
+    # GH #65 Fix 6: tear down a live creation-flow (folder-trust) WAIT task for
+    # this topic FIRST — the window must be settled before the entry (the
+    # ownership token) is dropped below. The teardown's own lock choreography
+    # releases the creation lock before it cancels/awaits, so calling it here
+    # (holding nothing) cannot deadlock.
+    await trust_flow.teardown_thread(
+        user_id, thread_id, bot=bot, user_data=user_data, reason="topic teardown"
+    )
 
     # Tear down any per-route queue first so its in-flight task can record
     # _tool_msg_ids before we sweep them below.

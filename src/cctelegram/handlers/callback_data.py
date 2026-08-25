@@ -70,6 +70,13 @@ CB_DECISION_PICK = "dcp:"  # dcp:<route_hash>:<fp8>:<opt>:<token>
 # handlers/artifacts registry row (PINNED resolved path + allowed roots);
 # ``dlf:<window_id>:<token>`` ≈ 22 bytes ≪ 64 (checked_callback_data enforces).
 CB_DOWNLOAD_FILE = "dlf:"  # dlf:<window_id>:<token>
+# GH #65 — the creation-flow folder-trust card. A PRE-BINDING surface: the tap
+# is validated against the thread's picker ENTRY (the directory-browser
+# precedent), never a thread_bindings lease, because the window is created but
+# deliberately not yet bound. ``tst:t:<token>`` resolves to a
+# ``handlers/decision_token`` row and dispatches navigate→verify→Enter;
+# ``tst:c:<generation>`` cancels by KILLING the window (never a keystroke).
+CB_TRUST_PICK = "tst:"  # tst:t:<token> | tst:c:<generation>
 
 # Session picker (resume existing session)
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
