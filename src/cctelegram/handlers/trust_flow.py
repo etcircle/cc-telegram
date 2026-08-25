@@ -1896,11 +1896,12 @@ async def _revalidate_bind_preconditions(flow: TrustFlow, session_mgr: Any) -> N
 
     Four questions, all of which could have changed while we were parked:
 
-    1. **Does the window still exist?** A FRESH probe (``fresh=True``), never
-       the 1 s listing cache and never the stale object we resolved before the
-       wait — binding a topic to a corpse is the exact harm the gate exists to
-       prevent, and a cached listing can be a full second behind a landed kill
-       (review r12 P1-B).
+    1. **Does the window still exist?** A DIRECT, uncached read
+       (``adoption_listing`` under the lifecycle lock, review r16) — never the
+       TTL cache and never the stale object we resolved before the wait.
+       Binding a topic to a corpse is the exact harm this gate exists to
+       prevent, and adoption correctness no longer depends on cache freshness
+       at all.
     2. **Is this THREAD still free?** A competing flow or a manual bind may have
        claimed it.
     3. **Is this WINDOW still free?** (review r12 P1-C.) Exclusivity has TWO
@@ -1938,11 +1939,10 @@ async def _revalidate_bind_preconditions(flow: TrustFlow, session_mgr: Any) -> N
         raise TrustBindRefused(
             f"window {flow.created_wid} no longer exists after the adoption wait"
         )
-    # POST-LIST PENDING RE-CHECK (review r15 P1-A, the belt). The
-    # start/end-generation match is what actually closes the mid-read race; this
-    # is one cheap synchronous read that also refuses the shape where a kill
-    # registered while we were listing. Both seams are kept because they fail in
-    # opposite directions and the cost here is a dict lookup.
+    # POST-LIST PENDING RE-CHECK (review r15 P1-A, kept as a belt). The DIRECT
+    # listing above is what makes the answer trustworthy — it samples tmux with
+    # no cache in the way (review r16) — while this one cheap synchronous read
+    # also refuses the shape where a kill REGISTERED while we were listing.
     if flow.tmux_mgr.window_kill_pending(flow.created_wid):
         raise TrustBindRefused(
             f"a kill for window {flow.created_wid} registered while we were "

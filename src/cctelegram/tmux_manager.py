@@ -1072,12 +1072,15 @@ class TmuxManager:
     ) -> TmuxWindow | None:
         """Find a window by its tmux window ID (e.g. '@0', '@12').
 
-        ``fresh=True`` BYPASSES (and refreshes) the 1 s listing cache. Every
-        probe that is deciding whether a window is safe to ADOPT must pass it
-        (review r12 P1-B): the cache is a performance device for the 1 Hz
-        pollers, and a "fresh" existence check that reads it can be up to a
-        second stale — long enough to hand an adopter a window a kill has
-        already removed. Correctness probes pay the extra tmux round-trip.
+        DISPLAY-SIDE ONLY. ``fresh=True`` bypasses (and refreshes) the 1 s
+        cache, which is useful for a display that wants an up-to-date view — but
+        it is NOT how adoption decisions read tmux.
+
+        ADOPTION USES :meth:`adoption_listing`, a DIRECT uncached read taken
+        under the window-lifecycle lock (review r16). Three rounds of defects in
+        the cache-guarding approach ended with the cache removed from adoption
+        entirely, so no amount of freshness flagging here makes this method
+        suitable for deciding whether a window is safe to adopt.
         """
         min_generation = self._invalidate_list_cache() if fresh else 0
         cache = await self._ensure_list_cache(min_generation=min_generation)
@@ -1854,6 +1857,37 @@ class TmuxManager:
             self.clear_window_stranded_draft(window_id, reason="window killed")
         return result
 
+    @staticmethod
+    def _transfer_ownership(
+        result: tuple[bool, str, str, str],
+        disposition: "_CreateDisposition",
+        reap: "Callable[[str], None]",
+    ) -> tuple[bool, str, str, str]:
+        """THE single exit for a ``create_window`` result. Returns it unchanged.
+
+        RETURNING AN ID TRANSFERS OWNERSHIP (review r16 P1-A, made total in r17
+        P1). This is the rule that gives every outcome EXACTLY ONE cleanup
+        owner: if the caller is handed a window id — the creation SUCCEEDED, it
+        came back created-but-unverified, or it partially succeeded — the caller
+        now knows about that window and is responsible for settling it (see
+        ``inbound_telegram``'s reserve-then-clean arm). Only when NO id reaches
+        the caller does the reaper own the window.
+
+        It is a FUNCTION, and every id-bearing return goes through it, because
+        the rule failed the moment one return path skipped it: the r16 shape had
+        a second ``return`` for the verification timeout that handed back the
+        real id without recording TAKEN, so the ``finally`` recorded DECLINED and
+        scheduled the reaper for a window the caller was simultaneously being
+        told to clean up. One exit is what makes "every id-bearing result" true
+        rather than aspirational.
+
+        The transition is recorded BEFORE the id is handed back, so the worker
+        callback can never observe "undecided" for a window the caller is taking.
+        """
+        if result[3] and disposition.record_caller(CallerDisposition.TAKEN):
+            reap(disposition.worker_window_id)
+        return result
+
     async def create_window(
         self,
         work_dir: str,
@@ -2090,11 +2124,10 @@ class TmuxManager:
                     # refusal requires a listing that actually WORKED (it
                     # returned other windows) and did not contain ours; an empty
                     # or failed listing is INDETERMINATE and logged, not fatal.
-                    # FRESH with the generation floor (r14 self-audit): an
-                    # invalidate-then-cached-read pair has the very hole r13
-                    # P1-A closed — an in-flight refresh can publish a stale
-                    # snapshot in between. ``list_windows_fresh`` carries the
-                    # floor through.
+                    # DIRECT, via ``adoption_listing`` (review r16): this is an
+                    # adoption-class decision, so it reads tmux with no cache in
+                    # the way — no generation floor to carry, and no unrelated
+                    # invalidation able to affect the answer.
                     #
                     # A VERIFICATION TIMEOUT MUST NOT ERASE A REAL WINDOW
                     # (review r14 P1-C). By this point creation is CONFIRMED, so
@@ -2115,12 +2148,19 @@ class TmuxManager:
                             new_wid,
                             e,
                         )
-                        return (
+                        # Falls THROUGH to the single ownership-transfer exit
+                        # below (review r17 P1): returning early here skipped the
+                        # TAKEN transition, so the ``finally`` recorded DECLINED
+                        # and the reaper fired for a window the caller was
+                        # simultaneously being told to clean up — two owners,
+                        # two possible kills.
+                        result = (
                             False,
                             CREATED_BUT_UNVERIFIED_MESSAGE,
                             _name,
                             new_wid,
                         )
+                        return self._transfer_ownership(result, disposition, _reap)
                     if listed and not any(w.window_id == new_wid for w in listed):
                         logger.error(
                             "created window %s is absent from a tmux listing of "
@@ -2141,21 +2181,7 @@ class TmuxManager:
                             "proceeding on the pre-create gate alone",
                             new_wid,
                         )
-                # RETURNING AN ID TRANSFERS OWNERSHIP (review r16 P1-A). This
-                # is the rule that gives every outcome EXACTLY ONE cleanup
-                # owner, including partial creation: if the caller is handed a
-                # window id — whether the creation SUCCEEDED or came back
-                # created-but-unverified — the caller now knows about that
-                # window and is responsible for settling it (see
-                # ``inbound_telegram``'s reserve-then-clean arm). Only when no
-                # id reaches the caller does the reaper own the window.
-                #
-                # Recorded BEFORE the id is handed back, so the worker callback
-                # can never see "undecided" for a window the caller is taking.
-                if result[3]:
-                    if disposition.record_caller(CallerDisposition.TAKEN):
-                        _reap(disposition.worker_window_id)
-                return result
+                return self._transfer_ownership(result, disposition, _reap)
         except LifecycleTimeout as e:
             logger.error("window creation exceeded its lifecycle bound: %s", e)
             return (

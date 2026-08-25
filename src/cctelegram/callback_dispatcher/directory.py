@@ -468,12 +468,20 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
                 else:
                     current_unbound_ids = {
                         wid
-                        for wid, _, _ in await _list_unbound_windows(
-                            adapters.tmux_manager,
-                            adapters.session_manager,
-                            # The DIRECT listing already read above — no
-                            # adoption decision touches the cache (review r16).
-                            listing=listed,
+                        for wid, _, _ in await tmux_manager._bounded_lifecycle(
+                            _list_unbound_windows(
+                                adapters.tmux_manager,
+                                adapters.session_manager,
+                                # The DIRECT listing already read above — no
+                                # adoption decision touches the cache (r16).
+                                listing=listed,
+                            ),
+                            # BOUNDED even though it cannot block (r17
+                            # self-audit): given a listing it is a pure filter,
+                            # but "every await under the hold is bounded" is
+                            # only useful as an ABSOLUTE rule — an exception
+                            # people have to remember is one they will forget.
+                            what="bind-to-existing unbound filter",
                         )
                     }
                     if selected_wid not in current_unbound_ids:
