@@ -14,10 +14,39 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncio
+from typing import Any
+
 import pytest
 
 from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram.session import WindowState, session_manager
+
+_LIFECYCLE_LOCK = asyncio.Lock()
+
+
+def _protocol_tmux() -> MagicMock:
+    """A MagicMock tmux manager wired for the GH #65 adoption protocol.
+
+    The guarded cleanup takes the window-lifecycle lock and kills in TWO phases
+    (``begin_kill_locked`` under the hold, ``finish_kill`` outside it), so a
+    bare MagicMock no longer satisfies it. ``begin_kill_locked`` delegates to
+    ``kill_window`` so these tests keep asserting on the seam they care about.
+    """
+    tmux = MagicMock()
+    tmux.kill_window = AsyncMock(return_value=True)
+    tmux.window_lifecycle_lock = lambda: _LIFECYCLE_LOCK
+
+    def _begin(window_id: str) -> Any:
+        return asyncio.ensure_future(tmux.kill_window(window_id))
+
+    async def _finish(window_id: str, inner: Any) -> bool:
+        del window_id
+        return await inner
+
+    tmux.begin_kill_locked = _begin
+    tmux.finish_kill = _finish
+    return tmux
 
 
 @pytest.mark.asyncio
@@ -27,8 +56,7 @@ async def test_cleanup_spares_window_bound_to_a_topic(
     """A window bound to a topic (won the race) is NOT killed."""
     monkeypatch.setattr(session_manager, "thread_bindings", {1: {42: "@7"}})
     monkeypatch.setattr(session_manager, "window_states", {})
-    tmux = MagicMock()
-    tmux.kill_window = AsyncMock(return_value=True)
+    tmux = _protocol_tmux()
 
     result = await inbound_module._cleanup_unbound_created_window(
         "@7", "winner", tmux, reason="test"
@@ -54,8 +82,7 @@ async def test_cleanup_spares_registered_but_unbound_window(
         "window_states",
         {"@8": WindowState(session_id="sid-8", cwd="/repo", window_name="live")},
     )
-    tmux = MagicMock()
-    tmux.kill_window = AsyncMock(return_value=True)
+    tmux = _protocol_tmux()
 
     result = await inbound_module._cleanup_unbound_created_window(
         "@8", "live", tmux, reason="test"
@@ -72,8 +99,7 @@ async def test_cleanup_kills_window_neither_bound_nor_registered(
     """A window with no binding AND no registered session (a true loser) is killed."""
     monkeypatch.setattr(session_manager, "thread_bindings", {})
     monkeypatch.setattr(session_manager, "window_states", {})
-    tmux = MagicMock()
-    tmux.kill_window = AsyncMock(return_value=True)
+    tmux = _protocol_tmux()
 
     result = await inbound_module._cleanup_unbound_created_window(
         "@9", "loser", tmux, reason="test"
@@ -89,8 +115,7 @@ async def test_abort_after_owner_change_spares_bound_winner(
 ) -> None:
     """The abort seam that reaches the cleanup must also spare a bound winner."""
     monkeypatch.setattr(session_manager, "thread_bindings", {1: {42: "@7"}})
-    tmux = MagicMock()
-    tmux.kill_window = AsyncMock(return_value=True)
+    tmux = _protocol_tmux()
 
     query = MagicMock()
     query.edit_message_text = AsyncMock()

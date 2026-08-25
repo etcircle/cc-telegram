@@ -55,6 +55,7 @@ from cctelegram.session import session_manager as _real_sm
 from cctelegram import tmux_manager as tmux_mod
 from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
 from cctelegram.utils import app_dir
+from tests.cctelegram._adoption_protocol import AdoptionProtocolMixin
 from cctelegram.handlers import (
     artifacts,
     attention,
@@ -122,7 +123,7 @@ class _PaneWindow:
 
 
 @dataclass
-class FakeTmux:
+class FakeTmux(AdoptionProtocolMixin):
     """Stand-in for ``tmux_manager`` used by scenario tests.
 
     Fixture binds these methods onto the real ``tmux_manager`` singleton so
@@ -248,33 +249,6 @@ class FakeTmux:
     async def kill_window(self, window_id: str) -> bool:
         self.kill_calls.append(window_id)
         return self.windows.pop(window_id, None) is not None
-
-    # GH #65 r12/r13 adoption protocol. The fake has no real tmux to race, so
-    # these are the trivially-satisfied forms — present so production code can
-    # call the seam unconditionally instead of feature-sniffing it.
-    def window_lifecycle_lock(self) -> asyncio.Lock:
-        if getattr(self, "_lifecycle_lock", None) is None:
-            self._lifecycle_lock = asyncio.Lock()
-        return self._lifecycle_lock
-
-    def window_kill_pending(self, window_id: str) -> bool:
-        del window_id
-        return False
-
-    def any_kill_pending(self) -> bool:
-        return False
-
-    async def await_kill_settled(self, window_id: str, **kwargs: Any) -> bool:
-        del window_id, kwargs
-        return True
-
-    async def await_all_kills_settled(self, **kwargs: Any) -> bool:
-        del kwargs
-        return True
-
-    async def _bounded_lifecycle(self, coro: Any, *, what: str, **kwargs: Any) -> Any:
-        del what, kwargs
-        return await coro
 
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         self.rename_calls.append((window_id, new_name))

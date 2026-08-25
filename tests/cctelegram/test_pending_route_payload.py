@@ -8,6 +8,7 @@ must be rejected without acting on or deleting the active pending owner.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -124,6 +125,26 @@ def _patch_both(name: str, *args, **kwargs) -> Iterator[object]:
                 if result is None:
                     result = module_result
         yield result
+
+
+def _completed_kill(_window_id: str) -> "asyncio.Future[bool]":
+    """A ``begin_kill_locked`` stand-in.
+
+    GH #65 r14: the guarded cleanup kills in TWO phases — dispatch under the
+    lifecycle lock, await outside it — so the interception point is the
+    synchronous ``begin_kill_locked``, which hands back a future that
+    ``finish_kill`` awaits.
+    """
+    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+    fut.set_result(True)
+    return fut
+
+
+def _failed_kill(_window_id: str) -> "asyncio.Future[bool]":
+    """A ``begin_kill_locked`` stand-in whose kill REPORTS FAILURE."""
+    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+    fut.set_result(False)
+    return fut
 
 
 def _attachment(path: Path) -> bot_module.PendingAttachment:
@@ -262,7 +283,7 @@ async def test_topic_close_bound_matching_pending_attachments_deletes_and_clears
         await bot_module.topic_closed_handler(update, context)
 
     mock_find.assert_awaited_once_with("@0")
-    mock_kill.assert_awaited_once_with("@0")
+    mock_kill.assert_called_once_with("@0")
     mock_unbind.assert_called_once_with(1, 10)
     mock_clear.assert_awaited_once_with(1, 10, context.bot, context.user_data)
     assert not payload.exists()
@@ -348,9 +369,8 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
         ) as wait_for_map,
         patch.object(
             bot_module.tmux_manager,
-            "kill_window",
-            new_callable=AsyncMock,
-            return_value=True,
+            "begin_kill_locked",
+            new=MagicMock(side_effect=_completed_kill),
         ) as kill_window,
         patch.object(
             bot_module.session_manager, "get_window_state"
@@ -370,7 +390,7 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
         )
 
     wait_for_map.assert_awaited_once_with("@42", timeout=5.0)
-    kill_window.assert_awaited_once_with("@42")
+    kill_window.assert_called_once_with("@42")
     get_window_state.assert_not_called()
     bind_thread.assert_not_called()
     safe_edit.assert_awaited_once()
@@ -474,9 +494,8 @@ async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
         ),
         patch.object(
             bot_module.tmux_manager,
-            "kill_window",
-            new_callable=AsyncMock,
-            return_value=False,
+            "begin_kill_locked",
+            new=MagicMock(side_effect=_failed_kill),
         ) as kill_window,
         patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
         _patch_both("safe_edit", new_callable=AsyncMock) as safe_edit,
@@ -492,7 +511,7 @@ async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
             session_mgr=bot_module.session_manager,
         )
 
-    kill_window.assert_awaited_once_with("@43")
+    kill_window.assert_called_once_with("@43")
     bind_thread.assert_not_called()
     safe_edit.assert_awaited_once()
     edited_text = safe_edit.await_args.args[1]
@@ -527,8 +546,8 @@ async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_windo
         ) as wait_for_map,
         patch.object(
             bot_module.tmux_manager,
-            "kill_window",
-            new_callable=AsyncMock,
+            "begin_kill_locked",
+            new=MagicMock(side_effect=_completed_kill),
         ) as kill_window,
         patch.object(
             bot_module.session_manager,
@@ -557,7 +576,7 @@ async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_windo
         )
 
     wait_for_map.assert_awaited_once_with("@44", timeout=15.0)
-    kill_window.assert_not_awaited()
+    kill_window.assert_not_called()
     assert window_state.session_id == "resume-123"
     assert window_state.cwd == "/repo"
     assert window_state.window_name == "repo"
@@ -1291,9 +1310,8 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
         ),
         patch.object(
             bot_module.tmux_manager,
-            "kill_window",
-            new_callable=AsyncMock,
-            return_value=True,
+            "begin_kill_locked",
+            new=MagicMock(side_effect=_completed_kill),
         ) as mock_kill,
         patch.object(
             bot_module.session_manager, "get_window_state"
@@ -1312,7 +1330,7 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
             session_mgr=bot_module.session_manager,
         )
 
-    mock_kill.assert_awaited_once_with("@10")
+    mock_kill.assert_called_once_with("@10")
     get_window_state.assert_not_called()
     mock_bind.assert_not_called()
     mock_replay.assert_not_called()

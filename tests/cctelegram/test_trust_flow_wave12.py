@@ -39,6 +39,7 @@ from cctelegram.handlers.directory_browser import (
     picker_entry,
 )
 from cctelegram.utils import app_dir
+from tests.cctelegram._adoption_protocol import AdoptionProtocolMixin
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 _TRUST = (_FIXTURES / "folder_trust_arrival_plain_v2.1.241.txt").read_text()
@@ -70,7 +71,7 @@ def _lane(monkeypatch: pytest.MonkeyPatch) -> Any:
     (app_dir() / "session_map.json").unlink(missing_ok=True)
 
 
-class _Tmux:
+class _Tmux(AdoptionProtocolMixin):
     def __init__(self, *, command: str = "claude", pane: str = "") -> None:
         self.command = command
         self.pane = pane
@@ -351,12 +352,18 @@ async def test_the_trust_revalidation_probe_bypasses_the_listing_cache() -> None
     tmux = _Tmux(pane=_IDLE)
     seen_fresh: list[bool] = []
 
-    async def _probe(window_id: str, *, fresh: bool = False) -> Any:
-        del window_id
-        seen_fresh.append(fresh)
-        return SimpleNamespace(window_id=_FAKE_WID, window_name="repo", cwd="/repo")
+    async def _fresh_listing() -> Any:
+        # Reaching the FRESH listing seam at all is the assertion: the cached
+        # ``list_windows`` must never be what an adoption probe consults.
+        seen_fresh.append(True)
+        return [SimpleNamespace(window_id=_FAKE_WID, window_name="repo", cwd="/repo")]
 
-    tmux.find_window_by_id = _probe  # type: ignore[attr-defined]
+    async def _cached_listing() -> Any:
+        seen_fresh.append(False)
+        return [SimpleNamespace(window_id=_FAKE_WID, window_name="repo", cwd="/repo")]
+
+    tmux.list_windows_fresh = _fresh_listing  # type: ignore[attr-defined]
+    tmux.list_windows = _cached_listing  # type: ignore[attr-defined]
     flow = await _start(user_data, tmux=tmux, bot=_Bot(), sessions=sessions)
     assert flow is not None
     sessions.registered = True

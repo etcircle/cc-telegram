@@ -25,6 +25,7 @@ import pytest
 from cctelegram import terminal_parser, tmux_manager as tmux_mod
 from cctelegram.handlers import decision_token, trust_flow
 from cctelegram.utils import app_dir
+from tests.cctelegram._adoption_protocol import AdoptionProtocolMixin
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 # A window id tmux CANNOT mint, so no seam can address a live pane.
@@ -274,7 +275,7 @@ def test_unreadable_pane_command_is_indeterminate() -> None:
 # ── Fix 4: typed cleanup + the linearization point ───────────────────────────
 
 
-class _KillRecorder:
+class _KillRecorder(AdoptionProtocolMixin):
     def __init__(self, *, result: bool | BaseException = True) -> None:
         self.calls: list[str] = []
         self._result = result

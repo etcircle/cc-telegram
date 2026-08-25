@@ -46,8 +46,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from ..config import config
 from ..markdown_v2 import convert_markdown
 from ..session import (
-    peek_session_id_for_window,
-    read_session_id_for_window_fresh,
     session_manager,
 )
 from ..terminal_parser import (
@@ -452,15 +450,29 @@ def release_window_reservation(window_id: str | None) -> None:
         logger.debug("trust lane released the reservation on window %s", window_id)
 
 
-def release_reservations_for_token(entry_token_value: str | None) -> None:
-    """Drop every reservation held under an entry token that just died."""
+_ORPHANED_RESERVATION = "<orphaned>"
+
+
+def orphan_reservations_for_token(entry_token_value: str | None) -> None:
+    """RE-KEY a dying token's reservations — never free them (review r14 P1-E).
+
+    Freeing on entry death was PREMATURE: an aborted creation drops its entry
+    and THEN runs the guarded cleanup, so releasing here exposed the window for
+    adoption during that cleanup — a competitor took it, and the cleanup's kill
+    then landed on the new owner's window. The reservation therefore SURVIVES
+    the token; only a SETTLED disposition frees it
+    (``release_window_reservation``, called once the cleanup has completed).
+    """
     if entry_token_value is None:
         return
-    for wid in [
-        wid for wid, token in _window_reservations.items() if token == entry_token_value
-    ]:
-        _window_reservations.pop(wid, None)
-        logger.debug("trust lane released reservation on %s (token cleared)", wid)
+    for wid, token in list(_window_reservations.items()):
+        if token == entry_token_value:
+            _window_reservations[wid] = _ORPHANED_RESERVATION
+            logger.debug(
+                "trust lane ORPHANED the reservation on %s (its token died; it "
+                "is freed only when the window's disposition settles)",
+                wid,
+            )
 
 
 def reset_reservations_for_tests() -> None:
@@ -757,10 +769,14 @@ async def cleanup_created_window(
     # supplies a fake, so it never has to SEED the live ``session_manager`` to
     # reach a ``SPARED_BOUND`` — seeding it is what let a fake-tmux test's
     # replay escape into the user's real tmux server.
+    #
+    # UNCONDITIONAL (review r14 P1-B, applied here by the self-audit): a
+    # ``getattr(..., None)`` fallback would silently SKIP the BOUND check for
+    # any authority missing the method — turning a safety check into a no-op
+    # exactly when it matters. Injection chooses WHICH authority answers; it
+    # never makes answering optional.
     bindings_source = session_mgr or session_manager
-    bindings_probe = getattr(bindings_source, "iter_thread_bindings", None)
-    if bindings_probe is None:
-        bindings_probe = session_manager.iter_thread_bindings
+    bindings_probe = bindings_source.iter_thread_bindings
     is_bound = window_id in {wid for _, _, wid in bindings_probe()}
     if is_bound:
         logger.warning(
@@ -778,18 +794,8 @@ async def cleanup_created_window(
     # nothing can interleave between them and the tmux call. Both are resolved
     # through the INJECTED authority when it offers them, so a unit test never
     # has to seed the live singleton to model a registered window.
-    cached_probe = getattr(bindings_source, "peek_session_id_for_window", None)
-    fresh_probe = getattr(bindings_source, "read_session_id_for_window_fresh", None)
-    cached_sid = (
-        cached_probe(window_id)
-        if cached_probe is not None
-        else peek_session_id_for_window(window_id)
-    )
-    fresh_sid = (
-        fresh_probe(window_id)
-        if fresh_probe is not None
-        else read_session_id_for_window_fresh(window_id)
-    )
+    cached_sid = bindings_source.peek_session_id_for_window(window_id)
+    fresh_sid = bindings_source.read_session_id_for_window_fresh(window_id)
     is_registered = cached_sid is not None or fresh_sid is not None
     if is_registered:
         logger.warning(
@@ -800,24 +806,65 @@ async def cleanup_created_window(
             reason,
         )
         return CleanupOutcome.SPARED_REGISTERED
-    if owner_guard is not None and not await owner_guard():
-        # OWNERSHIP RE-CHECK, immediately before the kill (review r9 P1-B). A
-        # cleanup can outlive the flow that started it — the orphan arm bounds
-        # it and then cancels, but a straggler already past its bound could
-        # still reach this line. By then a NEW flow may have adopted this window
-        # id, and killing it would destroy a live session that has nothing to do
-        # with us. This is the belt to the leash's suspenders: even a straggler
-        # cannot kill a window it no longer owns.
-        logger.warning(
-            "Skipping cleanup of tmux window %s (%s) after %s: it is no longer "
-            "owned by the flow that requested the cleanup",
-            window_id,
-            window_name,
-            reason,
-        )
-        return CleanupOutcome.SPARED_BOUND
+    # OWNERSHIP RE-CHECK, immediately before the kill, UNDER THE LIFECYCLE LOCK
+    # (review r9 P1-B, made linearizable in r14 P1-E). A cleanup can outlive the
+    # flow that started it, and by the time a straggler reaches this line a NEW
+    # owner may hold the window — killing it would destroy a live session that
+    # has nothing to do with us. Checking outside the lock was check-then-act:
+    # a bind could commit between the check and the kill. Both now happen in one
+    # critical section, so the kill can only ever land on a window that is still
+    # unowned AT THE MOMENT IT LANDS.
+    #
+    # The BINDING is re-read here too, not just the caller's guard: an aborted
+    # creation's cleanup races exactly the adopters this protects.
     try:
-        killed = await tmux_mgr.kill_window(window_id)
+        async with tmux_mgr.window_lifecycle_lock():
+            bindings_now = {wid for _, _, wid in bindings_probe()}
+            if window_id in bindings_now:
+                logger.warning(
+                    "Skipping cleanup of tmux window %s (%s) after %s: it was "
+                    "BOUND while the cleanup was in flight",
+                    window_id,
+                    window_name,
+                    reason,
+                )
+                return CleanupOutcome.SPARED_BOUND
+            if owner_guard is not None and not await owner_guard():
+                logger.warning(
+                    "Skipping cleanup of tmux window %s (%s) after %s: it is no "
+                    "longer owned by the flow that requested the cleanup",
+                    window_id,
+                    window_name,
+                    reason,
+                )
+                return CleanupOutcome.SPARED_BOUND
+            # DISPATCH under the lock, AWAIT outside it (r14 self-audit).
+            # The registration is what must be atomic with the checks above;
+            # the tmux round-trip must NOT be, or a wedged libtmux kill holds
+            # the lifecycle lock for every other window — the very thing P1-B
+            # bounds everywhere else.
+            inner = tmux_mgr.begin_kill_locked(window_id)
+    except LifecycleTimeout as e:
+        logger.error(
+            "cleanup of tmux window %s could not complete within its bound: %s",
+            window_id,
+            e,
+        )
+        return CleanupOutcome.KILL_FAILED
+    return await _settle_kill(window_id, window_name, tmux_mgr, inner, reason=reason)
+
+
+async def _settle_kill(
+    window_id: str,
+    window_name: str,
+    tmux_mgr: Any,
+    inner: Any,
+    *,
+    reason: str,
+) -> CleanupOutcome:
+    """Await a dispatched kill and classify it. The lifecycle lock is RELEASED."""
+    try:
+        killed = await tmux_mgr.finish_kill(window_id, inner)
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001
@@ -1868,39 +1915,43 @@ async def _revalidate_bind_preconditions(flow: TrustFlow, session_mgr: Any) -> N
     Raises ``TrustBindRefused``, which lands BEFORE ``bind_thread`` — so it is
     always a clean nothing-happened and the caller's failure arm owns the copy.
     """
-    finder = getattr(flow.tmux_mgr, "find_window_by_id", None)
-    if finder is not None:
-        try:
-            window = await finder(flow.created_wid, fresh=True)
-        except TypeError:
-            # An injected fake without the keyword; the freshness requirement is
-            # a production concern and a fake's listing is never stale.
-            window = await finder(flow.created_wid)
-        if window is None:
-            raise TrustBindRefused(
-                f"window {flow.created_wid} no longer exists after the adoption wait"
-            )
+    # BOUNDED (review r14 P1-B). This probe runs UNDER the lifecycle lock, so an
+    # unbounded await here meant ``LifecycleTimeout`` could never actually fire
+    # on the trust path — the one seam whose whole job is to not hang.
+    #
+    # No feature-sniffing: the adoption protocol is UNCONDITIONAL. Every manager
+    # the lane is given — production or fake — carries these seams, and a
+    # ``getattr(...) is not None`` guard silently degrades to NO protocol for
+    # any object that happens to lack one, which is precisely the failure mode
+    # a protocol exists to prevent.
+    #
+    # ABSENCE MUST BE PROVEN, NOT INFERRED (r14 self-audit) — the same rule the
+    # create verification and the legacy seam already follow. A bare ``None``
+    # from a lookup also means "the listing failed", and refusing on that would
+    # make the trust bind fail whenever enumeration hiccups. Only a listing that
+    # WORKED and does not contain our window proves it is gone.
+    listed = await flow.tmux_mgr._bounded_lifecycle(
+        flow.tmux_mgr.list_windows_fresh(),
+        what="trust bind existence probe",
+    )
+    if listed and not any(w.window_id == flow.created_wid for w in listed):
+        raise TrustBindRefused(
+            f"window {flow.created_wid} no longer exists after the adoption wait"
+        )
 
-    owner = getattr(session_mgr, "get_window_for_thread", None)
-    if owner is not None:
-        bound = owner(flow.user_id, flow.thread_id)
-        if bound is not None and bound != flow.created_wid:
-            raise TrustBindRefused(
-                f"thread {flow.thread_id} was bound to {bound} during the adoption wait"
-            )
+    bound = session_mgr.get_window_for_thread(flow.user_id, flow.thread_id)
+    if bound is not None and bound != flow.created_wid:
+        raise TrustBindRefused(
+            f"thread {flow.thread_id} was bound to {bound} during the adoption wait"
+        )
 
     # The OTHER direction of exclusivity (review r12 P1-C).
-    bindings = getattr(session_mgr, "iter_thread_bindings", None)
-    if bindings is not None:
-        for uid, tid, wid in bindings():
-            if wid == flow.created_wid and (uid, tid) != (
-                flow.user_id,
-                flow.thread_id,
-            ):
-                raise TrustBindRefused(
-                    f"window {flow.created_wid} was bound by thread {tid} during "
-                    "the adoption wait"
-                )
+    for uid, tid, wid in session_mgr.iter_thread_bindings():
+        if wid == flow.created_wid and (uid, tid) != (flow.user_id, flow.thread_id):
+            raise TrustBindRefused(
+                f"window {flow.created_wid} was bound by thread {tid} during "
+                "the adoption wait"
+            )
 
     entry = picker_entry(flow.user_data, flow.thread_id)
     if entry is None or entry.get(TRUST_GENERATION_KEY) != flow.generation:
@@ -2055,8 +2106,7 @@ async def _complete_bind(flow: TrustFlow, bot: Any, session_mgr: Any) -> None:
     # picker — can change while we are parked. Ignoring the wait's own boolean
     # was the same class: a wait that TIMED OUT meant the kill could still land,
     # which is precisely when binding is least safe.
-    kill_gate = getattr(flow.tmux_mgr, "await_kill_settled", None)
-    if kill_gate is not None and not await kill_gate(flow.created_wid):
+    if not await flow.tmux_mgr.await_kill_settled(flow.created_wid):
         raise TrustBindRefused(
             f"a kill for window {flow.created_wid} did not settle — refusing to "
             "bind a window that may be about to disappear"
@@ -2074,37 +2124,31 @@ async def _complete_bind(flow: TrustFlow, bot: Any, session_mgr: Any) -> None:
     # a wedged tmux must not freeze the lifecycle of every other window. Expiry
     # unwinds out of the ``async with`` (releasing the lock) and converts to
     # the lane's own typed refusal, which lands BEFORE ``bind_thread``.
-    lifecycle = getattr(flow.tmux_mgr, "window_lifecycle_lock", None)
-    if lifecycle is not None:
-        try:
-            async with lifecycle():
-                await _revalidate_bind_preconditions(flow, session_mgr)
-                session_mgr.bind_thread(
-                    flow.user_id,
-                    flow.thread_id,
-                    flow.created_wid,
-                    window_name=flow.window_name,
-                )
-                # The bind is DONE. Leave the discoverable note BEFORE the
-                # payload replay so a teardown racing the terminalizer can still
-                # learn completion won even if the replay itself raises (review
-                # r2 P2-A). It stays inside the hold so "bound" and "provably
-                # bound" are committed together.
-                _note_completion(flow)
-        except LifecycleTimeout as e:
-            raise TrustBindRefused(
-                f"the adoption check for {flow.created_wid} exceeded its "
-                f"lifecycle bound: {e}"
-            ) from e
-    else:
-        await _revalidate_bind_preconditions(flow, session_mgr)
-        session_mgr.bind_thread(
-            flow.user_id,
-            flow.thread_id,
-            flow.created_wid,
-            window_name=flow.window_name,
-        )
-        _note_completion(flow)
+    #
+    # UNCONDITIONAL (review r14 P1-B). The previous shape sniffed for the lock
+    # and fell back to an UNLOCKED bind when it was absent — which meant any
+    # manager missing the attribute silently got no protocol at all, exactly the
+    # hole the protocol exists to close. Every manager carries these seams.
+    try:
+        async with flow.tmux_mgr.window_lifecycle_lock():
+            await _revalidate_bind_preconditions(flow, session_mgr)
+            session_mgr.bind_thread(
+                flow.user_id,
+                flow.thread_id,
+                flow.created_wid,
+                window_name=flow.window_name,
+            )
+            # The bind is DONE. Leave the discoverable note BEFORE the payload
+            # replay so a teardown racing the terminalizer can still learn
+            # completion won even if the replay itself raises (review r2 P2-A).
+            # It stays inside the hold so "bound" and "provably bound" are
+            # committed together.
+            _note_completion(flow)
+    except LifecycleTimeout as e:
+        raise TrustBindRefused(
+            f"the adoption check for {flow.created_wid} exceeded its "
+            f"lifecycle bound: {e}"
+        ) from e
     _release_tokens(flow)
 
     route = (flow.user_id, flow.thread_id, flow.created_wid)

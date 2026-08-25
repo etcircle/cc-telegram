@@ -35,6 +35,7 @@ from cctelegram.handlers.directory_browser import (
     picker_entry,
 )
 from cctelegram.utils import app_dir
+from tests.cctelegram._adoption_protocol import AdoptionProtocolMixin
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 _TRUST = (_FIXTURES / "folder_trust_arrival_plain_v2.1.241.txt").read_text()
@@ -66,7 +67,7 @@ def _lane(monkeypatch: pytest.MonkeyPatch) -> Any:
     (app_dir() / "session_map.json").unlink(missing_ok=True)
 
 
-class _Tmux:
+class _Tmux(AdoptionProtocolMixin):
     def __init__(self, *, command: str = "claude", pane: str = "") -> None:
         self.command = command
         self.pane = pane
@@ -409,8 +410,16 @@ async def test_a_reserved_window_is_not_offered_before_its_flow_installs() -> No
         trust_flow.reset_reservations_for_tests()
 
 
-def test_a_dying_picker_entry_releases_its_reservation() -> None:
-    """An aborted creation must not hold a window id out of the list forever."""
+def test_a_dying_picker_entry_orphans_but_does_not_free_its_reservation() -> None:
+    """Entry death must NOT expose the window (review r14 P1-E).
+
+    Wave 13 freed the reservation when the entry token died. That was premature:
+    an aborted creation drops its entry and THEN runs the guarded cleanup, so
+    freeing at entry death exposed the window for adoption DURING that cleanup —
+    and the cleanup's kill then landed on whoever had just taken it. The
+    reservation survives the token, ORPHANED, until the window's disposition
+    SETTLES.
+    """
     from cctelegram.handlers.directory_browser import (
         drop_picker_entry,
         ensure_picker_entry,
@@ -426,21 +435,11 @@ def test_a_dying_picker_entry_releases_its_reservation() -> None:
 
     drop_picker_entry(user_data, _THREAD)
 
-    assert _FAKE_WID not in trust_flow.windows_owned_by_live_flows(), (
-        "the reservation must die with the entry token that owns it"
+    assert _FAKE_WID in trust_flow.windows_owned_by_live_flows(), (
+        "the window must stay unadoptable while its cleanup is still to run"
     )
 
-
-def test_the_kill_lock_bound_exceeds_the_lifecycle_bound() -> None:
-    """A kill must never fail merely because a LAWFUL create was slow.
-
-    Every legitimate holder of the lifecycle lock releases by
-    ``LIFECYCLE_TMUX_TIMEOUT_S``, so a kill that waits longer than that only
-    fails when something is wedged beyond the protocol. Inverting the two would
-    make kills fail during ordinary busy creation — the opposite of what the
-    bound is for.
-    """
-    assert tmux_mod.KILL_LOCK_TIMEOUT_S > tmux_mod.LIFECYCLE_TMUX_TIMEOUT_S, (
-        f"kill-lock bound {tmux_mod.KILL_LOCK_TIMEOUT_S}s must exceed the "
-        f"lifecycle bound {tmux_mod.LIFECYCLE_TMUX_TIMEOUT_S}s"
-    )
+    # Only a SETTLED disposition frees it.
+    trust_flow.release_window_reservation(_FAKE_WID)
+    assert _FAKE_WID not in trust_flow.windows_owned_by_live_flows()
+    trust_flow.reset_reservations_for_tests()

@@ -135,17 +135,24 @@ def drop_picker_entry(user_data: dict | None, thread_id: int | None) -> dict | N
     if not pickers:
         # Keep ``user_data`` tidy once the last thread's picker is gone.
         user_data.pop(_PENDING_PICKERS_KEY, None)
-    _release_trust_reservations(entry)
+    _orphan_trust_reservations(entry)
     return entry if isinstance(entry, dict) else None
 
 
-def _release_trust_reservations(entry: object) -> None:
-    """Drop any GH #65 pre-flow window reservation held under a dying entry.
+def _orphan_trust_reservations(entry: object) -> None:
+    """ORPHAN a dying entry's GH #65 window reservations — do not free them.
 
-    The reservation is keyed by the entry's identity token (review r13 P1-C), so
-    the token dying IS the reservation dying — that is what stops an aborted or
-    superseded creation from holding a window id out of the directory browser's
-    unbound list forever. Imported function-locally to keep this module a leaf.
+    Review r14 P1-E. Releasing on entry death was PREMATURE: an aborted creation
+    drops its entry and then runs the guarded cleanup, so freeing the window at
+    entry death exposed it for adoption DURING that cleanup — a competitor took
+    it, and the still-running cleanup then killed the window out from under the
+    new owner. A reservation may only be released once the window's disposition
+    has SETTLED (killed, or deliberately spared).
+
+    So the token is cleared but the reservation REMAINS, re-keyed to no owner:
+    the window stays unadoptable, and whoever is settling it releases it. The
+    entry-death path is a re-key, not a free. Imported function-locally to keep
+    this module a leaf.
     """
     if not isinstance(entry, dict):
         return
@@ -154,7 +161,7 @@ def _release_trust_reservations(entry: object) -> None:
         return
     from cctelegram.handlers import trust_flow
 
-    trust_flow.release_reservations_for_token(token)
+    trust_flow.orphan_reservations_for_token(token)
 
 
 def picker_entries(user_data: dict | None) -> list[dict]:

@@ -30,6 +30,7 @@ from cctelegram.handlers.directory_browser import (
     picker_entry,
 )
 from cctelegram.utils import app_dir
+from tests.cctelegram._adoption_protocol import AdoptionProtocolMixin
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 _TRUST = (_FIXTURES / "folder_trust_arrival_plain_v2.1.241.txt").read_text()
@@ -61,7 +62,7 @@ def _lane(monkeypatch: pytest.MonkeyPatch) -> Any:
     (app_dir() / "session_map.json").unlink(missing_ok=True)
 
 
-class _Tmux:
+class _Tmux(AdoptionProtocolMixin):
     def __init__(self, *, command: str = "claude", pane: str = "") -> None:
         self.command = command
         self.pane = pane
@@ -436,7 +437,7 @@ async def test_an_aborted_cancel_leaves_a_flow_that_is_still_observed() -> None:
     wait_task = flow.wait_task
     assert wait_task is not None
 
-    class _Exploding:
+    class _Exploding(AdoptionProtocolMixin):
         async def kill_window(self, window_id: str) -> bool:
             raise RuntimeError("boom")
 

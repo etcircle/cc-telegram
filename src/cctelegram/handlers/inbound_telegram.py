@@ -1429,10 +1429,11 @@ async def _abort_created_window_after_pending_owner_change(
     resume_session_id: str | None,
 ) -> None:
     """Surface a stale picker after a window was created but before binding."""
-    # The creation is being ABORTED, so the pre-flow reservation must go with it
-    # (review r13 P1-C) — otherwise an aborted creation would hold a window id
-    # out of the directory browser's unbound list forever.
-    trust_flow.release_window_reservation(created_wid)
+    # THE RESERVATION IS HELD ACROSS THE CLEANUP (review r14 P1-E). Releasing it
+    # here — before the guarded cleanup below has settled — exposed the window
+    # for adoption DURING that cleanup, and the cleanup's own kill then landed
+    # on whoever had just taken it. It is released after the cleanup instead, so
+    # a release is always coupled to a SETTLED disposition.
     logger.warning(
         "Pending owner changed before binding created window %s "
         "(user=%d, callback_thread=%d, owner_still_present=%s)",
@@ -1462,6 +1463,10 @@ async def _abort_created_window_after_pending_owner_change(
         show_alert = not cleanup_ok
     else:
         cleanup_note = " The resumed tmux window was left unbound."
+
+    # The disposition has now SETTLED (killed, or deliberately left unbound on
+    # the resume path), so the reservation may finally be freed.
+    trust_flow.release_window_reservation(created_wid)
 
     await safe_edit(
         query,
@@ -1525,6 +1530,23 @@ async def _create_and_bind_window(
         resume_session_id=resume_session_id,
         defer_launch=use_trust_lane,
     )
+    if not success and created_wid:
+        # CREATED-BUT-UNVERIFIED (review r14 P1-C): the window EXISTS even though
+        # creation reported failure, so it must be SETTLED rather than lost. It
+        # is reserved first — nothing may adopt it while we clean — and the
+        # reservation is released only once the guarded cleanup has settled.
+        trust_flow.reserve_window(created_wid, creation_entry_token)
+        try:
+            await trust_flow.cleanup_created_window(
+                created_wid,
+                created_wname,
+                tmux_mgr,
+                reason="creation could not be verified",
+                session_mgr=session_mgr,
+            )
+        finally:
+            trust_flow.release_window_reservation(created_wid)
+
     if success:
         # OWNERSHIP BEGINS AT CREATION (GH #65 review r13 P1-C). Registered
         # BEFORE any probe or Telegram await, so the window is never offered as
@@ -1556,67 +1578,113 @@ async def _create_and_bind_window(
             return
 
         if use_trust_lane:
-            # GH #65 Fix 0: the window was created in launch-deferred mode, so
-            # the pane is a fresh interactive shell. Probe ITS OWN CLI version
-            # (nonce-delimited, shell-resolution parity, positive
-            # ``(Claude Code)`` proof) and then ALWAYS launch — a probe failure
-            # only makes the trust card display-only, it never blocks a launch.
-            cli_version = await trust_flow.probe_version_and_launch(
-                created_wid, tmux_mgr
-            )
-            assert pending_thread_id is not None
-            if not _pending_owner_matches(context.user_data, pending_thread_id):
-                await _abort_created_window_after_pending_owner_change(
-                    query,
-                    user_data=context.user_data,
-                    user_id=user.id,
-                    pending_thread_id=pending_thread_id,
-                    tmux_mgr=tmux_mgr,
-                    created_wid=created_wid,
-                    created_wname=created_wname,
-                    resume_session_id=resume_session_id,
+            # THE WHOLE PRE-FLOW PHASE IS COVERED (review r14 P2). Between here
+            # and the flow install there are a version probe, a launch and two
+            # Telegram edits — any of which can raise or be cancelled. Every
+            # NAMED exit already settles the window, but an UNNAMED one (a crash,
+            # a cancellation) left the reservation with no cleanup owner: a later
+            # ``/start`` would eventually free it, but nothing knew to settle the
+            # WINDOW itself. This makes the invariant unconditional — on any exit
+            # that did NOT install the flow, run the guarded cleanup and only
+            # THEN release the reservation, so a release is always coupled to a
+            # settled disposition.
+            disposition_settled = False
+            try:
+                # GH #65 Fix 0: the window was created in launch-deferred mode, so
+                # the pane is a fresh interactive shell. Probe ITS OWN CLI version
+                # (nonce-delimited, shell-resolution parity, positive
+                # ``(Claude Code)`` proof) and then ALWAYS launch — a probe failure
+                # only makes the trust card display-only, it never blocks a launch.
+                cli_version = await trust_flow.probe_version_and_launch(
+                    created_wid, tmux_mgr
                 )
+                assert pending_thread_id is not None
+                if not _pending_owner_matches(context.user_data, pending_thread_id):
+                    # Settled by the helper (kill + reservation release), so the
+                    # ``finally`` must not repeat it.
+                    disposition_settled = True
+                    await _abort_created_window_after_pending_owner_change(
+                        query,
+                        user_data=context.user_data,
+                        user_id=user.id,
+                        pending_thread_id=pending_thread_id,
+                        tmux_mgr=tmux_mgr,
+                        created_wid=created_wid,
+                        created_wname=created_wname,
+                        resume_session_id=resume_session_id,
+                    )
+                    return
+                # GH #65 Fix 3: answer the callback + edit the card BEFORE the wait.
+                # The ENTIRE wait (including the first hook-timeout phase) runs in
+                # the spawned task, which captures stable primitives only — never
+                # the CallbackQuery / CallbackContext objects.
+                await safe_edit(query, f"🚀 {message}\n\nStarting Claude…")
+                await safe_answer(query, "Created")
+                card = getattr(query, "message", None)
+                flow = await trust_flow.start_trust_wait(
+                    bot=context.bot,
+                    user_id=user.id,
+                    thread_id=pending_thread_id,
+                    chat_id=session_mgr.resolve_chat_id(user.id, pending_thread_id),
+                    user_data=context.user_data,
+                    entry_token=creation_entry_token,
+                    card_chat_id=getattr(card, "chat_id", None),
+                    card_msg_id=getattr(card, "message_id", None),
+                    created_wid=created_wid,
+                    window_name=created_wname,
+                    selected_path=selected_path,
+                    create_message=message,
+                    cli_version=cli_version,
+                    tmux_mgr=tmux_mgr,
+                    session_mgr=session_mgr,
+                )
+                if flow is None:
+                    # GH #65 review r1 P1-1: the topic stopped being claimable
+                    # inside the two Telegram awaits above (a concurrent /start or
+                    # topic close). Installing an ownerless flow would leave it
+                    # UNREACHABLE, so abort through the guarded cleanup instead.
+                    #
+                    # That helper ALREADY settles the window and releases the
+                    # reservation, so this exit is accounted for — marking it
+                    # keeps the ``finally`` from cleaning a second time.
+                    disposition_settled = True
+                    await _abort_created_window_after_pending_owner_change(
+                        query,
+                        user_data=context.user_data,
+                        user_id=user.id,
+                        pending_thread_id=pending_thread_id,
+                        tmux_mgr=tmux_mgr,
+                        created_wid=created_wid,
+                        created_wname=created_wname,
+                        resume_session_id=resume_session_id,
+                    )
+                else:
+                    # The flow OWNS the window now; ownership passed from the
+                    # reservation to the flow record inside ``start_trust_wait``.
+                    disposition_settled = True
                 return
-            # GH #65 Fix 3: answer the callback + edit the card BEFORE the wait.
-            # The ENTIRE wait (including the first hook-timeout phase) runs in
-            # the spawned task, which captures stable primitives only — never
-            # the CallbackQuery / CallbackContext objects.
-            await safe_edit(query, f"🚀 {message}\n\nStarting Claude…")
-            await safe_answer(query, "Created")
-            card = getattr(query, "message", None)
-            flow = await trust_flow.start_trust_wait(
-                bot=context.bot,
-                user_id=user.id,
-                thread_id=pending_thread_id,
-                chat_id=session_mgr.resolve_chat_id(user.id, pending_thread_id),
-                user_data=context.user_data,
-                entry_token=creation_entry_token,
-                card_chat_id=getattr(card, "chat_id", None),
-                card_msg_id=getattr(card, "message_id", None),
-                created_wid=created_wid,
-                window_name=created_wname,
-                selected_path=selected_path,
-                create_message=message,
-                cli_version=cli_version,
-                tmux_mgr=tmux_mgr,
-                session_mgr=session_mgr,
-            )
-            if flow is None:
-                # GH #65 review r1 P1-1: the topic stopped being claimable
-                # inside the two Telegram awaits above (a concurrent /start or
-                # topic close). Installing an ownerless flow would leave it
-                # UNREACHABLE, so abort through the guarded cleanup instead.
-                await _abort_created_window_after_pending_owner_change(
-                    query,
-                    user_data=context.user_data,
-                    user_id=user.id,
-                    pending_thread_id=pending_thread_id,
-                    tmux_mgr=tmux_mgr,
-                    created_wid=created_wid,
-                    created_wname=created_wname,
-                    resume_session_id=resume_session_id,
-                )
-            return
+            finally:
+                if not disposition_settled:
+                    # Best effort, and it must never mask the original failure.
+                    try:
+                        await trust_flow.cleanup_created_window(
+                            created_wid,
+                            created_wname,
+                            tmux_mgr,
+                            reason="creation flow ended before the flow installed",
+                            session_mgr=session_mgr,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "pre-flow cleanup failed for window %s", created_wid
+                        )
+                    finally:
+                        # The disposition has settled (or we tried and failed and
+                        # logged it); either way the reservation must not outlive
+                        # this phase with nobody owning it.
+                        trust_flow.release_window_reservation(created_wid)
 
         # Wait for Claude Code's SessionStart hook to register in session_map.
         # Resume sessions take longer to start (loading session state), so use
@@ -1809,8 +1877,13 @@ async def _create_and_bind_window(
                     # would break the legacy path whenever enumeration hiccups.
                     # Only a listing that WORKED and lacks our window proves it
                     # is gone.
+                    # FRESH (review r14 P1-F). ``list_windows`` reads the 1 s
+                    # cache, and this path's own creation-verification warms it
+                    # — so a window killed right afterwards stayed "present" for
+                    # the rest of the TTL and the legacy seam bound a corpse.
+                    # Every adoption probe must bypass the cache.
                     listed = await tmux_mgr._bounded_lifecycle(
-                        tmux_mgr.list_windows(),
+                        tmux_mgr.list_windows_fresh(),
                         what="legacy bind existence probe",
                     )
                     proven_absent = bool(listed) and not any(
@@ -1851,10 +1924,28 @@ async def _create_and_bind_window(
                     "Binding the window took too long. Please check tmux and try again."
                 )
             if bind_refusal is not None:
-                trust_flow.release_window_reservation(created_wid)
+                # SETTLE BEFORE RELEASING (r14 self-audit, same class as P1-E).
+                # The bind did NOT happen, so the window is alive and unowned —
+                # releasing the reservation here without settling it would leave
+                # exactly the orphan the reservation exists to prevent. The
+                # guarded cleanup is the right seam: if the refusal was "another
+                # topic claimed it", that topic's binding makes this a
+                # SPARED_BOUND and the window is correctly left alone.
+                try:
+                    await trust_flow.cleanup_created_window(
+                        created_wid,
+                        created_wname,
+                        tmux_mgr,
+                        reason="legacy bind refused",
+                        session_mgr=session_mgr,
+                    )
+                finally:
+                    trust_flow.release_window_reservation(created_wid)
                 await safe_edit(query, f"⚠️ {bind_refusal}")
                 await safe_answer(query, "Could not bind the window", show_alert=True)
                 return
+            # BOUND is itself a settled disposition — the flow's window now has
+            # a real owner, so the reservation has done its job.
             trust_flow.release_window_reservation(created_wid)
 
             status = "Resumed" if resume_session_id else "Created"

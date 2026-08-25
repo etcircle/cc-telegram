@@ -36,6 +36,7 @@ from cctelegram.handlers.directory_browser import (
     picker_entry,
 )
 from cctelegram.utils import app_dir
+from tests.cctelegram._adoption_protocol import AdoptionProtocolMixin
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 _TRUST = (_FIXTURES / "folder_trust_arrival_plain_v2.1.241.txt").read_text()
@@ -67,7 +68,7 @@ def _lane(monkeypatch: pytest.MonkeyPatch) -> Any:
     (app_dir() / "session_map.json").unlink(missing_ok=True)
 
 
-class _Tmux:
+class _Tmux(AdoptionProtocolMixin):
     def __init__(self, *, command: str = "claude", pane: str = "") -> None:
         self.command = command
         self.pane = pane
@@ -253,6 +254,7 @@ async def test_create_window_proves_the_window_exists_before_reporting_success(
         ]
 
     monkeypatch.setattr(real_tmux, "list_windows", _listing_without_our_window)
+    monkeypatch.setattr(real_tmux, "list_windows_fresh", _listing_without_our_window)
     monkeypatch.setattr(asyncio, "to_thread", _to_thread)
 
     ok, msg, name, wid = await real_tmux.create_window(
@@ -314,12 +316,13 @@ async def test_the_trust_bind_refuses_a_window_that_died_during_the_wait() -> No
 
     probed = asyncio.Event()
 
-    async def _gone(window_id: str) -> Any:
-        del window_id
+    async def _listing_without_it() -> Any:
+        # A listing that WORKED and does not contain our window — the only shape
+        # that PROVES absence (an empty listing proves nothing).
         probed.set()
-        return None
+        return [SimpleNamespace(window_id="@fake-someone-else")]
 
-    tmux.find_window_by_id = _gone  # type: ignore[attr-defined]
+    tmux.list_windows_fresh = _listing_without_it  # type: ignore[attr-defined]
     flow = await _start(user_data, tmux=tmux, bot=_Bot(), sessions=sessions)
     assert flow is not None
     sessions.registered = True

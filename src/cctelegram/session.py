@@ -1459,6 +1459,24 @@ class SessionManager:
             for thread_id, window_id in bindings.items():
                 yield user_id, thread_id, window_id
 
+    def peek_session_id_for_window(self, window_id: str | None) -> str | None:
+        """The CACHED session id for a window, or None.
+
+        Part of the GH #65 "session authority" interface the guarded cleanup
+        calls UNCONDITIONALLY (review r14): the caller chooses WHICH authority
+        answers, but answering is never optional — a missing method would have
+        silently turned the registered-window safety check into a no-op.
+        """
+        return peek_session_id_for_window(window_id)
+
+    def read_session_id_for_window_fresh(self, window_id: str | None) -> str | None:
+        """The FRESH (on-disk) session id for a window, or None.
+
+        The declared linearization point of the guarded cleanup; see
+        ``peek_session_id_for_window`` for why it is a method.
+        """
+        return read_session_id_for_window_fresh(window_id)
+
     async def find_users_for_session(
         self,
         session_id: str,

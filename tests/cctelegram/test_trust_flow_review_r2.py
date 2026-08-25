@@ -42,6 +42,7 @@ from cctelegram.handlers.directory_browser import (
     picker_entry,
 )
 from cctelegram.utils import app_dir
+from tests.cctelegram._adoption_protocol import AdoptionProtocolMixin
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 _THREAD = 88
@@ -78,7 +79,7 @@ def _lane(monkeypatch: pytest.MonkeyPatch) -> Any:
     (app_dir() / "session_map.json").unlink(missing_ok=True)
 
 
-class _StubTmux:
+class _StubTmux(AdoptionProtocolMixin):
     def __init__(self, *, command: str = "claude", pane: str = "") -> None:
         self.command = command
         self.pane = pane
