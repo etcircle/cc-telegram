@@ -783,6 +783,14 @@ class TmuxManager:
         # fallback (which logs at debug and returns []).
         if _TMUX_BIN is None:
             return await asyncio.to_thread(self._list_windows_libtmux)
+        # CANCELLATION-SAFE (review r18 P2), the same discipline as
+        # ``capture_pane_cancellation_safe``. This is the ADOPTION listing's
+        # subprocess, and adoption callers run it under ``_bounded_lifecycle`` —
+        # so a wedged tmux means the deadline fires and cancels us mid-
+        # ``communicate``. ``CancelledError`` is a BaseException, so the
+        # ``except Exception`` below never saw it: the child was neither killed
+        # nor reaped, leaking one tmux process per timed-out adoption attempt.
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 _TMUX_BIN,
@@ -794,6 +802,23 @@ class TmuxManager:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:  # pragma: no cover — proc already gone
+                    pass
+                # The reap must survive a REPEATED cancellation: a second
+                # CancelledError landing in a bare ``await proc.wait()`` would
+                # escape and leave the killed child unreaped. ``shield`` keeps
+                # the reap running even if THIS await is cancelled again, and
+                # BaseException is caught so the ORIGINAL cancellation is what
+                # propagates.
+                try:
+                    await asyncio.shield(proc.wait())
+                except BaseException:  # noqa: BLE001 — reap best-effort
+                    pass
+            raise
         except Exception as e:
             logger.warning(
                 "tmux list-panes subprocess failed (%s); falling back to libtmux",

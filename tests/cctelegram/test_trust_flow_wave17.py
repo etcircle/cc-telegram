@@ -316,3 +316,113 @@ def test_every_id_bearing_exit_routes_through_the_ownership_transfer() -> None:
         "through _transfer_ownership, so the caller would be handed an id the "
         f"reaper also owns: {offenders}"
     )
+
+
+# ── r18 P2: the adoption listing reaps its subprocess on cancellation ─────
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_adoption_listing_kills_and_reaps_its_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wedged tmux must not leak one process per timed-out adoption.
+
+    ``_list_windows_direct`` is the adoption listing's subprocess, and adoption
+    callers run it under ``_bounded_lifecycle`` — so a wedged tmux means the
+    deadline fires and cancels the coroutine mid-``communicate``.
+    ``CancelledError`` is a BaseException, so the method's ``except Exception``
+    never saw it: the child was neither killed nor reaped.
+    """
+    from cctelegram.tmux_manager import tmux_manager as real_tmux
+
+    killed = asyncio.Event()
+    reaped = asyncio.Event()
+    communicating = asyncio.Event()
+
+    class _HungChild:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            communicating.set()
+            await asyncio.sleep(30)  # a wedged tmux
+            return b"", b""
+
+        def kill(self) -> None:
+            killed.set()
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            reaped.set()
+            return -9
+
+    child = _HungChild()
+
+    async def _spawn(*_a: Any, **_kw: Any) -> Any:
+        return child
+
+    monkeypatch.setattr(tmux_mod, "_TMUX_BIN", "/usr/bin/tmux")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+
+    task = asyncio.create_task(real_tmux._list_windows_direct())
+    await asyncio.wait_for(communicating.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert killed.is_set(), (
+        "the tmux child was ORPHANED — one leaked process per timed-out "
+        "adoption attempt against a wedged tmux"
+    )
+    assert reaped.is_set(), "…and it must be REAPED, not left a zombie"
+
+
+@pytest.mark.asyncio
+async def test_the_caller_still_gets_its_lifecycle_timeout_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cleanup must not swallow the cancellation.
+
+    The reap is best-effort housekeeping; the ORIGINAL cancellation is what has
+    to reach the caller, so its bounded await still converts to the typed
+    refusal every adoption door handles.
+    """
+    from cctelegram.tmux_manager import tmux_manager as real_tmux
+
+    reaped = asyncio.Event()
+    communicating = asyncio.Event()
+
+    class _HungChild:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            communicating.set()
+            await asyncio.sleep(30)
+            return b"", b""
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            reaped.set()
+            return -9
+
+    async def _spawn(*_a: Any, **_kw: Any) -> Any:
+        return _HungChild()
+
+    monkeypatch.setattr(tmux_mod, "_TMUX_BIN", "/usr/bin/tmux")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    monkeypatch.setattr(tmux_mod, "LIFECYCLE_TMUX_TIMEOUT_S", 0.15)
+    real_tmux.reset_lifecycle_lock_for_tests()
+
+    with pytest.raises(tmux_mod.LifecycleTimeout):
+        async with real_tmux.window_lifecycle_lock():
+            await real_tmux._bounded_lifecycle(
+                real_tmux.adoption_listing(), what="adoption listing"
+            )
+
+    await asyncio.wait_for(reaped.wait(), timeout=5)
+    assert not real_tmux.window_lifecycle_lock().locked(), (
+        "the lifecycle lock must still be released on the way out"
+    )
