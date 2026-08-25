@@ -106,8 +106,15 @@ class _Sessions:
     ) -> bool:
         del window_id, timeout
         self.poll_times.append(trust_flow._wall())
+        # FAITHFUL to production (review r8 P2-B): the real implementation
+        # returns IMMEDIATELY once the session-map entry exists and only sleeps
+        # ``interval`` between misses. Sleeping unconditionally here made the
+        # fake, not the WAIT loop, provide the inter-slice pacing — which is
+        # precisely what hid the loop's missing per-slice floor.
+        if self.registered:
+            return True
         await asyncio.sleep(interval)
-        return self.registered
+        return False
 
     def get_window_state(self, window_id: str) -> Any:
         from types import SimpleNamespace

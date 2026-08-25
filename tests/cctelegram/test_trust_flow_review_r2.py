@@ -49,6 +49,8 @@ _USER = 5150
 # A window id that CANNOT exist on a real tmux server, so even a future
 # regression in an injection seam cannot address a live pane.
 _FAKE_WID = "@fake-trust-test"
+# A SECOND unmintable id, for the two-topic concurrency tests.
+_FAKE_WID_B = "@fake-trust-test-b"
 _TRUST = (_FIXTURES / "folder_trust_arrival_plain_v2.1.241.txt").read_text()
 _IDLE = (_FIXTURES / "inputbox_idle_v2.1.207.txt").read_text()
 _CORPSE = (_FIXTURES / "folder_trust_postesc_t4_plain_v2.1.241.txt").read_text()
@@ -510,7 +512,7 @@ async def test_p2_a_a_flow_that_completes_after_the_sweep_snapshot_is_reported()
         bot=slow_bot,
         session_mgr=session_b,
         thread_id=thread_b,
-        created_wid="@6",
+        created_wid=_FAKE_WID_B,
     )
     assert flow_a is not None and flow_b is not None
 
@@ -676,7 +678,7 @@ async def test_p2_e_ownership_resolves_the_tapped_card_not_the_thread() -> None:
         bot=_StubBot(),
         session_mgr=_StubSessionMgr(),
         user_id=_USER + 1,
-        created_wid="@6",
+        created_wid=_FAKE_WID_B,
         card_msg_id=222,
     )
     assert flow_a is not None and flow_b is not None

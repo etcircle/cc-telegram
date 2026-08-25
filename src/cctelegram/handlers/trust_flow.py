@@ -176,6 +176,11 @@ DISPATCH_SETTLE_BUDGET_S: float = 45.0
 # Extra time a teardown gives a RETAINED BIND TAIL past its own budget. A bind
 # that is about to win must never be force-claimed out from under itself.
 BIND_TAIL_GRACE_S: float = 10.0
+# How long the aborted-teardown orphan arm may spend on its guarded cleanup
+# (review r8 P1-A). It runs while we are ALREADY unwinding, so it is shielded
+# against re-cancellation and bounded against a wedged tmux; the flow is dropped
+# on every outcome regardless.
+ORPHAN_CLEANUP_BUDGET_S: float = 15.0
 _DISPATCH_SETTLE_POLL_S: float = 0.05
 
 _PICKER_CHROME_STATES: Final[tuple[str, ...]] = (
@@ -264,11 +269,19 @@ class TrustFlow:
     # (teardown's own, the WAIT terminalizer's) — cancelling those mid-cleanup
     # is the very "drop beneath another actor's kill_window" bug (r6 P1-B).
     claim_cancellable: bool = False
-    # THE TEARDOWN FENCE (review r6 P1-A). Set under the lock when a teardown
+    # THE TEARDOWN FENCE (review r6 P1-A). Raised under the lock when a teardown
     # starts; while it is up, every claim ACQUISITION is refused, so successive
     # claims cannot starve the teardown loop. In-flight claims still settle
     # normally — the fence stops new ones, it does not steal existing ones.
-    teardown_fenced: bool = False
+    #
+    # It is OWNED (review r8 P2-A). A bare boolean had no owner, so the FIRST of
+    # two concurrent teardowns lowered the fence the SECOND had raised (or one a
+    # replacement generation was relying on) and the survivor ran unfenced —
+    # exactly the starvation the fence exists to prevent. The owner is the
+    # raising task PLUS the generation it raised for, and only that pair may
+    # lower it.
+    fence_owner: asyncio.Task[Any] | None = None
+    fence_generation: int | None = None
     # The collaborators every arbitration path needs, so ANY actor (the WAIT
     # task, a callback, teardown) can run the full choreography without the
     # caller having to thread them through.
@@ -292,6 +305,32 @@ class TrustFlow:
     def phase(self) -> str:
         """The flow's current phase. READ-ONLY — mutate via the CAS seam."""
         return self._phase
+
+    @property
+    def teardown_fenced(self) -> bool:
+        """Whether ANY teardown currently holds the fence."""
+        return self.fence_owner is not None
+
+    def raise_fence(self) -> None:
+        """Claim the fence for the CURRENT task. Caller holds the creation lock.
+
+        Re-raising an unowned fence, or one this task already owns, is the
+        normal per-pass refresh. A fence another task owns is LEFT ALONE — it is
+        already up, which is all this caller needs.
+        """
+        if self.fence_owner is None or self.fence_owner is asyncio.current_task():
+            self.fence_owner = asyncio.current_task()
+            self.fence_generation = self.generation
+
+    def lower_fence_if_owned(self) -> bool:
+        """Release the fence only if THIS task raised it for THIS generation."""
+        if self.fence_owner is not asyncio.current_task():
+            return False
+        if self.fence_generation != self.generation:
+            return False
+        self.fence_owner = None
+        self.fence_generation = None
+        return True
 
 
 _FlowKey = tuple[int, int]
@@ -373,6 +412,20 @@ def flow_task(user_id: int, thread_id: int) -> asyncio.Task[None] | None:
 def lane_enabled() -> bool:
     """False when ``CC_TELEGRAM_TRUST_PROMPT_CEILING_S=0`` disables the lane."""
     return config.trust_prompt_ceiling_s > 0
+
+
+def enable_strict_invariants() -> None:
+    """Make every invariant violation RAISE instead of logging.
+
+    Called ONCE at suite import (review r8 P3). Arming it only inside
+    ``reset_for_tests`` made strictness test-ORDER dependent: the very first
+    test in a process — or any single test run in isolation, which is exactly
+    how a failure gets reproduced — ran with the invariants merely logging, so
+    the assertions that are supposed to be the lane's safety net were silently
+    inert in the one run where they matter most.
+    """
+    global _STRICT_INVARIANTS
+    _STRICT_INVARIANTS = True
 
 
 def reset_for_tests() -> None:
@@ -1002,6 +1055,7 @@ def try_transition_locked(
         flow.claim_task = None
         flow.claim_cancellable = False
     flow._phase = to
+    _assert_open_implies_observed(flow, to)
     if to in _TASK_CLAIMED_PHASES:
         # CLAIMED IMPLIES OWNED (review r7 P1-B). Registering the owner HERE,
         # inside the same critical section as the phase write, makes it
@@ -1050,6 +1104,39 @@ def _assert_claimed_implies_owned(flow: TrustFlow) -> None:
         if _STRICT_INVARIANTS:
             raise AssertionError(message)
         logger.error(message)
+
+
+def _assert_open_implies_observed(flow: TrustFlow, to: str) -> None:
+    """OPEN IMPLIES OBSERVED (review r8 P1-A) — the lane's second invariant.
+
+    An OPEN phase is not a resting state: it means "nobody holds this flow, and
+    its WAIT task is watching it". The ceilings, the registration poll, the
+    trust-card render and every terminal decision live in that task. Restoring a
+    flow to an OPEN phase when its observer is DEAD therefore parks the topic
+    forever — no ceiling can fire, no registration can complete, and every
+    inbound message nudges a flow nothing will ever advance. Round 6 fixed one
+    door into that room (the WAIT loop's own lost-CAS return); this closes the
+    class, so no future caller can reopen it from a path we have not thought of.
+
+    ``wait_task is None`` is the legitimate pre-observer window: ``start_trust_wait``
+    installs the flow at ``awaiting_trust`` and only then creates the task.
+
+    Raises under ``_STRICT_INVARIANTS`` (the test posture) and logs loudly in
+    production, where refusing to proceed would be worse than the bug.
+    """
+    if to not in OPEN_PHASES:
+        return
+    task = flow.wait_task
+    if task is None or not task.done():
+        return
+    message = (
+        f"trust flow restored to OPEN phase {to} with a DEAD observer "
+        f"(window={flow.created_wid}, thread={flow.thread_id}) — it must "
+        "terminalize instead"
+    )
+    if _STRICT_INVARIANTS:
+        raise AssertionError(message)
+    logger.error(message)
 
 
 async def force_terminal_claim(flow: TrustFlow) -> bool:
@@ -1560,7 +1647,22 @@ async def _wait_loop(
     last_pane_poll = 0.0
     pane_text: str | None = None
     pane_command: str | None = None
+    slice_started: float | None = None
     while True:
+        # THE PER-SLICE FLOOR (review r8 P2-B). ``wait_for_session_map_entry``
+        # returns IMMEDIATELY once the entry exists, so a slice that stays in
+        # the loop after a REGISTERED classification — the completion tail
+        # losing its CAS to a claim-holder, say — costs nothing and the loop
+        # rereads session_map.json at full speed for as long as that claim is
+        # held. Sleeping the REMAINDER of the previous slice (rather than an
+        # unconditional sleep) enforces the floor without adding latency to the
+        # common unregistered slice, which already spends SLICE_S inside the
+        # poll. It runs regardless of which branch continued.
+        if slice_started is not None:
+            spent = time.monotonic() - slice_started
+            if spent < SLICE_S:
+                await asyncio.sleep(SLICE_S - spent)
+        slice_started = time.monotonic()
         # A flow marked terminal (a teardown, an entry clear) is not ours any
         # more — leave at once rather than spending another slice on a pane we
         # may no longer touch (review r4 P1-C).
@@ -1828,10 +1930,27 @@ async def _terminalize(
     """
     inner = flow.bind_task
     if inner is not None and not inner.done():
+        # BOUNDED (review r8 P1-B). An unbounded shield-await here was the other
+        # half of the hung-tail deadlock: teardown cancels and awaits the WAIT
+        # task, whose terminalizer sat on a bind tail that never finished, so
+        # topic-close and shutdown hung forever. The tail gets a real grace and
+        # is then CANCELLED; a tail that had to be killed is not a success, so
+        # `bind_ok` is False below and the failure arm runs the guarded cleanup.
         try:
-            await asyncio.shield(inner)
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            await asyncio.wait_for(asyncio.shield(inner), timeout=BIND_TAIL_GRACE_S)
+        except asyncio.CancelledError:
+            if not inner.cancelled():
+                raise
+        except (TimeoutError, Exception):  # noqa: BLE001
             pass
+        if not inner.done():
+            logger.warning(
+                "trust terminalizer's bind tail outlived its grace "
+                "(thread=%s, window=%s) — cancelling it",
+                flow.thread_id,
+                flow.created_wid,
+            )
+            await _cancel_and_await(inner)
     # The tail's ACTUAL outcome decides — a bind that raised before
     # ``bind_thread`` is not a success (review r4 P2-B).
     bind_ok = inner is not None and _bind_task_succeeded(inner)
@@ -2580,19 +2699,82 @@ async def teardown_thread(
         # owned by a DEAD task, which is the same acquisition/release asymmetry
         # every other actor already fixed: the release CAS names the phase THIS
         # actor holds, and hands the flow back to its observer.
+        orphaned: TrustFlow | None = None
         async with creation_lock(user_id, thread_id):
             leftover = _flows.get((user_id, thread_id))
             if leftover is not None and leftover.phase != PHASE_TERMINAL:
-                leftover.teardown_fenced = False
+                leftover.lower_fence_if_owned()
                 if (
                     leftover.phase == PHASE_CANCELLING
                     and leftover.claim_task is asyncio.current_task()
                 ):
-                    try_transition_locked(
-                        leftover,
-                        expect=frozenset({PHASE_CANCELLING}),
-                        to=PHASE_AWAITING_TRUST,
-                    )
+                    observer = leftover.wait_task
+                    if observer is not None and observer.done():
+                        # OPEN IMPLIES OBSERVED (review r8 P1-A). Teardown
+                        # cancels and awaits the WAIT task BEFORE the guarded
+                        # cleanup, so by the time an abort lands here the
+                        # observer is usually already DEAD. Handing the flow
+                        # "back to its observer" then parks the topic forever:
+                        # no ceiling, no registration, no bind, and every
+                        # inbound message nudging a flow nothing will advance.
+                        # With no observer to restore to, the only correct exit
+                        # is the terminal one — take it here, outside the lock.
+                        orphaned = leftover
+                    else:
+                        try_transition_locked(
+                            leftover,
+                            expect=frozenset({PHASE_CANCELLING}),
+                            to=PHASE_AWAITING_TRUST,
+                        )
+        if orphaned is not None:
+            # BEST EFFORT, and it must never mask the original failure: this
+            # runs on the way out of a teardown that already raised or was
+            # cancelled.
+            try:
+                # BOUNDED, and SHIELDED. This runs while we are already
+                # unwinding — usually from a cancellation — so it must neither
+                # be re-cancelled halfway through a kill nor park forever on a
+                # wedged tmux: either would strand the very flow this arm exists
+                # to settle. The drop below still runs on every outcome.
+                await asyncio.wait_for(
+                    asyncio.shield(
+                        _terminal_cleanup(
+                            orphaned,
+                            orphaned.bot,
+                            orphaned.tmux_mgr,
+                            reason="teardown aborted with no observer left",
+                            body=(
+                                "⚠️ This session setup was cancelled while an "
+                                "action was still in flight."
+                            ),
+                            session_mgr=session_mgr or orphaned.session_mgr,
+                            allow_completion=False,
+                        )
+                    ),
+                    timeout=ORPHAN_CLEANUP_BUDGET_S,
+                )
+            except (asyncio.CancelledError, TimeoutError, Exception):  # noqa: BLE001
+                # Logged, never re-raised: we are already unwinding, and the
+                # DROP below is what actually guarantees the invariant. A
+                # cancellation here is the NORMAL shape (the shielded cleanup
+                # keeps running to completion on its own).
+                logger.warning(
+                    "trust teardown's orphan cleanup did not complete "
+                    "(thread=%s, window=%s) — dropping the flow anyway",
+                    thread_id,
+                    orphaned.created_wid,
+                )
+            finally:
+                # The flow is orphaned on EVERY outcome — commit terminal and
+                # drop it, so no OPEN, unobserved record can survive this path.
+                async with creation_lock(user_id, thread_id):
+                    if _flows.get((user_id, thread_id)) is orphaned:
+                        try_transition_locked(
+                            orphaned, expect=NONTERMINAL_PHASES, to=PHASE_TERMINAL
+                        )
+                        _release_tokens(orphaned)
+                        _drop_entry(orphaned)
+                        _drop_flow(orphaned)
 
 
 async def _teardown_loop(
@@ -2624,7 +2806,7 @@ async def _teardown_loop(
                 # RAISE THE FENCE (review r6 P1-A) on every pass: while it is up
                 # no NEW claim can be acquired, so a stream of taps cannot starve
                 # this loop. In-flight claims still settle normally.
-                flow.teardown_fenced = True
+                flow.raise_fence()
             if flow is None:
                 return completed or _completion_won(
                     user_id,
@@ -2708,6 +2890,13 @@ async def _teardown_loop(
             if not await force_terminal_claim(current):
                 continue
             forced = True
+            # FORCE-SETTLE MEANS THE BIND TAIL DIES (review r8 P1-B). Its own
+            # bounded wait above has already expired, so the tail is genuinely
+            # hung. It must be cancelled BEFORE the WAIT task, because the WAIT
+            # task's terminalizer awaits this very tail — cancelling the
+            # observer first would park teardown on a task parked on the tail,
+            # and `/start`, topic-close and shutdown would hang forever.
+            await _cancel_and_await(current.bind_task)
             await _cancel_and_await(current.wait_task)
             await _terminal_cleanup(
                 current,

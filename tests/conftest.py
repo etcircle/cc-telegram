@@ -21,6 +21,7 @@ preserves the kill-criterion signal: scenarios fail the bar only when the
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -68,6 +69,14 @@ from cctelegram.handlers import (
     trust_flow,
     usage_cache,
 )
+
+# GH #65 review r8 P3: arm the trust lane's invariant assertions for the WHOLE
+# suite, at import. Arming them inside ``reset_for_tests`` alone made strictness
+# test-ORDER dependent — the first test in a process, and any single test run in
+# isolation (which is how a failure actually gets reproduced), ran with the
+# invariants merely logging, so the lane's safety net was inert in exactly the
+# run where it matters most.
+trust_flow.enable_strict_invariants()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1020,25 +1029,45 @@ class _NoLiveTmuxServer:
 
 @pytest.fixture(autouse=True)
 def _no_live_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
-    """POISON the real ``tmux_manager``'s libtmux connection for the whole suite.
+    """POISON both routes a test could reach a real tmux server through.
 
     A test that injects a fake into the seam it calls DIRECTLY can still reach
-    the real singleton through a seam it forgot. That is what bit us: a unit
-    test seeded a plausible window id into the live ``session_manager``, the
+    the real thing through a seam it forgot. That is what bit us: a unit test
+    seeded a plausible window id into the live ``session_manager``, the
     completion tail replayed the pending payload through the REAL
     ``tmux_manager``, and the keystrokes landed in a live Claude session on the
     developer's default tmux server.
 
     Injection is the fix (see ``trust_flow._replay_for``); this is the backstop
-    that makes the CLASS unreachable. It is deliberately placed at the libtmux
-    connection rather than on the manager's methods, because the tmux unit
-    suites legitimately exercise those methods against a patched
-    ``create_subprocess_exec`` — poisoning the methods would break them, while
-    poisoning the connection leaves them untouched. Every window/pane write
-    goes through this object, so nothing that could type into a real pane
-    survives it.
+    that makes the CLASS unreachable. There are exactly two routes, and BOTH are
+    covered here (review r8 P2-C — poisoning only the first left the second
+    open, and the docstring overclaimed):
+
+    1. **libtmux**, via the manager's cached ``_server``. Poisoned per-instance,
+       so window/pane operations on the singleton refuse.
+    2. **The tmux BINARY**, via ``asyncio.create_subprocess_exec`` — how
+       ``capture_pane`` and the pane-command probes actually run, and the route
+       a FRESHLY-constructed ``TmuxManager()`` takes regardless of what the
+       singleton's attributes say. Poisoned by argv: only a ``tmux``
+       executable is refused, so tests that spawn other subprocesses (the
+       ``md_capture`` appender benchmark spawns a real interpreter) are
+       unaffected, and the tmux suites that patch this same attribute
+       themselves still override us.
+
+    What this does NOT guarantee: a test that constructs its own manager and
+    monkeypatches its way past both routes is on its own. The guard is a
+    backstop for the seams production code actually uses, not a sandbox.
     """
     monkeypatch.setattr(_real_tmux, "_server", _NoLiveTmuxServer(), raising=False)
+
+    real_exec = asyncio.create_subprocess_exec
+
+    async def _refuse_tmux_binary(program: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(str(program)).name in {"tmux", "tmux.exe"}:
+            raise RuntimeError("live tmux blocked in tests")
+        return await real_exec(program, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _refuse_tmux_binary)
 
 
 @pytest.fixture

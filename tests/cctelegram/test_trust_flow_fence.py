@@ -206,7 +206,10 @@ async def test_a_teardown_fence_refuses_new_claims() -> None:
     )
     assert flow is not None
     async with trust_flow.creation_lock(_USER, _THREAD):
-        flow.teardown_fenced = True
+        # The fence is OWNED now (review r8 P2-A) — raised through its seam, not
+        # by assigning a flag, so only its owner can lower it again.
+        flow.raise_fence()
+    assert flow.teardown_fenced
 
     assert (
         await trust_flow.claim_for_dispatch(_USER, _THREAD, user_data=user_data)
