@@ -1380,6 +1380,12 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
             new_callable=AsyncMock,
             return_value=window,
         ),
+        patch.object(
+            bot_module.tmux_manager,
+            "adoption_listing",
+            new_callable=AsyncMock,
+            return_value=[window],
+        ),
         _patch_both(
             "_list_unbound_windows",
             new_callable=AsyncMock,
@@ -1553,6 +1559,12 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
             new_callable=AsyncMock,
             return_value=window,
         ),
+        patch.object(
+            bot_module.tmux_manager,
+            "adoption_listing",
+            new_callable=AsyncMock,
+            return_value=[window],
+        ),
         _patch_both(
             "_list_unbound_windows",
             new_callable=AsyncMock,
@@ -1616,6 +1628,12 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
             "find_window_by_id",
             new_callable=AsyncMock,
             return_value=window,
+        ),
+        patch.object(
+            bot_module.tmux_manager,
+            "adoption_listing",
+            new_callable=AsyncMock,
+            return_value=[window],
         ),
         _patch_both(
             "_list_unbound_windows",

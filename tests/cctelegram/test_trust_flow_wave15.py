@@ -275,14 +275,19 @@ async def test_a_partial_creation_reports_its_window_id_and_is_reaped(
     assert ok is False, "a partial creation is not a success"
     assert wid == "@partial", (
         "a window whose creation partially succeeded must still be NAMED, or "
-        "nobody can reap it"
+        "nobody can settle it"
     )
 
-    for _ in range(100):
-        await asyncio.sleep(0.02)
-        if killed:
-            break
-    assert killed == ["@partial"], "…and it is reaped, since no caller took it"
+    # EXACTLY ONE CLEANUP OWNER (review r16 P1-A). Returning the id TRANSFERS
+    # ownership to the caller, whose refusal arm reserves and cleans it (see
+    # ``test_a_created_but_unverified_window_is_settled_by_its_caller``), so the
+    # reaper must NOT also kill it — two owners is the bug, not one.
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    assert killed == [], (
+        "the reaper must not kill a window whose id was handed to the caller — "
+        "that would give a partial creation TWO cleanup owners"
+    )
     real_tmux.reset_kill_pending_for_tests()
 
 

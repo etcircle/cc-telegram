@@ -1931,7 +1931,7 @@ async def _revalidate_bind_preconditions(flow: TrustFlow, session_mgr: Any) -> N
     # make the trust bind fail whenever enumeration hiccups. Only a listing that
     # WORKED and does not contain our window proves it is gone.
     listed = await flow.tmux_mgr._bounded_lifecycle(
-        flow.tmux_mgr.list_windows_fresh(),
+        flow.tmux_mgr.adoption_listing(),
         what="trust bind existence probe",
     )
     if listed and not any(w.window_id == flow.created_wid for w in listed):

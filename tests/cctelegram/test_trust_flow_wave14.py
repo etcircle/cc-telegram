@@ -226,33 +226,6 @@ async def test_a_read_raced_by_an_invalidation_is_never_published(
 
 
 @pytest.mark.asyncio
-async def test_an_unstable_listing_refuses_rather_than_return_a_corpse(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """On exhaustion a freshness-critical probe REFUSES.
-
-    Returning the last rejected read — the wave-13 shape — hands back exactly
-    the observation the guard rejected. A typed refusal is the honest answer.
-    """
-    from cctelegram.tmux_manager import TmuxWindow, tmux_manager as real_tmux
-
-    real_tmux._invalidate_list_cache()
-
-    async def _always_raced() -> Any:
-        real_tmux._invalidate_list_cache()
-        return [TmuxWindow(window_id="@doomed", window_name="w", cwd="/x")]
-
-    monkeypatch.setattr(real_tmux, "_list_windows_direct", _always_raced)
-
-    with pytest.raises(tmux_mod.ListingUnstable):
-        await real_tmux.find_window_by_id("@doomed", fresh=True)
-
-    assert real_tmux._list_cache is None, (
-        "nothing may be published from a listing that never settled"
-    )
-
-
-@pytest.mark.asyncio
 async def test_an_ordinary_cached_read_still_works_under_the_same_pressure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -300,7 +273,7 @@ async def test_a_wedged_trust_revalidation_releases_the_lock_and_refuses() -> No
         await asyncio.sleep(30)
         return []
 
-    tmux.list_windows_fresh = _wedged_listing  # type: ignore[attr-defined]
+    tmux.adoption_listing = _wedged_listing  # type: ignore[attr-defined]
 
     bounded_calls: list[str] = []
 
@@ -427,7 +400,7 @@ async def test_a_verification_timeout_returns_the_real_window_id(
         return []
 
     monkeypatch.setattr(asyncio, "to_thread", _to_thread)
-    monkeypatch.setattr(real_tmux, "list_windows_fresh", _wedged_listing)
+    monkeypatch.setattr(real_tmux, "adoption_listing", _wedged_listing)
     monkeypatch.setattr(tmux_mod, "LIFECYCLE_TMUX_TIMEOUT_S", 0.15)
 
     ok, msg, _name, wid = await real_tmux.create_window(

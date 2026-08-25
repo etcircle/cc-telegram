@@ -450,10 +450,14 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
                 # probe exists to catch. BOUNDED (review r13 P1-B): no tmux await
                 # under this lock may be unbounded, or one wedged call freezes every
                 # other window's lifecycle.
-                w = await tmux_manager._bounded_lifecycle(
-                    tmux_manager.find_window_by_id(selected_wid, fresh=True),
+                # DIRECT, UNCACHED (review r16): adoption decisions never
+                # consult the TTL cache, so no unrelated invalidation can affect
+                # this answer and all three seams read tmux the same way.
+                listed = await tmux_manager._bounded_lifecycle(
+                    tmux_manager.adoption_listing(),
                     what="bind-to-existing existence probe",
                 )
+                w = next((win for win in listed if win.window_id == selected_wid), None)
                 if not w:
                     refusal = (
                         f"Window '{session_manager.get_display_name(selected_wid)}' "
@@ -464,11 +468,12 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
                 else:
                     current_unbound_ids = {
                         wid
-                        for wid, _, _ in await tmux_manager._bounded_lifecycle(
-                            _list_unbound_windows(
-                                adapters.tmux_manager, adapters.session_manager
-                            ),
-                            what="bind-to-existing unbound listing",
+                        for wid, _, _ in await _list_unbound_windows(
+                            adapters.tmux_manager,
+                            adapters.session_manager,
+                            # The DIRECT listing already read above — no
+                            # adoption decision touches the cache (review r16).
+                            listing=listed,
                         )
                     }
                     if selected_wid not in current_unbound_ids:

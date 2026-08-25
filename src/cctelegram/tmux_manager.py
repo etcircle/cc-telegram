@@ -197,17 +197,71 @@ CREATED_BUT_UNVERIFIED_MESSAGE: Final[str] = (
 )
 
 
-@dataclass
-class _CreateOwnership:
-    """Did the CALLER take ownership of a created window? (review r15 P1-B.)
+class CallerDisposition(Enum):
+    """What the CALLER decided about a window creation (review r16 P1-A)."""
 
-    A mutable box rather than a local, because the reaping done-callback runs
-    after ``create_window``'s frame may be gone — it must read the flag's final
-    value, not a closed-over snapshot. Set only on the successful-return path,
-    so timeout, cancellation and partial creation all leave the reaper armed.
+    UNDECIDED = "undecided"
+    TAKEN = "taken"
+    DECLINED = "declined"
+
+
+class _CreateDisposition:
+    """THE TWO-PARTY HANDSHAKE for a created window's fate.
+
+    Review r16 P1-A. The r15 shape had the worker-completion callback decide
+    alone: it fired when the worker finished — which can be BEFORE the shielded
+    waiter resumes — read ``taken_by_caller`` as still False, and scheduled a
+    kill of a window the caller was about to return successfully. Partial
+    creation could get TWO cleanup owners the same way.
+
+    The fix is that neither party may decide alone. Reaping needs BOTH facts:
+    the worker's outcome AND the caller's disposition. Whichever party learns
+    the second fact performs the reap, exactly once:
+
+      * the worker callback records the outcome, and reaps ONLY if the caller
+        has ALREADY declined;
+      * the caller always records its disposition in a ``finally`` — TAKEN on
+        the successful-return path (set BEFORE the id is handed back), DECLINED
+        on timeout, cancellation and refusal — and a DECLINED recorded after the
+        worker is done triggers the reap from the caller's side.
+
+    Contracts: a successful creation is NEVER reaped; a cancellation reaps
+    EXACTLY once; a partial creation has EXACTLY one cleanup owner.
     """
 
-    taken_by_caller: bool = False
+    def __init__(self) -> None:
+        self.caller: CallerDisposition = CallerDisposition.UNDECIDED
+        self.worker_done: bool = False
+        self.worker_window_id: str = ""
+        self._reaped: bool = False
+
+    def _should_reap(self) -> bool:
+        """True exactly once, and only when BOTH facts are known."""
+        if self._reaped:
+            return False
+        if not self.worker_done or not self.worker_window_id:
+            return False
+        if self.caller is not CallerDisposition.DECLINED:
+            return False
+        self._reaped = True
+        return True
+
+    def record_worker(self, window_id: str) -> bool:
+        """The worker finished. Returns True if THIS party must reap."""
+        self.worker_done = True
+        self.worker_window_id = window_id
+        return self._should_reap()
+
+    def record_caller(self, disposition: CallerDisposition) -> bool:
+        """The caller decided. Returns True if THIS party must reap.
+
+        A disposition is recorded ONCE — the first decision wins, so a
+        ``finally`` that defaults to DECLINED can never overwrite the TAKEN the
+        success path already recorded.
+        """
+        if self.caller is CallerDisposition.UNDECIDED:
+            self.caller = disposition
+        return self._should_reap()
 
 
 class _LifecycleLock:
@@ -255,16 +309,6 @@ class _LifecycleLock:
 
     async def __aexit__(self, *exc: Any) -> None:
         self.release()
-
-
-class ListingUnstable(Exception):
-    """A freshness-critical listing could not be sampled without a race.
-
-    Raised when every attempt to read the tmux window list was invalidated
-    mid-read (review r15 P1-A). The alternative — returning the sample anyway —
-    is precisely the pre-kill observation an adopter must never see, so the
-    honest answer is a typed refusal the caller turns into its own copy.
-    """
 
 
 class LifecycleTimeout(Exception):
@@ -935,13 +979,10 @@ class TmuxManager:
                 self._list_cache_generation = started_at_generation
                 return self._list_cache
 
-            if min_generation > 0:
-                raise ListingUnstable(
-                    f"tmux listing was invalidated during every one of "
-                    f"{_LIST_REFRESH_MAX_ATTEMPTS} attempts; refusing to answer a "
-                    "freshness-critical probe with a sample that may predate the "
-                    "last kill"
-                )
+            # No typed refusal here any more (review r16): ADOPTION no longer
+            # reads this cache at all, so there is no freshness-critical caller
+            # left to refuse. Display callers get the observation back
+            # UNPUBLISHED — a raced sample is still never cached for anyone.
             logger.warning(
                 "tmux listing raced invalidations %d times — returning an "
                 "UNPUBLISHED observation (no stale snapshot is cached)",
@@ -967,13 +1008,41 @@ class TmuxManager:
         self._invalidation_generation += 1
         return self._invalidation_generation
 
+    async def adoption_listing(self) -> list[TmuxWindow]:
+        """THE listing every ADOPTION decision uses. DIRECT, and never cached.
+
+        GH #65 review r16 — a DESIGN REPLACEMENT, not another guard. Three
+        consecutive rounds found a defect in the previous round's fix to the
+        cached-listing seam (r13's invalidate-then-read, r14's start-stamp,
+        r15's start/end match), which is the repo's "three doors into the same
+        room" signal: the approach was wrong, not the patches.
+
+        The root problem was that adoption correctness DEPENDED ON THE CACHE.
+        Every unrelated invalidation — any kill anywhere, from any topic —
+        participated in whether an adopter could trust what it read, and the
+        three adoption paths each had to reproduce the same freshness ritual
+        (invalidate, floor, re-check) without drifting. Reading tmux DIRECTLY
+        removes the dependency instead of guarding it: there is no snapshot, so
+        there is nothing to be stale, nothing to publish for someone else, and
+        no generation to reason about. The only failure it can raise is the
+        ``LifecycleTimeout`` every seam already handles.
+
+        Callers MUST hold the window-lifecycle lock (that is what makes the
+        answer usable for a decision — see the module docstring's LOCK ORDER
+        rule), and MUST wrap this in ``_bounded_lifecycle`` like any other tmux
+        await under the hold.
+
+        The TTL cache stays, DEMOTED to what it was always good at: the 1 Hz
+        pollers and display. No adoption decision consults it.
+        """
+        return await self._list_windows_direct()
+
     async def list_windows_fresh(self) -> list[TmuxWindow]:
         """``list_windows`` that BYPASSES (and refreshes) the 1 s cache.
 
-        The listing companion to ``find_window_by_id(fresh=True)`` (review r14
-        P1-F). Any probe deciding whether a window is safe to ADOPT must use a
-        fresh view: the cache is a performance device for the 1 Hz pollers, and
-        an adoption path can easily have warmed it itself moments earlier.
+        DISPLAY-SIDE ONLY. Adoption decisions must use
+        :meth:`adoption_listing` — see its docstring for why the cache is not
+        allowed to participate in them (review r16).
         """
         min_generation = self._invalidate_list_cache()
         cache = await self._ensure_list_cache(min_generation=min_generation)
@@ -1930,6 +1999,21 @@ class TmuxManager:
         # and a kill — which topic teardown and forced trust cleanup both need —
         # must be able to make progress. Expiry raises ``LifecycleTimeout``,
         # which RELEASES the lock and lands on the honest refusal below.
+        def _reap(window_id: str) -> None:
+            logger.warning(
+                "window %s exists but no caller took ownership of its creation "
+                "(timeout, cancellation or partial creation) — reaping it so it "
+                "cannot float unowned",
+                window_id,
+            )
+            # Best effort, and it marks kill-pending like any other kill so no
+            # adopter can take the window in the meantime.
+            asyncio.ensure_future(self.kill_window(window_id))
+
+        # Declared OUT here so the ``finally`` below can always read it — the
+        # caller must record a disposition on every exit, including one taken
+        # before the lock was ever acquired.
+        disposition: _CreateDisposition | None = None
         try:
             async with self.window_lifecycle_lock():
                 if self.any_kill_pending():
@@ -1940,44 +2024,35 @@ class TmuxManager:
                         "",
                     )
                 # A LATE WINDOW MUST NEVER FLOAT UNOWNED (review r14 P1-C).
-                # ``wait_for`` cancels the WRAPPER, but the worker thread keeps
-                # going and can create the window after we have given up — with
-                # no caller, no reservation and no owner. So the inner future
-                # carries a done-callback that outlives our cancellation: if we
-                # have already timed out, it reaps whatever the worker made.
-                # REAP ON "THE CALLER DID NOT TAKE OWNERSHIP" (review r15
-                # P1-B), not on "we timed out". Keying on the timeout missed two
-                # arms: a caller CANCELLATION propagates without ever setting it,
-                # and a setup failure AFTER ``new_window`` succeeded produced a
-                # real window the old empty-id return made unreachable. The flag
-                # is set ONLY on the successful-return path, so timeout,
-                # cancellation and partial creation are all covered by one rule —
-                # and the callback survives our cancellation, so it can still act
-                # after we are gone.
-                ownership = _CreateOwnership()
+                # A LATE WINDOW MUST NEVER FLOAT UNOWNED, and a window the
+                # caller SUCCESSFULLY took must never be reaped (review r16
+                # P1-A). ``wait_for`` cancels the WRAPPER while the worker
+                # thread keeps going, so the two facts that decide a window's
+                # fate — the worker's outcome and the caller's disposition —
+                # arrive in either order. The r15 shape let the worker callback
+                # decide ALONE: firing before the shielded waiter resumed, it
+                # read "not taken" and scheduled a kill of a window that was
+                # about to be returned successfully.
+                #
+                # Neither party decides alone now. Whichever learns the SECOND
+                # fact performs the reap, exactly once.
+                disposition = _CreateDisposition()
                 inner = asyncio.ensure_future(asyncio.to_thread(_create_and_start))
 
-                def _reap_unless_owned(fut: "asyncio.Future[Any]") -> None:
-                    if ownership.taken_by_caller or fut.cancelled():
+                def _on_worker_done(fut: "asyncio.Future[Any]") -> None:
+                    if fut.cancelled() or fut.exception() is not None:
+                        # Nothing was created that we can name, so there is
+                        # nothing to reap; the caller still records its own
+                        # disposition below.
+                        disposition.record_worker("")
                         return
-                    if fut.exception() is not None:
-                        return
-                    _late_ok, _lm, _ln, late_wid = fut.result()
+                    _ok, _m, _n, late_wid = fut.result()
                     # Present whenever ``new_window`` succeeded, even if later
                     # setup failed — that is the partial-creation arm.
-                    if not late_wid:
-                        return
-                    logger.warning(
-                        "window %s exists but no caller took ownership of its "
-                        "creation (timeout, cancellation or partial creation) — "
-                        "reaping it so it cannot float unowned",
-                        late_wid,
-                    )
-                    # Best effort, and it marks kill-pending like any other kill
-                    # so no adopter can take the window in the meantime.
-                    asyncio.ensure_future(self.kill_window(late_wid))
+                    if disposition.record_worker(late_wid):
+                        _reap(late_wid)
 
-                inner.add_done_callback(_reap_unless_owned)
+                inner.add_done_callback(_on_worker_done)
                 result = await self._bounded_lifecycle(
                     asyncio.shield(inner), what="create_window"
                 )
@@ -2029,7 +2104,7 @@ class TmuxManager:
                     # status, and the caller's refusal arm cleans it up.
                     try:
                         listed = await self._bounded_lifecycle(
-                            self.list_windows_fresh(),
+                            self.adoption_listing(),
                             what="create verification listing",
                         )
                     except LifecycleTimeout as e:
@@ -2066,10 +2141,20 @@ class TmuxManager:
                             "proceeding on the pre-create gate alone",
                             new_wid,
                         )
-                # THE CALLER IS TAKING OWNERSHIP. Set last, immediately
-                # before handing the result back, so every other exit leaves the
-                # reaper armed.
-                ownership.taken_by_caller = True
+                # RETURNING AN ID TRANSFERS OWNERSHIP (review r16 P1-A). This
+                # is the rule that gives every outcome EXACTLY ONE cleanup
+                # owner, including partial creation: if the caller is handed a
+                # window id — whether the creation SUCCEEDED or came back
+                # created-but-unverified — the caller now knows about that
+                # window and is responsible for settling it (see
+                # ``inbound_telegram``'s reserve-then-clean arm). Only when no
+                # id reaches the caller does the reaper own the window.
+                #
+                # Recorded BEFORE the id is handed back, so the worker callback
+                # can never see "undecided" for a window the caller is taking.
+                if result[3]:
+                    if disposition.record_caller(CallerDisposition.TAKEN):
+                        _reap(disposition.worker_window_id)
                 return result
         except LifecycleTimeout as e:
             logger.error("window creation exceeded its lifecycle bound: %s", e)
@@ -2079,6 +2164,15 @@ class TmuxManager:
                 "",
                 "",
             )
+        finally:
+            # EVERY OTHER EXIT DECLINES — timeout, cancellation, an early
+            # refusal, an unexpected raise. Recording is idempotent and
+            # first-decision-wins, so this can never overwrite the TAKEN above;
+            # and if the worker already finished, THIS is the party that reaps.
+            if disposition is not None and disposition.record_caller(
+                CallerDisposition.DECLINED
+            ):
+                _reap(disposition.worker_window_id)
 
     def _resolve_md_settings(self) -> str:
         """The bot-managed MessageDisplay settings path, or "" on failure.

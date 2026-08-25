@@ -351,6 +351,8 @@ async def _build_browser_payload() -> trust_flow.BrowserPayload:
 async def _list_unbound_windows(
     tmux_mgr: Any,
     session_mgr: Any,
+    *,
+    listing: list[Any] | None = None,
 ) -> list[tuple[str, str, str]]:
     """Return tmux windows not currently bound to any topic, as (id, name, cwd).
 
@@ -364,7 +366,11 @@ async def _list_unbound_windows(
     """
     from cctelegram.handlers import trust_flow
 
-    all_windows = await tmux_mgr.list_windows()
+    # ``listing`` lets an ADOPTION caller pass the DIRECT read it already took
+    # under the lifecycle lock (review r16), so no adoption decision consults
+    # the TTL cache even indirectly. Display callers pass nothing and get the
+    # cached view, which is all the browser render needs.
+    all_windows = listing if listing is not None else await tmux_mgr.list_windows()
     bound_ids = {bid for _, _, bid in session_mgr.iter_thread_bindings()}
     owned_ids = trust_flow.windows_owned_by_live_flows()
     return [
@@ -1889,7 +1895,7 @@ async def _create_and_bind_window(
                     # the rest of the TTL and the legacy seam bound a corpse.
                     # Every adoption probe must bypass the cache.
                     listed = await tmux_mgr._bounded_lifecycle(
-                        tmux_mgr.list_windows_fresh(),
+                        tmux_mgr.adoption_listing(),
                         what="legacy bind existence probe",
                     )
                     proven_absent = bool(listed) and not any(

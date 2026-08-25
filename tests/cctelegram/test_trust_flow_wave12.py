@@ -344,38 +344,43 @@ async def test_a_cancelled_kill_still_invalidates_the_listing_cache() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_trust_revalidation_probe_bypasses_the_listing_cache() -> None:
-    """Every adoption probe must ask tmux, not the 1 s cache."""
+async def test_the_trust_revalidation_reads_tmux_directly_never_the_cache() -> None:
+    """Adoption decisions do not consult the TTL cache AT ALL (review r16).
+
+    This replaces a wave-12 test that asserted the probe passed ``fresh=True``.
+    That was the cache-guarding design three consecutive rounds found defects
+    in; the cache is now display-only, so the property to hold is stronger and
+    simpler — an adoption seam produces ZERO cache reads.
+    """
     user_data: dict[str, Any] = {}
     _seed(user_data)
     sessions = _Sessions()
     tmux = _Tmux(pane=_IDLE)
-    seen_fresh: list[bool] = []
+    tmux._listing = [
+        SimpleNamespace(window_id=_FAKE_WID, window_name="repo", cwd="/repo")
+    ]
+    direct_reads: list[int] = []
 
-    async def _fresh_listing() -> Any:
-        # Reaching the FRESH listing seam at all is the assertion: the cached
-        # ``list_windows`` must never be what an adoption probe consults.
-        seen_fresh.append(True)
-        return [SimpleNamespace(window_id=_FAKE_WID, window_name="repo", cwd="/repo")]
+    original = tmux.adoption_listing
 
-    async def _cached_listing() -> Any:
-        seen_fresh.append(False)
-        return [SimpleNamespace(window_id=_FAKE_WID, window_name="repo", cwd="/repo")]
+    async def _counting_direct() -> Any:
+        direct_reads.append(1)
+        return await original()
 
-    tmux.list_windows_fresh = _fresh_listing  # type: ignore[attr-defined]
-    tmux.list_windows = _cached_listing  # type: ignore[attr-defined]
+    tmux.adoption_listing = _counting_direct  # type: ignore[attr-defined]
+
     flow = await _start(user_data, tmux=tmux, bot=_Bot(), sessions=sessions)
     assert flow is not None
     sessions.registered = True
     for _ in range(100):
         await asyncio.sleep(0.02)
-        if seen_fresh:
+        if direct_reads:
             break
 
-    assert seen_fresh, "the revalidation probe must run"
-    assert all(seen_fresh), (
-        "an adoption probe read the 1 s listing cache — it can be a full second "
-        "behind a landed kill"
+    assert direct_reads, "the revalidation must read tmux directly"
+    assert tmux.cache_reads == 0, (
+        "an adoption seam read the TTL cache — adoption correctness must not "
+        "depend on it, which is the whole point of the r16 replacement"
     )
     await trust_flow.teardown_thread(_USER, _THREAD)
 

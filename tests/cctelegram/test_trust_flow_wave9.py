@@ -341,8 +341,18 @@ def test_bind_committed_is_generation_and_window_qualified() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_straggler_cleanup_cannot_kill_a_window_a_new_flow_adopted() -> None:
-    """A cleanup that outlives its flow must never kill an adopted window."""
+async def test_adoption_is_refused_while_a_kill_is_still_in_flight() -> None:
+    """The guarantee is that ADOPTION cannot happen, not that the kill misses.
+
+    This test previously asserted that a straggler cleanup does not kill a
+    window a new flow adopted. That was asserting the DOCUMENTED IRREDUCIBLE
+    RESIDUAL: a kill already inside libtmux will kill the window it was aimed
+    at, and no gate can recall it. It only passed because the old test double
+    let a cancelled waiter cancel the fake kill — masking the race the protocol
+    exists to handle. With the double shielded like production (r16 P2), the
+    real contract shows through: the window stays KILL-PENDING for as long as
+    the kill can land, and adoption is refused for exactly that long.
+    """
     user_data: dict[str, Any] = {}
     _seed(user_data)
     tmux = _Tmux(pane=_TRUST)
@@ -367,28 +377,23 @@ async def test_a_straggler_cleanup_cannot_kill_a_window_a_new_flow_adopted() -> 
     except (asyncio.CancelledError, Exception):  # noqa: BLE001
         pass
 
-    assert trust_flow.get_flow(_USER, _THREAD) is None, "the old flow was dropped"
-
-    # A NEW flow adopts the very same window id — through the SAME tmux manager,
-    # which is what production has: one singleton for every flow. A separate
-    # fake per flow would make this assertion vacuous.
-    fresh_data: dict[str, Any] = {}
-    _seed(fresh_data)
-    adopter = await _start(fresh_data, tmux=tmux, bot=_Bot(), sessions=_Sessions())
-    assert adopter is not None
-    assert adopter.created_wid == _FAKE_WID
-    kills_before_adoption = len(tmux.kill_calls)
-
-    # Let any straggler run to completion.
-    release_kill.set()
-    await asyncio.sleep(0.3)
-
-    assert len(tmux.kill_calls) == kills_before_adoption, (
-        f"a straggler cleanup killed a window the NEW flow now owns: {tmux.kill_calls}"
+    # THE KILL IS STILL IN FLIGHT — so the id is unadoptable, and every
+    # adoption seam's settlement wait refuses it.
+    assert tmux.window_kill_pending(_FAKE_WID) is True, (
+        "the mark must stay up for as long as the kill can still land"
     )
-    assert trust_flow.get_flow(_USER, _THREAD) is adopter, "the new flow survives"
+    assert await tmux.await_kill_settled(_FAKE_WID) is False, (
+        "adoption must be REFUSED while a kill for this id is in flight"
+    )
 
-    await trust_flow.teardown_thread(_USER, _THREAD)
+    release_kill.set()
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if not tmux.window_kill_pending(_FAKE_WID):
+            break
+    assert tmux.window_kill_pending(_FAKE_WID) is False, (
+        "…and permitted again once the kill has genuinely settled"
+    )
 
 
 @pytest.mark.asyncio

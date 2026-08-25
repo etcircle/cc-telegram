@@ -253,8 +253,7 @@ async def test_create_window_proves_the_window_exists_before_reporting_success(
             TmuxWindow(window_id="@42", window_name="another", cwd="/tmp"),
         ]
 
-    monkeypatch.setattr(real_tmux, "list_windows", _listing_without_our_window)
-    monkeypatch.setattr(real_tmux, "list_windows_fresh", _listing_without_our_window)
+    monkeypatch.setattr(real_tmux, "adoption_listing", _listing_without_our_window)
     monkeypatch.setattr(asyncio, "to_thread", _to_thread)
 
     ok, msg, name, wid = await real_tmux.create_window(
@@ -322,7 +321,7 @@ async def test_the_trust_bind_refuses_a_window_that_died_during_the_wait() -> No
         probed.set()
         return [SimpleNamespace(window_id="@fake-someone-else")]
 
-    tmux.list_windows_fresh = _listing_without_it  # type: ignore[attr-defined]
+    tmux.adoption_listing = _listing_without_it  # type: ignore[attr-defined]
     flow = await _start(user_data, tmux=tmux, bot=_Bot(), sessions=sessions)
     assert flow is not None
     sessions.registered = True

@@ -100,15 +100,41 @@ class AdoptionProtocolMixin:
 
     async def finish_kill(self, window_id: str, inner: Any) -> bool:
         del window_id
-        return await inner
+        # SHIELDED, exactly as production does (review r16 P2). Awaiting
+        # ``inner`` bare meant cancelling the WAITER cancelled the fake kill and
+        # cleared the pending mark — masking the very cancelled-kill race this
+        # protocol exists to test. The mark must stay up until the kill itself
+        # genuinely completes.
+        return await asyncio.shield(inner)
 
     # ── the listing seams: fresh and cached are genuinely DIFFERENT ──────
+    @property
+    def cache_reads(self) -> int:
+        """How many times a CACHED listing was read (review r16).
+
+        Adoption seams must produce ZERO — the whole point of the design change
+        is that no adoption decision consults the cache.
+        """
+        return getattr(self, "_cache_reads", 0)
+
+    async def adoption_listing(self) -> Any:
+        """The DIRECT read every adoption decision uses.
+
+        Reflects reality immediately: a confirmed kill is gone from here at
+        once, with no cache, no generation and nothing to go stale.
+        """
+        return [
+            w
+            for w in (getattr(self, "_listing", []) or [])
+            if getattr(w, "window_id", None) not in self._dead
+        ]
+
     async def list_windows(self) -> Any:
         """The CACHED view — deliberately still shows a killed window.
 
-        This is what makes a non-fresh adoption probe fail a test instead of
-        passing by accident.
+        Counted, so a test can assert an adoption seam never came here.
         """
+        self._cache_reads = self.cache_reads + 1
         return list(getattr(self, "_listing", []) or [])
 
     async def list_windows_fresh(self) -> Any:

@@ -249,6 +249,10 @@ class FakeTmux(AdoptionProtocolMixin):
                 return self._to_tmux_window(w)
         return None
 
+    async def adoption_listing(self) -> Any:
+        """The DIRECT adoption read (GH #65 r16) — never the cache."""
+        return [self._to_tmux_window(w) for w in self.windows.values()]
+
     async def kill_window(self, window_id: str) -> bool:
         self.kill_calls.append(window_id)
         return self.windows.pop(window_id, None) is not None
