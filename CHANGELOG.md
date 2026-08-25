@@ -4,6 +4,25 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.8] — 2026-08-25
+
+The "multi-question prompts get their details card back" release.
+
+### Fixed
+- **Every multi-question AskUserQuestion on Claude Code 2.1.237 lost its "📋 full details" card
+  and showed a question clipped mid-sentence.** 2.1.237 started drawing a multi-question prompt's
+  question text inside a left `│` gutter box, wrapped across lines. The bridge read only the first
+  physical line, gutter glyph included, so it no longer matched the question the PreToolUse hook
+  had recorded — the details card (the only place per-option descriptions live) was dropped on
+  every such prompt, and the picker card's preamble was the same gutter-prefixed fragment, cut off
+  mid-sentence. Question text is now compared with the gutter stripped from the PANE-observed
+  side only (the recorded question text is never canonicalized — a record that itself begins
+  with a gutter glyph fails closed), and the wrapped lines are rejoined for display. Single-question prompts were never affected.
+- **The picker preamble shows the whole question again.** The preamble is still capped so the
+  option rows can't be pushed off the card, but it now clips the full question instead of a
+  fragment, and the `│` glyph is gone. The "📋 full details" card itself is uncapped, so a long
+  boxed question is no longer truncated in the one place that promises the whole thing.
+
 ## [0.4.7] — 2026-08-24
 
 The "your approval card stops blinking at you" release.

@@ -818,6 +818,98 @@ _RE_NUMBERED_OPTION = re.compile(
 # Option-row checkbox — ASCII brackets, NOT ☐/☒ (those are tab-header only).
 _RE_OPTION_CHECKBOX = re.compile(r"^\s*[❯›▶*)>↓\s]?\s*\d+\.\s+\[(?P<mark>[ ✔xX])\]\s")
 
+# Matches a LEADING box-gutter run: the BOX-DRAWING glyphs ``│`` (U+2502) and
+# ``┃`` (U+2503) ONLY, each followed by AT LEAST ONE SPACE, repeated. Claude Code
+# 2.1.237 draws a multi-question AUQ's question text inside a left-gutter box::
+#
+#     │ Dynamics CRM integration: which direction? (Full memo in temp/… on
+#     │ the client tenant unless users hold D365 … regardless.)
+#
+# ANCHORED AT LINE START ONLY — an interior ``│`` (a table row, a piped shell
+# command inside an option label) is NEVER touched.
+#
+# ASCII ``|`` is DELIBERATELY EXCLUDED (codex r1 P1-A). Accepting it — worse,
+# with zero required whitespace — made the canonicalizer NON-INJECTIVE against
+# legitimate question CONTENT: ``"| jq ."``, a markdown table row, an indented
+# monospace block would all collapse onto the same canonical value as the same
+# text without the pipe, so a stale side file whose labels happened to match
+# could be trusted for a DIFFERENT question. A hypothetical future ASCII-pipe
+# layout degrades to today's fail-closed ``title_mismatch`` instead — the safe
+# direction. The mandatory space is part of the same argument: ``│Foo`` is not a
+# shape the CC TUI emits, and requiring the separator keeps the accepted
+# alphabet as narrow as the observed chrome.
+_RE_LEADING_BOX_GUTTER = re.compile(r"^(?:[│┃] +)+")
+
+
+def strip_leading_gutter(text: str) -> str:
+    """Drop a leading box-gutter run from ``text`` (COMPARISON-time only).
+
+    The ONE shared canonicalizer for the CC 2.1.237 multi-question AUQ layout,
+    where the question text is drawn behind a left ``│`` gutter.
+
+    **APPLY IT TO THE PANE-OBSERVED SIDE ONLY — never to the authority.** The
+    gutter is PANE-RENDERING CHROME: authored question text (a side-file record,
+    a JSONL ``question``/``title``/``header``) never contains it, while the pane
+    is a RENDERING that does. The two sides of a title comparison are therefore
+    not the same kind of thing, and the usual symmetric-normalization rule — which
+    governs two sources OBSERVING THE SAME rendered artifact — does not apply
+    here. Stripping both sides is NON-INJECTIVE one level up: a stale authority
+    ``"│ Foo"`` canonicalizes to ``"Foo"`` and then matches a live pane
+    ``"│ Foo"`` whose real question is ``"Foo"``, so a stale record with
+    coincidentally-matching labels gets served as a TRUSTED source for a
+    DIFFERENT live question (codex r2 P1).
+
+    The sound form, which both call sites implement, is a single rule:
+    **de-chrome the PANE title; compare the AUTHORITY raw.** De-chroming
+    INVERTS the rendering, so the comparison is between two authored-shaped
+    strings. This is self-fail-closing on the ambiguous case — an authority that
+    itself begins with ``"│ "`` / ``"┃ "`` simply does not equal (or prefix) the
+    de-chromed pane, so it bails, which is the safe pre-2.1.237 answer. NOTE the
+    fail-closed behaviour comes from comparing the authority against the
+    STRIPPED pane; reverting BOTH sides to raw on an ambiguous authority does
+    NOT fail closed (raw-vs-raw is equal in exactly the collision case) and was
+    measured to leave the hole open.
+
+    Residual (accepted): the run is greedy, so a hypothetical DOUBLE-chromed
+    pane ``"│ │ Foo"`` de-chromes to ``"Foo"`` rather than ``"│ Foo"``, which
+    would fail to match a genuinely ``"│ Foo"``-titled question. That is a
+    false-NEGATIVE (no details card), never a wrong match, and CC renders one
+    gutter run per line.
+
+    Always returns a whitespace-stripped string. When there is no leading gutter
+    run the result is exactly ``text.strip()`` — a no-op on every pre-2.1.237
+    pane. When stripping the run would leave NOTHING behind, the gutter is kept
+    (``"│ "`` → ``"│"``): a title that is nothing but chrome is not evidence of
+    anything, and collapsing it to ``""`` would silently flip a caller's "is
+    there a title?" guard into the skip branch.
+
+    **MUST NOT be used to mutate stored state.** ``current_question_title``
+    feeds ``AskUserQuestionForm.fingerprint()`` and
+    ``decision_prompt_fingerprint``, where the "NO glyph stripping, EVER" rule
+    is load-bearing (a canonicalized title would rotate every live pick token).
+    Comparison-time only.
+    """
+    stripped = _RE_LEADING_BOX_GUTTER.sub("", text.lstrip()).strip()
+    if not stripped:
+        return text.strip()
+    return stripped
+
+
+def has_leading_gutter(text: str) -> bool:
+    """True when ``text`` begins with a gutter run that ``strip_leading_gutter``
+    would actually remove.
+
+    Used for BOTH halves of the rule in :func:`strip_leading_gutter`:
+
+      * on the PANE title, it gates whether de-chroming runs at all — False ⇒ the
+        whole step is skipped and the comparison is provably byte-identical to
+        its pre-2.1.237 behaviour;
+      * on the AUTHORITY text, True means AMBIGUOUS (authored text that looks
+        like chrome) ⇒ fail closed, compare raw.
+    """
+    return strip_leading_gutter(text) != text.strip()
+
+
 # Matches the picker's "Enter to select / Tab / Esc" footer.
 _RE_PICKER_FOOTER = re.compile(r"Enter to select")
 
@@ -1091,6 +1183,25 @@ class AskUserQuestionForm:
     # against a JSONL question would mis-overlay stale labels onto a
     # live pane (wrong-action class bug).
     pane_walkback_title: str | None = field(default=None, compare=False)
+    # Display-only FULL question text for the CC 2.1.237 multi-question layout,
+    # where the question is drawn behind a left ``│`` gutter and wraps across
+    # several physical lines. ``current_question_title`` keeps only the FIRST
+    # physical line (gutter included) because it is an IDENTITY field — it feeds
+    # ``_canonical_repr`` / ``fingerprint``, so it must stay byte-identical to
+    # what earlier renders minted tokens against. This field carries the
+    # gutter-stripped, space-joined whole question purely so the picker preamble
+    # and the 📋 details card stop showing a clipped "…Credits on".
+    #
+    # Populated by ``parse_ask_user_question`` ONLY, and only when the FIRST
+    # title line actually carries a gutter — every pre-2.1.237 layout leaves it
+    # None and renders exactly as before. ``resolve_ask_form`` does NOT
+    # propagate it through its merged-form constructors, mirroring
+    # ``pane_walkback_title``: every JSONL/side-file overlay path already has
+    # the authoritative, un-clipped question in ``current_question_title``.
+    #
+    # MUST NOT feed any fingerprint, render signature or dedup key — it is
+    # ``compare=False`` and excluded from ``_canonical_repr`` for that reason.
+    pane_question_display_text: str | None = field(default=None, compare=False)
     options_complete: bool = field(default=False, compare=False)
 
     def _canonical_repr(self) -> str:
@@ -2452,6 +2563,49 @@ def parse_ask_user_question(
             current_question_title = stripped
             break
 
+    # ``pane_question_display_text`` (DISPLAY only, CC 2.1.237): the scan above
+    # keeps ONE physical line because ``current_question_title`` is an identity
+    # field. 2.1.237 draws a multi-question AUQ's question inside a left ``│``
+    # gutter box and wraps it, so that single line is a mid-sentence clip. Join
+    # the consecutive GUTTER-PREFIXED lines back into the whole question.
+    #
+    # Gated on the first title line actually carrying a gutter, so every
+    # pre-2.1.237 layout leaves this None and renders byte-identically to today.
+    #
+    # UNCAPPED (codex r1 P3): every consecutive gutter line is preserved. An
+    # artificial line cap silently truncated a long boxed question that the 📋
+    # card then presented as "full details" — a quiet correctness loss in the one
+    # surface whose whole job is completeness. The scan needs no cap of its own:
+    # ``options_region`` is already bounded by the picker structure (tab header
+    # above, first option / rule / blank below) and by the pane height, and every
+    # line must carry the gutter to be taken at all.
+    pane_question_display_text: str | None = None
+    if current_question_title is not None and has_leading_gutter(
+        current_question_title
+    ):
+        q_parts: list[str] = []
+        for line in options_region:
+            stripped = line.strip()
+            if not stripped:
+                if q_parts:
+                    break
+                continue
+            if _RE_NUMBERED_OPTION.match(line):
+                break
+            if all(c == "─" for c in stripped):
+                break
+            if _RE_TAB_HEADER.match(line):
+                if q_parts:
+                    break
+                continue
+            if not has_leading_gutter(stripped):
+                # A non-gutter line ends the boxed question block.
+                break
+            q_parts.append(strip_leading_gutter(stripped))
+        joined = " ".join(p for p in q_parts if p).strip()
+        if joined:
+            pane_question_display_text = joined
+
     # ``pane_walkback_title`` (display only): walked-back title for the
     # single-tab path. Bounded gap (≤2 blanks between candidate and
     # topmost option) keeps us from pulling in pre-picker scrollback.
@@ -2526,6 +2680,7 @@ def parse_ask_user_question(
         is_free_text=is_free_text,
         pane_excerpt=pane_excerpt,
         pane_walkback_title=pane_walkback_title,
+        pane_question_display_text=pane_question_display_text,
         select_mode=select_mode,
         options_complete=options_complete,
     )
@@ -3787,11 +3942,26 @@ def _infer_current_tab_idx(
     if pane_form is None or not questions:
         return 0, False
 
-    # Primary: exact title match.
-    pane_title = (pane_form.current_question_title or "").strip()
+    # Primary: exact title match, with the CC 2.1.237 box gutter stripped from
+    # the PANE-OBSERVED title only, so ``│ Which direction?`` on the pane still
+    # matches ``Which direction?`` in JSONL instead of silently degrading to the
+    # weaker label-overlap leg below.
+    #
+    # ONE-SIDED by design (the same rule ``auq_source._record_consistent_with_pane``
+    # applies, for the same reason): the JSONL question is AUTHORED INPUT, the
+    # pane title is a RENDERING of it, and the gutter is rendering CHROME that
+    # authored text never contains. De-chroming the pane INVERTS the rendering;
+    # de-chroming the authority as well would let a question that genuinely
+    # BEGINS with ``│ `` match a differently-titled live tab. A gutterless pane
+    # de-chromes to itself, so this comparison stays byte-identical to before.
+    #
+    # Comparison-time only — ``current_question_title`` is never mutated (it
+    # feeds the form fingerprint).
+    pane_title = strip_leading_gutter(pane_form.current_question_title or "")
     if pane_title:
         title_matches: list[int] = []
         for i, q in enumerate(questions):
+            # The AUTHORITY is compared raw — never de-chromed.
             if pane_title == q.title.strip() or pane_title == q.header.strip():
                 title_matches.append(i)
         if len(title_matches) == 1:

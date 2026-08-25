@@ -1934,7 +1934,17 @@ def _format_auq_context_message_from_form(form: AskUserQuestionForm) -> str:
                         parts.append(f"   {line}")
                 parts.append("")
     else:
-        title = (form.current_question_title or form.pane_walkback_title or "").strip()
+        # ``pane_question_display_text`` first: on CC 2.1.237 the boxed
+        # multi-line question leaves ``current_question_title`` a one-line,
+        # gutter-prefixed CLIP (it is an identity field and must stay so), while
+        # this display-only field carries the whole joined question. None on
+        # every other layout, so the pre-existing order is unchanged there.
+        title = (
+            form.pane_question_display_text
+            or form.current_question_title
+            or form.pane_walkback_title
+            or ""
+        ).strip()
         if title:
             parts.append(title)
             parts.append("")
@@ -2617,7 +2627,17 @@ def _render_ask_user_question(
     # fresh single-tab pickers that Claude Code hasn't flushed to JSONL
     # yet (2026-05-21 D5 incident). The renderer prefers the
     # authoritative title and falls through to the walk-back guess.
-    title = form.current_question_title or form.pane_walkback_title
+    #
+    # ``pane_question_display_text`` outranks BOTH: it is set only on the CC
+    # 2.1.237 boxed multi-question layout, where ``current_question_title`` is
+    # a one-physical-line, gutter-prefixed CLIP of the same question (it stays
+    # clipped because it is an identity/fingerprint field). None on every other
+    # layout ⇒ the pre-existing preference order is untouched there.
+    title = (
+        form.pane_question_display_text
+        or form.current_question_title
+        or form.pane_walkback_title
+    )
     if title:
         # Cap the preamble so the picker card stays short and a long question
         # no longer pushes the option lines off the bottom (DISPLAY-only — the
