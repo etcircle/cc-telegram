@@ -513,13 +513,19 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     caption = update.message.caption or ""
     media_group_id = update.message.media_group_id
 
+    # GH #65 review r3 P2-4: an initially-unbound payload that resolves BOUND
+    # after the download race has already had its reply context rendered, so the
+    # bound path below must not render it a SECOND time (two quote blocks for
+    # one message). One flag, set the moment it is applied.
+    reply_context_applied = False
+    has_reply_ctx = False
     if wid is None:
         # §2.5: render reply-context before stashing an unbound-topic caption
         # so the later directory/window/session-picker flush preserves the
         # same quote block as the bound aggregator path below. Keep the same
         # media-group guard as the bound path: non-caption-bearing album items
         # must not each synthesize their own quote block.
-        has_reply_ctx = False
+        reply_context_applied = True
         if caption or media_group_id is None:
             caption, has_reply_ctx = await _apply_reply_context(
                 update.message, user.id, thread_id, caption
@@ -625,11 +631,11 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # caption on item 1 only, and rendering with empty caption on items 2-N
     # would re-emit the quote block multiple times (the random nonce in
     # ``render_for_claude`` defeats the aggregator's exact-string dedup).
-    has_reply_ctx = False
-    if caption or media_group_id is None:
-        caption, has_reply_ctx = await _apply_reply_context(
-            update.message, user.id, thread_id, caption
-        )
+    if not reply_context_applied:
+        if caption or media_group_id is None:
+            caption, has_reply_ctx = await _apply_reply_context(
+                update.message, user.id, thread_id, caption
+            )
 
     # §2.8: feed photo + caption + media_group_id into the aggregator. The
     # bundle's flush handler builds the §2.8.2 single-text + grouped-paths
@@ -926,12 +932,16 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     caption = update.message.caption or ""
     media_group_id = update.message.media_group_id
 
+    # GH #65 review r3 P2-4: see photo_handler — a payload that resolves BOUND
+    # after the download race must carry EXACTLY ONE quote block.
+    reply_context_applied = False
+    has_reply_ctx = False
     if wid is None:
         # §2.5: render reply-context before stashing an unbound-topic caption
         # so the later picker flush preserves the same quote block as the bound
         # aggregator path below. Keep the same media-group guard as the bound
         # path to avoid duplicate quote blocks for non-caption-bearing items.
-        has_reply_ctx = False
+        reply_context_applied = True
         if caption or media_group_id is None:
             caption, has_reply_ctx = await _apply_reply_context(
                 update.message, user.id, thread_id, caption
@@ -1016,11 +1026,11 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
 
     # §2.5: see photo_handler for the media-group caption-skip rationale.
-    has_reply_ctx = False
-    if caption or media_group_id is None:
-        caption, has_reply_ctx = await _apply_reply_context(
-            update.message, user.id, thread_id, caption
-        )
+    if not reply_context_applied:
+        if caption or media_group_id is None:
+            caption, has_reply_ctx = await _apply_reply_context(
+                update.message, user.id, thread_id, caption
+            )
 
     route = (user.id, thread_id, wid)
     await aggregator_offer_document(

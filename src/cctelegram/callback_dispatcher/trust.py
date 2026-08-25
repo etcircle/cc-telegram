@@ -208,7 +208,12 @@ async def _handle_trust(
     # provably SENT Enter, ``awaiting_trust`` otherwise. The WAIT loop's global
     # observation ceiling is the backstop for anything this cannot reach.
     outcome = None
-    enter_sent = False
+    progress: dict[str, bool] = {"enter_sent": False}
+
+    def _note_commit_sent() -> None:
+        progress["enter_sent"] = True
+        trust_flow.note_dispatch_enter_sent(flow)
+
     try:
         outcome = await _dispatch_trust(
             user=user,
@@ -216,12 +221,18 @@ async def _handle_trust(
             w=w,
             flow=flow,
             entry=entry,
+            on_commit_sent=_note_commit_sent,
         )
-        enter_sent = outcome is not None and outcome.kind in (
-            "dispatched",
-            "commit_unconfirmed",
+        # The hook is the AUTHORITY (review r3 P2-5): a cancellation after the
+        # Enter but before the return must still restore ``awaiting_registration``
+        # with a rebased budget, never ``awaiting_trust`` with a stale deadline.
+        enter_sent = progress["enter_sent"] or (
+            outcome is not None and outcome.kind in ("dispatched", "commit_unconfirmed")
         )
     finally:
+        enter_sent = progress["enter_sent"] or (
+            outcome is not None and outcome.kind in ("dispatched", "commit_unconfirmed")
+        )
         if flow.phase == trust_flow.PHASE_DISPATCHING:
             await trust_flow.release_dispatch_claim(
                 flow,
@@ -256,7 +267,6 @@ async def _handle_trust(
     # ``dispatched``). Both end the human trust wait, so both REBASE the
     # registration budget and enter ``awaiting_registration``; the WAIT task's
     # documented demotion recovers if the Enter did not in fact commit.
-    trust_flow.note_dispatch_enter_sent(flow)
     await trust_flow.release_dispatch_claim(
         flow, phase=trust_flow.PHASE_AWAITING_REGISTRATION
     )
@@ -293,6 +303,7 @@ async def _dispatch_trust(
     w: Any,
     flow: Any,
     entry: Any,
+    on_commit_sent: Any = None,
 ) -> Any:
     """Lock-acquire (reject-if-held) → the shipped locked pane transaction.
 
@@ -344,4 +355,5 @@ async def _dispatch_trust(
             option_label=entry.option_label,
             ledger_key=flow.ledger_key,
             license_check=_trust_license,
+            on_commit_sent=on_commit_sent,
         )

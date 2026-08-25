@@ -58,6 +58,9 @@ def _lane(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(config, "hook_timeout_extension_s", 0.05)
     monkeypatch.setattr(trust_flow, "SLICE_S", 0.01)
     monkeypatch.setattr(trust_flow, "PANE_POLL_EVERY_S", 0.0)
+    # A teardown that meets an in-flight dispatch waits this out; the
+    # production budget is 45s, which no test needs to spend.
+    monkeypatch.setattr(trust_flow, "DISPATCH_SETTLE_BUDGET_S", 0.2)
     (app_dir() / "session_map.json").unlink(missing_ok=True)
     yield
     trust_flow.reset_for_tests()

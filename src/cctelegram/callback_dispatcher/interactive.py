@@ -839,6 +839,7 @@ async def _dispatch_decision_pane_locked(
     option_label: str,
     ledger_key: str | None,
     license_check: Callable[[str, str | None], bool] | None = None,
+    on_commit_sent: Callable[[], None] | None = None,
 ) -> _DecisionPaneOutcome:
     """§3 dispatch transaction — the caller holds the window send lock.
 
@@ -857,6 +858,14 @@ async def _dispatch_decision_pane_locked(
     PROBED in this very pane at creation is licensed — because the pane command
     can never carry a version on Linux/WSL (``/proc/comm`` reports ``claude``),
     so the shipped default can never license a tap there.
+
+    ``on_commit_sent`` is an optional progress hook fired IMMEDIATELY BEFORE the
+    commit ``Enter`` (GH #65 review r3 P2-5). A caller that must restore state in
+    a ``finally`` cannot infer "Enter was sent" from the return value alone — a
+    cancellation between the send and the return would lose it — so the fact is
+    published the moment it becomes possible. Fired BEFORE rather than after the
+    send deliberately: over-reporting a commit is the fail-safe direction (the
+    caller stays in a phase that does not re-offer the button).
     """
 
     def _bail_not_advanced(reason: str) -> _DecisionPaneOutcome:
@@ -1016,6 +1025,8 @@ async def _dispatch_decision_pane_locked(
 
     # (f) Commit — the version-stable Enter (a False return means it never reached
     # tmux → still a PRE-COMMIT bail).
+    if on_commit_sent is not None:
+        on_commit_sent()
     if not await tmux_manager.send_keys(
         w.window_id, "Enter", enter=False, literal=False
     ):

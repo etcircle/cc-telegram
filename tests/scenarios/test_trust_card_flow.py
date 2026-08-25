@@ -1232,3 +1232,73 @@ async def test_p1_a_a_creation_install_racing_start_command_cannot_survive_it(
 
     assert flow is None, "an install whose entry /start cleared must ABORT"
     assert trust_flow.get_flow(scenario.user_id, _THREAD) is None
+
+
+@pytest.mark.asyncio
+async def test_p2_4_a_raced_photo_carries_exactly_one_quote_block(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A payload that resolves BOUND after the download race is rendered ONCE.
+
+    The unbound branch applies reply context before the ownership decision; the
+    bound fall-through used to apply it a SECOND time, so a raced reply reached
+    Claude with TWO quote blocks (review r3 P2-4).
+    """
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    racer = _Racer(scenario, wid, _THREAD)
+    applied: list[str] = []
+
+    from cctelegram.handlers import inbound_telegram as inbound_module
+
+    original = inbound_module._apply_reply_context
+
+    async def _counting(message: Any, user_id: int, thread_id: Any, text: str) -> Any:
+        applied.append(text)
+        return f"<quote>{text}", True
+
+    monkeypatch.setattr(inbound_module, "_apply_reply_context", _counting)
+    try:
+        await bot_module.photo_handler(
+            _photo_update(scenario, on_download=racer), scenario.context
+        )
+        await aggregator_flush_route((scenario.user_id, _THREAD, wid))
+    finally:
+        monkeypatch.setattr(inbound_module, "_apply_reply_context", original)
+
+    assert racer.fired
+    assert len(applied) == 1, (
+        f"reply context must be applied EXACTLY once, got {applied}"
+    )
+    written = "\n".join(scenario.tmux.written_texts)
+    assert written.count("<quote>") <= 1, written
+
+
+@pytest.mark.asyncio
+async def test_p2_4_a_raced_document_carries_exactly_one_quote_block(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    racer = _Racer(scenario, wid, _THREAD)
+    applied: list[str] = []
+
+    from cctelegram.handlers import inbound_telegram as inbound_module
+
+    original = inbound_module._apply_reply_context
+
+    async def _counting(message: Any, user_id: int, thread_id: Any, text: str) -> Any:
+        applied.append(text)
+        return f"<quote>{text}", True
+
+    monkeypatch.setattr(inbound_module, "_apply_reply_context", _counting)
+    try:
+        await bot_module.document_handler(
+            _document_update(scenario, on_download=racer), scenario.context
+        )
+        await aggregator_flush_route((scenario.user_id, _THREAD, wid))
+    finally:
+        monkeypatch.setattr(inbound_module, "_apply_reply_context", original)
+
+    assert racer.fired
+    assert len(applied) == 1, (
+        f"reply context must be applied EXACTLY once, got {applied}"
+    )

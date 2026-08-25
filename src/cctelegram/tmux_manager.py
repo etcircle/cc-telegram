@@ -853,6 +853,59 @@ class TmuxManager:
             logger.error(f"Unexpected error capturing pane {window_id}: {e}")
             return None
 
+    async def pane_current_command_cancellation_safe(
+        self, window_id: str
+    ) -> str | None:
+        """``pane_current_command`` that REAPS its subprocess when cancelled.
+
+        The command-probe sibling of ``capture_pane_cancellation_safe`` (GH #65
+        review r3 P2-3). The plain ``pane_current_command`` has no subprocess
+        timeout, so a caller that wraps it in ``asyncio.wait_for`` — which the
+        trust lane's bounded slices do, once per slice — would ORPHAN a tmux
+        subprocess on every deadline. Same return semantics as the plain method
+        on all normal paths; ``None`` on a non-zero exit or non-empty stderr.
+        """
+        tmux_bin = _TMUX_BIN if _TMUX_BIN is not None else "tmux"
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                tmux_bin,
+                "display-message",
+                "-p",
+                "-t",
+                window_id,
+                "#{pane_current_command}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:  # pragma: no cover — proc already gone
+                    pass
+                try:
+                    await asyncio.shield(proc.wait())
+                except BaseException:  # noqa: BLE001 — reap best-effort
+                    pass
+            raise
+        except Exception as e:
+            logger.error(
+                "pane_current_command subprocess failed for %s: %s", window_id, e
+            )
+            return None
+        err = stderr.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0 or err:
+            logger.error(
+                "tmux display-message failed for %s (rc=%s): %s",
+                window_id,
+                proc.returncode,
+                err,
+            )
+            return None
+        return stdout.decode("utf-8", errors="replace").strip()
+
     @staticmethod
     def _cmd_send_literal(pane: libtmux.Pane, window_id: str, chars: str) -> bool:
         """Send literal text via raw ``send-keys -l -- <chars>`` and check stderr.

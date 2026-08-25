@@ -33,7 +33,6 @@ from .dashboard import clear_dashboards_in_thread
 from .directory_browser import (
     CARD_CHAT_ID_KEY,
     CARD_MSG_ID_KEY,
-    drop_picker_entry,
     picker_entries,
 )
 from .inbound_aggregator import aggregator_clear_route
@@ -281,8 +280,11 @@ async def clear_topic_state(
 
     # Clear this thread's pending picker entry from user_data (GH #66: per-thread
     # keyed, so closing this topic never touches another topic's in-flight entry).
+    # GH #65 wave 3 (r3 P1-2): the drop goes through the LOCKED trust_flow seam —
+    # never a direct map pop — so the entry clear, its identity-token
+    # invalidation and any live flow's terminal mark are ONE critical section.
     if user_data is not None:
-        entry = drop_picker_entry(user_data, thread_id)
+        entry = await trust_flow.clear_topic_entry(user_id, thread_id, user_data)
         if entry is not None:
             if drop_pending:
                 _delete_pending_attachment_files(

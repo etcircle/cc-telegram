@@ -59,6 +59,9 @@ def _lane(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(config, "hook_timeout_extension_s", 0.05)
     monkeypatch.setattr(trust_flow, "SLICE_S", 0.01)
     monkeypatch.setattr(trust_flow, "PANE_POLL_EVERY_S", 0.0)
+    # A teardown that meets an in-flight dispatch waits this out; the
+    # production budget is 45s, which no test needs to spend.
+    monkeypatch.setattr(trust_flow, "DISPATCH_SETTLE_BUDGET_S", 0.2)
     (app_dir() / "session_map.json").unlink(missing_ok=True)
     yield
     trust_flow.reset_for_tests()
@@ -349,14 +352,17 @@ async def test_p1_c_a_wedged_tmux_call_cannot_outlive_the_global_ceiling(
 
 
 @pytest.mark.asyncio
-async def test_p1_c_the_dispatching_phase_is_not_budget_exempt(
+async def test_p1_c_a_dispatch_cannot_park_the_flow_forever(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A dispatch that never returns must still hit the global ceiling.
+    """A dispatch must not make the flow immortal — but the ceiling DEFERS.
 
-    ``dispatching`` suspends the KILL-capable budgets (a tap owns the pane), but
-    the global observation ceiling — whose terminal action only SPARES — must
-    still bound it, or a wedged callback parks the flow forever.
+    Round 2 asked for "``dispatching`` is not budget-exempt"; round 3 refined
+    WHAT that means (r3 P1-3): sparing or terminalizing UNDER an active dispatch
+    is itself a side effect on a flow another actor owns, so the global ceiling
+    now defers and re-checks. The bound is the callback's ``finally``, which
+    always releases the claim — so the flow is still terminal, just never
+    terminalized underneath a live transaction.
     """
     monkeypatch.setattr(config, "trust_prompt_ceiling_s", 0.05)
     monkeypatch.setattr(trust_flow, "GLOBAL_CEILING_MARGIN_S", 0.1)
@@ -367,10 +373,16 @@ async def test_p1_c_the_dispatching_phase_is_not_budget_exempt(
         user_data, tmux=tmux, bot=_StubBot(), session_mgr=_StubSessionMgr()
     )
     assert flow is not None
-    # A Trust tap claims the pane and then wedges (its own task never returns).
     claim = await trust_flow.claim_for_dispatch(_USER, _THREAD, user_data=user_data)
     assert claim.ok
 
+    # Well past the ceiling, the flow is DEFERRED, not terminalized.
+    await asyncio.sleep(0.3)
+    assert trust_flow.get_flow(_USER, _THREAD) is flow
+    assert tmux.kill_calls == []
+
+    # The callback's finally releases the claim → the ceiling fires at once.
+    await trust_flow.release_dispatch_claim(flow, phase=trust_flow.PHASE_AWAITING_TRUST)
     task = trust_flow.flow_task(_USER, _THREAD)
     assert task is not None
     await asyncio.wait_for(task, timeout=5)
