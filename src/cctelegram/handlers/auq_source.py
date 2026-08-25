@@ -1008,8 +1008,8 @@ def _record_consistent_with_pane(
     raw_pane_title = (pane_form.current_question_title or "").strip()
     # ONE-SIDED chrome strip. The gutter is PANE-RENDERING CHROME, so it is
     # removed from the PANE-OBSERVED title only; the record's authored question
-    # text is NEVER canonicalized. See ``_pane_title_for`` for the ambiguity
-    # rule and the docstring above for why this is not the symmetric form.
+    # text is NEVER canonicalized. See ``terminal_parser.strip_leading_gutter``
+    # for the ambiguity rule and why this is not the symmetric form.
     # The pane title is de-chromed; the record's authored question is compared
     # RAW, always. An authority that itself begins with ``"│ "`` therefore fails
     # to match the de-chromed pane and bails — which is exactly the fail-closed

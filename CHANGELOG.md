@@ -15,8 +15,9 @@ The "multi-question prompts get their details card back" release.
   physical line, gutter glyph included, so it no longer matched the question the PreToolUse hook
   had recorded — the details card (the only place per-option descriptions live) was dropped on
   every such prompt, and the picker card's preamble was the same gutter-prefixed fragment, cut off
-  mid-sentence. Question text is now compared with the gutter canonicalized away on both sides,
-  and the wrapped lines are rejoined for display. Single-question prompts were never affected.
+  mid-sentence. Question text is now compared with the gutter stripped from the PANE-observed
+  side only (the recorded question text is never canonicalized — a record that itself begins
+  with a gutter glyph fails closed), and the wrapped lines are rejoined for display. Single-question prompts were never affected.
 - **The picker preamble shows the whole question again.** The preamble is still capped so the
   option rows can't be pushed off the card, but it now clips the full question instead of a
   fragment, and the `│` glyph is gone. The "📋 full details" card itself is uncapped, so a long
