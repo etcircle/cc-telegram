@@ -19,11 +19,8 @@ The "multi-question prompts get their details card back" release.
   and the wrapped lines are rejoined for display. Single-question prompts were never affected.
 - **The picker preamble shows the whole question again.** The preamble is still capped so the
   option rows can't be pushed off the card, but it now clips the full question instead of a
-  fragment, and the `│` glyph is gone.
-- **A future terminal-layout change can no longer silently drop the details card.** When the
-  recorded prompt and the on-screen prompt disagree on question TEXT alone but carry the same
-  prompt identity, the details card is posted anyway. Any other disagreement — different options,
-  different content — still suppresses it, unchanged.
+  fragment, and the `│` glyph is gone. The "📋 full details" card itself is uncapped, so a long
+  boxed question is no longer truncated in the one place that promises the whole thing.
 
 ## [0.4.7] — 2026-08-24
 

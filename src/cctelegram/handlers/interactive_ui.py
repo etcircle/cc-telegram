@@ -4210,38 +4210,12 @@ async def handle_interactive_ui(
                     ctx_source = None
                     dedup_key = ""
                     source_tag = "bail_no_ctx"
-            elif render_source.decision == "bail":
-                # Complete-picker bail (trusted). Normally NO ctx card — the pane
-                # is the user's real, genuinely-different live question and the
-                # side file would be the WRONG one.
-                #
-                # ONE exception (identity proof): a ``title_mismatch``-only bail
-                # whose side file carries the SAME ``tool_use_id`` the bot already
-                # holds for this window from an INDEPENDENT source. That proves
-                # the side file describes the very AUQ invocation this card was
-                # minted for, so the title disagreement is a parse artifact and
-                # the details card may post. Every other bail reason, and an
-                # unknown / mismatched identity, keep today's ``bail_no_ctx``.
-                #
-                # ORDERING: the independent identity only exists once a card has
-                # been recorded for this route, so this can never fire on a FIRST
-                # publish — the details-before-picker gate below is untouched and
-                # a first tick still defers exactly as before.
-                proven = None
-                if render_source.reason == "bail_title_mismatch":
-                    proven = auq_source.ctx_source_via_identity_proof(
-                        window_id,
-                        render_source.form,
-                        _independent_auq_identity(ikey, window_id),
-                    )
-                if proven is not None:
-                    ctx_source = proven.payload
-                    dedup_key = f"pretool:{proven.source_fingerprint[:16]}"
-                    source_tag = "dict_via_identity_proof"
-                else:
-                    ctx_source = None
-                    dedup_key = ""
-                    source_tag = "bail_no_ctx"
+            elif (
+                render_source.decision == "bail"
+            ):  # complete-picker bail (trusted) — unchanged
+                ctx_source = None
+                dedup_key = ""
+                source_tag = "bail_no_ctx"
             elif form is not None:
                 ctx_source = form
                 dedup_key = f"form:{form.fingerprint()}"
@@ -4678,32 +4652,6 @@ def _current_auq_tool_use_id(window_id: str) -> str | None:
     narration could clear B. Same side-file-first priority the parity checks use.
     """
     return _peek_side_file_auq_id(window_id) or _last_auq_tool_use_id.get(window_id)
-
-
-def _independent_auq_identity(ikey: tuple[int, int], window_id: str) -> str | None:
-    """The route's AUQ identity from a source INDEPENDENT of the side file.
-
-    Deliberately NOT ``_current_auq_tool_use_id`` / ``_live_auq_tool_use_id``:
-    both are side-file-FIRST, so comparing their result against the side file's
-    own ``tool_use_id`` would be true by construction — a vacuously-true match
-    predicate, which is exactly the class of guard this repo has been bitten by
-    before. The two independent witnesses, in order:
-
-      1. the identity STAMPED on the published picker card
-         (``_InteractiveMsgMeta.tool_use_id``, persisted in
-         ``interactive_state.json`` — this is what matched the side file in the
-         2.1.237 incident), then
-      2. ``_last_auq_tool_use_id`` — the JSONL-flushed id. Usually unset while a
-         picker is live (Claude Code buffers the AUQ ``tool_use`` until the
-         answer), so it is the weaker, later-arriving witness.
-
-    ``None`` when neither is known — every caller treats that as "unknown" and
-    fails closed, never as a match.
-    """
-    meta = _interactive_msg_meta.get(ikey)
-    if meta is not None and meta.tool_use_id:
-        return meta.tool_use_id
-    return _last_auq_tool_use_id.get(window_id) or None
 
 
 def _live_auq_tool_use_id(

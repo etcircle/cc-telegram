@@ -43,6 +43,7 @@ from cctelegram.handlers.auq_source import PreToolAskRecord
 from cctelegram.terminal_parser import (
     AskOption,
     AskQuestion,
+    has_leading_gutter,
     parse_ask_user_question,
     strip_leading_gutter,
 )
@@ -210,6 +211,36 @@ class TestQuestionDisplayJoin:
         assert "worth checking their posture regardless." in display
         assert not display.endswith("Credits on")
 
+    def test_a_long_boxed_question_is_never_silently_truncated(self) -> None:
+        """P3: NO artificial line cap.
+
+        An 8-line cap silently dropped the tail of a longer boxed question that
+        the 📋 card then presented as "full details" — a quiet correctness loss
+        in the one surface whose entire job is completeness. 12 gutter lines
+        here; all 12 must survive, in order.
+        """
+        sentences = [f"sentence {i} of the question." for i in range(1, 13)]
+        pane = "\n".join(
+            [
+                "←  ☐ Alpha  ☐ Beta  ✔ Submit  →",
+                "",
+                *(f"│ {s}" for s in sentences),
+                "",
+                "❯ 1. Do it now",
+                "  2. Do it later",
+                "  3. Type something.",
+                "─" * 40,
+                "  4. Chat about this",
+                "",
+                "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+            ]
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert form.pane_question_display_text == " ".join(sentences)
+        # The identity field still keeps exactly ONE physical line.
+        assert form.current_question_title == "│ sentence 1 of the question."
+
     def test_non_gutter_layout_leaves_the_display_field_none(self) -> None:
         """Every pre-2.1.237 layout must render byte-identically to today."""
         pane = "\n".join(
@@ -242,12 +273,11 @@ class TestStripLeadingGutter:
         [
             ("│ Which direction?", "Which direction?"),
             ("┃ Which direction?", "Which direction?"),
-            ("| Which direction?", "Which direction?"),
+            ("│  Which direction?", "Which direction?"),  # >1 space
             ("│ │  Which direction?", "Which direction?"),  # repeated run
             ("   │ Which direction?", "Which direction?"),  # indented box
             ("Which direction?", "Which direction?"),  # no gutter → untouched
-            ("│", ""),  # gutter-only carries no question text
-            ("│   ", ""),
+            ("  padded  ", "padded"),  # always whitespace-normalized
             ("", ""),
         ],
     )
@@ -255,12 +285,131 @@ class TestStripLeadingGutter:
         assert strip_leading_gutter(raw) == expected
 
     def test_interior_glyphs_are_never_touched(self) -> None:
-        """A pipe INSIDE the text (a table row, a shell pipeline in a label) is
+        """A glyph INSIDE the text (a table row, a shell pipeline in a label) is
         content, not chrome — stripping it would corrupt the comparison."""
         assert (
             strip_leading_gutter("│ run `ls | wc -l` │ then stop")
             == "run `ls | wc -l` │ then stop"
         )
+
+    def test_a_chrome_only_title_keeps_its_glyph(self) -> None:
+        """Stripping to nothing is refused: a title that is ALL chrome carries no
+        question text, and collapsing it to "" would silently flip a caller's
+        "is there a title?" guard into the skip branch."""
+        assert strip_leading_gutter("│ ") == "│"
+        assert strip_leading_gutter("│ │ ") == "│ │"
+
+
+# ── (P1-A) INJECTIVITY: the canonicalizer must not merge distinct content ────
+
+
+class TestCanonicalizerInjectivity:
+    """The accepted delimiter set is the BOX-DRAWING glyphs ``│``/``┃`` ONLY,
+    each followed by at least one space.
+
+    ASCII ``|`` is excluded on purpose. Accepting it — worse, with no required
+    whitespace — made the canonicalizer NON-INJECTIVE against legitimate
+    question CONTENT: a question that genuinely starts with a pipe would
+    canonicalize onto the same value as the same text WITHOUT the pipe, so a
+    stale side file whose labels happened to line up could be trusted for a
+    DIFFERENT question (a wrong-question card).
+    """
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "| jq . to pretty-print it?",  # a shell pipeline
+            "| col a | col b |",  # a markdown table row
+            "|| fallback to the default?",  # a shell OR
+            "|",
+        ],
+    )
+    def test_ascii_pipe_content_is_never_stripped(self, content: str) -> None:
+        assert strip_leading_gutter(content) == content
+        assert has_leading_gutter(content) is False
+
+    @pytest.mark.parametrize(
+        ("with_pipe", "without_pipe"),
+        [
+            ("| jq . to pretty-print it?", "jq . to pretty-print it?"),
+            ("| col a | col b |", "col a | col b |"),
+        ],
+    )
+    def test_pipe_and_pipeless_content_do_not_collide(
+        self, with_pipe: str, without_pipe: str
+    ) -> None:
+        """THE collision test: two DIFFERENT questions must not share a canonical
+        value. Under the pre-fold alphabet both sides collapsed to the same
+        string and compared EQUAL."""
+        assert strip_leading_gutter(with_pipe) != strip_leading_gutter(without_pipe)
+
+    def test_box_glyph_without_a_space_is_not_chrome(self) -> None:
+        """``│Foo`` is not a shape the CC TUI emits; requiring the separator
+        keeps the accepted alphabet as narrow as the OBSERVED chrome."""
+        assert strip_leading_gutter("│Foo") == "│Foo"
+        assert has_leading_gutter("│Foo") is False
+
+    def test_markdown_table_question_stays_fail_closed_against_the_pane(self) -> None:
+        """End-to-end injectivity: a record question that begins with a markdown
+        table row does NOT become consistent with the real gutter pane."""
+        form = parse_ask_user_question(_pane_text())
+        assert form is not None
+        consistent, reason = auq_source._record_consistent_with_pane(
+            _record("| col a | col b |\nWhich direction?"), form
+        )
+        assert (consistent, reason) == (False, "title_mismatch")
+
+    def test_the_real_fixture_still_resolves_consistent(self) -> None:
+        """…and the narrowing did not cost the fix: the real 2.1.237 pane still
+        reconciles with its record."""
+        form = parse_ask_user_question(_pane_text())
+        assert form is not None
+        assert auq_source._record_consistent_with_pane(
+            _record(_FULL_QUESTION), form
+        ) == (True, "ok")
+
+
+# ── (P1-A) the canonicalization is GATED on the pane carrying a gutter ───────
+
+
+class TestCanonicalizationIsGatedOnThePane:
+    def test_non_gutter_pane_skips_canonicalization_entirely(self) -> None:
+        """A record question that begins with a box gutter must NOT be stripped
+        when the PANE has none — the transform is one-sided BY OBSERVATION, so a
+        non-gutter pane compares byte-identically to its pre-2.1.237 behaviour.
+        """
+        pane = "\n".join(
+            [
+                "←  ☐ Alpha  ☐ Beta  ✔ Submit  →",
+                "",
+                "Which approach should we take?",
+                "",
+                "❯ 1. Option A spike",
+                "  2. Option B direct",
+                "  3. Entra SSO variant first",
+                "  4. Park it",
+                "  5. Type something.",
+                "─" * 40,
+                "  6. Chat about this",
+                "",
+                "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+            ]
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert has_leading_gutter(form.current_question_title or "") is False
+
+        # Same text, but the RECORD carries the gutter. With the gate, nothing is
+        # stripped on either side ⇒ mismatch (the pre-2.1.237 answer).
+        consistent, reason = auq_source._record_consistent_with_pane(
+            _record("│ Which approach should we take?"), form
+        )
+        assert (consistent, reason) == (False, "title_mismatch")
+
+        # The gutterless record still matches, unchanged.
+        assert auq_source._record_consistent_with_pane(
+            _record("Which approach should we take?"), form
+        ) == (True, "ok")
 
 
 # ── (a) Part A: the record/pane consistency check accepts the gutter pane ───

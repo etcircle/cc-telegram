@@ -13,6 +13,17 @@ TRUSTED complete-picker ``bail`` → the ctx-gate maps that to ``bail_no_ctx``
 (the ``bail`` rescue branch is gated on ``not dispatch_trusted``, unreachable
 here) → NO details card, and the preamble falls back to the same clipped line.
 
+The fix is the gutter canonicalization alone. An "identity proof" override that
+would have posted the details card on ANY ``title_mismatch``-only bail whose
+side file matched a held ``tool_use_id`` was DROPPED in review as unsound: under
+in-place turnover AUQ-A's stamped identity and its side file can BOTH be stale
+while the complete pane has already advanced to AUQ-B, so the override would
+post A's details beside B's picker — the exact class GH #67 exists to prevent,
+with no pane-bindable witness available to separate them (labels-only identity
+is the accepted GH #50 residual, and the question-region binder was deleted for
+failing injectivity). The trusted bail therefore stays FAIL-CLOSED, pinned by
+``test_trusted_bail_on_genuine_mismatch_still_posts_no_ctx_card`` below.
+
 These tests drive the public seam (``handle_interactive_ui``) with the fake bot
 / fake tmux and the REAL captured pane, and assert on ``scenario.bot.sent`` —
 no monkeypatch of handler internals in test bodies.
@@ -258,128 +269,41 @@ async def test_gutter_picker_preamble_carries_the_whole_question(
     assert not picker.split("\n\n")[1].endswith(_CLIP_BOUNDARY)
 
 
-# ── Part C: the identity-proof override ──────────────────────────────────────
+# ── the trusted bail stays FAIL-CLOSED (the dropped-Part-C pin) ───────────────
 
 
 @pytest.mark.asyncio
-async def test_identity_proof_recovers_ctx_on_title_mismatch(
+async def test_trusted_bail_on_genuine_mismatch_still_posts_no_ctx_card(
     scenario: ScenarioHarness,
 ) -> None:
-    """Part C hardening: a ``title_mismatch``-only bail whose side file carries
-    the SAME ``tool_use_id`` the bot independently holds is overridden and the
-    details card posts.
+    """A complete-picker (TRUSTED) bail posts NO details card, full stop.
 
-    Simulates a FUTURE layout drift that Part A's canonicalizer does not cover
-    (the side file's question text no longer reconciles with the pane) while the
-    OCCURRENCE identity still proves it is the same AUQ invocation.
+    Pins the review decision to drop the identity-proof override. A side file
+    whose question no longer reconciles with the pane is exactly the shape that
+    an in-place AUQ-A→AUQ-B turnover produces — a STALE record whose
+    ``tool_use_id`` may still match the identity the bot holds. Posting its
+    details beside the live picker would show the user the WRONG question's
+    options, so the contract is: on a trusted bail the stale side-file card is
+    never posted, whatever the reason code or the identity says.
+
+    Also green on bare main — its value is pinning that the hotfix does not
+    widen the bail.
     """
     pane = _pane()
     wid = _bind(scenario, pane)
 
     drifted = _multi_q_input()
-    # Text that no canonicalizer can reconcile with the pane — but the SAME
-    # option labels, so only the TITLE leg fails.
     drifted["questions"][0]["question"] = "A question the pane no longer renders"
     _write_side_file(drifted)
+    # The bot holds an identity that MATCHES the side file's — under the dropped
+    # override this alone would have unlocked the card.
+    interactive_ui._last_auq_tool_use_id[wid] = _TOOL_USE_ID
 
-    # Premise guard: this is a title_mismatch-only, TRUSTED bail.
     resolved = auq_source.resolve_auq_source_for_render(wid, pane)
     assert resolved.decision == "bail"
     assert resolved.dispatch_trusted is True
     assert resolved.reason == "bail_title_mismatch"
 
-    # The bot independently holds this AUQ's identity (JSONL-flushed id here;
-    # in production the picker card's persisted ``tool_use_id`` is the usual
-    # witness). NOT sourced from the side file — that would be vacuous.
-    interactive_ui._last_auq_tool_use_id[wid] = _TOOL_USE_ID
-
-    assert await _render(scenario, wid)
-
-    details = _details_indexes(scenario)
-    assert len(details) == 1
-    assert details[0] < _picker_index(scenario)
-    assert "How should we scope the todo list?" in _sent_texts(scenario)[details[0]]
-
-
-@pytest.mark.asyncio
-async def test_identity_mismatch_keeps_the_bail_unchanged(
-    scenario: ScenarioHarness,
-) -> None:
-    """The negative half: a DIFFERENT identity ⇒ today's ``bail_no_ctx``.
-
-    Proves the override is gated on real identity evidence, not on the
-    ``title_mismatch`` reason alone.
-    """
-    pane = _pane()
-    wid = _bind(scenario, pane)
-
-    drifted = _multi_q_input()
-    drifted["questions"][0]["question"] = "A question the pane no longer renders"
-    _write_side_file(drifted, tool_use_id="toolu_some_OTHER_invocation")
-
-    resolved = auq_source.resolve_auq_source_for_render(wid, pane)
-    assert resolved.reason == "bail_title_mismatch"
-
-    interactive_ui._last_auq_tool_use_id[wid] = _TOOL_USE_ID  # ≠ the side file's
-
     assert await _render(scenario, wid)
 
     assert _details_indexes(scenario) == []
-
-
-@pytest.mark.asyncio
-async def test_identity_proof_does_not_fire_without_an_independent_witness(
-    scenario: ScenarioHarness,
-) -> None:
-    """Fail-closed: with NO independent identity the override must not fire.
-
-    This is also the anti-vacuity pin. The side file always knows its own
-    ``tool_use_id``, so an override that compared it against a side-file-first
-    resolver would be true by construction and would fire here. It must not.
-    """
-    pane = _pane()
-    wid = _bind(scenario, pane)
-
-    drifted = _multi_q_input()
-    drifted["questions"][0]["question"] = "A question the pane no longer renders"
-    _write_side_file(drifted)
-
-    resolved = auq_source.resolve_auq_source_for_render(wid, pane)
-    assert resolved.reason == "bail_title_mismatch"
-
-    # No _last_auq_tool_use_id, no published card ⇒ no independent witness.
-    assert interactive_ui._last_auq_tool_use_id.get(wid) is None
-
-    assert await _render(scenario, wid)
-
-    assert _details_indexes(scenario) == []
-
-
-@pytest.mark.asyncio
-async def test_identity_proof_is_scoped_to_title_mismatch_only(
-    scenario: ScenarioHarness,
-) -> None:
-    """A LABEL mismatch is genuinely different CONTENT — a matching identity
-    must NOT excuse it (the pane would get the wrong question's card)."""
-    pane = _pane()
-    wid = _bind(scenario, pane)
-
-    drifted = _multi_q_input()
-    drifted["questions"][0]["options"] = [
-        {"label": "Something else entirely", "description": "nope"},
-        {"label": "Another wrong label", "description": "nope"},
-        {"label": "A third wrong label", "description": "nope"},
-        {"label": "A fourth wrong label", "description": "nope"},
-    ]
-    _write_side_file(drifted)
-    interactive_ui._last_auq_tool_use_id[wid] = _TOOL_USE_ID
-
-    resolved = auq_source.resolve_auq_source_for_render(wid, pane)
-    assert resolved.reason != "bail_title_mismatch"
-
-    proven = auq_source.ctx_source_via_identity_proof(
-        wid,
-        resolved.form,
-        _TOOL_USE_ID,
-    )
-    assert proven is None
