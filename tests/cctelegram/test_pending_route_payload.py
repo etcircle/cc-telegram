@@ -51,6 +51,21 @@ from cctelegram.handlers.directory_browser import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _trust_lane_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GH #65: pin this module to the LANE-DISABLED creation path.
+
+    ``CC_TELEGRAM_TRUST_PROMPT_CEILING_S=0`` turns the folder-trust creation
+    lane off, restoring the pre-#65 inline wait-then-kill flow byte-for-byte —
+    which is exactly the flow these pending-payload regressions pin, and which
+    still ships as the lane's documented kill-switch degradation. The lane's own
+    creation path (launch-deferred create, in-pane version probe, classifying
+    WAIT task, trust card) is covered by ``tests/cctelegram/test_trust_flow.py``
+    and ``tests/scenarios/test_trust_card_flow.py``.
+    """
+    monkeypatch.setattr(inbound_module.config, "trust_prompt_ceiling_s", 0.0)
+
+
 @contextmanager
 def _patch_both(name: str, *args, **kwargs) -> Iterator[object]:
     """Patch ``name`` on both ``bot_module`` and ``inbound_module``.

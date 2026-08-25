@@ -1,0 +1,51 @@
+
+felixcardix@Felixs-Mac-mini trustrig % cd '/private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-telegram/64f5dbae-3564-43a2-a821-eaa679b542ff/scratchpad
+/trustrig/dirs/e0a-1787644983' && CC_TELEGRAM_DIR='/private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-telegram/64f5dbae-3564-43a2-a821-eaa679b542ff/sc
+ratchpad/trustrig/ccdir' DISABLE_AUTOUPDATER=1 claude --dangerously-skip-permissions --settings '/private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-te
+legram/64f5dbae-3564-43a2-a821-eaa679b542ff/scratchpad/trustrig/md_settings.json'
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-telegram/64f5dbae-3564-43a2-a821-eaa679b542ff/scratchpad/trustrig/dirs/e0a-1787644983
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

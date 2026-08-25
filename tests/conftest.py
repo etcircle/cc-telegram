@@ -39,6 +39,11 @@ import pytest
 # terminal_parser.reset_for_tests() locally.
 os.environ["CC_TELEGRAM_PERMISSION_PROMPTS"] = "false"
 os.environ["CC_TELEGRAM_DECISION_CARDS"] = "false"
+# GH #65: the same floor posture for the folder-trust CREATION lane. ``0``
+# disables it, so every pre-existing scenario keeps the pre-#65 inline
+# wait-then-kill creation path. The lane's own tests restore a real ceiling by
+# monkeypatching ``config.trust_prompt_ceiling_s``.
+os.environ["CC_TELEGRAM_TRUST_PROMPT_CEILING_S"] = "0"
 
 from cctelegram import bot as bot_module
 from cctelegram.handlers import inbound_telegram as inbound_module
@@ -60,6 +65,7 @@ from cctelegram.handlers import (
     pick_intent,
     pick_token,
     status_polling,
+    trust_flow,
     usage_cache,
 )
 
@@ -118,6 +124,12 @@ class FakeTmux:
     kill_calls: list[str] = field(default_factory=list)
     rename_calls: list[tuple[str, str]] = field(default_factory=list)
     create_calls: list[dict[str, Any]] = field(default_factory=list)
+    # GH #65: the launch-deferred creation substrate. ``probe_version_response``
+    # is what the in-pane ``--version`` probe resolves to (None ⇒ the trust card
+    # degrades to display-only); ``launch_calls`` records the deferred launch.
+    probe_version_response: str | None = None
+    probe_calls: list[str] = field(default_factory=list)
+    launch_calls: list[str] = field(default_factory=list)
     create_response: tuple[bool, str] | None = None  # override for failure injection
     send_keys_response: bool | None = None  # override for failure injection
     # GH #50: fired right AFTER a LITERAL (Enter-withheld) write, so a scenario
@@ -284,6 +296,22 @@ class FakeTmux:
         name = window_name or Path(cwd).name or "window"
         wid = self.add_window(window_name=name, cwd=cwd)
         return True, f"Created window '{name}' at {cwd}", name, wid
+
+    async def probe_cli_version(
+        self, window_id: str, *, timeout: float = 5.0
+    ) -> str | None:
+        """GH #65 Fix 0: the per-creation in-pane ``--version`` probe."""
+        del timeout
+        self.probe_calls.append(window_id)
+        return self.probe_version_response
+
+    async def launch_claude_in_window(
+        self, window_id: str, *, resume_session_id: str | None = None
+    ) -> bool:
+        """GH #65 Fix 0: the launch a ``defer_launch`` create postponed."""
+        del resume_session_id
+        self.launch_calls.append(window_id)
+        return window_id in self.windows
 
     async def get_or_create_session(self) -> Any:
         return MagicMock(name="fake-tmux-session")
@@ -752,6 +780,52 @@ def make_update_callback(
     return update
 
 
+def make_update_real_callback(
+    data: str,
+    *,
+    bot: Any,
+    thread_id: int | None = None,
+    message_id: int = 200,
+    user_id: int = _DEFAULT_USER_ID,
+    chat_id: int = _DEFAULT_CHAT_ID,
+) -> Any:
+    """A callback Update built from REAL python-telegram-bot objects.
+
+    ``inbound_telegram._create_and_bind_window`` asserts ``isinstance(query,
+    CallbackQuery)``, so the creation flow cannot be driven with the MagicMock
+    factory above. The objects are bound to the FakeBot, so ``query.answer`` and
+    ``query.edit_message_text`` land in ``FakeBot.sent`` exactly like every other
+    outbound call — no library monkeypatching in test bodies.
+    """
+    from datetime import datetime, timezone
+
+    from telegram import CallbackQuery, Chat, Message, Update
+    from telegram import User as TgUser
+
+    tg_user = TgUser(id=user_id, first_name="Test", is_bot=False)
+    chat = Chat(id=chat_id, type="supergroup", is_forum=True)
+    message = Message(
+        message_id=message_id,
+        date=datetime.now(timezone.utc),
+        chat=chat,
+        from_user=tg_user,
+        message_thread_id=thread_id,
+        is_topic_message=thread_id is not None,
+    )
+    message.set_bot(bot)
+    query = CallbackQuery(
+        id="cbq-real",
+        from_user=tg_user,
+        chat_instance="chat-instance",
+        data=data,
+        message=message,
+    )
+    query.set_bot(bot)
+    update = Update(update_id=1, callback_query=query)
+    update.set_bot(bot)
+    return update
+
+
 def make_update_command(
     command: str,
     *,
@@ -895,6 +969,9 @@ def _reset_all_handler_state() -> None:
     dashboard.reset_for_tests()
     # /cost + /usage overlay result cache (co-located reset seam).
     usage_cache.reset_for_tests()
+    # GH #65: cancel + drop every folder-trust creation flow (its WAIT task is
+    # loop-bound, so a leak across tests would outlive its event loop).
+    trust_flow.reset_for_tests()
     # Re-inject the production JSONL-cache getter (bot.post_init wires this
     # once at startup, but post_init doesn't run under test). Without it the
     # ``jsonl_cache`` resolver branch would no-op and the render path would
@@ -941,6 +1018,8 @@ def fake_tmux(monkeypatch: pytest.MonkeyPatch) -> FakeTmux:
         "capture_pane_cancellation_safe",
         "pane_current_command",
         "create_window",
+        "probe_cli_version",
+        "launch_claude_in_window",
         "get_or_create_session",
         "get_session",
         "session_exists",
@@ -1175,6 +1254,7 @@ __all__ = [
     "make_context",
     "make_update_callback",
     "make_update_command",
+    "make_update_real_callback",
     "make_update_text",
     "make_update_topic_closed",
     "make_update_topic_renamed",
