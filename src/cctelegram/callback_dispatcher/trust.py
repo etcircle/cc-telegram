@@ -51,7 +51,10 @@ async def execute_trust_callback(authorized: Any, adapters: Any) -> None:
     # DIFFERENT dict, so every entry-keyed check below would read "expired" and
     # EDIT THE OWNER'S CARD. A non-owner tap answers the callback and touches
     # nothing: no edit, no token consume, keyboard intact.
-    owner = trust_flow.flow_owner_for_thread(thread_id)
+    card = getattr(query, "message", None)
+    owner = trust_flow.flow_owner_for_card(
+        getattr(card, "chat_id", None), getattr(card, "message_id", None)
+    )
     if owner is not None and owner != user.id:
         logger.info("TRUST_TAP wrong_user user=%d owner=%d", user.id, owner)
         await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
@@ -198,13 +201,36 @@ async def _handle_trust(
         await safe_answer(query, "Window not found", show_alert=True)
         return
 
-    outcome = await _dispatch_trust(
-        user=user,
-        tmux_manager=tmux_manager,
-        w=w,
-        flow=flow,
-        entry=entry,
-    )
+    # P1-C(ii): ``dispatching`` must never become a black hole. Any raise or
+    # cancellation between the claim and the normal release would strand the
+    # flow in a phase that suspends the kill-capable budgets, so the phase is
+    # restored in a ``finally``: ``awaiting_registration`` when the transaction
+    # provably SENT Enter, ``awaiting_trust`` otherwise. The WAIT loop's global
+    # observation ceiling is the backstop for anything this cannot reach.
+    outcome = None
+    enter_sent = False
+    try:
+        outcome = await _dispatch_trust(
+            user=user,
+            tmux_manager=tmux_manager,
+            w=w,
+            flow=flow,
+            entry=entry,
+        )
+        enter_sent = outcome is not None and outcome.kind in (
+            "dispatched",
+            "commit_unconfirmed",
+        )
+    finally:
+        if flow.phase == trust_flow.PHASE_DISPATCHING:
+            await trust_flow.release_dispatch_claim(
+                flow,
+                phase=(
+                    trust_flow.PHASE_AWAITING_REGISTRATION
+                    if enter_sent
+                    else trust_flow.PHASE_AWAITING_TRUST
+                ),
+            )
 
     if outcome is None:
         # The send lock was held — Enter provably never sent.
@@ -248,15 +274,16 @@ async def _handle_trust(
 
 
 async def _refresh_trust_card(flow: Any, context: Any, tmux_manager: Any) -> None:
-    """Re-capture the pane and re-render the card (a fresh mint when licensed).
+    """Re-render the card through the LIVE-PANE-GATED seam.
 
     The single re-render seam: an expired/stale tap, a busy send lock, and a
     pre-commit bail all use it, so a live prompt never ends up behind a dead
-    button. A pane that is no longer a licensed trust frame simply renders the
-    display-only shape.
+    button. ``refresh_card_if_live`` owns the two guards (review r2 P2-C): a
+    positive ``pane_command_is_claude`` before ANY re-mint — a committed or
+    cancelled prompt leaves its text painted on a dead pane — and a re-validation
+    of the flow's identity/generation after its own capture await.
     """
-    pane = await tmux_manager.capture_pane(flow.created_wid)
-    await trust_flow.render_trust_card(flow, context.bot, pane)
+    await trust_flow.refresh_card_if_live(flow, context.bot, tmux_manager)
 
 
 async def _dispatch_trust(

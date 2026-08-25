@@ -26,6 +26,7 @@ from cctelegram.handlers.callback_data import CB_DIR_CONFIRM, CB_TRUST_PICK
 from cctelegram.handlers.inbound_aggregator import aggregator_flush_route
 from cctelegram.handlers.directory_browser import (
     BROWSE_PATH_KEY,
+    ENTRY_TOKEN_KEY,
     CARD_CHAT_ID_KEY,
     CARD_MSG_ID_KEY,
     STATE_BROWSING_DIRECTORY,
@@ -268,8 +269,13 @@ async def _start_flow(
     return "@0", pane
 
 
-def _photo_update(scenario: ScenarioHarness) -> Any:
-    """A photo Update whose file the fake bot will "download"."""
+def _photo_update(scenario: ScenarioHarness, on_download: Any = None) -> Any:
+    """A photo Update whose file the fake bot will "download".
+
+    ``on_download`` fires DURING the download — the spec's pre-processing await
+    for the photo handler — so a race test can land a binding or a creation flow
+    exactly where Fix 5 says the handler must re-read.
+    """
     from unittest.mock import AsyncMock, MagicMock
 
     photo = MagicMock(name="PhotoSize")
@@ -277,6 +283,8 @@ def _photo_update(scenario: ScenarioHarness) -> Any:
     tg_file = MagicMock()
 
     async def _download(out_path: Any) -> Any:
+        if on_download is not None:
+            await on_download()
         Path(out_path).write_bytes(b"\x00")
         return out_path
 
@@ -290,7 +298,8 @@ def _photo_update(scenario: ScenarioHarness) -> Any:
     return update
 
 
-def _document_update(scenario: ScenarioHarness) -> Any:
+def _document_update(scenario: ScenarioHarness, on_download: Any = None) -> Any:
+    """As ``_photo_update``, for the document handler's download await."""
     from unittest.mock import AsyncMock, MagicMock
 
     doc = MagicMock(name="Document")
@@ -300,6 +309,8 @@ def _document_update(scenario: ScenarioHarness) -> Any:
     tg_file = MagicMock()
 
     async def _download(out_path: Any) -> Any:
+        if on_download is not None:
+            await on_download()
         Path(out_path).write_bytes(b"hello")
         return out_path
 
@@ -409,8 +420,9 @@ async def test_trust_tap_navigates_verifies_enters_then_binds(
 
     keys = [k for _w, k, _e, _l in scenario.tmux.sent_keys]
     assert "Enter" in keys, keys
-    # Digits COMMIT instantly on this surface — the lane must never send one.
-    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys), (
+    # Digits COMMIT INSTANTLY on this surface, whether sent literally or as a
+    # named key — the lane must never send one in ANY form (review r1 P3-2).
+    assert not any(k.isdigit() for _w, k, _e, _lit in scenario.tmux.sent_keys), (
         scenario.tmux.sent_keys
     )
     assert pane.committed == 1, "Enter must commit the CURSORED first option"
@@ -1003,4 +1015,220 @@ async def test_p2_3_topic_close_during_completing_bind_awaits_the_tail(
     assert _THREAD not in scenario.session_manager.thread_bindings.get(
         scenario.user_id, {}
     )
+    assert trust_flow.get_flow(scenario.user_id, _THREAD) is None
+
+
+# ── Codex review round 2 — the Telegram-seam folds ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_p2_f_photo_binding_during_the_ATTACHMENT_DOWNLOAD_is_delivered(
+    scenario: ScenarioHarness,
+) -> None:
+    """Fix 5's own pre-processing await: the DOWNLOAD, not the browser build.
+
+    A binding that lands while the photo is still downloading must make THAT
+    payload fall through to bound delivery — never a stale directory browser.
+    """
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    racer = _Racer(scenario, wid, _THREAD)
+
+    await bot_module.photo_handler(
+        _photo_update(scenario, on_download=racer), scenario.context
+    )
+    await aggregator_flush_route((scenario.user_id, _THREAD, wid))
+
+    assert racer.fired, "the race must fire during the download"
+    assert picker_entry(scenario.user_data, _THREAD) is None, (
+        "a bound topic must never be given browser state"
+    )
+    assert scenario.tmux.written_texts, "the photo must reach the bound route"
+
+
+@pytest.mark.asyncio
+async def test_p2_f_document_binding_during_the_ATTACHMENT_DOWNLOAD_is_delivered(
+    scenario: ScenarioHarness,
+) -> None:
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    racer = _Racer(scenario, wid, _THREAD)
+
+    await bot_module.document_handler(
+        _document_update(scenario, on_download=racer), scenario.context
+    )
+    await aggregator_flush_route((scenario.user_id, _THREAD, wid))
+
+    assert racer.fired, "the race must fire during the download"
+    assert picker_entry(scenario.user_data, _THREAD) is None
+    assert scenario.tmux.written_texts, "the document must reach the bound route"
+
+
+@pytest.mark.asyncio
+async def test_p2_f_a_trust_flow_starting_during_the_download_is_not_overwritten(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same download window, with a CREATION FLOW appearing in it."""
+    scenario.tmux.probe_version_response = _LICENSED
+    scenario.add_window(window_id="@0", window_name="repo", cwd="/repo")
+    _TrustPane(scenario, "@0").install(monkeypatch)
+
+    async def _start_during_download() -> None:
+        entry = ensure_picker_entry(scenario.user_data, _THREAD)
+        entry[CARD_CHAT_ID_KEY] = scenario.chat_id
+        entry[CARD_MSG_ID_KEY] = 4242
+        await trust_flow.start_trust_wait(
+            bot=scenario.bot,
+            user_id=scenario.user_id,
+            thread_id=_THREAD,
+            chat_id=scenario.chat_id,
+            user_data=scenario.user_data,
+            entry_token=entry[ENTRY_TOKEN_KEY],
+            created_wid="@0",
+            window_name="repo",
+            selected_path="/repo",
+            create_message="Created",
+            cli_version=_LICENSED,
+            tmux_mgr=scenario.tmux,
+            session_mgr=scenario.session_manager,
+        )
+
+    await bot_module.photo_handler(
+        _photo_update(scenario, on_download=_start_during_download), scenario.context
+    )
+
+    entry = picker_entry(scenario.user_data, _THREAD)
+    assert entry is not None
+    assert entry[STATE_KEY] == trust_flow.STATE_AWAITING_TRUST, (
+        "a live creation flow must never be overwritten by a browser rebuild"
+    )
+    assert entry.get("_pending_thread_attachments"), "the photo is QUEUED"
+    await trust_flow.teardown_thread(scenario.user_id, _THREAD)
+
+
+@pytest.mark.asyncio
+async def test_p2_f_an_expired_tap_on_a_DEAD_pane_never_re_mints(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corpse retains the trust text — an expired tap must not re-arm it.
+
+    After Claude exits (a digit commit or Escape) the prompt block stays painted
+    above the shell prompt. The refresh must key on the pane COMMAND and disable
+    the card instead of minting a Trust button that would type into a shell.
+    """
+    await _start_flow(scenario, monkeypatch)
+    live_tap = _trust_button(scenario)
+    # Claude exits: prompt text still on screen, but the pane is a shell now.
+    pane = _TrustPane(scenario, "@0", command="zsh")
+    monkeypatch.setattr(pane, "_pane", lambda: _POST_ESC_SHELL, raising=False)
+    pane.install(monkeypatch)
+
+    keyboards_before = len(_card_keyboards(scenario))
+
+    await _tap(scenario, f"{CB_TRUST_PICK}t:{'0' * 12}")
+
+    # The disable edit carries NO keyboard, so no new keyboard may appear at
+    # all — a re-mint would show up here.
+    assert len(_card_keyboards(scenario)) == keyboards_before, (
+        "a corpse must never be re-armed with a Trust button"
+    )
+    assert "no longer live" in _card_edits(scenario)[-1], _card_edits(scenario)[-1]
+    assert scenario.tmux.sent_keys == [], "an expired tap types nothing"
+    assert trust_flow.get_flow(scenario.user_id, _THREAD).token is None
+    del live_tap
+
+
+@pytest.mark.asyncio
+async def test_p2_e_a_second_users_tap_on_their_own_card_is_accepted(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ownership resolves the tapped CARD, so two flows can share one topic.
+
+    A thread-only owner lookup rejected the second user's tap on their OWN card;
+    keying on the card's coordinates accepts it.
+    """
+    wid, _pane = await _start_flow(scenario, monkeypatch)
+    owner_flow = trust_flow.get_flow(scenario.user_id, _THREAD)
+    assert owner_flow is not None
+    # The card is the message the tap arrives on — the callback's own message,
+    # which is what ``_create_and_bind_window`` records.
+    owner_card_id = owner_flow.card_msg_id
+    assert owner_card_id is not None
+
+    # A SECOND allowed user's flow, in the same topic, with its own card.
+    other_id = scenario.user_id + 7
+    other_data: dict[str, Any] = {}
+    other_entry = ensure_picker_entry(other_data, _THREAD)
+    assert other_entry is not None
+    other_entry[CARD_CHAT_ID_KEY] = scenario.chat_id
+    other_entry[CARD_MSG_ID_KEY] = 5150
+    scenario.add_window(window_id="@9", window_name="repo2", cwd="/repo2")
+    other_flow = await trust_flow.start_trust_wait(
+        bot=scenario.bot,
+        user_id=other_id,
+        thread_id=_THREAD,
+        chat_id=scenario.chat_id,
+        user_data=other_data,
+        entry_token=other_entry[ENTRY_TOKEN_KEY],
+        created_wid="@9",
+        window_name="repo2",
+        selected_path="/repo2",
+        create_message="Created",
+        cli_version=_LICENSED,
+        tmux_mgr=scenario.tmux,
+        session_mgr=scenario.session_manager,
+    )
+    assert other_flow is not None
+
+    # Each card resolves to ITS OWN owner…
+    assert (
+        trust_flow.flow_owner_for_card(scenario.chat_id, owner_card_id)
+        == scenario.user_id
+    )
+    assert trust_flow.flow_owner_for_card(scenario.chat_id, 5150) == other_id
+    # …and the second user tapping the FIRST user's card is still refused.
+    assert trust_flow.flow_owner_for_card(scenario.chat_id, owner_card_id) != other_id
+    # A thread-only lookup would have collapsed these two to one owner.
+    assert owner_card_id != 5150
+
+    await trust_flow.teardown_thread(scenario.user_id, _THREAD)
+    await trust_flow.teardown_thread(other_id, _THREAD)
+    del wid
+
+
+@pytest.mark.asyncio
+async def test_p1_a_a_creation_install_racing_start_command_cannot_survive_it(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/start` clears every entry under its lock, so a racing install aborts.
+
+    Driven at the seam: the entry token is captured, `/start` runs, and only
+    THEN does the install attempt land — exactly the snapshot→clear gap.
+    """
+    entry = ensure_picker_entry(scenario.user_data, _THREAD)
+    assert entry is not None
+    entry[CARD_CHAT_ID_KEY] = scenario.chat_id
+    entry[CARD_MSG_ID_KEY] = 4242
+    captured_token = entry[ENTRY_TOKEN_KEY]
+    scenario.add_window(window_id="@0", window_name="repo", cwd="/repo")
+
+    await bot_module.start_command(
+        make_update_text("/start", thread_id=None), scenario.context
+    )
+
+    flow = await trust_flow.start_trust_wait(
+        bot=scenario.bot,
+        user_id=scenario.user_id,
+        thread_id=_THREAD,
+        chat_id=scenario.chat_id,
+        user_data=scenario.user_data,
+        entry_token=captured_token,
+        created_wid="@0",
+        window_name="repo",
+        selected_path="/repo",
+        create_message="Created",
+        cli_version=_LICENSED,
+        tmux_mgr=scenario.tmux,
+        session_mgr=scenario.session_manager,
+    )
+
+    assert flow is None, "an install whose entry /start cleared must ABORT"
     assert trust_flow.get_flow(scenario.user_id, _THREAD) is None

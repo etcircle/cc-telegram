@@ -72,6 +72,7 @@ from .directory_browser import (
     CARD_MSG_ID_KEY,
     build_directory_browser,
     drop_picker_entry,
+    entry_token,
     picker_entry,
 )
 from .inbound_aggregator import (
@@ -1475,6 +1476,13 @@ async def _create_and_bind_window(
         await safe_answer(query, "Stale picker", show_alert=True)
         return
 
+    # GH #65 review r2 P1-A: capture the picker entry's IDENTITY TOKEN before
+    # anything is created. ``start_trust_wait`` re-validates it under the
+    # creation lock, so a teardown that clears this entry (and with it the
+    # token) while the window is being created makes the install ABORT rather
+    # than land on a replacement entry a fresh inbound may have created.
+    creation_entry_token = entry_token(context.user_data, pending_thread_id)
+
     # GH #65: the creation-flow trust lane covers NON-RESUME creation ONLY. The
     # resume path keeps today's manual-association fallback byte-identical (its
     # 15s timeout, its window_state override, its messaging) — pinned by a
@@ -1544,12 +1552,16 @@ async def _create_and_bind_window(
             # the CallbackQuery / CallbackContext objects.
             await safe_edit(query, f"🚀 {message}\n\nStarting Claude…")
             await safe_answer(query, "Created")
+            card = getattr(query, "message", None)
             flow = await trust_flow.start_trust_wait(
                 bot=context.bot,
                 user_id=user.id,
                 thread_id=pending_thread_id,
                 chat_id=session_mgr.resolve_chat_id(user.id, pending_thread_id),
                 user_data=context.user_data,
+                entry_token=creation_entry_token,
+                card_chat_id=getattr(card, "chat_id", None),
+                card_msg_id=getattr(card, "message_id", None),
                 created_wid=created_wid,
                 window_name=created_wname,
                 selected_path=selected_path,

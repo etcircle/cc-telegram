@@ -14,6 +14,7 @@ Key components:
 """
 
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -70,6 +71,16 @@ _PENDING_PICKERS_KEY = "_pending_pickers"
 CARD_CHAT_ID_KEY = "_card_chat_id"
 CARD_MSG_ID_KEY = "_card_msg_id"
 
+# GH #65 (review r2 P1-A): every picker entry carries an EXPLICIT identity token,
+# minted once at entry CREATION. "An entry exists for this thread" is not
+# identity — a teardown that clears the entry and an inbound that immediately
+# creates a REPLACEMENT are indistinguishable to a presence check, so a creation
+# callback that started before the clear could install its flow onto the fresh
+# entry (an ABA hijack) or resurrect an unreachable one. A long-lived actor
+# therefore captures this token up front and re-validates it before it claims;
+# dropping the entry destroys the token with it, so any later claim fails closed.
+ENTRY_TOKEN_KEY = "_entry_token"
+
 
 def picker_entry(user_data: dict | None, thread_id: int | None) -> dict | None:
     """Return this thread's picker entry, or None when absent."""
@@ -97,9 +108,20 @@ def ensure_picker_entry(user_data: dict | None, thread_id: int | None) -> dict |
         user_data[_PENDING_PICKERS_KEY] = pickers
     entry = pickers.get(thread_id)
     if not isinstance(entry, dict):
-        entry = {}
+        # A NEW entry is a NEW identity (review r2 P1-A). Minted here, once, so
+        # every creator gets one without having to remember to.
+        entry = {ENTRY_TOKEN_KEY: secrets.token_hex(8)}
         pickers[thread_id] = entry
     return entry
+
+
+def entry_token(user_data: dict | None, thread_id: int | None) -> str | None:
+    """This thread's picker-entry identity token, or None when there is none."""
+    entry = picker_entry(user_data, thread_id)
+    if entry is None:
+        return None
+    token = entry.get(ENTRY_TOKEN_KEY)
+    return token if isinstance(token, str) and token else None
 
 
 def drop_picker_entry(user_data: dict | None, thread_id: int | None) -> dict | None:

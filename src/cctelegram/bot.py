@@ -301,6 +301,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # flow start while the old window still lives.
     await teardown_all_creation_flows(user.id, context.bot, context.user_data)
     await disable_all_picker_cards(context.bot, context.user_data)
+    # Each entry is dropped under ITS OWN creation lock (review r2 P1-A), so a
+    # creation callback that started before this reset cannot install a flow
+    # into the gap between the teardown sweep and the clear.
+    await trust_flow.clear_all_topic_entries(user.id, context.user_data)
     clear_all_picker_entries(context.user_data)
 
     if update.message:
@@ -1276,13 +1280,18 @@ async def topic_closed_handler(
         bot=context.bot,
         user_data=context.user_data,
         reason="topic closed",
+        session_mgr=session_manager,
     )
 
-    _clear_pending_route_payload_for_thread(
-        context.user_data,
-        thread_id,
-        delete_files=True,
-    )
+    # GH #65 review r2 P1-A: the entry is dropped INSIDE the creation lock, so a
+    # creation callback still in flight cannot install a flow between the
+    # teardown above and this clear — its entry-token check will fail instead.
+    async with trust_flow.creation_lock(user.id, thread_id):
+        _clear_pending_route_payload_for_thread(
+            context.user_data,
+            thread_id,
+            delete_files=True,
+        )
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid:

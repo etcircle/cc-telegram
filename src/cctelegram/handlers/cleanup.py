@@ -112,7 +112,9 @@ async def teardown_all_creation_flows(
     awaited); the now-BOUND topic then goes through the normal bound-topic
     teardown, per Fix 6's protocol (review r1 P2-3).
     """
-    for thread_id in await trust_flow.teardown_all_for_user(user_id):
+    for thread_id in await trust_flow.teardown_all_for_user(
+        user_id, session_mgr=session_manager
+    ):
         logger.info(
             "creation flow completed during /start teardown — running the "
             "bound-topic teardown (user=%d, thread=%d)",
@@ -155,7 +157,12 @@ async def clear_topic_state(
     # releases the creation lock before it cancels/awaits, so calling it here
     # (holding nothing) cannot deadlock.
     await trust_flow.teardown_thread(
-        user_id, thread_id, bot=bot, user_data=user_data, reason="topic teardown"
+        user_id,
+        thread_id,
+        bot=bot,
+        user_data=user_data,
+        reason="topic teardown",
+        session_mgr=session_manager,
     )
 
     # Tear down any per-route queue first so its in-flight task can record
