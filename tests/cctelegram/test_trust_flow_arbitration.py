@@ -59,6 +59,8 @@ def _lane(monkeypatch: pytest.MonkeyPatch) -> Any:
     # A teardown that meets an in-flight dispatch waits this out; the
     # production budget is 45s, which no test needs to spend.
     monkeypatch.setattr(trust_flow, "DISPATCH_SETTLE_BUDGET_S", 0.2)
+    # The OVERALL teardown budget (production 120s) — no test needs it.
+    monkeypatch.setattr(trust_flow, "TEARDOWN_BUDGET_S", 1.0)
     (app_dir() / "session_map.json").unlink(missing_ok=True)
     yield
     trust_flow.reset_for_tests()

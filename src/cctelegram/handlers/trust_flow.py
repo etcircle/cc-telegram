@@ -250,6 +250,16 @@ class TrustFlow:
     # leaves the claimed phase. Teardown cancels + AWAITS it — positive proof
     # the side effect is over, instead of inferring settlement from a timer.
     claim_task: asyncio.Task[Any] | None = field(default=None)
+    # Whether the claim's owner may be CANCELLED to settle it. True for the
+    # callback claims (a tap's transaction); False for the cooperative ones
+    # (teardown's own, the WAIT terminalizer's) — cancelling those mid-cleanup
+    # is the very "drop beneath another actor's kill_window" bug (r6 P1-B).
+    claim_cancellable: bool = False
+    # THE TEARDOWN FENCE (review r6 P1-A). Set under the lock when a teardown
+    # starts; while it is up, every claim ACQUISITION is refused, so successive
+    # claims cannot starve the teardown loop. In-flight claims still settle
+    # normally — the fence stops new ones, it does not steal existing ones.
+    teardown_fenced: bool = False
     # The collaborators every arbitration path needs, so ANY actor (the WAIT
     # task, a callback, teardown) can run the full choreography without the
     # caller having to thread them through.
@@ -617,12 +627,33 @@ async def cleanup_created_window(
     return CleanupOutcome.KILL_FAILED
 
 
+def binding_is_current_route(flow: TrustFlow, session_mgr: Any = None) -> bool:
+    """True when THIS topic is the one bound to the flow's window.
+
+    ``cleanup_created_window`` only proves the window is bound SOMEWHERE
+    (review r6 P2), which is two very different situations: if the binding is
+    THIS route's, the bind WON and the spec requires the pending payload to be
+    delivered normally; if it belongs to another topic, the window is collateral
+    and this flow is simply cancelled — and the card must not claim that this
+    topic is bound.
+    """
+    resolver = session_mgr or flow.session_mgr or session_manager
+    try:
+        return resolver.get_window_for_thread(flow.user_id, flow.thread_id) == (
+            flow.created_wid
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def cleanup_note(outcome: CleanupOutcome, window_name: str, window_id: str) -> str:
     """The honest per-outcome sentence appended to a failure card edit."""
     if outcome is CleanupOutcome.KILLED:
         return "The unmonitored tmux window was cleaned up."
     if outcome is CleanupOutcome.SPARED_BOUND:
-        return "The tmux window was left alone — it is already bound."
+        # Deliberately does NOT name a topic: the guard only proves the window is
+        # bound SOMEWHERE (review r6 P2).
+        return "The tmux window was left alone — a session is already bound to it."
     if outcome is CleanupOutcome.SPARED_REGISTERED:
         return "The tmux window was left alone — a live session registered in it."
     return (
@@ -892,7 +923,14 @@ async def render_trust_card(flow: TrustFlow, bot: Any, pane_text: str | None) ->
 # ── Fix 3 / Fix 7: terminal transitions ──────────────────────────────────────
 
 
-def try_transition_locked(flow: TrustFlow, *, expect: frozenset[str], to: str) -> bool:
+def try_transition_locked(
+    flow: TrustFlow,
+    *,
+    expect: frozenset[str],
+    to: str,
+    acquisition: bool = False,
+    ignore_fence: bool = False,
+) -> bool:
     """THE ONLY MUTATOR OF ``flow.phase``. The caller MUST hold the creation lock.
 
     Wave 3's structural consolidation. Three consecutive review rounds found the
@@ -912,6 +950,12 @@ def try_transition_locked(flow: TrustFlow, *, expect: frozenset[str], to: str) -
     """
     if _flows.get((flow.user_id, flow.thread_id)) is not flow:
         return False
+    if acquisition and flow.teardown_fenced and not ignore_fence:
+        # A teardown owns this topic's future. New claims are REFUSED so the
+        # loop cannot be starved by an endless stream of them (r6 P1-A); a
+        # registration losing here is the same accepted, documented loss class
+        # as one landing after the fresh-read linearization point.
+        return False
     if flow._phase not in expect:
         return False
     if flow._phase in _TASK_CLAIMED_PHASES and to != flow._phase:
@@ -919,14 +963,28 @@ def try_transition_locked(flow: TrustFlow, *, expect: frozenset[str], to: str) -
         # critical section, so teardown can never await a task that no longer
         # owns anything (review r5 P1-B).
         flow.claim_task = None
+        flow.claim_cancellable = False
     flow._phase = to
     return True
 
 
-async def transition(flow: TrustFlow, *, expect: frozenset[str], to: str) -> bool:
+async def transition(
+    flow: TrustFlow,
+    *,
+    expect: frozenset[str],
+    to: str,
+    acquisition: bool = False,
+    ignore_fence: bool = False,
+) -> bool:
     """Acquire the creation lock and CAS (the seam for callers not holding it)."""
     async with creation_lock(flow.user_id, flow.thread_id):
-        return try_transition_locked(flow, expect=expect, to=to)
+        return try_transition_locked(
+            flow,
+            expect=expect,
+            to=to,
+            acquisition=acquisition,
+            ignore_fence=ignore_fence,
+        )
 
 
 async def force_terminal_claim(flow: TrustFlow) -> bool:
@@ -953,6 +1011,7 @@ async def force_terminal_claim(flow: TrustFlow) -> bool:
             flow.thread_id,
         )
         flow.claim_task = None
+        flow.claim_cancellable = False
         flow._phase = PHASE_CANCELLING
         return True
 
@@ -979,15 +1038,38 @@ async def _cancel_and_await(task: asyncio.Task[Any] | None) -> None:
         pass
 
 
-async def claim_terminal(flow: TrustFlow, phase: str = PHASE_CANCELLING) -> bool:
+async def claim_terminal(
+    flow: TrustFlow,
+    phase: str = PHASE_CANCELLING,
+    *,
+    ignore_fence: bool = False,
+    cancellable: bool = False,
+) -> bool:
     """CLAIM the flow for a cleanup. EXCLUSIVE against every claimed phase.
 
     Refuses when the flow is in ANY claimed or terminal phase — ``dispatching``,
     ``completing_bind``, ``cancelling`` or ``terminal`` — so two cleanups can
     never both win, and a cleanup can never fire underneath a dispatch or a
     bind. Only the two OPEN phases are claimable.
+
+    Like EVERY acquisition (review r6 P1-B) it registers its owner, so whoever
+    needs to settle this claim has a handle on the task actually doing the work
+    instead of only a phase to poll. ``ignore_fence`` is for teardown's own
+    claim — the fence exists to keep OTHERS out, not to lock teardown out of the
+    topic it is tearing down.
     """
-    return await transition(flow, expect=OPEN_PHASES, to=phase)
+    async with creation_lock(flow.user_id, flow.thread_id):
+        if not try_transition_locked(
+            flow,
+            expect=OPEN_PHASES,
+            to=phase,
+            acquisition=True,
+            ignore_fence=ignore_fence,
+        ):
+            return False
+        flow.claim_task = asyncio.current_task()
+        flow.claim_cancellable = cancellable
+        return True
 
 
 @dataclass(frozen=True)
@@ -1181,7 +1263,9 @@ async def _run_completion_tail(
     window is already dying.
     """
     async with creation_lock(flow.user_id, flow.thread_id):
-        if not try_transition_locked(flow, expect=expect, to=PHASE_COMPLETING_BIND):
+        if not try_transition_locked(
+            flow, expect=expect, to=PHASE_COMPLETING_BIND, acquisition=True
+        ):
             return False
         inner = asyncio.create_task(_complete_bind(flow, bot, session_mgr))
         flow.bind_task = inner
@@ -1420,10 +1504,17 @@ async def _wait_loop(
 
         if kind is SliceKind.REGISTERED:
             # A registration landing while a cleanup holds ``cancelling`` LOSES
-            # (the window is already dying) — the same accepted loss class as
-            # the fresh-read linearization point.
+            # the CAS (the window is already being settled) — the same accepted
+            # loss class as the fresh-read linearization point.
+            #
+            # But losing must NOT end the loop (review r6 P1-C). Returning here
+            # left the flow with NO OBSERVER the moment the winner aborted and
+            # restored an open phase: no ceilings, no registration, no bind.
+            # WAIT keeps observing until it sees a TERMINAL phase committed by
+            # whoever won — the check at the top of the slice — so a restored
+            # flow is automatically observed again.
             if not await _run_completion_tail(flow, bot, session_mgr):
-                return
+                continue
             return
 
         if kind is SliceKind.SHELL:
@@ -1683,9 +1774,14 @@ async def _terminalize(
                 to=PHASE_CANCELLING,
             ):
                 return
-        elif not try_transition_locked(flow, expect=OPEN_PHASES, to=PHASE_CANCELLING):
-            # Another actor holds the claim — it owns the cleanup AND the drop.
+        elif not try_transition_locked(
+            flow, expect=OPEN_PHASES, to=PHASE_CANCELLING, acquisition=True
+        ):
+            # Another actor holds the claim (or a teardown has fenced the flow)
+            # — it owns the cleanup AND the drop.
             return
+        flow.claim_task = asyncio.current_task()
+        flow.claim_cancellable = False
 
     if not bind_ok and flow.bind_task is not None:
         reason, body = (
@@ -1898,10 +1994,14 @@ async def claim_for_dispatch(
         if entry is None or entry.get(TRUST_GENERATION_KEY) != flow.generation:
             return TrustClaim(False, None, "missing_entry")
         if not try_transition_locked(
-            flow, expect=frozenset({PHASE_AWAITING_TRUST}), to=PHASE_DISPATCHING
+            flow,
+            expect=frozenset({PHASE_AWAITING_TRUST}),
+            to=PHASE_DISPATCHING,
+            acquisition=True,
         ):
             return TrustClaim(False, flow, "wrong_state", flow.phase)
         flow.claim_task = asyncio.current_task()
+        flow.claim_cancellable = True
         return TrustClaim(True, flow, None, PHASE_AWAITING_TRUST)
 
 
@@ -1940,9 +2040,12 @@ async def claim_for_cancel(
         if card_generation is not None and card_generation != flow.generation:
             return TrustClaim(False, None, "stale_generation")
         previous = flow.phase
-        if not try_transition_locked(flow, expect=OPEN_PHASES, to=PHASE_CANCELLING):
+        if not try_transition_locked(
+            flow, expect=OPEN_PHASES, to=PHASE_CANCELLING, acquisition=True
+        ):
             return TrustClaim(False, flow, "wrong_state", flow.phase)
         flow.claim_task = asyncio.current_task()
+        flow.claim_cancellable = True
         # ``previous_phase`` is the ACQUIRED phase (review r5 P1-D): an abort
         # path must restore what it took, not assume ``awaiting_trust``.
         return TrustClaim(True, flow, None, previous)
@@ -1973,11 +2076,14 @@ async def cancel_flow(flow: TrustFlow, bot: Any, tmux_mgr: Any) -> CleanupOutcom
     outcome = await cleanup_created_window(
         flow.created_wid, flow.window_name, tmux_mgr, reason="trust card cancel"
     )
-    if outcome is CleanupOutcome.SPARED_REGISTERED:
-        # The registration WON. Hand the flow to the completion tail through the
-        # same seam every other completion uses, releasing ``cancelling`` as
-        # part of that CAS. The WAIT task is still alive and will settle behind
-        # the tail's own terminal transition.
+    if outcome is CleanupOutcome.SPARED_REGISTERED or (
+        outcome is CleanupOutcome.SPARED_BOUND and binding_is_current_route(flow)
+    ):
+        # The bind WON — either a registration landed under us, or THIS route is
+        # already bound to the window (review r6 P2). Both are completions, so
+        # both go through the ONE completion seam: the pending payload is
+        # delivered through normal bound delivery and its files are NOT deleted,
+        # because they were delivered.
         await _run_completion_tail(
             flow,
             bot,
@@ -1996,7 +2102,14 @@ async def cancel_flow(flow: TrustFlow, bot: Any, tmux_mgr: Any) -> CleanupOutcom
             "Send a message here to start again."
         )
     elif outcome is CleanupOutcome.SPARED_BOUND:
-        body = "✅ That session is already bound to this topic — nothing was cancelled."
+        # COLLATERAL binding: the current-route arm returned above, so reaching
+        # here means the window belongs to a DIFFERENT topic (review r6 P2).
+        # This flow IS genuinely cancelled, and the copy names neither topic as
+        # bound.
+        body = (
+            "❌ Cancelled — the tmux window is in use by another topic, so it "
+            "was left running.\n\nSend a message here to start again."
+        )
     else:
         body = "⚠️ Cancelled, but " + cleanup_note(
             outcome, flow.window_name, flow.created_wid
@@ -2185,10 +2298,14 @@ async def _await_bind_tail(bind_task: asyncio.Task[Any]) -> bool:
     return bind_task.exception() is None
 
 
-async def _await_dispatch_settled(
-    user_id: int, thread_id: int, generation: int
-) -> bool:
-    """Wait (bounded) for a flow to leave ``dispatching``. True if it did."""
+async def _await_claim_settled(user_id: int, thread_id: int, generation: int) -> bool:
+    """Wait (bounded) for a flow to leave ANY task-held claim. True if it did.
+
+    Review r6 P1-B: polling only for ``dispatching`` reported a LIVE
+    ``cancelling`` claim settled on the very first poll, which is how a teardown
+    could drop beneath another teardown's — or the WAIT terminalizer's —
+    ``kill_window``.
+    """
     deadline = _wall() + DISPATCH_SETTLE_BUDGET_S
     while _wall() < deadline:
         await asyncio.sleep(_DISPATCH_SETTLE_POLL_S)
@@ -2197,7 +2314,7 @@ async def _await_dispatch_settled(
             if (
                 flow is None
                 or flow.generation != generation
-                or flow.phase != PHASE_DISPATCHING
+                or flow.phase not in _TASK_CLAIMED_PHASES
             ):
                 return True
     return False
@@ -2274,8 +2391,14 @@ async def _settle_claim_task(
     flow is no longer in a task-held claim.
     """
     task = flow.claim_task
+    cancellable = flow.claim_cancellable
     if task is not None and task is not asyncio.current_task() and not task.done():
-        task.cancel()
+        if cancellable:
+            # A CALLBACK claim: cancelling it is how its ``finally`` runs.
+            task.cancel()
+        # A COOPERATIVE claim (another teardown, the WAIT terminalizer) is
+        # AWAITED, never cancelled (review r6 P1-B) — cancelling one mid-cleanup
+        # is exactly the "drop beneath another actor's kill_window" bug.
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=budget)
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
@@ -2289,13 +2412,15 @@ async def _settle_claim_task(
         if flow.phase not in _TASK_CLAIMED_PHASES:
             return True
     # No handle (or the task ignored the cancel): fall back to the bounded poll.
-    return await _await_dispatch_settled(flow.user_id, flow.thread_id, flow.generation)
+    return await _await_claim_settled(flow.user_id, flow.thread_id, flow.generation)
 
 
-# How many times teardown may re-dispatch on the flow's CURRENT phase before it
-# gives up and forces. Each pass makes progress (a claim settles, a tail
-# finishes, a cleanup commits), so this only bounds pathological churn.
-_TEARDOWN_MAX_PASSES: Final[int] = 8
+# The OVERALL wall-clock budget for one teardown (review r6 P1-A). A pass
+# counter was not a time budget and its exhaustion ended in a BLIND registry
+# drop — tokens released and the flow dropped without settling the owner,
+# cancelling the WAIT task or cleaning the window. On expiry teardown
+# FORCE-SETTLES the current phase instead; it never drops blindly.
+TEARDOWN_BUDGET_S: float = 120.0
 
 
 async def teardown_thread(
@@ -2328,8 +2453,16 @@ async def teardown_thread(
       * an OPEN phase         → claim it, cancel the WAIT task, run the guarded
                                 cleanup, then look again.
 
-    It exits only from a terminal reading (or a flow that is already gone), and
-    the forced path is the bound of last resort.
+    It exits only from a terminal reading (or a flow that is already gone).
+
+    Two things keep that loop honest (review r6 P1-A). It raises a per-flow
+    TEARDOWN FENCE on every pass, so no NEW claim can be acquired while it runs
+    — a stream of taps cannot starve it, and a registration losing to the fence
+    is the same accepted, documented loss class as one landing after the
+    fresh-read linearization point. And its bound is a real WALL-CLOCK budget
+    (``TEARDOWN_BUDGET_S``), whose expiry FORCE-SETTLES whatever phase the flow
+    is in — settle the registered owner, force the claim, guarded cleanup, drop
+    — never the blind registry drop a pass counter used to end in.
     """
     del bot, user_data, reason  # the flow record carries its own card + entry
     if thread_id is None:
@@ -2339,10 +2472,16 @@ async def teardown_thread(
     observed_wid: str | None = expected_wid
     generation: int | None = expected_generation
     forced = False
+    deadline = _wall() + TEARDOWN_BUDGET_S
 
-    for _ in range(_TEARDOWN_MAX_PASSES):
+    while True:
         async with creation_lock(user_id, thread_id):
             flow = _flows.get(key)
+            if flow is not None:
+                # RAISE THE FENCE (review r6 P1-A) on every pass: while it is up
+                # no NEW claim can be acquired, so a stream of taps cannot starve
+                # this loop. In-flight claims still settle normally.
+                flow.teardown_fenced = True
             if flow is None:
                 return completed or _completion_won(
                     user_id,
@@ -2365,6 +2504,37 @@ async def teardown_thread(
                     _drop_entry(current)
                     _drop_flow(current)
             return completed
+
+        if _wall() >= deadline and not forced:
+            # The OVERALL budget expired (review r6 P1-A). FORCE-SETTLE the
+            # phase we are actually in — settle the registered owner, force the
+            # claim, run the guarded cleanup, drop — instead of the blind
+            # registry drop the old pass counter ended in.
+            logger.warning(
+                "trust teardown budget expired in %s (thread=%s, window=%s) — "
+                "force-settling",
+                phase,
+                thread_id,
+                observed_wid,
+            )
+            await _settle_claim_task(current, budget=_DISPATCH_SETTLE_POLL_S)
+            if not await force_terminal_claim(current):
+                continue
+            forced = True
+            await _cancel_and_await(current.wait_task)
+            await _terminal_cleanup(
+                current,
+                current.bot,
+                current.tmux_mgr,
+                reason="teardown budget expired",
+                body=(
+                    "⚠️ This session setup was cancelled while an action was "
+                    "still in flight."
+                ),
+                session_mgr=session_mgr or current.session_mgr,
+                allow_completion=False,
+            )
+            continue
 
         if phase == PHASE_COMPLETING_BIND:
             if bind_task is not None:
@@ -2404,7 +2574,7 @@ async def teardown_thread(
         # OPEN: claim it, settle the WAIT task, run the guarded cleanup, look
         # again (the cleanup either CASes to terminal or hands the flow to the
         # completion seam, and the next pass acts on whichever it is).
-        if not await claim_terminal(current):
+        if not await claim_terminal(current, ignore_fence=True):
             continue
         await _cancel_and_await(wait_task)
         await _terminal_cleanup(
@@ -2416,17 +2586,6 @@ async def teardown_thread(
             session_mgr=session_mgr or current.session_mgr,
         )
 
-    logger.warning(
-        "trust teardown exhausted its passes for thread=%s window=%s — dropping",
-        thread_id,
-        observed_wid,
-    )
-    async with creation_lock(user_id, thread_id):
-        leftover = _flows.get(key)
-        if leftover is not None:
-            _release_tokens(leftover)
-            _drop_entry(leftover)
-            _drop_flow(leftover)
     return completed
 
 

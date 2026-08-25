@@ -1302,3 +1302,76 @@ async def test_p2_4_a_raced_document_carries_exactly_one_quote_block(
     assert len(applied) == 1, (
         f"reply context must be applied EXACTLY once, got {applied}"
     )
+
+
+@pytest.mark.asyncio
+async def test_r6_a_current_route_binding_delivers_the_queued_payload(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Cancel whose window is bound to THIS topic is a completion, not a
+    cancellation: the queued first message is DELIVERED and its file survives.
+
+    ``cleanup_created_window`` only proves the window is bound SOMEWHERE, so the
+    two cases have to be told apart (review r6 P2).
+    """
+    wid, pane = await _start_flow(scenario, monkeypatch)
+    pane.post_commit = IDLE_PANE_V2_1_207
+    pane.committed = 1
+    entry = picker_entry(scenario.user_data, _THREAD)
+    assert entry is not None
+    assert entry["_pending_thread_text"] == "hello claude"
+
+    # THIS topic is bound to the created window.
+    scenario.bind_thread(
+        _THREAD, wid, display_name="repo", cwd="/repo", session_id="sid-bound"
+    )
+    flow = trust_flow.get_flow(scenario.user_id, _THREAD)
+    assert flow is not None
+    claim = await trust_flow.claim_for_cancel(
+        scenario.user_id,
+        _THREAD,
+        user_data=scenario.user_data,
+        card_generation=flow.generation,
+    )
+    assert claim.ok
+
+    outcome = await trust_flow.cancel_flow(flow, scenario.bot, scenario.tmux)
+    await aggregator_flush_route((scenario.user_id, _THREAD, wid))
+
+    assert outcome is trust_flow.CleanupOutcome.SPARED_BOUND
+    assert scenario.tmux.kill_calls == [], "a bound window is never killed"
+    assert scenario.tmux.delivered("hello claude"), scenario.tmux.written_texts
+    assert not any("Cancelled" in t for t in _card_edits(scenario)), _card_edits(
+        scenario
+    )
+    assert trust_flow.get_flow(scenario.user_id, _THREAD) is None
+
+
+@pytest.mark.asyncio
+async def test_r6_a_collateral_binding_is_cancelled_without_naming_this_topic(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other arm: the window belongs to a DIFFERENT topic."""
+    wid, _pane = await _start_flow(scenario, monkeypatch)
+    # A different topic owns the window; THIS topic stays unbound.
+    scenario.session_manager.thread_bindings.setdefault(scenario.user_id, {})[
+        _THREAD + 1
+    ] = wid
+    flow = trust_flow.get_flow(scenario.user_id, _THREAD)
+    assert flow is not None
+    claim = await trust_flow.claim_for_cancel(
+        scenario.user_id,
+        _THREAD,
+        user_data=scenario.user_data,
+        card_generation=flow.generation,
+    )
+    assert claim.ok
+
+    outcome = await trust_flow.cancel_flow(flow, scenario.bot, scenario.tmux)
+
+    assert outcome is trust_flow.CleanupOutcome.SPARED_BOUND
+    assert scenario.tmux.kill_calls == [], "another topic's window is never killed"
+    final = _card_edits(scenario)[-1]
+    assert "Cancelled" in final, final
+    assert "bound to this topic" not in final, final
+    assert picker_entry(scenario.user_data, _THREAD) is None

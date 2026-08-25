@@ -126,10 +126,12 @@ async def _handle_cancel(
             await safe_answer(query, "Session already started — binding it instead.")
             return
         if outcome is trust_flow.CleanupOutcome.SPARED_BOUND:
-            # ``cancel_flow`` completed the teardown inline (tokens, entry,
-            # flow, final card edit) — review r5 P2-A, where this arm used to
-            # return leaving all three leaked.
-            await safe_answer(query, "Already bound.")
+            # Two dispositions, both already handled by ``cancel_flow`` (review
+            # r6 P2): a CURRENT-ROUTE binding went through the completion seam
+            # (payload delivered), and a COLLATERAL one completed the teardown
+            # inline with the honest cancellation copy. The answer text must not
+            # claim this topic is bound in either case.
+            await safe_answer(query, "That window is already in use.")
             return
         await trust_flow.finish_cancelled_flow(flow)
         await safe_answer(

@@ -47,6 +47,8 @@ def _lane(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(trust_flow, "SLICE_S", 0.01)
     monkeypatch.setattr(trust_flow, "PANE_POLL_EVERY_S", 0.0)
     monkeypatch.setattr(trust_flow, "DISPATCH_SETTLE_BUDGET_S", 0.2)
+    # The OVERALL teardown budget (production 120s) — no test needs it.
+    monkeypatch.setattr(trust_flow, "TEARDOWN_BUDGET_S", 1.0)
     (app_dir() / "session_map.json").unlink(missing_ok=True)
     yield
     trust_flow.reset_for_tests()
