@@ -4,6 +4,19 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.10] — 2026-08-25
+
+### Added
+- **Folder-trust one-tap licensed on CC 2.1.246 (GH #72, partial).** The CLI auto-updated to
+  2.1.246 hours after v0.4.9 shipped, so fresh trust cards rendered display-only (the designed
+  fail-closed shape for an un-characterised version). An isolated rig re-ran the full E0–E4 + V1
+  battery against 2.1.246: the prompt block is byte-identical to 2.1.239/2.1.241, arrows still
+  wrap without committing, Enter commits the cursored option, bare digits still commit instantly
+  (and stay forbidden), Escape cancels. `folder-trust` is now licensed on 2.1.246; fixtures and
+  the per-version licensing regression test are committed alongside
+  (`decision_trust_folder_v2.1.246_keystrokes.md`). Remaining #72 scope (free-text + `dcp:`
+  lanes on 2.1.246) stays open; the new 2.1.246 `/rc` status-bar element is tracked as #73.
+
 ## [0.4.9] — 2026-08-25
 
 The "a new session that asks you to trust the folder is not a failure" release.
