@@ -1,9 +1,13 @@
 """Regression tests for unbound-topic pending payload cleanup.
 
-Unbound text/photo/document payloads live in ``context.user_data`` while the
-user is choosing a directory, existing session, or tmux window. Cancel paths
-must clear the whole bundle, including downloaded files. Stale picker callbacks
-must be rejected without acting on or deleting the active pending owner.
+Unbound photo/document payloads live in ``context.user_data`` while the user is
+choosing a directory, existing session, or tmux window. Cancel paths must clear
+the whole bundle, including downloaded files. Stale picker callbacks must be
+rejected without acting on or deleting the active pending owner.
+
+GH #74: TEXT is not one of these payloads any more — a text message into an
+unbound topic only opens the picker, so nothing about it survives to be
+replayed. ``tests/scenarios/test_gh74_bind_trigger_no_payload.py`` pins that.
 """
 
 from __future__ import annotations
@@ -161,7 +165,6 @@ def _pending_user_data(path: Path, *, thread_id: int = 10) -> dict[str, object]:
     ensure_picker_entry(user_data, thread_id).update(
         {
             STATE_KEY: STATE_BROWSING_DIRECTORY,
-            "_pending_thread_text": "hello",
             "_pending_thread_attachments": [_attachment(path)],
             "_selected_path": "/tmp/selected",
         }
@@ -318,7 +321,6 @@ async def test_topic_close_different_thread_preserves_active_pending_payload(
     entry = picker_entry(context.user_data, 99)
     assert entry is not None
     assert entry[STATE_KEY] == STATE_BROWSING_DIRECTORY
-    assert entry["_pending_thread_text"] == "hello"
     assert entry["_pending_thread_attachments"] == [_attachment(payload)]
 
 
@@ -352,7 +354,7 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
     query, user = _make_real_callback_query()
     context = MagicMock()
     context.user_data = {}
-    ensure_picker_entry(context.user_data, 10)["_pending_thread_text"] = "hello"
+    ensure_picker_entry(context.user_data, 10)
 
     with (
         patch.object(
@@ -477,7 +479,7 @@ async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
     query, user = _make_real_callback_query()
     context = MagicMock()
     context.user_data = {}
-    ensure_picker_entry(context.user_data, 10)["_pending_thread_text"] = "hello"
+    ensure_picker_entry(context.user_data, 10)
 
     with (
         patch.object(
@@ -759,7 +761,6 @@ async def test_stale_session_picker_mismatch_preserves_pending_attachments(
     entry = picker_entry(context.user_data, 10)
     assert entry is not None
     assert entry["_pending_thread_attachments"] == [_attachment(payload)]
-    assert entry["_pending_thread_text"] == "hello"
     mock_create.assert_not_called()
     # Self-heal on the orphaned card (no popup string).
     update.callback_query.answer.assert_awaited_once()
@@ -798,7 +799,6 @@ async def test_stale_directory_browser_callbacks_preserve_pending_attachments(
     entry = picker_entry(context.user_data, 10)
     assert entry is not None
     assert entry["_pending_thread_attachments"] == [_attachment(payload)]
-    assert entry["_pending_thread_text"] == "hello"
     # The dead thread-99 card self-heals (edit + answer, no popup string).
     mock_safe_edit.assert_awaited_once()
     update.callback_query.answer.assert_awaited_once()
@@ -1291,7 +1291,7 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
 
     async def replace_owner_during_hook_wait(*_args: object, **_kwargs: object) -> bool:
         context.user_data = _pending_user_data(new_payload, thread_id=99)
-        picker_entry(context.user_data, 99)["_pending_thread_text"] = "topic 99 text"
+        picker_entry(context.user_data, 99)["_selected_path"] = "/topic-99"
         return True
 
     with (
@@ -1340,7 +1340,7 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
     query.answer.assert_awaited_once_with("Stale picker", show_alert=False)
     _entry99 = picker_entry(context.user_data, 99)
     assert _entry99 is not None
-    assert _entry99["_pending_thread_text"] == "topic 99 text"
+    assert _entry99["_selected_path"] == "/topic-99"
     assert _entry99["_pending_thread_attachments"] == [_attachment(new_payload)]
     assert new_payload.exists()
 
@@ -1367,7 +1367,7 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
         tmux_mgr: object, session_mgr: object
     ) -> list[tuple[str, str, str]]:
         context.user_data = _pending_user_data(new_payload, thread_id=99)
-        picker_entry(context.user_data, 99)["_pending_thread_text"] = "topic 99 text"
+        picker_entry(context.user_data, 99)["_selected_path"] = "/topic-99"
         return [("@0", "existing-window", str(tmp_path))]
 
     with (
@@ -1404,7 +1404,7 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
     update.callback_query.answer.assert_awaited_once()
     _entry99 = picker_entry(context.user_data, 99)
     assert _entry99 is not None
-    assert _entry99["_pending_thread_text"] == "topic 99 text"
+    assert _entry99["_selected_path"] == "/topic-99"
     assert _entry99["_pending_thread_attachments"] == [_attachment(new_payload)]
     assert new_payload.exists()
 
@@ -1430,7 +1430,6 @@ async def test_flush_pending_route_payload_owner_mismatch_preserves_new_payload(
     mock_clear_route.assert_not_called()
     _entry99 = picker_entry(user_data, 99)
     assert _entry99 is not None
-    assert _entry99["_pending_thread_text"] == "hello"
     assert _entry99["_pending_thread_attachments"] == [_attachment(payload)]
     assert payload.exists()
 
@@ -1502,11 +1501,10 @@ async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_clea
     mock_bind.assert_called_once_with(1, 10, "@0", window_name="created-window")
     mock_replay.assert_awaited_once_with(
         (1, 10, "@0"),
-        text="hello",
+        # GH #74: only attachments cross a bind — the text that opened the
+        # picker was a knock and was never stored.
+        text=None,
         attachments=[_replay_attachment(payload)],
-        # GH #50 PR-2: the pending store carries the provenance facts across
-        # the bind. This fixture stashes the text directly (no handler run), so
-        # there are no stored facts and the replay degrades to None.
         text_provenance=None,
     )
     mock_clear_route.assert_called_once_with((1, 10, "@0"))
@@ -1583,11 +1581,10 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
     mock_bind.assert_called_once_with(1, 10, "@0", window_name="existing-window")
     mock_replay.assert_awaited_once_with(
         (1, 10, "@0"),
-        text="hello",
+        # GH #74: only attachments cross a bind — the text that opened the
+        # picker was a knock and was never stored.
+        text=None,
         attachments=[_replay_attachment(payload)],
-        # GH #50 PR-2: the pending store carries the provenance facts across
-        # the bind. This fixture stashes the text directly (no handler run), so
-        # there are no stored facts and the replay degrades to None.
         text_provenance=None,
     )
     mock_clear_route.assert_called_once_with((1, 10, "@0"))
@@ -1652,11 +1649,10 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
     mock_bind.assert_called_once_with(1, 10, "@0", window_name="existing-window")
     mock_replay.assert_awaited_once_with(
         (1, 10, "@0"),
-        text="hello",
+        # GH #74: only attachments cross a bind — the text that opened the
+        # picker was a knock and was never stored.
+        text=None,
         attachments=[_replay_attachment(payload)],
-        # GH #50 PR-2: the pending store carries the provenance facts across
-        # the bind. This fixture stashes the text directly (no handler run), so
-        # there are no stored facts and the replay degrades to None.
         text_provenance=None,
     )
     edit_text = mock_edit.await_args.args[1]
@@ -1695,7 +1691,6 @@ async def test_pending_replay_STOPS_at_the_first_refused_split(
     context.user_data = {}
     ensure_picker_entry(context.user_data, 10).update(
         {
-            "_pending_thread_text": "hello",
             "_pending_thread_attachments": [
                 bot_module.PendingAttachment(
                     str(paths[0]), "caption one", media_groups[0]
@@ -1731,7 +1726,7 @@ async def test_pending_replay_STOPS_at_the_first_refused_split(
     assert delivered.reason == delivery.REASON_PROMPT_PRESENT
     assert mock_send.await_count == 1
     first_send = mock_send.await_args_list[0].args[1]
-    assert "hello" in first_send
+    assert "caption one" in first_send
     assert str(paths[0]) in first_send
     assert str(paths[1]) in first_send
     assert str(paths[2]) not in first_send
@@ -1826,7 +1821,7 @@ async def test_legacy_door_refuses_and_cleans_when_its_adoption_listing_times_ou
     query, user = _make_real_callback_query()
     context = MagicMock()
     context.user_data = {}
-    ensure_picker_entry(context.user_data, 10)["_pending_thread_text"] = "hello"
+    ensure_picker_entry(context.user_data, 10)
 
     cleaned: list[str] = []
 

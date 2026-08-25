@@ -3,14 +3,15 @@
 When a user sends text in a topic with no ``thread_bindings`` entry, the bot
 must:
   - reply with the directory browser keyboard,
-  - stash the text in this thread's picker entry (``_pending_thread_text``) so
-    it can be flushed once the user picks a directory,
-  - key the entry by thread id (GH #66) so callbacks know which thread owns the
-    pending payload.
+  - say on that card that the message is a knock and will not be sent (GH #74),
+  - claim this thread's picker entry and key it by thread id (GH #66) so
+    callbacks know which thread owns the picker,
+  - store NOTHING to replay: the text is neither stashed nor delivered.
 
-A separate scenario (``test_stale_pending_replacement``) covers the case where
-a *second* unbound topic shows up while the first still has a pending payload —
-GH #66: the two coexist as independent per-thread entries (no displacement).
+A separate scenario (``test_gh74_bind_trigger_no_payload``) walks the trigger
+message through every bind lane; ``test_stale_pending_replacement`` covers the
+case where a *second* unbound topic shows up while the first is still mid-picker
+— GH #66: the two coexist as independent per-thread entries (no displacement).
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ pytestmark = pytest.mark.scenario
 
 
 @pytest.mark.asyncio
-async def test_unbound_topic_text_opens_browser_and_stashes_text(
+async def test_unbound_topic_text_opens_browser_without_stashing_the_text(
     scenario: ScenarioHarness,
 ) -> None:
     update = make_update_text("hello claude", thread_id=42)
@@ -41,10 +42,15 @@ async def test_unbound_topic_text_opens_browser_and_stashes_text(
     update.message.reply_text.assert_awaited()
     sent_kwargs = update.message.reply_text.await_args.kwargs
     assert "reply_markup" in sent_kwargs
-    # Pending payload is stashed in THIS thread's per-topic picker entry (GH #66).
+    # GH #74: the card says so BEFORE the user can be surprised by a message
+    # that silently went nowhere.
+    card = update.message.reply_text.await_args.args[0]
+    assert "won't be sent to Claude" in card, card
+    # The thread's per-topic picker entry is claimed (GH #66) — and holds no
+    # payload: the text was the knock, not the first turn (GH #74).
     entry = picker_entry(scenario.user_data, 42)
     assert entry is not None
-    assert entry["_pending_thread_text"] == "hello claude"
+    assert "_pending_thread_text" not in entry
     assert entry[STATE_KEY] == STATE_BROWSING_DIRECTORY
     assert BROWSE_PATH_KEY in entry
     # No tmux send_keys: nothing is forwarded until the directory is picked.

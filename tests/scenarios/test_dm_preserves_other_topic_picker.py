@@ -56,7 +56,6 @@ async def test_dm_text_mid_picker_preserves_other_topics_flow(
         {
             STATE_KEY: picker_state,
             BROWSE_PATH_KEY: "/tmp/browse",
-            "_pending_thread_text": "hello from topic A",
             "_pending_thread_attachments": [
                 inbound_module.PendingAttachment(str(payload), "caption", None)
             ],
@@ -71,11 +70,10 @@ async def test_dm_text_mid_picker_preserves_other_topics_flow(
     reply_text = update.message.reply_text.await_args.args[0]
     assert "named topic" in reply_text
 
-    # Topic A's per-thread picker entry is fully intact — state, text, AND files.
+    # Topic A's per-thread picker entry is fully intact — state, payload, files.
     entry = picker_entry(scenario.user_data, 42)
     assert entry is not None
     assert entry[STATE_KEY] == picker_state
-    assert entry["_pending_thread_text"] == "hello from topic A"
     assert entry["_pending_thread_attachments"] == [
         inbound_module.PendingAttachment(str(payload), "caption", None)
     ]

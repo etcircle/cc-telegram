@@ -2996,7 +2996,6 @@ async def claim_unbound_inbound(
     build_browser: Callable[[], Any] | None = None,
     browse_start_path: str | None = None,
     stash: Callable[[dict[str, Any]], None] | None = None,
-    stash_on_picker: bool = True,
 ) -> InboundDecision:
     """Fix 5 — decide AND mutate inside ONE critical section (review r1 P1-2).
 
@@ -3020,9 +3019,9 @@ async def claim_unbound_inbound(
         critical section, so the decision and the mutation are inseparable.
 
     ``stash`` runs INSIDE the lock so a payload can never land in an entry a
-    concurrent teardown already dropped. ``stash_on_picker=False`` keeps
-    text_handler's pre-#65 behavior (a text message arriving mid-picker is a
-    nudge, not a stash).
+    concurrent teardown already dropped. GH #74: text_handler passes NO stash at
+    all — an unbound topic's text is the knock that opens the picker, so the
+    only callers that hold anything are the attachment handlers.
     """
     browser: BrowserPayload | None = None
     for _ in range(2):
@@ -3044,7 +3043,7 @@ async def claim_unbound_inbound(
                     stash(entry)
                 return InboundDecision("trust_owned", picker_state=state)
             if entry is not None and state in _PICKER_CHROME_STATES:
-                if stash is not None and stash_on_picker:
+                if stash is not None:
                     stash(entry)
                 return InboundDecision("picker_owned", picker_state=state)
             if browser is not None or build_browser is None:

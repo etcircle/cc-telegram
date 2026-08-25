@@ -523,9 +523,10 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             await safe_answer(query, refusal, show_alert=True)
             return
 
-        # Replay pending text and/or attachments through the synchronous
-        # aggregator helper so §2.8.2 formatting is preserved without
-        # offer-path background/intermediate flushes hiding failures.
+        # Replay any pending attachments through the synchronous aggregator
+        # helper so §2.8.2 formatting is preserved without offer-path
+        # background/intermediate flushes hiding failures. GH #74: text never
+        # reaches here — the message that opened the picker was a knock.
         route = (user.id, thread_id, selected_wid)
         pending_delivered = await _flush_pending_route_payload(route, context.user_data)
         if pending_delivered is not None and not pending_delivered.ok:
@@ -602,8 +603,8 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             await safe_answer(query, "No unbound windows available", show_alert=True)
             return
         msg_text, keyboard, win_ids = build_window_picker(unbound)
-        # Swap state from browse → picker. Keep pending thread/text/attachments
-        # so the bind handler can flush them once a window is chosen.
+        # Swap state from browse → picker. Keep the pending thread and its
+        # attachments so the bind handler can flush them once a window is chosen.
         clear_browse_state(entry)
         if entry is not None:
             entry[STATE_KEY] = STATE_SELECTING_WINDOW
