@@ -412,6 +412,22 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             await safe_answer(query)
             return
 
+        # THE ADOPTION GATE (GH #65 review r10 P1-B). Binding a topic to an
+        # EXISTING window is an adoption: a kill still in flight for that id
+        # (its async wrapper cancelled, its libtmux worker thread very much
+        # alive) would otherwise land on the window we just handed the user.
+        # Refuse while the kill can still fire — a window nobody has adopted is
+        # the only thing a straggler is allowed to kill.
+        if not await tmux_manager.await_kill_settled(selected_wid):
+            await safe_edit(
+                query,
+                "⚠️ That window is being closed right now. Please pick again in "
+                "a moment.",
+                reply_markup=None,
+            )
+            await safe_answer(query)
+            return
+
         display = w.window_name
         clear_window_picker_state(_entry())
         session_manager.bind_thread(

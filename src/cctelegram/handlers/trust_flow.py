@@ -37,7 +37,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Awaitable, Callable, Final, Literal
 
@@ -257,6 +257,15 @@ class TrustFlow:
     awaiting_registration_at: float | None = None
     trust_seen: bool = False
     terminal_committed: bool = False
+    # THE CARD IS FINALIZED (review r10 P2-A). Set by an arm that has posted the
+    # LAST, most ACTIONABLE copy the user should see — today that is the
+    # committed-but-unfinished bind's "your pending message may not have been
+    # delivered" warning. A later generic edit (``_terminal_cleanup``'s
+    # cancelled-copy on the forced path) would otherwise overwrite it, and the
+    # user would be told the setup was cancelled when in fact the topic is bound
+    # and their message is in limbo — the worst of both readings. The actionable
+    # disclosure must be the last copy on every path that produced it.
+    card_finalized: bool = False
     wait_task: asyncio.Task[None] | None = None
     bind_task: asyncio.Task[None] | None = field(default=None)
     # The task that currently HOLDS a ``dispatching`` / ``cancelling`` claim
@@ -798,6 +807,14 @@ async def _edit_card(
     """
     if bot is None or not flow.card_chat_id or not flow.card_msg_id:
         return
+    if flow.card_finalized:
+        # A FINAL, actionable disclosure already stands (review r10 P2-A).
+        # Generic later copy must not bury it.
+        logger.debug(
+            "trust card edit skipped for thread=%s — the card is finalized",
+            flow.thread_id,
+        )
+        return
     try:
         await bot.edit_message_text(
             chat_id=flow.card_chat_id,
@@ -1322,14 +1339,60 @@ def _note_completion(flow: TrustFlow) -> None:
     )
 
 
+def _evidence_pinned(key: _FlowKey, note: "_CompletionNote | _BaselineNote") -> bool:
+    """EVIDENCE FOR A LIVE MATCHING GENERATION MUST NOT EXPIRE (review r10 P1-A).
+
+    The note is the ONLY durable proof that a synchronous ``bind_thread``
+    committed, and the tail that wrote it can lawfully sit at the payload replay
+    for far longer than the TTL — a replay waits on Telegram and on the pane. If
+    the note aged out underneath a flow that is still live, ``bind_committed``
+    went False at all three outcome sites and the round-9 misclassification came
+    straight back: a committed bind reported as a failure, ``/start`` skipping
+    the bound-topic teardown, files deleted under a live binding.
+
+    So the TTL only ever prunes evidence NOBODY IS STILL USING: a note whose
+    generation and window match a flow still in the registry is PINNED, and
+    starts ageing only once that flow is gone. The wall-clock bound is preserved
+    for every note that is genuinely orphaned, which is the case the TTL exists
+    for.
+    """
+    flow = _flows.get(key)
+    if flow is None:
+        return False
+    if flow.generation != note.generation:
+        return False
+    # A completion note names the window it proves; a baseline names what the
+    # topic was bound to BEFORE the flow, which is not this flow's window — for
+    # a baseline the generation match is the whole test.
+    if isinstance(note, _CompletionNote):
+        return flow.created_wid == note.window_id
+    return True
+
+
+def _note_expired(key: _FlowKey, note: "_CompletionNote | _BaselineNote") -> bool:
+    """True when the note is past its TTL *and* no live flow is relying on it."""
+    if _wall() - note.at <= _COMPLETION_NOTE_TTL_S:
+        return False
+    return not _evidence_pinned(key, note)
+
+
 def _prune_completion_notes() -> None:
-    now = _wall()
     for store in (_completed_binds, _binding_baselines):
         for key, note in list(store.items()):
-            if now - note.at > _COMPLETION_NOTE_TTL_S:
+            if _note_expired(key, note):
                 store.pop(key, None)
         while len(store) > _COMPLETION_NOTE_CAP:
-            oldest = min(store.items(), key=lambda kv: kv[1].at)[0]
+            # The cap must not evict evidence a LIVE flow still needs either
+            # (review r10 P1-A) — same rule as the TTL. Spend the UNPINNED notes
+            # first; only at true capacity, with every note pinned, does the
+            # memory bound win over the oldest one.
+            unpinned = [
+                (key, note)
+                for key, note in store.items()
+                if not _evidence_pinned(key, note)
+            ]
+            pool = unpinned or list(store.items())
+            oldest = min(pool, key=lambda kv: kv[1].at)[0]
             store.pop(oldest, None)
 
 
@@ -1344,7 +1407,7 @@ def _consume_completion(
     note = _completed_binds.get(key)
     if note is None:
         return False
-    if _wall() - note.at > _COMPLETION_NOTE_TTL_S:
+    if _note_expired(key, note):
         _completed_binds.pop(key, None)
         return False
     if generation is not None and note.generation != generation:
@@ -1367,7 +1430,7 @@ def _peek_completion(
     note = _completed_binds.get(key)
     if note is None:
         return False
-    if _wall() - note.at > _COMPLETION_NOTE_TTL_S:
+    if _note_expired(key, note):
         return False
     if generation is not None and note.generation != generation:
         return False
@@ -1452,6 +1515,28 @@ def _drop_flow(flow: TrustFlow) -> None:
     key = (flow.user_id, flow.thread_id)
     if _flows.get(key) is flow:
         _flows.pop(key, None)
+        _restamp_unpinned_evidence(key, flow)
+
+
+def _restamp_unpinned_evidence(key: _FlowKey, flow: TrustFlow) -> None:
+    """Start the TTL clock when the flow ENDS, not when the bind happened.
+
+    The completion note is PINNED while its flow is live (review r10 P1-A), so
+    dropping the flow is the moment it becomes eligible to age. Without this it
+    would un-pin already-expired: a bind that committed early in a long replay
+    would have its evidence vanish in the same breath the flow was dropped —
+    and the teardown that dropped it consults ``_completion_won`` immediately
+    afterwards to decide whether completion won. Re-stamping makes the TTL mean
+    what it says, "how long we keep evidence nobody is using", and keeps the
+    wall-clock bound intact.
+    """
+    now = _wall()
+    completion = _completed_binds.get(key)
+    if completion is not None and completion.generation == flow.generation:
+        _completed_binds[key] = replace(completion, at=now)
+    baseline = _binding_baselines.get(key)
+    if baseline is not None and baseline.generation == flow.generation:
+        _binding_baselines[key] = replace(baseline, at=now)
 
 
 async def _terminal_cleanup(
@@ -1684,6 +1769,14 @@ async def _settle_committed_but_unfinished_bind(flow: TrustFlow, bot: Any) -> No
     rejected: it is not safely re-derivable — a replay that DID run would be
     delivered twice, and a duplicate first message is worse than an honest
     prompt to resend.
+
+    ACCOUNTING vs USABILITY are decided SEPARATELY (review r10 P2-B). The note
+    is the completion evidence and it always wins the ACCOUNTING question — the
+    bind did commit, so the caller must do bound-topic teardown and the payload
+    is uncertain. But the topic may since have been UNBOUND (``/unbind``, or a
+    topic close whose own teardown ran before ours), and telling the user "send
+    messages here" on an unbound topic is simply false. So the COPY is chosen
+    from the CURRENT binding, not from the note.
     """
     logger.warning(
         "trust completion tail was cut short AFTER a committed bind "
@@ -1691,14 +1784,23 @@ async def _settle_committed_but_unfinished_bind(flow: TrustFlow, bot: Any) -> No
         flow.created_wid,
         flow.thread_id,
     )
-    await _edit_card(
-        flow,
-        bot,
-        f"✅ {flow.create_message}\n\nCreated. Send messages here.\n\n"
-        "⚠️ Your pending message may not have been delivered — resend it if you "
-        "don't see a reply.",
-        None,
+    still_bound = binding_is_current_route(flow)
+    payload_warning = (
+        "\n\n⚠️ Your pending message may not have been delivered — resend it if "
+        "you don't see a reply."
     )
+    if still_bound:
+        body = f"✅ {flow.create_message}\n\nCreated. Send messages here."
+    else:
+        body = (
+            f"✅ {flow.create_message}\n\nCreated — but this topic was unbound or "
+            "closed straight afterwards, so there is nothing to send to here."
+        )
+    await _edit_card(flow, bot, body + payload_warning, None)
+    # The disclosure above is the LAST word on this card (review r10 P2-A): a
+    # later generic "setup was cancelled" edit would bury the one line the user
+    # can act on.
+    flow.card_finalized = True
     flow.terminal_committed = True
     async with creation_lock(flow.user_id, flow.thread_id):
         if _flows.get((flow.user_id, flow.thread_id)) is flow:
@@ -1773,6 +1875,17 @@ async def _complete_bind(flow: TrustFlow, bot: Any, session_mgr: Any) -> None:
                 _bot_module.session_monitor.register_session(
                     track_sid, file_path, offset=0
                 )
+
+    # THE ADOPTION GATE (review r10 P1-B). The completion bind is an adoption
+    # too. A kill for this id whose async wrapper was cancelled can still be
+    # inside libtmux, and it resolves its target BY ID — so binding the topic
+    # first would hand the user a window a straggler is about to remove. Wait
+    # for any in-flight kill to settle; the bind itself stays SYNCHRONOUS and
+    # immediately followed by the note, which is what makes `bind_committed`
+    # exact.
+    kill_gate = getattr(flow.tmux_mgr, "await_kill_settled", None)
+    if kill_gate is not None:
+        await kill_gate(flow.created_wid)
 
     session_mgr.bind_thread(
         flow.user_id, flow.thread_id, flow.created_wid, window_name=flow.window_name
@@ -2781,10 +2894,11 @@ def _completion_won(
     baseline = _binding_baselines.get((user_id, thread_id))
     if baseline is None:
         return False
-    if _wall() - baseline.at > _COMPLETION_NOTE_TTL_S:
+    if _note_expired((user_id, thread_id), baseline):
         # An EXPIRED baseline is no baseline (review r5 P2-B) — reading a stale
         # one as "not pre-existing" would resurrect the very false positive the
-        # baseline exists to prevent.
+        # baseline exists to prevent. It is PINNED while its own flow generation
+        # is still live (review r10 P1-A), for the same reason the note is.
         _binding_baselines.pop((user_id, thread_id), None)
         return False
     if baseline.generation != generation:

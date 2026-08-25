@@ -475,6 +475,18 @@ class TmuxManager:
         # module docstring + the "brake lifecycle" comment on the mutators.
         # In-memory only — a bot restart clears it (documented residual).
         self._stranded_draft_windows: dict[str, float] = {}
+        # GH #65 review r10 P1-B — the KILL-PENDING registry: window_id → count
+        # of kills currently in flight for that id. Mirrors the quarantine and
+        # brake precedent above, and exists for the one hazard cancellation
+        # cannot reach: ``kill_window`` runs libtmux inside ``asyncio.to_thread``,
+        # and cancelling the async wrapper does NOT stop the worker thread. A
+        # surviving worker could therefore kill a window that had been ADOPTED
+        # after the caller's ownership check — a TOCTOU the killer's side cannot
+        # close. So it is closed on the ADOPTION side instead: an id with a kill
+        # in flight is refused for adoption until the kill settles. A counter,
+        # not a flag, so concurrent kills for one id cannot clear each other's
+        # pending state. In-memory only — a bot restart clears it.
+        self._kill_pending_windows: dict[str, int] = {}
 
     @property
     def server(self) -> libtmux.Server:
@@ -1105,6 +1117,54 @@ class TmuxManager:
         """Drop all stranded-draft brakes (test isolation seam)."""
         self._stranded_draft_windows.clear()
 
+    def window_kill_pending(self, window_id: str) -> bool:
+        """True while a kill for this window id is still in flight.
+
+        THE ADOPTION GATE (GH #65 review r10 P1-B). ``kill_window`` dispatches
+        libtmux into ``asyncio.to_thread``; cancelling the async wrapper cannot
+        stop the worker thread, so a kill can still land after its caller has
+        given up and released ownership. Every seam that would ADOPT a window id
+        — reusing it for a new window, binding a topic to an existing one, the
+        trust lane's completion bind — must consult this first and refuse or
+        defer, because a window nobody has adopted is the only thing a straggler
+        is allowed to kill.
+
+        **Irreducible residual, stated honestly:** a kill already inside libtmux
+        WILL kill the window it was aimed at. That was always its target, and no
+        gate here can recall it. What this closes is the harm that mattered — an
+        ADOPTED window dying under a new owner. Nothing that has been adopted
+        can be killed by a straggler, because adoption cannot happen while the
+        kill is pending.
+        """
+        return self._kill_pending_windows.get(window_id, 0) > 0
+
+    async def await_kill_settled(
+        self, window_id: str, *, timeout: float = 10.0, interval: float = 0.05
+    ) -> bool:
+        """DEFER until no kill for this id is in flight. True if it settled.
+
+        The adoption seams' companion to :meth:`window_kill_pending`: a caller
+        that would rather wait than refuse polls here first. Bounded, so a
+        wedged libtmux worker degrades to a refusal instead of a hang.
+        """
+        if not self.window_kill_pending(window_id):
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(interval)
+            if not self.window_kill_pending(window_id):
+                return True
+        logger.warning(
+            "a kill for window %s did not settle within %.1fs — refusing adoption",
+            window_id,
+            timeout,
+        )
+        return False
+
+    def reset_kill_pending_for_tests(self) -> None:
+        """Drop all kill-pending marks (test isolation seam)."""
+        self._kill_pending_windows.clear()
+
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
     ) -> bool:
@@ -1253,7 +1313,30 @@ class TmuxManager:
                 logger.error(f"Failed to kill window {window_id}: {e}")
                 return False
 
-        result = await asyncio.to_thread(_sync_kill)
+        # MARK BEFORE DISPATCH, CLEAR WHEN THE EXECUTOR CALL ACTUALLY RETURNS
+        # (review r10 P1-B). The mark is set here, on the event loop, strictly
+        # before the work is handed to the thread. It is cleared from a
+        # DONE-CALLBACK on the inner future rather than a plain ``finally``,
+        # because a ``finally`` on this coroutine runs as soon as WE are
+        # cancelled — while the worker thread is still inside ``window.kill()``.
+        # The done-callback fires when the thread genuinely finishes, success or
+        # failure, so the adoption gate stays shut for exactly as long as a kill
+        # can still land.
+        self._kill_pending_windows[window_id] = (
+            self._kill_pending_windows.get(window_id, 0) + 1
+        )
+        inner = asyncio.ensure_future(asyncio.to_thread(_sync_kill))
+
+        def _clear_kill_pending(_fut: "asyncio.Future[bool]") -> None:
+            remaining = self._kill_pending_windows.get(window_id, 0) - 1
+            if remaining > 0:
+                self._kill_pending_windows[window_id] = remaining
+            else:
+                self._kill_pending_windows.pop(window_id, None)
+
+        inner.add_done_callback(_clear_kill_pending)
+        # SHIELDED: our own cancellation must not detach the mark from the work.
+        result = await asyncio.shield(inner)
         self._invalidate_list_cache()
         # Drop the per-window send lock ONLY on a confirmed kill (Wave 3a
         # Hermes P3): a failed kill can leave the window ALIVE with an
@@ -1394,6 +1477,29 @@ class TmuxManager:
         created, _msg, _name, new_wid = result
         if created and new_wid:
             self.clear_window_stranded_draft(new_wid, reason="window newly created")
+            # THE ADOPTION GATE (review r10 P1-B). tmux window ids RESET to @0
+            # when the tmux server restarts, so a brand-new window can be handed
+            # an id a straggler kill is still aimed at — and that kill resolves
+            # its target BY ID inside the worker thread, so it would find THIS
+            # window. Wait for the kill to settle, then verify we survived; a
+            # window that did not is reported honestly rather than handed to a
+            # caller who would bind a topic to a corpse.
+            if self.window_kill_pending(new_wid):
+                logger.warning(
+                    "newly created window %s has a kill in flight for its id — "
+                    "waiting for it to settle before adoption",
+                    new_wid,
+                )
+                await self.await_kill_settled(new_wid)
+                self._invalidate_list_cache()
+                if await self.find_window_by_id(new_wid) is None:
+                    return (
+                        False,
+                        "The new window was removed by a concurrent teardown. "
+                        "Please try again.",
+                        "",
+                        "",
+                    )
         return result
 
     def _resolve_md_settings(self) -> str:

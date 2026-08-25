@@ -206,7 +206,11 @@ async def test_a_bind_cancelled_at_the_replay_still_counts_as_completed() -> Non
     files_dir.mkdir(parents=True, exist_ok=True)
     stashed = files_dir / "wave9-pending.txt"
     stashed.write_text("the user's first message attachment")
-    entry["pending_files"] = [str(stashed)]
+    # The PRODUCTION key (review r10 P3-A). Seeding "pending_files" made this
+    # assertion vacuous: `_delete_pending_attachments` reads
+    # `_pending_thread_attachments`, so nothing was ever a candidate for
+    # deletion and the test passed against a delete-everything mutation too.
+    entry["_pending_thread_attachments"] = [{"path": str(stashed)}]
 
     tmux = _Tmux(pane=_IDLE)
     sessions = _Sessions()

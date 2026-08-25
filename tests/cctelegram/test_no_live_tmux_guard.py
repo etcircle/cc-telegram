@@ -35,8 +35,17 @@ async def test_the_tmux_binary_is_refused_by_argv() -> None:
     # bytes argv must be covered as well
     with pytest.raises(RuntimeError, match="live tmux blocked in tests"):
         await asyncio.create_subprocess_exec(b"tmux", b"list-windows")
-    with pytest.raises(RuntimeError, match="live tmux blocked in tests"):
-        await asyncio.create_subprocess_shell("tmux list-windows")
+    # Review r10 P3-B: the tmux binary is not always the FIRST shell token.
+    for shell_cmd in (
+        "tmux list-windows",
+        "env tmux list-windows",
+        "command tmux kill-window",
+        "true; tmux kill-window",
+        "echo hi && tmux kill-server",
+        "(tmux list-windows)",
+    ):
+        with pytest.raises(RuntimeError, match="live tmux blocked in tests"):
+            await asyncio.create_subprocess_shell(shell_cmd)
 
 
 @pytest.mark.asyncio
