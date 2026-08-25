@@ -818,6 +818,45 @@ _RE_NUMBERED_OPTION = re.compile(
 # Option-row checkbox — ASCII brackets, NOT ☐/☒ (those are tab-header only).
 _RE_OPTION_CHECKBOX = re.compile(r"^\s*[❯›▶*)>↓\s]?\s*\d+\.\s+\[(?P<mark>[ ✔xX])\]\s")
 
+# Matches a LEADING box-gutter run: one or more of ``│ ┃ |`` plus the spaces
+# that follow, repeated. Claude Code 2.1.237 draws a multi-question AUQ's
+# question text inside a left-gutter box::
+#
+#     │ Dynamics CRM integration: which direction? (Full memo in temp/… on
+#     │ the client tenant unless users hold D365 … regardless.)
+#
+# ANCHORED AT LINE START ONLY — an interior ``│`` (a table row, a piped shell
+# command inside an option label) is NEVER touched.
+_RE_LEADING_BOX_GUTTER = re.compile(r"^(?:[│┃|]+[ \t]*)+")
+
+# Cap on the physical lines joined into ``pane_question_display_text``. A real
+# boxed question wraps over a handful of lines at 160 cols; the cap only stops a
+# malformed frame from gluing an unbounded block together.
+_QUESTION_DISPLAY_MAX_LINES = 8
+
+
+def strip_leading_gutter(text: str) -> str:
+    """Drop a leading box-gutter run from ``text`` (COMPARISON-time only).
+
+    The ONE shared canonicalizer for the CC 2.1.237 multi-question AUQ layout,
+    where the question text is drawn behind a left ``│`` gutter. Callers apply
+    it SYMMETRICALLY to BOTH sides of a title comparison (the repo's
+    symmetric-normalization-across-sources rule) — a JSONL/side-file question
+    never carries a gutter, a pane-scraped one on 2.1.237 always does, and a
+    one-sided strip would just move the mismatch.
+
+    **MUST NOT be used to mutate stored state.** ``current_question_title``
+    feeds ``AskUserQuestionForm.fingerprint()`` and
+    ``decision_prompt_fingerprint``, where the "NO glyph stripping, EVER" rule
+    is load-bearing (a canonicalized title would rotate every live pick token).
+    Comparison-time only.
+
+    Leading whitespace is stripped first (a pane capture may indent the box);
+    the result is stripped again so ``"│ "`` alone canonicalizes to ``""``.
+    """
+    return _RE_LEADING_BOX_GUTTER.sub("", text.lstrip()).strip()
+
+
 # Matches the picker's "Enter to select / Tab / Esc" footer.
 _RE_PICKER_FOOTER = re.compile(r"Enter to select")
 
@@ -1091,6 +1130,25 @@ class AskUserQuestionForm:
     # against a JSONL question would mis-overlay stale labels onto a
     # live pane (wrong-action class bug).
     pane_walkback_title: str | None = field(default=None, compare=False)
+    # Display-only FULL question text for the CC 2.1.237 multi-question layout,
+    # where the question is drawn behind a left ``│`` gutter and wraps across
+    # several physical lines. ``current_question_title`` keeps only the FIRST
+    # physical line (gutter included) because it is an IDENTITY field — it feeds
+    # ``_canonical_repr`` / ``fingerprint``, so it must stay byte-identical to
+    # what earlier renders minted tokens against. This field carries the
+    # gutter-stripped, space-joined whole question purely so the picker preamble
+    # and the 📋 details card stop showing a clipped "…Credits on".
+    #
+    # Populated by ``parse_ask_user_question`` ONLY, and only when the FIRST
+    # title line actually carries a gutter — every pre-2.1.237 layout leaves it
+    # None and renders exactly as before. ``resolve_ask_form`` does NOT
+    # propagate it through its merged-form constructors, mirroring
+    # ``pane_walkback_title``: every JSONL/side-file overlay path already has
+    # the authoritative, un-clipped question in ``current_question_title``.
+    #
+    # MUST NOT feed any fingerprint, render signature or dedup key — it is
+    # ``compare=False`` and excluded from ``_canonical_repr`` for that reason.
+    pane_question_display_text: str | None = field(default=None, compare=False)
     options_complete: bool = field(default=False, compare=False)
 
     def _canonical_repr(self) -> str:
@@ -2452,6 +2510,45 @@ def parse_ask_user_question(
             current_question_title = stripped
             break
 
+    # ``pane_question_display_text`` (DISPLAY only, CC 2.1.237): the scan above
+    # keeps ONE physical line because ``current_question_title`` is an identity
+    # field. 2.1.237 draws a multi-question AUQ's question inside a left ``│``
+    # gutter box and wraps it, so that single line is a mid-sentence clip. Join
+    # the consecutive GUTTER-PREFIXED lines back into the whole question.
+    #
+    # Gated on the first title line actually carrying a gutter, so every
+    # pre-2.1.237 layout leaves this None and renders byte-identically to today.
+    # Bounded at ``_QUESTION_DISPLAY_MAX_LINES`` physical lines so a malformed
+    # frame cannot glue an unbounded block together (the renderer clips again).
+    pane_question_display_text: str | None = None
+    if current_question_title is not None and _RE_LEADING_BOX_GUTTER.match(
+        current_question_title
+    ):
+        q_parts: list[str] = []
+        for line in options_region:
+            stripped = line.strip()
+            if not stripped:
+                if q_parts:
+                    break
+                continue
+            if _RE_NUMBERED_OPTION.match(line):
+                break
+            if all(c == "─" for c in stripped):
+                break
+            if _RE_TAB_HEADER.match(line):
+                if q_parts:
+                    break
+                continue
+            if not _RE_LEADING_BOX_GUTTER.match(stripped):
+                # A non-gutter line ends the boxed question block.
+                break
+            q_parts.append(strip_leading_gutter(stripped))
+            if len(q_parts) >= _QUESTION_DISPLAY_MAX_LINES:
+                break
+        joined = " ".join(p for p in q_parts if p).strip()
+        if joined:
+            pane_question_display_text = joined
+
     # ``pane_walkback_title`` (display only): walked-back title for the
     # single-tab path. Bounded gap (≤2 blanks between candidate and
     # topmost option) keeps us from pulling in pre-picker scrollback.
@@ -2526,6 +2623,7 @@ def parse_ask_user_question(
         is_free_text=is_free_text,
         pane_excerpt=pane_excerpt,
         pane_walkback_title=pane_walkback_title,
+        pane_question_display_text=pane_question_display_text,
         select_mode=select_mode,
         options_complete=options_complete,
     )
@@ -3787,12 +3885,20 @@ def _infer_current_tab_idx(
     if pane_form is None or not questions:
         return 0, False
 
-    # Primary: exact title match.
-    pane_title = (pane_form.current_question_title or "").strip()
+    # Primary: exact title match. Both sides are gutter-canonicalized
+    # (``strip_leading_gutter``) so a CC 2.1.237 boxed question title —
+    # ``│ Which direction?`` on the pane vs ``Which direction?`` in JSONL —
+    # still pins its tab instead of silently degrading to the weaker
+    # label-overlap leg below. SYMMETRIC by construction; comparison-time only
+    # (``current_question_title`` itself is never mutated — it feeds the form
+    # fingerprint).
+    pane_title = strip_leading_gutter(pane_form.current_question_title or "")
     if pane_title:
         title_matches: list[int] = []
         for i, q in enumerate(questions):
-            if pane_title == q.title.strip() or pane_title == q.header.strip():
+            if pane_title == strip_leading_gutter(
+                q.title
+            ) or pane_title == strip_leading_gutter(q.header):
                 title_matches.append(i)
         if len(title_matches) == 1:
             return title_matches[0], True

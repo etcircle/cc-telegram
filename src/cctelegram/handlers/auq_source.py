@@ -962,7 +962,20 @@ def _record_consistent_with_pane(
     walkback-only-title, multi-question subset) has a principled answer.
     NEVER computes ``AskUserQuestionForm.fingerprint()`` here — that
     includes cursor/recommended/tab state and would reject valid records.
+
+    Both title comparisons (5.a and 5.b) run on GUTTER-CANONICAL forms:
+    Claude Code 2.1.237 draws a multi-question AUQ's question text behind a
+    left ``│`` gutter, so the pane title arrives as ``"│ Which direction? …"``
+    while the record's question is the bare ``"Which direction? …"`` and NO
+    prefix relation holds in either direction — every multi-question AUQ on
+    that release rejected with ``title_mismatch``, which dropped the 📋
+    details card. ``strip_leading_gutter`` is applied SYMMETRICALLY to BOTH
+    sides (the repo's symmetric-normalization rule) and only at comparison
+    time — neither the record nor ``pane_form.current_question_title`` is
+    mutated, so every fingerprint stays byte-identical.
     """
+    from ..terminal_parser import strip_leading_gutter
+
     if pane_form is None or not pane_form.options:
         return False, "no_pane_form"
 
@@ -971,7 +984,10 @@ def _record_consistent_with_pane(
         return False, "no_candidate"
 
     pane_labels = tuple(o.label for o in pane_form.options)
-    pane_title = (pane_form.current_question_title or "").strip()
+    # Gutter-canonical pane title, used for BOTH title comparisons below. A
+    # title that is nothing BUT gutter glyphs canonicalizes to "" and is
+    # therefore treated as "no title" — it carries no question text to compare.
+    pane_title = strip_leading_gutter(pane_form.current_question_title or "")
     candidate: dict | None = None
 
     # Step 5.a — pick a candidate record-question.
@@ -981,7 +997,7 @@ def _record_consistent_with_pane(
         for q in raw_questions:
             if not isinstance(q, dict):
                 continue
-            qt = (q.get("question") or "").strip()
+            qt = strip_leading_gutter(q.get("question") or "")
             if not qt:
                 continue
             if qt.startswith(pane_title) or pane_title.startswith(qt):
@@ -1019,7 +1035,7 @@ def _record_consistent_with_pane(
     # different live question. Residual: if the pane title is genuinely
     # unparseable and labels coincidentally match a stale not-overwritten side
     # file within TTL, that edge remains irreducible without question text.
-    candidate_title = (candidate.get("question") or "").strip()
+    candidate_title = strip_leading_gutter(candidate.get("question") or "")
     if pane_title and candidate_title:
         if not (
             candidate_title.startswith(pane_title)
@@ -1829,6 +1845,66 @@ def recover_consistent_side_file_for_ctx(window_id, pane_text):
         return None  # inconsistent partial bail -> wrong question -> no ctx card
     if not _ctx_evidence_floor_ok(record, pane_form):  # round-2 P1b floor
         return None
+    return RecoverySideFile(
+        payload=record.tool_input,
+        source_fingerprint=_canonical_dict_fingerprint(record.tool_input),
+        tool_use_id=record.tool_use_id,
+        written_at=record.written_at,
+    )
+
+
+def ctx_source_via_identity_proof(
+    window_id: str,
+    pane_form: AskUserQuestionForm | None,
+    expected_tool_use_id: str | None,
+) -> RecoverySideFile | None:
+    """Side-file ctx payload recovered by IDENTITY PROOF on a ``title_mismatch``.
+
+    The hardening leg for the CC 2.1.237 gutter class. ``_record_consistent_with_pane``
+    decides which question is live from TEXT alone, and a title comparison is a
+    heuristic: any future layout change that perturbs the pane's rendering of the
+    question — a new gutter glyph, a badge, a different wrap — re-opens the exact
+    failure this hotfix closes (``title_mismatch`` ⇒ ``bail`` ⇒ NO 📋 details card,
+    silently, on every multi-question AUQ).
+
+    An OCCURRENCE IDENTITY is stronger evidence than any text heuristic: when the
+    side file's ``tool_use_id`` equals the identity the bot INDEPENDENTLY holds for
+    this window (the picker card's recorded ``tool_use_id``, else the JSONL-flushed
+    ``_last_auq_tool_use_id``), the side file provably describes the SAME AUQ
+    invocation the live card was minted for. The title disagreement is then a parse
+    artifact, not a different question, and the ctx card may post.
+
+    Scoped HARD, all conditions required:
+
+      * the rejection reason is EXACTLY ``title_mismatch`` — every other reason
+        (``label_mismatch``, ``count_sanity``, ``no_candidate``, ``no_pane_form``)
+        is untouched, because those indicate genuinely different CONTENT, which an
+        id match does not excuse;
+      * ``expected_tool_use_id`` is non-empty AND equals the record's own
+        ``tool_use_id`` (also non-empty). The caller MUST source it from something
+        other than this side file — comparing the side file against itself would be
+        a vacuously-true predicate (the repo's own bug class). None/'' ⇒ unknown ⇒
+        no override, never a mismatch.
+
+    Returns the ctx payload on proof, else ``None``. CTX-ONLY: it does not change
+    ``dispatch_trusted``, mint any token, or mutate ``_pretool_ask_records`` — a
+    pane whose title we could not reconcile stays untrusted for DISPATCH.
+    """
+    if not expected_tool_use_id:
+        return None
+    record = _read_live_pretool_record(window_id, apply_ttl=False)
+    if record is None:
+        return None
+    if not record.tool_use_id or record.tool_use_id != expected_tool_use_id:
+        return None
+    consistent, reason = _record_consistent_with_pane(record, pane_form)
+    if consistent or reason != "title_mismatch":
+        return None
+    logger.info(
+        "AUQ ctx identity-proof override: window=%s reason=title_mismatch "
+        "tool_use_id matched — posting details card from the side file",
+        window_id,
+    )
     return RecoverySideFile(
         payload=record.tool_input,
         source_fingerprint=_canonical_dict_fingerprint(record.tool_input),
