@@ -51,6 +51,7 @@ from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram import route_runtime, terminal_parser, transcript_event_adapter
 from cctelegram import session as session_module
 from cctelegram.session import session_manager as _real_sm
+from cctelegram import tmux_manager as tmux_mod
 from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
 from cctelegram.utils import app_dir
 from cctelegram.handlers import (
@@ -1039,35 +1040,69 @@ def _no_live_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
     developer's default tmux server.
 
     Injection is the fix (see ``trust_flow._replay_for``); this is the backstop
-    that makes the CLASS unreachable. There are exactly two routes, and BOTH are
-    covered here (review r8 P2-C — poisoning only the first left the second
-    open, and the docstring overclaimed):
+    that makes the CLASS unreachable. Poisoning is at the CLASS/MODULE seams, so
+    a FRESHLY-CONSTRUCTED ``TmuxManager()`` is covered too (review r9 P2-B — the
+    per-instance ``_server`` poison missed every route a new instance takes):
 
-    1. **libtmux**, via the manager's cached ``_server``. Poisoned per-instance,
-       so window/pane operations on the singleton refuse.
-    2. **The tmux BINARY**, via ``asyncio.create_subprocess_exec`` — how
-       ``capture_pane`` and the pane-command probes actually run, and the route
-       a FRESHLY-constructed ``TmuxManager()`` takes regardless of what the
-       singleton's attributes say. Poisoned by argv: only a ``tmux``
-       executable is refused, so tests that spawn other subprocesses (the
-       ``md_capture`` appender benchmark spawns a real interpreter) are
-       unaffected, and the tmux suites that patch this same attribute
-       themselves still override us.
+    1. **libtmux**, at ``tmux_manager``'s own ``libtmux.Server`` symbol. Every
+       manager — the singleton and any instance a test builds — acquires its
+       server through that name, so this covers ``send_keys`` / ``kill_window``
+       / ``rename_window`` / ``create_window`` and everything else that reaches
+       tmux through ``asyncio.to_thread``. The singleton's already-cached
+       ``_server`` is poisoned as well, since it was built before we got here.
+    2. **The tmux BINARY**, via ``create_subprocess_exec`` AND
+       ``create_subprocess_shell`` — how ``capture_pane`` and the pane-command
+       probes actually run. Poisoned by argv, accepting ``str``, ``bytes`` and
+       ``PathLike`` program arguments: only a ``tmux`` executable is refused, so
+       tests that spawn other subprocesses (the ``md_capture`` appender
+       benchmark spawns a real interpreter) are unaffected, and the tmux suites
+       that patch these same attributes themselves still override us.
 
-    What this does NOT guarantee: a test that constructs its own manager and
-    monkeypatches its way past both routes is on its own. The guard is a
-    backstop for the seams production code actually uses, not a sandbox.
+    What this does NOT cover, stated plainly: a **synchronous** ``subprocess``
+    call (``subprocess.run`` / ``Popen``) made from arbitrary code. Fencing that
+    would mean poisoning ``subprocess`` process-wide, which breaks legitimate
+    tooling the suite runs; production's tmux access does not take that route,
+    so it is a known, named gap rather than a covered one.
     """
     monkeypatch.setattr(_real_tmux, "_server", _NoLiveTmuxServer(), raising=False)
 
+    class _NoLiveTmuxServerFactory:
+        """Stands in for ``libtmux.Server`` for every manager instance."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise AssertionError(
+                "a test constructed a REAL libtmux Server. Inject a fake tmux "
+                "manager, or request the ``fake_tmux`` fixture — a test must "
+                "never address a live pane."
+            )
+
+    monkeypatch.setattr(
+        tmux_mod.libtmux, "Server", _NoLiveTmuxServerFactory, raising=False
+    )
+
+    def _is_tmux(program: Any) -> bool:
+        raw = program
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        return Path(str(raw)).name in {"tmux", "tmux.exe"}
+
     real_exec = asyncio.create_subprocess_exec
+    real_shell = asyncio.create_subprocess_shell
 
     async def _refuse_tmux_binary(program: Any, *args: Any, **kwargs: Any) -> Any:
-        if Path(str(program)).name in {"tmux", "tmux.exe"}:
+        if _is_tmux(program):
             raise RuntimeError("live tmux blocked in tests")
         return await real_exec(program, *args, **kwargs)
 
+    async def _refuse_tmux_shell(cmd: Any, *args: Any, **kwargs: Any) -> Any:
+        raw = cmd.decode("utf-8", "replace") if isinstance(cmd, bytes) else str(cmd)
+        if _is_tmux(raw.split()[0]) if raw.split() else False:
+            raise RuntimeError("live tmux blocked in tests")
+        return await real_shell(cmd, *args, **kwargs)
+
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _refuse_tmux_binary)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", _refuse_tmux_shell)
 
 
 @pytest.fixture

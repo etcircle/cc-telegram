@@ -39,7 +39,7 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Final, Literal
+from typing import Any, Awaitable, Callable, Final, Literal
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -315,12 +315,28 @@ class TrustFlow:
         """Claim the fence for the CURRENT task. Caller holds the creation lock.
 
         Re-raising an unowned fence, or one this task already owns, is the
-        normal per-pass refresh. A fence another task owns is LEFT ALONE — it is
+        normal per-pass refresh. A fence a LIVE task owns is left alone — it is
         already up, which is all this caller needs.
+
+        A fence whose owner is DEAD is RECLAIMED (review r9 P2-A). Ownership was
+        introduced so one teardown could not lower another's fence, but it also
+        meant a teardown killed uncleanly — before its ``finally`` could lower
+        it — left the topic fenced by a corpse: no later teardown could take
+        ownership, so nothing could ever lower it again and every claim
+        acquisition was refused for the life of the process.
         """
-        if self.fence_owner is None or self.fence_owner is asyncio.current_task():
-            self.fence_owner = asyncio.current_task()
-            self.fence_generation = self.generation
+        owner = self.fence_owner
+        if owner is not None and owner is not asyncio.current_task():
+            if not owner.done():
+                return
+            logger.warning(
+                "trust flow reclaiming a fence from a DEAD owner "
+                "(window=%s, thread=%s)",
+                self.created_wid,
+                self.thread_id,
+            )
+        self.fence_owner = asyncio.current_task()
+        self.fence_generation = self.generation
 
     def lower_fence_if_owned(self) -> bool:
         """Release the fence only if THIS task raised it for THIS generation."""
@@ -606,6 +622,7 @@ async def cleanup_created_window(
     *,
     reason: str,
     session_mgr: Any = None,
+    owner_guard: Callable[[], Awaitable[bool]] | None = None,
 ) -> CleanupOutcome:
     """Guarded kill of a created-but-unbound window, with a TYPED outcome.
 
@@ -686,6 +703,22 @@ async def cleanup_created_window(
             reason,
         )
         return CleanupOutcome.SPARED_REGISTERED
+    if owner_guard is not None and not await owner_guard():
+        # OWNERSHIP RE-CHECK, immediately before the kill (review r9 P1-B). A
+        # cleanup can outlive the flow that started it — the orphan arm bounds
+        # it and then cancels, but a straggler already past its bound could
+        # still reach this line. By then a NEW flow may have adopted this window
+        # id, and killing it would destroy a live session that has nothing to do
+        # with us. This is the belt to the leash's suspenders: even a straggler
+        # cannot kill a window it no longer owns.
+        logger.warning(
+            "Skipping cleanup of tmux window %s (%s) after %s: it is no longer "
+            "owned by the flow that requested the cleanup",
+            window_id,
+            window_name,
+            reason,
+        )
+        return CleanupOutcome.SPARED_BOUND
     try:
         killed = await tmux_mgr.kill_window(window_id)
     except asyncio.CancelledError:
@@ -1184,15 +1217,41 @@ async def release_claim(flow: TrustFlow, *, expect: str, to: str) -> bool:
     return await transition(flow, expect=frozenset({expect}), to=to)
 
 
-async def _cancel_and_await(task: asyncio.Task[Any] | None) -> None:
-    """Cancel a task and await it, swallowing its outcome."""
+async def _cancel_and_await(
+    task: asyncio.Task[Any] | None, *, budget: float | None = None
+) -> None:
+    """Cancel a task and await it, swallowing its outcome.
+
+    ``budget`` bounds the wind-down wait: a task that refuses to die must not
+    park the caller forever (the leash in the orphan arm relies on this).
+    """
     if task is None or task.done():
         return
     task.cancel()
     try:
-        await task
-    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        if budget is None:
+            await task
+        else:
+            await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+    except (asyncio.CancelledError, TimeoutError, Exception):  # noqa: BLE001
         pass
+
+
+async def _bounded_shield(coro: Any, *, budget: float, what: str) -> None:
+    """Run ``coro`` so a cancellation aimed at US cannot abandon it half-done.
+
+    Used for the steps that MUST happen on every outcome (review r9 P1-B): the
+    shield keeps the work running, the bound keeps us from parking on it, and
+    the task handle means nothing is left detached.
+    """
+    task = asyncio.create_task(coro)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+    except (asyncio.CancelledError, TimeoutError, Exception):  # noqa: BLE001
+        logger.warning("trust %s did not complete within its budget", what)
+    finally:
+        if not task.done():
+            await _cancel_and_await(task, budget=budget)
 
 
 async def claim_terminal(
@@ -1296,6 +1355,52 @@ def _consume_completion(
     return True
 
 
+def _peek_completion(
+    key: _FlowKey, *, generation: int | None = None, window_id: str | None = None
+) -> bool:
+    """``_consume_completion`` WITHOUT the pop — the same match rules.
+
+    Outcome derivation must be able to read the evidence without spending it:
+    the note is single-use because teardown consumes it to decide accounting,
+    and a derivation that consumed it would silently steal that decision.
+    """
+    note = _completed_binds.get(key)
+    if note is None:
+        return False
+    if _wall() - note.at > _COMPLETION_NOTE_TTL_S:
+        return False
+    if generation is not None and note.generation != generation:
+        return False
+    if window_id is not None and note.window_id != window_id:
+        return False
+    return True
+
+
+def bind_committed(flow: TrustFlow) -> bool:
+    """DURABLE EVIDENCE that this flow's bind actually landed (review r9 P1-A).
+
+    Task flags are NOT sufficient. ``session_mgr.bind_thread`` is SYNCHRONOUS,
+    so a cancellation aimed at the tail cannot interrupt it — it lands at the
+    NEXT await (the payload replay, or the final card edit), by which time the
+    binding AND this note have both been written. The task then reports
+    ``cancelled()``, and deriving "failed" from that flag alone made the caller
+    run the failure arm: ``/start`` skipped the bound-topic teardown while a
+    LIVE binding survived the reset, and the pending payload's files were
+    deleted underneath it.
+
+    The note is written in the SAME synchronous stretch as ``bind_thread`` —
+    ``bind_thread`` → ``_note_completion`` → ``_release_tokens`` with no await
+    between — so "note present" is exactly equivalent to "bind committed", with
+    no window in which one is true and the other is not. It is generation- AND
+    window-qualified, so an older flow's note can never be read as this one's.
+    """
+    return _peek_completion(
+        (flow.user_id, flow.thread_id),
+        generation=flow.generation,
+        window_id=flow.created_wid,
+    )
+
+
 def _release_tokens(flow: TrustFlow) -> None:
     """Fix 7's non-dispatch terminal token op: ROW REMOVAL, ledger untouched.
 
@@ -1308,18 +1413,24 @@ def _release_tokens(flow: TrustFlow) -> None:
     decision_token.teardown_route(flow.user_id, flow.thread_id, flow.created_wid)
 
 
-def _drop_entry(flow: TrustFlow) -> None:
+def _drop_entry(flow: TrustFlow, *, delete_attachments: bool = True) -> None:
     """Drop the ownership token LAST (never before the window is settled).
 
-    This is a TERMINAL drop — the stashed first-turn payload was never
+    This is normally a TERMINAL drop — the stashed first-turn payload was never
     delivered — so the downloaded attachment files go with it. Without that,
     a flow that terminalized before its caller could read the entry (the
     forced-teardown path, which drops it first) leaked those files.
+
+    ``delete_attachments=False`` is for the ONE case where the payload's fate is
+    genuinely UNKNOWN (review r9 P1-A): a bind that committed but whose tail was
+    cancelled at the replay await. Deleting there would destroy the user's
+    message on a topic that is now live and usable, so the files are kept and
+    the card says so.
     """
     entry = picker_entry(flow.user_data, flow.thread_id)
     if entry is not None and entry.get(TRUST_GENERATION_KEY) == flow.generation:
         dropped = drop_picker_entry(flow.user_data, flow.thread_id)
-        if dropped is not None:
+        if dropped is not None and delete_attachments:
             _delete_pending_attachments(dropped)
 
 
@@ -1376,6 +1487,7 @@ async def _terminal_cleanup(
         tmux_mgr,
         reason=reason,
         session_mgr=session_mgr or flow.session_mgr,
+        owner_guard=_owner_guard_for(flow),
     )
     if (
         outcome is CleanupOutcome.SPARED_REGISTERED
@@ -1462,6 +1574,15 @@ async def _run_completion_tail(
                 _drop_entry(flow)
                 _drop_flow(flow)
         return True
+    if bind_committed(flow):
+        # THE BIND COMMITTED, the tail just did not get to finish (review r9
+        # P1-A). ``bind_thread`` is synchronous, so a cancellation lands at the
+        # NEXT await — the replay or the card edit — with the binding already
+        # written. This is a COMPLETION, not a failure: the guarded cleanup must
+        # not run (it would kill a window the topic is now bound to), and the
+        # caller must do bound-topic accounting.
+        await _settle_committed_but_unfinished_bind(flow, bot)
+        return True
     # FAILED: take the claim back from ``completing_bind`` and settle the window
     # ourselves, with the honest ❌ — the same outcome branch the terminalizer
     # runs, so every caller of the tail gets identical semantics.
@@ -1508,6 +1629,88 @@ def _replay_for(flow: TrustFlow) -> Any:
     from .inbound_telegram import _flush_pending_route_payload
 
     return _flush_pending_route_payload
+
+
+async def _drop_orphan(user_id: int, thread_id: int, orphaned: TrustFlow) -> None:
+    """Commit terminal and drop an orphaned flow. Idempotent, lock-taking."""
+    async with creation_lock(user_id, thread_id):
+        if _flows.get((user_id, thread_id)) is orphaned:
+            try_transition_locked(
+                orphaned, expect=NONTERMINAL_PHASES, to=PHASE_TERMINAL
+            )
+            _release_tokens(orphaned)
+            _drop_entry(orphaned)
+            _drop_flow(orphaned)
+
+
+def _owner_guard_for(flow: TrustFlow) -> Callable[[], Awaitable[bool]]:
+    """A last-moment "do I still own this window?" check for the guarded kill.
+
+    Evaluated immediately before ``kill_window`` (review r9 P1-B). The hazard is
+    a cleanup that outlives the flow that started it: it is bounded and then
+    cancelled, but a straggler already past its bound could still reach the kill
+    — by which time a NEW flow may have adopted the same window id, and the kill
+    would destroy a live session that is not ours.
+
+    The registry read is a single dict lookup with no ``await``, so it is
+    already atomic against every other actor — and it deliberately does NOT take
+    the creation lock: ``creation_lock`` is a plain non-reentrant
+    ``asyncio.Lock``, and the guard runs inside ``_terminal_cleanup``, which
+    several callers reach from paths that must stay lock-free. Taking it here
+    would risk a deadlock to buy nothing a single read does not already give.
+    """
+
+    async def _still_owns() -> bool:
+        current = _flows.get((flow.user_id, flow.thread_id))
+        if current is None or current is flow:
+            return True
+        # A DIFFERENT flow owns this topic now. It only blocks us if it has
+        # adopted the very window we were about to kill.
+        return current.created_wid != flow.created_wid
+
+    return _still_owns
+
+
+async def _settle_committed_but_unfinished_bind(flow: TrustFlow, bot: Any) -> None:
+    """Terminalize a flow whose bind COMMITTED but whose tail never finished.
+
+    The window is BOUND and usable, so there is no guarded cleanup to run — only
+    honest accounting and honest copy. The payload's fate is genuinely UNKNOWN:
+    the note is written BEFORE the replay, so a tail cancelled at that await may
+    or may not have delivered the first message, and nothing durable records
+    which. We therefore KEEP the downloaded attachment files (deleting them
+    would destroy the user's message on a topic that now works) and say plainly
+    that the message may not have arrived. Re-running the replay instead was
+    rejected: it is not safely re-derivable — a replay that DID run would be
+    delivered twice, and a duplicate first message is worse than an honest
+    prompt to resend.
+    """
+    logger.warning(
+        "trust completion tail was cut short AFTER a committed bind "
+        "(window=%s, thread=%s) — keeping the binding and the pending files",
+        flow.created_wid,
+        flow.thread_id,
+    )
+    await _edit_card(
+        flow,
+        bot,
+        f"✅ {flow.create_message}\n\nCreated. Send messages here.\n\n"
+        "⚠️ Your pending message may not have been delivered — resend it if you "
+        "don't see a reply.",
+        None,
+    )
+    flow.terminal_committed = True
+    async with creation_lock(flow.user_id, flow.thread_id):
+        if _flows.get((flow.user_id, flow.thread_id)) is flow:
+            try_transition_locked(
+                flow,
+                expect=NONTERMINAL_PHASES,
+                to=PHASE_TERMINAL,
+            )
+            _release_tokens(flow)
+            # KEEP the attachments — see above.
+            _drop_entry(flow, delete_attachments=False)
+            _drop_flow(flow)
 
 
 def _bind_task_succeeded(task: asyncio.Task[Any]) -> bool:
@@ -1934,8 +2137,9 @@ async def _terminalize(
         # half of the hung-tail deadlock: teardown cancels and awaits the WAIT
         # task, whose terminalizer sat on a bind tail that never finished, so
         # topic-close and shutdown hung forever. The tail gets a real grace and
-        # is then CANCELLED; a tail that had to be killed is not a success, so
-        # `bind_ok` is False below and the failure arm runs the guarded cleanup.
+        # is then CANCELLED. A killed tail is not a task-level success — but it
+        # may still have COMMITTED its bind (review r9 P1-A), which is why
+        # `bind_ok` below consults the durable evidence and not just the flags.
         try:
             await asyncio.wait_for(asyncio.shield(inner), timeout=BIND_TAIL_GRACE_S)
         except asyncio.CancelledError:
@@ -1952,8 +2156,13 @@ async def _terminalize(
             )
             await _cancel_and_await(inner)
     # The tail's ACTUAL outcome decides — a bind that raised before
-    # ``bind_thread`` is not a success (review r4 P2-B).
+    # ``bind_thread`` is not a success (review r4 P2-B) — where "actual" means
+    # the DURABLE EVIDENCE, not only the task flags (review r9 P1-A). A tail
+    # cancelled at the replay await has already written the binding.
     bind_ok = inner is not None and _bind_task_succeeded(inner)
+    if inner is not None and not bind_ok and bind_committed(flow):
+        await _settle_committed_but_unfinished_bind(flow, bot)
+        return
 
     async with creation_lock(flow.user_id, flow.thread_id):
         if _flows.get((flow.user_id, flow.thread_id)) is not flow:
@@ -2730,51 +2939,57 @@ async def teardown_thread(
             # BEST EFFORT, and it must never mask the original failure: this
             # runs on the way out of a teardown that already raised or was
             # cancelled.
-            try:
-                # BOUNDED, and SHIELDED. This runs while we are already
-                # unwinding — usually from a cancellation — so it must neither
-                # be re-cancelled halfway through a kill nor park forever on a
-                # wedged tmux: either would strand the very flow this arm exists
-                # to settle. The drop below still runs on every outcome.
-                await asyncio.wait_for(
-                    asyncio.shield(
-                        _terminal_cleanup(
-                            orphaned,
-                            orphaned.bot,
-                            orphaned.tmux_mgr,
-                            reason="teardown aborted with no observer left",
-                            body=(
-                                "⚠️ This session setup was cancelled while an "
-                                "action was still in flight."
-                            ),
-                            session_mgr=session_mgr or orphaned.session_mgr,
-                            allow_completion=False,
-                        )
+            # LEASHED, not merely bounded (review r9 P1-B). ``wait_for`` on a
+            # SHIELD only stops US waiting — the shielded coroutine keeps
+            # running, so on timeout a kill-capable task was left DETACHED and
+            # could fire its ``kill_window`` long after we had released
+            # ownership, against a window a new flow had since adopted. We hold
+            # the handle, and on expiry we CANCEL it and bounded-await its
+            # wind-down, so nothing kill-capable outlives this arm. The
+            # ownership re-check inside the cleanup is the second line of
+            # defence for a straggler that still gets through.
+            cleanup_task = asyncio.create_task(
+                _terminal_cleanup(
+                    orphaned,
+                    orphaned.bot,
+                    orphaned.tmux_mgr,
+                    reason="teardown aborted with no observer left",
+                    body=(
+                        "⚠️ This session setup was cancelled while an "
+                        "action was still in flight."
                     ),
-                    timeout=ORPHAN_CLEANUP_BUDGET_S,
+                    session_mgr=session_mgr or orphaned.session_mgr,
+                    allow_completion=False,
+                )
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(cleanup_task), timeout=ORPHAN_CLEANUP_BUDGET_S
                 )
             except (asyncio.CancelledError, TimeoutError, Exception):  # noqa: BLE001
                 # Logged, never re-raised: we are already unwinding, and the
-                # DROP below is what actually guarantees the invariant. A
-                # cancellation here is the NORMAL shape (the shielded cleanup
-                # keeps running to completion on its own).
+                # DROP below is what guarantees the invariant.
                 logger.warning(
                     "trust teardown's orphan cleanup did not complete "
-                    "(thread=%s, window=%s) — dropping the flow anyway",
+                    "(thread=%s, window=%s) — cancelling it and dropping the flow",
                     thread_id,
                     orphaned.created_wid,
                 )
             finally:
+                if not cleanup_task.done():
+                    await _cancel_and_await(
+                        cleanup_task, budget=ORPHAN_CLEANUP_BUDGET_S
+                    )
                 # The flow is orphaned on EVERY outcome — commit terminal and
                 # drop it, so no OPEN, unobserved record can survive this path.
-                async with creation_lock(user_id, thread_id):
-                    if _flows.get((user_id, thread_id)) is orphaned:
-                        try_transition_locked(
-                            orphaned, expect=NONTERMINAL_PHASES, to=PHASE_TERMINAL
-                        )
-                        _release_tokens(orphaned)
-                        _drop_entry(orphaned)
-                        _drop_flow(orphaned)
+                # SHIELDED: a cancellation arriving while we reacquire the lock
+                # used to skip the drop entirely, which made
+                # "drop-on-every-outcome" only true when nobody cancelled us.
+                await _bounded_shield(
+                    _drop_orphan(user_id, thread_id, orphaned),
+                    budget=ORPHAN_CLEANUP_BUDGET_S,
+                    what="orphan drop",
+                )
 
 
 async def _teardown_loop(
@@ -2855,7 +3070,13 @@ async def _teardown_loop(
                 except (TimeoutError, Exception):  # noqa: BLE001
                     pass
                 if bind_task.done():
-                    completed = _bind_task_succeeded(bind_task)
+                    # DURABLE EVIDENCE, not just the flags (review r9 P1-A): a
+                    # tail cancelled at the replay await committed its bind, and
+                    # reporting False here made `/start` skip the bound-topic
+                    # teardown while a live binding survived the reset.
+                    completed = _bind_task_succeeded(bind_task) or bind_committed(
+                        current
+                    )
                     if consumed_bind is not bind_task:
                         # FIRST observation: re-read the phase, because the
                         # tail's own terminalizer may have moved it.
