@@ -1,0 +1,50 @@
+
+
+⏺ Morning-after checks: done as far as physics allows. Summary:
+
+  - Timing reframe — the release deployed at 10:48Z, after last night's job windows, so retention and reflection last ran on the old image. Their first
+    post-#360 runs are tonight (00:00Z / 02:00Z); the concrete re-check greps and expected values are logged in today's daily note for tomorrow's session.
+  - Readiness: all green. Both jobs registered on the new image; the prior-learnings wiring is live with a non-empty corpus (4 of 11 users get full blocks
+    tonight); zero references to the dropped legacy tables anywhere in the running image; retention's orphan predicate reads 0-to-delete against a genuine
+    5,110-row scan population — and if the old bug shape ever returned, it would show up as exactly 1,000 deletions (the per-run cap), a clean signature.
+  - Embedding job: PASS — 25 clean cycles, retry backlog genuinely draining, zero missing-table errors.
+  - Two pre-existing prod defects found and filed: #386 (a user_id=0 FK sentinel silently prevents upload-progress rows from ever being written — the admin
+    surface can't see those uploads) and #387 (the deprecated qwen:free model is still the code default and the inline-email-image lane from #292 has no prod
+    settings override — it's failing soft against a dead model right now; the ops half of the fix is just adding one settings row). Plus #388 (P3, logging gap
+    that makes tomorrow's reflection verification an absence-check).
+
+  #387's ops arm is a one-row prod settings insert you could authorize ahead of the code fix — say the word. Still outstanding: the Dynamics research memo
+  (nudged) and your todo-scope ruling.
+
+
+⏺ Teammate @prod-morning-checks finished
+
+› Message from @dynamics-mcp-researc… (ctrl+o to expand)
+
+⏺ Teammate @dynamics-mcp-research finished
+
+⏺ The Dynamics research landed and it's decision-grade. Persisting it and logging:
+
+  Read 1 file
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Dynamics  ☐ Todo scope  ☐ #387 ops fix  ✔ Submit  →
+
+│ Dynamics CRM integration: which direction? (Full memo in temp/dynamics_mcp_auth_options_memo.md. Note: metering — Dataverse MCP calls bill Copilot Credits on
+│ the client tenant unless users hold D365 Premium/M365 Copilot licenses; worth checking their posture regardless.)
+
+❯ 1. Option A spike (Recommended)
+     ~2-day spike on a real Dataverse tenant: can our confidential client get a per-user mcp.tools token and call /api/mcp? Proves/kills the per-user MCP path
+     before any architecture is committed. Needs a tenant to test against (client's or a dev tenant).
+  2. Option B direct
+     Skip MCP: app-only credential + CallerObjectId impersonation against the Dataverse Web API. Fully documented, no per-user consent — but our code becomes
+     the sole authorization gate and all users likely share one rate bucket.
+  3. Entra SSO variant first
+     Bigger product decision: add Entra SSO as a DI Copilot login method, unlocking true on-behalf-of flow — per-user linking disappears entirely. Defers CRM
+     integration behind the SSO work.
+  4. Park it
+     Hold the item; memo stands as the decision record for later.
+  5. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

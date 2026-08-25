@@ -729,6 +729,10 @@ _BASELINE_CLASSIFICATIONS = {
     "auq_freetext_typed_identical_label_v2.1.207.ansi.txt": "prompt_row_is_option",
     "auq_longlabel_160x50_v2.1.198.txt": "no_input_box",
     "auq_multi_picker_v2.1.207.txt": "no_input_box",
+    # CC 2.1.237 multi-question gutter layout (the AUQ details-card hotfix's
+    # real capture). A live picker replaces the input box ⇒ no_input_box, i.e.
+    # the delivery gate keeps refusing a payload at this surface.
+    "auq_multiq_gutter_pane_v2.1.237.txt": "no_input_box",
     "auq_multiq_q1_pane.txt": "prompt_row_is_option",
     "auq_multiq_q2_after_pick_pane.txt": "prompt_row_is_option",
     "auq_multiq_submit_pane.txt": "no_input_box",

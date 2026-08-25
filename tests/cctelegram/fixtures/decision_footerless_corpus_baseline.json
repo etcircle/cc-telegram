@@ -13,6 +13,7 @@
  "auq_freetext_typed_identical_label_v2.1.207.ansi.txt": null,
  "auq_longlabel_160x50_v2.1.198.txt": "AskUserQuestion",
  "auq_multi_picker_v2.1.207.txt": "AskUserQuestion",
+ "auq_multiq_gutter_pane_v2.1.237.txt": "AskUserQuestion",
  "auq_multiq_q1_pane.txt": "AskUserQuestion",
  "auq_multiq_q2_after_pick_pane.txt": "AskUserQuestion",
  "auq_multiq_submit_pane.txt": "AskUserQuestion",
