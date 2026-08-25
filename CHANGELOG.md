@@ -4,6 +4,50 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.9] — 2026-08-25
+
+The "a new session that asks you to trust the folder is not a failure" release.
+
+### Added
+- **The folder-trust card (GH #65).** A brand-new Claude Code window opens on "Do you trust the
+  files in this folder?", which never reaches a transcript and never registers a session — so the
+  creation flow read it as a hook timeout, KILLED the fresh window, and reported a failed session.
+  The inline wait is now a classifying one: while the pane positively shows the trust prompt, the
+  picker card becomes a 🔐 trust card with **Trust this folder** and **Cancel — close the window**.
+  Trust drives the live prompt through the shipped navigate → verify → Enter discipline (arrows
+  never commit, the pre-Enter verify is the only licence to press Enter, digits are forbidden
+  because they commit instantly); Cancel closes the window without typing a single key. Answering
+  in tmux works too — the bot notices, binds the topic, and replays your first message.
+- **Per-creation version licensing that works on Linux/WSL.** The window is created without its
+  launch command, and the bot runs a nonce-delimited `--version` probe *in that pane's own shell*
+  (preserving any `NAME=value` prefix from `CLAUDE_COMMAND`, and requiring a literal
+  `N.N.N (Claude Code)` reply) before launching. That is the version the pane will actually run, so
+  the keystroke licence no longer depends on `pane_current_command`, which reports a bare `claude`
+  on Linux/WSL. A failed probe simply makes the card display-only; it never blocks or delays the
+  launch. Characterised versions: 2.1.204, 2.1.206, 2.1.207, 2.1.239, 2.1.241.
+- **Three new environment variables**, all documented in the README:
+  `CC_TELEGRAM_TRUST_PROMPT_CEILING_S` (how long a trust prompt keeps the window alive; `0`
+  disables the lane), `CC_TELEGRAM_HOOK_TIMEOUT_EXTENSION_S` (grace on top of
+  `CC_TELEGRAM_HOOK_TIMEOUT`, restarted whenever you answer the trust prompt), and
+  `CC_TELEGRAM_TRUST_CARD_DISPATCH` (default on; an explicit
+  `CC_TELEGRAM_DECISION_DISPATCH=false` turns this lane off too).
+
+### Fixed
+- **A window the bot cannot read is left alive, not killed.** Every kill is now a typed decision
+  with an explicit ownership re-check immediately before it, and the outer observation ceiling's
+  terminal action *spares* the window, releases the topic and tells you to use "Bind to Existing
+  Window". A dead pane that still shows the trust prompt text (Claude Code leaves it on screen
+  after a commit or Escape) is recognised by the process running in the pane, so it is cleaned up
+  rather than shown as a live card.
+- **A message sent while a new session is starting is queued, not swallowed.** Text, photos and
+  documents arriving into a topic whose session is still coming up now re-read the topic's state
+  after their own downloads finish: if the session bound in the meantime the message is delivered
+  normally, and if the trust prompt is still up the message is queued and you get a short nudge
+  instead of a second directory browser.
+- **Closing a topic (or `/start`) during session creation now cleans up.** The no-binding branch of
+  topic-close previously skipped teardown entirely, leaving the wait running and the new window
+  orphaned.
+
 ## [0.4.8] — 2026-08-25
 
 The "multi-question prompts get their details card back" release.

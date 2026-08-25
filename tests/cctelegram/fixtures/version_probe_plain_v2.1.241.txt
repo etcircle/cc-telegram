@@ -1,0 +1,53 @@
+
+felixcardix@Felixs-Mac-mini trustrig % clear
+
+felixcardix@Felixs-Mac-mini trustrig % printf 'CCTGVERA9f31\n'; DISABLE_AUTOUPDATER=1 '/private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-telegram/64f
+5dbae-3564-43a2-a821-eaa679b542ff/scratchpad/trustrig/cc241/bin/claude' --version; printf 'CCTGVERB9f31\n'
+CCTGVERA9f31
+2.1.241 (Claude Code)
+CCTGVERB9f31
+felixcardix@Felixs-Mac-mini trustrig %
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

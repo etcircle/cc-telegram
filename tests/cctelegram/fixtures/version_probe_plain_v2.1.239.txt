@@ -1,0 +1,53 @@
+
+felixcardix@Felixs-Mac-mini trustrig % clear
+
+felixcardix@Felixs-Mac-mini trustrig % printf 'CCTGVERA9f31\n'; DISABLE_AUTOUPDATER=1 claude --version; printf 'CCTGVERB9f31\n'
+CCTGVERA9f31
+2.1.239 (Claude Code)
+CCTGVERB9f31
+felixcardix@Felixs-Mac-mini trustrig %
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

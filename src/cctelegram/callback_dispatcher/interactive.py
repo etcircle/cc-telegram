@@ -11,7 +11,7 @@ Key components:
 
 from __future__ import annotations
 
-from typing import Any, Literal, cast
+from typing import Any, Callable, Literal, cast
 
 import asyncio
 import logging
@@ -838,6 +838,8 @@ async def _dispatch_decision_pane_locked(
     option_number: int,
     option_label: str,
     ledger_key: str | None,
+    license_check: Callable[[str, str | None], bool] | None = None,
+    on_commit_sent: Callable[[], None] | None = None,
 ) -> _DecisionPaneOutcome:
     """§3 dispatch transaction — the caller holds the window send lock.
 
@@ -846,6 +848,27 @@ async def _dispatch_decision_pane_locked(
     proof) → Enter → confirm → terminal ledger write. NO Telegram I/O. Every gate
     runs BEFORE any keystroke, so a keystroke is NEVER sent to an unlicensed /
     non-matching shape.
+
+    ``license_check`` is the FRESH in-lock license predicate ``(family,
+    live_pane_command) -> bool``. ``None`` = the ``dcp:`` lane's shipped default
+    (``pane_command_is_claude`` AND the pane command itself licensed in the
+    table) — byte-identical behavior for that lane. GH #65's creation-flow trust
+    lane passes its own: ``pane_command_is_claude`` (proof the TUI owns the
+    pane, on BOTH platforms) AND the family is ``folder-trust`` AND the version
+    PROBED in this very pane at creation is licensed — because the pane command
+    can never carry a version on Linux/WSL (``/proc/comm`` reports ``claude``),
+    so the shipped default can never license a tap there.
+
+    ``on_commit_sent`` is an optional progress hook published the moment the
+    commit becomes possible (GH #65 review r3 P2-5): a caller that must restore
+    state in a ``finally`` cannot infer "Enter was sent" from the return value
+    alone, because a cancellation between the send and the return would lose it.
+
+    It fires AFTER the ``Enter`` ``send_keys`` — on a TRUTHY return, and from the
+    exception path on a raise/timeout (ambiguous: the key may have landed) — but
+    NEVER on a clean ``False``, which is tmux telling us the key provably never
+    left (review r4 P2-D, mirroring the delivery gate: a provable non-send is not
+    stamped, ambiguity keeps its stamp).
     """
 
     def _bail_not_advanced(reason: str) -> _DecisionPaneOutcome:
@@ -911,9 +934,15 @@ async def _dispatch_decision_pane_locked(
     # decline before ANY key + an INFO log (post-/update dead taps stay
     # observable).
     live_cmd = await tmux_manager.pane_current_command(window_id)
-    if not pane_command_is_claude(live_cmd) or not decision_token.lookup(
-        family, live_cmd or ""
-    ):
+    licensed = (
+        license_check(family, live_cmd)
+        if license_check is not None
+        else (
+            pane_command_is_claude(live_cmd)
+            and decision_token.lookup(family, live_cmd or "")
+        )
+    )
+    if not licensed:
         logger.info(
             "DECISION dispatch declined: live pane command %r not licensed for "
             "family %s (user=%d window=%s)",
@@ -999,9 +1028,24 @@ async def _dispatch_decision_pane_locked(
 
     # (f) Commit — the version-stable Enter (a False return means it never reached
     # tmux → still a PRE-COMMIT bail).
-    if not await tmux_manager.send_keys(
-        w.window_id, "Enter", enter=False, literal=False
-    ):
+    #
+    # ``on_commit_sent`` fires AFTER the send, per the delivery gate's precedent
+    # (review r4 P2-D): a clean False is PROVEN non-delivery and must NOT be
+    # stamped, while a raise or a timeout is AMBIGUOUS — the key may have landed
+    # — and keeps its stamp. Firing before the send made the stamp false for the
+    # one case tmux tells us about.
+    try:
+        commit_sent = await tmux_manager.send_keys(
+            w.window_id, "Enter", enter=False, literal=False
+        )
+    except BaseException:
+        if on_commit_sent is not None:
+            on_commit_sent()
+        raise
+    if commit_sent:
+        if on_commit_sent is not None:
+            on_commit_sent()
+    else:
         return _bail_not_advanced("commit_send_failed")
     await asyncio.sleep(COMMIT_SETTLE)
     pane2 = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)

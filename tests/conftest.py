@@ -21,9 +21,11 @@ preserves the kill-criterion signal: scenarios fail the bar only when the
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,14 +41,21 @@ import pytest
 # terminal_parser.reset_for_tests() locally.
 os.environ["CC_TELEGRAM_PERMISSION_PROMPTS"] = "false"
 os.environ["CC_TELEGRAM_DECISION_CARDS"] = "false"
+# GH #65: the same floor posture for the folder-trust CREATION lane. ``0``
+# disables it, so every pre-existing scenario keeps the pre-#65 inline
+# wait-then-kill creation path. The lane's own tests restore a real ceiling by
+# monkeypatching ``config.trust_prompt_ceiling_s``.
+os.environ["CC_TELEGRAM_TRUST_PROMPT_CEILING_S"] = "0"
 
 from cctelegram import bot as bot_module
 from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram import route_runtime, terminal_parser, transcript_event_adapter
 from cctelegram import session as session_module
 from cctelegram.session import session_manager as _real_sm
+from cctelegram import tmux_manager as tmux_mod
 from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
 from cctelegram.utils import app_dir
+from tests.cctelegram._adoption_protocol import AdoptionProtocolMixin
 from cctelegram.handlers import (
     artifacts,
     attention,
@@ -60,8 +69,20 @@ from cctelegram.handlers import (
     pick_intent,
     pick_token,
     status_polling,
+    trust_flow,
     usage_cache,
 )
+
+# GH #65 review r8 P3: arm the trust lane's invariant assertions for the WHOLE
+# suite, at import. Arming them inside ``reset_for_tests`` alone made strictness
+# test-ORDER dependent — the first test in a process, and any single test run in
+# isolation (which is how a failure actually gets reproduced), ran with the
+# invariants merely logging, so the lane's safety net was inert in exactly the
+# run where it matters most.
+trust_flow.enable_strict_invariants()
+# GH #65 r15 P2-B: a lifecycle hold that grows past the declared ceiling
+# invalidates the DERIVED kill bound, so make it raise for the whole suite.
+tmux_mod.enable_strict_lifecycle_invariants()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -105,7 +126,7 @@ class _PaneWindow:
 
 
 @dataclass
-class FakeTmux:
+class FakeTmux(AdoptionProtocolMixin):
     """Stand-in for ``tmux_manager`` used by scenario tests.
 
     Fixture binds these methods onto the real ``tmux_manager`` singleton so
@@ -118,6 +139,12 @@ class FakeTmux:
     kill_calls: list[str] = field(default_factory=list)
     rename_calls: list[tuple[str, str]] = field(default_factory=list)
     create_calls: list[dict[str, Any]] = field(default_factory=list)
+    # GH #65: the launch-deferred creation substrate. ``probe_version_response``
+    # is what the in-pane ``--version`` probe resolves to (None ⇒ the trust card
+    # degrades to display-only); ``launch_calls`` records the deferred launch.
+    probe_version_response: str | None = None
+    probe_calls: list[str] = field(default_factory=list)
+    launch_calls: list[str] = field(default_factory=list)
     create_response: tuple[bool, str] | None = None  # override for failure injection
     send_keys_response: bool | None = None  # override for failure injection
     # GH #50: fired right AFTER a LITERAL (Enter-withheld) write, so a scenario
@@ -125,6 +152,11 @@ class FakeTmux:
     # transaction genuinely closes, and the only way to reach ``draft_written``
     # from the public Telegram seam.
     on_write: Any | None = None
+    # GH #65 review r1 (P1-2): fired at the TOP of ``list_windows``, so a
+    # scenario can script the "a binding / creation flow appears while the
+    # handler is still building the directory browser" race — the one gap the
+    # locked decision has to close.
+    on_list_windows: Any | None = None
     _next_id: int = 0
 
     # ── seeding helpers ────────────────────────────────────────────────
@@ -202,6 +234,9 @@ class FakeTmux:
 
     # ── tmux_manager interface (async) ─────────────────────────────────
     async def list_windows(self) -> list[TmuxWindow]:
+        if self.on_list_windows is not None:
+            hook, self.on_list_windows = self.on_list_windows, None
+            await hook()
         return [self._to_tmux_window(w) for w in self.windows.values()]
 
     async def find_window_by_id(self, window_id: str) -> TmuxWindow | None:
@@ -213,6 +248,10 @@ class FakeTmux:
             if w.window_name == window_name:
                 return self._to_tmux_window(w)
         return None
+
+    async def adoption_listing(self) -> Any:
+        """The DIRECT adoption read (GH #65 r16) — never the cache."""
+        return [self._to_tmux_window(w) for w in self.windows.values()]
 
     async def kill_window(self, window_id: str) -> bool:
         self.kill_calls.append(window_id)
@@ -284,6 +323,22 @@ class FakeTmux:
         name = window_name or Path(cwd).name or "window"
         wid = self.add_window(window_name=name, cwd=cwd)
         return True, f"Created window '{name}' at {cwd}", name, wid
+
+    async def probe_cli_version(
+        self, window_id: str, *, timeout: float = 5.0
+    ) -> str | None:
+        """GH #65 Fix 0: the per-creation in-pane ``--version`` probe."""
+        del timeout
+        self.probe_calls.append(window_id)
+        return self.probe_version_response
+
+    async def launch_claude_in_window(
+        self, window_id: str, *, resume_session_id: str | None = None
+    ) -> bool:
+        """GH #65 Fix 0: the launch a ``defer_launch`` create postponed."""
+        del resume_session_id
+        self.launch_calls.append(window_id)
+        return window_id in self.windows
 
     async def get_or_create_session(self) -> Any:
         return MagicMock(name="fake-tmux-session")
@@ -752,6 +807,52 @@ def make_update_callback(
     return update
 
 
+def make_update_real_callback(
+    data: str,
+    *,
+    bot: Any,
+    thread_id: int | None = None,
+    message_id: int = 200,
+    user_id: int = _DEFAULT_USER_ID,
+    chat_id: int = _DEFAULT_CHAT_ID,
+) -> Any:
+    """A callback Update built from REAL python-telegram-bot objects.
+
+    ``inbound_telegram._create_and_bind_window`` asserts ``isinstance(query,
+    CallbackQuery)``, so the creation flow cannot be driven with the MagicMock
+    factory above. The objects are bound to the FakeBot, so ``query.answer`` and
+    ``query.edit_message_text`` land in ``FakeBot.sent`` exactly like every other
+    outbound call — no library monkeypatching in test bodies.
+    """
+    from datetime import datetime, timezone
+
+    from telegram import CallbackQuery, Chat, Message, Update
+    from telegram import User as TgUser
+
+    tg_user = TgUser(id=user_id, first_name="Test", is_bot=False)
+    chat = Chat(id=chat_id, type="supergroup", is_forum=True)
+    message = Message(
+        message_id=message_id,
+        date=datetime.now(timezone.utc),
+        chat=chat,
+        from_user=tg_user,
+        message_thread_id=thread_id,
+        is_topic_message=thread_id is not None,
+    )
+    message.set_bot(bot)
+    query = CallbackQuery(
+        id="cbq-real",
+        from_user=tg_user,
+        chat_instance="chat-instance",
+        data=data,
+        message=message,
+    )
+    query.set_bot(bot)
+    update = Update(update_id=1, callback_query=query)
+    update.set_bot(bot)
+    return update
+
+
 def make_update_command(
     command: str,
     *,
@@ -895,6 +996,9 @@ def _reset_all_handler_state() -> None:
     dashboard.reset_for_tests()
     # /cost + /usage overlay result cache (co-located reset seam).
     usage_cache.reset_for_tests()
+    # GH #65: cancel + drop every folder-trust creation flow (its WAIT task is
+    # loop-bound, so a leak across tests would outlive its event loop).
+    trust_flow.reset_for_tests()
     # Re-inject the production JSONL-cache getter (bot.post_init wires this
     # once at startup, but post_init doesn't run under test). Without it the
     # ``jsonl_cache`` resolver branch would no-op and the render path would
@@ -915,11 +1019,132 @@ def _reset_all_handler_state() -> None:
     # are loop-bound at first acquire — drop them between tests so a lock
     # created under a previous test's event loop never leaks forward.
     _real_tmux.reset_window_send_locks_for_tests()
+    # GH #65 r12: the window-lifecycle lock is loop-bound at first acquire, for
+    # the same reason the send locks are — drop it so a lock created under a
+    # previous test's event loop never leaks forward.
+    _real_tmux.reset_lifecycle_lock_for_tests()
+    _real_tmux.reset_kill_pending_for_tests()
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Pytest fixtures
 # ──────────────────────────────────────────────────────────────────────────
+
+
+# Shell metacharacters and whitespace that separate one command word from the
+# next — used to scan EVERY token of a shell string for a tmux reference.
+_SHELL_TOKEN_RE = re.compile(r"[\s;&|()<>`]+")
+
+
+class _NoLiveTmuxServer:
+    """A libtmux server stand-in that refuses every attribute access."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(
+            f"a test reached the REAL tmux server (libtmux .{name}). Inject a "
+            "fake tmux manager, or request the ``fake_tmux`` fixture — a test "
+            "must never address a live pane."
+        )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POISON both routes a test could reach a real tmux server through.
+
+    A test that injects a fake into the seam it calls DIRECTLY can still reach
+    the real thing through a seam it forgot. That is what bit us: a unit test
+    seeded a plausible window id into the live ``session_manager``, the
+    completion tail replayed the pending payload through the REAL
+    ``tmux_manager``, and the keystrokes landed in a live Claude session on the
+    developer's default tmux server.
+
+    Injection is the fix (see ``trust_flow._replay_for``); this is the backstop
+    that makes the CLASS unreachable. Poisoning is at the CLASS/MODULE seams, so
+    a FRESHLY-CONSTRUCTED ``TmuxManager()`` is covered too (review r9 P2-B — the
+    per-instance ``_server`` poison missed every route a new instance takes):
+
+    1. **libtmux**, at ``tmux_manager``'s own ``libtmux.Server`` symbol. Every
+       manager — the singleton and any instance a test builds — acquires its
+       server through that name, so this covers ``send_keys`` / ``kill_window``
+       / ``rename_window`` / ``create_window`` and everything else that reaches
+       tmux through ``asyncio.to_thread``. The singleton's already-cached
+       ``_server`` is poisoned as well, since it was built before we got here.
+    2. **The tmux BINARY**, via ``create_subprocess_exec`` AND
+       ``create_subprocess_shell`` — how ``capture_pane`` and the pane-command
+       probes actually run. Poisoned by argv, accepting ``str``, ``bytes`` and
+       ``PathLike`` program arguments. The shell form does NOT try to identify
+       which token is in executable position — it tokenizes shell-aware (so
+       ``'tmux'`` quoted counts) and refuses if ANY token names a tmux
+       executable. That deliberately over-blocks: ``echo tmux`` is refused too.
+       For a test guard that is the correct direction — a false refusal is a
+       loud, one-line test fix, while a false pass types into someone's live
+       session. Non-tmux subprocesses are otherwise untouched (the
+       ``md_capture`` appender benchmark spawns a real interpreter), and the
+       tmux suites that patch these same attributes still override us.
+
+    What this does NOT cover, stated plainly: a **synchronous** ``subprocess``
+    call (``subprocess.run`` / ``Popen``) made from arbitrary code. Fencing that
+    would mean poisoning ``subprocess`` process-wide, which breaks legitimate
+    tooling the suite runs; production's tmux access does not take that route,
+    so it is a known, named gap rather than a covered one.
+    """
+    monkeypatch.setattr(_real_tmux, "_server", _NoLiveTmuxServer(), raising=False)
+
+    class _NoLiveTmuxServerFactory:
+        """Stands in for ``libtmux.Server`` for every manager instance."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise AssertionError(
+                "a test constructed a REAL libtmux Server. Inject a fake tmux "
+                "manager, or request the ``fake_tmux`` fixture — a test must "
+                "never address a live pane."
+            )
+
+    monkeypatch.setattr(
+        tmux_mod.libtmux, "Server", _NoLiveTmuxServerFactory, raising=False
+    )
+
+    def _is_tmux(program: Any) -> bool:
+        raw = program
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        return Path(str(raw)).name in {"tmux", "tmux.exe"}
+
+    real_exec = asyncio.create_subprocess_exec
+    real_shell = asyncio.create_subprocess_shell
+
+    async def _refuse_tmux_binary(program: Any, *args: Any, **kwargs: Any) -> Any:
+        if _is_tmux(program):
+            raise RuntimeError("live tmux blocked in tests")
+        return await real_exec(program, *args, **kwargs)
+
+    async def _refuse_tmux_shell(cmd: Any, *args: Any, **kwargs: Any) -> Any:
+        raw = cmd.decode("utf-8", "replace") if isinstance(cmd, bytes) else str(cmd)
+        # BOTH tokenizers, because neither is sufficient alone (review r11 P3):
+        # ``shlex`` strips QUOTES (``'tmux' list-windows`` runs tmux just as
+        # surely as the bare form) but does NOT split on shell metacharacters,
+        # so ``(tmux list-windows)`` survives as the single token ``(tmux``.
+        # The metacharacter split covers that but cannot see through quotes. So
+        # shlex first, then split every token again on metacharacters, and check
+        # all of them. Unbalanced quotes make shlex raise; falling back to the
+        # metacharacter split alone is the fail-closed direction.
+        try:
+            shlex_tokens = shlex.split(raw, comments=False, posix=True)
+        except ValueError:
+            shlex_tokens = [raw]
+        tokens = [
+            piece
+            for token in shlex_tokens
+            for piece in _SHELL_TOKEN_RE.split(token)
+            if piece
+        ]
+        if any(_is_tmux(token) for token in tokens):
+            raise RuntimeError("live tmux blocked in tests")
+        return await real_shell(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _refuse_tmux_binary)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", _refuse_tmux_shell)
 
 
 @pytest.fixture
@@ -941,6 +1166,8 @@ def fake_tmux(monkeypatch: pytest.MonkeyPatch) -> FakeTmux:
         "capture_pane_cancellation_safe",
         "pane_current_command",
         "create_window",
+        "probe_cli_version",
+        "launch_claude_in_window",
         "get_or_create_session",
         "get_session",
         "session_exists",
@@ -1175,6 +1402,7 @@ __all__ = [
     "make_context",
     "make_update_callback",
     "make_update_command",
+    "make_update_real_callback",
     "make_update_text",
     "make_update_topic_closed",
     "make_update_topic_renamed",

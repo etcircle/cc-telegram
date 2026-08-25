@@ -56,31 +56,23 @@ from telegram.error import NetworkError
 from telegram.ext import ContextTypes
 
 from .. import delivery, route_runtime
-from . import artifacts, decision_token, pane_signals, usage_cache
+from . import artifacts, decision_token, pane_signals, trust_flow, usage_cache
 from ..config import config
 from ..delivery import DeliveryResult
 from ..markdown_v2 import convert_markdown
 from ..session import peek_session_id_for_window, session_manager
 from ..terminal_parser import extract_bash_output, is_interactive_ui
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import LifecycleTimeout, tmux_manager
 from ..transcribe import transcribe_voice
 from ..utils import app_dir
 from . import attention
 from . import reply_context as reply_context_mod
 from .directory_browser import (
-    BROWSE_DIRS_KEY,
-    BROWSE_PAGE_KEY,
-    BROWSE_PATH_KEY,
-    BROWSE_UNBOUND_COUNT_KEY,
     CARD_CHAT_ID_KEY,
     CARD_MSG_ID_KEY,
-    STATE_BROWSING_DIRECTORY,
-    STATE_KEY,
-    STATE_SELECTING_SESSION,
-    STATE_SELECTING_WINDOW,
     build_directory_browser,
     drop_picker_entry,
-    ensure_picker_entry,
+    entry_token,
     picker_entry,
 )
 from .inbound_aggregator import (
@@ -335,17 +327,56 @@ def _get_thread_id(update: Update) -> int | None:
     return tid
 
 
+async def _build_browser_payload() -> trust_flow.BrowserPayload:
+    """Render the directory browser — the LAST pre-processing await.
+
+    GH #65 review r1 P1-2: this is built OUTSIDE the ownership critical section
+    (it lists tmux windows and scans a directory), so it must be produced BEFORE
+    the decision that consumes it — never between the decision and the mutation.
+    """
+    unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
+    start_path = str(config.browse_root)
+    msg_text, keyboard, subdirs = build_directory_browser(
+        start_path, unbound_count=unbound_count
+    )
+    return trust_flow.BrowserPayload(
+        text=msg_text,
+        keyboard=keyboard,
+        subdirs=subdirs,
+        unbound_count=unbound_count,
+        start_path=start_path,
+    )
+
+
 async def _list_unbound_windows(
     tmux_mgr: Any,
     session_mgr: Any,
+    *,
+    listing: list[Any] | None = None,
 ) -> list[tuple[str, str, str]]:
-    """Return tmux windows not currently bound to any topic, as (id, name, cwd)."""
-    all_windows = await tmux_mgr.list_windows()
+    """Return tmux windows not currently bound to any topic, as (id, name, cwd).
+
+    "Unbound" is NOT the same as "adoptable" (GH #65 review r12 P1-C). A
+    trust-lane creation flow binds its window as the LAST step of its tail, so
+    for the whole life of the flow the window is unbound — and offering it here
+    let another topic legitimately grab it mid-flow, producing two routes to one
+    window. Ownership by a live flow is the third state between "bound" and
+    "free", and excluding it closes that race AT THE SOURCE rather than merely
+    detecting it in the trust tail's exclusivity re-check.
+    """
+    from cctelegram.handlers import trust_flow
+
+    # ``listing`` lets an ADOPTION caller pass the DIRECT read it already took
+    # under the lifecycle lock (review r16), so no adoption decision consults
+    # the TTL cache even indirectly. Display callers pass nothing and get the
+    # cached view, which is all the browser render needs.
+    all_windows = listing if listing is not None else await tmux_mgr.list_windows()
     bound_ids = {bid for _, _, bid in session_mgr.iter_thread_bindings()}
+    owned_ids = trust_flow.windows_owned_by_live_flows()
     return [
         (w.window_id, w.window_name, w.cwd)
         for w in all_windows
-        if w.window_id not in bound_ids
+        if w.window_id not in bound_ids and w.window_id not in owned_ids
     ]
 
 
@@ -500,63 +531,71 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     caption = update.message.caption or ""
     media_group_id = update.message.media_group_id
 
+    # GH #65 review r3 P2-4: an initially-unbound payload that resolves BOUND
+    # after the download race has already had its reply context rendered, so the
+    # bound path below must not render it a SECOND time (two quote blocks for
+    # one message). One flag, set the moment it is applied.
+    reply_context_applied = False
+    has_reply_ctx = False
     if wid is None:
-        # GH #66: stash into THIS thread's picker entry. No cross-thread
-        # displacement — another topic's entry is untouched by construction.
-        entry = ensure_picker_entry(context.user_data, thread_id)
         # §2.5: render reply-context before stashing an unbound-topic caption
         # so the later directory/window/session-picker flush preserves the
         # same quote block as the bound aggregator path below. Keep the same
         # media-group guard as the bound path: non-caption-bearing album items
         # must not each synthesize their own quote block.
-        has_reply_ctx = False
+        reply_context_applied = True
         if caption or media_group_id is None:
             caption, has_reply_ctx = await _apply_reply_context(
                 update.message, user.id, thread_id, caption
             )
-        # §2.8.3 photo-in-unbound-topic: stash the path so the directory
-        # picker's flush in _create_and_bind_window can feed the aggregator
-        # for the freshly-bound route. Multiple photos can pile up here
-        # while the user navigates the directory browser.
-        if entry is not None:
-            pending_attachments = entry.setdefault("_pending_thread_attachments", [])
-            pending_attachments.append(
+
+        def _stash_photo(entry: dict[str, Any]) -> None:
+            # §2.8.3 photo-in-unbound-topic: stash the path so the picker's
+            # flush can feed the aggregator for the freshly-bound route.
+            entry.setdefault("_pending_thread_attachments", []).append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
                 )
             )
 
-            # If the user is already mid-picker (text_handler opened the
-            # directory browser, window picker, or session picker for THIS
-            # topic), stashing the photo is enough — re-emitting the picker
-            # here would stomp on the existing browse/picker state and lose
-            # the user's progress. Mirrors the same-thread guards in
-            # text_handler.
-            if entry.get(STATE_KEY) in (
-                STATE_BROWSING_DIRECTORY,
-                STATE_SELECTING_WINDOW,
-                STATE_SELECTING_SESSION,
-            ):
-                return
-
-        # Always open the directory browser for unbound topics. If
-        # unbound tmux windows exist, the browser surfaces an opt-in
-        # "🖥 Bind existing window" button so the user can pivot to the
-        # window picker — but the directory choice stays primary.
-        unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
-        start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(
-            start_path, unbound_count=unbound_count
+        # GH #65 Fix 5 (+ review r1 P1-2): the download, the reply-context
+        # resolution AND the browser build are all AWAITS a creation flow or a
+        # binding can complete inside. ``claim_unbound_inbound`` decides and
+        # mutates in ONE critical section — the browser is built before it, and
+        # a still-free topic is CLAIMED inside it.
+        decision = await trust_flow.claim_unbound_inbound(
+            user.id,
+            thread_id,
+            context.user_data,
+            session_manager,
+            build_browser=_build_browser_payload,
+            stash=_stash_photo,
         )
-        if entry is not None:
-            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            entry[BROWSE_PATH_KEY] = start_path
-            entry[BROWSE_PAGE_KEY] = 0
-            entry[BROWSE_DIRS_KEY] = subdirs
-            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
-        sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
-        _remember_picker_card(entry, sent)
-        return
+        if decision.kind == "trust_owned":
+            await safe_reply(update.message, trust_flow.TRUST_NUDGE)
+            return
+        if decision.kind == "picker_owned":
+            # Mid-picker: stashing is enough — re-emitting the picker would
+            # stomp on the user's browse progress.
+            return
+        if decision.kind == "browser":
+            # The entry was claimed (state + browse caches + stash) under the
+            # lock; all that is left is the send. Always the directory browser
+            # for unbound topics — the opt-in "🖥 Bind existing window" row
+            # appears when unbound tmux windows exist, but the directory choice
+            # stays primary.
+            assert decision.browser is not None
+            sent = await safe_reply(
+                update.message,
+                decision.browser.text,
+                reply_markup=decision.browser.keyboard,
+            )
+            _remember_picker_card(decision.entry, sent)
+            return
+        # The binding appeared while we downloaded: deliver THIS payload
+        # through the normal bound path below instead of a stale picker.
+        assert decision.window_id is not None
+        wid = decision.window_id
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
@@ -610,11 +649,11 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # caption on item 1 only, and rendering with empty caption on items 2-N
     # would re-emit the quote block multiple times (the random nonce in
     # ``render_for_claude`` defeats the aggregator's exact-string dedup).
-    has_reply_ctx = False
-    if caption or media_group_id is None:
-        caption, has_reply_ctx = await _apply_reply_context(
-            update.message, user.id, thread_id, caption
-        )
+    if not reply_context_applied:
+        if caption or media_group_id is None:
+            caption, has_reply_ctx = await _apply_reply_context(
+                update.message, user.id, thread_id, caption
+            )
 
     # §2.8: feed photo + caption + media_group_id into the aggregator. The
     # bundle's flush handler builds the §2.8.2 single-text + grouped-paths
@@ -911,49 +950,54 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     caption = update.message.caption or ""
     media_group_id = update.message.media_group_id
 
+    # GH #65 review r3 P2-4: see photo_handler — a payload that resolves BOUND
+    # after the download race must carry EXACTLY ONE quote block.
+    reply_context_applied = False
+    has_reply_ctx = False
     if wid is None:
-        # GH #66: stash into THIS thread's picker entry — no cross-thread
-        # displacement of any other topic's in-flight picker.
-        entry = ensure_picker_entry(context.user_data, thread_id)
-        if entry is not None:
-            # §2.5: render reply-context before stashing an unbound-topic
-            # caption so the later picker flush preserves the same quote block
-            # as the bound aggregator path below. Keep the same media-group
-            # guard as the bound path to avoid duplicate quote blocks for
-            # non-caption-bearing album items.
-            has_reply_ctx = False
-            if caption or media_group_id is None:
-                caption, has_reply_ctx = await _apply_reply_context(
-                    update.message, user.id, thread_id, caption
-                )
-            pending_attachments = entry.setdefault("_pending_thread_attachments", [])
-            pending_attachments.append(
+        # §2.5: render reply-context before stashing an unbound-topic caption
+        # so the later picker flush preserves the same quote block as the bound
+        # aggregator path below. Keep the same media-group guard as the bound
+        # path to avoid duplicate quote blocks for non-caption-bearing items.
+        reply_context_applied = True
+        if caption or media_group_id is None:
+            caption, has_reply_ctx = await _apply_reply_context(
+                update.message, user.id, thread_id, caption
+            )
+
+        def _stash_document(entry: dict[str, Any]) -> None:
+            entry.setdefault("_pending_thread_attachments", []).append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
                 )
             )
 
-            if entry.get(STATE_KEY) in (
-                STATE_BROWSING_DIRECTORY,
-                STATE_SELECTING_WINDOW,
-                STATE_SELECTING_SESSION,
-            ):
-                return
-
-        unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
-        start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(
-            start_path, unbound_count=unbound_count
+        # GH #65 Fix 5 (+ review r1 P1-2): one critical section for the
+        # decision AND the mutation, with the browser built before it.
+        decision = await trust_flow.claim_unbound_inbound(
+            user.id,
+            thread_id,
+            context.user_data,
+            session_manager,
+            build_browser=_build_browser_payload,
+            stash=_stash_document,
         )
-        if entry is not None:
-            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            entry[BROWSE_PATH_KEY] = start_path
-            entry[BROWSE_PAGE_KEY] = 0
-            entry[BROWSE_DIRS_KEY] = subdirs
-            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
-        sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
-        _remember_picker_card(entry, sent)
-        return
+        if decision.kind == "trust_owned":
+            await safe_reply(update.message, trust_flow.TRUST_NUDGE)
+            return
+        if decision.kind == "picker_owned":
+            return
+        if decision.kind == "browser":
+            assert decision.browser is not None
+            sent = await safe_reply(
+                update.message,
+                decision.browser.text,
+                reply_markup=decision.browser.keyboard,
+            )
+            _remember_picker_card(decision.entry, sent)
+            return
+        assert decision.window_id is not None
+        wid = decision.window_id
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
@@ -1000,11 +1044,11 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     set_route_last_user_message(user.id, thread_id, wid, update.message.message_id)
 
     # §2.5: see photo_handler for the media-group caption-skip rationale.
-    has_reply_ctx = False
-    if caption or media_group_id is None:
-        caption, has_reply_ctx = await _apply_reply_context(
-            update.message, user.id, thread_id, caption
-        )
+    if not reply_context_applied:
+        if caption or media_group_id is None:
+            caption, has_reply_ctx = await _apply_reply_context(
+                update.message, user.id, thread_id, caption
+            )
 
     route = (user.id, thread_id, wid)
     await aggregator_offer_document(
@@ -1162,57 +1206,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         update.message, user.id, thread_id, text
     )
 
-    # GH #66: text arriving while THIS thread is mid-picker is a no-op nudge —
-    # the picker owns the topic until it commits or cancels. State lives in the
-    # thread's own picker entry, so a picker in another topic is untouched (no
-    # cross-thread stale-clearing is needed or possible under per-thread keying).
-    _entry = picker_entry(context.user_data, thread_id)
-    if _entry is not None:
-        _picker_state = _entry.get(STATE_KEY)
-        if _picker_state == STATE_SELECTING_WINDOW:
-            await safe_reply(
-                update.message,
-                "Please use the window picker above, or tap Cancel.",
-            )
-            return
-        if _picker_state == STATE_BROWSING_DIRECTORY:
-            await safe_reply(
-                update.message,
-                "Please use the directory browser above, or tap Cancel.",
-            )
-            return
-        if _picker_state == STATE_SELECTING_SESSION:
-            await safe_reply(
-                update.message,
-                "Please use the session picker above, or tap Cancel.",
-            )
-            return
-
     if wid is None:
-        # Unbound topic — always show the directory browser. If unbound
-        # tmux windows exist, the browser includes a "🖥 Bind existing
-        # window" opt-in row that pivots to the window picker. We never
-        # auto-default to an existing window's cwd, since that locks the
-        # user into a directory they didn't choose.
-        unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
-        logger.info(
-            "Unbound topic: showing directory browser (user=%d, thread=%d, unbound=%d)",
-            user.id,
-            thread_id,
-            unbound_count,
-        )
-        start_path = str(config.browse_root)
-        msg_text, keyboard, subdirs = build_directory_browser(
-            start_path, unbound_count=unbound_count
-        )
-        # GH #66: stash into THIS thread's picker entry.
-        entry = ensure_picker_entry(context.user_data, thread_id)
-        if entry is not None:
-            entry[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            entry[BROWSE_PATH_KEY] = start_path
-            entry[BROWSE_PAGE_KEY] = 0
-            entry[BROWSE_DIRS_KEY] = subdirs
-            entry[BROWSE_UNBOUND_COUNT_KEY] = unbound_count
+
+        def _stash_text(entry: dict[str, Any]) -> None:
             entry["_pending_thread_text"] = text
             # Carry the OBSERVED provenance across the stash so the pending-bind
             # replay is classified the same way a live offer would be
@@ -1221,9 +1217,63 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "typed_text": True,
                 "reply_context": has_reply_ctx,
             }
-        sent = await safe_reply(update.message, msg_text, reply_markup=keyboard)
-        _remember_picker_card(entry, sent)
-        return
+
+        # GH #65 Fix 5 (+ review r1 P1-2): ``_apply_reply_context`` above and the
+        # browser build below are AWAITS a binding or a creation flow can
+        # complete inside, so the ownership read and the mutation it authorizes
+        # share ONE critical section. This SUBSUMES the pre-#65 mid-picker nudge
+        # block that used to run here: reading a DETACHED entry after the
+        # reply-context await could nudge (and DISCARD the payload) for a topic
+        # whose binding had just landed. A binding now always wins — the payload
+        # is delivered — and a live picker still gets its own state-specific
+        # nudge. ``stash_on_picker=False`` keeps the pre-#65 behavior that a text
+        # message arriving mid-picker is a nudge, not a stash.
+        decision = await trust_flow.claim_unbound_inbound(
+            user.id,
+            thread_id,
+            context.user_data,
+            session_manager,
+            build_browser=_build_browser_payload,
+            stash=_stash_text,
+            stash_on_picker=False,
+        )
+        if decision.kind == "trust_owned":
+            await safe_reply(update.message, trust_flow.TRUST_NUDGE)
+            return
+        if decision.kind == "picker_owned":
+            await safe_reply(
+                update.message,
+                trust_flow.PICKER_NUDGES.get(
+                    decision.picker_state or "",
+                    "Please use the picker above, or tap Cancel.",
+                ),
+            )
+            return
+        if decision.kind == "browser":
+            # Unbound topic — always the directory browser. If unbound tmux
+            # windows exist it includes a "🖥 Bind existing window" opt-in row
+            # that pivots to the window picker. We never auto-default to an
+            # existing window's cwd, since that locks the user into a directory
+            # they didn't choose. The entry was claimed under the lock.
+            assert decision.browser is not None
+            logger.info(
+                "Unbound topic: showing directory browser "
+                "(user=%d, thread=%d, unbound=%d)",
+                user.id,
+                thread_id,
+                decision.browser.unbound_count,
+            )
+            sent = await safe_reply(
+                update.message,
+                decision.browser.text,
+                reply_markup=decision.browser.keyboard,
+            )
+            _remember_picker_card(decision.entry, sent)
+            return
+        # The binding appeared while we resolved reply-context / built the
+        # browser: deliver THIS payload through the normal bound path below.
+        assert decision.window_id is not None
+        wid = decision.window_id
 
     # Bound topic — forward to bound window
     w = await tmux_manager.find_window_by_id(wid)
@@ -1358,74 +1408,19 @@ async def _cleanup_unbound_created_window(
     *,
     reason: str = "SessionStart hook timeout",
 ) -> bool:
-    """Best-effort kill of a newly-created window that should not be bound."""
-    if not window_id:
-        logger.error(
-            "Cannot clean up unbound tmux window '%s' after %s because no "
-            "window_id was returned",
-            window_name,
-            reason,
-        )
-        return False
-    # GH #63 §2b (Codex Q1): NEVER kill a window that holds a live/won session.
-    # The bring-up ordering is register(session_map) → pending-owner recheck →
-    # BIND, so a WINNER can be REGISTERED and already running a live Claude in
-    # its pane during the gap BEFORE it is bound. Spare on EITHER proof:
-    #   - BOUND: it appears in the authoritative ``thread_bindings`` (the same
-    #     source ``clear_topic_state`` consults), OR
-    #   - REGISTERED: ``peek_session_id_for_window`` is non-None — SessionStart
-    #     fired, so a live Claude owns the pane and killing it is the exact §2b
-    #     destruction.
-    # Both are read SYNCHRONOUSLY immediately before the kill, so no ``await``
-    # interleaves between this ownership decision and the tmux call. A bare peek
-    # was rejected earlier because "registered" cannot distinguish a winner from
-    # a superseded loser — so this guard deliberately takes the SAFE direction:
-    # it may SPARE a registered-but-superseded LOSER (leaking that unbound tmux
-    # window — a rare, minor resource leak a future janitor could reap) in order
-    # to NEVER kill a registered WINNER (a live session, the actual §2b bug). The
-    # loser-leak is an ACCEPTED residual; reaping it is out of scope here (there
-    # is no clean, atomic way to tell a registered loser from a registered winner
-    # — that is precisely why the bare peek was rejected).
-    is_bound = window_id in {
-        wid for _, _, wid in session_manager.iter_thread_bindings()
-    }
-    is_registered = peek_session_id_for_window(window_id) is not None
-    if is_bound or is_registered:
-        logger.warning(
-            "Skipping cleanup of tmux window %s (%s) after %s: it holds a %s "
-            "session (won or live) — not collateral",
-            window_id,
-            window_name,
-            reason,
-            "bound" if is_bound else "registered",
-        )
-        return True
-    try:
-        killed = await tmux_mgr.kill_window(window_id)
-    except Exception as e:  # pragma: no cover - tmux_manager normally swallows errors
-        logger.error(
-            "Failed to clean up unbound tmux window %s (%s) after %s: %s",
-            window_id,
-            window_name,
-            reason,
-            e,
-        )
-        return False
-    if killed:
-        logger.warning(
-            "Cleaned up unbound tmux window %s (%s) after %s",
-            window_id,
-            window_name,
-            reason,
-        )
-        return True
-    logger.error(
-        "Could not clean up unbound tmux window %s (%s) after %s",
-        window_id,
-        window_name,
-        reason,
+    """Best-effort kill of a newly-created window that should not be bound.
+
+    GH #65 Fix 4: the arbitration itself now lives in
+    ``trust_flow.cleanup_created_window`` with a TYPED outcome
+    (``killed | spared_bound | spared_registered | kill_failed``) and a declared
+    linearization point (the FRESH session-map read). This wrapper preserves the
+    pre-#65 ``bool`` contract for every existing caller byte-for-byte: True for
+    a kill or either SPARE, False only when the kill itself failed.
+    """
+    outcome = await trust_flow.cleanup_created_window(
+        window_id, window_name, tmux_mgr, reason=reason
     )
-    return False
+    return outcome is not trust_flow.CleanupOutcome.KILL_FAILED
 
 
 async def _abort_created_window_after_pending_owner_change(
@@ -1440,6 +1435,11 @@ async def _abort_created_window_after_pending_owner_change(
     resume_session_id: str | None,
 ) -> None:
     """Surface a stale picker after a window was created but before binding."""
+    # THE RESERVATION IS HELD ACROSS THE CLEANUP (review r14 P1-E). Releasing it
+    # here — before the guarded cleanup below has settled — exposed the window
+    # for adoption DURING that cleanup, and the cleanup's own kill then landed
+    # on whoever had just taken it. It is released after the cleanup instead, so
+    # a release is always coupled to a SETTLED disposition.
     logger.warning(
         "Pending owner changed before binding created window %s "
         "(user=%d, callback_thread=%d, owner_still_present=%s)",
@@ -1469,6 +1469,10 @@ async def _abort_created_window_after_pending_owner_change(
         show_alert = not cleanup_ok
     else:
         cleanup_note = " The resumed tmux window was left unbound."
+
+    # The disposition has now SETTLED (killed, or deliberately left unbound on
+    # the resume path), so the reservation may finally be freed.
+    trust_flow.release_window_reservation(created_wid)
 
     await safe_edit(
         query,
@@ -1509,10 +1513,52 @@ async def _create_and_bind_window(
         await safe_answer(query, "Stale picker", show_alert=True)
         return
 
-    success, message, created_wname, created_wid = await tmux_mgr.create_window(
-        selected_path, resume_session_id=resume_session_id
+    # GH #65 review r2 P1-A: capture the picker entry's IDENTITY TOKEN before
+    # anything is created. ``start_trust_wait`` re-validates it under the
+    # creation lock, so a teardown that clears this entry (and with it the
+    # token) while the window is being created makes the install ABORT rather
+    # than land on a replacement entry a fresh inbound may have created.
+    creation_entry_token = entry_token(context.user_data, pending_thread_id)
+
+    # GH #65: the creation-flow trust lane covers NON-RESUME creation ONLY. The
+    # resume path keeps today's manual-association fallback byte-identical (its
+    # 15s timeout, its window_state override, its messaging) — pinned by a
+    # resume-timeout parity test. ``lane_enabled()`` is False when
+    # ``CC_TELEGRAM_TRUST_PROMPT_CEILING_S=0`` disables the lane, which also
+    # restores the pre-#65 path exactly.
+    use_trust_lane = (
+        resume_session_id is None
+        and pending_thread_id is not None
+        and trust_flow.lane_enabled()
     )
+    success, message, created_wname, created_wid = await tmux_mgr.create_window(
+        selected_path,
+        resume_session_id=resume_session_id,
+        defer_launch=use_trust_lane,
+    )
+    if not success and created_wid:
+        # CREATED-BUT-UNVERIFIED (review r14 P1-C): the window EXISTS even though
+        # creation reported failure, so it must be SETTLED rather than lost. It
+        # is reserved first — nothing may adopt it while we clean — and the
+        # reservation is released only once the guarded cleanup has settled.
+        trust_flow.reserve_window(created_wid, creation_entry_token)
+        try:
+            await trust_flow.cleanup_created_window(
+                created_wid,
+                created_wname,
+                tmux_mgr,
+                reason="creation could not be verified",
+                session_mgr=session_mgr,
+            )
+        finally:
+            trust_flow.release_window_reservation(created_wid)
+
     if success:
+        # OWNERSHIP BEGINS AT CREATION (GH #65 review r13 P1-C). Registered
+        # BEFORE any probe or Telegram await, so the window is never offered as
+        # "unbound" during the interval between creation and flow install.
+        # Keyed by the entry token, so it dies with the entry.
+        trust_flow.reserve_window(created_wid, creation_entry_token)
         logger.info(
             "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s)",
             created_wname,
@@ -1522,20 +1568,135 @@ async def _create_and_bind_window(
             pending_thread_id,
             resume_session_id,
         )
-        if pending_thread_id is not None and not _pending_owner_matches(
-            context.user_data, pending_thread_id
-        ):
-            await _abort_created_window_after_pending_owner_change(
-                query,
-                user_data=context.user_data,
-                user_id=user.id,
-                pending_thread_id=pending_thread_id,
-                tmux_mgr=tmux_mgr,
-                created_wid=created_wid,
-                created_wname=created_wname,
-                resume_session_id=resume_session_id,
-            )
-            return
+        # THE FIRST POST-RESERVATION OWNER CHECK IS INSIDE THE PROTECTED
+        # REGION (review r15 P2-A). It sat BEFORE the ``try``, so a raise or a
+        # cancellation in it — or in the abort helper it awaits — left the
+        # reservation with no cleanup owner, which is the very gap the
+        # try/finally exists to close. It is now the first thing the protected
+        # region does.
+        if use_trust_lane:
+            # THE WHOLE PRE-FLOW PHASE IS COVERED (review r14 P2). Between here
+            # and the flow install there are a version probe, a launch and two
+            # Telegram edits — any of which can raise or be cancelled. Every
+            # NAMED exit already settles the window, but an UNNAMED one (a crash,
+            # a cancellation) left the reservation with no cleanup owner: a later
+            # ``/start`` would eventually free it, but nothing knew to settle the
+            # WINDOW itself. This makes the invariant unconditional — on any exit
+            # that did NOT install the flow, run the guarded cleanup and only
+            # THEN release the reservation, so a release is always coupled to a
+            # settled disposition.
+            disposition_settled = False
+            try:
+                if pending_thread_id is not None and not _pending_owner_matches(
+                    context.user_data, pending_thread_id
+                ):
+                    await _abort_created_window_after_pending_owner_change(
+                        query,
+                        user_data=context.user_data,
+                        user_id=user.id,
+                        pending_thread_id=pending_thread_id,
+                        tmux_mgr=tmux_mgr,
+                        created_wid=created_wid,
+                        created_wname=created_wname,
+                        resume_session_id=resume_session_id,
+                    )
+                    disposition_settled = True
+                    return
+                # GH #65 Fix 0: the window was created in launch-deferred mode, so
+                # the pane is a fresh interactive shell. Probe ITS OWN CLI version
+                # (nonce-delimited, shell-resolution parity, positive
+                # ``(Claude Code)`` proof) and then ALWAYS launch — a probe failure
+                # only makes the trust card display-only, it never blocks a launch.
+                cli_version = await trust_flow.probe_version_and_launch(
+                    created_wid, tmux_mgr
+                )
+                assert pending_thread_id is not None
+                if not _pending_owner_matches(context.user_data, pending_thread_id):
+                    await _abort_created_window_after_pending_owner_change(
+                        query,
+                        user_data=context.user_data,
+                        user_id=user.id,
+                        pending_thread_id=pending_thread_id,
+                        tmux_mgr=tmux_mgr,
+                        created_wid=created_wid,
+                        created_wname=created_wname,
+                        resume_session_id=resume_session_id,
+                    )
+                    # AFTER the helper returned (review r15 P2-A). Setting it
+                    # BEFORE the await meant a cancellation INSIDE the helper
+                    # skipped the ``finally``'s recovery — the flag claimed a
+                    # settlement that had not happened yet.
+                    disposition_settled = True
+                    return
+                # GH #65 Fix 3: answer the callback + edit the card BEFORE the wait.
+                # The ENTIRE wait (including the first hook-timeout phase) runs in
+                # the spawned task, which captures stable primitives only — never
+                # the CallbackQuery / CallbackContext objects.
+                await safe_edit(query, f"🚀 {message}\n\nStarting Claude…")
+                await safe_answer(query, "Created")
+                card = getattr(query, "message", None)
+                flow = await trust_flow.start_trust_wait(
+                    bot=context.bot,
+                    user_id=user.id,
+                    thread_id=pending_thread_id,
+                    chat_id=session_mgr.resolve_chat_id(user.id, pending_thread_id),
+                    user_data=context.user_data,
+                    entry_token=creation_entry_token,
+                    card_chat_id=getattr(card, "chat_id", None),
+                    card_msg_id=getattr(card, "message_id", None),
+                    created_wid=created_wid,
+                    window_name=created_wname,
+                    selected_path=selected_path,
+                    create_message=message,
+                    cli_version=cli_version,
+                    tmux_mgr=tmux_mgr,
+                    session_mgr=session_mgr,
+                )
+                if flow is None:
+                    # GH #65 review r1 P1-1: the topic stopped being claimable
+                    # inside the two Telegram awaits above (a concurrent /start or
+                    # topic close). Installing an ownerless flow would leave it
+                    # UNREACHABLE, so abort through the guarded cleanup instead.
+                    await _abort_created_window_after_pending_owner_change(
+                        query,
+                        user_data=context.user_data,
+                        user_id=user.id,
+                        pending_thread_id=pending_thread_id,
+                        tmux_mgr=tmux_mgr,
+                        created_wid=created_wid,
+                        created_wname=created_wname,
+                        resume_session_id=resume_session_id,
+                    )
+                    # AFTER the helper returned (review r15 P2-A) — it settles
+                    # the window and releases the reservation itself.
+                    disposition_settled = True
+                else:
+                    # The flow OWNS the window now; ownership passed from the
+                    # reservation to the flow record inside ``start_trust_wait``.
+                    disposition_settled = True
+                return
+            finally:
+                if not disposition_settled:
+                    # Best effort, and it must never mask the original failure.
+                    try:
+                        await trust_flow.cleanup_created_window(
+                            created_wid,
+                            created_wname,
+                            tmux_mgr,
+                            reason="creation flow ended before the flow installed",
+                            session_mgr=session_mgr,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "pre-flow cleanup failed for window %s", created_wid
+                        )
+                    finally:
+                        # The disposition has settled (or we tried and failed and
+                        # logged it); either way the reservation must not outlive
+                        # this phase with nobody owning it.
+                        trust_flow.release_window_reservation(created_wid)
 
         # Wait for Claude Code's SessionStart hook to register in session_map.
         # Resume sessions take longer to start (loading session state), so use
@@ -1709,10 +1870,98 @@ async def _create_and_bind_window(
                 )
                 return
 
-            # Thread bind flow: bind thread to newly created window
-            session_mgr.bind_thread(
-                user.id, pending_thread_id, created_wid, window_name=created_wname
-            )
+            # Thread bind flow: bind thread to newly created window.
+            #
+            # THE THIRD ADOPTION SEAM (GH #65 review r13 P1-C). This is the
+            # pre-#65 legacy path — the resume flow, and any creation with the
+            # trust lane disabled — and it bound with NO lifecycle lock, no
+            # fresh existence probe and no exclusivity check, across a hook wait
+            # of many seconds. It now runs the SAME revalidate→commit protocol
+            # as the other two seams. User-visible messaging on the success path
+            # is unchanged (the resume-parity pin stays green); only the new
+            # refusal arm is added.
+            bind_refusal: str | None = None
+            try:
+                async with tmux_mgr.window_lifecycle_lock():
+                    # ABSENCE MUST BE PROVEN, NOT INFERRED — the same rule the
+                    # create-verification uses (review r11 P1-A). A bare None
+                    # also means "the listing failed", and refusing on that
+                    # would break the legacy path whenever enumeration hiccups.
+                    # Only a listing that WORKED and lacks our window proves it
+                    # is gone.
+                    # FRESH (review r14 P1-F). ``list_windows`` reads the 1 s
+                    # cache, and this path's own creation-verification warms it
+                    # — so a window killed right afterwards stayed "present" for
+                    # the rest of the TTL and the legacy seam bound a corpse.
+                    # Every adoption probe must bypass the cache.
+                    listed = await tmux_mgr._bounded_lifecycle(
+                        tmux_mgr.adoption_listing(),
+                        what="legacy bind existence probe",
+                    )
+                    proven_absent = bool(listed) and not any(
+                        w.window_id == created_wid for w in listed
+                    )
+                    if proven_absent:
+                        bind_refusal = (
+                            "The new window disappeared before it could be "
+                            "bound. Please try again."
+                        )
+                    # The pending check runs AFTER the listing (review r15 P1-A):
+                    # a kill that registered while we were listing must refuse,
+                    # and checking before the read would miss it.
+                    elif tmux_mgr.window_kill_pending(created_wid):
+                        bind_refusal = (
+                            "That window is being closed right now. Please try "
+                            "again in a moment."
+                        )
+                    else:
+                        taken_by = [
+                            (uid, tid)
+                            for uid, tid, wid in session_mgr.iter_thread_bindings()
+                            if wid == created_wid
+                            and (uid, tid) != (user.id, pending_thread_id)
+                        ]
+                        if taken_by:
+                            bind_refusal = (
+                                "Another topic just claimed that window. Please "
+                                "try again."
+                            )
+                        else:
+                            session_mgr.bind_thread(
+                                user.id,
+                                pending_thread_id,
+                                created_wid,
+                                window_name=created_wname,
+                            )
+            except LifecycleTimeout as e:
+                logger.error("legacy bind exceeded its lifecycle bound: %s", e)
+                bind_refusal = (
+                    "Binding the window took too long. Please check tmux and try again."
+                )
+            if bind_refusal is not None:
+                # SETTLE BEFORE RELEASING (r14 self-audit, same class as P1-E).
+                # The bind did NOT happen, so the window is alive and unowned —
+                # releasing the reservation here without settling it would leave
+                # exactly the orphan the reservation exists to prevent. The
+                # guarded cleanup is the right seam: if the refusal was "another
+                # topic claimed it", that topic's binding makes this a
+                # SPARED_BOUND and the window is correctly left alone.
+                try:
+                    await trust_flow.cleanup_created_window(
+                        created_wid,
+                        created_wname,
+                        tmux_mgr,
+                        reason="legacy bind refused",
+                        session_mgr=session_mgr,
+                    )
+                finally:
+                    trust_flow.release_window_reservation(created_wid)
+                await safe_edit(query, f"⚠️ {bind_refusal}")
+                await safe_answer(query, "Could not bind the window", show_alert=True)
+                return
+            # BOUND is itself a settled disposition — the flow's window now has
+            # a real owner, so the reservation has done its job.
+            trust_flow.release_window_reservation(created_wid)
 
             status = "Resumed" if resume_session_id else "Created"
 

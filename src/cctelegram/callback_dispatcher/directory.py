@@ -15,6 +15,7 @@ from typing import Any
 
 import logging
 from pathlib import Path
+from cctelegram.tmux_manager import LifecycleTimeout
 from cctelegram.handlers.callback_data import (
     CB_DIR_BIND_EXISTING,
     CB_DIR_CANCEL,
@@ -412,11 +413,115 @@ async def execute_directory_callback(authorized: Any, adapters: Any) -> None:
             await safe_answer(query)
             return
 
-        display = w.window_name
-        clear_window_picker_state(_entry())
-        session_manager.bind_thread(
-            user.id, thread_id, selected_wid, window_name=display
-        )
+        # THE ADOPTION GATE (GH #65 review r10 P1-B). Binding a topic to an
+        # EXISTING window is an adoption: a kill still in flight for that id
+        # (its async wrapper cancelled, its libtmux worker thread very much
+        # alive) would otherwise land on the window we just handed the user.
+        # Refuse while the kill can still fire — a window nobody has adopted is
+        # the only thing a straggler is allowed to kill.
+        if not await tmux_manager.await_kill_settled(selected_wid):
+            await safe_edit(
+                query,
+                "⚠️ That window is being closed right now. Please pick again in "
+                "a moment.",
+                reply_markup=None,
+            )
+            await safe_answer(query)
+            return
+
+        # EVERY PRECONDITION IS RE-VALIDATED AFTER THE WAIT (review r11 P1-B).
+        # The checks above ran BEFORE a wait that can last seconds, and all of
+        # them can go stale inside it: the window can die, another topic can
+        # claim it, and the picker entry can be replaced. Binding the object we
+        # resolved before the wait is binding a stale observation.
+        #
+        # REVALIDATE → COMMIT UNDER THE LIFECYCLE LOCK (review r12 P1-A), so no
+        # kill can REGISTER between the last check and the bind. The lock is
+        # INNERMOST: no Telegram I/O runs inside it, so each arm records a
+        # refusal and the reply is sent AFTER the hold is released. The bind
+        # itself is a synchronous dict write.
+        refusal: str | None = None
+        expired = False
+        display = session_manager.get_display_name(selected_wid)
+        try:
+            async with tmux_manager.window_lifecycle_lock():
+                # FRESH (review r12 P1-B): the 1 s listing cache can be a full
+                # second behind a landed kill, which is exactly the corpse this
+                # probe exists to catch. BOUNDED (review r13 P1-B): no tmux await
+                # under this lock may be unbounded, or one wedged call freezes every
+                # other window's lifecycle.
+                # DIRECT, UNCACHED (review r16): adoption decisions never
+                # consult the TTL cache, so no unrelated invalidation can affect
+                # this answer and all three seams read tmux the same way.
+                listed = await tmux_manager._bounded_lifecycle(
+                    tmux_manager.adoption_listing(),
+                    what="bind-to-existing existence probe",
+                )
+                w = next((win for win in listed if win.window_id == selected_wid), None)
+                if not w:
+                    refusal = (
+                        f"Window '{session_manager.get_display_name(selected_wid)}' "
+                        "no longer exists"
+                    )
+                elif tmux_manager.window_kill_pending(selected_wid):
+                    refusal = "That window is being closed right now, please retry"
+                else:
+                    current_unbound_ids = {
+                        wid
+                        for wid, _, _ in await tmux_manager._bounded_lifecycle(
+                            _list_unbound_windows(
+                                adapters.tmux_manager,
+                                adapters.session_manager,
+                                # The DIRECT listing already read above — no
+                                # adoption decision touches the cache (r16).
+                                listing=listed,
+                            ),
+                            # BOUNDED even though it cannot block (r17
+                            # self-audit): given a listing it is a pure filter,
+                            # but "every await under the hold is bounded" is
+                            # only useful as an ABSOLUTE rule — an exception
+                            # people have to remember is one they will forget.
+                            what="bind-to-existing unbound filter",
+                        )
+                    }
+                    if selected_wid not in current_unbound_ids:
+                        refusal = "Window is no longer unbound, please retry"
+                    elif tmux_manager.window_kill_pending(selected_wid):
+                        # RE-CHECKED AFTER the listings too (review r15 P1-A): a
+                        # kill that REGISTERED while we were reading must refuse,
+                        # and the check above ran before those reads.
+                        refusal = "That window is being closed right now, please retry"
+                    else:
+                        ok, _pending_tid, _reason = _validate_pending_picker_callback(
+                            context.user_data,
+                            cb_thread_id,
+                            (STATE_SELECTING_WINDOW,),
+                        )
+                        if not ok:
+                            expired = True
+                        else:
+                            display = w.window_name
+                            clear_window_picker_state(_entry())
+                            session_manager.bind_thread(
+                                user.id, thread_id, selected_wid, window_name=display
+                            )
+
+        except LifecycleTimeout as e:
+            logger.error("bind-to-existing exceeded its lifecycle bound: %s", e)
+            await safe_answer(
+                query,
+                "That took too long — please check tmux and try again",
+                show_alert=True,
+            )
+            return
+
+        if expired:
+            await safe_edit(query, PICKER_EXPIRED_TEXT, reply_markup=None)
+            await safe_answer(query)
+            return
+        if refusal is not None:
+            await safe_answer(query, refusal, show_alert=True)
+            return
 
         # Replay pending text and/or attachments through the synchronous
         # aggregator helper so §2.8.2 formatting is preserved without

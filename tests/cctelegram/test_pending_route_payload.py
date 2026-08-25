@@ -8,6 +8,7 @@ must be rejected without acting on or deleting the active pending owner.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -49,6 +50,21 @@ from cctelegram.handlers.directory_browser import (
     ensure_picker_entry,
     picker_entry,
 )
+
+
+@pytest.fixture(autouse=True)
+def _trust_lane_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GH #65: pin this module to the LANE-DISABLED creation path.
+
+    ``CC_TELEGRAM_TRUST_PROMPT_CEILING_S=0`` turns the folder-trust creation
+    lane off, restoring the pre-#65 inline wait-then-kill flow byte-for-byte —
+    which is exactly the flow these pending-payload regressions pin, and which
+    still ships as the lane's documented kill-switch degradation. The lane's own
+    creation path (launch-deferred create, in-pane version probe, classifying
+    WAIT task, trust card) is covered by ``tests/cctelegram/test_trust_flow.py``
+    and ``tests/scenarios/test_trust_card_flow.py``.
+    """
+    monkeypatch.setattr(inbound_module.config, "trust_prompt_ceiling_s", 0.0)
 
 
 @contextmanager
@@ -109,6 +125,26 @@ def _patch_both(name: str, *args, **kwargs) -> Iterator[object]:
                 if result is None:
                     result = module_result
         yield result
+
+
+def _completed_kill(_window_id: str) -> "asyncio.Future[bool]":
+    """A ``begin_kill_locked`` stand-in.
+
+    GH #65 r14: the guarded cleanup kills in TWO phases — dispatch under the
+    lifecycle lock, await outside it — so the interception point is the
+    synchronous ``begin_kill_locked``, which hands back a future that
+    ``finish_kill`` awaits.
+    """
+    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+    fut.set_result(True)
+    return fut
+
+
+def _failed_kill(_window_id: str) -> "asyncio.Future[bool]":
+    """A ``begin_kill_locked`` stand-in whose kill REPORTS FAILURE."""
+    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+    fut.set_result(False)
+    return fut
 
 
 def _attachment(path: Path) -> bot_module.PendingAttachment:
@@ -247,7 +283,7 @@ async def test_topic_close_bound_matching_pending_attachments_deletes_and_clears
         await bot_module.topic_closed_handler(update, context)
 
     mock_find.assert_awaited_once_with("@0")
-    mock_kill.assert_awaited_once_with("@0")
+    mock_kill.assert_called_once_with("@0")
     mock_unbind.assert_called_once_with(1, 10)
     mock_clear.assert_awaited_once_with(1, 10, context.bot, context.user_data)
     assert not payload.exists()
@@ -333,9 +369,8 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
         ) as wait_for_map,
         patch.object(
             bot_module.tmux_manager,
-            "kill_window",
-            new_callable=AsyncMock,
-            return_value=True,
+            "begin_kill_locked",
+            new=MagicMock(side_effect=_completed_kill),
         ) as kill_window,
         patch.object(
             bot_module.session_manager, "get_window_state"
@@ -355,7 +390,7 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
         )
 
     wait_for_map.assert_awaited_once_with("@42", timeout=5.0)
-    kill_window.assert_awaited_once_with("@42")
+    kill_window.assert_called_once_with("@42")
     get_window_state.assert_not_called()
     bind_thread.assert_not_called()
     safe_edit.assert_awaited_once()
@@ -459,9 +494,8 @@ async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
         ),
         patch.object(
             bot_module.tmux_manager,
-            "kill_window",
-            new_callable=AsyncMock,
-            return_value=False,
+            "begin_kill_locked",
+            new=MagicMock(side_effect=_failed_kill),
         ) as kill_window,
         patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
         _patch_both("safe_edit", new_callable=AsyncMock) as safe_edit,
@@ -477,7 +511,7 @@ async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
             session_mgr=bot_module.session_manager,
         )
 
-    kill_window.assert_awaited_once_with("@43")
+    kill_window.assert_called_once_with("@43")
     bind_thread.assert_not_called()
     safe_edit.assert_awaited_once()
     edited_text = safe_edit.await_args.args[1]
@@ -512,8 +546,8 @@ async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_windo
         ) as wait_for_map,
         patch.object(
             bot_module.tmux_manager,
-            "kill_window",
-            new_callable=AsyncMock,
+            "begin_kill_locked",
+            new=MagicMock(side_effect=_completed_kill),
         ) as kill_window,
         patch.object(
             bot_module.session_manager,
@@ -542,7 +576,7 @@ async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_windo
         )
 
     wait_for_map.assert_awaited_once_with("@44", timeout=15.0)
-    kill_window.assert_not_awaited()
+    kill_window.assert_not_called()
     assert window_state.session_id == "resume-123"
     assert window_state.cwd == "/repo"
     assert window_state.window_name == "repo"
@@ -1276,9 +1310,8 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
         ),
         patch.object(
             bot_module.tmux_manager,
-            "kill_window",
-            new_callable=AsyncMock,
-            return_value=True,
+            "begin_kill_locked",
+            new=MagicMock(side_effect=_completed_kill),
         ) as mock_kill,
         patch.object(
             bot_module.session_manager, "get_window_state"
@@ -1297,7 +1330,7 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
             session_mgr=bot_module.session_manager,
         )
 
-    mock_kill.assert_awaited_once_with("@10")
+    mock_kill.assert_called_once_with("@10")
     get_window_state.assert_not_called()
     mock_bind.assert_not_called()
     mock_replay.assert_not_called()
@@ -1346,6 +1379,12 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
             "find_window_by_id",
             new_callable=AsyncMock,
             return_value=window,
+        ),
+        patch.object(
+            bot_module.tmux_manager,
+            "adoption_listing",
+            new_callable=AsyncMock,
+            return_value=[window],
         ),
         _patch_both(
             "_list_unbound_windows",
@@ -1520,6 +1559,12 @@ async def test_existing_window_bind_pending_flush_failure_is_explicit_and_cleans
             new_callable=AsyncMock,
             return_value=window,
         ),
+        patch.object(
+            bot_module.tmux_manager,
+            "adoption_listing",
+            new_callable=AsyncMock,
+            return_value=[window],
+        ),
         _patch_both(
             "_list_unbound_windows",
             new_callable=AsyncMock,
@@ -1583,6 +1628,12 @@ async def test_existing_window_bind_pending_flush_success_remains_normal(
             "find_window_by_id",
             new_callable=AsyncMock,
             return_value=window,
+        ),
+        patch.object(
+            bot_module.tmux_manager,
+            "adoption_listing",
+            new_callable=AsyncMock,
+            return_value=[window],
         ),
         _patch_both(
             "_list_unbound_windows",
@@ -1686,3 +1737,151 @@ async def test_pending_replay_STOPS_at_the_first_refused_split(
     assert str(paths[2]) not in first_send
     assert picker_entry(context.user_data, 10) is None
     assert all(not path.exists() for path in paths)
+
+
+@pytest.mark.asyncio
+async def test_directory_door_refuses_when_its_adoption_listing_times_out(
+    tmp_path: Path,
+) -> None:
+    """GH #65 r17 P2-B — fault injection at the DIRECTORY adoption door.
+
+    Driven through ``callback_handler`` so the seam's own error handling is
+    what runs. The wave-16 version was two substring checks, which could not
+    have caught a door that failed to handle the fault at all.
+
+    ``LifecycleTimeout`` is the only typed failure the adoption path can raise
+    now that the listing is direct, so it is the one to inject.
+    """
+    from cctelegram.tmux_manager import LifecycleTimeout
+
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"data")
+    context = MagicMock()
+    context.user_data = _pending_user_data(payload, thread_id=10)
+    picker_entry(context.user_data, 10).update(
+        {STATE_KEY: STATE_SELECTING_WINDOW, UNBOUND_WINDOWS_KEY: ["@0"]}
+    )
+    update = _make_callback_update(f"{CB_WIN_BIND}0", thread_id=10)
+    window = MagicMock()
+    window.window_id = "@0"
+    window.window_name = "existing-window"
+
+    async def _times_out(coro, *, what: str, **kwargs):
+        del kwargs
+        coro.close()
+        raise LifecycleTimeout(f"injected at {what}")
+
+    with (
+        _patch_both("is_user_allowed", return_value=True),
+        patch.object(bot_module.session_manager, "set_group_chat_id"),
+        patch.object(bot_module.session_manager, "bind_thread") as mock_bind,
+        patch.object(
+            bot_module.tmux_manager,
+            "find_window_by_id",
+            new_callable=AsyncMock,
+            return_value=window,
+        ),
+        _patch_both(
+            "_list_unbound_windows",
+            new_callable=AsyncMock,
+            return_value=[("@0", "existing-window", str(tmp_path))],
+        ),
+        patch.object(bot_module.tmux_manager, "_bounded_lifecycle", new=_times_out),
+        _patch_both("safe_edit", new_callable=AsyncMock),
+        _patch_both("aggregator_replay_payload", new_callable=AsyncMock) as mock_replay,
+    ):
+        await bot_module.callback_handler(update, context)
+
+    mock_bind.assert_not_called()
+    mock_replay.assert_not_called()
+    answer = update.callback_query.answer
+    answer.assert_awaited()
+    said = " ".join(str(call.args[0]) for call in answer.await_args_list if call.args)
+    assert "try again" in said.lower(), (
+        f"the user must get a retry-able refusal, not a stack trace: {said!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_door_refuses_and_cleans_when_its_adoption_listing_times_out(
+    tmp_path: Path,
+) -> None:
+    """GH #65 r17 P2-A — fault injection at the LEGACY (lane-disabled) door.
+
+    Driven through ``_create_and_bind_window``, the seam's OWN entry point, with
+    a real ``CallbackQuery`` — so the door's refusal arm is what runs. The
+    wave-16 version called ``cleanup_created_window`` directly and released the
+    reservation by hand: it exercised the helpers, so it could not have caught a
+    door that failed to call them.
+
+    This is the door that leaked a reserved, alive, unbound window when a typed
+    failure escaped, so all four properties are asserted: no bind, a
+    user-visible refusal, cleanup ran, and the reservation released.
+    """
+    from cctelegram.handlers import trust_flow
+    from cctelegram.tmux_manager import LifecycleTimeout
+
+    trust_flow.reset_reservations_for_tests()
+
+    query, user = _make_real_callback_query()
+    context = MagicMock()
+    context.user_data = {}
+    ensure_picker_entry(context.user_data, 10)["_pending_thread_text"] = "hello"
+
+    cleaned: list[str] = []
+
+    async def _record_cleanup(window_id, window_name, tmux_mgr, **kwargs):
+        del window_name, tmux_mgr, kwargs
+        cleaned.append(window_id)
+        return trust_flow.CleanupOutcome.KILLED
+
+    async def _times_out(coro, *, what: str, **kwargs):
+        del kwargs
+        coro.close()
+        raise LifecycleTimeout(f"injected at {what}")
+
+    with (
+        patch.object(
+            bot_module.tmux_manager,
+            "create_window",
+            new_callable=AsyncMock,
+            return_value=(True, "Created window 'repo' at /repo", "repo", "@legacy"),
+        ),
+        patch.object(
+            bot_module.session_manager,
+            "wait_for_session_map_entry",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch.object(bot_module.tmux_manager, "_bounded_lifecycle", new=_times_out),
+        patch.object(
+            inbound_module.trust_flow, "cleanup_created_window", new=_record_cleanup
+        ),
+        patch.object(bot_module.session_manager, "get_window_state"),
+        patch.object(bot_module.session_manager, "bind_thread") as bind_thread,
+        _patch_both("safe_edit", new_callable=AsyncMock) as safe_edit,
+        patch.object(CallbackQuery, "answer", new_callable=AsyncMock),
+    ):
+        await bot_module._create_and_bind_window(
+            query,
+            context,
+            user,
+            "/repo",
+            pending_thread_id=10,
+            tmux_mgr=bot_module.tmux_manager,
+            session_mgr=bot_module.session_manager,
+        )
+
+    bind_thread.assert_not_called()
+    assert cleaned == ["@legacy"], (
+        f"the door's refusal arm must settle the window it created, got {cleaned}"
+    )
+    assert "@legacy" not in trust_flow.windows_owned_by_live_flows(), (
+        "and release the reservation only after that settlement"
+    )
+    safe_edit.assert_awaited()
+    edited = " ".join(
+        str(call.args[1]) for call in safe_edit.await_args_list if len(call.args) > 1
+    )
+    assert edited.strip(), "the user must see a refusal, not a stack trace"
+    trust_flow.reset_reservations_for_tests()

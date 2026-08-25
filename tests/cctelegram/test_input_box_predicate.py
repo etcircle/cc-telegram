@@ -800,6 +800,23 @@ _BASELINE_CLASSIFICATIONS = {
     "epm_v2170_ctrl_plus_g.txt": "no_input_box",
     "folder_trust_arrival_plain_v2.1.206.txt": "no_input_box",
     "folder_trust_arrival_plain_v2.1.207.txt": "no_input_box",
+    # GH #65 / Wave 3 rig (2026-08-25). Every one of these is a blocking trust
+    # prompt, a post-commit/post-cancel corpse still SHOWING that prompt's text,
+    # a transitional blank frame, or a bare shell running the version probe —
+    # none is a ready input box, so all classify ``no_input_box`` and the
+    # delivery gate refuses. (The post-commit corpses are exactly why the trust
+    # lane's slice classifier checks the pane COMMAND before any pane TEXT.)
+    "folder_trust_arrival_plain_v2.1.239.txt": "no_input_box",
+    "folder_trust_arrival_plain_v2.1.241.txt": "no_input_box",
+    "folder_trust_e2c_navto2_plain_v2.1.241.txt": "no_input_box",
+    "folder_trust_postdigit2_t2_plain_v2.1.241.txt": "no_input_box",
+    "folder_trust_postdown2_plain_v2.1.241.txt": "no_input_box",
+    "folder_trust_postdown_plain_v2.1.241.txt": "no_input_box",
+    "folder_trust_postenter_t1_plain_v2.1.241.txt": "no_input_box",
+    "folder_trust_postesc_t4_plain_v2.1.241.txt": "no_input_box",
+    "folder_trust_postup_plain_v2.1.241.txt": "no_input_box",
+    "version_probe_plain_v2.1.239.txt": "no_input_box",
+    "version_probe_plain_v2.1.241.txt": "no_input_box",
     "gate_epm_v2.1.207.txt": "no_input_box",
     "gate_permission_v2.1.207.txt": "no_input_box",
     "gate_workflow_v2.1.207.txt": "no_input_box",

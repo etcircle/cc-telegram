@@ -43,6 +43,7 @@ from cctelegram.handlers.callback_data import (
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
     CB_SETTINGS,
+    CB_TRUST_PICK,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -269,6 +270,14 @@ CALLBACK_REGISTRY: tuple[CallbackRegistryEntry, ...] = (
         "cctelegram.callback_dispatcher.interactive",
         "tests/scenarios/test_decision_dispatch.py",
         "execute_interactive_callback",
+    ),
+    CallbackRegistryEntry(
+        CB_TRUST_PICK,
+        "TrustCardCommand",
+        "cctelegram.handlers.trust_flow",
+        "cctelegram.callback_dispatcher.trust",
+        "tests/scenarios/test_trust_card_flow.py",
+        "execute_trust_callback",
     ),
     CallbackRegistryEntry(
         CB_DOWNLOAD_FILE,

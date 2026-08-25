@@ -242,6 +242,25 @@ verified, the free-text lane switches itself off and the card goes back to
 buttons-and-refusal rather than trusting a stale assumption about the terminal.
 Set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to turn it off entirely.
 
+### A new session that asks you to trust the folder is not a failure
+
+The first time Claude Code opens a directory it asks "Do you trust the files in
+this folder?". That prompt never reaches a transcript, so the bot used to read
+it as a startup failure: it closed the fresh tmux window and told you the
+session had not registered.
+
+Now the picker card turns into a 🔐 trust card showing the directory, with
+**Trust this folder** and **Cancel — close the window**. Tapping Trust drives
+the real prompt in the terminal the same way the other one-tap cards do — it
+moves the cursor, verifies it landed on the right option, and only then presses
+Enter — and once Claude finishes starting, the topic binds and your first
+message is delivered. Tapping Cancel closes the window without typing anything
+into it. Answering in tmux yourself works too; the bot notices and binds.
+
+Anything it cannot read positively — a Claude version it has not characterised,
+an unrecognisable terminal — falls back to a display-only card, and a window it
+genuinely cannot make sense of is left running rather than killed.
+
 ### Sessions survive the boring failures
 
 Claude runs in tmux, so closing Telegram, losing mobile signal, or restarting the bot does not kill the session. Routing and read positions are saved on disk and reconciled at startup.
@@ -343,6 +362,9 @@ Everything else has a default.
 - `CC_TELEGRAM_SHOW_TOOL_CALLS` controls display of tool activity, including sub-agent cards. Hiding it does not stop transcript tracking or busy-state detection.
 - `CC_TELEGRAM_SHOW_HIDDEN_DIRS` shows dot-directories in the picker when true. Default: false.
 - `CC_TELEGRAM_HOOK_TIMEOUT` changes how long the bot waits for Claude's SessionStart hook. The built-in defaults are 5 seconds for fresh sessions and 15 seconds for resumed sessions. This is useful on slow WSL mounts or when several MCP servers delay startup.
+- `CC_TELEGRAM_HOOK_TIMEOUT_EXTENSION_S` is the extra grace the new-session flow allows on top of `CC_TELEGRAM_HOOK_TIMEOUT` before it gives up on a window that is running Claude but has not registered. Default: 15 seconds. The clock restarts whenever you answer the folder-trust prompt, so time spent waiting for *you* never counts against it.
+- `CC_TELEGRAM_TRUST_PROMPT_CEILING_S` is how long the bot keeps a brand-new window alive while it waits for you to trust the folder. Default: 900 seconds (15 minutes). Set it to `0` to switch the trust card off entirely and go back to closing the window when the session does not register.
+- `CC_TELEGRAM_TRUST_CARD_DISPATCH` makes the folder-trust card's "Trust this folder" button actually answer the prompt for you. Default: true. With it off — or with `CC_TELEGRAM_DECISION_DISPATCH` explicitly set to a false value, which turns both keystroke lanes off — the card is display-only and you answer in tmux; Cancel still closes the window. As with every keystroke lane, this is limited to Claude Code versions cc-telegram has characterised (currently 2.1.204, 2.1.206, 2.1.207, 2.1.239 and 2.1.241); anything else is display-only.
 - `CC_TELEGRAM_WINDOW_GEOMETRY` sets the tmux geometry used by the parser. Default: `160x50`; accepted bounds are 20–500 columns and 5–300 rows.
 - `CC_TELEGRAM_PERMISSION_PROMPTS` surfaces tool permission prompts and Workflow launch gates as Telegram cards. Default: true (set `CC_TELEGRAM_PERMISSION_PROMPTS=false` to disable).
 - `CC_TELEGRAM_DECISION_CARDS` surfaces otherwise unsupported numbered confirmation prompts as display-only cards. Default: true (set `CC_TELEGRAM_DECISION_CARDS=false` to disable).
@@ -663,6 +685,7 @@ src/cctelegram/handlers/                Telegram interaction layer
   dashboard.py                          cross-topic dashboard
   updater.py                            /update and in-place restarts
   directory_browser.py                  project and session picker
+  trust_flow.py                         folder-trust card and session creation wait
   history.py                            /history paginator
   cleanup.py                            topic teardown
 src/cctelegram/delivery.py              delivery result, refusal copy, payload shaping

@@ -14,6 +14,7 @@ Key components:
 """
 
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -70,6 +71,16 @@ _PENDING_PICKERS_KEY = "_pending_pickers"
 CARD_CHAT_ID_KEY = "_card_chat_id"
 CARD_MSG_ID_KEY = "_card_msg_id"
 
+# GH #65 (review r2 P1-A): every picker entry carries an EXPLICIT identity token,
+# minted once at entry CREATION. "An entry exists for this thread" is not
+# identity — a teardown that clears the entry and an inbound that immediately
+# creates a REPLACEMENT are indistinguishable to a presence check, so a creation
+# callback that started before the clear could install its flow onto the fresh
+# entry (an ABA hijack) or resurrect an unreachable one. A long-lived actor
+# therefore captures this token up front and re-validates it before it claims;
+# dropping the entry destroys the token with it, so any later claim fails closed.
+ENTRY_TOKEN_KEY = "_entry_token"
+
 
 def picker_entry(user_data: dict | None, thread_id: int | None) -> dict | None:
     """Return this thread's picker entry, or None when absent."""
@@ -97,9 +108,20 @@ def ensure_picker_entry(user_data: dict | None, thread_id: int | None) -> dict |
         user_data[_PENDING_PICKERS_KEY] = pickers
     entry = pickers.get(thread_id)
     if not isinstance(entry, dict):
-        entry = {}
+        # A NEW entry is a NEW identity (review r2 P1-A). Minted here, once, so
+        # every creator gets one without having to remember to.
+        entry = {ENTRY_TOKEN_KEY: secrets.token_hex(8)}
         pickers[thread_id] = entry
     return entry
+
+
+def entry_token(user_data: dict | None, thread_id: int | None) -> str | None:
+    """This thread's picker-entry identity token, or None when there is none."""
+    entry = picker_entry(user_data, thread_id)
+    if entry is None:
+        return None
+    token = entry.get(ENTRY_TOKEN_KEY)
+    return token if isinstance(token, str) and token else None
 
 
 def drop_picker_entry(user_data: dict | None, thread_id: int | None) -> dict | None:
@@ -113,7 +135,33 @@ def drop_picker_entry(user_data: dict | None, thread_id: int | None) -> dict | N
     if not pickers:
         # Keep ``user_data`` tidy once the last thread's picker is gone.
         user_data.pop(_PENDING_PICKERS_KEY, None)
+    _orphan_trust_reservations(entry)
     return entry if isinstance(entry, dict) else None
+
+
+def _orphan_trust_reservations(entry: object) -> None:
+    """ORPHAN a dying entry's GH #65 window reservations — do not free them.
+
+    Review r14 P1-E. Releasing on entry death was PREMATURE: an aborted creation
+    drops its entry and then runs the guarded cleanup, so freeing the window at
+    entry death exposed it for adoption DURING that cleanup — a competitor took
+    it, and the still-running cleanup then killed the window out from under the
+    new owner. A reservation may only be released once the window's disposition
+    has SETTLED (killed, or deliberately spared).
+
+    So the token is cleared but the reservation REMAINS, re-keyed to no owner:
+    the window stays unadoptable, and whoever is settling it releases it. The
+    entry-death path is a re-key, not a free. Imported function-locally to keep
+    this module a leaf.
+    """
+    if not isinstance(entry, dict):
+        return
+    token = entry.get(ENTRY_TOKEN_KEY)
+    if not token:
+        return
+    from cctelegram.handlers import trust_flow
+
+    trust_flow.orphan_reservations_for_token(token)
 
 
 def picker_entries(user_data: dict | None) -> list[dict]:

@@ -97,6 +97,22 @@ def _run_bot() -> None:
         "ON" if config.decision_dispatch_enabled else "OFF",
     )
 
+    # GH #65: seed the folder-trust card's TWO gates onto the same leaf — the
+    # trust flag (default ON, owner-ratified) and the EXPLICIT
+    # ``CC_TELEGRAM_DECISION_DISPATCH=<false>`` operator kill switch (unset does
+    # NOT count). Both are consulted at the render mint AND at the tst: callback.
+    decision_token.set_trust_card_dispatch_enabled(config.trust_card_dispatch_enabled)
+    decision_token.set_decision_dispatch_force_disabled(
+        config.decision_dispatch_force_disabled
+    )
+    logger.info(
+        "Tappable folder-trust card: %s",
+        "ON"
+        if config.trust_card_dispatch_enabled
+        and not config.decision_dispatch_force_disabled
+        else "OFF (display-only)",
+    )
+
     # GH #50 PR-2: seed the free-text-answer flag onto the ``free_text`` leaf
     # (same config-free-leaf discipline). The lane is ALSO version-licensed
     # inside the leaf, so an un-characterized CC release degrades to the PR-1

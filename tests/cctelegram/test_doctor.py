@@ -12,6 +12,11 @@ import pytest
 
 from cctelegram import doctor
 
+# The developer's REAL home, captured at import — before any test can
+# monkeypatch HOME. Used to prove a helper that writes under ``~`` is running
+# against an isolated home, never the live one.
+_REAL_HOME = Path.home()
+
 
 def _isolate_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "home"
@@ -28,6 +33,15 @@ def _stub_environment_clean(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _stub_environment_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This helper WRITES ``~/.claude/settings.json``, so it is only safe once
+    # ``_isolate_home`` has repointed HOME at a tmp dir. Every caller does that
+    # today; this makes the dependency fail CLOSED instead of silently
+    # clobbering the developer's real Claude Code settings.
+    assert Path.home() != _REAL_HOME, (
+        "call _isolate_home(...) before _stub_environment_healthy(...) — it "
+        "writes ~/.claude/settings.json, which is the REAL one until HOME is "
+        "repointed"
+    )
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "stub-token")
     monkeypatch.setenv("ALLOWED_USERS", "1234")
     monkeypatch.setattr(

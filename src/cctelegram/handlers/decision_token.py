@@ -142,6 +142,16 @@ _now: Callable[[], float] = time.monotonic
 # never mints buttons, the callback declines). Reset by ``reset_for_tests``.
 _DISPATCH_ENABLED: bool = False
 
+# GH #65 Fix 2 — the trust-card lane's own flags, kept on this leaf beside the
+# §7 flag for the same config-free reason. ``_TRUST_CARD_DISPATCH_ENABLED``
+# mirrors ``CC_TELEGRAM_TRUST_CARD_DISPATCH`` (production default ON — owner
+# signed off 2026-08-25); ``_DECISION_DISPATCH_FORCE_DISABLED`` mirrors an
+# EXPLICIT ``CC_TELEGRAM_DECISION_DISPATCH=<false value>`` (unset does NOT
+# count). Both are seeded by ``main._run_bot``; the TEST default is OFF/False
+# so a suite that never seeds them behaves like the shipped ``dcp:`` floor.
+_TRUST_CARD_DISPATCH_ENABLED: bool = False
+_DECISION_DISPATCH_FORCE_DISABLED: bool = False
+
 # Serialises token-store mutations so ``consume`` reserves EXCLUSIVELY (the
 # critical section never awaits, so concurrent consumes have exactly one winner).
 _store_lock = asyncio.Lock()
@@ -418,7 +428,20 @@ _DECISION_DISPATCH_TABLE: Final[dict[str, frozenset[str]]] = {
     # highlighted option (the prompt disappears and Claude proceeds) — the E2/E3
     # invariant holds, so the family signature + navigate→verify→Enter dispatch
     # discipline carry; B2.4 canary precondition.
-    "folder-trust": frozenset({"2.1.204", "2.1.206", "2.1.207"}),
+    # 2.1.239 + 2.1.241 licensed from the GH #65 / Wave 3 rig
+    # (``decision_trust_folder_v2.1.239_keystrokes.md`` /
+    # ``..._v2.1.241_keystrokes.md``, fixtures ``folder_trust_*_v2.1.239.txt`` /
+    # ``*_v2.1.241.txt``): the folder-trust prompt is byte-identical to the
+    # 2.1.20x shape (title "Accessing workspace:", options
+    # ["Yes, I trust this folder", "No, exit"], footer
+    # "Enter to confirm · Esc to cancel"), arrows MOVE the ❯ without committing,
+    # and Enter COMMITS the cursored option (E2 + E3 + the E2c compound run).
+    # DIVERGENCE from the AUQ 2.1.207 clamp finding: arrows WRAP on this family
+    # (Down from the last option lands on option 1). Nav is therefore exact-step
+    # from the parsed cursor and the pre-Enter verify is the ONLY licence to
+    # commit — a failed verify is ``not_advanced``, never extra blind arrows.
+    # Digits COMMIT instantly on this surface, so they stay forbidden.
+    "folder-trust": frozenset({"2.1.204", "2.1.206", "2.1.207", "2.1.239", "2.1.241"}),
 }
 
 
@@ -471,16 +494,49 @@ def decision_dispatch_enabled() -> bool:
     return _DISPATCH_ENABLED
 
 
+def set_trust_card_dispatch_enabled(enabled: bool) -> None:
+    """Seed the GH #65 trust-card dispatch flag from config (``main._run_bot``).
+
+    Default ON — the owner's ratified posture difference from the ``dcp:`` lane
+    (one rig-characterized family; Cancel never types). A module-local write so
+    this leaf stays config-free."""
+    global _TRUST_CARD_DISPATCH_ENABLED
+    _TRUST_CARD_DISPATCH_ENABLED = enabled
+
+
+def set_decision_dispatch_force_disabled(force_disabled: bool) -> None:
+    """Seed the GH #65 EXPLICIT operator kill switch (``main._run_bot``).
+
+    True only when ``CC_TELEGRAM_DECISION_DISPATCH`` was EXPLICITLY set to a
+    false value — an operator who turned the Decision keystroke lane off gets
+    the trust lane off too. Unset/default does NOT count."""
+    global _DECISION_DISPATCH_FORCE_DISABLED
+    _DECISION_DISPATCH_FORCE_DISABLED = force_disabled
+
+
+def trust_card_dispatch_enabled() -> bool:
+    """True iff the GH #65 trust card may mint / dispatch a Trust button.
+
+    The TWO-GATE contract, consulted at BOTH the render mint site and the
+    ``tst:`` callback entry: the trust flag must be ON **and** the explicit
+    ``CC_TELEGRAM_DECISION_DISPATCH=false`` operator kill switch must be
+    absent. Either gate failing ⇒ display-only card (Cancel stays live)."""
+    return _TRUST_CARD_DISPATCH_ENABLED and not _DECISION_DISPATCH_FORCE_DISABLED
+
+
 def reset_for_tests(*, now: Callable[[], float] | None = None) -> None:
     """Clear all in-memory state; optionally inject a monotonic clock.
 
     Resets tokens, rows, the nav-generation registry, the module-global
     generation counter (so a test that minted into a tombstone cannot leak a
-    generation into the next test), AND the §7 dispatch flag back to OFF."""
+    generation into the next test), AND every dispatch flag back to OFF."""
     global _generation_counter, _now, _DISPATCH_ENABLED
+    global _TRUST_CARD_DISPATCH_ENABLED, _DECISION_DISPATCH_FORCE_DISABLED
     _tokens.clear()
     _rows.clear()
     _nav_generations.clear()
     _generation_counter = _INITIAL_GENERATION
     _now = now if now is not None else time.monotonic
     _DISPATCH_ENABLED = False
+    _TRUST_CARD_DISPATCH_ENABLED = False
+    _DECISION_DISPATCH_FORCE_DISABLED = False

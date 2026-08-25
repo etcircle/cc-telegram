@@ -68,11 +68,12 @@ from .callback_dispatcher.settings import settings_command
 from .callback_dispatcher.screenshot import (
     build_screenshot_keyboard as _build_screenshot_keyboard,
 )
-from .handlers.directory_browser import (
-    clear_all_picker_entries,
-)
 from .handlers import output_prefs
-from .handlers.cleanup import clear_topic_state, disable_all_picker_cards
+from .handlers.cleanup import (
+    clear_topic_state,
+    disable_all_picker_cards,
+    teardown_all_creation_flows,
+)
 from .handlers.dashboard import clear_dashboards_in_thread, dashboard_command
 from .handlers.history import send_history
 from .handlers.inbound_aggregator import (
@@ -147,7 +148,13 @@ from .handlers.message_sender import (
 from .handlers.response_builder import build_response_parts, is_task_notification
 from .handlers.status_polling import status_poll_loop, typing_action_loop
 from . import route_runtime, terminal_parser, transcript_event_adapter
-from .handlers import artifacts, decision_token, pane_signals, usage_cache
+from .handlers import (
+    artifacts,
+    decision_token,
+    pane_signals,
+    trust_flow,
+    usage_cache,
+)
 from .screenshot import text_to_image
 from .session import peek_session_id_for_window, session_manager
 from .session_monitor import (
@@ -285,8 +292,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # picker entry (not just one thread's). Disable each entry's recorded card
     # FIRST (Codex Q5 — otherwise its buttons look live until tapped), then
     # clear. Both are no-ops when no picker is in flight.
+    # GH #65 Fix 6: a live folder-trust creation flow is torn down (window
+    # settled through the guarded cleanup) BEFORE its entry is cleared — the
+    # entry is the ownership token, so dropping it first would let a concurrent
+    # flow start while the old window still lives.
+    await teardown_all_creation_flows(user.id, context.bot, context.user_data)
     await disable_all_picker_cards(context.bot, context.user_data)
-    clear_all_picker_entries(context.user_data)
+    # Each entry is dropped under ITS OWN creation lock (r2 P1-A / r3 P1-2): the
+    # whole-map pop that used to follow is DELETED, because an unlocked pop is
+    # exactly the snapshot→clear gap a racing install slipped through.
+    await trust_flow.clear_all_topic_entries(user.id, context.user_data)
 
     if update.message:
         await safe_reply(
@@ -1250,11 +1265,28 @@ async def topic_closed_handler(
     if thread_id is None:
         return
 
-    _clear_pending_route_payload_for_thread(
-        context.user_data,
+    # GH #65 Fix 6: settle a live creation flow BEFORE the pending payload (and
+    # with it the ownership entry) is dropped. Reachable on BOTH branches below
+    # — including the no-binding branch, which historically skipped
+    # ``clear_topic_state`` entirely and would have leaked the WAIT task and its
+    # unbound window.
+    await trust_flow.teardown_thread(
+        user.id,
         thread_id,
-        delete_files=True,
+        bot=context.bot,
+        user_data=context.user_data,
+        reason="topic closed",
+        session_mgr=session_manager,
     )
+
+    # GH #65 (r2 P1-A / r3 P1-2): the entry is dropped through the ONE locked
+    # seam, so the clear, its token invalidation and any live flow's terminal
+    # mark share a single critical section.
+    _entry = await trust_flow.clear_topic_entry(user.id, thread_id, context.user_data)
+    if _entry is not None:
+        _delete_pending_attachment_files(
+            list(_entry.get("_pending_thread_attachments") or [])
+        )
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid:
@@ -2710,6 +2742,11 @@ async def post_shutdown(application: Application) -> None:
             pass
         _message_refs_gc_task = None
         logger.info("message_refs GC task stopped")
+
+    # GH #65 Fix 6: cancel + await every live folder-trust creation flow. Each
+    # task's terminalizer settles its window (guarded cleanup) and drops its
+    # entry, so shutdown never strands an unbound window with a live task.
+    await trust_flow.shutdown()
 
     # Stop all queue workers
     await shutdown_workers()
