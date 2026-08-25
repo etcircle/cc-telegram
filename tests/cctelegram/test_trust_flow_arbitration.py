@@ -185,9 +185,15 @@ def test_phase_has_exactly_one_mutator_in_the_module() -> None:
     assignments = [
         line.strip()
         for line in source.splitlines()
-        if ".phase = " in line and not line.strip().startswith("#")
+        if "._phase = " in line and not line.strip().startswith("#")
     ]
-    assert assignments == ["flow.phase = to"], assignments
+    assert assignments == ["flow._phase = to", "flow._phase = PHASE_CANCELLING"], (
+        assignments
+    )
+    # Belt AND braces: the public attribute is READ-ONLY, so a direct write is a
+    # type error rather than a convention violation (review r4 P3).
+    assert isinstance(trust_flow.TrustFlow.phase, property)
+    assert trust_flow.TrustFlow.phase.fset is None
 
 
 @pytest.mark.asyncio

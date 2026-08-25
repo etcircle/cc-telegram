@@ -1025,11 +1025,24 @@ async def _dispatch_decision_pane_locked(
 
     # (f) Commit — the version-stable Enter (a False return means it never reached
     # tmux → still a PRE-COMMIT bail).
-    if on_commit_sent is not None:
-        on_commit_sent()
-    if not await tmux_manager.send_keys(
-        w.window_id, "Enter", enter=False, literal=False
-    ):
+    #
+    # ``on_commit_sent`` fires AFTER the send, per the delivery gate's precedent
+    # (review r4 P2-D): a clean False is PROVEN non-delivery and must NOT be
+    # stamped, while a raise or a timeout is AMBIGUOUS — the key may have landed
+    # — and keeps its stamp. Firing before the send made the stamp false for the
+    # one case tmux tells us about.
+    try:
+        commit_sent = await tmux_manager.send_keys(
+            w.window_id, "Enter", enter=False, literal=False
+        )
+    except BaseException:
+        if on_commit_sent is not None:
+            on_commit_sent()
+        raise
+    if commit_sent:
+        if on_commit_sent is not None:
+            on_commit_sent()
+    else:
         return _bail_not_advanced("commit_send_failed")
     await asyncio.sleep(COMMIT_SETTLE)
     pane2 = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)

@@ -560,7 +560,11 @@ async def test_p2_b_a_cancelled_completion_tail_is_not_reported_as_completed() -
         await asyncio.sleep(30)
 
     inner = asyncio.create_task(_never())
-    flow.phase = trust_flow.PHASE_COMPLETING_BIND
+    assert await trust_flow.transition(
+        flow,
+        expect=trust_flow.OPEN_PHASES,
+        to=trust_flow.PHASE_COMPLETING_BIND,
+    )
     flow.bind_task = inner
     inner.cancel()
     try:
@@ -602,7 +606,11 @@ async def test_p2_b_teardown_cancellation_does_not_kill_the_bind_tail() -> None:
         finished.append("bound")
 
     inner = asyncio.create_task(_tail())
-    flow.phase = trust_flow.PHASE_COMPLETING_BIND
+    assert await trust_flow.transition(
+        flow,
+        expect=trust_flow.OPEN_PHASES,
+        to=trust_flow.PHASE_COMPLETING_BIND,
+    )
     flow.bind_task = inner
 
     teardown = asyncio.create_task(trust_flow.teardown_thread(_USER, _THREAD))

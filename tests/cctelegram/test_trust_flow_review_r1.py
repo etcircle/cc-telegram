@@ -350,7 +350,11 @@ async def test_p2_3_teardown_honors_a_completing_bind_transition_in_its_window()
         completed.set()
 
     trust_flow._flows[(_USER, _THREAD)] = flow
-    flow.phase = trust_flow.PHASE_COMPLETING_BIND
+    assert await trust_flow.transition(
+        flow,
+        expect=trust_flow.OPEN_PHASES,
+        to=trust_flow.PHASE_COMPLETING_BIND,
+    )
     flow.bind_task = asyncio.create_task(_tail())
 
     won = await trust_flow.teardown_thread(_USER, _THREAD)
@@ -399,7 +403,10 @@ async def test_every_nonterminal_phase_refuses_a_browser_rebuild(phase: str) -> 
         user_data, tmux=tmux, bot=_StubBot(), session_mgr=_StubSessionMgr()
     )
     assert flow is not None
-    flow.phase = phase
+    assert (
+        await trust_flow.transition(flow, expect=trust_flow.OPEN_PHASES, to=phase)
+        or flow.phase == phase
+    )
 
     class _NoBinding:
         def get_window_for_thread(self, *_a: Any) -> str | None:

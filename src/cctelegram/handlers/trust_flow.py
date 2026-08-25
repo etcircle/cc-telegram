@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Final, Literal
@@ -217,7 +218,6 @@ class TrustFlow:
     # later claim re-validates it, so an entry cleared and recreated underneath
     # the flow is detected rather than silently adopted.
     entry_token: str | None = None
-    phase: str = PHASE_AWAITING_TRUST
     # Minted trust-button identity (Fix 7's retained row identifiers).
     fingerprint: str | None = None
     ledger_key: str | None = None
@@ -239,6 +239,22 @@ class TrustFlow:
     terminal_committed: bool = False
     wait_task: asyncio.Task[None] | None = None
     bind_task: asyncio.Task[None] | None = field(default=None)
+    # The collaborators every arbitration path needs, so ANY actor (the WAIT
+    # task, a callback, teardown) can run the full choreography without the
+    # caller having to thread them through.
+    bot: Any = None
+    tmux_mgr: Any = None
+    session_mgr: Any = None
+    # PRIVATE (review r4 P3): the single-mutator invariant is enforced by the
+    # type, not by convention — ``phase`` below is read-only, the field is not a
+    # constructor argument (a flow always starts at ``awaiting_trust``), and the
+    # ONLY writers are ``try_transition_locked`` and ``force_terminal_claim``.
+    _phase: str = field(default=PHASE_AWAITING_TRUST, init=False, repr=False)
+
+    @property
+    def phase(self) -> str:
+        """The flow's current phase. READ-ONLY — mutate via the CAS seam."""
+        return self._phase
 
 
 _FlowKey = tuple[int, int]
@@ -252,10 +268,13 @@ _flows: dict[_FlowKey, TrustFlow] = {}
 # CONSUMES it on a reacquire-sees-None, and falls back to the authoritative
 # binding as a second proof.
 _completed_binds: dict[_FlowKey, "_CompletionNote"] = {}
-# Whether the topic was ALREADY bound to the flow's window when the flow was
-# installed — the baseline the completion fallback compares against, so a
-# pre-existing binding is never read as this flow's completion (r3 P2-1).
-_preexisting_binding: dict[_FlowKey, str | None] = {}
+_binding_baselines: dict[_FlowKey, "_BaselineNote"] = {}
+# The PRE-FLOW binding baseline, GENERATION-QUALIFIED and independent of the
+# flow's lifetime (review r4 P2-C). Keeping it on the flow meant it died in
+# ``_drop_flow`` — exactly when the completion fallback needs it — so a
+# pre-existing binding, a rebind, or a reused tmux window id after a tmux-server
+# restart could read as this flow's completion. Same TTL/cap sweep as the
+# completion notes; never dropped with the flow.
 # RETAINED per-(user, thread) creation locks: the registry is bounded by real
 # user×thread cardinality, and evicting one with a live waiter is the bug.
 # Generation validation ALWAYS runs AFTER acquisition.
@@ -329,7 +348,7 @@ def reset_for_tests() -> None:
     _flows.clear()
     _locks.clear()
     _completed_binds.clear()
-    _preexisting_binding.clear()
+    _binding_baselines.clear()
     _generation_counter = 0
 
 
@@ -849,6 +868,11 @@ async def render_trust_card(flow: TrustFlow, bot: Any, pane_text: str | None) ->
     async with creation_lock(flow.user_id, flow.thread_id):
         if _flows.get((flow.user_id, flow.thread_id)) is not flow:
             return
+        # PHASE, not just identity (review r4 P1-C / P2-A): a terminal-marked or
+        # claimed flow must never mint a token or repaint a card another actor
+        # has already given its final state.
+        if flow.phase != PHASE_AWAITING_TRUST:
+            return
         token = _mint_trust_token_locked(flow, pane_text)
     text, keyboard = build_trust_card(flow, trust_token=token)
     await _edit_card(flow, bot, text, keyboard)
@@ -877,9 +901,9 @@ def try_transition_locked(flow: TrustFlow, *, expect: frozenset[str], to: str) -
     """
     if _flows.get((flow.user_id, flow.thread_id)) is not flow:
         return False
-    if flow.phase not in expect:
+    if flow._phase not in expect:
         return False
-    flow.phase = to
+    flow._phase = to
     return True
 
 
@@ -887,6 +911,44 @@ async def transition(flow: TrustFlow, *, expect: frozenset[str], to: str) -> boo
     """Acquire the creation lock and CAS (the seam for callers not holding it)."""
     async with creation_lock(flow.user_id, flow.thread_id):
         return try_transition_locked(flow, expect=expect, to=to)
+
+
+async def force_terminal_claim(flow: TrustFlow) -> bool:
+    """CAS from ANY phase into ``cancelling``. RESERVED — two callers only.
+
+    The escape hatch for a claim that never came back (review r4 P1-B): the
+    teardown-expiry path, after its bounded wait for a dispatch to settle has
+    truly expired, and shutdown. Every other actor must win an ordinary CAS.
+
+    **Disclosed residual:** forcing means an in-flight dispatch's ``Enter`` may
+    still land on the pane after teardown has claimed the flow. It is bounded to
+    the topic-close / shutdown paths, where the window is about to be killed
+    anyway, and it is strictly better than the alternative — a flow wedged in
+    ``dispatching`` forever, which is what three earlier rounds produced.
+    """
+    async with creation_lock(flow.user_id, flow.thread_id):
+        if _flows.get((flow.user_id, flow.thread_id)) is not flow:
+            return False
+        logger.warning(
+            "trust flow FORCED out of %s (window=%s, thread=%s) — a claim never "
+            "returned; an in-flight keystroke may still land",
+            flow._phase,
+            flow.created_wid,
+            flow.thread_id,
+        )
+        flow._phase = PHASE_CANCELLING
+        return True
+
+
+async def release_claim(flow: TrustFlow, *, expect: str, to: str) -> bool:
+    """Release a claim THIS actor made. The CAS matches the phase it acquired.
+
+    Acquisition and release must be symmetric (review r4 P1-A): a Cancel that
+    claimed ``cancelling`` releasing through a ``dispatching``-only CAS never
+    releases at all, which wedges the flow against every later claim. Each actor
+    names the phase it holds.
+    """
+    return await transition(flow, expect=frozenset({expect}), to=to)
 
 
 async def claim_terminal(flow: TrustFlow, phase: str = PHASE_CANCELLING) -> bool:
@@ -906,6 +968,15 @@ class _CompletionNote:
 
     generation: int
     window_id: str
+    at: float
+
+
+@dataclass(frozen=True)
+class _BaselineNote:
+    """What the topic was bound to when ONE flow generation was installed."""
+
+    generation: int
+    binding: str | None
     at: float
 
 
@@ -930,12 +1001,13 @@ def _note_completion(flow: TrustFlow) -> None:
 
 def _prune_completion_notes() -> None:
     now = _wall()
-    for key, note in list(_completed_binds.items()):
-        if now - note.at > _COMPLETION_NOTE_TTL_S:
-            _completed_binds.pop(key, None)
-    while len(_completed_binds) > _COMPLETION_NOTE_CAP:
-        oldest = min(_completed_binds.items(), key=lambda kv: kv[1].at)[0]
-        _completed_binds.pop(oldest, None)
+    for store in (_completed_binds, _binding_baselines):
+        for key, note in list(store.items()):
+            if now - note.at > _COMPLETION_NOTE_TTL_S:
+                store.pop(key, None)
+        while len(store) > _COMPLETION_NOTE_CAP:
+            oldest = min(store.items(), key=lambda kv: kv[1].at)[0]
+            store.pop(oldest, None)
 
 
 def _consume_completion(
@@ -973,17 +1045,38 @@ def _release_tokens(flow: TrustFlow) -> None:
 
 
 def _drop_entry(flow: TrustFlow) -> None:
-    """Drop the ownership token LAST (never before the window is settled)."""
+    """Drop the ownership token LAST (never before the window is settled).
+
+    This is a TERMINAL drop — the stashed first-turn payload was never
+    delivered — so the downloaded attachment files go with it. Without that,
+    a flow that terminalized before its caller could read the entry (the
+    forced-teardown path, which drops it first) leaked those files.
+    """
     entry = picker_entry(flow.user_data, flow.thread_id)
     if entry is not None and entry.get(TRUST_GENERATION_KEY) == flow.generation:
-        drop_picker_entry(flow.user_data, flow.thread_id)
+        dropped = drop_picker_entry(flow.user_data, flow.thread_id)
+        if dropped is not None:
+            _delete_pending_attachments(dropped)
+
+
+def _delete_pending_attachments(entry: dict[str, Any]) -> None:
+    """Best-effort deletion of an undelivered payload's downloaded files."""
+    for attachment in list(entry.get("_pending_thread_attachments") or []):
+        path = getattr(attachment, "path", None)
+        if path is None and isinstance(attachment, dict):
+            path = attachment.get("path")
+        if not isinstance(path, (str, Path)):
+            continue
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug("failed to delete pending attachment %s: %s", path, e)
 
 
 def _drop_flow(flow: TrustFlow) -> None:
     key = (flow.user_id, flow.thread_id)
     if _flows.get(key) is flow:
         _flows.pop(key, None)
-        _preexisting_binding.pop(key, None)
 
 
 async def _terminal_cleanup(
@@ -1055,7 +1148,37 @@ async def _run_completion_tail(
         inner = asyncio.create_task(_complete_bind(flow, bot, session_mgr))
         flow.bind_task = inner
     await asyncio.shield(inner)
+    # FINALIZE on the tail's ACTUAL outcome (review r4 P2-B). A tail that raised
+    # before ``bind_thread`` is NOT a completion: leaving the flow in
+    # ``completing_bind`` would strand it, and treating it as success would drop
+    # everything with the window unbound. Success ends the flow here — every
+    # completion path terminates the same way.
+    if _bind_task_succeeded(inner):
+        async with creation_lock(flow.user_id, flow.thread_id):
+            if _flows.get((flow.user_id, flow.thread_id)) is flow:
+                try_transition_locked(
+                    flow,
+                    expect=frozenset({PHASE_COMPLETING_BIND}),
+                    to=PHASE_TERMINAL,
+                )
+                _release_tokens(flow)
+                _drop_entry(flow)
+                _drop_flow(flow)
+        return True
+    logger.error(
+        "trust completion tail did not bind (window=%s, thread=%s) — leaving the "
+        "flow for the terminalizer's guarded cleanup",
+        flow.created_wid,
+        flow.thread_id,
+    )
     return True
+
+
+def _bind_task_succeeded(task: asyncio.Task[Any]) -> bool:
+    """True only when the retained tail RAN TO COMPLETION without raising."""
+    if not task.done() or task.cancelled():
+        return False
+    return task.exception() is None
 
 
 async def _terminal_spare(flow: TrustFlow, bot: Any, *, body: str) -> None:
@@ -1190,6 +1313,11 @@ async def _wait_loop(
     pane_text: str | None = None
     pane_command: str | None = None
     while True:
+        # A flow marked terminal (a teardown, an entry clear) is not ours any
+        # more — leave at once rather than spending another slice on a pane we
+        # may no longer touch (review r4 P1-C).
+        if flow.phase == PHASE_TERMINAL:
+            return
         registered = bool(
             await _bounded(
                 session_mgr.wait_for_session_map_entry(
@@ -1442,21 +1570,49 @@ async def _terminalize(
             await asyncio.shield(inner)
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+    # The tail's ACTUAL outcome decides — a bind that raised before
+    # ``bind_thread`` is not a success (review r4 P2-B).
+    bind_ok = inner is not None and _bind_task_succeeded(inner)
 
     async with creation_lock(flow.user_id, flow.thread_id):
         if _flows.get((flow.user_id, flow.thread_id)) is not flow:
             return
-        if flow.phase in (PHASE_COMPLETING_BIND, PHASE_TERMINAL):
-            # The tail (or an already-finished terminal path) owns the outcome.
+        if flow.phase == PHASE_TERMINAL:
             _release_tokens(flow)
             _drop_entry(flow)
             _drop_flow(flow)
             return
-        if not try_transition_locked(flow, expect=OPEN_PHASES, to=PHASE_CANCELLING):
+        if flow.phase == PHASE_COMPLETING_BIND:
+            if bind_ok:
+                try_transition_locked(
+                    flow,
+                    expect=frozenset({PHASE_COMPLETING_BIND}),
+                    to=PHASE_TERMINAL,
+                )
+                _release_tokens(flow)
+                _drop_entry(flow)
+                _drop_flow(flow)
+                return
+            # The tail FAILED. Take the claim from ``completing_bind`` and run
+            # the guarded cleanup, so the window is settled and the card honest
+            # instead of the topic being dropped with the window unbound.
+            if not try_transition_locked(
+                flow,
+                expect=frozenset({PHASE_COMPLETING_BIND}),
+                to=PHASE_CANCELLING,
+            ):
+                return
+        elif not try_transition_locked(flow, expect=OPEN_PHASES, to=PHASE_CANCELLING):
             # Another actor holds the claim — it owns the cleanup AND the drop.
             return
 
-    if cancelled:
+    if not bind_ok and flow.bind_task is not None:
+        reason, body = (
+            "completion tail failed",
+            "❌ The session started but I couldn't finish binding this topic."
+            "\n\nSend your message again to retry.",
+        )
+    elif cancelled:
         reason, body = "creation flow torn down", "⚠️ This session setup was cancelled."
     else:
         reason, body = (
@@ -1588,6 +1744,9 @@ async def start_trust_wait(
             cli_version=cli_version,
             user_data=user_data,
             entry_token=live_token if isinstance(live_token, str) else None,
+            bot=bot,
+            tmux_mgr=tmux_mgr,
+            session_mgr=session_mgr,
             started_at=now,
             registration_deadline=now + budget,
             global_deadline=now
@@ -1599,11 +1758,13 @@ async def start_trust_wait(
         # topic is somehow ALREADY bound to this window, a later binding to it
         # proves nothing about this flow.
         try:
-            _preexisting_binding[(user_id, thread_id)] = (
-                session_mgr.get_window_for_thread(user_id, thread_id)
-            )
+            _baseline = session_mgr.get_window_for_thread(user_id, thread_id)
         except Exception:  # noqa: BLE001
-            _preexisting_binding[(user_id, thread_id)] = None
+            _baseline = None
+        _prune_completion_notes()
+        _binding_baselines[(user_id, thread_id)] = _BaselineNote(
+            generation=generation, binding=_baseline, at=now
+        )
         task = asyncio.create_task(_wait_task_body(flow, bot, tmux_mgr, session_mgr))
         task.add_done_callback(_log_task_result)
         flow.wait_task = task
@@ -1666,9 +1827,19 @@ async def release_dispatch_claim(flow: TrustFlow, *, phase: str) -> bool:
 
 
 async def claim_for_cancel(
-    user_id: int, thread_id: int | None, *, user_data: dict[str, Any] | None
+    user_id: int,
+    thread_id: int | None,
+    *,
+    user_data: dict[str, Any] | None,
+    card_generation: int | None = None,
 ) -> TrustClaim:
-    """Claim ``awaiting_trust → cancelling`` (the Cancel tap's state claim)."""
+    """Claim ``open → cancelling`` (the Cancel tap's state claim).
+
+    ``card_generation`` — the generation the TAPPED CARD carries — is validated
+    inside the SAME lock hold as the acquisition (review r4 P1-A): checking it
+    after the claim meant a stale card could claim a NEWER flow and then fail to
+    release it, wedging the topic. A mismatch never claims at all.
+    """
     if thread_id is None:
         return TrustClaim(False, None, "no_thread")
     async with creation_lock(user_id, thread_id):
@@ -1678,6 +1849,8 @@ async def claim_for_cancel(
         entry = picker_entry(user_data, thread_id)
         if entry is None or entry.get(TRUST_GENERATION_KEY) != flow.generation:
             return TrustClaim(False, None, "missing_entry")
+        if card_generation is not None and card_generation != flow.generation:
+            return TrustClaim(False, None, "stale_generation")
         previous = flow.phase
         if not try_transition_locked(flow, expect=OPEN_PHASES, to=PHASE_CANCELLING):
             return TrustClaim(False, flow, "wrong_state", flow.phase)
@@ -1687,39 +1860,19 @@ async def claim_for_cancel(
 async def cancel_flow(flow: TrustFlow, bot: Any, tmux_mgr: Any) -> CleanupOutcome:
     """Cancel: NO keystrokes into the pane — kill the window under the guard.
 
-    Dispatching option 2 / Esc would exit Claude to a bare shell anyway, so
-    killing the window is the same end state with zero keystroke risk. A cancel
-    that RACES a registration is SPARED by the typed guard, and the caller flips
-    into the completion tail instead of reporting "cancelled".
+    The caller already holds ``cancelling``. Dispatching option 2 / Esc would
+    exit Claude to a bare shell anyway, so killing the window is the same end
+    state with zero keystroke risk.
+
+    ORDER IS LOAD-BEARING (review r4 P2-A): the WAIT task is cancelled and
+    awaited FIRST, so no slice renderer can repaint the card after this path
+    writes its terminal text. Only then does the guarded cleanup run, and only
+    then the final edit.
+
+    A cancel that RACES a registration is SPARED by the typed guard and routed
+    into the ONE completion seam (r4 P1-A(iv)) — the topic binds instead of
+    being reported cancelled.
     """
-    outcome = await cleanup_created_window(
-        flow.created_wid, flow.window_name, tmux_mgr, reason="trust card cancel"
-    )
-    if outcome is CleanupOutcome.KILLED:
-        _release_tokens(flow)
-        await _edit_card(
-            flow,
-            bot,
-            "❌ Cancelled — the new tmux window was closed.\n\n"
-            "Send a message here to start again.",
-            None,
-        )
-        flow.terminal_committed = True
-    elif outcome is CleanupOutcome.KILL_FAILED:
-        _release_tokens(flow)
-        await _edit_card(
-            flow,
-            bot,
-            "⚠️ Cancelled, but "
-            + cleanup_note(outcome, flow.window_name, flow.created_wid),
-            None,
-        )
-        flow.terminal_committed = True
-    return outcome
-
-
-async def finish_cancelled_flow(flow: TrustFlow) -> None:
-    """Terminal bookkeeping after a cancel: cancel the WAIT task, drop entry."""
     task = flow.wait_task
     if task is not None and not task.done():
         task.cancel()
@@ -1727,6 +1880,48 @@ async def finish_cancelled_flow(flow: TrustFlow) -> None:
             await task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+
+    outcome = await cleanup_created_window(
+        flow.created_wid, flow.window_name, tmux_mgr, reason="trust card cancel"
+    )
+    if outcome is CleanupOutcome.SPARED_REGISTERED:
+        # The registration WON. Hand the flow to the completion tail through the
+        # same seam every other completion uses, releasing ``cancelling`` as
+        # part of that CAS.
+        await _run_completion_tail(
+            flow,
+            bot,
+            flow.session_mgr,
+            expect=frozenset({PHASE_CANCELLING}),
+        )
+        return outcome
+    if outcome is CleanupOutcome.SPARED_BOUND:
+        # Already bound: release our claim and let the normal bound-topic
+        # machinery own it. The release CAS matches the phase WE claimed.
+        await release_claim(flow, expect=PHASE_CANCELLING, to=PHASE_TERMINAL)
+        return outcome
+    _release_tokens(flow)
+    if outcome is CleanupOutcome.KILLED:
+        body = (
+            "❌ Cancelled — the new tmux window was closed.\n\n"
+            "Send a message here to start again."
+        )
+    else:
+        body = "⚠️ Cancelled, but " + cleanup_note(
+            outcome, flow.window_name, flow.created_wid
+        )
+    await _edit_card(flow, bot, body, None)
+    await release_claim(flow, expect=PHASE_CANCELLING, to=PHASE_TERMINAL)
+    flow.terminal_committed = True
+    return outcome
+
+
+async def finish_cancelled_flow(flow: TrustFlow) -> None:
+    """Terminal bookkeeping after a cancel: drop the entry and the flow.
+
+    The WAIT task was already cancelled + awaited by ``cancel_flow`` (the
+    terminal-edit-last ordering), so this is only the registry drop.
+    """
     async with creation_lock(flow.user_id, flow.thread_id):
         _drop_entry(flow)
         _drop_flow(flow)
@@ -1940,10 +2135,17 @@ def _completion_won(
         (user_id, thread_id), generation=generation, window_id=observed_wid
     ):
         return True
-    # The binding fallback needs a PRE-FLOW BASELINE (review r3 P2-1): a topic
-    # already bound to this window when the flow installed proves nothing, so
-    # only a binding that APPEARED after install counts.
-    if _preexisting_binding.get((user_id, thread_id)) == observed_wid:
+    # The binding fallback needs a PRE-FLOW BASELINE (r3 P2-1), matched BY
+    # GENERATION (r4 P2-C): a topic already bound to this window when THIS
+    # generation installed proves nothing, and a baseline recorded for a
+    # different generation must never be mistaken for ours. No baseline at all
+    # (swept, or a generation we cannot identify) fails CLOSED.
+    baseline = _binding_baselines.get((user_id, thread_id))
+    if baseline is None:
+        return False
+    if generation is not None and baseline.generation != generation:
+        return False
+    if baseline.binding == observed_wid:
         return False
     resolver = session_mgr if session_mgr is not None else session_manager
     try:
@@ -1993,6 +2195,7 @@ async def teardown_thread(
     completed = False
     observed_wid: str | None = expected_wid
     generation: int | None = None
+    forced = False
     for _ in range(4):
         async with creation_lock(user_id, thread_id):
             flow = _flows.get(key)
@@ -2004,26 +2207,56 @@ async def teardown_thread(
                     generation=generation,
                     session_mgr=session_mgr,
                 )
+            claimed_flow = flow
             phase = flow.phase
             wait_task = flow.wait_task
             bind_task = flow.bind_task
             generation = flow.generation
             observed_wid = flow.created_wid
 
-        if phase == PHASE_DISPATCHING:
+        if phase == PHASE_DISPATCHING and not forced:
             # A dispatch owns the pane. Cancelling the WAIT task or running a
             # kill-capable cleanup underneath it is exactly the class of hole
             # three review rounds kept finding (r3 P1-4), so WAIT — bounded —
             # for the phase to leave ``dispatching``. The callback's ``finally``
             # guarantees it does; the bound is a safety net, not the mechanism.
-            if not await _await_dispatch_settled(user_id, thread_id, generation):
-                logger.warning(
-                    "trust teardown gave up waiting for a dispatch to settle "
-                    "(thread=%s, window=%s)",
-                    thread_id,
-                    observed_wid,
-                )
-            continue
+            if await _await_dispatch_settled(user_id, thread_id, generation):
+                continue
+            # The bound EXPIRED (r4 P1-B): the claim never came back — a wedged
+            # tmux, a killed task. Teardown must never return leaving the topic
+            # owned, so it FORCE-claims. Disclosed residual: an Enter already in
+            # flight may still land on a window this teardown is about to kill.
+            logger.warning(
+                "trust teardown FORCING a stuck dispatch claim (thread=%s, "
+                "window=%s) — an in-flight keystroke may still land",
+                thread_id,
+                observed_wid,
+            )
+            if not await force_terminal_claim(claimed_flow):
+                continue
+            forced = True
+            if wait_task is not None and not wait_task.done():
+                wait_task.cancel()
+                try:
+                    await wait_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            await _terminal_cleanup(
+                claimed_flow,
+                claimed_flow.bot,
+                claimed_flow.tmux_mgr,
+                reason="teardown forced a stuck dispatch claim",
+                body=(
+                    "⚠️ This session setup was cancelled while an action was "
+                    "still in flight."
+                ),
+                session_mgr=session_mgr or claimed_flow.session_mgr,
+            )
+            async with creation_lock(user_id, thread_id):
+                if _flows.get(key) is claimed_flow:
+                    _drop_entry(claimed_flow)
+                    _drop_flow(claimed_flow)
+            return completed
 
         if phase == PHASE_COMPLETING_BIND and bind_task is not None:
             # Do NOT cancel — the completion tail is a separately-tracked inner
@@ -2043,6 +2276,7 @@ async def teardown_thread(
                     user_id,
                     thread_id,
                     observed_wid=observed_wid,
+                    generation=generation,
                     session_mgr=session_mgr,
                 )
             if not completed and current.phase == PHASE_COMPLETING_BIND:
@@ -2057,35 +2291,57 @@ async def teardown_thread(
 
 
 async def clear_topic_entry(
-    user_id: int, thread_id: int | None, user_data: dict[str, Any] | None
+    user_id: int,
+    thread_id: int | None,
+    user_data: dict[str, Any] | None,
+    *,
+    session_mgr: Any = None,
 ) -> dict[str, Any] | None:
-    """THE ONLY entry-removal seam for teardown. One lock hold does everything.
+    """THE ONLY entry-removal seam for teardown — and the LAST step of it.
 
-    Wave 3 (review r3 P1-2): entry clear and flow stop are ONE critical section.
-    In a single hold this
-      * drops the picker entry — destroying its identity token, so a creation
-        callback still in flight fails its install CAS;
-      * CASes any live flow straight to ``terminal``, so a WAIT slice, a tap or
-        a cleanup that wakes up afterwards also loses its CAS and performs no
-        side effect.
-    Callers must never pop the entry themselves — an unlocked pop is exactly the
-    snapshot→clear gap three review rounds kept finding.
+    In one lock hold this drops the picker entry (destroying its identity token,
+    so a creation callback still in flight fails its install CAS) and CASes the
+    flow to ``terminal``.
+
+    **It CASes from ``OPEN_PHASES ∪ {terminal}`` and REFUSES every CLAIMED
+    phase** (review r4 P1-C). Clearing from any nonterminal phase let it STEAL a
+    live ``dispatching`` / ``cancelling`` / ``completing_bind`` claim
+    mid-side-effect, and dropped the entry without stopping the WAIT task. On a
+    refusal it runs the FULL teardown choreography — settle the dispatch, cancel
+    the WAIT task, guarded cleanup — and retries; ``teardown_thread``'s
+    forced-terminal expiry guarantees that converges.
     """
     if thread_id is None:
         return None
+    key = (user_id, thread_id)
+    for _ in range(3):
+        async with creation_lock(user_id, thread_id):
+            flow = _flows.get(key)
+            if flow is None:
+                return drop_picker_entry(user_data, thread_id)
+            if try_transition_locked(
+                flow, expect=OPEN_PHASES | {PHASE_TERMINAL}, to=PHASE_TERMINAL
+            ):
+                return drop_picker_entry(user_data, thread_id)
+        # A CLAIMED phase owns the flow: settle it properly, then retry.
+        await teardown_thread(
+            user_id, thread_id, reason="entry clear", session_mgr=session_mgr
+        )
+    logger.warning(
+        "trust entry clear could not settle the flow for thread %s — dropping "
+        "the entry anyway",
+        thread_id,
+    )
     async with creation_lock(user_id, thread_id):
-        flow = _flows.get((user_id, thread_id))
-        if flow is not None:
-            try_transition_locked(flow, expect=NONTERMINAL_PHASES, to=PHASE_TERMINAL)
         return drop_picker_entry(user_data, thread_id)
 
 
 async def clear_all_topic_entries(
-    user_id: int, user_data: dict[str, Any] | None
+    user_id: int, user_data: dict[str, Any] | None, *, session_mgr: Any = None
 ) -> None:
     """Drop EVERY thread's picker entry for one user, each under its own lock."""
     for thread_id in list(_picker_thread_ids(user_data)):
-        await clear_topic_entry(user_id, thread_id, user_data)
+        await clear_topic_entry(user_id, thread_id, user_data, session_mgr=session_mgr)
 
 
 def _picker_thread_ids(user_data: dict[str, Any] | None) -> list[int]:
@@ -2125,6 +2381,32 @@ async def teardown_all_for_user(
 
 
 async def shutdown() -> None:
-    """Cancel + await every live flow task at bot shutdown."""
+    """Cancel + await every live flow task at bot shutdown.
+
+    Never ABANDONS a task (review r4 P1-B): a flow the ordinary teardown could
+    not settle is force-claimed and its task cancelled + awaited here, so the
+    process does not exit with a live WAIT task still typing into a pane.
+    """
     for uid, tid in list(_flows.keys()):
         await teardown_thread(uid, tid, reason="bot shutdown")
+    for uid, tid in list(_flows.keys()):
+        flow = _flows.get((uid, tid))
+        if flow is None:
+            continue
+        logger.warning(
+            "trust flow survived shutdown teardown (thread=%s, window=%s) — forcing",
+            tid,
+            flow.created_wid,
+        )
+        await force_terminal_claim(flow)
+        for task in (flow.wait_task, flow.bind_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        async with creation_lock(uid, tid):
+            if _flows.get((uid, tid)) is flow:
+                _drop_entry(flow)
+                _drop_flow(flow)

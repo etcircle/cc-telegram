@@ -81,8 +81,27 @@ async def _handle_cancel(
     raw_generation: str,
     tmux_manager: Any,
 ) -> None:
+    """[❌ Cancel] — claim, then EVERY exit releases the phase IT claimed.
+
+    Wave 4 (review r4 P1-A). The old shape claimed ``cancelling`` but released
+    through a ``dispatching``-only CAS, so the stale-generation and both SPARED
+    exits never released at all and a stale card permanently wedged a newer
+    flow. Now the card's generation is validated INSIDE the acquisition (a stale
+    card never claims), and everything after the acquisition sits in a
+    ``try/finally`` that restores ``awaiting_trust`` on any escape.
+    """
+    try:
+        card_generation = int(raw_generation)
+    except ValueError:
+        await safe_edit(query, TRUST_EXPIRED_TEXT, reply_markup=None)
+        await safe_answer(query)
+        return
+
     claim = await trust_flow.claim_for_cancel(
-        user.id, thread_id, user_data=context.user_data
+        user.id,
+        thread_id,
+        user_data=context.user_data,
+        card_generation=card_generation,
     )
     if not claim.ok or claim.flow is None:
         if claim.reason == "wrong_state":
@@ -91,39 +110,37 @@ async def _handle_cancel(
             await safe_edit(query, TRUST_EXPIRED_TEXT, reply_markup=None)
             await safe_answer(query)
         return
-    flow = claim.flow
-    if raw_generation != str(flow.generation):
-        # A stale scrollback card from an EARLIER creation flow.
-        await trust_flow.release_dispatch_claim(
-            flow, phase=claim.previous_phase or trust_flow.PHASE_AWAITING_TRUST
-        )
-        await safe_edit(query, TRUST_EXPIRED_TEXT, reply_markup=None)
-        await safe_answer(query)
-        return
 
-    outcome = await trust_flow.cancel_flow(flow, context.bot, tmux_manager)
-    if outcome is trust_flow.CleanupOutcome.SPARED_REGISTERED:
-        # The window registered under us: the completion tail WINS — leave the
-        # WAIT task alone (it flips to ``completing_bind`` on its next slice).
-        await trust_flow.release_dispatch_claim(
-            flow, phase=trust_flow.PHASE_AWAITING_REGISTRATION
+    flow = claim.flow
+    settled = False
+    try:
+        outcome = await trust_flow.cancel_flow(flow, context.bot, tmux_manager)
+        # ``cancel_flow`` owns the release for every outcome it handles.
+        settled = True
+        if outcome is trust_flow.CleanupOutcome.SPARED_REGISTERED:
+            await safe_answer(query, "Session already started — binding it instead.")
+            return
+        if outcome is trust_flow.CleanupOutcome.SPARED_BOUND:
+            await safe_answer(query, "Already bound.")
+            return
+        await trust_flow.finish_cancelled_flow(flow)
+        await safe_answer(
+            query,
+            "Cancelled"
+            if outcome is trust_flow.CleanupOutcome.KILLED
+            else "Cancelled; cleanup failed",
+            show_alert=outcome is trust_flow.CleanupOutcome.KILL_FAILED,
         )
-        await safe_answer(query, "Session already started — binding it instead.")
-        return
-    if outcome is trust_flow.CleanupOutcome.SPARED_BOUND:
-        await trust_flow.release_dispatch_claim(
-            flow, phase=trust_flow.PHASE_COMPLETING_BIND
-        )
-        await safe_answer(query, "Already bound.")
-        return
-    await trust_flow.finish_cancelled_flow(flow)
-    await safe_answer(
-        query,
-        "Cancelled"
-        if outcome is trust_flow.CleanupOutcome.KILLED
-        else "Cancelled; cleanup failed",
-        show_alert=outcome is trust_flow.CleanupOutcome.KILL_FAILED,
-    )
+    finally:
+        if not settled:
+            # An exception or a cancellation escaped mid-cancel: hand the flow
+            # back rather than leaving it claimed forever. The release CAS names
+            # the phase THIS actor holds.
+            await trust_flow.release_claim(
+                flow,
+                expect=trust_flow.PHASE_CANCELLING,
+                to=trust_flow.PHASE_AWAITING_TRUST,
+            )
 
 
 async def _handle_trust(
@@ -151,7 +168,34 @@ async def _handle_trust(
             await safe_answer(query)
         return
     flow = claim.flow
+    # EVERYTHING after the acquisition runs inside the guard (review r4 P1-B):
+    # the token consume and the window lookup below are awaits too, and a
+    # cancellation in either used to leave ``dispatching`` set forever — a phase
+    # the ceiling can only ever retry a CAS against, never clear.
+    try:
+        await _dispatch_after_claim(query, context, user, flow, token, tmux_manager)
+    finally:
+        if flow.phase == trust_flow.PHASE_DISPATCHING:
+            await trust_flow.release_claim(
+                flow,
+                expect=trust_flow.PHASE_DISPATCHING,
+                to=(
+                    trust_flow.PHASE_AWAITING_REGISTRATION
+                    if flow.enter_sent_at is not None
+                    else trust_flow.PHASE_AWAITING_TRUST
+                ),
+            )
 
+
+async def _dispatch_after_claim(
+    query: Any,
+    context: Any,
+    user: Any,
+    flow: Any,
+    token: str,
+    tmux_manager: Any,
+) -> None:
+    """The Trust tap's body, running under the caller's ``dispatching`` claim."""
     peeked = decision_token.peek(token)
     if peeked is not None and peeked.user_id != user.id:
         # Belt and braces beside the entry-level owner gate above.
