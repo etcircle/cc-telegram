@@ -24,6 +24,29 @@ logger = logging.getLogger(__name__)
 SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
 
 
+def _parse_positive_float_env(
+    name: str, default: float, *, allow_zero: bool = False
+) -> float:
+    """Read ``name`` as a finite, non-negative float; WARN + default otherwise.
+
+    Shared by the GH #65 budget knobs. ``allow_zero=True`` accepts ``0`` (which
+    those knobs give a documented meaning: "no extension" / "lane disabled").
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = float(raw)
+        if not math.isfinite(parsed):
+            raise ValueError("must be finite")
+        if parsed < 0 or (parsed == 0 and not allow_zero):
+            raise ValueError("must be a positive number of seconds")
+    except ValueError:
+        logger.warning("Invalid %s=%r; using the default %.1fs", name, raw, default)
+        return default
+    return parsed
+
+
 class Config:
     """Application configuration loaded from environment variables."""
 
@@ -91,6 +114,56 @@ class Config:
                     "(using the built-in 5s/15s SessionStart-hook defaults)",
                     _raw_hook_timeout,
                 )
+
+        # GH #65 Fix 1 — the SECOND registration budget the creation-flow WAIT
+        # loop grants a window that is running Claude but has not registered in
+        # session_map yet. The total registration budget is
+        # ``hook_timeout + CC_TELEGRAM_HOOK_TIMEOUT_EXTENSION_S``, and it is
+        # REBASED to a fresh full budget whenever a Trust dispatch SENT Enter
+        # (``dispatched`` OR ``commit_unconfirmed`` — addendum r1 P1) or the
+        # trust prompt disappears after a manual in-tmux answer: human wait time
+        # must never consume the machine's registration budget. An invalid value
+        # (non-numeric / non-finite / < 0) logs a WARNING and falls back to the
+        # 15.0 default. config OWNS this canonical declaration for docs + the
+        # README sync rule.
+        self.hook_timeout_extension_s: float = _parse_positive_float_env(
+            "CC_TELEGRAM_HOOK_TIMEOUT_EXTENSION_S", 15.0, allow_zero=True
+        )
+
+        # GH #65 Fix 1 — the trust ceiling. Once the creation-flow WAIT loop has
+        # seen a folder-trust frame on the freshly-created pane, ONLY this
+        # ceiling applies (the registration budget is suspended — the wait is on
+        # a HUMAN). Expiry ⇒ guarded cleanup + an honest "timed out waiting for
+        # you to trust…" card edit. ``0`` DISABLES the lane entirely (a trust
+        # frame then falls through to the pre-#65 guarded cleanup + honest
+        # message). config OWNS this canonical declaration.
+        self.trust_prompt_ceiling_s: float = _parse_positive_float_env(
+            "CC_TELEGRAM_TRUST_PROMPT_CEILING_S", 900.0, allow_zero=True
+        )
+
+        # GH #65 Fix 2 — the tappable folder-trust card. Default ON (OWNER
+        # SIGNED OFF 2026-08-25): the ``dcp:`` lane's default-OFF was the canary
+        # posture for ARBITRARY Decision families, while this lane is ONE
+        # rig-characterized family (2.1.239 / 2.1.241) whose only other button,
+        # Cancel, never types a keystroke. Set ``=false`` for a display-only
+        # card (Cancel stays live). NOTE an explicit UNRECOGNIZED value also
+        # parses false — only unset/empty inherits the ON default.
+        self.trust_card_dispatch_enabled = os.getenv(
+            "CC_TELEGRAM_TRUST_CARD_DISPATCH", "true"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        # GH #65 Fix 2 — the EXPLICIT operator kill switch. An operator who set
+        # ``CC_TELEGRAM_DECISION_DISPATCH`` to a false value turned the Decision
+        # keystroke lane OFF deliberately, and that decision covers the trust
+        # lane too. UNSET / empty does NOT count (that is merely the ``dcp:``
+        # lane's default-OFF posture, which predates this lane) — only an
+        # explicit false value force-disables trust dispatch.
+        _raw_decision_dispatch = os.getenv("CC_TELEGRAM_DECISION_DISPATCH")
+        self.decision_dispatch_force_disabled: bool = (
+            _raw_decision_dispatch is not None
+            and _raw_decision_dispatch.strip() != ""
+            and _raw_decision_dispatch.strip().lower() not in ("1", "true", "yes", "on")
+        )
 
         # All state files live under config_dir
         self.state_file = self.config_dir / "state.json"

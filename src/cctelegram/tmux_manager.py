@@ -76,6 +76,7 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import time
@@ -83,7 +84,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 # Cache the resolved tmux binary path before libtmux is used. Every
 # libtmux command (libtmux/common.py:tmux_cmd.__init__) calls
@@ -195,6 +196,103 @@ def _compose_launch_command(
     if resume_session_id:
         cmd = f"{cmd} --resume {shlex.quote(resume_session_id)}"
     return cmd
+
+
+# ── GH #65 Fix 0: the per-creation, in-pane CLI version probe ────────────────
+#
+# The trust card's keystroke license must name the version of the binary THIS
+# pane's shell will resolve one second later — not the version a bot-side
+# subprocess would resolve (PATH / shell function / wrapper divergence), and not
+# a cached value (an auto-update can land between creations). So the probe runs
+# IN the created pane, in launch-deferred mode (a fresh interactive shell owned
+# by the creation flow, nothing else typed yet), with SHELL-RESOLUTION PARITY
+# and NONCE-DELIMITED output.
+_RE_ENV_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", re.DOTALL
+)
+# The POSITIVE Claude proof: a wrapper that reports its OWN version fails this
+# and the card degrades to display-only. The README already requires
+# CLAUDE_COMMAND to exec the real binary; the probe does not trust that.
+_RE_PROBE_VERSION_LINE: Final[re.Pattern[str]] = re.compile(
+    r"(\d+\.\d+\.\d+\S*)\s+\(Claude Code\)"
+)
+TRUST_VERSION_PROBE_TIMEOUT_S: Final[float] = 5.0
+_PROBE_POLL_INTERVAL_S: Final[float] = 0.25
+
+
+def probe_command_prefix(base_command: str) -> str | None:
+    """The ``<env-prefix> <binary>`` slice of ``CLAUDE_COMMAND``, or None.
+
+    Keeps EVERY leading ``NAME=value`` env assignment (a ``PATH=…`` prefix
+    changes which binary the shell resolves — it must apply to the probe too),
+    keeps the binary token, DROPS the remaining args. Each assignment is
+    re-emitted as an UNQUOTED name plus a shell-quoted value: quoting the whole
+    word (``'PATH=/x'``) would stop the shell recognizing it as an assignment.
+    Returns None when no binary token can be extracted (⇒ no probe ⇒ the card is
+    display-only).
+    """
+    try:
+        tokens = shlex.split(base_command)
+    except ValueError:
+        return None
+    parts: list[str] = []
+    index = 0
+    while index < len(tokens):
+        match = _RE_ENV_ASSIGNMENT.fullmatch(tokens[index])
+        if match is None:
+            break
+        parts.append(f"{match.group(1)}={shlex.quote(match.group(2))}")
+        index += 1
+    if index >= len(tokens):
+        return None
+    parts.append(shlex.quote(tokens[index]))
+    return " ".join(parts)
+
+
+def compose_version_probe(base_command: str, nonce_a: str, nonce_b: str) -> str | None:
+    """The nonce-delimited ``--version`` probe line, or None when un-probeable."""
+    prefix = probe_command_prefix(base_command)
+    if prefix is None:
+        return None
+    return f"printf '{nonce_a}\\n'; {prefix} --version; printf '{nonce_b}\\n'"
+
+
+def parse_probe_version(pane: str, nonce_a: str, nonce_b: str) -> str | None:
+    """Extract the probed CC version from ONE capture, or None (fail closed).
+
+    The delimiter match is an EXACT WHOLE-LINE FULLMATCH of the nonce after
+    strip (Phase-0 addendum item 4): the shell ECHOES the probe command, and a
+    long binary path WRAPS that echo so nonce-A and nonce-B each end an echoed
+    line — a naive "line contains the nonce" scan finds an EMPTY region between
+    them. Echoed lines never fullmatch; the ``printf`` output lines always do.
+
+    Between the LAST nonce-A line and the FIRST nonce-B line after it, exactly
+    one line must carry the positive ``N.N.N (Claude Code)`` shape; zero or
+    several ⇒ None. Only the bare version (``2.1.241``) is returned — that is
+    what ``decision_token.lookup`` compares.
+    """
+    lines = pane.splitlines()
+    start = -1
+    for index, line in enumerate(lines):
+        if line.strip() == nonce_a:
+            start = index
+    if start == -1:
+        return None
+    end = -1
+    for index in range(start + 1, len(lines)):
+        if lines[index].strip() == nonce_b:
+            end = index
+            break
+    if end == -1:
+        return None
+    found: list[str] = []
+    for line in lines[start + 1 : end]:
+        match = _RE_PROBE_VERSION_LINE.fullmatch(line.strip())
+        if match is not None:
+            found.append(match.group(1))
+    if len(found) != 1:
+        return None
+    return found[0]
 
 
 class RestartOutcome(Enum):
@@ -1127,6 +1225,7 @@ class TmuxManager:
         window_name: str | None = None,
         start_claude: bool = True,
         resume_session_id: str | None = None,
+        defer_launch: bool = False,
     ) -> tuple[bool, str, str, str]:
         """Create a new tmux window and optionally start Claude Code.
 
@@ -1135,6 +1234,12 @@ class TmuxManager:
             window_name: Optional window name (defaults to directory name)
             start_claude: Whether to start claude command
             resume_session_id: If set, append --resume <id> to claude command
+            defer_launch: GH #65 Fix 0 — create the window and resize it but do
+                NOT send the launch command, leaving the pane a fresh
+                interactive shell owned by the caller. The caller runs its
+                in-pane ``--version`` probe there and then calls
+                ``launch_claude_in_window`` (which composes the SAME command
+                line). Ignored when ``start_claude`` is False.
 
         Returns:
             Tuple of (success, message, window_name, window_id)
@@ -1162,14 +1267,7 @@ class TmuxManager:
         # global SessionStart / PreToolUse hooks. A failed write degrades
         # gracefully — the window still launches, just without live-prose
         # capture (falls back to post-resolution JSONL delivery).
-        from . import md_capture
-
-        try:
-            md_settings_path = md_capture.ensure_capture_settings()
-            md_settings = str(md_settings_path) if md_settings_path.exists() else ""
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Could not prepare MessageDisplay capture settings: %s", e)
-            md_settings = ""
+        md_settings = self._resolve_md_settings()
 
         # Create window in thread
         def _create_and_start() -> tuple[bool, str, str, str]:
@@ -1195,8 +1293,9 @@ class TmuxManager:
                     window, config.window_width, config.window_height
                 )
 
-                # Start Claude Code if requested
-                if start_claude:
+                # Start Claude Code if requested. GH #65 Fix 0: launch-deferred
+                # mode leaves the pane a fresh shell for the caller's probe.
+                if start_claude and not defer_launch:
                     pane = window.active_pane
                     if pane:
                         cmd = _compose_launch_command(
@@ -1239,6 +1338,89 @@ class TmuxManager:
         if created and new_wid:
             self.clear_window_stranded_draft(new_wid, reason="window newly created")
         return result
+
+    def _resolve_md_settings(self) -> str:
+        """The bot-managed MessageDisplay settings path, or "" on failure.
+
+        Shared by ``create_window`` and the GH #65 deferred
+        ``launch_claude_in_window`` so both compose the SAME command line.
+        """
+        from . import md_capture
+
+        try:
+            md_settings_path = md_capture.ensure_capture_settings()
+            return str(md_settings_path) if md_settings_path.exists() else ""
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not prepare MessageDisplay capture settings: %s", e)
+            return ""
+
+    async def launch_claude_in_window(
+        self, window_id: str, *, resume_session_id: str | None = None
+    ) -> bool:
+        """Send the deferred launch command into a ``defer_launch`` window.
+
+        GH #65 Fix 0: the LAUNCH ALWAYS PROCEEDS regardless of the probe's
+        outcome, immediately after the probe settles — the pane is still the
+        flow-owned fresh shell and the probe output scrolls away under Claude's
+        alt-screen. Composes the identical ``_compose_launch_command`` line
+        ``create_window`` would have sent.
+        """
+        md_settings = await asyncio.to_thread(self._resolve_md_settings)
+        cmd = _compose_launch_command(
+            config.claude_command, md_settings, resume_session_id
+        )
+        return await self.send_keys(window_id, cmd, enter=True, literal=True)
+
+    async def probe_cli_version(
+        self,
+        window_id: str,
+        *,
+        timeout: float = TRUST_VERSION_PROBE_TIMEOUT_S,
+    ) -> str | None:
+        """Run the nonce-delimited ``--version`` probe IN ``window_id``'s shell.
+
+        GH #65 Fix 0. Returns the bare version string (``"2.1.241"``) on the
+        positive ``N.N.N (Claude Code)`` proof between two whole-line nonce
+        delimiters, else ``None`` — an un-extractable binary, a send failure, a
+        timeout, a wrapper reporting its own version, or any capture failure all
+        degrade to ``None``, which makes the trust card DISPLAY-ONLY. NEVER
+        raises to the caller (except ``CancelledError``, which propagates), and
+        NEVER blocks the launch.
+        """
+        nonce = secrets.token_hex(4).upper()
+        nonce_a, nonce_b = f"CCTGVERA{nonce}", f"CCTGVERB{nonce}"
+        probe = compose_version_probe(config.claude_command, nonce_a, nonce_b)
+        if probe is None:
+            logger.info(
+                "trust version probe skipped: no binary token in CLAUDE_COMMAND "
+                "(window=%s)",
+                window_id,
+            )
+            return None
+        try:
+            if not await self.send_keys(window_id, probe, enter=True, literal=True):
+                logger.info("trust version probe send failed (window=%s)", window_id)
+                return None
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                pane = await self.capture_pane(window_id)
+                if pane:
+                    version = parse_probe_version(pane, nonce_a, nonce_b)
+                    if version is not None:
+                        logger.info(
+                            "trust version probe ok window=%s version=%s",
+                            window_id,
+                            version,
+                        )
+                        return version
+                await asyncio.sleep(_PROBE_POLL_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning("trust version probe raised (window=%s): %s", window_id, e)
+            return None
+        logger.info("trust version probe timed out (window=%s)", window_id)
+        return None
 
     async def pane_current_command(self, window_id: str) -> str | None:
         """Real-time read of a window's active-pane foreground command.
