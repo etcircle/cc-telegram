@@ -303,12 +303,13 @@ def test_no_unlocked_entry_pops_remain_in_the_teardown_paths() -> None:
 
 
 @pytest.mark.asyncio
-async def test_teardown_waits_for_an_in_flight_dispatch_instead_of_cancelling() -> None:
-    """A dispatch owns the pane: teardown must not cancel or kill underneath it.
+async def test_teardown_settles_an_in_flight_dispatch_before_acting() -> None:
+    """A dispatch owns the pane: teardown must not kill underneath it.
 
-    Driven through the real claim: a Trust tap holds ``dispatching`` while
-    teardown runs. Teardown must still be waiting when the dispatch is
-    released, and only then proceed.
+    Wave 5 sharpened HOW it waits (r5 P1-B): the claim's owner is registered on
+    the flow, so teardown CANCELS and AWAITS that task — positive proof the side
+    effect is over — instead of inferring settlement from a timer. The claim is
+    held here by a REAL parked callback task, not by the test's own task.
     """
     user_data: dict[str, Any] = {}
     _entry(user_data)
@@ -316,20 +317,38 @@ async def test_teardown_waits_for_an_in_flight_dispatch_instead_of_cancelling() 
     flow = await _start(user_data, tmux=tmux, bot=_Bot(), sessions=_Sessions())
     assert flow is not None
     await asyncio.sleep(0.03)
-    claim = await trust_flow.claim_for_dispatch(_USER, _THREAD, user_data=user_data)
-    assert claim.ok
 
-    teardown = asyncio.create_task(trust_flow.teardown_thread(_USER, _THREAD))
-    await asyncio.sleep(0.1)
+    entered = asyncio.Event()
+    released = asyncio.Event()
 
-    assert not teardown.done(), "teardown must WAIT for the dispatch to settle"
-    assert tmux.kill_calls == [], "no kill may run under a live dispatch"
-    assert flow.wait_task is not None and not flow.wait_task.cancelled()
+    async def _slow_callback() -> None:
+        claim = await trust_flow.claim_for_dispatch(_USER, _THREAD, user_data=user_data)
+        assert claim.ok
+        entered.set()
+        try:
+            await asyncio.sleep(30)  # a long transaction
+        finally:
+            # The callback's own finally is what releases the claim.
+            await trust_flow.release_claim(
+                flow,
+                expect=trust_flow.PHASE_DISPATCHING,
+                to=trust_flow.PHASE_AWAITING_TRUST,
+            )
+            released.set()
 
-    # The callback's finally releases the claim; teardown then proceeds.
-    await trust_flow.release_dispatch_claim(flow, phase=trust_flow.PHASE_AWAITING_TRUST)
-    await asyncio.wait_for(teardown, timeout=5)
-    assert tmux.kill_calls == ["@5"]
+    callback = asyncio.create_task(_slow_callback())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    assert flow.phase == trust_flow.PHASE_DISPATCHING
+    assert flow.claim_task is callback, "the claim registers its owner"
+    assert tmux.kill_calls == [], "nothing may run under a live dispatch"
+
+    won = await asyncio.wait_for(trust_flow.teardown_thread(_USER, _THREAD), timeout=5)
+
+    assert won is False
+    assert released.is_set(), "teardown must CANCEL + AWAIT the claim's owner"
+    assert callback.done()
+    assert tmux.kill_calls == ["@5"], "and only THEN settle the window"
+    assert trust_flow.get_flow(_USER, _THREAD) is None
 
 
 @pytest.mark.asyncio

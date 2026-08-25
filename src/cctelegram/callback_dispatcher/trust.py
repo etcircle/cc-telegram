@@ -112,6 +112,11 @@ async def _handle_cancel(
         return
 
     flow = claim.flow
+    # The phase this actor ACQUIRED (review r5 P1-D). An abort path must hand
+    # back exactly what it took — restoring ``awaiting_trust`` over an
+    # ``awaiting_registration`` acquisition would resurrect a trust ceiling for
+    # a prompt the user has already answered.
+    acquired = claim.previous_phase or trust_flow.PHASE_AWAITING_TRUST
     settled = False
     try:
         outcome = await trust_flow.cancel_flow(flow, context.bot, tmux_manager)
@@ -121,6 +126,9 @@ async def _handle_cancel(
             await safe_answer(query, "Session already started — binding it instead.")
             return
         if outcome is trust_flow.CleanupOutcome.SPARED_BOUND:
+            # ``cancel_flow`` completed the teardown inline (tokens, entry,
+            # flow, final card edit) — review r5 P2-A, where this arm used to
+            # return leaving all three leaked.
             await safe_answer(query, "Already bound.")
             return
         await trust_flow.finish_cancelled_flow(flow)
@@ -135,11 +143,14 @@ async def _handle_cancel(
         if not settled:
             # An exception or a cancellation escaped mid-cancel: hand the flow
             # back rather than leaving it claimed forever. The release CAS names
-            # the phase THIS actor holds.
+            # the phase THIS actor holds, and restores the one it ACQUIRED — the
+            # WAIT task is still alive across the cleanup (r5 P1-D), so the
+            # restored flow is genuinely observed again: its ceilings fire and a
+            # registration is still noticed.
             await trust_flow.release_claim(
                 flow,
                 expect=trust_flow.PHASE_CANCELLING,
-                to=trust_flow.PHASE_AWAITING_TRUST,
+                to=acquired,
             )
 
 

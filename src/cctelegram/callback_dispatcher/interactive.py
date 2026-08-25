@@ -859,13 +859,16 @@ async def _dispatch_decision_pane_locked(
     can never carry a version on Linux/WSL (``/proc/comm`` reports ``claude``),
     so the shipped default can never license a tap there.
 
-    ``on_commit_sent`` is an optional progress hook fired IMMEDIATELY BEFORE the
-    commit ``Enter`` (GH #65 review r3 P2-5). A caller that must restore state in
-    a ``finally`` cannot infer "Enter was sent" from the return value alone — a
-    cancellation between the send and the return would lose it — so the fact is
-    published the moment it becomes possible. Fired BEFORE rather than after the
-    send deliberately: over-reporting a commit is the fail-safe direction (the
-    caller stays in a phase that does not re-offer the button).
+    ``on_commit_sent`` is an optional progress hook published the moment the
+    commit becomes possible (GH #65 review r3 P2-5): a caller that must restore
+    state in a ``finally`` cannot infer "Enter was sent" from the return value
+    alone, because a cancellation between the send and the return would lose it.
+
+    It fires AFTER the ``Enter`` ``send_keys`` — on a TRUTHY return, and from the
+    exception path on a raise/timeout (ambiguous: the key may have landed) — but
+    NEVER on a clean ``False``, which is tmux telling us the key provably never
+    left (review r4 P2-D, mirroring the delivery gate: a provable non-send is not
+    stamped, ambiguity keeps its stamp).
     """
 
     def _bail_not_advanced(reason: str) -> _DecisionPaneOutcome:
