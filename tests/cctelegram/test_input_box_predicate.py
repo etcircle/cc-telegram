@@ -863,6 +863,17 @@ _BASELINE_CLASSIFICATIONS = {
     # the tall-draft fallback fail-closed and the topic wedged. Its own explicit
     # flip test is `test_gh62_tall_draft_2_1_238_is_a_READY_input_box`.
     "inputbox_tall_draft_v2.1.238.txt": None,
+    # GH #73 — the CC 2.1.246 rig captures, baked at their POST-fix values (the
+    # GH #62 precedent). `inputbox_tall_draft_v2.1.246.txt` is the REGRESSION twin:
+    # it classified `no_input_box` before the right-block split, because the `/rc`
+    # Remote Control pill is right-ALIGNED on the status row and the segment
+    # splitter handed the hint fullmatch a tail it could not consume. The flip is
+    # additionally pinned by its own explicit test below.
+    "inputbox_idle_v2.1.246.txt": None,
+    "inputbox_paste_collapsed_v2.1.246.txt": None,
+    "inputbox_rc_active_v2.1.246.txt": None,
+    "inputbox_rc_connecting_v2.1.246.txt": None,
+    "inputbox_tall_draft_v2.1.246.txt": None,
     "inputbox_tasklist_footer_v2.1.207.txt": None,
     "inputbox_tasks_mode_v2.1.207.txt": "tasks_mode",
     "inputbox_wrapped_draft_v2.1.207.txt": None,
@@ -1057,6 +1068,29 @@ _REAL_CORPUS_STATUS_ROWS = [
 ]
 
 
+def _status_row_of(name: str) -> str:
+    """The first non-blank row below a fixture's BOTTOM rule — its status bar."""
+    lines = tp._strip_ansi(_pane(name)).split("\n")
+    seps = [i for i, line in enumerate(lines) if tp._is_rule_separator(line)]
+    assert seps, name
+    return next(line.strip() for line in lines[seps[-1] + 1 :] if line.strip())
+
+
+# GH #73 — the CC 2.1.246 rows carry the right-ALIGNED `/rc` pill, whose padding
+# run is capture-exact (tens of spaces), so they are read FROM the fixtures rather
+# than re-typed as literals.
+_REAL_CORPUS_STATUS_ROWS_246 = [
+    _status_row_of(name)
+    for name in (
+        "inputbox_idle_v2.1.246.txt",
+        "inputbox_paste_collapsed_v2.1.246.txt",
+        "inputbox_rc_active_v2.1.246.txt",
+        "inputbox_rc_connecting_v2.1.246.txt",
+        "inputbox_tall_draft_v2.1.246.txt",
+    )
+]
+
+
 @pytest.mark.parametrize("row", _LIVE_BOT_ROWS)
 def test_the_live_bot_rows_are_accepted(row: str) -> None:
     """THE COMPLETENESS PIN (provenance: sampled from the running bot's panes —
@@ -1207,6 +1241,12 @@ _GRAMMAR_REGEX_CLASS_REPRESENTATIVES = {
     "← 3 agents",
     "← 99+ done",
     "1 feedback draft",
+    # `_RE_STATUS_RIGHT_BLOCK` — CC 2.1.246's right-ALIGNED footer child (GH #73).
+    # It is NOT a `·` segment: it is split off the row before the grammar runs, so
+    # the representative is listed here purely to keep the lockstep an honest
+    # superset. It can never satisfy acceptance alone (see the `not_in_leg3`
+    # comment below).
+    "/rc active",
 }
 
 
@@ -1306,6 +1346,13 @@ def test_the_grammar_and_leg3_alphabet_stay_in_lockstep() -> None:
         "← 3 agents",
         "← 99+ done",
         "1 feedback draft",
+        # GH #73 — the right-ALIGNED `/rc` pill. Leg 3 does NOT carry it, and that
+        # divergence is WEAKER than the ones above: the pill is a typed slot that
+        # never satisfies acceptance on its own, so a row made only of it is
+        # refused by the GRAMMAR too (pinned in
+        # `test_gh73_a_right_block_only_row_is_not_a_status_bar`) and can never
+        # reach the leg-3 refusal at all.
+        "/rc active",
     }
 
 
@@ -1332,7 +1379,7 @@ def test_every_REAL_status_row_the_grammar_accepts_also_satisfies_leg3() -> None
             tp._RE_INPUT_READY_TASK_TOKEN.search("· " + row)
         )
 
-    for row in _LIVE_BOT_ROWS + _REAL_CORPUS_STATUS_ROWS:
+    for row in _LIVE_BOT_ROWS + _REAL_CORPUS_STATUS_ROWS + _REAL_CORPUS_STATUS_ROWS_246:
         assert tp._is_status_row(row) is True, row
         assert _below_marker_ok(row), row
 
@@ -1913,3 +1960,216 @@ def test_a_grammar_only_singleton_row_still_refuses_fail_closed(row: str) -> Non
     assert tp.classify_input_box_failure(pane) == "no_ready_chrome", row
     assert "no_ready_chrome" in tp.INPUT_BOX_INDETERMINATE_REASONS
     assert tp.pane_input_box_present(pane) is False, row
+
+
+# ── GH #73: the CC 2.1.246 RIGHT-ALIGNED `/rc` status-bar element ─────────────
+#
+# CC 2.1.246 shipped Remote Control, whose `/rc` pill is the first footer element
+# that is NOT part of the `·`-joined hint line: the footer container is a ROW flex
+# box whose second child (`MY`) carries `marginLeft: "auto"`, so the pill lands
+# right-ALIGNED on the SAME physical row, separated by a run of padding spaces. A
+# tmux capture therefore reads
+#
+#   `  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents   …   /rc`
+#
+# and the segment splitter handed `← for agents   …   /rc` to the hint fullmatch,
+# which refused. Same consequence as GH #62: the GH #56 tall-draft fallback took
+# leg (a) → `no_input_box` → Enter withheld → stranded-draft brake → topic WEDGE.
+#
+# The alphabet is read off the RENDERER, never guessed — the label function in the
+# plaintext bundle at `~/.local/share/claude/versions/2.1.246` (@204455048) is
+# exhaustive: `/rc failed` (error) | `/rc reconnecting` | `/rc active` |
+# `/rc connecting…`, plus the `/rc active` ⇒ bare `/rc` abbreviation (@212974312)
+# once the `rc-active-badge` notification has been seen 5 times. Both rig windows
+# settled into the ABBREVIATED form, so it is the common shape, not an edge case.
+
+_TALL_DRAFT_246 = "inputbox_tall_draft_v2.1.246.txt"
+_IDLE_246 = "inputbox_idle_v2.1.246.txt"
+_PASTE_COLLAPSED_246 = "inputbox_paste_collapsed_v2.1.246.txt"
+_RC_CONNECTING_246 = "inputbox_rc_connecting_v2.1.246.txt"
+_RC_ACTIVE_246 = "inputbox_rc_active_v2.1.246.txt"
+
+
+def test_gh73_tall_draft_2_1_246_is_a_READY_input_box() -> None:
+    """THE REGRESSION PIN. This real 2.1.246 rig capture classified `no_input_box`
+    before the right-block split — the wedge shape. Post-fix it is a fully-ready
+    box, and the brake's release proof reads the SAME rows: box FOUND, input row
+    non-empty (False, never None)."""
+    pane = _pane(_TALL_DRAFT_246)
+    # Non-vacuity: the fixture genuinely has the tall shape (exactly ONE separator
+    # in the 20-line window, so the fallback is the path under test) and its status
+    # row genuinely carries the right-aligned pill.
+    lines = tp._strip_ansi(pane).split("\n")
+    start = max(0, len(lines) - tp._CHROME_SCAN_LINES)
+    seps = [i for i in range(start, len(lines)) if tp._is_rule_separator(lines[i])]
+    assert len(seps) == 1
+    assert "> line fifteen of the quoted block" in tp._strip_ansi(pane)
+    assert _status_row_of(_TALL_DRAFT_246).endswith(" /rc")
+
+    assert tp.pane_input_box_present(pane) is True
+    assert tp.classify_input_box_failure(pane) is None
+    assert tp.pane_input_row_empty(pane) is False
+
+
+def test_gh73_the_pre_fix_failing_row_now_passes() -> None:
+    """The measured before/after, stated as the row rather than the pane: the bar
+    ALONE was accepted and the same bar PLUS the right-aligned pill was refused."""
+    bar = "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    assert tp._is_status_row(bar) is True
+    for pill in ("/rc connecting…", "/rc active", "/rc"):
+        assert tp._is_status_row(f"{bar}{' ' * 40}{pill}") is True, pill
+
+
+def test_gh73_the_2_1_246_captures_are_the_negative_controls() -> None:
+    """The same sessions with an EMPTY box: normal 2-separator panes (so the
+    fallback never fires), deliverable, input row provably empty — and still IDLE,
+    so `/update` and `/cost` keep working on a `/rc` pane."""
+    for name in (_IDLE_246, _RC_CONNECTING_246, _RC_ACTIVE_246):
+        pane = _pane(name)
+        assert tp.classify_input_box_failure(pane) is None, name
+        assert tp.pane_input_box_present(pane) is True, name
+        assert tp.pane_input_row_empty(pane) is True, name
+        assert tp.pane_looks_idle(tp.clean_ghost_input_text(pane)) is True, name
+
+
+def test_gh73_the_captures_cover_all_three_OBSERVED_pill_states() -> None:
+    """Non-vacuity for the alphabet: the fixtures hold `connecting…`, `active` and
+    the bare abbreviation. `/rc reconnecting` and `/rc failed` are binary-derived
+    only — they are not reachable on demand, so no synthetic fixture was built for
+    them (they are still in the regex, from the renderer's own label function)."""
+    assert _status_row_of(_RC_CONNECTING_246).endswith(" /rc connecting…")
+    assert _status_row_of(_RC_ACTIVE_246).endswith(" /rc active")
+    assert _status_row_of(_IDLE_246).endswith(" /rc")
+
+
+def test_gh73_the_exclusive_row_co_renders_with_the_right_block() -> None:
+    """WHY the split runs BEFORE the exclusive check, PANE-CONFIRMED rather than
+    inferred: `Pasting…` / `paste again to expand` / `Press <key> again to exit`
+    are early `return`s INSIDE the LEFT child (FooterHintLine), so the right block
+    still renders beside them. This real capture holds exactly that row."""
+    row = _status_row_of(_PASTE_COLLAPSED_246)
+    assert row.startswith("paste again to expand")
+    assert row.endswith(" /rc")
+    assert tp._is_status_row(row) is True
+    pane = _pane(_PASTE_COLLAPSED_246)
+    assert "[Pasted text #1" in pane
+    assert tp.pane_input_box_present(pane) is True
+    # An UNCOMMITTED draft is still not idle, and the brake must not self-release.
+    assert tp.pane_input_row_empty(pane) is False
+    assert tp.pane_looks_idle(tp.clean_ghost_input_text(pane)) is False
+
+
+_GH73_ACCEPTED_ROWS = [
+    # the two verbose states + the abbreviation, on the real bar shape
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents      /rc",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents      /rc active",
+    "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents      /rc connecting…",
+    # the two binary-derived states with no capture
+    "⏸ manual mode on · ? for shortcuts      /rc reconnecting",
+    "⏸ manual mode on · ? for shortcuts      /rc failed",
+    # the pill's own keyboard-SELECTED suffix (`bridgeSelected` — derived from the
+    # chord renderer, whose `<Key> to <action>` join and `Enter` label are proven
+    # by two literals the grammar already accepts)
+    "⏸ manual mode on · ? for shortcuts      /rc active · Enter to view",
+    # an EXCLUSIVE row beside the right block (the captured shape)
+    "paste again to expand      /rc",
+    "Pasting…      /rc active",
+    "! for shell mode      /rc",
+    # a single-space gap (`columnGap: 1` — reachable when the bar nearly fills the
+    # row) is a boundary too: the pill token is what proves the split point
+    "⏸ manual mode on · ? for shortcuts /rc active",
+]
+
+
+@pytest.mark.parametrize("row", _GH73_ACCEPTED_ROWS)
+def test_gh73_rows_carrying_the_right_block_are_accepted(row: str) -> None:
+    assert tp._is_status_row(row) is True
+
+
+_GH73_REFUSED_ROWS = [
+    # UNKNOWN pill state — the alphabet is closed, not a `/rc <anything>` wildcard
+    "⏸ manual mode on · ? for shortcuts      /rc bogus",
+    "⏸ manual mode on · ? for shortcuts      /rc ACTIVE",
+    "⏸ manual mode on · ? for shortcuts      /RC active",
+    # unconsumed text AFTER the pill — the block is anchored at end-of-row
+    "⏸ manual mode on · ? for shortcuts      /rc active extra",
+    "⏸ manual mode on · ? for shortcuts      /rc active · Enter to view tasks",
+    # a DIFFERENT right-block member (the IDE selection, the `Debug` flag, the
+    # cloud link, the PR link): real renders, but no capture holds one, so they
+    # stay fail-closed exactly like residual (3)'s `⧉` indicator
+    "⏸ manual mode on      ⧉ In foo.py",
+    "⏸ manual mode on      Debug",
+    "⏸ manual mode on      Debug · /rc active",
+    # the LEFT half must still be a well-formed bar — the split is not an escape
+    # hatch for arbitrary prose
+    "hello there      /rc active",
+    "❯ tell me about /rc active",
+    "1. Yes, trust this folder      /rc active",
+    # BYTE DISCIPLINE: an NBSP variant of the pill refuses (this lane never
+    # normalizes Unicode spaces — GH #56)
+    "⏸ manual mode on · ? for shortcuts      /rc\xa0active",
+    "⏸ manual mode on · ? for shortcuts\xa0\xa0\xa0\xa0\xa0\xa0/rc active",
+]
+
+
+@pytest.mark.parametrize("row", _GH73_REFUSED_ROWS)
+def test_gh73_unlicensed_right_aligned_text_still_refuses(row: str) -> None:
+    """Fail-closed on everything the renderer read does not license. Asserted
+    through the FULL predicates too, so the refusal is the shipped behavior and
+    not just a grammar detail."""
+    assert tp._is_status_row(row) is False
+    pane = _lone_sep_pane(row)
+    assert tp.pane_input_box_present(pane) is False, row
+    assert tp.classify_input_box_failure(pane) == "no_input_box", row
+    # …and the stranded-draft brake never gets a keyless release from such a row.
+    assert tp.pane_input_row_empty(pane) is not True, row
+
+
+@pytest.mark.parametrize("row", ["/rc", "/rc active", "/rc connecting…"])
+def test_gh73_a_right_block_only_row_is_not_a_status_bar(row: str) -> None:
+    """THE NON-WIDENING DECISION, pinned. The renderer DOES permit an empty left
+    half (FooterHintLine's fall-through can render nothing), so this row shape is
+    real — but acceptance stays exactly `has_mode or >=1 HINT`, the invariant GH
+    #62 shipped, so the pill widens nothing on its own, precisely like a bare
+    `PR #309` / `2 monitors` / `12 memories recalled`. No capture in any corpus
+    holds such a row; it degrades to today's fail-closed refusal."""
+    assert tp._is_status_row(row) is False
+    for typed_slot in ("PR #309", "2 monitors", "12 memories recalled"):
+        assert tp._is_status_row(typed_slot) is False
+
+
+def test_gh73_the_split_is_a_NO_OP_without_a_right_block() -> None:
+    """Byte-identity for every older pane: `_split_status_right_block` returns the
+    row UNCHANGED unless it ends in a licensed block, so no pre-2.1.246 row can
+    take a different path through the predicate."""
+    for row in _LIVE_BOT_ROWS + _REAL_CORPUS_STATUS_ROWS:
+        assert tp._split_status_right_block(row) == row, row
+    # And a row that DOES carry one loses exactly the block plus its padding.
+    assert (
+        tp._split_status_right_block("⏸ manual mode on      /rc active")
+        == "⏸ manual mode on"
+    )
+
+
+def test_gh73_needs_no_leg3_or_idle_alphabet_change() -> None:
+    """MEASURED, per the GH #62 precedent that grammar and leg 3 are SEPARATE
+    alphabets extended only where the frames prove a need: every 2.1.246 capture
+    already carries a leg-3 marker (`shift+tab to cycle` / the paste hint) to the
+    LEFT of the pill, so `_INPUT_READY_CHROME_MARKERS` and `_READY_STATUS_MARKERS`
+    are deliberately UNCHANGED — `/rc` is grammar vocabulary only."""
+    assert "/rc" not in tp._INPUT_READY_CHROME_MARKERS
+    assert "/rc" not in tp._READY_STATUS_MARKERS
+    for name in (_IDLE_246, _RC_CONNECTING_246, _RC_ACTIVE_246, _TALL_DRAFT_246):
+        below = _status_row_of(name)
+        assert any(m in below for m in tp._INPUT_READY_CHROME_MARKERS), name
+
+
+def test_gh73_needs_no_rule_separator_change() -> None:
+    """`_RE_RULE_SEPARATOR` is unchanged, pinned on the real captures: every
+    input-box rule in the 2.1.246 fixtures already satisfies `_is_rule_separator`
+    (the capture set carries PURE-dash rules only)."""
+    for name in (_IDLE_246, _TALL_DRAFT_246, _PASTE_COLLAPSED_246):
+        lines = tp._strip_ansi(_pane(name)).split("\n")
+        seps = [line for line in lines if tp._is_rule_separator(line)]
+        assert len(seps) >= 2, name
+        assert all(set(line.strip()) == {"─"} for line in seps), name
