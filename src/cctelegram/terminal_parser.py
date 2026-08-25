@@ -847,6 +847,35 @@ def strip_leading_gutter(text: str) -> str:
     The ONE shared canonicalizer for the CC 2.1.237 multi-question AUQ layout,
     where the question text is drawn behind a left ``│`` gutter.
 
+    **APPLY IT TO THE PANE-OBSERVED SIDE ONLY — never to the authority.** The
+    gutter is PANE-RENDERING CHROME: authored question text (a side-file record,
+    a JSONL ``question``/``title``/``header``) never contains it, while the pane
+    is a RENDERING that does. The two sides of a title comparison are therefore
+    not the same kind of thing, and the usual symmetric-normalization rule — which
+    governs two sources OBSERVING THE SAME rendered artifact — does not apply
+    here. Stripping both sides is NON-INJECTIVE one level up: a stale authority
+    ``"│ Foo"`` canonicalizes to ``"Foo"`` and then matches a live pane
+    ``"│ Foo"`` whose real question is ``"Foo"``, so a stale record with
+    coincidentally-matching labels gets served as a TRUSTED source for a
+    DIFFERENT live question (codex r2 P1).
+
+    The sound form, which both call sites implement, is a single rule:
+    **de-chrome the PANE title; compare the AUTHORITY raw.** De-chroming
+    INVERTS the rendering, so the comparison is between two authored-shaped
+    strings. This is self-fail-closing on the ambiguous case — an authority that
+    itself begins with ``"│ "`` / ``"┃ "`` simply does not equal (or prefix) the
+    de-chromed pane, so it bails, which is the safe pre-2.1.237 answer. NOTE the
+    fail-closed behaviour comes from comparing the authority against the
+    STRIPPED pane; reverting BOTH sides to raw on an ambiguous authority does
+    NOT fail closed (raw-vs-raw is equal in exactly the collision case) and was
+    measured to leave the hole open.
+
+    Residual (accepted): the run is greedy, so a hypothetical DOUBLE-chromed
+    pane ``"│ │ Foo"`` de-chromes to ``"Foo"`` rather than ``"│ Foo"``, which
+    would fail to match a genuinely ``"│ Foo"``-titled question. That is a
+    false-NEGATIVE (no details card), never a wrong match, and CC renders one
+    gutter run per line.
+
     Always returns a whitespace-stripped string. When there is no leading gutter
     run the result is exactly ``text.strip()`` — a no-op on every pre-2.1.237
     pane. When stripping the run would leave NOTHING behind, the gutter is kept
@@ -870,12 +899,13 @@ def has_leading_gutter(text: str) -> bool:
     """True when ``text`` begins with a gutter run that ``strip_leading_gutter``
     would actually remove.
 
-    The GATE for the comparison-time canonicalization: callers canonicalize only
-    when the PANE side genuinely carries the 2.1.237 gutter. A record/JSONL
-    question never does, so the canonicalization is one-sided BY OBSERVATION
-    while remaining one shared helper applied to both sides — and on every
-    non-gutter pane the whole step is provably a no-op, i.e. byte-identical to
-    the pre-2.1.237 comparison.
+    Used for BOTH halves of the rule in :func:`strip_leading_gutter`:
+
+      * on the PANE title, it gates whether de-chroming runs at all — False ⇒ the
+        whole step is skipped and the comparison is provably byte-identical to
+        its pre-2.1.237 behaviour;
+      * on the AUTHORITY text, True means AMBIGUOUS (authored text that looks
+        like chrome) ⇒ fail closed, compare raw.
     """
     return strip_leading_gutter(text) != text.strip()
 
@@ -2550,7 +2580,7 @@ def parse_ask_user_question(
     # above, first option / rule / blank below) and by the pane height, and every
     # line must carry the gutter to be taken at all.
     pane_question_display_text: str | None = None
-    if current_question_title is not None and _RE_LEADING_BOX_GUTTER.match(
+    if current_question_title is not None and has_leading_gutter(
         current_question_title
     ):
         q_parts: list[str] = []
@@ -2568,7 +2598,7 @@ def parse_ask_user_question(
                 if q_parts:
                     break
                 continue
-            if not _RE_LEADING_BOX_GUTTER.match(stripped):
+            if not has_leading_gutter(stripped):
                 # A non-gutter line ends the boxed question block.
                 break
             q_parts.append(strip_leading_gutter(stripped))
@@ -3912,29 +3942,27 @@ def _infer_current_tab_idx(
     if pane_form is None or not questions:
         return 0, False
 
-    # Primary: exact title match. GATED gutter canonicalization — when (and only
-    # when) the PANE title genuinely carries the CC 2.1.237 box gutter, both
-    # sides are run through ``strip_leading_gutter`` so ``│ Which direction?`` on
-    # the pane still matches ``Which direction?`` in JSONL instead of silently
-    # degrading to the weaker label-overlap leg below. On every other pane the
-    # step is skipped entirely, so this comparison is byte-identical to before.
+    # Primary: exact title match, with the CC 2.1.237 box gutter stripped from
+    # the PANE-OBSERVED title only, so ``│ Which direction?`` on the pane still
+    # matches ``Which direction?`` in JSONL instead of silently degrading to the
+    # weaker label-overlap leg below.
+    #
+    # ONE-SIDED by design (the same rule ``auq_source._record_consistent_with_pane``
+    # applies, for the same reason): the JSONL question is AUTHORED INPUT, the
+    # pane title is a RENDERING of it, and the gutter is rendering CHROME that
+    # authored text never contains. De-chroming the pane INVERTS the rendering;
+    # de-chroming the authority as well would let a question that genuinely
+    # BEGINS with ``│ `` match a differently-titled live tab. A gutterless pane
+    # de-chromes to itself, so this comparison stays byte-identical to before.
+    #
     # Comparison-time only — ``current_question_title`` is never mutated (it
     # feeds the form fingerprint).
-    raw_pane_title = (pane_form.current_question_title or "").strip()
-    gutter_active = has_leading_gutter(raw_pane_title)
-    pane_title = (
-        strip_leading_gutter(raw_pane_title) if gutter_active else raw_pane_title
-    )
+    pane_title = strip_leading_gutter(pane_form.current_question_title or "")
     if pane_title:
         title_matches: list[int] = []
         for i, q in enumerate(questions):
-            q_title = (
-                strip_leading_gutter(q.title) if gutter_active else q.title.strip()
-            )
-            q_header = (
-                strip_leading_gutter(q.header) if gutter_active else q.header.strip()
-            )
-            if pane_title == q_title or pane_title == q_header:
+            # The AUTHORITY is compared raw — never de-chromed.
+            if pane_title == q.title.strip() or pane_title == q.header.strip():
                 title_matches.append(i)
         if len(title_matches) == 1:
             return title_matches[0], True

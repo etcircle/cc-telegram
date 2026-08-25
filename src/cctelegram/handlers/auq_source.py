@@ -963,23 +963,39 @@ def _record_consistent_with_pane(
     NEVER computes ``AskUserQuestionForm.fingerprint()`` here — that
     includes cursor/recommended/tab state and would reject valid records.
 
-    Both title comparisons (5.a and 5.b) run on GUTTER-CANONICAL forms WHEN —
-    and only when — the PANE title genuinely carries a CC 2.1.237 box gutter.
-    2.1.237 draws a multi-question AUQ's question text behind a left ``│``
-    gutter, so the pane title arrives as ``"│ Which direction? …"`` while the
-    record's question is the bare ``"Which direction? …"`` and NO prefix
-    relation holds in either direction — every multi-question AUQ on that
-    release rejected with ``title_mismatch``, which dropped the 📋 details card.
+    Both title comparisons (5.a and 5.b) strip the CC 2.1.237 box gutter from
+    the PANE-OBSERVED title only. 2.1.237 draws a multi-question AUQ's question
+    text behind a left ``│`` gutter, so the pane title arrives as
+    ``"│ Which direction? …"`` while the record's question is the bare
+    ``"Which direction? …"`` and NO prefix relation holds in either direction —
+    every multi-question AUQ on that release rejected with ``title_mismatch``,
+    which dropped the 📋 details card.
 
-    The canonicalization is GATED on ``has_leading_gutter(pane_title)`` (codex
-    r1 P1-A): a record question never carries the gutter, so the transform is
-    one-sided BY OBSERVATION while still being ONE shared helper applied to both
-    sides, and on every non-gutter pane the step is skipped outright — this
-    predicate is then byte-identical to its pre-2.1.237 behaviour. Comparison
-    time only: neither the record nor ``pane_form.current_question_title`` is
-    mutated, so every fingerprint stays byte-identical.
+    The strip is ONE-SIDED, and deliberately NOT the symmetric form (codex r2
+    P1). The two sides are not the same kind of thing: the record's question is
+    AUTHORED INPUT, the pane title is a RENDERING of it, and the gutter is
+    rendering CHROME that authored text never contains. Canonicalizing both
+    sides re-opened the injectivity hole one level up — a STALE record
+    ``"│ Foo"`` canonicalized to ``"Foo"`` and matched a live pane ``"│ Foo"``
+    whose real question was ``"Foo"``, so with coincidentally-matching labels
+    the stale record was served as a TRUSTED ``side_file_ok``.
+
+    ONE rule: **de-chrome the pane title; compare the record's question RAW.**
+    De-chroming INVERTS the rendering, so both sides of the comparison are
+    authored-shaped. A gutterless pane de-chromes to itself, so this predicate
+    is byte-identical to its pre-2.1.237 behaviour on every other release.
+
+    That rule is self-fail-closing on the ambiguous authority: a record question
+    that itself begins with ``"│ "`` does not prefix (nor is prefixed by) the
+    de-chromed pane, so it bails. Reverting BOTH sides to raw in that case does
+    NOT fail closed — raw-vs-raw is equal in exactly the collision case — and
+    was measured to leave the hole open.
+
+    Comparison time only: neither the record nor
+    ``pane_form.current_question_title`` is mutated, so every fingerprint stays
+    byte-identical.
     """
-    from ..terminal_parser import has_leading_gutter, strip_leading_gutter
+    from ..terminal_parser import strip_leading_gutter
 
     if pane_form is None or not pane_form.options:
         return False, "no_pane_form"
@@ -990,14 +1006,15 @@ def _record_consistent_with_pane(
 
     pane_labels = tuple(o.label for o in pane_form.options)
     raw_pane_title = (pane_form.current_question_title or "").strip()
-    # The gate: canonicalize the titles below ONLY when the pane really is the
-    # 2.1.237 boxed layout. ``_canon`` is the identity function otherwise.
-    gutter_active = has_leading_gutter(raw_pane_title)
-
-    def _canon(value: str) -> str:
-        return strip_leading_gutter(value) if gutter_active else value.strip()
-
-    pane_title = _canon(raw_pane_title)
+    # ONE-SIDED chrome strip. The gutter is PANE-RENDERING CHROME, so it is
+    # removed from the PANE-OBSERVED title only; the record's authored question
+    # text is NEVER canonicalized. See ``_pane_title_for`` for the ambiguity
+    # rule and the docstring above for why this is not the symmetric form.
+    # The pane title is de-chromed; the record's authored question is compared
+    # RAW, always. An authority that itself begins with ``"│ "`` therefore fails
+    # to match the de-chromed pane and bails — which is exactly the fail-closed
+    # answer we want for that ambiguous shape.
+    pane_title = strip_leading_gutter(raw_pane_title)
     candidate: dict | None = None
 
     # Step 5.a — pick a candidate record-question.
@@ -1007,7 +1024,7 @@ def _record_consistent_with_pane(
         for q in raw_questions:
             if not isinstance(q, dict):
                 continue
-            qt = _canon(q.get("question") or "")
+            qt = (q.get("question") or "").strip()
             if not qt:
                 continue
             if qt.startswith(pane_title) or pane_title.startswith(qt):
@@ -1045,7 +1062,7 @@ def _record_consistent_with_pane(
     # different live question. Residual: if the pane title is genuinely
     # unparseable and labels coincidentally match a stale not-overwritten side
     # file within TTL, that edge remains irreducible without question text.
-    candidate_title = _canon(candidate.get("question") or "")
+    candidate_title = (candidate.get("question") or "").strip()
     if pane_title and candidate_title:
         if not (
             candidate_title.startswith(pane_title)

@@ -93,6 +93,28 @@ def _pane_text() -> str:
     return _GUTTER_PANE.read_text()
 
 
+def _gutter_pane(question_lines: list[str]) -> str:
+    """A synthetic 2.1.237-shaped multi-tab picker whose question sits behind the
+    box gutter, carrying the fixture's own option labels."""
+    return "\n".join(
+        [
+            "←  ☐ Dynamics  ☐ Todo scope  ✔ Submit  →",
+            "",
+            *(f"│ {line}" for line in question_lines),
+            "",
+            *(
+                f"{'❯' if i == 1 else ' '} {i}. {label}"
+                for i, label in enumerate(_PANE_LABELS, start=1)
+            ),
+            f"  {len(_PANE_LABELS) + 1}. Type something.",
+            "─" * 40,
+            f"  {len(_PANE_LABELS) + 2}. Chat about this",
+            "",
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        ]
+    )
+
+
 def _record(question: str, *, tool_use_id: str = "toolu_gutter_1") -> PreToolAskRecord:
     """A PreToolUse side-file record shaped like the real 2.1.237 incident."""
     tool_input: dict[str, Any] = {
@@ -368,15 +390,46 @@ class TestCanonicalizerInjectivity:
             _record(_FULL_QUESTION), form
         ) == (True, "ok")
 
+    def test_a_stale_gutter_authority_cannot_borrow_the_panes_chrome_strip(
+        self,
+    ) -> None:
+        """THE r2 P1 collision, stated as the attack it enables.
 
-# ── (P1-A) the canonicalization is GATED on the pane carrying a gutter ───────
+        Live question is ``Foo``; the pane renders it as ``│ Foo``. A STALE
+        record whose authored question is literally ``│ Foo`` is a DIFFERENT
+        question. Under the two-sided strip both collapsed to ``Foo`` and
+        compared EQUAL — with matching labels that is a trusted ``side_file_ok``
+        for the wrong question. One-sided + ambiguous-authority-fail-closed
+        keeps them distinct.
+        """
+        live_question = "Which rollout cadence do you prefer?"
+        pane = _gutter_pane([live_question])
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        # Premise: the pane really does render the live question behind a gutter.
+        assert form.current_question_title == f"│ {live_question}"
+
+        # The genuine record (authored, gutterless) matches.
+        assert auq_source._record_consistent_with_pane(
+            _record(live_question), form
+        ) == (True, "ok")
+
+        # The stale look-alike, whose AUTHORED text carries the glyph, does not.
+        consistent, reason = auq_source._record_consistent_with_pane(
+            _record(f"│ {live_question}"), form
+        )
+        assert (consistent, reason) == (False, "title_mismatch")
 
 
-class TestCanonicalizationIsGatedOnThePane:
-    def test_non_gutter_pane_skips_canonicalization_entirely(self) -> None:
-        """A record question that begins with a box gutter must NOT be stripped
-        when the PANE has none — the transform is one-sided BY OBSERVATION, so a
-        non-gutter pane compares byte-identically to its pre-2.1.237 behaviour.
+# ── (r2 P1) ASYMMETRY: only the PANE is de-chromed, never the authority ──────
+
+
+class TestOnlyThePaneIsDeChromed:
+    def test_a_gutter_record_never_matches_a_gutterless_pane(self) -> None:
+        """The AUTHORITY is never de-chromed, so a record question that begins
+        with a box gutter cannot match a pane that has none. A gutterless pane
+        de-chromes to itself, so the comparison is byte-identical to its
+        pre-2.1.237 behaviour.
         """
         pane = "\n".join(
             [
@@ -399,8 +452,8 @@ class TestCanonicalizationIsGatedOnThePane:
         assert form is not None
         assert has_leading_gutter(form.current_question_title or "") is False
 
-        # Same text, but the RECORD carries the gutter. With the gate, nothing is
-        # stripped on either side ⇒ mismatch (the pre-2.1.237 answer).
+        # Same text, but the RECORD carries the gutter. The authority is never
+        # de-chromed ⇒ mismatch (the pre-2.1.237 answer).
         consistent, reason = auq_source._record_consistent_with_pane(
             _record("│ Which approach should we take?"), form
         )
@@ -410,6 +463,45 @@ class TestCanonicalizationIsGatedOnThePane:
         assert auq_source._record_consistent_with_pane(
             _record("Which approach should we take?"), form
         ) == (True, "ok")
+
+    def test_tab_inference_also_refuses_a_gutter_prefixed_authority(self) -> None:
+        """The SAME asymmetry at the other call site. A JSONL question whose own
+        title carries the glyph must not be pinned by a de-chromed pane title —
+        otherwise a stale tab could be selected for the live one."""
+        live_title = "Which rollout cadence do you prefer?"
+        form = parse_ask_user_question(_gutter_pane([live_title]))
+        assert form is not None
+        assert form.current_question_title == f"│ {live_title}"
+
+        # Authority WITHOUT the glyph == the live question ⇒ pinned.
+        genuine = (
+            AskQuestion(
+                title="Something else",
+                header="Todo scope",
+                options=(_opt(1, "Unrelated"),),
+            ),
+            AskQuestion(
+                title=live_title, header="Dynamics", options=(_opt(1, "Unrelated2"),)
+            ),
+        )
+        assert terminal_parser._infer_current_tab_idx(genuine, form) == (1, True)
+
+        # Authority WITH the glyph is a DIFFERENT title ⇒ no title pin. The
+        # option labels are non-overlapping too, so the secondary leg cannot
+        # rescue it and inference fails closed.
+        stale = (
+            AskQuestion(
+                title="Something else",
+                header="Todo scope",
+                options=(_opt(1, "Unrelated"),),
+            ),
+            AskQuestion(
+                title=f"│ {live_title}",
+                header="Dynamics",
+                options=(_opt(1, "Unrelated2"),),
+            ),
+        )
+        assert terminal_parser._infer_current_tab_idx(stale, form) == (0, False)
 
 
 # ── (a) Part A: the record/pane consistency check accepts the gutter pane ───
@@ -438,15 +530,34 @@ class TestRecordConsistentWithGutterPane:
         )
         assert (consistent, reason) == (False, "title_mismatch")
 
-    def test_a_gutter_prefixed_record_question_also_matches(self) -> None:
-        """SYMMETRY: canonicalization is applied to BOTH sides, so a record whose
-        own text somehow carried a gutter matches too."""
+    def test_a_gutter_prefixed_record_question_FAILS_CLOSED(self) -> None:
+        """ASYMMETRY (codex r2 P1) — the inverse of what an earlier round pinned.
+
+        The gutter is PANE-RENDERING CHROME; authored question text never carries
+        it. Stripping BOTH sides was non-injective one level up: a stale record
+        ``"│ Foo"`` canonicalized to ``"Foo"`` and matched a live pane
+        ``"│ Foo"`` whose real question is ``"Foo"``, so with coincidentally
+        matching labels the stale record was served as a TRUSTED source for a
+        DIFFERENT live question.
+
+        An authority that begins with what looks like chrome is AMBIGUOUS, so
+        the comparison runs RAW and bails.
+        """
         form = parse_ask_user_question(_pane_text())
         assert form is not None
         consistent, reason = auq_source._record_consistent_with_pane(
             _record(f"│ {_FULL_QUESTION}"), form
         )
-        assert (consistent, reason) == (True, "ok")
+        assert (consistent, reason) == (False, "title_mismatch")
+
+    def test_the_gutterless_record_still_matches_the_gutter_pane(self) -> None:
+        """…and the asymmetry did not cost the fix: the REAL 2.1.237 shape —
+        authored text without a gutter, pane with one — still reconciles."""
+        form = parse_ask_user_question(_pane_text())
+        assert form is not None
+        assert auq_source._record_consistent_with_pane(
+            _record(_FULL_QUESTION), form
+        ) == (True, "ok")
 
 
 # ── (d) Part A: tab inference pins the active tab by exact title ────────────
