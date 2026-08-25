@@ -12,9 +12,10 @@ Core responsibilities:
     media-group bundling path via ``aggregator_offer_{photo,document}``.
   - Pending-route-payload state machine (``_clear_pending_route_payload``,
     ``_flush_pending_route_payload``, ``_pending_owner_matches``): stashes
-    text + attachments in the thread's per-topic picker entry (GH #66) while
-    an unbound topic is in the directory/session/window picker, and flushes
-    them onto the freshly-bound route once the picker commits.
+    ATTACHMENTS in the thread's per-topic picker entry (GH #66) while an
+    unbound topic is in the directory/session/window picker, and flushes them
+    onto the freshly-bound route once the picker commits. GH #74: text is NOT
+    part of this — an unbound topic's text only opens the picker.
   - Window-creation helpers (``_create_and_bind_window``,
     ``_abort_created_window_after_pending_owner_change``,
     ``_cleanup_unbound_created_window``): shared by text_handler's
@@ -77,7 +78,6 @@ from .directory_browser import (
 )
 from .inbound_aggregator import (
     AggregatorReplayAttachment,
-    Provenance,
     aggregator_clear_route,
     aggregator_offer_document,
     aggregator_offer_photo,
@@ -153,9 +153,41 @@ class PendingAttachment:
     has_reply_context: bool = False
 
 
-# The provenance facts of a stashed pending TEXT payload (the same reason). Kept
-# inside this thread's picker entry beside ``_pending_thread_text``.
-_PENDING_TEXT_FACTS_KEY = "_pending_thread_text_facts"
+# GH #74: a text message into an UNBOUND topic is the KNOCK that opens the
+# picker — never a payload. It is not stashed and never replayed, so the picker
+# card has to say so BEFORE the user can be surprised by a message that silently
+# went nowhere (the pre-#74 replay produced a refusal card, an alert and a
+# "please resend it here" for a "hi" the user never wanted delivered).
+UNBOUND_TEXT_TRIGGER_NOTICE = (
+    "_This message opened the picker — it won't be sent to Claude. "
+    "After binding, send your prompt._"
+)
+
+# The same fact for text that arrives while a picker or a trust card is ALREADY
+# up: the generic nudges only say "use the card above", which leaves the user to
+# discover on their own that what they typed went nowhere.
+UNBOUND_TEXT_NUDGE_NOTICE = (
+    "_This message won't be sent to Claude. Send your prompt once the topic is bound._"
+)
+
+# Written by a pre-#74 process into a thread's picker entry. Nothing reads them
+# any more, but a picker the user never finishes keeps its entry alive for the
+# lifetime of the process, so the text would sit in ``user_data`` forever.
+_LEGACY_PENDING_TEXT_KEYS = ("_pending_thread_text", "_pending_thread_text_facts")
+
+
+def _drop_legacy_text_payload(entry: dict[str, Any]) -> None:
+    """Migration-on-access: scrub a pre-#74 text stash out of ``entry``.
+
+    Runs INSIDE ``claim_unbound_inbound``'s critical section (it is passed as
+    the ``stash`` hook) and at the head of the attachment stashes, so every
+    inbound that touches an unbound topic's entry cleans it. It touches ONLY the
+    dead keys — attachments, picker state and ownership are left exactly as they
+    were, because an in-flight picker must survive the scrub.
+    """
+    for key in _LEGACY_PENDING_TEXT_KEYS:
+        if entry.pop(key, None) is not None:
+            logger.info("dropped legacy pre-GH#74 pending-text key %s", key)
 
 
 def _pending_owner_matches(user_data: dict | None, thread_id: int | None) -> bool:
@@ -177,12 +209,12 @@ def _clear_pending_route_payload(
 ) -> list[PendingAttachment]:
     """Drop ``thread_id``'s whole picker entry and optionally delete its files.
 
-    Pending text/photo/document data lives inside the thread's picker entry
-    while the user is choosing a directory/window/session. Cancel, bind failure,
-    and the successful-flush clear all drop the entry as a unit (state, browse
-    caches, text, and attachments) — otherwise a later bind could forward media
-    the user already cancelled. GH #66: thread-scoped, so dropping one topic's
-    entry never touches another's.
+    Pending photo/document data lives inside the thread's picker entry while the
+    user is choosing a directory/window/session. Cancel, bind failure, and the
+    successful-flush clear all drop the entry as a unit (state, browse caches,
+    attachments — and any legacy pre-#74 text stash) — otherwise a later bind
+    could forward media the user already cancelled. GH #66: thread-scoped, so
+    dropping one topic's entry never touches another's.
     """
     entry = drop_picker_entry(user_data, thread_id)
     if entry is None:
@@ -244,7 +276,7 @@ async def _flush_pending_route_payload(
     route: tuple[int, int, str],
     user_data: dict | None,
 ) -> DeliveryResult | None:
-    """Synchronously replay the pending first-turn payload for a new binding.
+    """Synchronously replay the pending ATTACHMENTS for a new binding.
 
     Returns the STRUCTURED delivery result when a pending payload was attempted,
     and ``None`` when there was no pending payload. GH #50 §1.4: the bare
@@ -252,6 +284,10 @@ async def _flush_pending_route_payload(
     case — the very first message into a brand-new window lands while Claude is
     blocked on "Do you trust the files in this folder?", so the refusal must
     name it.
+
+    GH #74: TEXT no longer has a leg here. An unbound topic's text is a knock,
+    not a payload, so the only thing that can still be waiting on a bind is a
+    photo/document the user would otherwise have to re-upload.
 
     Pending picker state is cleared before sending to make callback
     double-clicks idempotent; on failure, route buffers are cleared and
@@ -268,15 +304,13 @@ async def _flush_pending_route_payload(
         return None
 
     entry = picker_entry(user_data, route[1])
-    pending_text = entry.get("_pending_thread_text") if entry else None
-    pending_facts = entry.get(_PENDING_TEXT_FACTS_KEY) if entry else None
     pending_attachments: list[PendingAttachment] = (
         list(entry.get("_pending_thread_attachments") or []) if entry else []
     )
     if user_data is not None:
         _clear_pending_route_payload(user_data, route[1], delete_files=False)
 
-    if not pending_text and not pending_attachments:
+    if not pending_attachments:
         return None
 
     replay_attachments = [
@@ -288,21 +322,13 @@ async def _flush_pending_route_payload(
         )
         for attachment in pending_attachments
     ]
-    text_provenance = (
-        Provenance(
-            typed_text=bool(pending_facts.get("typed_text")),
-            reply_context=bool(pending_facts.get("reply_context")),
-        )
-        if isinstance(pending_facts, dict)
-        else None
-    )
 
     try:
         result = await aggregator_replay_payload(
             route,
-            text=pending_text if isinstance(pending_text, str) else None,
+            text=None,
             attachments=replay_attachments,
-            text_provenance=text_provenance,
+            text_provenance=None,
         )
     except Exception as e:
         logger.error("pending route payload replay raised for route %s: %s", route, e)
@@ -552,6 +578,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         def _stash_photo(entry: dict[str, Any]) -> None:
             # §2.8.3 photo-in-unbound-topic: stash the path so the picker's
             # flush can feed the aggregator for the freshly-bound route.
+            _drop_legacy_text_payload(entry)
             entry.setdefault("_pending_thread_attachments", []).append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
@@ -966,6 +993,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
 
         def _stash_document(entry: dict[str, Any]) -> None:
+            _drop_legacy_text_payload(entry)
             entry.setdefault("_pending_thread_attachments", []).append(
                 PendingAttachment(
                     str(file_path), caption, media_group_id, has_reply_ctx
@@ -1198,55 +1226,57 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = update.message.text
 
-    # §2.5.1: render any reply-context BEFORE the _pending_thread_text stash
-    # paths below — otherwise a brand-new-topic flow (where the directory
-    # browser holds the text while the user picks a directory) would lose
-    # the quote when it eventually flushes via _create_and_bind_window.
+    # §2.5.1: render any reply-context here, BEFORE the ownership decision
+    # below, because the "a binding landed while we were deciding" arm falls
+    # through to the bound aggregator path and must carry the same quote block
+    # as any other bound text turn.
     text, has_reply_ctx = await _apply_reply_context(
         update.message, user.id, thread_id, text
     )
 
     if wid is None:
-
-        def _stash_text(entry: dict[str, Any]) -> None:
-            entry["_pending_thread_text"] = text
-            # Carry the OBSERVED provenance across the stash so the pending-bind
-            # replay is classified the same way a live offer would be
-            # (plan §2.3 [r4 P2-1]).
-            entry[_PENDING_TEXT_FACTS_KEY] = {
-                "typed_text": True,
-                "reply_context": has_reply_ctx,
-            }
-
         # GH #65 Fix 5 (+ review r1 P1-2): ``_apply_reply_context`` above and the
         # browser build below are AWAITS a binding or a creation flow can
         # complete inside, so the ownership read and the mutation it authorizes
         # share ONE critical section. This SUBSUMES the pre-#65 mid-picker nudge
         # block that used to run here: reading a DETACHED entry after the
-        # reply-context await could nudge (and DISCARD the payload) for a topic
-        # whose binding had just landed. A binding now always wins — the payload
-        # is delivered — and a live picker still gets its own state-specific
-        # nudge. ``stash_on_picker=False`` keeps the pre-#65 behavior that a text
-        # message arriving mid-picker is a nudge, not a stash.
+        # reply-context await could nudge for a topic whose binding had just
+        # landed. A binding now always wins — the payload is delivered — and a
+        # live picker still gets its own state-specific nudge.
+        #
+        # GH #74: the ``stash`` hook STORES NOTHING. Unbound-topic text is the
+        # knock that opens the picker, in every ownership state — browser,
+        # mid-picker nudge, and trust-card nudge alike — so nothing is replayed
+        # onto the fresh binding and there is no payload for the delivery gate
+        # to refuse against a TUI that has not finished rendering. The hook is
+        # passed only because it is the one callback that runs on the entry
+        # INSIDE the lock, which is where a pre-#74 process's leftover text
+        # stash gets scrubbed.
         decision = await trust_flow.claim_unbound_inbound(
             user.id,
             thread_id,
             context.user_data,
             session_manager,
             build_browser=_build_browser_payload,
-            stash=_stash_text,
-            stash_on_picker=False,
+            stash=_drop_legacy_text_payload,
         )
+        # EVERY text reply here says the message is going nowhere. The nudges
+        # alone only point at the card, which leaves the user to discover on
+        # their own that what they typed was discarded.
         if decision.kind == "trust_owned":
-            await safe_reply(update.message, trust_flow.TRUST_NUDGE)
-            return
-        if decision.kind == "picker_owned":
             await safe_reply(
                 update.message,
-                trust_flow.PICKER_NUDGES.get(
-                    decision.picker_state or "",
-                    "Please use the picker above, or tap Cancel.",
-                ),
+                f"{trust_flow.TRUST_NUDGE_TEXT}\n\n{UNBOUND_TEXT_NUDGE_NOTICE}",
+            )
+            return
+        if decision.kind == "picker_owned":
+            nudge = trust_flow.PICKER_NUDGES.get(
+                decision.picker_state or "",
+                "Please use the picker above, or tap Cancel.",
+            )
+            await safe_reply(
+                update.message,
+                f"{nudge}\n\n{UNBOUND_TEXT_NUDGE_NOTICE}",
             )
             return
         if decision.kind == "browser":
@@ -1265,7 +1295,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             sent = await safe_reply(
                 update.message,
-                decision.browser.text,
+                f"{decision.browser.text}\n\n{UNBOUND_TEXT_TRIGGER_NOTICE}",
                 reply_markup=decision.browser.keyboard,
             )
             _remember_picker_card(decision.entry, sent)
@@ -1493,7 +1523,7 @@ async def _create_and_bind_window(
     session_mgr: Any,
     resume_session_id: str | None = None,
 ) -> None:
-    """Create a tmux window, bind it to a topic, and forward pending text.
+    """Create a tmux window, bind it to a topic, and replay pending attachments.
 
     Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
     """
@@ -1812,12 +1842,12 @@ async def _create_and_bind_window(
 
             if not track_sid:
                 # Non-resume + hook timeout: we don't know the session_id, so
-                # any pending text we send produces a response the monitor
+                # any pending payload we send produces a response the monitor
                 # cannot route back. Surface the failure instead of silently
                 # dropping the first reply.
                 logger.warning(
                     "Hook timed out for new window %s — refusing to forward "
-                    "pending text since session is unmonitored",
+                    "the pending payload since session is unmonitored",
                     created_wid,
                 )
                 await safe_edit(
@@ -1965,9 +1995,10 @@ async def _create_and_bind_window(
 
             status = "Resumed" if resume_session_id else "Created"
 
-            # Replay pending text and/or attachments through the synchronous
-            # aggregator helper so §2.8.2 formatting is preserved without
-            # offer-path background/intermediate flushes hiding failures.
+            # Replay any pending attachments through the synchronous aggregator
+            # helper so §2.8.2 formatting is preserved without offer-path
+            # background/intermediate flushes hiding failures. GH #74: text never
+            # reaches here — the message that opened the picker was a knock.
             route = (user.id, pending_thread_id, created_wid)
             pending_delivered = await _flush_pending_route_payload(
                 route, context.user_data
@@ -1977,17 +2008,19 @@ async def _create_and_bind_window(
                 # window's very first turn lands on the folder-trust prompt.
                 await safe_edit(
                     query,
-                    f"✅ {message}\n\n{status}, but the first message was not "
-                    f"delivered.\n\n⚠️ {pending_delivered.message}\n\n"
+                    f"✅ {message}\n\n{status}, but the pending attachment was "
+                    f"not delivered.\n\n⚠️ {pending_delivered.message}\n\n"
                     "The pending payload was cleared; please resend it here.",
                 )
                 await safe_answer(
-                    query, f"{status}; first message not delivered", show_alert=True
+                    query,
+                    f"{status}; pending attachment not delivered",
+                    show_alert=True,
                 )
                 return
 
             first_turn_note = (
-                " First message sent."
+                " Pending attachment sent."
                 if pending_delivered is not None and pending_delivered.ok
                 else ""
             )

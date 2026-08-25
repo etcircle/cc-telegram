@@ -493,7 +493,6 @@ async def test_a_flow_installed_in_the_teardown_to_clear_gap_is_cleaned_up() -> 
     assert flow is not None
     entry = picker_entry(user_data, _THREAD)
     assert entry is not None
-    entry["_pending_thread_text"] = "queued"
     await asyncio.sleep(0.03)
 
     dropped = await asyncio.wait_for(

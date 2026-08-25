@@ -85,7 +85,7 @@ cc-telegram doctor
 cc-telegram
 ```
 
-Now send a message in a Telegram topic. The first message opens a directory picker so you can choose which project that topic should use.
+Now send a message in a Telegram topic. The first message opens a directory picker so you can choose which project that topic should use. That message is only the knock: it opens the picker and is not sent to Claude, so type your actual prompt once the topic is bound. A photo or document sent into an unbound topic is the exception — it is held and delivered after the bind, so you never have to upload it twice.
 
 For daily use on macOS, install the included LaunchAgent:
 
@@ -253,9 +253,9 @@ Now the picker card turns into a 🔐 trust card showing the directory, with
 **Trust this folder** and **Cancel — close the window**. Tapping Trust drives
 the real prompt in the terminal the same way the other one-tap cards do — it
 moves the cursor, verifies it landed on the right option, and only then presses
-Enter — and once Claude finishes starting, the topic binds and your first
-message is delivered. Tapping Cancel closes the window without typing anything
-into it. Answering in tmux yourself works too; the bot notices and binds.
+Enter — and once Claude finishes starting, the topic binds and is ready for your
+prompt. Tapping Cancel closes the window without typing anything into it.
+Answering in tmux yourself works too; the bot notices and binds.
 
 Anything it cannot read positively — a Claude version it has not characterised,
 an unrecognisable terminal — falls back to a display-only card, and a window it

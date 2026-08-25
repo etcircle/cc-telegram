@@ -2167,13 +2167,13 @@ async def _complete_bind(flow: TrustFlow, bot: Any, session_mgr: Any) -> None:
         await _edit_card(
             flow,
             bot,
-            f"✅ {flow.create_message}\n\nCreated, but the first message was not "
-            f"delivered.\n\n⚠️ {pending.message}\n\n"
+            f"✅ {flow.create_message}\n\nCreated, but the pending attachment was "
+            f"not delivered.\n\n⚠️ {pending.message}\n\n"
             "The pending payload was cleared; please resend it here.",
             None,
         )
     else:
-        note = " First message sent." if pending is not None and pending.ok else ""
+        note = " Pending attachment sent." if pending is not None and pending.ok else ""
         await _edit_card(
             flow,
             bot,
@@ -2974,11 +2974,22 @@ class InboundDecision:
     entry: dict[str, Any] | None = None
 
 
-TRUST_NUDGE: Final[str] = (
+_TRUST_WAIT: Final[str] = (
     "🔐 Claude is waiting for you to trust the folder — tap ✅ on the card "
-    "above, or answer in the tmux window. Your message is queued and will be "
-    "sent as soon as the session is up."
+    "above, or answer in the tmux window."
 )
+
+# The ATTACHMENT lane, where the queue promise is still true: a photo/document
+# arriving while the flow owns the topic IS held and replayed once the bind
+# lands (GH #74 kept that leg alive).
+TRUST_NUDGE: Final[str] = (
+    f"{_TRUST_WAIT} Your message is queued and will be sent as soon as the "
+    "session is up."
+)
+
+# The TEXT lane. GH #74: text is never held, so the queue promise would be a
+# lie. The caller appends its own "this won't be sent" line.
+TRUST_NUDGE_TEXT: Final[str] = _TRUST_WAIT
 
 PICKER_NUDGES: Final[dict[str, str]] = {
     STATE_BROWSING_DIRECTORY: "Please use the directory browser above, or tap Cancel.",
@@ -2996,7 +3007,6 @@ async def claim_unbound_inbound(
     build_browser: Callable[[], Any] | None = None,
     browse_start_path: str | None = None,
     stash: Callable[[dict[str, Any]], None] | None = None,
-    stash_on_picker: bool = True,
 ) -> InboundDecision:
     """Fix 5 — decide AND mutate inside ONE critical section (review r1 P1-2).
 
@@ -3020,9 +3030,10 @@ async def claim_unbound_inbound(
         critical section, so the decision and the mutation are inseparable.
 
     ``stash`` runs INSIDE the lock so a payload can never land in an entry a
-    concurrent teardown already dropped. ``stash_on_picker=False`` keeps
-    text_handler's pre-#65 behavior (a text message arriving mid-picker is a
-    nudge, not a stash).
+    concurrent teardown already dropped. GH #74: an unbound topic's text is the
+    knock that opens the picker — text_handler's stash only scrubs the legacy
+    pre-upgrade text keys (``_drop_legacy_text_payload``) and stores nothing;
+    the only callers that hold a payload are the attachment handlers.
     """
     browser: BrowserPayload | None = None
     for _ in range(2):
@@ -3044,7 +3055,7 @@ async def claim_unbound_inbound(
                     stash(entry)
                 return InboundDecision("trust_owned", picker_state=state)
             if entry is not None and state in _PICKER_CHROME_STATES:
-                if stash is not None and stash_on_picker:
+                if stash is not None:
                     stash(entry)
                 return InboundDecision("picker_owned", picker_state=state)
             if browser is not None or build_browser is None:

@@ -206,7 +206,6 @@ async def test_window_picker_rejects_window_that_became_bound_after_render():
         {
             STATE_KEY: STATE_SELECTING_WINDOW,
             UNBOUND_WINDOWS_KEY: ["@0"],
-            "_pending_thread_text": "hello",
         }
     )
     window = MagicMock()

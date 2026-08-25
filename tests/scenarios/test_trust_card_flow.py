@@ -324,6 +324,19 @@ def _document_update(scenario: ScenarioHarness, on_download: Any = None) -> Any:
     return update
 
 
+async def _queue_pending_document(scenario: ScenarioHarness) -> None:
+    """Park a real pending payload on the live flow.
+
+    GH #74: text into a topic the flow owns is a nudge and nothing more, so an
+    ATTACHMENT is the only payload a completion tail can still have to replay —
+    and the only way a scenario can hold that tail in flight through the pane
+    captures the replay's delivery gate takes.
+    """
+    await bot_module.document_handler(_document_update(scenario), scenario.context)
+    entry = picker_entry(scenario.user_data, _THREAD)
+    assert entry is not None and entry.get("_pending_thread_attachments")
+
+
 # ── The issue's regression test ──────────────────────────────────────────────
 
 
@@ -345,10 +358,11 @@ async def test_trust_prompt_yields_a_card_not_a_kill(
     cbs = _card_keyboards(scenario)[-1]
     assert any(c.startswith(f"{CB_TRUST_PICK}t:") for c in cbs), cbs
     assert any(c.startswith(f"{CB_TRUST_PICK}c:") for c in cbs), cbs
-    # The first message is still queued for the post-bind replay.
+    # GH #74: the message that opened the picker was a knock — nothing is
+    # queued for a post-bind replay.
     entry = picker_entry(scenario.user_data, _THREAD)
     assert entry is not None
-    assert entry["_pending_thread_text"] == "hello claude"
+    assert "_pending_thread_text" not in entry
     assert entry[STATE_KEY] == trust_flow.STATE_AWAITING_TRUST
 
 
@@ -428,8 +442,8 @@ async def test_trust_tap_navigates_verifies_enters_then_binds(
     assert pane.committed == 1, "Enter must commit the CURSORED first option"
 
     # Claude finishes booting (the welcome/REPL is painted) and the session
-    # registers; the WAIT task completes the bind + replays the queued first
-    # message through the normal gated delivery transaction.
+    # registers; the WAIT task completes the bind and replays whatever payload
+    # the picker was holding through the normal gated delivery transaction.
     pane.post_commit = IDLE_PANE_V2_1_207
     scenario.session_manager.window_states.clear()
     scenario._write_session_map_entry(wid, "sid-trust", "/repo")
@@ -440,6 +454,34 @@ async def test_trust_tap_navigates_verifies_enters_then_binds(
     assert scenario.session_manager.thread_bindings[scenario.user_id][_THREAD] == wid
     assert picker_entry(scenario.user_data, _THREAD) is None
     assert any("Send messages here" in t for t in _card_edits(scenario))
+
+
+@pytest.mark.asyncio
+async def test_gh74_the_trust_lane_bind_delivers_nothing_for_a_text_knock(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GH #74 on the #65 creation lane — the third replay site.
+
+    The text that opened the picker is a knock, so the completion tail has
+    nothing to replay: the pane is never typed into and the card never carries
+    the "first message" copy the replay used to produce.
+    """
+    wid, pane = await _start_flow(scenario, monkeypatch)
+    await _tap(scenario, _trust_button(scenario))
+    pane.post_commit = IDLE_PANE_V2_1_207
+    scenario.session_manager.window_states.clear()
+    scenario._write_session_map_entry(wid, "sid-trust-74", "/repo")
+    task = trust_flow.flow_task(scenario.user_id, _THREAD)
+    assert task is not None
+    await asyncio.wait_for(task, timeout=5)
+
+    assert scenario.session_manager.thread_bindings[scenario.user_id][_THREAD] == wid
+    assert scenario.tmux.written_texts == [], scenario.tmux.written_texts
+    cards = _card_edits(scenario)
+    assert not any("message sent" in t.lower() for t in cards), cards
+    assert not any("attachment sent" in t.lower() for t in cards), cards
+    assert not any("not delivered" in t for t in cards), cards
+    assert any("Send messages here" in t for t in cards), cards
 
 
 @pytest.mark.asyncio
@@ -523,10 +565,10 @@ async def test_cancel_kills_the_window_without_a_single_keystroke(
 
 
 @pytest.mark.asyncio
-async def test_text_during_awaiting_trust_queues_and_nudges(
+async def test_text_during_awaiting_trust_nudges_without_queueing(
     scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No browser rebuild may race a live flow; the payload is queued."""
+    """No browser rebuild may race a live flow; and GH #74: nothing is queued."""
     await _start_flow(scenario, monkeypatch)
     update = make_update_text("second message", thread_id=_THREAD)
 
@@ -534,10 +576,15 @@ async def test_text_during_awaiting_trust_queues_and_nudges(
 
     reply = update.message.reply_text.await_args.args[0]
     assert "trust the folder" in reply
+    # The nudge must not promise a delivery that will never happen, and must
+    # say so rather than leaving the user to find out (GH #74).
+    assert "queued" not in reply, reply
+    assert "won't be sent to Claude" in reply, reply
+    assert "once the topic is bound" in reply, reply
     entry = picker_entry(scenario.user_data, _THREAD)
     assert entry is not None
     assert entry[STATE_KEY] == trust_flow.STATE_AWAITING_TRUST
-    assert entry["_pending_thread_text"] == "second message"
+    assert "_pending_thread_text" not in entry
     assert scenario.tmux.kill_calls == []
 
 
@@ -723,7 +770,7 @@ async def test_resume_creation_never_enters_the_trust_lane(
         "x", bot=scenario.bot, thread_id=_THREAD, user_id=scenario.user_id
     )
     query = update.callback_query
-    ensure_picker_entry(scenario.user_data, _THREAD)["_pending_thread_text"] = "hi"
+    ensure_picker_entry(scenario.user_data, _THREAD)
     await inbound_module._create_and_bind_window(
         query,
         scenario.context,
@@ -969,9 +1016,10 @@ async def test_p2_3_start_during_completing_bind_awaits_and_tears_down_bound(
     """
     wid, pane = await _start_flow(scenario, monkeypatch)
     # The prompt is answered and the REPL is up, so the tail's replay of the
-    # queued first message actually lands.
+    # queued attachment actually lands.
     pane.post_commit = IDLE_PANE_V2_1_207
     pane.committed = 1
+    await _queue_pending_document(scenario)
     # The session registers, so the very next slice claims ``completing_bind``
     # and starts the tail; the slow capture holds that tail IN FLIGHT while
     # ``/start`` fires at it.
@@ -1001,6 +1049,7 @@ async def test_p2_3_topic_close_during_completing_bind_awaits_the_tail(
     wid, pane = await _start_flow(scenario, monkeypatch)
     pane.post_commit = IDLE_PANE_V2_1_207
     pane.committed = 1
+    await _queue_pending_document(scenario)
     pane.capture_delay = 0.15
     scenario._write_session_map_entry(wid, "sid-close-race", "/repo")
     await _await_phase(scenario, trust_flow.PHASE_COMPLETING_BIND)
@@ -1309,7 +1358,7 @@ async def test_r6_a_current_route_binding_delivers_the_queued_payload(
     scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A Cancel whose window is bound to THIS topic is a completion, not a
-    cancellation: the queued first message is DELIVERED and its file survives.
+    cancellation: the queued attachment is DELIVERED and its file survives.
 
     ``cleanup_created_window`` only proves the window is bound SOMEWHERE, so the
     two cases have to be told apart (review r6 P2).
@@ -1317,9 +1366,7 @@ async def test_r6_a_current_route_binding_delivers_the_queued_payload(
     wid, pane = await _start_flow(scenario, monkeypatch)
     pane.post_commit = IDLE_PANE_V2_1_207
     pane.committed = 1
-    entry = picker_entry(scenario.user_data, _THREAD)
-    assert entry is not None
-    assert entry["_pending_thread_text"] == "hello claude"
+    await _queue_pending_document(scenario)
 
     # THIS topic is bound to the created window.
     scenario.bind_thread(
@@ -1340,7 +1387,9 @@ async def test_r6_a_current_route_binding_delivers_the_queued_payload(
 
     assert outcome is trust_flow.CleanupOutcome.SPARED_BOUND
     assert scenario.tmux.kill_calls == [], "a bound window is never killed"
-    assert scenario.tmux.delivered("hello claude"), scenario.tmux.written_texts
+    written = scenario.tmux.written_texts
+    assert any("notes.txt" in t for t in written), written
+    assert scenario.tmux.committed, scenario.tmux.sent_keys
     assert not any("Cancelled" in t for t in _card_edits(scenario)), _card_edits(
         scenario
     )

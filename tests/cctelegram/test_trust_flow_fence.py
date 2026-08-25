@@ -523,7 +523,6 @@ async def test_a_current_route_binding_delivers_the_pending_payload(
     payload.write_bytes(b"data")
     user_data: dict[str, Any] = {}
     entry = _seed(user_data)
-    entry["_pending_thread_text"] = "hello"
     from cctelegram.handlers.inbound_telegram import PendingAttachment
 
     entry["_pending_thread_attachments"] = [
