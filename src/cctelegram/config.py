@@ -344,6 +344,35 @@ class Config:
             "CC_TELEGRAM_FREE_TEXT_ANSWERS", "true"
         ).strip().lower() in ("1", "true", "yes", "on")
 
+        # GH #76 — headless-registration guard. Default ON; set ``=false`` to
+        # disable. NOTE an explicit UNRECOGNIZED value also parses false — only
+        # unset/empty inherits the ON default. When ON, the SessionStart hook
+        # refuses to write ``session_map.json`` if a ``claude`` ancestor of the
+        # hook process runs in headless ``--print``/``-p`` mode. A hook-spawned
+        # headless run (a threshold- or SessionEnd-triggered ``/self-curate``,
+        # say) INHERITS the interactive session's ``TMUX_PANE`` and cwd, so
+        # without the guard it registers under the interactive window's key;
+        # last-writer-wins then flips routing AND tracking to the headless sid
+        # and every subsequent Telegram message for that window is silently
+        # dropped. Detection is preventive because a landed hijack drops the
+        # per-parent sidechain registries irrecoverably.
+        #
+        # Linux only — the walk reads ``/proc``; where it is absent (macOS) the
+        # guard is inert and registration proceeds. FAIL-OPEN by construction:
+        # any probe failure registers normally, since a fail-closed bug would
+        # stop ALL session registration.
+        #
+        # config OWNS this canonical declaration for documentation + the README
+        # sync rule; ``hook`` is a pure stdlib leaf that must NOT import config
+        # (which raises without a bot token) and reads the SAME env var via a
+        # LOCAL ``os.getenv``. There is no seeding seam here — the hook is a
+        # separate short-lived process, so its own read is the only authority.
+        # Default ON; only an explicit false token ("0"/"false"/"no"/"off")
+        # disarms it — empty or unrecognized values inherit the default.
+        self.headless_registration_guard = os.getenv(
+            "CC_TELEGRAM_HEADLESS_REGISTRATION_GUARD", "true"
+        ).strip().lower() not in ("0", "false", "no", "off")
+
         # Artifact delivery lane (handlers/artifacts.py). When Claude's prose
         # mentions a deliverable local file, the bot offers a 📎 tap-to-download
         # card; ``/file <path>`` is the durable escape hatch. config OWNS these
