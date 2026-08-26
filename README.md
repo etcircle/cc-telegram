@@ -370,6 +370,7 @@ Everything else has a default.
 - `CC_TELEGRAM_DECISION_CARDS` surfaces otherwise unsupported numbered confirmation prompts as display-only cards. Default: true (set `CC_TELEGRAM_DECISION_CARDS=false` to disable).
 - `CC_TELEGRAM_DECISION_DISPATCH` enables verified one-tap dispatch for known-good decision families when decision cards are also enabled. Unknown prompts and uncharacterised Claude versions remain display-only.
 - `CC_TELEGRAM_FREE_TEXT_ANSWERS` lets a plain message (typed or voice, including a swipe-reply that quotes the card) answer a live question card in your own words, by driving the card's free-text row. Default: true (set `CC_TELEGRAM_FREE_TEXT_ANSWERS=false` to fall back to refusing those messages). Limited to Claude Code versions cc-telegram has characterised; an uncharacterised version disables the lane by itself. It also requires the `PreToolUse(AskUserQuestion)` hook, because that hook is what identifies *which* question you are answering. Without it, those messages are refused rather than delivered. Plan approvals are deliberately not covered. See [you can still answer a question card in your own words](#but-you-can-still-answer-a-question-card-in-your-own-words).
+- `CC_TELEGRAM_HEADLESS_REGISTRATION_GUARD` stops a headless Claude run (`claude --print`) from claiming the tmux window of the interactive session that spawned it. Default: true (set `CC_TELEGRAM_HEADLESS_REGISTRATION_GUARD=false` to disable). A headless child inherits the parent's `TMUX_PANE`, so without the guard its SessionStart hook overwrites the window's entry in `session_map.json` and your messages stop arriving while the topic still looks alive. The check reads `/proc`, so it only applies on Linux; elsewhere it does nothing. If it cannot tell either way it registers as usual.
 - `CC_TELEGRAM_ARTIFACT_MAX_MB` sets the maximum upload size for attachment cards and `/file`. Default: 45 MB; Telegram's bot limit is 50 MB.
 - `CC_TELEGRAM_ARTIFACT_ROOTS` adds comma-separated absolute directories that may serve files in addition to the active session directory.
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` limits the input preview shown in tool lines. Default: 40.
@@ -507,7 +508,7 @@ This updates `~/.claude/settings.json` with three entries:
 
 The hooks have separate jobs:
 
-- `SessionStart` writes `session_map.json` so messages return to the right tmux window.
+- `SessionStart` writes `session_map.json` so messages return to the right tmux window. It skips the write when the session it is registering was started headlessly — a `claude --print` run spawned by another hook, which inherits the interactive session's pane and would otherwise take the window's binding for itself. That check reads `/proc` and so applies on Linux only; see `CC_TELEGRAM_HEADLESS_REGISTRATION_GUARD`.
 - `PreToolUse` captures the structured AskUserQuestion payload before Claude renders its picker. It is also what tells one question apart from another, so **without it a plain message sent at a question card is refused rather than delivered as the answer** — see [you can still answer a question card in your own words](#but-you-can-still-answer-a-question-card-in-your-own-words).
 - `Notification` records that Claude is blocked on an approval prompt that may never appear in the session JSONL.
 

@@ -4,6 +4,29 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.13] — 2026-08-26
+
+### Fixed
+- **A background job could silently kill Telegram delivery for the session that started it
+  (GH #76).** Messages stopped arriving for an interactive session — no error, no warning, the
+  topic still showing a live pane — after a hook-spawned headless run (`claude --print`, e.g. a
+  threshold- or SessionEnd-triggered `/self-curate`) started in the same window. The headless
+  child inherits the parent's `TMUX_PANE` and cwd, so its own SessionStart hook registered it in
+  `session_map.json` under the *interactive* window's key; last-writer-wins then handed both the
+  routing authority and the tracking authority to the headless session id, untracking the
+  interactive session along with its per-parent sidechain registries. `CLAUDE_CODE_ENTRYPOINT`
+  cannot separate the two — the child inherits that too — so the hook now inspects the nearest
+  `claude` ancestor's argv and declines to register when it finds an exact `-p` or `--print`
+  token. The fix has to be preventive: once a hijack lands the dropped registries cannot be
+  recovered. Fail-open by construction — no `/proc` (macOS), a vanished pid, an unreadable
+  status file or any other probe failure all register normally, because a fail-closed bug here
+  would stop *all* session registration. Residual: the guard is inert on macOS. The related
+  bridge-side rebind gate remains open on #76.
+
+### Added
+- `CC_TELEGRAM_HEADLESS_REGISTRATION_GUARD` (default true) turns the headless-registration guard
+  above off.
+
 ## [0.4.12] — 2026-08-26
 
 ### Changed

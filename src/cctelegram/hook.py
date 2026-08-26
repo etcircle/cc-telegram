@@ -36,6 +36,7 @@ uses utils.app_dir(), which only needs CC_TELEGRAM_DIR.
 """
 
 import argparse
+import dataclasses
 import fcntl
 import json
 import logging
@@ -60,6 +61,14 @@ _SESSION_START_TIMEOUT_S = 5
 _PRE_TOOL_USE_TIMEOUT_S = 2
 _NOTIFICATION_TIMEOUT_S = 2
 HookStatus = Literal["current", "missing"]
+
+# GH #76 — how far up the process tree to look for a headless ``claude``.
+# The hook process sits 1-2 hops under the claude that spawned it (shell
+# wrapper in between); 5 hops is generous headroom without walking to init.
+_HEADLESS_ANCESTOR_MAX_HOPS = 5
+# Exact argv tokens that put Claude Code in headless (non-interactive) mode.
+# EXACT match only — ``--print-foo`` is a different flag and must not match.
+_HEADLESS_ARGV_TOKENS = ("-p", "--print")
 
 
 def _command_matches(cmd: str, suffix: str) -> bool:
@@ -264,6 +273,101 @@ def _resolve_tmux_window_key(
     return parts[0], parts[1], parts[2]
 
 
+@dataclasses.dataclass(frozen=True)
+class _HeadlessMatch:
+    """A headless ``claude`` ancestor of this hook process (GH #76)."""
+
+    ancestor_pid: int
+    argv_token: str  # the EXACT token found: "-p" or "--print"
+
+
+def _read_proc_ppid(proc_root: Path, pid: int) -> int | None:
+    """Return the parent pid from ``<proc_root>/<pid>/status``, or None."""
+    for line in (proc_root / str(pid) / "status").read_text().splitlines():
+        if line.startswith("PPid:"):
+            raw = line.split(":", 1)[1].strip()
+            return int(raw) if raw.isdigit() else None
+    return None
+
+
+def _find_headless_claude_ancestor(
+    proc_root: Path = Path("/proc"),
+) -> _HeadlessMatch | None:
+    """Return the headless ``claude`` ancestor of this process, or None.
+
+    GH #76: a hook-spawned headless run (``claude --print``, e.g. a
+    threshold-triggered ``/self-curate``) INHERITS the interactive session's
+    ``TMUX_PANE`` and cwd, so its SessionStart hook would register itself in
+    ``session_map.json`` under the interactive window's key. Last-writer-wins
+    then flips both the routing and the tracking authority to the headless sid,
+    untracking the interactive session and its per-parent sidechain registries —
+    every subsequent interactive message is silently dropped while pane-polling
+    keeps the topic looking alive. The hijack is unrecoverable once landed, so
+    detection has to be preventive: refuse to register at all.
+
+    ``CLAUDE_CODE_ENTRYPOINT`` cannot be used for this — it is INHERITED by the
+    hook-spawned child, which is precisely why the sdk- skip in ``hook_main``
+    does not cover this lane. Only argv inspection distinguishes them.
+
+    Walk at most ``_HEADLESS_ANCESTOR_MAX_HOPS`` hops up from ``os.getppid()``
+    via ``<proc_root>/<pid>/status`` (``PPid:``) and ``<proc_root>/<pid>/comm``,
+    stopping at the FIRST ancestor whose comm is ``claude``. That process's
+    ``cmdline`` is split on NUL and matched against EXACT argv tokens — a
+    prefix like ``--print-foo`` is a different flag and does not match.
+
+    FAIL OPEN, always. Every failure mode — no claude ancestor, a vanished or
+    unreadable proc entry (racing process exit), a malformed status file, walk
+    depth exhausted, or a non-Linux host with no ``/proc`` at all — returns
+    None, meaning "register normally". A fail-CLOSED bug here would stop ALL
+    session registration, which is strictly worse than the bug it guards.
+    Residual: on macOS the guard is inert (no ``ps`` fallback — textual
+    ``ps args=`` output cannot reliably reconstruct exact argv tokens).
+
+    ``proc_root`` is a parameter so tests can drive a fake proc tree.
+    """
+    try:
+        pid = os.getppid()
+        for _ in range(_HEADLESS_ANCESTOR_MAX_HOPS):
+            if pid <= 0:
+                return None
+            comm = (proc_root / str(pid) / "comm").read_text().strip()
+            if comm == "claude":
+                raw_cmdline = (proc_root / str(pid) / "cmdline").read_bytes()
+                argv = raw_cmdline.decode("utf-8", "replace").split("\0")
+                for token in _HEADLESS_ARGV_TOKENS:
+                    if token in argv:
+                        return _HeadlessMatch(ancestor_pid=pid, argv_token=token)
+                return None
+            parent = _read_proc_ppid(proc_root, pid)
+            if parent is None:
+                return None
+            pid = parent
+        return None
+    except (OSError, ValueError, UnicodeDecodeError):
+        # Vanished/unreadable/malformed proc entries: fail OPEN.
+        return None
+
+
+def _headless_guard_enabled() -> bool:
+    """Return whether the GH #76 headless-registration guard is armed.
+
+    Read LOCALLY (hook.py must not import config, which raises without a bot
+    token); ``config.headless_registration_guard`` owns the canonical
+    declaration for the README sync rule.
+    """
+    # Default ON; only an EXPLICIT false token disarms it. Empty or
+    # unrecognized values inherit the default (Codex r1 P2 — the positive
+    # parse would have silently disabled the guard on e.g. an empty export).
+    return os.getenv(
+        "CC_TELEGRAM_HEADLESS_REGISTRATION_GUARD", "true"
+    ).strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def _handle_session_start(payload: dict) -> int:
     """Write the window↔session mapping to session_map.json.
 
@@ -292,6 +396,30 @@ def _handle_session_start(payload: dict) -> int:
         session_id,
         cwd,
     )
+
+    # GH #76 — a headless (``claude --print``) registrant must NEVER claim the
+    # window key it merely INHERITED from the interactive session that spawned
+    # it. The helper is contractually non-raising, but the call is wrapped
+    # anyway: an exception escaping here would reach ``hook_main``'s catch-all,
+    # which returns WITHOUT registering — fail-CLOSED, the one outcome this
+    # guard must never produce. On any error we treat it as "no match" and
+    # register normally.
+    if _headless_guard_enabled():
+        try:
+            headless = _find_headless_claude_ancestor()
+        except Exception as e:  # noqa: BLE001 — fail-open is the whole point
+            logger.debug("Headless-ancestor probe failed, registering anyway: %s", e)
+            headless = None
+        if headless is not None:
+            logger.info(
+                "Skipping session_map registration for headless run "
+                "(sid=%s, key=%s, ancestor_pid=%d, argv_token=%s)",
+                session_id,
+                session_window_key,
+                headless.ancestor_pid,
+                headless.argv_token,
+            )
+            return 0
 
     from .utils import app_dir, atomic_write_json
 
