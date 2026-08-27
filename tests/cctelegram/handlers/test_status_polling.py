@@ -39,6 +39,7 @@ def _clear_interactive_state():
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
+    status_polling._drift_remint_latch.clear()  # GH #78 one-remint-per-source latch
     status_polling._auq_first_publish_defer.clear()
     status_polling._absent_streak.clear()
     status_polling._prev_run_state.clear()
@@ -48,6 +49,7 @@ def _clear_interactive_state():
     _interactive_msgs.clear()
     status_polling._last_pane_capture.clear()
     status_polling._last_published_ui_hash.clear()
+    status_polling._drift_remint_latch.clear()  # GH #78 one-remint-per-source latch
     status_polling._auq_first_publish_defer.clear()
     status_polling._absent_streak.clear()
     status_polling._prev_run_state.clear()
@@ -2581,9 +2583,13 @@ class TestPollerSourceDriftRemint:
 
             # No side file on disk → resolve_auq_source → pane, so the card's
             # minted side_file source has DRIFTED. The poller MUST re-mint (found
-            # by ROUTE despite the fingerprint mismatch) and NOT refresh.
+            # by ROUTE despite the fingerprint mismatch).
             mock_handle_ui.assert_awaited()
-            mock_refresh.assert_not_awaited()
+            # GH #78: the deadline refresh is no longer SKIPPED on a re-mint. A
+            # drift the re-mint cannot converge (render vs strict resolver
+            # disagreement) otherwise starved every tick's refresh and the live
+            # card's tokens TTL-expired underneath the user.
+            mock_refresh.assert_awaited()
         finally:
             pick_token.reset_for_tests()
 
@@ -3154,10 +3160,12 @@ class TestSiteBSourceDriftRemint:
                     mock_bot, user_id=1, window_id=window_id, thread_id=42
                 )
 
-            # Site (b) must detect the drift and re-mint, NOT refresh stale
-            # side_file tokens.
+            # Site (b) must detect the drift and re-mint.
             mock_handle_ui.assert_awaited()
-            mock_refresh.assert_not_awaited()
+            # GH #78: and STILL refresh the deadlines — the re-mint's True return
+            # used to early-return past this, TTL-killing a live Submit card's
+            # tokens whenever the drift could not converge.
+            mock_refresh.assert_awaited()
         finally:
             pick_token.reset_for_tests()
 

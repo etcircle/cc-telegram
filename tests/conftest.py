@@ -937,6 +937,7 @@ def _reset_status_polling() -> None:
     for name in (
         "_last_pane_capture",
         "_last_published_ui_hash",
+        "_drift_remint_latch",
         "_absent_streak",
         "_prev_run_state",
         "_decision_card_eot_grace",

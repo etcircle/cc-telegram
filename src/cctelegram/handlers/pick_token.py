@@ -5,10 +5,11 @@ minting a single-use token at render, caching sibling tokens so a same-form
 re-render stays byte-identical (Telegram ``MESSAGE_NOT_MODIFIED``), reading a
 token without consuming it, deriving the Wave-3 ledger key, and — the reason
 this module exists as one home — the atomic ``validate_and_consume`` that
-re-resolves the AUQ source through the SAME ``auq_source.resolve_auq_source``
-the minter used (measurable mint/validate SOURCE parity) and wins-or-loses the
-single-use consume by EXCLUSIVE RESERVATION without holding the store lock
-across pane/window I/O.
+re-parses the live pane against the source the card was MINTED against —
+``auq_source.resolve_minted_payload`` (measurable mint/validate SOURCE parity;
+GH #78: never a re-run of a differently-ordered priority chain) — and
+wins-or-loses the single-use consume by EXCLUSIVE RESERVATION without holding
+the store lock across pane/window I/O.
 
 Core responsibilities:
   - Own ``_pick_tokens`` (token → entry) and ``_pick_token_cache`` (route +
@@ -30,7 +31,7 @@ Key components:
   - ``mint`` / ``mint_row`` / ``peek`` / ``stable_key`` / ``prune_for_route``.
   - ``validate_and_consume`` — the atomic reservation-based finalizer.
 
-Stays a leaf: imports ``resolve_auq_source`` / ``ResolvedAuqSource`` from the
+Stays a leaf: imports ``resolve_minted_payload`` & friends from the
 ``auq_source`` LEAF — NEVER from ``interactive_ui`` (no import cycle). Pane
 capture / window lookup are INJECTED into ``validate_and_consume`` so this
 module has no telegram/tmux import and is unit-testable.
@@ -50,7 +51,7 @@ from . import auq_ledger, pick_intent
 from .auq_source import (
     RecoverySideFile,
     read_side_file_for_recovery,
-    resolve_auq_source,
+    resolve_minted_payload,
     side_file_live_for_session,
 )
 
@@ -538,6 +539,13 @@ class PickValidation:
     found at phase (a)); ``current_form`` is the live re-parse, supplied on
     ``ok`` so the caller's submit-guard can compare against the same form the
     consume validated.
+
+    ``pinned_payload`` (GH #78) is the MINTED source's ``tool_input``, resolved
+    exactly ONCE during phase (b) — before any keystroke — and handed back on
+    ``ok`` so the dispatcher's nav-verify and post-Enter confirm re-parse with
+    the SAME payload instead of re-peeking. ``None`` is meaningful (the ``pane``
+    kind pins to "no source dict"), which is why the pin result travels rather
+    than being re-derived downstream.
     """
 
     outcome: Literal[
@@ -551,6 +559,37 @@ class PickValidation:
     ]
     entry: PickTokenEntry | None
     current_form: AskUserQuestionForm | None
+    pinned_payload: dict | None = None
+
+
+def _log_pick_reject(
+    outcome: str,
+    entry: PickTokenEntry,
+    window_id: str,
+    current_form: AskUserQuestionForm | None,
+    pinned_ok: bool,
+) -> None:
+    """INFO-log the diagnosable quartet on a ``stale_form``/``source_drift``.
+
+    GH #78: the callback layer only logged ``minted_fp``, so a forever-rejecting
+    card gave no way to tell "the form moved" from "we validated against a
+    DIFFERENT source". Mirrors the ``aqt:`` toggle's reject log — minted fp, the
+    computed fp (or ``parse_none``), the minted (kind, source_fp), and what the
+    PIN did. Never logs question text.
+    """
+    logger.info(
+        "AUQ_PICK validate_reject=%s user=%d window=%s opt=%d minted_fp=%s "
+        "computed_fp=%s minted_src=%s minted_src_fp=%s pinned=%s",
+        outcome,
+        entry.user_id,
+        window_id,
+        entry.option_number,
+        entry.fingerprint[:8],
+        current_form.fingerprint()[:8] if current_form is not None else "parse_none",
+        entry.source_kind,
+        entry.source_fingerprint[:8],
+        "ok" if pinned_ok else "peek_none",
+    )
 
 
 _ReservePhaseA = tuple[PickValidation | None, PickTokenEntry | None, str | None]
@@ -695,11 +734,19 @@ async def validate_and_consume(
           mark RESERVED, release the lock.
       (b) Lock RELEASED — the slow work, wrapped in try/finally:
             find_window_by_id → ``window_gone`` if None; capture_pane;
-            resolve_auq_source (the SAME leaf resolver mint used) +
-            resolve_ask_form; FORM-fingerprint compare → ``stale_form``;
-            SOURCE compare (kind + source_fingerprint vs the minted tags) →
-            ``source_drift``; then phase (c). On a WINNING consume set
-            ``completed_ok = True``.
+            SOURCE PIN via ``resolve_minted_payload`` against the MINTED
+            (kind, source_fingerprint) — a MISS (the minted side_file /
+            jsonl_cache source vanished or was replaced) is ``source_drift``
+            (GH #78; deliberately NO strict-chain fallback, unlike the ``aqt:``
+            toggle lane); then resolve_ask_form with that PINNED payload.
+            Source parity needs no second compare: the pin only resolves on
+            canonical-fingerprint equality, and the ``pane`` kind's parity
+            witness IS the form fingerprint. The pinned payload rides back on
+            ``PickValidation.pinned_payload`` so the dispatcher's nav-verify +
+            post-Enter confirm reuse the SAME pin (pin ONCE per tap; never
+            re-peek after a keystroke). FORM-fingerprint compare → ``stale_form``;
+            (now honest: same source, so the live form really moved); then
+            phase (c). On a WINNING consume set ``completed_ok = True``.
           finally: if not completed_ok (modeled reject, raised exception, OR
             task cancellation), re-acquire the lock and unreserve the token
             ONLY IF it is still reserved by THIS call's ``reserved_by`` owner
@@ -731,7 +778,7 @@ async def validate_and_consume(
 
         # GH #54 capture spine (seam 3): the injected ``capture_pane`` returns the
         # ANSI frame; ``_capture_normalized_pair`` derives plain (region-equal to
-        # a plain capture, fed to the plain-only ``resolve_auq_source``) and
+        # a plain capture, fed to the plain-only pane re-parse) and
         # retains the raw for tier-2 SGR cursor detection so the nav delta comes
         # from a REAL parsed cursor on a chevron-less preview picker. A plain
         # frame (tests / a no-escape pane) normalizes to ``ansi == plain`` ⇒
@@ -739,24 +786,42 @@ async def validate_and_consume(
         # normalize REJECT takes the ONE plain re-capture (P2-A) — plain-only,
         # never a forever-``stale_form`` against a plain-fallback-rendered card.
         pane, pane_ansi = await _capture_normalized_pair(capture_pane, window_id)
-        live_source = resolve_auq_source(window_id, None, pane or "")
+        # GH #78 SOURCE PIN: re-parse against the source this token was MINTED
+        # against, resolved ONCE here (before any keystroke) and handed to the
+        # dispatcher so nav-verify + the post-Enter confirm reuse the SAME
+        # payload. NEVER a re-run of the strict priority chain: on a review
+        # screen the render resolver bails to ``pane`` while the strict chain
+        # falls through to ``jsonl_cache``, whose overlay fingerprint can never
+        # equal the pane-minted one → forever ``stale_form``.
+        pinned_payload, pinned_ok = resolve_minted_payload(
+            window_id, entry.source_kind, entry.source_fingerprint, pane or ""
+        )
+        if not pinned_ok:
+            # The minted side_file/jsonl_cache source is gone or was replaced.
+            # Honest label (pre-fix this was misreported as ``stale_form``: the
+            # form compare fired before the parity check). Deliberately NO
+            # fallback to ``resolve_auq_source`` — see resolve_minted_payload.
+            _log_pick_reject("source_drift", entry, window_id, None, False)
+            return PickValidation("source_drift", entry, None)
         current_form = (
-            resolve_ask_form(live_source.payload, pane, ansi_text=pane_ansi)
+            resolve_ask_form(pinned_payload, pane, ansi_text=pane_ansi)
             if pane
             else None
         )
 
         if current_form is None or current_form.fingerprint() != entry.fingerprint:
+            # Same source, different form — the live pane genuinely moved.
+            _log_pick_reject("stale_form", entry, window_id, current_form, True)
             return PickValidation("stale_form", entry, None)
 
-        # Source parity (measurable): the re-resolved (kind, source_fingerprint)
-        # must match the minted tags. Reachable only for side_file/jsonl_cache —
-        # for the pane kind the FORM-fingerprint check above fires first.
-        if (
-            live_source.kind != entry.source_kind
-            or live_source.source_fingerprint != entry.source_fingerprint
-        ):
-            return PickValidation("source_drift", entry, None)
+        # Source parity is established BY CONSTRUCTION above: the pin re-ran
+        # ONLY the minted kind's own resolver leg (``resolve_minted_payload`` —
+        # ``resolve_record`` for side_file, keeping its pane-consistency guard;
+        # the injected cache getter for jsonl_cache) and returned a payload only
+        # when that source's canonical fingerprint still matches; the pane kind
+        # carries no source dict (its parity witness IS the form fingerprint
+        # just compared). No second, differently-ordered resolve here — that
+        # cross-kind fall-through asymmetry was the bug.
 
         # Phase (c): win-or-lose the consume under the lock.
         async with _store_lock:
@@ -764,8 +829,9 @@ async def validate_and_consume(
         if result.outcome == "ok":
             completed_ok = True
             # Hand the live re-parse back so the caller's submit-guard compares
-            # against the same form the consume validated.
-            return PickValidation("ok", entry, current_form)
+            # against the same form the consume validated, plus the PIN itself
+            # (GH #78) so the dispatcher never re-peeks the source.
+            return PickValidation("ok", entry, current_form, pinned_payload)
         return result
     finally:
         if not completed_ok:
@@ -789,7 +855,8 @@ class PickRecovery:
     row reservation), so the caller only dispatches the bare digit + writes the
     terminal ``dispatched`` at ``ledger_key`` (v2.1.167 single-keystroke model —
     no ``digit_sent``/Enter step). ``current_form`` is the live re-parse so the
-    caller's Submit guard compares the same form.
+    caller's Submit guard compares the same form; ``pinned_payload`` is the
+    source payload that re-parse used (GH #78), carried to ``_dispatch_pick``.
     """
 
     outcome: Literal[
@@ -809,6 +876,7 @@ class PickRecovery:
     is_review_submit: bool = False
     option_label: str | None = None
     current_form: AskUserQuestionForm | None = None
+    pinned_payload: dict | None = None
 
 
 # Ledger states that provably committed NOTHING (or whose AUQ instance
@@ -1003,6 +1071,11 @@ async def recover_and_consume(
             is_review_submit=intent.is_review_submit,
             option_label=intent.option_label,
             current_form=current_form,
+            # GH #78: the payload recovery ALREADY pinned above — the same dict
+            # ``current_form`` was built from. Handed to ``_dispatch_pick`` so
+            # nav-verify / confirm re-parse identically (behaviour-preserving:
+            # recovery never consulted the strict chain).
+            pinned_payload=payload,
         )
     finally:
         # Always release THIS call's row reservation (owner-id guard). After a

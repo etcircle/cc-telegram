@@ -188,6 +188,7 @@ async def _run_dispatch(
         option_label=option_label,
         is_review_submit=False,
         current_form=form,
+        pinned_payload=None,  # GH #78: pane-kind mint → no source dict to pin
         ledger_key=ledger_key,
     )
     return query, locked_during_rerender, locked_during_record
@@ -291,6 +292,7 @@ async def test_lock_held_blocks_concurrent_acquirer(
             option_label=_OPT2_LABEL,
             is_review_submit=False,
             current_form=form,
+            pinned_payload=None,  # GH #78: pane-kind mint → no source dict
             ledger_key=ledger_key,
         )
     )

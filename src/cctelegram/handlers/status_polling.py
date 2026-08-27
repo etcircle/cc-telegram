@@ -218,6 +218,32 @@ _last_pane_capture: dict[tuple[int, int, str], float] = {}
 # so the JSONL-driven dispatch can't recover until after the fact.
 _last_published_ui_hash: dict[tuple[int, int, str], str] = {}
 
+# GH #78 drift-remint LATCH: the (live kind, live source_fingerprint) the route
+# was last drift-re-minted against, keyed by ``(user_id, thread_id_or_0,
+# window_id)``. ``_remint_on_source_drift`` re-renders AT MOST ONCE per distinct
+# live source: when the RENDER resolver and the STRICT resolver standingly
+# disagree (review screen → render ``bail``s to ``pane`` while strict falls
+# through to ``jsonl_cache``) the re-mint can NEVER converge, and the unlatched
+# version fired on every ~1s tick (observed 124× in 6.5 min). The entry is
+# dropped as soon as live == minted again (the genuine side_file→pane FLIP the
+# re-mint was built for still repairs on the first tick), and the whole route's
+# entry is popped by ``clear_route_caches_for_topic``. Each arm is a fresh
+# ``_DriftRemintArm`` instance so the failure-path unlatch can require IDENTITY
+# (``is``) — value equality would let a failing render pop a newer, equal-tagged
+# arm installed after a concurrent clear+re-arm.
+
+
+class _DriftRemintArm:
+    """One arming of the drift-remint latch: the tags, with object identity."""
+
+    __slots__ = ("tags",)
+
+    def __init__(self, tags: tuple[str, str]) -> None:
+        self.tags = tags
+
+
+_drift_remint_latch: dict[tuple[int, int, str], _DriftRemintArm] = {}
+
 # AUQ details-after-picker regression: per-route first-publish deferral state — a
 # PLAIN consecutive-defer count, ``route -> int``, under ONE invariant.
 #
@@ -396,8 +422,12 @@ def clear_route_caches_for_topic(user_id: int, thread_id_or_0: int) -> None:
     calls this so a rebound topic reusing the same route key never inherits
     stale poller entries (a leftover ``_last_published_ui_hash`` skips the
     first-picker content-drain barrier, a leftover ``_prev_run_state``
-    defeats the seed-without-edit repaint semantics, and a stale
-    ``_last_pane_capture`` delays the rebound's first watchdog scrape).
+    defeats the seed-without-edit repaint semantics, a stale
+    ``_last_pane_capture`` delays the rebound's first watchdog scrape, and a
+    leftover ``_drift_remint_latch`` would suppress the rebound's first
+    legitimate drift re-mint — observing ``minted is None`` inside
+    ``_remint_on_source_drift`` is NOT a cleanup path for a route torn down
+    without another drift call).
     Window-scoped within the topic is unnecessary: 1 topic = 1 window, and
     any historical window's entries under this (user, thread) are equally
     stale. Called by ``cleanup`` via a lazy import (this module imports
@@ -406,6 +436,7 @@ def clear_route_caches_for_topic(user_id: int, thread_id_or_0: int) -> None:
     caches = (
         _last_pane_capture,
         _last_published_ui_hash,
+        _drift_remint_latch,
         _auq_first_publish_defer,
         _absent_streak,
         _prev_run_state,
@@ -752,6 +783,9 @@ def _on_interactive_clear(
     # post-clear repaint); the update-loop clear paths already drop this hash, so
     # this is redundant-but-safe for AUQ/EPM and load-bearing only for Decision.
     _last_published_ui_hash.pop((user_id, thread_id_or_0, window_id), None)
+    # GH #78: the surface is gone, so the drift-remint latch must not suppress
+    # the NEXT surface's first legitimate re-mint on this route.
+    _drift_remint_latch.pop((user_id, thread_id_or_0, window_id), None)
     # AUQ details-after-picker: drop any in-flight first-publish defer state so a
     # rebound / re-raised surface starts its settle window fresh.
     _auq_first_publish_defer.pop((user_id, thread_id_or_0, window_id), None)
@@ -806,20 +840,37 @@ async def _remint_on_source_drift(
     the side-file-form and pane-form fingerprints differ), and on a mismatch
     re-render via ``handle_interactive_ui`` (re-mint to the CURRENT source).
 
-    Returns True iff the drift re-mint fired — the caller returns without
-    refreshing deadlines. Loop-safe (exactly ONE re-mint): the re-mint
-    fresh-mints the live source and ``mint_row``'s hygiene drops the old
-    row, so the next tick sees live == minted → no further re-render.
+    Returns True iff the drift re-mint fired. The caller then re-renders'ed the
+    card, but MUST still refresh the route deadlines (GH #78 — a True return
+    used to early-return past ``refresh_route_deadlines``, so a non-converging
+    drift starved the card's tokens to a ~300s TTL death).
+
+    LOOP SAFETY (GH #78) is a LATCH, not the re-mint itself. The old claim —
+    "exactly ONE re-mint: the re-mint fresh-mints the live source so the next
+    tick sees live == minted" — is FALSE whenever the RENDER resolver and this
+    STRICT resolver disagree standingly: on a review screen the render path
+    ``bail``s to ``kind="pane"`` (the side file is inconsistent with the
+    Submit/Cancel rows) while the strict chain falls through to
+    ``jsonl_cache``, so the re-render can never make ``live == minted`` and the
+    unlatched version re-rendered on every tick (124× in 6.5 min, observed).
+    ``_drift_remint_latch`` therefore permits at most ONE re-mint per
+    ``(route, live.kind, live.source_fingerprint)``; the entry is cleared the
+    moment live == minted again (so a genuine later flip still repairs) and by
+    ``clear_route_caches_for_topic`` on topic teardown.
 
     ``ui_hash`` (same-hash branch only): stored in ``_last_published_ui_hash``
     before the await for parity with the new-UI branch so a concurrent tick
     doesn't double-publish. Site (b) has no ``ui_content`` and passes None.
     """
+    route = (user_id, thread_id or 0, window_id)
     live = auq_source.resolve_auq_source(window_id, None, pane_text)
     if resolve_ask_form(live.payload, pane_text) is None:
         return False
     minted = pick_token.peek_route_source(user_id, thread_id, window_id)
     if minted is None or (live.kind, live.source_fingerprint) == minted:
+        # Converged (or no card): drop the latch so a LATER genuine drift on
+        # this route re-mints on its first tick.
+        _drift_remint_latch.pop(route, None)
         return False
     # Fix A (di-copilot picker churn): a PANE↔PANE "drift" is capture noise, not
     # a real source change. The card's pane token was minted from
@@ -835,9 +886,33 @@ async def _remint_on_source_drift(
     # (minted kind != ``pane``) it was built for.
     if minted[0] == "pane" and live.kind == "pane":
         return False
+    # GH #78 LATCH: one re-mint per distinct live source. A standing
+    # render/strict disagreement (review screen: minted ``pane`` vs strict
+    # ``jsonl_cache``) can never converge, so without this the poller re-rendered
+    # every tick AND starved the deadline refresh.
+    live_tags = (live.kind, live.source_fingerprint)
+    latched = _drift_remint_latch.get(route)
+    if latched is not None and latched.tags == live_tags:
+        return False
+    # Armed BEFORE the await so a concurrent tick can't double-publish, but a
+    # re-render that raises or is cancelled must NOT leave the latch set — no
+    # replacement card was minted, and a latched failure would suppress repair
+    # until the source changes or the route is torn down (fold: Codex diff P2).
+    # The entry is a fresh IDENTITY-bearing object per arm, and the failure
+    # path removes it only while THIS arm is still installed — never a newer
+    # equal-tagged arm installed after a clear+re-arm raced the await (fold r2).
+    armed = _DriftRemintArm(live_tags)
+    _drift_remint_latch[route] = armed
     if ui_hash is not None:
-        _last_published_ui_hash[(user_id, thread_id or 0, window_id)] = ui_hash
-    await handle_interactive_ui(bot, user_id, window_id, thread_id, from_poller=True)
+        _last_published_ui_hash[route] = ui_hash
+    try:
+        await handle_interactive_ui(
+            bot, user_id, window_id, thread_id, from_poller=True
+        )
+    except BaseException:
+        if _drift_remint_latch.get(route) is armed:
+            _drift_remint_latch.pop(route, None)
+        raise
     return True
 
 
@@ -1124,10 +1199,11 @@ async def update_status_message(
                 # the stale tokens, so the user's first tap ``source_drift``s
                 # (swallowed + a misleading "Form changed, refreshing."). Re-mint
                 # the live card to the current source so the tokens track it.
-                # mint_row's source-aware reuse prevents a re-render loop (after
-                # the re-mint to pane, the next tick sees pane==pane → no drift).
-                # Shared with preserve-site (b) via _remint_on_source_drift
-                # (review finding 15) — same comparison, same loop-safety.
+                # Loop safety is the GH #78 LATCH inside the helper (one re-mint
+                # per distinct live source): mint_row's source-aware reuse alone
+                # does NOT converge when the render and strict resolvers
+                # standingly disagree. Shared with preserve-site (b) via
+                # _remint_on_source_drift (review finding 15).
                 #
                 # BEFORE the drift re-mint: this is an observed-live card, so
                 # raise its side-file freshness floor (same gating as the
@@ -1141,10 +1217,14 @@ async def update_status_message(
                 # never drop to bail (the floor was raised on the prior tick), so
                 # there is no flicker.
                 auq_source.refresh_side_file_freshness(window_id)
-                if await _remint_on_source_drift(
+                # GH #78: the re-mint's return value no longer SKIPS the deadline
+                # refresh. A drift that cannot converge (render/strict standing
+                # disagreement) otherwise starved every tick's refresh and the
+                # card's tokens TTL-died (~300s) under a live picker. Refreshing
+                # after a re-mint is harmless — the fresh row is re-stamped.
+                await _remint_on_source_drift(
                     bot, user_id, thread_id, window_id, pane_text, ui_hash=ui_hash
-                ):
-                    return
+                )
                 await pick_token.refresh_route_deadlines(
                     user_id,
                     thread_id,
@@ -1239,16 +1319,18 @@ async def update_status_message(
             # refreshing its deadlines would PRESERVE stale side_file source
             # tags and the first tap would be swallowed as source_drift. Run
             # the SAME drift comparison as the same-hash branch BEFORE the
-            # deadline refresh; on a re-mint, return (the next tick converges:
-            # live == minted → no further re-render, then SET (b) re-asserts).
+            # deadline refresh (the re-mint LATCHES — a non-converging drift
+            # re-renders once and then leaves the card alone; SET (b) re-asserts
+            # on the next tick either way).
             # BEFORE the re-mint: raise the side-file freshness floor (this is an
             # observed-live Submit/picker card) so a long-open side_file_ok card
             # stays trusted + tappable past the 300s read-TTL.
             auq_source.refresh_side_file_freshness(window_id)
-            if await _remint_on_source_drift(
-                bot, user_id, thread_id, window_id, pane_text
-            ):
-                return
+            # GH #78: as at the same-hash site, a re-mint must NOT skip the
+            # deadline refresh below — this is the review/Submit branch where the
+            # non-converging drift was observed, so the skip was exactly what
+            # TTL-killed the live Submit card's tokens.
+            await _remint_on_source_drift(bot, user_id, thread_id, window_id, pane_text)
             # D3-β: live (scrolled/compressed) Submit card — keep its tokens
             # alive so a tap after a long idle on this screen still dispatches.
             await pick_token.refresh_route_deadlines(

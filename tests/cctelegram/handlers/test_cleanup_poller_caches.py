@@ -24,11 +24,15 @@ _WID = "@9"
 _ALL_CACHES = (
     status_polling._last_pane_capture,
     status_polling._last_published_ui_hash,
+    # GH #78: a leftover drift-remint latch would suppress a rebound topic's
+    # first legitimate source-drift re-mint (the helper's own "live == minted"
+    # cleanup never runs for a route torn down without another drift call).
+    status_polling._drift_remint_latch,
     status_polling._absent_streak,
     status_polling._prev_run_state,
 )
 
-_SEED_VALUES = (123.0, "hash", 2, object())
+_SEED_VALUES = (123.0, "hash", ("pane", "fp"), 2, object())
 
 
 @pytest.fixture(autouse=True)

@@ -1798,6 +1798,50 @@ class TestSideFileFreshnessFloor:
         finally:
             _unbind_window(self._WID)
 
+    def test_render_bail_vs_strict_jsonl_cache_divergence_is_known(self, _cc_dir):
+        """GH #78 root cause, pinned as a KNOWN divergence.
+
+        Side file present + INCONSISTENT with the pane (a review screen matches
+        no question) + jsonl cache populated: the RENDER resolver ``bail``s to
+        ``kind="pane"`` and never falls through, while the STRICT chain DOES
+        fall through to ``jsonl_cache``. The two therefore mint and re-resolve
+        different sources for the same window — which is why
+        ``pick_token.validate_and_consume`` must PIN the minted source instead
+        of re-running the chain (a card minted here could otherwise never be
+        tapped: forever ``stale_form``).
+
+        Asserted rather than fixed: unifying the two resolvers is a deliberate,
+        separate change (option 5 in the issue, explicitly out of scope), and
+        this test is the tripwire that makes it deliberate.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_side_file_at(_cc_dir, self._SID, written_at=time.time())
+            pane = (_FIXTURE_DIR / "auq_multiq_submit_pane.txt").read_text()
+            auq_source.set_jsonl_cache_getter(lambda _wid: tool_input)
+
+            render = auq_source.resolve_auq_source_for_render(self._WID, pane)
+            strict = auq_source.resolve_auq_source(self._WID, None, pane)
+            assert render.decision == "bail" and render.kind == "pane"
+            assert render.dispatch_trusted is True  # tokens ARE minted here
+            assert strict.kind == "jsonl_cache"
+            assert render.source_fingerprint != strict.source_fingerprint
+
+            # The pin (what the pick lane uses) honours the MINTED kind, so a
+            # ``pane`` mint stays ``pane`` and the tap can validate.
+            assert auq_source.resolve_minted_payload(
+                self._WID, render.kind, render.source_fingerprint, pane
+            ) == (None, True)
+            # And the side-file leg still refuses the pane-contradicted record.
+            assert auq_source.resolve_minted_payload(
+                self._WID,
+                "side_file",
+                auq_source._canonical_dict_fingerprint(tool_input),
+                pane,
+            ) == (None, False)
+        finally:
+            _unbind_window(self._WID)
+
     def test_remint_on_source_drift_noop_under_floor(self, _cc_dir):
         """The render decision + strict source agree under the floor, so the
         poller's drift compare sees minted==live and does NOT re-render (loop
