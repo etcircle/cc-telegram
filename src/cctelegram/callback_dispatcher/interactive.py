@@ -328,6 +328,7 @@ async def _dispatch_pick(
     option_label: str,
     is_review_submit: bool,
     current_form: AskUserQuestionForm,
+    pinned_payload: dict | None,
     ledger_key: str | None,
 ) -> None:
     """Navigate the live cursor to the tapped option, verify, Enter, confirm advance.
@@ -342,7 +343,17 @@ async def _dispatch_pick(
 
     Shared by the live ``ok`` path and D2 restart-recovery. The caller writes the
     ``accepted`` claim BEFORE calling this (the live path inline; recovery inside
-    ``pick_token.recover_and_consume``). ``ledger_key`` is None only on a
+    ``pick_token.recover_and_consume``).
+
+    ``pinned_payload`` (GH #78) is the MINTED source's ``tool_input``, already
+    resolved by the caller — the live path takes it from
+    ``PickValidation.pinned_payload``, recovery passes the payload
+    ``recover_and_consume`` already pinned (``sf.payload`` / None). It is
+    carried, never re-resolved: nav-verify and the post-Enter confirm re-parse
+    with THIS payload so they can never disagree with the mint, and no site
+    re-peeks after a keystroke (a successful dispatch legitimately consumes the
+    side file / clears the cache — a re-peek would turn it into a false
+    ``commit_unconfirmed``). ``ledger_key`` is None only on a
     collision-suppression fall-through — the ``if ledger_key is not None`` guards
     keep those writes off another route's row. ``send_keys`` returns False (does
     not raise) on failure; every return is checked (Wave-3 P1).
@@ -372,6 +383,7 @@ async def _dispatch_pick(
             option_label=option_label,
             is_review_submit=is_review_submit,
             current_form=current_form,
+            pinned_payload=pinned_payload,
             ledger_key=ledger_key,
         )
     # ── Unlocked response section: Telegram I/O only after lock release. ──
@@ -395,6 +407,7 @@ async def _dispatch_pick_pane_locked(
     option_label: str,
     is_review_submit: bool,
     current_form: AskUserQuestionForm,
+    pinned_payload: dict | None,
     ledger_key: str | None,
 ) -> _PickPaneOutcome:
     """Pane-critical section of the pick dispatch — caller holds the window lock.
@@ -403,6 +416,14 @@ async def _dispatch_pick_pane_locked(
     plus the TERMINAL ledger write (``dispatched`` / ``not_advanced`` /
     ``commit_unconfirmed``), and NO Telegram I/O. Returns the structured
     outcome the unlocked response section in ``_dispatch_pick`` renders from.
+
+    ``pinned_payload`` is the caller's already-resolved MINTED source payload
+    (GH #78). Both source-dependent re-parses here — the nav VERIFY form and the
+    post-Enter CONFIRM form — use it. Neither re-resolves the strict priority
+    chain (which diverges from the render resolver on a review screen →
+    permanent ``verify_failed``) and neither re-peeks the source (this function
+    has no post-commit drift outcome, so a vanished-after-Enter source must not
+    be observable here).
     """
 
     def _bail_not_advanced(reason: str) -> _PickPaneOutcome:
@@ -494,8 +515,11 @@ async def _dispatch_pick_pane_locked(
     vpane_ansi = vpair.ansi if vpair is not None else None
     vform: AskUserQuestionForm | None = None
     if vpane:
-        vsource = auq_source.resolve_auq_source(window_id, None, vpane)
-        vform = resolve_ask_form(vsource.payload, vpane, ansi_text=vpane_ansi)
+        # GH #78: the PINNED minted payload, never a fresh strict resolve — a
+        # re-resolve can pick a DIFFERENT source than the mint (review screen:
+        # render bails to ``pane``, strict falls through to ``jsonl_cache``),
+        # whose overlay fingerprint fails the equality check below forever.
+        vform = resolve_ask_form(pinned_payload, vpane, ansi_text=vpane_ansi)
     vc = next((o for o in vform.options if o.cursor), None) if vform else None
     # PANE-ONLY real-cursor requirement (the load-bearing fail-closed gate). The
     # overlaid ``vform`` cursor above may be the SYNTHETIC default that
@@ -563,18 +587,27 @@ async def _dispatch_pick_pane_locked(
     pane2_ansi = pane2_pair.ansi if pane2_pair is not None else None
     if pane2 is None:
         return _bail_commit_unconfirmed("confirm_capture_failed")
-    asource = auq_source.resolve_auq_source(window_id, None, pane2)
-    aform = (
-        resolve_ask_form(asource.payload, pane2, ansi_text=pane2_ansi)
-        if pane2
-        else None
-    )
-    if aform is None:
+    # GH #78: "is the picker still on screen?" is decided PANE-ONLY, and the
+    # pinned payload is used only to SHAPE the form for ``_classify_advance``.
+    # Deliberately no re-peek here (``Enter`` already landed and this function
+    # has no post-commit drift outcome), but the pin must not be the liveness
+    # signal either: a successful commit RESOLVES the tool, and an overlay over
+    # a resolved pane still synthesizes a form from the payload — which would
+    # downgrade EVERY successful dispatch to ``commit_unconfirmed``. Pre-fix
+    # this worked only by accident, because the re-resolved source had usually
+    # vanished by the confirm capture.
+    pane2_only = resolve_ask_form(None, pane2, ansi_text=pane2_ansi)
+    if pane2_only is None:
         if _pane_looks_like_picker(pane2):
             # Markers present but unparseable → AMBIGUOUS; never record dispatched.
             return _bail_commit_unconfirmed("confirm_parse_failed")
+        aform = None
         resolved = True  # picker positively GONE → the tool resolved.
     else:
+        aform = resolve_ask_form(pinned_payload, pane2, ansi_text=pane2_ansi)
+        if aform is None:
+            # A live picker the pinned overlay cannot reconcile → AMBIGUOUS.
+            return _bail_commit_unconfirmed("confirm_parse_failed")
         resolved = False
 
     confirm_entry = SimpleNamespace(
@@ -731,6 +764,13 @@ async def _attempt_pick_recovery(
         option_number=result.option_number,
         option_label=result.option_label,
         is_review_submit=result.is_review_submit,
+        # GH #78: recovery pinned its own source in ``recover_and_consume``
+        # (``sf.payload`` for a live side_file, else None — see
+        # ``_recovery_source_parity_ok``); pass THAT payload so the nav-verify /
+        # confirm re-parses match the form recovery just validated. Behaviour is
+        # unchanged from before the pin (recovery already built its
+        # ``current_form`` from exactly this payload).
+        pinned_payload=result.pinned_payload,
         current_form=result.current_form,
         ledger_key=result.ledger_key,
     )
@@ -1917,9 +1957,10 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             logger.info("AUQ_PICK stale_window user=%d window=%s", user.id, window_id)
             return
 
-        # Atomic validate + single-use consume. Re-resolves the AUQ source via
-        # the SAME auq_source.resolve_auq_source the minter used (measurable
-        # source parity), re-parses the live pane (fingerprint staleness), and
+        # Atomic validate + single-use consume. PINS the AUQ source to the one
+        # the minter recorded via auq_source.resolve_minted_payload (measurable
+        # source parity; GH #78 — never a re-run of a differently-ordered
+        # priority chain), re-parses the live pane (fingerprint staleness), and
         # wins-or-loses the consume by exclusive reservation — without holding
         # the store lock across capture_pane / find_window_by_id. Capture with
         # the SAME 500-line scrollback as the render path so the validate pane
@@ -2094,6 +2135,10 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             option_label=entry.option_label,
             is_review_submit=entry.is_review_submit,
             current_form=current_form,
+            # GH #78: the SOURCE PIN ``validate_and_consume`` resolved (once,
+            # pre-keystroke) rides along so nav-verify + the post-Enter confirm
+            # re-parse against the minted source rather than re-resolving.
+            pinned_payload=result.pinned_payload,
             ledger_key=ledger_key,
         )
 

@@ -4,6 +4,32 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [Unreleased]
+
+### Fixed
+- **Submit on a multi-question review card never worked (GH #78).** Every tap on "Submit
+  answers" answered "Form changed, refreshing." and nothing was sent — permanently, until the
+  card's tokens expired ~5 minutes later. The card and the tap were reading different sources:
+  the render path sees a PreToolUse side file that cannot match a review screen (whose only rows
+  are Submit/Cancel), so it bails to the pane and mints pane-sourced buttons — while the tap
+  re-ran a *differently ordered* resolver that fell through to the buffered JSONL tool input,
+  whose question text overlays the pane and changes the form fingerprint. The two could never
+  agree. A tap now validates against the source its button was minted from, resolved once before
+  the first keystroke and carried through the navigate/verify/commit transaction, so a source
+  that legitimately disappears when the answer lands cannot retract a successful dispatch. Each
+  per-source trust check is unchanged — a side file the live pane contradicts is still refused,
+  so a stale question can never be answered by a tap.
+- **The poller re-rendered a drifting card every second and starved its tokens (GH #78).** The
+  same resolver disagreement made the source-drift re-mint a treadmill (observed: 124 re-renders
+  in 6.5 minutes), and each re-mint skipped the deadline refresh that keeps a visible card
+  tappable — so the card timed out while the user was looking at it. The re-mint now fires once
+  per observed source and never suppresses the refresh.
+
+### Changed
+- A pick rejected because its minted source vanished or was replaced now reports `source_drift`
+  rather than `stale_form`, and both rejections log the minted/computed fingerprints and the
+  source resolution alongside the outcome.
+
 ## [0.4.13] — 2026-08-26
 
 ### Fixed

@@ -30,6 +30,9 @@ Key components:
   - ``peek_sticky_source`` — re-resolve the EXACT source a callback was minted
     against (side_file / jsonl_cache), pane-AGNOSTIC, so the ``aqt:`` toggle can
     pin its minted source through a transient render→tap source flip.
+  - ``resolve_minted_payload`` — the shared ``(payload, pinned_ok)`` pin used by
+    the ``aqp:`` pick lane (GH #78): validate against the MINTED source, never a
+    re-run of a different resolver priority chain. No strict-chain fallback.
   - ``side_file_live_for_session`` / ``side_file_live_for_window`` —
     pane-INDEPENDENT "is the AUQ still live?" authority for the card-clear
     gate and the startup orphan reconciler (presence + schema + future-skew,
@@ -1252,6 +1255,73 @@ def peek_sticky_source(
             return cached
         return None
     return None
+
+
+def resolve_minted_payload(
+    window_id: str, minted_kind: str, minted_fingerprint: str, pane_text: str
+) -> tuple[dict | None, bool]:
+    """Resolve the payload for the source a card's tokens were MINTED against.
+
+    This is :func:`resolve_auq_source`'s OWN leg for ``minted_kind``, evaluated
+    in ISOLATION — same per-leg trust checks, but NO fall-through to a different
+    kind. Returns ``(payload, pinned_ok)``:
+
+      - ``pane``       → ``(None, True)``. A pane-kind mint has no source dict;
+        the pane-only re-parse IS the pinned form and the FORM fingerprint is
+        the parity witness (``_pane_fingerprint`` hashes the same canonical
+        repr), so there is nothing further to check here.
+      - ``side_file``  → :func:`resolve_record` (so the record must STILL be
+        live, within the TTL/floor, AND consistent with the live pane — the
+        wrong-question guard is NOT bypassed) plus canonical-fingerprint
+        equality with the mint.
+      - ``jsonl_cache`` → the injected getter plus canonical-fingerprint
+        equality (the strict chain's jsonl leg has no pane predicate either).
+      - anything else  → ``(None, False)`` (fail closed).
+
+    GH #78: the ``aqp:`` pick lane used to re-run the WHOLE strict chain at
+    validate. On a review screen the RENDER resolver ``bail``s to ``pane`` (the
+    side file is inconsistent with the Submit/Cancel rows) while the strict
+    chain falls THROUGH to ``jsonl_cache`` — so mint-fp != validate-fp BY
+    CONSTRUCTION and every Submit tap rejected ``stale_form``, forever. Removing
+    only the cross-kind fall-through restores the module's own measurable
+    mint/validate SOURCE-parity invariant without weakening any per-leg check.
+
+    DELIBERATE DIVERGENCE from the ``aqt:`` toggle lane: that lane FALLS BACK to
+    :func:`resolve_auq_source` when its pin misses (and pins pane-AGNOSTICALLY
+    via :func:`peek_sticky_source`, which is safe for a toggle — it sends no
+    committing key). The ``aqp:`` lane does NOT fall back: a pick DISPATCHES
+    KEYSTROKES, so a vanished/replaced/pane-contradicted minted source must
+    surface honestly as ``source_drift`` (and let the poller re-mint to the
+    current source) rather than silently validate against whatever source the
+    chain now prefers. Silent fallback to a DIFFERENT source kind is exactly the
+    asymmetry this helper removes.
+
+    PIN ONCE: callers resolve this EXACTLY ONCE per tap, BEFORE any keystroke,
+    and carry the returned payload through nav-verify and the post-Enter
+    confirm. Re-peeking after Enter would turn a SUCCESSFUL dispatch (which
+    legitimately consumes the side file / clears the cache) into a false
+    ``commit_unconfirmed``.
+    """
+    from ..terminal_parser import resolve_ask_form
+
+    if minted_kind == "pane":
+        return None, True
+    if minted_kind == "side_file":
+        pane_form = resolve_ask_form(None, pane_text) if pane_text else None
+        record = resolve_record(window_id, pane_form)
+        if record is not None and (
+            _canonical_dict_fingerprint(record.tool_input) == minted_fingerprint
+        ):
+            return record.tool_input, True
+        return None, False
+    if minted_kind == "jsonl_cache":
+        cached = _jsonl_cache_getter(window_id)
+        if isinstance(cached, dict) and (
+            _canonical_dict_fingerprint(cached) == minted_fingerprint
+        ):
+            return cached, True
+        return None, False
+    return None, False
 
 
 # ── Side-file lifecycle ───────────────────────────────────────────────────────

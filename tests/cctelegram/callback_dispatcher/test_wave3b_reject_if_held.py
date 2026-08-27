@@ -704,6 +704,7 @@ async def test_r2_esc_mid_dispatch_rejected_no_false_dispatched(
             option_label=_OPT2_LABEL,
             is_review_submit=False,
             current_form=form,
+            pinned_payload=None,  # GH #78: pane-kind mint → no source dict
             ledger_key=ledger_key,
         )
     )

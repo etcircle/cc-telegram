@@ -88,6 +88,7 @@ async def test_preview_wrap_pick_dispatches_via_sgr_cursor():
         option_label=authority_label,
         is_review_submit=False,
         current_form=current_form,
+        pinned_payload=None,  # GH #78: pane-kind mint → no source dict to pin
         ledger_key=None,
     )
     assert outcome.kind == "dispatched", (outcome.kind, outcome.reason)
@@ -119,6 +120,7 @@ async def test_preview_pick_no_real_cursor_fails_closed():
         option_label=current_form.options[1].wrap_canonical,
         is_review_submit=False,
         current_form=current_form,
+        pinned_payload=None,  # GH #78: pane-kind mint → no source dict to pin
         ledger_key=None,
     )
     assert outcome.kind == "not_advanced", (outcome.kind, outcome.reason)
