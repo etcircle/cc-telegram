@@ -72,16 +72,17 @@ class TestNormalizeCapture:
 
     def test_osc8_hyperlink_is_consumed_whole(self):
         """The OSC-8 hyperlink (F9) is consumed through ST — its invisible
-        metadata (the ``id=`` param) never survives, unlike the legacy
-        ``_strip_ansi`` which leaves the whole OSC payload behind."""
+        metadata (the ``id=`` param) never survives."""
         raw = _load("auq_preview_singleselect_v2.1.207.ansi.txt")
         assert "id=1iz7s2z" in raw  # the OSC-8 hyperlink metadata is present
         cap = normalize_capture(raw)
         assert cap is not None
         assert "1iz7s2z" not in cap.plain  # the whole OSC payload is consumed
-        # The legacy strip leaves the OSC-8 payload behind — the very junk the
-        # region-equality normalize closes (F9).
-        assert "1iz7s2z" in tp._strip_ansi(raw)
+        # GH #81: the leaf-safe ``_strip_ansi`` now agrees. It used to leave the
+        # payload behind (this line pinned that as the gap normalize_capture
+        # closed) — and the leaked URL was exactly what broke the status-row read
+        # on a `-e` capture once CC started hyperlinking the `/rc` pill.
+        assert "1iz7s2z" not in tp._strip_ansi(raw)
 
     def test_unknown_control_byte_rejects(self):
         """An UNKNOWN control byte (not part of a recognized escape family)
