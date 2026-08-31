@@ -56,7 +56,7 @@ async def test_same_session_quote_renders_normally() -> None:
     ):
         rendered, applied = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
-    assert "Cross-session reply" not in rendered
+    assert "[Cross-session:" not in rendered
     assert "[User message]\nask" in rendered
 
 
@@ -95,7 +95,7 @@ async def test_cross_session_quote_renders_with_marker_by_default() -> None:
     ):
         rendered, applied = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
-    assert "Cross-session reply" in rendered
+    assert "[Cross-session:" in rendered
     assert "from old session" in rendered  # quoted body still present
     assert "[User message]\nask" in rendered
 
@@ -137,7 +137,7 @@ async def test_kill_switch_restores_silent_drop() -> None:
 
     # Silent drop: user_text returned verbatim, no quote block, no marker.
     assert rendered == "ask"
-    assert "Cross-session reply" not in rendered
+    assert "[Cross-session:" not in rendered
 
 
 @pytest.mark.asyncio
@@ -211,6 +211,6 @@ async def test_unknown_session_treats_as_non_stale() -> None:
         rendered, applied = await bot_module._apply_reply_context(message, 7, 99, "ask")
 
     # Normal render, no cross-session marker.
-    assert "Cross-session reply" not in rendered
+    assert "[Cross-session:" not in rendered
     assert "unknown provenance" in rendered
     assert "[User message]\nask" in rendered
