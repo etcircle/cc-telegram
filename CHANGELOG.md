@@ -4,6 +4,23 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.15] — 2026-08-31
+
+### Fixed
+- **Reply-quoted messages were typed but never sent (GH #81).** Every reply-quoted Telegram
+  message landed in the input box with its Enter withheld — "❌ Not delivered — the terminal
+  changed while your message was being typed" — and had to be submitted by hand. Plain messages
+  were unaffected. Claude Code 2.1.24x started wrapping the right-aligned `/rc` status pill in an
+  OSC 8 hyperlink, and the parser's escape stripper only understood CSI-shaped sequences: it bit
+  off the first few bytes of the hyperlink and left the session URL sitting on the status row as
+  visible text. The delivery gate's fallback for a tall draft — the one every reply-quote takes,
+  because the quote block pushes the input box's top rule out of view — proves the lone rule it
+  can see is the box's bottom by checking that a status bar sits under it. With the URL on that
+  row it no longer looked like one, so the gate concluded there was no input box at all. OSC
+  sequences are now stripped properly, both terminators, in the status-row read and in the
+  ghost-suggestion tokenizer. An unterminated one still degrades as before rather than eating the
+  rows below it.
+
 ## [0.4.14] — 2026-08-27
 
 ### Fixed

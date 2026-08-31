@@ -873,6 +873,12 @@ _BASELINE_CLASSIFICATIONS = {
     "inputbox_paste_collapsed_v2.1.246.txt": None,
     "inputbox_rc_active_v2.1.246.txt": None,
     "inputbox_rc_connecting_v2.1.246.txt": None,
+    # GH #81 — the first `-e` (ANSI-preserving) `/rc` capture in the corpus: CC
+    # 2.1.251 wraps the pill in an OSC 8 hyperlink. This bottom-rows fixture keeps
+    # its two-rule box, so it classifies `None` both before and after the OSC strip;
+    # the leak's real victim is the exactly-one-separator fallback, flipped by
+    # `test_gh81_osc_status_row.py`.
+    "inputbox_rc_osc8_agents_v2.1.251.txt": None,
     "inputbox_tall_draft_v2.1.246.txt": None,
     "inputbox_tasklist_footer_v2.1.207.txt": None,
     "inputbox_tasks_mode_v2.1.207.txt": "tasks_mode",

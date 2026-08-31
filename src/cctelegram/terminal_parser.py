@@ -4607,6 +4607,15 @@ _RE_CSI = re.compile(r"\x1b\[([0-9;]*)([\x40-\x7e])")
 # Any remaining ESC-introduced sequence (non-CSI: OSC, single-char, etc.) — a
 # catch-all so ``clean_ghost_input_text`` returns text with EVERY escape removed.
 _RE_ANSI_ANY = re.compile(r"\x1b[\[\]][0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+# OSC (Operating System Command): ``ESC ] <payload> ST`` where ST is BEL or ``ESC \``.
+# CC ≥2.1.24x emits OSC 8 hyperlinks around the ``/rc`` status pill (GH #81); the
+# payload holds ``;``, ``=``, ``:``, ``/``, ``?`` — none of which the CSI-shaped
+# ``_RE_ANSI_ANY`` can consume, so it stopped at the first letter and LEAKED the
+# URL onto the status row. Must be tried BEFORE ``_RE_ANSI_ANY``. The payload class
+# excludes ``\r``/``\n`` (these regexes run on WHOLE-PANE text): an UNTERMINATED OSC
+# must never reach across a row boundary and swallow the next row's visible text —
+# it is left to the catch-all, degrading exactly as it did before (fail-closed).
+_RE_OSC = re.compile(r"\x1b\][^\x07\x1b\r\n]*(?:\x07|\x1b\\)")
 
 # The input-row prompt cursor glyphs ``pane_looks_idle`` accepts (kept in lockstep
 # with its ``s[0] not in (...)`` gate). A ghost-suggestion pre-clean only ever
@@ -4619,9 +4628,13 @@ def _strip_ansi(text: str) -> str:
 
     Local (leaf-safe) strip — ``screenshot.py`` has a richer ANSI parser but it
     imports PIL, which ``terminal_parser`` must not. Handles CSI sequences (the
-    common SGR/styling + cursor family) plus a catch-all for the rarer
-    ESC-introduced forms.
+    common SGR/styling + cursor family), OSC sequences (``ESC ] … BEL`` /
+    ``ESC ] … ESC \\`` — the CC ≥2.1.24x ``/rc`` hyperlink, GH #81) plus a
+    catch-all for the rarer ESC-introduced forms. OSC runs FIRST: its payload is
+    not CSI-shaped, so the catch-all would bite off only its head and leave the
+    URL behind as visible text.
     """
+    text = _RE_OSC.sub("", text)
     text = _RE_CSI.sub("", text)
     return _RE_ANSI_ANY.sub("", text)
 
@@ -6502,6 +6515,13 @@ def _visible_chars_with_dim(raw_line: str) -> list[tuple[str, bool]]:
                 if m.group(2) == "m":
                     dim = _sgr_updates_dim(m.group(1), dim)
                 pos = m.end()
+                continue
+            # An OSC hyperlink (GH #81) carries no SGR, so it never changes dim
+            # state — but it must be consumed WHOLE, before the CSI-shaped
+            # catch-all leaks its URL payload in as visible chars.
+            m_osc = _RE_OSC.match(raw_line, pos)
+            if m_osc is not None:
+                pos = m_osc.end()
                 continue
             m2 = _RE_ANSI_ANY.match(raw_line, pos)
             if m2 is not None:
