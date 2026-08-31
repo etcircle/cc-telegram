@@ -4,7 +4,7 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
-## [Unreleased]
+## [0.4.15] — 2026-08-31
 
 ### Fixed
 - **Reply-quoted messages were typed but never sent (GH #81).** Every reply-quoted Telegram
