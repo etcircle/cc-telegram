@@ -423,10 +423,10 @@ def test_cross_session_marker_lives_in_pre_fence_header() -> None:
     )
     rendered = render_for_claude("now", ctx, cross_session=True)
     marker_idx = rendered.index("[Cross-session:")
-    # The header prose mentions the open_marker inline ("markers <<<QUOTE_xxx>>>
-    # and <<<END_QUOTE_xxx>>>"), so the regex finds the open_marker twice:
-    # once inlined in the header, once as the actual open-fence on its own
-    # line. The real open-fence is the LAST <<<QUOTE_*>>> match.
+    # The header line names the OPEN marker inline ("the <<<QUOTE_xxx>>>
+    # block below" — the END marker is not named, GH #83), so the regex finds
+    # the open_marker twice: once inlined in the header, once as the actual
+    # open-fence on its own line. The real open-fence is the LAST match.
     matches = list(_FENCE_RE.finditer(rendered))
     assert len(matches) >= 2  # header reference + actual open fence
     actual_open_fence_idx = matches[-1].start()

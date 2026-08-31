@@ -4,7 +4,7 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
-## [Unreleased]
+## [0.4.16] — 2026-08-31
 
 ### Changed
 - **Reply-quote prompt wrapper trimmed from 17 rows to 6 (GH #83).** Replying to a message wrapped
