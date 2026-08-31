@@ -4,6 +4,32 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [Unreleased]
+
+### Changed
+- **Reply-quote prompt wrapper trimmed from 17 rows to 6 (GH #83).** Replying to a message wrapped
+  the quote in a ~15-row scaffold — a six-line guardrail header, a four-line "Referenced message"
+  block, three blank lines — so a one-line reply to a one-line quote became a 17-row prompt. The
+  wrapper is now a single header line carrying the sender role, the Telegram message id and the
+  nonce that opens the fenced block, followed directly by the fence, the quote, `[User message]`
+  and the text: 6 rows, no blank lines. Both header variants — ordinary replies and replies to one
+  of the bot's own status/activity cards — carry that same role + message-id pair, as the old
+  "Referenced message" block did. Nothing about the security contract moved: the same per-render
+  nonce fence still bounds the quoted body, the same demotion sentence still says the quote is
+  context and not new instructions, and the cross-session notice still lives pre-fence where a
+  hostile quote cannot spoof it. The `Claude session:` line is gone from ordinary replies; the
+  session id now appears only on a cross-session reply, inside that notice.
+
+  Those 6 rows are 6 rows on screen, not just 6 newlines: every header and notice line is at most
+  158 characters even at its worst case (longest role, a 10-digit message id, a 36-character
+  session uuid), and the bot's panes are 160 columns wide, so no scaffold line wraps and the
+  prompt's line count is the count the terminal actually shows. That is the point of the change.
+  At 17 rows every reply-quote draft pushed the input box's top rule out of the delivery gate's
+  20-row chrome window, so each one took the GH #56 tall-draft fallback — the fragile leg that
+  GH #62, #73 and #81 each broke in turn, wedging the topic every time. At 6 rows most
+  reply-quotes now sit inside the window and take the gate's primary two-rule input-box proof
+  instead.
+
 ## [0.4.15] — 2026-08-31
 
 ### Fixed

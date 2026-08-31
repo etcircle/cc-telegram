@@ -86,29 +86,63 @@ def test_clean_ghost_input_text_leaves_no_osc_residue_on_the_fixture() -> None:
 
 # ── 3. the tall reply-quote draft delivers on this pane ─────────────────────
 
-_PROSE = [f"  scrollback prose line {i}" for i in range(27)]
+_PROSE = [f"  scrollback prose line {i}" for i in range(23)]
+
+# GH #83 trimmed the reply-quote wrapper from 15 scaffold rows to 5, so a
+# one-line quote no longer reaches past the 20-row chrome window at all (that
+# is the point of the change). The tall-draft leg this module exercises still
+# has to be reachable, so the scenario now quotes a REAL multi-line block —
+# the shape that still overflows the window and still needs the GH #56
+# upward scan.
+_MULTILINE_QUOTE = "\n".join(
+    [
+        "Wave 2 plan (store + tenancy), as agreed:",
+        "",
+        "1. Store",
+        "   - move the per-tenant blobs behind a single repository facade",
+        "   - keep the on-disk layout, only the accessor changes",
+        "   - back-fill the index lazily on first read, never at boot",
+        "2. Tenancy",
+        "   - thread the tenant id through the request scope, not a global",
+        "   - every query gets an explicit tenant predicate (no implicit joins)",
+        "   - the admin console keeps its cross-tenant read, gated on the role",
+        "3. Migration",
+        "   - dual-write for one release, then flip the read path",
+        "   - the rollback is a config flag, not a schema revert",
+        "   - keep the old reader compiled in until the flip is a week old",
+        "",
+        "Next on your word: wave 2 (store, tenancy).",
+    ]
+)
 
 
 def _reply_quote_draft() -> str:
     """The exact ``render_for_claude`` payload a reply-quoted Telegram send types."""
     ctx = ReplyContext(
         original_message_id=3405,
-        quoted_text="Next on your word: wave 2 (store, tenancy).",
-        original_text="Next on your word: wave 2 (store, tenancy).",
+        quoted_text=_MULTILINE_QUOTE,
+        original_text=_MULTILINE_QUOTE,
     )
     return render_for_claude("do wave 2", ctx)
 
 
 def _pane_with_draft(below_box: str) -> tuple[str, str]:
-    """A 160x50-shaped pane: prose, top rule, the 17-row draft, then ``below_box``.
+    """A 160x50-shaped pane: prose, top rule, the 21-row draft, then ``below_box``.
 
     The draft's first row carries the ``❯`` glyph; every continuation row is
     indented and glyph-less, exactly as CC renders a wrapped multi-line draft.
     """
     draft = _reply_quote_draft()
     rows = draft.split("\n")
-    assert len(rows) == 17, len(rows)
+    assert len(rows) == 21, len(rows)
+    # Codex r1 P2-2: this synthesis counts LOGICAL rows, so it is only
+    # display-faithful while every logical row fits one 160-column pane row.
+    # Each box row is a 2-char prefix ("❯ " / "  ") plus the logical row, so
+    # the budget is 158. A longer row would soft-wrap on a real pane and this
+    # 50-row pane would be a shape tmux can never produce.
+    assert max(len(r) for r in rows) <= 158, max(rows, key=len)
     box = [f"❯ {rows[0]}"] + [f"  {r}" for r in rows[1:]]
+    assert all(len(r) <= 160 for r in box)
     pane = "\n".join([*_PROSE, RAW_TOP_RULE, *box, below_box])
     return pane, draft
 

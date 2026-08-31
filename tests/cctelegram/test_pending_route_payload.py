@@ -845,9 +845,9 @@ async def test_unbound_photo_caption_reply_context_is_stashed_rendered(
     ]
     assert len(pending_attachments) == 1
     caption = pending_attachments[0].caption
-    assert "[Telegram reply context]" in caption
+    assert "[Reply — from " in caption
     assert "prior assistant guidance" in caption
-    assert "Telegram message id: 42" in caption
+    assert ", msg 42;" in caption
     assert "[User message]\nplease apply this" in caption
     mock_resolve.assert_awaited_once()
 
@@ -893,9 +893,9 @@ async def test_unbound_document_caption_reply_context_is_stashed_rendered(
     ]
     assert len(pending_attachments) == 1
     caption = pending_attachments[0].caption
-    assert "[Telegram reply context]" in caption
+    assert "[Reply — from " in caption
     assert "prior document guidance" in caption
-    assert "Telegram message id: 42" in caption
+    assert ", msg 42;" in caption
     assert "[User message]\nplease apply this to the file" in caption
     mock_resolve.assert_awaited_once()
 
@@ -952,7 +952,7 @@ async def test_unbound_photo_media_group_caption_guard_avoids_duplicate_context(
         ]
     ]
     assert len(captions) == 2
-    assert captions[0].count("[Telegram reply context]") == 1
+    assert captions[0].count("[Reply — from ") == 1
     assert "[User message]\nalbum caption" in captions[0]
     assert captions[1] == ""
     mock_resolve.assert_awaited_once()
@@ -1010,7 +1010,7 @@ async def test_unbound_document_media_group_caption_guard_avoids_duplicate_conte
         ]
     ]
     assert len(captions) == 2
-    assert captions[0].count("[Telegram reply context]") == 1
+    assert captions[0].count("[Reply — from ") == 1
     assert "[User message]\nalbum caption" in captions[0]
     assert captions[1] == ""
     mock_resolve.assert_awaited_once()
