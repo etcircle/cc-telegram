@@ -23,7 +23,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Set CC_TELEGRAM_DIR
         run: echo "CC_TELEGRAM_DIR=$RUNNER_TEMP/cc-telegram-config" >> "$GITHUB_ENV"
-      - run: uv sync --all-extras
+      # --locked: install EXACTLY the committed uv.lock (fail loudly if it has
+      # drifted from pyproject) so CI runs the same toolchain as the local gates —
+      # a fresh resolve let ruff 0.16's widened defaults break CI for a month.
+      - run: uv sync --all-extras --locked
       - name: Formatter
         run: |
           uv run ruff check src/ tests/
