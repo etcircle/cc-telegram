@@ -61,3 +61,9 @@ exclude_lines = [
     "if __name__ == .__main__.",
     "logger\\.",
 ]
+
+[tool.ruff.lint]
+# Pin the default rule set explicitly: ruff 0.16 widened the DEFAULT select and
+# broke CI (which resolves tools fresh - uv.lock is deliberately untracked).
+# Lint semantics must not drift with the ruff version; widen only on purpose.
+select = ["E4", "E7", "E9", "F"]
