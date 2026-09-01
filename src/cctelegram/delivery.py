@@ -537,14 +537,20 @@ def chunk_literal(text: str, cap: int = LITERAL_WRITE_MAX_BYTES) -> list[str] | 
         allowed — rig R6 committed leading, trailing and mid-payload blank runs
         exactly, with ONE Enter.
       - **no minted lone-digit edge line** — see ``_mints_digit_edge_line``. The
-        cut walks LEFT until it is clean (in practice a character or two).
+        cut walks LEFT until it is clean (in practice a character or two); if
+        the left walk would leave an all-``\\n`` chunk it walks RIGHT instead,
+        bounded by the hard max (Codex r1 P2: ``"\\n"*511 + "7a"`` is one valid
+        513-byte chunk, and backing off the ``7`` must not refuse it). One
+        direction per cut, so the repair cannot oscillate.
 
     Returns ``None`` — the seam's ``payload_too_large`` refusal — only when no
     valid chunk fits under the hard max: a ``\\n`` run of 900+ bytes, or an
     all-newlines payload above ``cap``. ``""`` maps to ``[""]`` (today's one
     no-op write) and an at-or-below-cap payload to ``[text]``, byte-identical to
-    the pre-#84 single write.
+    the pre-#84 single write. ``cap`` may never exceed the hard max (the fast
+    path returns the payload whole).
     """
+    assert cap <= LITERAL_WRITE_HARD_MAX_BYTES, "cap above the hard max"
     if not text:
         return [""]
     if len(text.encode()) <= cap:
@@ -566,10 +572,28 @@ def chunk_literal(text: str, cap: int = LITERAL_WRITE_MAX_BYTES) -> list[str] | 
             q += 1
             if _too_big(text, p, q):
                 return None
-        while _mints_digit_edge_line(text, p, q):
-            q -= 1
-            if q <= p or _is_all_lf(text, p, q):
-                return None
+        if _mints_digit_edge_line(text, p, q):
+            left = q
+            while (
+                _mints_digit_edge_line(text, p, left)
+                and left - 1 > p
+                and not _is_all_lf(text, p, left - 1)
+            ):
+                left -= 1
+            if not _mints_digit_edge_line(text, p, left):
+                q = left
+            else:
+                # The left walk ran into an all-LF chunk: grow RIGHT instead.
+                right = q
+                while (
+                    _mints_digit_edge_line(text, p, right)
+                    and right < n
+                    and not _too_big(text, p, right + 1)
+                ):
+                    right += 1
+                if _mints_digit_edge_line(text, p, right):
+                    return None
+                q = right
         if q < n and all(c == "\n" for c in text[q:]):
             if _too_big(text, p, n):
                 return None

@@ -19,6 +19,7 @@ whitespace-only lines, emoji and CJK.
 from __future__ import annotations
 
 import random
+import re
 
 import pytest
 
@@ -102,8 +103,12 @@ def test_generated_payloads_plan_soundly() -> None:
         text = _random_payload(rng)
         chunks = delivery.chunk_literal(text)
         if chunks is None:
-            # Only an untypable newline shape may be refused.
-            assert "\n" in text
+            # ONLY an untypable newline shape may be refused: a maximal ``\n``
+            # run the hard max cannot carry together with one real character,
+            # or an all-newlines payload above the cap (Codex r1 P2 — a bare
+            # ``"\n" in text`` let a wrongly-refused 513-byte payload through).
+            longest_run = max(len(run) for run in re.findall(r"\n+", text))
+            assert set(text) == {"\n"} or longest_run >= HARD - 1, repr(text)
             continue
         planned += 1
         if len(text.encode()) > CAP:
@@ -156,6 +161,34 @@ def test_the_cap_is_a_parameter_not_a_hard_coded_512() -> None:
     assert chunks is not None
     assert [len(c) for c in chunks] == [25, 25, 25, 25]
     assert "".join(chunks) == text
+
+
+def test_the_cap_may_never_exceed_the_hard_max() -> None:
+    # Codex r1 P2: the fast path returns the payload WHOLE, so a cap above the
+    # hard max would hand the writer a chunk the pty read cannot carry.
+    with pytest.raises(AssertionError):
+        delivery.chunk_literal("x" * 901, HARD + 100)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_first"),
+    [
+        # Codex r1 P2: a lone digit right after a newline run, followed by more
+        # text. Backing the cut off the digit leaves an all-LF chunk, so the
+        # repair must grow RIGHT — the whole 513-byte payload is one valid chunk.
+        ("\n" * 511 + "7a", "\n" * 511 + "7a"),
+        # The same shape past the cap: the first chunk absorbs the run, the
+        # digit AND the character that keeps its line from being a lone digit.
+        ("\n" * 513 + "5x" + "b" * 40, "\n" * 513 + "5x"),
+    ],
+)
+def test_digit_after_a_newline_run_grows_right_instead_of_refusing(
+    text: str, expected_first: str
+) -> None:
+    chunks = delivery.chunk_literal(text)
+    assert chunks is not None, "a typeable payload must never be refused"
+    assert chunks[0] == expected_first
+    _assert_plan_is_sound(text, chunks)
 
 
 def test_a_newline_run_that_still_fits_the_hard_max_is_planned() -> None:

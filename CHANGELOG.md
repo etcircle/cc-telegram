@@ -4,7 +4,7 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
-## [Unreleased]
+## [0.4.17] — 2026-09-01
 
 ### Fixed
 - **Long messages arrived at Claude with their beginning cut off (GH #84).** A 1429-character
