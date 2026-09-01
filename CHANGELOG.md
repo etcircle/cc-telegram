@@ -4,6 +4,29 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.18] — 2026-09-01
+
+### Fixed
+- **A topic with background watchers still running looked completely idle (GH #86).** When a
+  turn ended while Monitor-tool watchers were still going — a CI watch, a test-suite tail — the
+  done-card showed no ⏳ and `/dashboard` showed a plain `⚪ idle` row, so the topic read as
+  finished while work was still pending behind it. Claude Code 2.1.238 changed how the status bar
+  lists live background work: as well as `1 shell` it now renders `2 monitors`, the comma-joined
+  `1 shell, 1 monitor`, or `N background tasks` when the families are mixed — and the bridge
+  recognised only the old shell-only form, so all three read as nothing running. A pane whose bar
+  starts with `⏸` (plan mode) was not read at all.
+
+  All four shapes are now read, from either mode glyph, and the decoration says what is actually
+  running: `⏳ waiting on 2 monitors`, `⏳ 1 background shell`, `⏳ 1 background shell · waiting on
+  2 monitors`, `⏳ 3 background tasks` — the same phrase on the collapsed done-card and the
+  `/dashboard` row. The `🔔 waiting on you` row still outranks it, and a stale reading still
+  silently drops back to `⚪ idle`.
+
+  Side effect on the `1 shell, 1 monitor` pane: its shell is now visible to the idle check, so
+  `/update` no longer treats that pane as free to restart (`/cost` never consulted that check —
+  it restarts nothing). Monitors on their own still do NOT hold `/update` off — that decision is
+  still open on the issue.
+
 ## [0.4.17] — 2026-09-01
 
 ### Fixed
