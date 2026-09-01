@@ -19,10 +19,16 @@ user payload into a live Claude Code pane:
     ``window_send_lock`` (an explicit, named exception documented in the lock
     contract). It may not await, may not schedule work, and may not mutate
     anything else.
-  - ``literal_segments`` / ``lone_hotkey_line`` — the SEGMENT-aware,
-    PER-LINE hotkey refusal (§1.3). On CC 2.1.207 a bare digit is a live HOTKEY
-    on a single-select-shaped surface (it commits with NO Enter), so a payload
-    whose emitted literal segments contain a bare-digit LINE is never written.
+  - ``lone_hotkey_line`` / ``lone_hotkey_line_free_text`` — the PER-LINE hotkey
+    refusal (§1.3). On CC 2.1.207 a bare digit is a live HOTKEY on a
+    single-select-shaped surface (it commits with NO Enter), so a payload whose
+    RAW lines contain a bare-digit LINE is never written. The gate's variant
+    also inspects the ``!`` bash-mode split, which emits ``1`` as its own write.
+  - ``chunk_literal`` / ``plan_gate_segments`` — the GH #84 byte-capped chunk
+    planner: the literal writes the writer will ACTUALLY emit. CC >= 2.1.246
+    keeps only the LAST <= 1022-byte pty read of a single ``send-keys -l`` burst
+    and silently discards everything before it, so an above-cap payload is
+    written as several small writes instead of one.
   - ``unsafe_control_char`` — the RAW-CONTROL-BYTE refusal (§1.3b). ``send-keys
     -l`` stops *tmux* interpreting key NAMES but passes C0/ESC bytes to the pty
     VERBATIM (rig-confirmed), so an embedded ``ESC [ B`` + digit is a cursor-move
@@ -112,6 +118,10 @@ REASON_SEND_FAILED: Final = "send_failed"
 REASON_REVERIFY_FAILED: Final = "reverify_failed"
 REASON_STAMP_FAILED: Final = "stamp_failed"
 REASON_ENTER_FAILED: Final = "enter_failed"
+# GH #84: the payload cannot be typed as byte-capped chunks — it is either above
+# the flat ``MAX_PAYLOAD_BYTES`` ceiling, or its newline runs leave no chunk that
+# carries a real character under ``LITERAL_WRITE_HARD_MAX_BYTES``.
+REASON_PAYLOAD_TOO_LARGE: Final = "payload_too_large"
 
 # GH #50 PR-2 — the free-text lane (``handlers/free_text``). Declared HERE, not
 # there, because ``REFUSAL_COPY`` below is the ONE refusal vocabulary and a
@@ -145,6 +155,7 @@ DELIVERY_REFUSAL_REASONS: Final = (
             REASON_REVERIFY_FAILED,
             REASON_STAMP_FAILED,
             REASON_ENTER_FAILED,
+            REASON_PAYLOAD_TOO_LARGE,
             REASON_FREE_TEXT_VERIFY_FAILED,
             REASON_FREE_TEXT_COMMIT_UNCONFIRMED,
         }
@@ -264,6 +275,11 @@ REFUSAL_COPY: Final[dict[str, str]] = {
         "KEYPRESSES rather than text — arrow keys, Tab, Enter — so they are never "
         "typed into a pane. Resend without them (normal line breaks are fine)."
     ),
+    REASON_PAYLOAD_TOO_LARGE: (
+        "Not delivered — this message is too long (or has too many consecutive "
+        "blank lines) to type into the terminal safely in one go. Split it into "
+        "smaller messages or trim the blank lines."
+    ),
     REASON_STRANDED_DRAFT: STRANDED_DRAFT_MSG,
     # A failed literal write does NOT prove zero bytes reached the pane (r2 F5),
     # so its copy is the NEUTRAL written-state copy, not "failed to send keys".
@@ -366,16 +382,13 @@ def commit_unknown(reason: str, *, message: str | None = None) -> DeliveryResult
 _RE_LONE_DIGIT_LINE: Final = re.compile(r"^[0-9]$")
 
 
-def literal_segments(text: str) -> list[str]:
-    """The literal writes the mode-aware writer will ACTUALLY emit for ``text``.
+def _raw_bash_split(text: str) -> list[str]:
+    """The ``!`` bash-mode two-step, as the GATE's writer reproduces it.
 
     Claude Code's bash mode needs the ``!`` to land FIRST (so the TUI switches
     modes) and the remainder ~1 s later — ``tmux_manager.send_keys`` does that
     two-step, but ONLY when ``literal and enter`` are both true. The GH #50
-    writer withholds the Enter, so it reproduces the split itself — and the
-    hotkey refusal must therefore inspect the SEGMENTS, not the payload:
-    ``!1`` passes a payload-level ``^\\d$`` test yet emits ``"1"`` as its own
-    write, exactly the hotkey shape (rig C7: CONFIRMED FIRES).
+    writer withholds the Enter, so it reproduces the split itself.
     """
     if text.startswith("!"):
         rest = text[1:]
@@ -383,25 +396,203 @@ def literal_segments(text: str) -> list[str]:
     return [text]
 
 
-def lone_hotkey_line(text: str) -> str | None:
-    """The first bare-digit LINE any emitted segment carries, or ``None``.
+def _first_bare_digit_line(segments: list[str]) -> str | None:
+    for segment in segments:
+        for line in segment.split("\n"):
+            if _RE_LONE_DIGIT_LINE.fullmatch(line):
+                return line
+    return None
 
-    PER-LINE, not per-segment (rig §5 finding 3): a bare-digit LINE inside a
+
+def lone_hotkey_line(text: str) -> str | None:
+    """The first bare-digit LINE the GATE would emit for ``text``, or ``None``.
+
+    PER-LINE, not per-payload (rig §5 finding 3): a bare-digit LINE inside a
     multi-line single write DOES fire — ``first line\\n2\\nthird line`` written
     as ONE ``send-keys -l`` COMMITTED option 2 on a live picker. So the rule is:
-    refuse if ANY LINE of ANY emitted literal segment is an ASCII ``[0-9]``
-    fullmatch. This covers ``"1"``, the ``!1`` two-step split, and the
-    multi-line case.
+    refuse if ANY LINE of the RAW payload — or of the ``!`` bash-mode split,
+    since ``!1`` passes a payload-level ``^\\d$`` test yet emits ``"1"`` as its
+    own write (rig C7: CONFIRMED FIRES) — is an ASCII ``[0-9]`` fullmatch.
+
+    It reads the RAW payload, NOT the GH #84 chunk plan: the chunker is forbidden
+    to MINT a lone-digit edge line (see ``chunk_literal``), so the raw lines are
+    exactly the lone-digit lines any emitted chunk can carry.
 
     ``"12"`` and a digit embedded WITHIN a longer line are delivered — an
     empirically narrowed, NON-PROOF case (pty chunking could still split a
     write); the residual is disclosed, not closed.
     """
-    for segment in literal_segments(text):
-        for line in segment.split("\n"):
-            if _RE_LONE_DIGIT_LINE.fullmatch(line):
-                return line
-    return None
+    return _first_bare_digit_line(_raw_bash_split(text))
+
+
+def lone_hotkey_line_free_text(text: str) -> str | None:
+    """``lone_hotkey_line`` WITHOUT the ``!`` bash-mode split (PR-2's lane).
+
+    The free-text executor writes the payload verbatim into a card's affordance
+    row — bash mode is a property of the INPUT BOX, so that lane never emits a
+    lone ``!`` and a leading ``!`` is just text. Applying the gate's split there
+    declined ``!1`` as prose for a keystroke it would never send; ``"1"`` (and
+    any bare-digit LINE) is still refused.
+    """
+    return _first_bare_digit_line([text])
+
+
+# ── The byte-capped chunk planner (GH #84) ───────────────────────────────
+#
+# CC >= 2.1.246 (still present in 2.1.252) keeps only the LAST <= 1022-byte pty
+# read of a single ``tmux send-keys -l`` burst and silently DISCARDS everything
+# before it — most reliably on the first big write of a fresh session. A 1429-char
+# voice transcription arrived as ``payload[1022:]`` with zero signal. The cure is
+# the per-write SIZE (each write must fit one pty read), not the gap: rig R5 got
+# exact commits at 0.00 / 0.08 / 0.12 / 0.20 s gaps and under CPU load.
+
+# Soft per-chunk cap, in UTF-8 BYTES. Rig R1 (2.1.247): 511 / 512 / 513-byte
+# chunks over a 3000-char payload all committed EXACTLY, rendering as a literal
+# draft that submits on the FIRST Enter — while chunks >= ~890 bytes flip the
+# draft into the `[Pasted text #N]` collapse, whose first Enter only EXPANDS it.
+LITERAL_WRITE_MAX_BYTES: Final = 512
+
+# The bound an EDGE REPAIR may grow a chunk to (a newline run that would
+# otherwise leave a chunk carrying no real character). Below the 1022-byte pty
+# read that causes the bug; rig R1 committed 890-byte chunks exactly.
+LITERAL_WRITE_HARD_MAX_BYTES: Final = 900
+
+# Inter-chunk gap. Not load-bearing for correctness (rig R5) — kept as margin.
+CHUNK_SETTLE_S: Final = 0.12
+
+# Flat payload ceiling, in UTF-8 bytes. 16 KiB / 512 = 32 chunks ⇒ 31 × 0.12 s of
+# gaps (3.7 s) + ~0.14 s per tmux round trip (4.5 s) ≈ 8.5 s, comfortably inside
+# ``session.DELIVERY_DEADLINE_S`` (20 s) with the 0.5 s settle + the re-verify.
+# The existing deadline checks remain the backstop for a slow pane.
+MAX_PAYLOAD_BYTES: Final = 16384
+
+_ASCII_DIGITS: Final = frozenset("0123456789")
+
+
+def _byte_bounded_end(text: str, p: int, cap: int) -> int:
+    """The largest ``q`` with ``text[p:q]`` at most ``cap`` UTF-8 bytes.
+
+    Python string indices ARE character boundaries, so a chunk can never split a
+    multi-byte glyph (rig R3: CJK + emoji chunked at a 512-BYTE cap committed
+    exactly).
+    """
+    used = 0
+    q = p
+    while q < len(text):
+        size = len(text[q].encode())
+        if used + size > cap:
+            break
+        used += size
+        q += 1
+    return q
+
+
+def _is_all_lf(text: str, p: int, q: int) -> bool:
+    return q > p and all(c == "\n" for c in text[p:q])
+
+
+def _too_big(text: str, p: int, q: int) -> bool:
+    return len(text[p:q].encode()) > LITERAL_WRITE_HARD_MAX_BYTES
+
+
+def _mints_digit_edge_line(text: str, p: int, q: int) -> bool:
+    """True iff cutting at ``q`` would CREATE a bare-digit line the payload lacks.
+
+    A bare digit is a live HOTKEY (see ``lone_hotkey_line``), and the gate checks
+    the RAW payload — so the planner must never manufacture one that the raw
+    lines do not contain. An ORIGINAL full-line bare digit is not this function's
+    concern: it survives intact in some chunk and the seam refuses the payload
+    before any chunk is written.
+    """
+    n = len(text)
+    if q >= n:
+        return False
+    # (a) the NEXT chunk would OPEN with a lone-digit line, but the digit sat
+    # mid-line in the payload.
+    if (
+        text[q] in _ASCII_DIGITS
+        and (q + 1 == n or text[q + 1] == "\n")
+        and text[q - 1] != "\n"
+    ):
+        return True
+    # (b) THIS chunk would CLOSE with a lone-digit line, but the original line
+    # continued past the cut.
+    if text[q] != "\n":
+        line_start = max(text.rfind("\n", p, q) + 1, p)
+        if q - line_start == 1 and text[q - 1] in _ASCII_DIGITS:
+            return True
+    return False
+
+
+def chunk_literal(text: str, cap: int = LITERAL_WRITE_MAX_BYTES) -> list[str] | None:
+    """Split ``text`` into the byte-capped literal writes the writer will emit.
+
+    GREEDY at UTF-8 character boundaries, with two LOCAL edge repairs:
+
+      - **no newlines-only chunk** — a write of nothing but ``\\n`` is a run of
+        bare Enters at the pty. If the greedy chunk is all ``\\n`` it is extended
+        forward to the first real character, and if the REMAINDER would be all
+        ``\\n`` this chunk absorbs it. Either extension may grow the chunk to
+        ``LITERAL_WRITE_HARD_MAX_BYTES``. A cut INSIDE a newline run is otherwise
+        allowed — rig R6 committed leading, trailing and mid-payload blank runs
+        exactly, with ONE Enter.
+      - **no minted lone-digit edge line** — see ``_mints_digit_edge_line``. The
+        cut walks LEFT until it is clean (in practice a character or two).
+
+    Returns ``None`` — the seam's ``payload_too_large`` refusal — only when no
+    valid chunk fits under the hard max: a ``\\n`` run of 900+ bytes, or an
+    all-newlines payload above ``cap``. ``""`` maps to ``[""]`` (today's one
+    no-op write) and an at-or-below-cap payload to ``[text]``, byte-identical to
+    the pre-#84 single write.
+    """
+    if not text:
+        return [""]
+    if len(text.encode()) <= cap:
+        return [text]
+
+    n = len(text)
+    chunks: list[str] = []
+    p = 0
+    while p < n:
+        q = _byte_bounded_end(text, p, cap)
+        if q <= p:
+            return None
+        if _is_all_lf(text, p, q):
+            # Walk to the first real character and take it with us.
+            while q < n and text[q] == "\n":
+                q += 1
+            if q >= n:
+                return None  # the whole tail is newlines
+            q += 1
+            if _too_big(text, p, q):
+                return None
+        while _mints_digit_edge_line(text, p, q):
+            q -= 1
+            if q <= p or _is_all_lf(text, p, q):
+                return None
+        if q < n and all(c == "\n" for c in text[q:]):
+            if _too_big(text, p, n):
+                return None
+            q = n
+        chunks.append(text[p:q])
+        p = q
+    return chunks
+
+
+def plan_gate_segments(text: str) -> list[str] | None:
+    """The literal writes the GATE's mode-aware writer will ACTUALLY emit.
+
+    The ``!`` bash-mode two-step (see ``_raw_bash_split``) composed with the
+    GH #84 byte cap: the ``!`` lands alone, the remainder as chunks. ``None``
+    propagates from ``chunk_literal`` — the ``payload_too_large`` refusal.
+    """
+    if text.startswith("!"):
+        rest = text[1:]
+        if not rest:
+            return ["!"]
+        tail = chunk_literal(rest)
+        return None if tail is None else ["!", *tail]
+    return chunk_literal(text)
 
 
 # ── The raw-control-byte refusal ─────────────────────────────────────────
@@ -422,13 +613,18 @@ def lone_hotkey_line(text: str) -> str | None:
 #
 # WHAT IS ALLOWED, AND WHY (decided deliberately):
 #
-#   \n  (LF, 0x0A) — ALLOWED, and load-bearing. A multi-line payload written in
-#       ONE ``send-keys -l`` is consumed PASTE-SHAPED by CC and commits WHOLE
-#       (rig: 947-char / 9-line and 5 274-char / 30-line payloads both landed
-#       intact). Every real voice note and every reply-context quote is
-#       multi-line, so refusing LF would break the lane's primary flow. This code
-#       does not touch newline handling AT ALL — the byte set below simply
-#       excludes 0x0A.
+#   \n  (LF, 0x0A) — ALLOWED, and load-bearing. Every real voice note and every
+#       reply-context quote is multi-line, so refusing LF would break the lane's
+#       primary flow. This code does not touch newline handling AT ALL — the byte
+#       set below simply excludes 0x0A.
+#
+#       VERSION-QUALIFIED (GH #84): "a multi-line payload written in ONE
+#       ``send-keys -l`` is consumed PASTE-SHAPED and commits WHOLE" (rig:
+#       947-char / 9-line and 5 274-char / 30-line payloads) held at ANY size on
+#       <= 2.1.238. On >= 2.1.246 a burst above the 1022-byte pty read keeps only
+#       its LAST read and silently drops the head — which is why both seams now
+#       write byte-capped CHUNKS (``chunk_literal``). Multi-line is unaffected;
+#       only the per-write SIZE changed.
 #
 #   \t  (TAB, 0x09) — REFUSED. Tab is a live TUI KEY, not whitespace: on a picker
 #       it advances the surface, in the input box it drives completion. The rig

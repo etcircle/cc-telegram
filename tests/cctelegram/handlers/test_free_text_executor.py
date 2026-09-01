@@ -477,9 +477,15 @@ class TestTheOwnersActualUseCase:
         result = await free_text.try_answer(WINDOW, BIG_ANSWER, user_turn=STAMP)
 
         assert result is not None and result.ok, result
-        # ONE literal write — exactly what the bot's send_keys does, and what the
-        # rig proved does NOT paste-collapse on an affordance row.
-        assert pane.literal_writes == [BIG_ANSWER]
+        # GH #84: TWO byte-capped writes, not one — CC >= 2.1.246 keeps only the
+        # LAST <= 1022-byte pty read of a single burst. What must hold is the
+        # JOIN, and that one Enter still commits it.
+        assert "".join(pane.literal_writes) == BIG_ANSWER
+        assert len(pane.literal_writes) == 2
+        assert all(
+            len(w.encode()) <= delivery.LITERAL_WRITE_MAX_BYTES
+            for w in pane.literal_writes
+        )
         assert pane.enter_sent is True
         assert stamped == [(1, 42, WINDOW)]
 
@@ -1498,6 +1504,69 @@ class TestTheAnchorIsBoundToThePane:
         assert result is not None and result.ok, result
         assert pane.enter_sent is True
         assert stamped == [(1, 42, WINDOW)]
+
+
+class TestTheChunkedWrite:
+    """GH #84 — the answer is typed as byte-capped chunks, and the lane's
+    lone-hotkey precheck drops the gate's ``!`` bash split."""
+
+    def test_the_precheck_no_longer_splits_a_leading_bang(self):
+        # The lane never emits a lone "!" (bash mode is a property of the INPUT
+        # BOX), so `!1` is prose on a card — but a bare-digit LINE still isn't.
+        assert delivery.lone_hotkey_line_free_text("!1") is None
+        assert delivery.lone_hotkey_line_free_text("1") == "1"
+
+    @pytest.mark.asyncio
+    async def test_a_bang_digit_answer_is_typed(self, monkeypatch, stamped):
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        result = await free_text.try_answer(WINDOW, "!1", user_turn=STAMP)
+
+        assert result is not None
+        assert pane.literal_writes == ["!1"]
+
+    @pytest.mark.asyncio
+    async def test_a_lone_digit_answer_still_declines_with_zero_keystrokes(
+        self, monkeypatch, stamped
+    ):
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        assert await free_text.try_answer(WINDOW, "1", user_turn=STAMP) is None
+        assert pane.keys == []
+        assert stamped == []
+
+    @pytest.mark.asyncio
+    async def test_an_above_cap_answer_is_typed_as_n_chunks(self, monkeypatch):
+        payload = "chunk this answer. " * 100  # 1900 bytes ⇒ 4 chunks
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED_BIG, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        await free_text.try_answer(WINDOW, payload, user_turn=STAMP)
+
+        assert len(pane.literal_writes) == 4
+        assert "".join(pane.literal_writes) == payload
+        assert all(
+            len(w.encode()) <= delivery.LITERAL_WRITE_MAX_BYTES
+            for w in pane.literal_writes
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unplannable_answer_declines_with_zero_keystrokes(
+        self, monkeypatch, stamped
+    ):
+        """A pre-keystroke bail returns ``None`` — the additive invariant. PR-1's
+        gate then owns the single ``payload_too_large`` refusal."""
+        pane = FakePane([AUQ_X_LIVE, AUQ_X_LANDED, AUQ_X_TYPED, AUQ_RESOLVED])
+        _wire(monkeypatch, pane)
+
+        assert (
+            await free_text.try_answer(WINDOW, "\n" * 901 + "x", user_turn=STAMP)
+            is None
+        )
+        assert pane.keys == []
+        assert stamped == []
 
 
 class TestRawControlBytesAreNeverTyped:

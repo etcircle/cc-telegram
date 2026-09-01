@@ -261,10 +261,11 @@ class TestTheOwnersActualUseCase:
         await aggregator_flush_route((scenario.user_id, 42, wid))
 
         assert len(BIG_ANSWER) > 800
-        assert scenario.tmux.delivered(BIG_ANSWER), scenario.tmux.written_texts
-        # ONE literal write — what the bot's send_keys emits, and what the rig
-        # proved is consumed as literal text on an affordance row.
-        assert scenario.tmux.written_texts == [BIG_ANSWER]
+        # GH #84: typed as byte-capped CHUNKS (a single burst above the 1022-byte
+        # pty read is silently truncated by CC >= 2.1.246), so the JOIN is the
+        # payload and one Enter commits it.
+        assert "".join(scenario.tmux.written_texts) == BIG_ANSWER
+        assert scenario.tmux.committed
         assert not any("Not delivered" in n for n in _notices(scenario))
 
 
@@ -326,10 +327,11 @@ class TestReplyQuotedPayloadsAreEligible:
         )
         await aggregator_flush_route((scenario.user_id, 42, wid))
 
-        assert scenario.tmux.delivered(BIG_ANSWER), scenario.tmux.written_texts
         # THE QUOTE IS INCLUDED — Claude gets the context, not just the words.
         assert BIG_ANSWER.startswith('> Re: "')
-        assert scenario.tmux.written_texts == [BIG_ANSWER]
+        # GH #84: byte-capped chunks, so the JOIN is the payload (see above).
+        assert "".join(scenario.tmux.written_texts) == BIG_ANSWER
+        assert scenario.tmux.committed
         assert not any("Not delivered" in n for n in _notices(scenario))
 
     @pytest.mark.asyncio

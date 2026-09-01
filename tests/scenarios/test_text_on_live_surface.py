@@ -519,7 +519,10 @@ async def test_a_long_multiline_reply_delivers_through_the_paste_collapse(
     result = await aggregator_flush_route(route)
 
     assert result.ok, result.reason
-    assert _typed(scenario) == [_LONG_REPLY_PAYLOAD]
+    # GH #84: an above-cap payload is typed as byte-capped chunks, so the JOIN is
+    # what must match (a single burst above the 1022-byte pty read is silently
+    # truncated by CC >= 2.1.246).
+    assert "".join(_typed(scenario)) == _LONG_REPLY_PAYLOAD
     assert scenario.tmux.committed, "the Enter PR-1 was withholding"
     # …and the topic is NOT braked: the next message must still go through.
     scenario.tmux.on_write = None

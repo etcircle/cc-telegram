@@ -4,6 +4,31 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [Unreleased]
+
+### Fixed
+- **Long messages arrived at Claude with their beginning cut off (GH #84).** A 1429-character
+  voice transcription reached the terminal as its last 407 characters; a long reply-quote lost its
+  head the same way. There was no error and no notice — the message simply started mid-sentence.
+  Claude Code 2.1.246 changed how it reads a burst of typed text: anything above one 1022-byte
+  read is discarded except the final read, most reliably on the first big message of a fresh
+  session. The behaviour is still present in 2.1.252.
+
+  Both inbound paths — an ordinary message into the input box, and a free-text answer typed into a
+  card's "Type something." row — now type a long message as a series of 512-byte writes about a
+  tenth of a second apart, committed by the same single Enter as before. On the rig this commits
+  the message byte-exactly on 2.1.238, 2.1.247 and 2.1.252, including where a write boundary falls
+  inside a run of blank lines, while the same payload sent as one burst still truncates. Chunked
+  writes also render as ordinary text rather than a collapsed `[Pasted text]` block, so the first
+  Enter submits instead of merely expanding the paste.
+
+  A message the bot cannot type safely is now refused before anything is typed, with a new notice
+  ("this message is too long, or has too many consecutive blank lines"): above 16 KB, or a run of
+  900+ consecutive blank lines. Nothing else about the delivery gate moved — the same checks run in
+  the same order, a message at or below 512 bytes is written exactly as before, and a message
+  containing a line that is just a digit is still refused for that reason. Splitting a long message
+  never creates such a line where the original had none.
+
 ## [0.4.16] — 2026-08-31
 
 ### Changed

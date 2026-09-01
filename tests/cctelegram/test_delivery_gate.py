@@ -630,7 +630,13 @@ async def test_a_long_multiline_payload_delivers_through_the_paste_collapse(
     result = await session_manager.deliver_to_window("@1", _LONG_MULTILINE_PAYLOAD)
 
     assert result.ok, result.reason
-    assert pane.written == [_LONG_MULTILINE_PAYLOAD]
+    # GH #84: an above-cap payload is typed as byte-capped CHUNKS (a single burst
+    # above the 1022-byte pty read keeps only its LAST read on CC >= 2.1.246), so
+    # what must hold is the JOIN — and exactly one Enter after the last chunk.
+    assert "".join(pane.written) == _LONG_MULTILINE_PAYLOAD
+    assert all(
+        len(c.encode()) <= delivery.LITERAL_WRITE_MAX_BYTES for c in pane.written
+    )
     assert pane.committed  # the Enter that PR-1 was withholding
     assert not session_mod.window_has_stranded_draft("@1")  # and no brake
 
@@ -1252,6 +1258,170 @@ async def test_a_first_segment_write_failure_is_classified_written(monkeypatch) 
     assert result.reason == delivery.REASON_SEND_FAILED
     assert result.outcome is delivery.DeliveryOutcome.DRAFT_WRITTEN
     assert session_mod.window_has_stranded_draft("@1")
+
+
+# ── GH #84: step 0c — the byte-capped chunk plan at the seam ─────────────
+#
+# CC >= 2.1.246 keeps only the LAST <= 1022-byte pty read of a single
+# ``send-keys -l`` burst and silently discards the head (a 1429-char voice note
+# arrived as ``payload[1022:]``). The planner itself is pinned in
+# ``test_delivery_chunking.py``; what belongs HERE is the seam: the cadence, the
+# failure classification and the refusal.
+
+_ABOVE_CAP = "chunk me please. " * 100  # 1700 bytes ⇒ 4 chunks
+
+
+def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay: float, *args, **kwargs):
+        slept.append(delay)
+        return await real_sleep(0, *args, **kwargs)
+
+    monkeypatch.setattr(session_mod.asyncio, "sleep", fake_sleep)
+    return slept
+
+
+@pytest.mark.asyncio
+async def test_an_above_cap_payload_is_typed_as_chunks_with_the_inter_chunk_gap(
+    monkeypatch,
+) -> None:
+    pane = _wire(monkeypatch, _Pane([IDLE_PANE_V2_1_207]))
+    monkeypatch.setattr(delivery, "CHUNK_SETTLE_S", 0.12)
+    monkeypatch.setattr(session_mod, "TEXT_SETTLE_S", 0.5)
+    slept = _record_sleeps(monkeypatch)
+
+    result = await session_manager.deliver_to_window("@1", _ABOVE_CAP)
+
+    assert result.ok, result.reason
+    assert len(pane.written) == 4
+    assert "".join(pane.written) == _ABOVE_CAP
+    assert all(
+        len(c.encode()) <= delivery.LITERAL_WRITE_MAX_BYTES for c in pane.written
+    )
+    assert pane.committed  # exactly ONE Enter, after the last chunk
+    # 3 inter-chunk gaps, then the text→Enter settle.
+    assert slept == [0.12, 0.12, 0.12, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_only_the_bash_boundary_takes_the_bash_settle(monkeypatch) -> None:
+    """The ``!`` two-step needs the TUI ~1 s to switch modes; every FURTHER
+    boundary is an ordinary chunk boundary."""
+    pane = _wire(
+        monkeypatch, _Pane([pane_fixture("inputbox_bashmode_draft_v2.1.207.txt")])
+    )
+    monkeypatch.setattr(delivery, "CHUNK_SETTLE_S", 0.12)
+    monkeypatch.setattr(session_mod, "BASH_MODE_SETTLE_S", 1.0)
+    monkeypatch.setattr(session_mod, "TEXT_SETTLE_S", 0.0)
+    slept = _record_sleeps(monkeypatch)
+
+    payload = "!echo " + "x" * 1200
+    result = await session_manager.deliver_to_window("@1", payload)
+
+    assert result.ok, result.reason
+    assert pane.written[0] == "!"
+    assert "".join(pane.written) == payload
+    assert slept[0] == 1.0  # the bash mode switch
+    assert set(slept[1:-1]) == {0.12}  # every later boundary is a chunk gap
+
+
+@pytest.mark.asyncio
+async def test_a_mid_chunk_write_failure_is_classified_written(monkeypatch) -> None:
+    """The r2 F5 rule, unchanged by chunking: a False from ``send_keys`` does not
+    prove zero bytes landed — and an earlier chunk certainly DID land."""
+    pane = _wire(monkeypatch, _Pane([IDLE_PANE_V2_1_207]))
+
+    async def send_keys(window_id, text, enter=True, literal=True):
+        pane.sent.append((text, enter, literal))
+        return len(pane.written) < 2
+
+    monkeypatch.setattr(real_tmux, "send_keys", send_keys)
+
+    result = await session_manager.deliver_to_window("@1", _ABOVE_CAP)
+
+    assert result.reason == delivery.REASON_SEND_FAILED
+    assert result.outcome is delivery.DeliveryOutcome.DRAFT_WRITTEN
+    assert len(pane.written) == 2  # it stopped at the failure
+    assert not pane.committed
+    assert session_mod.window_has_stranded_draft("@1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "x" * (delivery.MAX_PAYLOAD_BYTES + 1),  # above the flat ceiling
+        "\n" * 901 + "x",  # no chunk can carry a real character
+    ],
+)
+async def test_an_unplannable_payload_is_refused_before_any_capture(
+    monkeypatch, payload: str
+) -> None:
+    pane = _wire(monkeypatch, _Pane([IDLE_PANE_V2_1_207]))
+
+    result = await session_manager.deliver_to_window("@1", payload)
+
+    assert result.reason == delivery.REASON_PAYLOAD_TOO_LARGE
+    assert result.outcome is delivery.DeliveryOutcome.NOT_WRITTEN
+    assert pane.sent == []
+    assert pane.capture_calls == 0
+    assert "too long" in result.message
+
+
+# The rig's own 2.1.247 capture of a 1709-byte payload typed as 512-byte chunks:
+# chunked writes render as a LITERAL tall draft (never the `[Pasted text]`
+# collapse, whose first Enter only EXPANDS it), so the pre-Enter re-verify sees a
+# ready input box and the ONE Enter submits.
+_CHUNKED_FIXTURE = "inputbox_chunked_draft_v2.1.247.txt"
+_CHUNKED_DRAFT = " ".join(
+    [
+        "Here is a long dictated message that the bridge had to type into the "
+        "terminal in several separate literal writes because a single burst is "
+        "silently truncated by Claude Code on this release."
+    ]
+    * 9
+)
+
+
+def test_a_real_chunked_draft_frame_is_a_ready_input_box() -> None:
+    pane = pane_fixture(_CHUNKED_FIXTURE)
+    assert tp.pane_input_box_present(pane, expected_draft=_CHUNKED_DRAFT) is True
+    assert tp.classify_input_box_failure(pane, expected_draft=_CHUNKED_DRAFT) is None
+
+
+@pytest.mark.asyncio
+async def test_the_reverify_commits_on_the_real_chunked_draft_frame(
+    monkeypatch,
+) -> None:
+    pane = _Pane([IDLE_PANE_V2_1_207])
+    pane.on_write = lambda: setattr(pane, "captures", [pane_fixture(_CHUNKED_FIXTURE)])
+    _wire(monkeypatch, pane)
+
+    result = await session_manager.deliver_to_window("@1", _CHUNKED_DRAFT)
+
+    assert result.ok, result.reason
+    assert len(pane.written) == 4
+    assert "".join(pane.written) == _CHUNKED_DRAFT
+    assert pane.committed
+    assert not session_mod.window_has_stranded_draft("@1")
+
+
+@pytest.mark.asyncio
+async def test_an_unplannable_payload_is_never_stamped(monkeypatch) -> None:
+    _wire(monkeypatch, _Pane([IDLE_PANE_V2_1_207]))
+    stamped: list[object] = []
+    monkeypatch.setattr(session_mod, "_stamp_user_turn", stamped.append)
+
+    result = await session_manager.deliver_to_window(
+        "@1",
+        "x" * (delivery.MAX_PAYLOAD_BYTES + 1),
+        user_turn=delivery.UserTurnStamp(1, 42, "@1"),
+    )
+
+    assert result.outcome is delivery.DeliveryOutcome.NOT_WRITTEN
+    assert stamped == []
 
 
 # ── §1.4: the reason → copy map ──────────────────────────────────────────

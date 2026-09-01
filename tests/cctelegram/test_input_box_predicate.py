@@ -840,6 +840,11 @@ _BASELINE_CLASSIFICATIONS = {
     "inputbox_bgshell_v2.1.207.txt": None,
     "inputbox_busy_thinking_v2.1.207.txt": None,
     "inputbox_busy_tool_v2.1.207.txt": None,
+    # GH #84 — a 2.1.247 capture of a 1709-byte payload typed as 512-byte CHUNKS.
+    # Byte-capped chunks render as an ordinary LITERAL tall draft (never the
+    # `[Pasted text]` collapse), so it is a plain deliverable box: nothing about
+    # the predicate changed for GH #84, and this fixture is the pin for that.
+    "inputbox_chunked_draft_v2.1.247.txt": None,
     "inputbox_draft_typed_v2.1.207.txt": None,
     "inputbox_idle_v2.1.207.txt": None,
     # GH #62: the 2.1.238 idle rig capture. Deliverable BEFORE the change too (a
