@@ -23,8 +23,9 @@ this project's package version is bumped per release, not per deploy (see the `-
   silently drops back to `⚪ idle`.
 
   Side effect on the `1 shell, 1 monitor` pane: its shell is now visible to the idle check, so
-  `/update` and `/cost` no longer treat that pane as free to restart. Monitors on their own still
-  do NOT hold those two commands off — that decision is still open on the issue.
+  `/update` no longer treats that pane as free to restart (`/cost` never consulted that check —
+  it restarts nothing). Monitors on their own still do NOT hold `/update` off — that decision is
+  still open on the issue.
 
 ## [0.4.17] — 2026-09-01
 

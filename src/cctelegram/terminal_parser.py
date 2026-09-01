@@ -4541,9 +4541,11 @@ def parse_background_jobs(pane_text: str) -> int | None:
     This is the IDLE-GATE view: ``pane_looks_idle``'s leg 5 ("no LIVE
     background shells") is the only consumer, and it DELIBERATELY excludes
     monitors and the generic ``background task(s)`` fallback — a restart does
-    kill a monitor, but whether that should block ``/update`` / ``/cost`` is
-    an owner decision still pending on GH #86. Widening this view is the ONE
-    change that would move those two commands' semantics.
+    kill a monitor, but whether that should block ``/update`` is an owner
+    decision still pending on GH #86 (``/cost`` opts OUT of leg 5 via
+    ``bot._USAGE_ALLOW_BG_SHELLS`` — it restarts nothing, so shells never gate
+    it; Codex r1 P3). Widening this view is the ONE change that would move
+    ``/update``'s semantics.
 
     ``None`` (no chrome / untrusted frame) propagates unchanged.
     """
