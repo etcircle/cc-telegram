@@ -4409,36 +4409,63 @@ def parse_status_line(pane_text: str) -> str | None:
     return None
 
 
-_RE_BG_SHELLS_BAR = re.compile(r"(?:^|·\s)(\d+)\s+shells?(?=\s*·|\s*$)")
 _RE_BG_SHELLS_CHURN = re.compile(r"·\s*(\d+)\s+shells?\s+still\s+running\b")
+# Count extractors for a segment ALREADY proven to be a TASKS segment by the
+# GH #62 grammar's ``_RE_STATUS_TASKS``. ASCII digits only (``\d`` is
+# Unicode-wide — the GH #62 r3 ``١ shell`` spoof).
+_RE_BG_TASKS_SHELLS = re.compile(r"([0-9]+) shells?")
+_RE_BG_TASKS_MONITORS = re.compile(r"([0-9]+) monitors?")
+_RE_BG_TASKS_GENERIC = re.compile(r"([0-9]+) background tasks?")
 
 
-def parse_background_jobs(pane_text: str) -> int | None:
-    """Extract Claude Code's background-shell count from a pane frame (GH #43).
+@dataclass(frozen=True)
+class BackgroundTasks:
+    """Per-family live background-task counts read off one pane frame."""
 
-    A turn that ends with a backgrounded shell still executing shows the
-    count in two chrome-region places (v2.1.168, real-fixture verified):
+    shells: int
+    monitors: int
+    tasks: int
+    """The mixed-family ``<n> background task(s)`` fallback count."""
 
-      - the status bar below the bottom separator:
-        ``⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage``
-      - the churn/spinner line above the top separator:
-        ``✻ Brewed for 6s · 1 shell still running``
+    @property
+    def total(self) -> int:
+        return self.shells + self.monitors + self.tasks
+
+
+def parse_background_tasks(pane_text: str) -> BackgroundTasks | None:
+    """Extract Claude Code's live background-task counts from a pane frame.
+
+    A turn that ends with work still executing shows the counts in two
+    chrome-region places (real-fixture verified):
+
+      - the status bar below the bottom separator, whose TASKS slot renders
+        as ``1 shell``, ``2 monitors``, the comma-joined ``1 shell, 1
+        monitor`` pair or the mixed-family ``N background tasks`` fallback
+        (CC ≥2.1.238 — GH #86; the slot is parsed with the GH #62 status-row
+        grammar's own ``_RE_STATUS_TASKS``, never a parallel alphabet)::
+
+            ⏵⏵ bypass permissions on · 2 monitors · ← for agents
+
+      - the churn/spinner line above the top separator, shells only (the
+        legacy ≤2.1.217 form)::
+
+            ✻ Brewed for 6s · 1 shell still running
 
     The scan is anchored to the CHROME REGION ONLY (never body prose — a
     ``· 3 shells ·`` string in Claude's output must not count): the status
-    bar is the first ``⏵`` line below the LAST separator; the churn line is
-    the spinner line found by the same bounded walk-up
-    ``parse_status_line`` uses. The status bar is the primary anchor (the
-    2026-06-11 incident frame defeated ``parse_status_line`` via the
-    task-progress overlay while its status bar still showed ``· 1 shell``);
-    on conflicting tokens the MAX wins.
+    bar is the first ``⏵``/``⏸`` line below the LAST separator (a plan-mode
+    pane opens its bar with ``⏸``); the churn line is the spinner line found
+    by the same bounded walk-up ``parse_status_line`` uses. The status bar is
+    the primary anchor (the 2026-06-11 incident frame defeated
+    ``parse_status_line`` via the task-progress overlay while its status bar
+    still showed ``· 1 shell``); per FAMILY, conflicting tokens take the MAX.
 
     Returns ``None`` when no chrome separator is visible (untrusted /
-    truncated frame — callers must not record), and ``0`` when the chrome
-    is present but neither token is (positively no background shells).
-    NOTE: a mid-run frame may read 0 even with live shells (the running
-    status bar truncates and the active spinner carries no token) — callers
-    only RENDER the count on idle routes, where the idle frame restores it
+    truncated frame — callers must not record), and all-zero counts when the
+    chrome is present but no token is (positively nothing in flight).
+    NOTE: a mid-run frame may read 0 even with live work (the running status
+    bar truncates and the active spinner carries no token) — callers only
+    RENDER the counts on idle routes, where the idle frame restores them
     within one capture watchdog interval.
     """
     if not pane_text:
@@ -4458,18 +4485,30 @@ def parse_background_jobs(pane_text: str) -> int | None:
         if len(lines[i].strip()) >= 20 and all(c == "─" for c in lines[i].strip())
     ]
 
-    counts: list[int] = []
+    shells: list[int] = []
+    monitors: list[int] = []
+    tasks: list[int] = []
 
-    # Status bar: first ⏵ line below the LAST separator in the frame.
+    # Status bar: first ⏵/⏸ line below the LAST separator in the frame. The
+    # GH #73 right-aligned block is split off before the segment walk (a no-op
+    # on a row without one), then each ``·`` segment the GH #62 grammar
+    # recognises as the TASKS slot yields its per-family counts.
     last_sep = sep_idxs[-1]
     for i in range(last_sep + 1, len(lines)):
         line = lines[i].strip()
         if not line:
             continue
-        if line.startswith("⏵"):
-            m = _RE_BG_SHELLS_BAR.search(line)
-            if m:
-                counts.append(int(m.group(1)))
+        if line.startswith(("⏵", "⏸")):
+            for raw in _split_status_right_block(line).split("·"):
+                seg = raw.strip(" \t\r\n")
+                if _RE_STATUS_TASKS.fullmatch(seg) is None:
+                    continue
+                if m := _RE_BG_TASKS_SHELLS.search(seg):
+                    shells.append(int(m.group(1)))
+                if m := _RE_BG_TASKS_MONITORS.search(seg):
+                    monitors.append(int(m.group(1)))
+                if m := _RE_BG_TASKS_GENERIC.search(seg):
+                    tasks.append(int(m.group(1)))
             break
 
     # Churn line: the spinner line above the input box's TOP separator
@@ -4483,13 +4522,33 @@ def parse_background_jobs(pane_text: str) -> int | None:
         if line[0] in STATUS_SPINNERS:
             m = _RE_BG_SHELLS_CHURN.search(line)
             if m:
-                counts.append(int(m.group(1)))
+                shells.append(int(m.group(1)))
             break
         if line.startswith(_TASK_PROGRESS_PREFIXES):
             continue
         break
 
-    return max(counts) if counts else 0
+    return BackgroundTasks(
+        shells=max(shells, default=0),
+        monitors=max(monitors, default=0),
+        tasks=max(tasks, default=0),
+    )
+
+
+def parse_background_jobs(pane_text: str) -> int | None:
+    """The SHELLS-only view of ``parse_background_tasks`` (GH #43 / GH #86).
+
+    This is the IDLE-GATE view: ``pane_looks_idle``'s leg 5 ("no LIVE
+    background shells") is the only consumer, and it DELIBERATELY excludes
+    monitors and the generic ``background task(s)`` fallback — a restart does
+    kill a monitor, but whether that should block ``/update`` / ``/cost`` is
+    an owner decision still pending on GH #86. Widening this view is the ONE
+    change that would move those two commands' semantics.
+
+    ``None`` (no chrome / untrusted frame) propagates unchanged.
+    """
+    t = parse_background_tasks(pane_text)
+    return None if t is None else t.shells
 
 
 def is_status_active(pane_text: str) -> bool:

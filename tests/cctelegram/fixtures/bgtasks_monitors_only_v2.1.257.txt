@@ -1,0 +1,50 @@
+
+
+⏺ Placeholder narration line kept at roughly the captured width so the frame geometry survives the scrub. Nothing here is real project text.
+  and a wrapped continuation row of the same shape.
+
+
+⏺ Teammate @placeholder-lane finished
+  A short one-line teammate summary stands in for the original.…
+
+⏺ Another placeholder narration row, one wrapped line only.
+
+  Ran 1 shell command
+
+⏺ A placeholder narration row that once carried a verification summary and now carries neutral filler instead of it. · summarized
+  Second wrapped row of the same placeholder narration.
+
+  Pushed to placeholder-branch, ran 1 shell command
+
+⏺ A placeholder narration row standing in for a merge-readiness note, wrapped across two rows exactly as the capture had it.
+  Second wrapped row of the merge-readiness placeholder.
+
+❯ a placeholder user message row
+
+⏺ A placeholder answer row, one line.
+
+  Waiting on
+  - First placeholder bullet, wrapped to about the captured width.
+  - Second placeholder bullet, wrapped to about the captured width.
+
+  A placeholder paragraph row standing in for the original explanation, wrapped across four rows of roughly the captured width, with no
+  project detail left in it at all. The rows exist only so the frame keeps its height and the chrome below sits where it sat in the real
+  capture. Nothing in these rows is parsed by anything under test; they are here to prove the scan is anchored to the chrome region and
+  never to body prose.
+
+  A closing placeholder row.
+
+  Read 1 file
+
+⏺ A placeholder narration row standing in for a brief written just before the capture, wrapped across three rows of roughly the captured
+  width so the geometry above the chrome is unchanged. No project text remains.
+  Third wrapped row of the placeholder brief.
+
+⏺ Monitor event: "placeholder monitor label (each result as it lands)"
+
+⏺ A placeholder row noting that one gate passed and two are still running.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ hello
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 2 monitors · ← for agents · ↓ to manage                                                                                /rc failed

@@ -1389,14 +1389,16 @@ def _render_collapsed_activity_summary(
     status: str,
     display: str,
     suffix: str,
-    bg_jobs: int | None = None,
+    bg_jobs: pane_signals.BackgroundJobs | None = None,
 ) -> str:
     """One-line W1 summary: header + frozen counts + frozen duration.
 
-    ``bg_jobs`` (GH #43) appends a live ``⏳ N background job(s)`` decoration
-    — the one non-frozen part: it appears while the pane reports running
-    background shells on an idle route and disappears when they finish (the
-    poller repaints on count change; staleness hides it otherwise).
+    ``bg_jobs`` (GH #43 / GH #86) appends a live ``⏳ <phrase>`` decoration —
+    the one non-frozen part: it appears while the pane reports running
+    background shells / monitors / tasks on an idle route and disappears when
+    they finish (the poller repaints on phrase change; staleness hides it
+    otherwise). The phrase itself comes from ``pane_signals`` so this card
+    and the /dashboard row can never drift apart.
     """
     parts = [f"{status} — {display}{suffix}"]
     if state.tool_count:
@@ -1408,8 +1410,12 @@ def _render_collapsed_activity_summary(
         )
     if state.started_at and state.finalized_at:
         parts.append(_format_duration(state.finalized_at - state.started_at))
-    if bg_jobs:
-        parts.append(f"⏳ {bg_jobs} background job{'s' if bg_jobs != 1 else ''}")
+    if bg_jobs is not None:
+        phrase = pane_signals.describe_background_jobs(
+            bg_jobs.shells, bg_jobs.monitors, bg_jobs.tasks
+        )
+        if phrase:
+            parts.append(f"⏳ {phrase}")
     return " · ".join(parts)
 
 
@@ -1463,10 +1469,10 @@ def _render_activity_digest(
         suffix = ""
     if collapse_done and state.done:
         # GH #43: idle routes decorate the collapsed card with the pane's
-        # background-shell count (pull-read from the pane_signals leaf;
+        # background-task counts (pull-read from the pane_signals leaf;
         # active routes never render it — Busy/typing already say "work in
         # flight").
-        bg_jobs: int | None = None
+        bg_jobs: pane_signals.BackgroundJobs | None = None
         if route is not None and route_runtime.snapshot(route).run_state in (
             RunState.IDLE_RECENT,
             RunState.IDLE_CLEARED,

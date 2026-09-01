@@ -8,12 +8,17 @@ job(s)`` and /dashboard shows ⏳ instead of ⚪ — never a run-state mutation,
 never typing (user decision recorded on the issue).
 
 Pieces under test:
-  - W4a ``terminal_parser.parse_background_jobs`` — chrome-region anchored
-    (status-bar ``· N shell`` primary, churn-line ``· N shell(s) still
-    running`` fallback, MAX on conflict; 0 = chrome present but no token;
-    None = no chrome / untrusted frame). Fixture is a REAL v2.1.168 frame.
+  - W4a ``terminal_parser.parse_background_tasks`` — chrome-region anchored
+    (status-bar TASKS slot primary, churn-line ``· N shell(s) still running``
+    fallback, per-family MAX on conflict; all-zero = chrome present but no
+    token; None = no chrome / untrusted frame). Fixture is a REAL v2.1.168
+    frame. GH #86 adds the CC ≥2.1.238 slot shapes (``2 monitors``, the
+    comma-joined ``1 shell, 1 monitor`` pair, the ``N background tasks``
+    fallback) and the ``⏸`` plan-mode bar, off a REAL 2.1.257 capture.
+    ``parse_background_jobs`` stays as the SHELLS-only idle-gate view.
   - W4b ``handlers/pane_signals`` — bounded in-memory leaf store with
-    staleness (3× the 10s capture watchdog) and route/topic teardown.
+    staleness (3× the 10s capture watchdog) and route/topic teardown, plus
+    the ONE shared ``describe_background_jobs`` phrase.
   - W4c renderers — collapsed done-card suffix; dashboard ⏳ glyph with 🔔
     precedence.
 """
@@ -26,12 +31,19 @@ from pathlib import Path
 import pytest
 
 from cctelegram import route_runtime
+from cctelegram.handlers.pane_signals import BackgroundJobs
 from cctelegram.route_runtime import TranscriptLifecycleEvent
-from cctelegram.terminal_parser import parse_background_jobs
+from cctelegram.terminal_parser import parse_background_jobs, parse_background_tasks
 
-FIXTURE = Path(__file__).parent / "fixtures" / "gh43_bg_shell_frame.txt"
+FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURE = FIXTURES / "gh43_bg_shell_frame.txt"
 
 ROUTE: route_runtime.Route = (1, 42, "@7")
+
+
+def _shells(rec: BackgroundJobs | None) -> int | None:
+    """The recorded shell count, or None when the record is absent / stale."""
+    return None if rec is None else rec.shells
 
 
 def _evt(
@@ -74,6 +86,10 @@ def test_parser_real_fixture_reads_one_shell():
     status bar) — both say 1."""
     frame = FIXTURE.read_text()
     assert parse_background_jobs(frame) == 1
+    tasks = parse_background_tasks(frame)
+    assert tasks is not None
+    assert (tasks.shells, tasks.monitors, tasks.tasks) == (1, 0, 0)
+    assert tasks.total == 1
 
 
 def test_parser_no_chrome_returns_none():
@@ -142,6 +158,62 @@ def test_parser_conflicting_tokens_take_max():
     assert parse_background_jobs(frame) == 2
 
 
+# ── GH #86: the CC ≥2.1.238 TASKS slot ───────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("bgtasks_monitors_only_v2.1.257.txt", (0, 2, 0)),
+        ("bgtasks_shell_monitor_pair_v2.1.257.txt", (1, 1, 0)),
+        ("bgtasks_generic_tasks_v2.1.257.txt", (0, 0, 2)),
+        ("bgtasks_plan_mode_shell_v2.1.257.txt", (1, 0, 0)),
+    ],
+)
+def test_parser_reads_every_tasks_slot_shape(name: str, expected: tuple[int, int, int]):
+    """The REAL 2.1.257 ``2 monitors`` capture (right-aligned ``/rc`` block and
+    all) plus the three synthetic status-bar variants derived from it: the
+    comma-joined pair, the mixed-family fallback, and a ``⏸`` plan-mode bar.
+    Every one of these read 0 before GH #86."""
+    tasks = parse_background_tasks((FIXTURES / name).read_text())
+    assert tasks is not None
+    assert (tasks.shells, tasks.monitors, tasks.tasks) == expected
+
+
+def test_shells_only_view_excludes_monitors_and_generic_tasks():
+    """``parse_background_jobs`` is the IDLE-GATE view: monitors and the
+    generic fallback deliberately do NOT gate /update / /cost (owner decision
+    pending on GH #86), while the pair's SHELL now counts (it read 0 before —
+    the `,` defeated the old lookahead)."""
+    monitors = (FIXTURES / "bgtasks_monitors_only_v2.1.257.txt").read_text()
+    generic = (FIXTURES / "bgtasks_generic_tasks_v2.1.257.txt").read_text()
+    pair = (FIXTURES / "bgtasks_shell_monitor_pair_v2.1.257.txt").read_text()
+    assert parse_background_jobs(monitors) == 0
+    assert parse_background_jobs(generic) == 0
+    assert parse_background_jobs(pair) == 1
+
+
+def test_parser_ignores_a_tasks_shaped_token_in_body_prose():
+    """The GH #86 widening keeps the chrome-region anchoring: a monitors/tasks
+    token in Claude's OUTPUT is never counted."""
+    frame = (
+        "Claude says: · 2 monitors · and · 3 background tasks · in prose\n"
+        "──────────────────────────────────────\n"
+        "❯ \n"
+        "──────────────────────────────────────\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+    tasks = parse_background_tasks(frame)
+    assert tasks is not None
+    assert (tasks.shells, tasks.monitors, tasks.tasks) == (0, 0, 0)
+    assert tasks.total == 0
+
+
+def test_parser_no_chrome_returns_none_structured():
+    assert parse_background_tasks("") is None
+    assert parse_background_tasks("just some text\nno chrome here") is None
+
+
 # ── W4b: pane_signals leaf ───────────────────────────────────────────────
 
 
@@ -149,14 +221,16 @@ def test_pane_signals_record_and_peek_fresh():
     from cctelegram.handlers import pane_signals
 
     now = 1000.0
-    assert pane_signals.record_background_jobs(ROUTE, 1, now=now) is True
-    assert pane_signals.peek_background_jobs(ROUTE, now=now + 5.0) == 1
+    assert pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=now) is True
+    rec = pane_signals.peek_background_jobs(ROUTE, now=now + 5.0)
+    assert rec is not None
+    assert (rec.shells, rec.monitors, rec.tasks) == (1, 0, 0)
 
 
 def test_pane_signals_staleness_hides_count():
     from cctelegram.handlers import pane_signals
 
-    pane_signals.record_background_jobs(ROUTE, 1, now=1000.0)
+    pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=1000.0)
     assert (
         pane_signals.peek_background_jobs(
             ROUTE, now=1000.0 + pane_signals.BG_JOBS_MAX_AGE_S + 0.1
@@ -168,20 +242,52 @@ def test_pane_signals_staleness_hides_count():
 def test_pane_signals_record_returns_changed():
     from cctelegram.handlers import pane_signals
 
-    assert pane_signals.record_background_jobs(ROUTE, 1, now=1000.0) is True
-    assert pane_signals.record_background_jobs(ROUTE, 1, now=1001.0) is False
-    assert pane_signals.record_background_jobs(ROUTE, 0, now=1002.0) is True
+    assert pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=1000.0) is True
+    assert pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=1001.0) is False
+    assert pane_signals.record_background_jobs(ROUTE, 0, 0, 0, now=1002.0) is True
+
+
+def test_pane_signals_change_detection_is_phrase_based():
+    """GH #86: the shell count is UNCHANGED at 1 but two monitors appeared —
+    the rendered phrase changed, so the poller must repaint."""
+    from cctelegram.handlers import pane_signals
+
+    assert pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=1000.0) is True
+    assert pane_signals.record_background_jobs(ROUTE, 1, 2, 0, now=1001.0) is True
+    assert pane_signals.record_background_jobs(ROUTE, 1, 2, 0, now=1002.0) is False
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ((0, 0, 0), None),
+        ((1, 0, 0), "1 background shell"),
+        ((3, 0, 0), "3 background shells"),
+        ((0, 1, 0), "waiting on 1 monitor"),
+        ((0, 2, 0), "waiting on 2 monitors"),
+        ((1, 2, 0), "1 background shell · waiting on 2 monitors"),
+        ((0, 0, 1), "1 background task"),
+        ((0, 0, 3), "3 background tasks"),
+        ((1, 1, 2), "1 background shell · waiting on 1 monitor · 2 background tasks"),
+    ],
+)
+def test_describe_background_jobs_phrases(
+    counts: tuple[int, int, int], expected: str | None
+):
+    from cctelegram.handlers import pane_signals
+
+    assert pane_signals.describe_background_jobs(*counts) == expected
 
 
 def test_pane_signals_teardown_seams():
     from cctelegram.handlers import pane_signals
 
     other: route_runtime.Route = (1, 42, "@9")
-    pane_signals.record_background_jobs(ROUTE, 1, now=1000.0)
-    pane_signals.record_background_jobs(other, 2, now=1000.0)
+    pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=1000.0)
+    pane_signals.record_background_jobs(other, 2, 0, 0, now=1000.0)
     pane_signals.clear_route(ROUTE)
     assert pane_signals.peek_background_jobs(ROUTE, now=1001.0) is None
-    assert pane_signals.peek_background_jobs(other, now=1001.0) == 2
+    assert pane_signals.peek_background_jobs(other, now=1001.0) is not None
     pane_signals.clear_routes_for_topic(1, 42)
     assert pane_signals.peek_background_jobs(other, now=1001.0) is None
 
@@ -200,7 +306,7 @@ async def test_collapsed_done_card_gains_bg_jobs_suffix():
     from cctelegram.handlers import message_queue, pane_signals
 
     await _idle_route(ROUTE)
-    pane_signals.record_background_jobs(ROUTE, 1, now=time.time())
+    pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=time.time())
     state = message_queue.ActivityDigestState(
         message_id=1,
         window_id="@7",
@@ -211,8 +317,30 @@ async def test_collapsed_done_card_gains_bg_jobs_suffix():
         finalized_at=321.0,
     )
     text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
-    assert "⏳ 1 background job" in text
+    assert "⏳ 1 background shell" in text
     assert text.startswith("✅ Done")
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ((0, 2, 0), "⏳ waiting on 2 monitors"),
+        ((1, 1, 0), "⏳ 1 background shell · waiting on 1 monitor"),
+        ((0, 0, 3), "⏳ 3 background tasks"),
+    ],
+)
+async def test_collapsed_done_card_renders_every_phrase_shape(
+    counts: tuple[int, int, int], expected: str
+):
+    """GH #86: the card's ⏳ now carries the shared phrase, so a monitors-only
+    or mixed-family pane is no longer silently blank."""
+    from cctelegram.handlers import message_queue, pane_signals
+
+    await _idle_route(ROUTE)
+    pane_signals.record_background_jobs(ROUTE, *counts, now=time.time())
+    state = message_queue.ActivityDigestState(message_id=1, window_id="@7", done=True)
+    text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
+    assert expected in text
 
 
 async def test_collapsed_done_card_no_suffix_when_zero_or_stale():
@@ -222,17 +350,17 @@ async def test_collapsed_done_card_no_suffix_when_zero_or_stale():
     state = message_queue.ActivityDigestState(message_id=1, window_id="@7", done=True)
     # No record at all.
     text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
-    assert "background job" not in text
+    assert "⏳" not in text
     # Zero recorded.
-    pane_signals.record_background_jobs(ROUTE, 0, now=time.time())
+    pane_signals.record_background_jobs(ROUTE, 0, 0, 0, now=time.time())
     text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
-    assert "background job" not in text
+    assert "⏳" not in text
     # Stale record.
     pane_signals.record_background_jobs(
-        ROUTE, 2, now=time.time() - pane_signals.BG_JOBS_MAX_AGE_S - 1.0
+        ROUTE, 2, 0, 0, now=time.time() - pane_signals.BG_JOBS_MAX_AGE_S - 1.0
     )
     text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
-    assert "background job" not in text
+    assert "⏳" not in text
 
 
 async def test_running_route_never_renders_bg_suffix():
@@ -241,10 +369,10 @@ async def test_running_route_never_renders_bg_suffix():
     from cctelegram.handlers import message_queue, pane_signals
 
     await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
-    pane_signals.record_background_jobs(ROUTE, 1, now=time.time())
+    pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=time.time())
     state = message_queue.ActivityDigestState(message_id=1, window_id="@7", done=True)
     text = message_queue._render_activity_digest(state, route=ROUTE, collapse_done=True)
-    assert "background job" not in text
+    assert "⏳" not in text
 
 
 # ── W4c: dashboard glyph ─────────────────────────────────────────────────
@@ -260,10 +388,27 @@ async def test_dashboard_idle_with_bg_jobs_shows_hourglass(fresh_handler_state):
     session_manager.set_group_chat_id(uid, 42, chat)
     route = (uid, 42, "@7")
     await _idle_route(route)
-    pane_signals.record_background_jobs(route, 1, now=time.time())
+    pane_signals.record_background_jobs(route, 1, 0, 0, now=time.time())
     text = dashboard.render_dashboard(uid, chat)
     assert "⏳ di-copilot-2" in text
-    assert "1 background job" in text
+    assert "1 background shell" in text
+    assert "⚪ di-copilot-2" not in text
+
+
+async def test_dashboard_idle_with_monitors_shows_hourglass(fresh_handler_state):
+    """GH #86: the reported symptom — a monitors-only pane read ⚪ idle."""
+    from cctelegram.handlers import dashboard, pane_signals
+    from cctelegram.session import session_manager
+
+    uid = 12345
+    chat = -1001234567890
+    session_manager.bind_thread(uid, 42, "@7", "di-copilot-2")
+    session_manager.set_group_chat_id(uid, 42, chat)
+    route = (uid, 42, "@7")
+    await _idle_route(route)
+    pane_signals.record_background_jobs(route, 0, 2, 0, now=time.time())
+    text = dashboard.render_dashboard(uid, chat)
+    assert "⏳ di-copilot-2 — idle · waiting on 2 monitors" in text
     assert "⚪ di-copilot-2" not in text
 
 
@@ -290,7 +435,7 @@ async def test_dashboard_unanswered_bell_wins_over_bg_jobs(fresh_handler_state):
             timestamp=time.time(),
         ),
     )
-    pane_signals.record_background_jobs(route, 1, now=time.time())
+    pane_signals.record_background_jobs(route, 1, 0, 0, now=time.time())
     text = dashboard.render_dashboard(uid, chat)
     assert "🔔 di-copilot-2" in text  # the bell outranks the hourglass
     assert "⏳ di-copilot-2" not in text
@@ -306,7 +451,7 @@ async def test_dashboard_idle_no_bg_jobs_stays_white(fresh_handler_state):
     session_manager.set_group_chat_id(uid, 42, chat)
     route = (uid, 42, "@7")
     await _idle_route(route)
-    pane_signals.record_background_jobs(route, 0, now=time.time())
+    pane_signals.record_background_jobs(route, 0, 0, 0, now=time.time())
     text = dashboard.render_dashboard(uid, chat)
     assert "⚪ di-copilot-2" in text
     assert "⏳" not in text
@@ -348,7 +493,7 @@ async def test_poller_records_bg_jobs_and_repaints_on_change():
         await status_polling.update_status_message(
             AsyncMock(), user_id=1, window_id=window_id, thread_id=42
         )
-        assert pane_signals.peek_background_jobs(route, now=time.time()) == 1
+        assert _shells(pane_signals.peek_background_jobs(route, now=time.time())) == 1
         first_refreshes = mock_refresh.await_count
         assert first_refreshes >= 1  # changed (first observation) → repaint
         # Same count again → no additional change-repaint. Pop the watchdog
@@ -371,7 +516,7 @@ async def test_topic_teardown_clears_bg_jobs():
     uid = 12345
     session_manager.bind_thread(uid, 42, "@7", "x")
     route = (uid, 42, "@7")
-    pane_signals.record_background_jobs(route, 1, now=time.time())
+    pane_signals.record_background_jobs(route, 1, 0, 0, now=time.time())
     await cleanup.clear_topic_state(uid, 42)
     assert pane_signals.peek_background_jobs(route, now=time.time()) is None
 
@@ -385,12 +530,12 @@ def test_pane_signals_stale_to_fresh_same_count_is_changed():
     SAME count must report changed so the repaint brings the ⏳ back."""
     from cctelegram.handlers import pane_signals
 
-    assert pane_signals.record_background_jobs(ROUTE, 1, now=1000.0) is True
+    assert pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=1000.0) is True
     # Re-observed fresh at the same count → no change.
-    assert pane_signals.record_background_jobs(ROUTE, 1, now=1005.0) is False
+    assert pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=1005.0) is False
     # Re-observed AFTER the staleness horizon at the same count → changed.
     later = 1005.0 + pane_signals.BG_JOBS_MAX_AGE_S + 1.0
-    assert pane_signals.record_background_jobs(ROUTE, 1, now=later) is True
+    assert pane_signals.record_background_jobs(ROUTE, 1, 0, 0, now=later) is True
 
 
 def test_parser_churn_anchor_survives_quoted_separator_in_body():
@@ -449,7 +594,7 @@ async def test_poller_one_to_zero_drops_suffix_and_repaints():
             AsyncMock(), user_id=1, window_id=window_id, thread_id=42
         )
         after_one = mock_refresh.await_count
-        assert pane_signals.peek_background_jobs(route, now=time.time()) == 1
+        assert _shells(pane_signals.peek_background_jobs(route, now=time.time())) == 1
         # The shell finished — next capture has chrome but no token. Pop
         # the watchdog stamp so this tick re-captures.
         status_polling._last_pane_capture.pop(route, None)
@@ -457,5 +602,5 @@ async def test_poller_one_to_zero_drops_suffix_and_repaints():
         await status_polling.update_status_message(
             AsyncMock(), user_id=1, window_id=window_id, thread_id=42
         )
-        assert pane_signals.peek_background_jobs(route, now=time.time()) == 0
+        assert _shells(pane_signals.peek_background_jobs(route, now=time.time())) == 0
         assert mock_refresh.await_count > after_one  # 1→0 repainted

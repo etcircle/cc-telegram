@@ -199,16 +199,21 @@ def render_dashboard(
             line = f"🟡 {name} — running" + (f" {detail}" if detail else "")
             rows.append((1, name.lower(), line))
         else:
-            # GH #43: an idle route with fresh pane-reported background
-            # shells shows ⏳ instead of ⚪ (a decoration only — 🔔 above
-            # outranks it, the run-state is untouched, and a stale count
-            # silently falls back to ⚪ via the peek's max_age).
+            # GH #43: an idle route with fresh pane-reported background work
+            # shows ⏳ instead of ⚪ (a decoration only — 🔔 above outranks
+            # it, the run-state is untouched, and a stale record silently
+            # falls back to ⚪ via the peek's max_age). GH #86: the phrase is
+            # the shared pane_signals one (shells / monitors / tasks).
             bg_jobs = pane_signals.peek_background_jobs(route, now=time.time())
-            if bg_jobs:
-                line = (
-                    f"⏳ {name} — idle · {bg_jobs} background "
-                    f"job{'s' if bg_jobs != 1 else ''}" + (f" {age}" if age else "")
+            phrase = (
+                pane_signals.describe_background_jobs(
+                    bg_jobs.shells, bg_jobs.monitors, bg_jobs.tasks
                 )
+                if bg_jobs is not None
+                else None
+            )
+            if phrase:
+                line = f"⏳ {name} — idle · {phrase}" + (f" {age}" if age else "")
             else:
                 line = f"⚪ {name} — idle" + (f" {age}" if age else "")
             rows.append((2, name.lower(), line))

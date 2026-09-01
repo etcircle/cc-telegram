@@ -772,6 +772,13 @@ _BASELINE_CLASSIFICATIONS = {
     "auq_single_picker_v2.1.207.txt": "prompt_row_is_option",
     "auq_single_select_with_affordances_pane.txt": "no_input_box",
     "auq_stale_tabheader_over_live_picker_S500.txt": "no_input_box",
+    # GH #86 tasks-slot fixtures (one real 2.1.257 capture + three synthetic
+    # status-bar variants of it): an ordinary idle box holding a short draft, so
+    # all four are deliverable — the tasks slot is not an input-box signal.
+    "bgtasks_generic_tasks_v2.1.257.txt": None,
+    "bgtasks_monitors_only_v2.1.257.txt": None,
+    "bgtasks_plan_mode_shell_v2.1.257.txt": None,
+    "bgtasks_shell_monitor_pair_v2.1.257.txt": None,
     "control_gitrepo_branch_no_label_v2.1.207.txt": None,
     "cost_overlay_d_v2.1.206.txt": "no_input_box",
     "cost_overlay_live_v2.1.206.txt": "no_input_box",

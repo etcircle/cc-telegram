@@ -65,7 +65,7 @@ from ..terminal_parser import (
     has_pane_chrome,
     is_picker_anchor_visible,
     is_status_active,
-    parse_background_jobs,
+    parse_background_tasks,
     parse_status_line,
     parse_unknown_blocking_prompt,
     resolve_ask_form,
@@ -1112,15 +1112,21 @@ async def update_status_message(
     pane_ansi = pane_pair.ansi
     _last_pane_capture[route] = time.monotonic()
 
-    # GH #43: record the pane's background-shell count on every full capture
-    # (0 = chrome present, positively no shells — recorded so a finished
-    # shell's ⏳ disappears; None = no chrome → skip, a bad frame must not
-    # erase a fresh count). On a CHANGED count, repaint the digest so the
-    # collapsed done-card's ⏳ decoration tracks the pane (pull-side refresh
-    # — no observer; c313657 stays forbidden).
-    bg_jobs = parse_background_jobs(pane_text)
+    # GH #43 / GH #86: record the pane's background-task counts on every full
+    # capture (all-zero = chrome present, positively nothing in flight —
+    # recorded so a finished shell's ⏳ disappears; None = no chrome → skip, a
+    # bad frame must not erase a fresh record). On a CHANGED rendered phrase,
+    # repaint the digest so the collapsed done-card's ⏳ decoration tracks the
+    # pane (pull-side refresh — no observer; c313657 stays forbidden).
+    bg_jobs = parse_background_tasks(pane_text)
     if bg_jobs is not None:
-        if pane_signals.record_background_jobs(route, bg_jobs, now=capture_wall):
+        if pane_signals.record_background_jobs(
+            route,
+            bg_jobs.shells,
+            bg_jobs.monitors,
+            bg_jobs.tasks,
+            now=capture_wall,
+        ):
             await refresh_activity_digest_if_present(bot, user_id, thread_id, window_id)
 
     # Read the next-turn context size from the session's JSONL into the
