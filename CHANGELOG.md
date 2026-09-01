@@ -4,7 +4,7 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
-## [Unreleased]
+## [0.4.18] — 2026-09-01
 
 ### Fixed
 - **A topic with background watchers still running looked completely idle (GH #86).** When a
