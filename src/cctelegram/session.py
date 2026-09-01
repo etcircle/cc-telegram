@@ -1544,6 +1544,11 @@ class SessionManager:
              VERBATIM (rig-confirmed), so an embedded ``ESC [ B`` + digit is a
              cursor-move + HOTKEY commit that no post-write check can undo. LF is
              allowed (paste-shaped multi-line payloads are a first-class flow).
+          0c. The GH #84 CHUNK PLAN — also before any capture. A payload above
+             ``delivery.MAX_PAYLOAD_BYTES``, or one whose newline runs leave no
+             typable chunk, is refused ``payload_too_large``; everything else is
+             planned into byte-capped literal writes (CC >= 2.1.246 keeps only
+             the LAST <= 1022-byte pty read of a single burst).
           1. Bounded, cancellation-safe pane capture (``capture_pane_cancellation_safe``
              under ``asyncio.wait_for``); the whole transaction carries an overall
              deadline.
@@ -1557,9 +1562,10 @@ class SessionManager:
           3. ``pane_input_box_present`` — the POSITIVE structural proof that the
              pane is at Claude's ready input box (bounded retry on an
              INDETERMINATE frame; a positive hazard refuses on the first capture).
-          4. Write the text with the Enter WITHHELD (mode-aware: the ``!``
-             bash-mode two-step is reproduced explicitly — ``send_keys`` performs
-             it ONLY when ``literal and enter`` are BOTH true).
+          4. Write step 0c's segments with the Enter WITHHELD — the ``!``
+             bash-mode two-step (``send_keys`` performs it ONLY when ``literal
+             and enter`` are BOTH true) followed by the GH #84 byte-capped
+             chunks, ``CHUNK_SETTLE_S`` apart.
           5. Re-verify (``_reverify_input_box``): the BOUNDED
              ``pane_command_is_claude`` probe FIRST, then the pane capture LAST
              (r2 F4 — the capture must be the final observation before the Enter,
@@ -1578,6 +1584,16 @@ class SessionManager:
           - gate → write: a prompt appearing in that window can still take a
             keystroke. Mitigated empirically (a multi-char payload written in ONE
             ``send-keys -l`` is consumed paste-shaped and is inert) and by step 0.
+            GH #84 WIDENS this window for an above-cap payload by the (N-1)
+            inter-chunk gaps plus (N-1) extra tmux round trips. The realistic
+            consequence is payload LOSS, not a wrong commit: rig R7 wrote chunks
+            into a live AUQ picker and a folder-trust prompt and every chunk was
+            SWALLOWED (cursor unmoved, nothing committed) — and the planner's
+            no-minted-bare-digit rule keeps a chunk from ever being a hotkey.
+          - a tmux server reset landing in an inter-chunk gap can land the tail
+            in a RECYCLED window id (rig R10a). Pre-existing for every multi-key
+            dispatch (``_dispatch_pick`` / ``_dispatch_decision``); tracked as
+            GH #85 and deliberately NOT closed here.
           - final capture → Enter: one tmux round-trip. No terminal protocol can
             make this atomic — the identical residual the shipped ``_dispatch_pick``
             / ``_dispatch_decision`` already accept.
@@ -1621,6 +1637,34 @@ class SessionManager:
             )
             return delivery.refuse(delivery.REASON_CONTROL_CHARS, written=False)
 
+        # (0c) The GH #84 chunk plan. Payload-only, no capture: CC >= 2.1.246
+        # keeps only the LAST <= 1022-byte pty read of a single ``send-keys -l``
+        # burst and silently discards the head, so an above-cap payload must be
+        # typed as several small writes. A payload above the flat ceiling — or
+        # one whose newline runs leave no chunk carrying a real character — is
+        # refused before any keystroke rather than typed truncated.
+        payload_bytes = len(text.encode())
+        segments = (
+            delivery.plan_gate_segments(text)
+            if payload_bytes <= delivery.MAX_PAYLOAD_BYTES
+            else None
+        )
+        if segments is None:
+            logger.info(
+                "DELIVERY REFUSED window=%s reason=%s outcome=not_written",
+                window_id,
+                delivery.REASON_PAYLOAD_TOO_LARGE,
+            )
+            return delivery.refuse(delivery.REASON_PAYLOAD_TOO_LARGE, written=False)
+        if payload_bytes > delivery.LITERAL_WRITE_MAX_BYTES:
+            logger.info(
+                "DELIVERY CHUNKED window=%s text_len=%d bytes=%d chunks=%d",
+                window_id,
+                len(text),
+                payload_bytes,
+                len(segments),
+            )
+
         # r2 F2 + the cancellation fold: the brake is armed through ONE seam, and
         # INSIDE the send lock — a queued send already waiting on
         # ``window_send_lock`` must never acquire it before the brake is up.
@@ -1630,7 +1674,7 @@ class SessionManager:
             write = _WriteAttempt()
             try:
                 result = await self._deliver_locked(
-                    window_id, text, display, user_turn, write
+                    window_id, text, display, user_turn, write, segments
                 )
             except BaseException:
                 # CancelledError MUST propagate (never swallowed into a
@@ -1682,10 +1726,12 @@ class SessionManager:
         display: str,
         user_turn: UserTurnStamp | None,
         write: _WriteAttempt,
+        segments: list[str],
     ) -> DeliveryResult:
         """The gated delivery transaction. Caller holds ``window_send_lock``.
 
-        ``write`` is the caller's write-attempt probe: this method SETS it
+        ``segments`` is step 0c's chunk plan — the literal writes to emit, in
+        order. ``write`` is the caller's write-attempt probe: this method SETS it
         immediately before the first literal ``send_keys``, so a cancellation /
         unexpected raise anywhere from that instant on (the settle, the
         re-verify, the stamp, the Enter) still arms the stranded-draft brake in
@@ -1751,12 +1797,16 @@ class SessionManager:
         if gate is not None:
             return gate
 
-        # (4) Write with the Enter WITHHELD. The ``!`` bash-mode two-step is
-        # reproduced explicitly — ``send_keys``'s own two-step fires ONLY when
-        # ``literal and enter`` are BOTH true.
-        for i, segment in enumerate(delivery.literal_segments(text)):
+        # (4) Write step 0c's segments with the Enter WITHHELD. The ``!``
+        # bash-mode two-step is reproduced explicitly — ``send_keys``'s own
+        # two-step fires ONLY when ``literal and enter`` are BOTH true — and the
+        # GH #84 chunks follow it at the (much shorter) inter-chunk gap.
+        for i, segment in enumerate(segments):
             if i:
-                await asyncio.sleep(BASH_MODE_SETTLE_S)
+                bash_step = i == 1 and segments[0] == "!"
+                await asyncio.sleep(
+                    BASH_MODE_SETTLE_S if bash_step else delivery.CHUNK_SETTLE_S
+                )
             # Set BEFORE the write, never after: a write whose await is CANCELLED
             # can still have landed in the pane, so the brake must consider the
             # payload potentially stranded from the instant the attempt begins.

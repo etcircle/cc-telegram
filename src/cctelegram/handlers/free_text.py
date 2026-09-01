@@ -94,9 +94,18 @@ lane's primary flow); PR-1's gate owns the single refusal message.
 **ALSO CARRIED FORWARD (the pre-existing GH #50 M2 residual):** a pty-level split
 of a single ``send-keys -l`` could in principle land a digit as a lone HOTKEY with
 no Enter. Empirically a whole multi-char payload is consumed PASTE-shaped and is
-inert on a live picker, and ``delivery.lone_hotkey_line`` refuses any bare-digit
-LINE outright — but this is an empirical narrowing, not a proof, and it stays on
-record as a residual.
+inert on a live picker, and ``delivery.lone_hotkey_line_free_text`` refuses any
+bare-digit LINE outright — but this is an empirical narrowing, not a proof, and it
+stays on record as a residual.
+
+**THE ANSWER IS TYPED AS BYTE-CAPPED CHUNKS (GH #84).** CC >= 2.1.246 keeps only
+the LAST <= 1022-byte pty read of a single ``send-keys -l`` burst and silently
+discards the head, so an above-cap answer would land truncated with zero signal.
+``delivery.chunk_literal`` plans the writes BEFORE the lock (an unplannable or
+above-ceiling payload simply declines, per the additive invariant) and step 4
+emits them ``delivery.CHUNK_SETTLE_S`` apart. Everything after the write — the
+identity + typed-state verify, the Enter, the advance confirmation — is unchanged
+and still sees the WHOLE payload.
 
 It reuses the shipped dispatch discipline (``_dispatch_pick`` /
 ``_dispatch_decision_pane_locked``) verbatim: per-window send lock, bounded
@@ -895,11 +904,14 @@ async def try_answer(
 
     # The SEGMENT-aware lone-hotkey rule, BEFORE any capture. A digit is a live
     # HOTKEY on a single-select-shaped surface (rig C7/C8) and this lane targets
-    # exactly those, so a payload of "3" must never be typed here. Falling
-    # through is correct AND sufficient: ``deliver_to_window``'s step 0 applies
-    # the SAME ``delivery.lone_hotkey_line`` rule and refuses it with the
-    # lone-hotkey copy — one rule, one owner, no duplicate message.
-    if delivery.lone_hotkey_line(payload) is not None:
+    # exactly those, so a payload of "3" must never be typed here. This lane
+    # never emits a lone ``!`` (bash mode is a property of the INPUT BOX, and a
+    # leading ``!`` in the affordance row is just text), so it uses the variant
+    # WITHOUT the bash split — ``!1`` is prose here. Falling through is correct
+    # AND sufficient for what it does decline: ``deliver_to_window``'s step 0
+    # applies its own rule and refuses with the lone-hotkey copy — one rule, one
+    # owner, no duplicate message.
+    if delivery.lone_hotkey_line_free_text(payload) is not None:
         return None
 
     # The RAW-CONTROL-BYTE rule (round-5 P1-A), BEFORE any capture. ``send-keys
@@ -913,10 +925,34 @@ async def try_answer(
     if delivery.unsafe_control_char(payload) is not None:
         return None
 
+    # The GH #84 chunk plan, BEFORE any capture. CC >= 2.1.246 keeps only the
+    # LAST <= 1022-byte pty read of a single ``send-keys -l`` burst, so an
+    # above-cap answer must be typed as byte-capped chunks. An unplannable
+    # payload DECLINES (the additive invariant — every pre-keystroke bail returns
+    # ``None``); the gate then owns the single ``payload_too_large`` refusal.
+    payload_bytes = len(payload.encode())
+    segments = (
+        delivery.chunk_literal(payload)
+        if payload_bytes <= delivery.MAX_PAYLOAD_BYTES
+        else None
+    )
+    if segments is None:
+        return None
+    if payload_bytes > delivery.LITERAL_WRITE_MAX_BYTES:
+        logger.info(
+            "FREE_TEXT CHUNKED window=%s payload_len=%d bytes=%d chunks=%d",
+            window_id,
+            len(payload),
+            payload_bytes,
+            len(segments),
+        )
+
     async with tmux_manager.window_send_lock(window_id):
         write = _WriteAttempt()
         try:
-            result = await _answer_locked(window_id, payload, user_turn, write, display)
+            result = await _answer_locked(
+                window_id, payload, user_turn, write, display, segments
+            )
         except BaseException:
             # CancelledError MUST propagate — but a write that was ATTEMPTED may
             # have landed in the affordance row, so the brake goes up first
@@ -981,8 +1017,12 @@ async def _answer_locked(
     user_turn: UserTurnStamp | None,
     write: _WriteAttempt,
     display: str,
+    segments: list[str],
 ) -> DeliveryResult | None:
     """The gated free-text transaction. Caller holds ``window_send_lock``.
+
+    ``segments`` is the caller's GH #84 chunk plan for ``payload`` — the literal
+    writes to emit into the affordance row, in order.
 
     EVERY return before the first keystroke is ``None`` — the additive
     invariant (see ``try_answer``). ``_decline`` names the bail in ONE INFO log
@@ -1129,19 +1169,23 @@ async def _answer_locked(
         )
         return _decline(REASON_LANDING_FAILED)
 
-    # (4) Type the payload with the Enter WITHHELD. ONE literal write — the
-    # ``!`` bash-mode two-step is deliberately NOT reproduced here: bash mode is
-    # a property of the INPUT BOX, and a live card owns the keyboard, so a
-    # leading ``!`` inside the affordance row is just text. Splitting it would
-    # emit a lone ``!`` keystroke into a picker for no reason.
-    write.attempted = True
-    if not await tmux_manager.send_keys(
-        window.window_id, payload, enter=False, literal=True
-    ):
-        # A False from send_keys does NOT prove zero bytes landed (r2 F5) ⇒
-        # classified WRITTEN, fail-closed: the brake goes up and its
-        # empty-row self-heal releases it if nothing actually landed.
-        return delivery.refuse(delivery.REASON_SEND_FAILED, written=True)
+    # (4) Type the payload with the Enter WITHHELD, as the caller's byte-capped
+    # chunks (GH #84). The ``!`` bash-mode two-step is deliberately NOT
+    # reproduced here: bash mode is a property of the INPUT BOX, and a live card
+    # owns the keyboard, so a leading ``!`` inside the affordance row is just
+    # text. Splitting it would emit a lone ``!`` keystroke into a picker for no
+    # reason.
+    for i, segment in enumerate(segments):
+        if i:
+            await asyncio.sleep(delivery.CHUNK_SETTLE_S)
+        write.attempted = True
+        if not await tmux_manager.send_keys(
+            window.window_id, segment, enter=False, literal=True
+        ):
+            # A False from send_keys does NOT prove zero bytes landed (r2 F5) ⇒
+            # classified WRITTEN, fail-closed: the brake goes up and its
+            # empty-row self-heal releases it if nothing actually landed.
+            return delivery.refuse(delivery.REASON_SEND_FAILED, written=True)
     await asyncio.sleep(TEXT_SETTLE_S)
 
     # (5) IDENTITY + TYPED-STATE VERIFY. From here every failure is DRAFT_WRITTEN.

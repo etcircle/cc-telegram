@@ -1187,11 +1187,16 @@ def _fast_delivery_settles(monkeypatch: pytest.MonkeyPatch) -> None:
     an indeterminate frame. Real seconds in unit tests buy nothing; the timing
     ITSELF is pinned by ``test_delivery_gate.py`` against the module constants.
     """
+    from cctelegram import delivery as delivery_module
     from cctelegram import session as session_module
 
     monkeypatch.setattr(session_module, "TEXT_SETTLE_S", 0.0)
     monkeypatch.setattr(session_module, "BASH_MODE_SETTLE_S", 0.0)
     monkeypatch.setattr(session_module, "GATE_RETRY_DELAY_S", 0.0)
+    # GH #84: the same rule for the inter-chunk gap — an above-cap payload is
+    # typed as N writes, and N-1 real gaps buy nothing in a unit test. The
+    # cadence ITSELF is pinned in ``test_delivery_gate.py``.
+    monkeypatch.setattr(delivery_module, "CHUNK_SETTLE_S", 0.0)
 
 
 @pytest.fixture
