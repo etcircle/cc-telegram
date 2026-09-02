@@ -831,6 +831,30 @@ _BASELINE_CLASSIFICATIONS = {
     "folder_trust_postdown_plain_v2.1.246.txt": "no_input_box",
     "folder_trust_postesc_t4_plain_v2.1.246.txt": "no_input_box",
     "folder_trust_postup_plain_v2.1.246.txt": "no_input_box",
+    # GH #88: the CC 2.1.258 REDESIGN of the same surface (unnumbered options,
+    # inverted order, default cursor on the destructive row). The delivery gate
+    # is unaffected — every LIVE prompt frame still refuses ``no_input_box``, and
+    # the frames where Claude has EXITED (postesc / postenter on ``No, exit``)
+    # keep refusing too because the retained prompt text sits above a shell
+    # prompt, not an input box. The post-accept REPL frames (and the
+    # post-Enter-on-``Yes`` T+1 capture, which is ALREADY the REPL on this
+    # version — there is no blank transitional frame) classify deliverable.
+    "folder_trust_arrival_plain_v2.1.258.txt": "no_input_box",
+    "folder_trust_arrival_plain_v2.1.258.ansi.txt": "no_input_box",
+    "folder_trust_arrival_settings_v2.1.258.txt": "no_input_box",
+    "folder_trust_arrival_settings_v2.1.258.ansi.txt": "no_input_box",
+    "folder_trust_postdigit1_plain_v2.1.258.txt": "no_input_box",
+    "folder_trust_postdigit1_settings_v2.1.258.txt": "no_input_box",
+    "folder_trust_postdigit2_plain_v2.1.258.txt": "no_input_box",
+    "folder_trust_postdown_plain_v2.1.258.txt": "no_input_box",
+    "folder_trust_postdown_settings_v2.1.258.txt": "no_input_box",
+    "folder_trust_postdown2_plain_v2.1.258.txt": "no_input_box",
+    "folder_trust_postup_plain_v2.1.258.txt": "no_input_box",
+    "folder_trust_postesc_t4_plain_v2.1.258.txt": "no_input_box",
+    "folder_trust_postenter_noexit_t4_plain_v2.1.258.txt": "no_input_box",
+    "folder_trust_postenter_t1_plain_v2.1.258.txt": None,
+    "trust_after_accept_repl_v2.1.258.txt": None,
+    "trust_after_accept_settings_repl_v2.1.258.txt": None,
     "version_probe_plain_v2.1.239.txt": "no_input_box",
     "version_probe_plain_v2.1.241.txt": "no_input_box",
     "version_probe_plain_v2.1.246.txt": "no_input_box",
