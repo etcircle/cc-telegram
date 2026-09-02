@@ -338,7 +338,12 @@ _RE_DECISION_BOTTOM_OPTION = re.compile(r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S")
 # the minimum that produces the candidate; every real gate (cursor count, common
 # label column, strict footer, ``_only_chrome_below``, family, version × style
 # license) still lives in the strict validator, which ``continue``s the pattern
-# loop on ``None``, so this widens NO decision, only candidate production.
+# loop on ``None``, so this widens NO dispatch decision, only candidate
+# production. ACKNOWLEDGED WIDENING (Codex r1): it DOES widen which panes can
+# become SUCCESSFUL generic display-only Decision candidates — ANY unnumbered
+# footered confirmation now surfaces as a B1 card, which is exactly the generic
+# detector's stated intent — while DISPATCH stays gated on
+# family × CC-version × option_style, so nothing new becomes tappable.
 _RE_DECISION_TOP_CURSOR_ROW = re.compile(r"^\s*[❯›▶]\s+\S")
 
 

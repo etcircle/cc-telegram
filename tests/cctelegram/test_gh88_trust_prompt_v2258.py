@@ -410,8 +410,10 @@ def test_the_card_shows_the_warning_only_when_present() -> None:
 
 _INJECTION = (
     "⚠ This folder pre-approves 3 tool permissions in .claude/settings.json:\n"
+    "```\n"  # a line STARTING with a fence — the close-the-fence-early attempt
     "  ```\n"
-    "  Bash(rm -rf *), [click me](http://evil.example/x), *bold*, \\ escape\n"
+    "  Bash(rm -rf *), [click me](http://evil.example/x), *bold*, _under_, "
+    "\\ escape\n"
     "  `inline` and a \x07 bell and a \x1b[31m sequence\n"
 )
 
@@ -444,6 +446,96 @@ def test_the_sanitizer_caps_length() -> None:
     out = trust_flow.sanitize_pane_copy("x" * 5000)
     assert len(out) <= trust_flow.PANE_COPY_CAP
     assert out.endswith("…")
+
+
+def test_the_sanitizer_is_idempotent() -> None:
+    """The sinks re-run it on whatever they receive, so a second pass over
+    already-sanitized copy must be a no-op."""
+    once = trust_flow.sanitize_pane_copy(_INJECTION)
+    assert trust_flow.sanitize_pane_copy(once) == once
+    capped = trust_flow.sanitize_pane_copy("y" * 5000)
+    assert trust_flow.sanitize_pane_copy(capped) == capped
+
+
+# ── §D — sanitization is enforced at the SINK, through the real edit path ────
+
+
+class _CardBot:
+    """A fake bot recording ``edit_message_text`` calls (first attempt wins)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def edit_message_text(self, **kwargs: Any) -> None:
+        self.calls.append(kwargs)
+
+
+def _card_flow() -> trust_flow.TrustFlow:
+    flow = _flow(_V258)
+    flow.card_chat_id = -100123
+    flow.card_msg_id = 4242
+    return flow
+
+
+async def _edit(flow: trust_flow.TrustFlow, text: str, keyboard: Any) -> _CardBot:
+    bot = _CardBot()
+    await trust_flow._edit_card(flow, bot, text, keyboard)
+    return bot
+
+
+def _assert_card_survived(call: dict[str, Any]) -> str:
+    """Shared assertions for a rendered card carrying untrusted pane copy."""
+    assert call["parse_mode"] == "MarkdownV2"
+    rendered = call["text"]
+    # The payload's OWN backticks are gone, so no fence can be closed early and
+    # no inline-code span can be opened by the pane.
+    assert "`inline`" not in rendered
+    assert "'inline'" in rendered
+    # Our own fence is intact (an opener AND a closer).
+    assert rendered.count("```") >= 2
+    # The keyboard survives the untrusted copy.
+    markup = call["reply_markup"]
+    assert markup is not None
+    datas = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert any(d and d.startswith("tst:c:") for d in datas), datas
+    return rendered
+
+
+@pytest.mark.asyncio
+async def test_the_trust_card_sanitizes_a_RAW_payload_at_the_sink() -> None:
+    """Codex r1 P3-4: the RAW block goes straight in — no caller-side sanitize —
+    and the real ``_edit_card`` path must still render a MarkdownV2 card."""
+    flow = _card_flow()
+    text, keyboard = trust_flow.build_trust_card(
+        flow, trust_token="tok", warning_block=_INJECTION
+    )
+    # The card SOURCE already carries the sanitized block: the only backticks in
+    # it are our own fence pair plus the inline-code path.
+    assert "`inline`" not in text
+    bot = await _edit(flow, text, keyboard)
+    assert len(bot.calls) == 1, "the MarkdownV2 attempt must have SUCCEEDED"
+    rendered = _assert_card_survived(bot.calls[0])
+    # The visible content survives (MarkdownV2 escapes the hyphen).
+    assert "3 tool permissions" in rendered
+    markup = bot.calls[0]["reply_markup"]
+    datas = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert any(d and d.startswith("tst:t:") for d in datas), datas
+
+
+@pytest.mark.asyncio
+async def test_the_unknown_prompt_card_sanitizes_a_RAW_payload_at_the_sink() -> None:
+    flow = _card_flow()
+    text, keyboard = trust_flow.build_unknown_prompt_card(
+        flow, pane_tail_text=_INJECTION
+    )
+    bot = await _edit(flow, text, keyboard)
+    assert len(bot.calls) == 1, "the MarkdownV2 attempt must have SUCCEEDED"
+    _assert_card_survived(bot.calls[0])
+    assert not any(
+        d and d.startswith("tst:t:")
+        for row in bot.calls[0]["reply_markup"].inline_keyboard
+        for d in [b.callback_data for b in row]
+    ), "the advisory must never carry a ✅ button"
 
 
 # ── §F — SliceKind.UNKNOWN_PROMPT ───────────────────────────────────────────
@@ -550,3 +642,142 @@ async def test_a_style_mismatch_declines_before_any_keystroke(
     assert outcome.kind == "not_advanced"
     assert outcome.reason == "option_style_mismatch"
     tmux.send_keys.assert_not_called()
+
+
+# ── §E — the POST-NAVIGATION style belt (the fingerprints genuinely collide) ──
+#
+# The body-inclusive fingerprint folds title + body + ``number:label`` pairs and
+# NOTHING style-specific, so the SAME prompt rendered numbered vs unnumbered
+# hashes IDENTICALLY (asserted below, so the belt is never mistaken for
+# redundancy). Only the explicit style parity can catch a mid-transaction flip.
+
+_LABEL_ORDER_258 = {"No, exit": 1, "Yes, I trust this folder": 2}
+_LABEL_ORDER_246 = {"Yes, I trust this folder": 1, "No, exit": 2}
+
+
+def _as_numbered(pane: str) -> str:
+    """Re-render a 2.1.258 (unnumbered) frame in the 2.1.246 numbered grammar,
+    preserving row order + cursor — so the fingerprint is IDENTICAL."""
+    out: list[str] = []
+    for line in pane.split("\n"):
+        stripped = line.strip()
+        cursored = stripped.startswith("❯")
+        label = stripped[1:].strip() if cursored else stripped
+        if label in _LABEL_ORDER_258:
+            prefix = " ❯ " if cursored else "   "
+            out.append(f"{prefix}{_LABEL_ORDER_258[label]}. {label}")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _as_unnumbered(pane: str) -> str:
+    """The inverse, for a 2.1.246 frame."""
+    import re as _re
+
+    out: list[str] = []
+    for line in pane.split("\n"):
+        m = _re.match(r"^(\s*)(❯ )?(\d)\.\s+(.*?)\s*$", line)
+        if m is not None and m.group(4) in _LABEL_ORDER_246:
+            out.append((" ❯ " if m.group(2) else "   ") + m.group(4))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def test_the_two_renderings_fingerprint_IDENTICALLY() -> None:
+    """The premise of the style belt, pinned: identity alone cannot see a flip."""
+    original = _form(_ARRIVAL_PLAIN)
+    twin = tp.parse_generic_decision(_as_numbered(_fx(_ARRIVAL_PLAIN)))
+    assert twin is not None
+    assert tp.option_style_of(twin) == tp.OPTION_STYLE_NUMBERED
+    assert tp.decision_prompt_fingerprint(twin) == tp.decision_prompt_fingerprint(
+        original
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_style_flip_after_navigation_fails_the_verify_with_zero_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delta != 0 path: the pane re-renders NUMBERED between the Down and the
+    verify. Same fingerprint, right cursor, real motion — only the style belt
+    refuses, and Enter is NEVER sent."""
+    from unittest.mock import AsyncMock
+
+    from cctelegram.callback_dispatcher import interactive as cbi
+
+    monkeypatch.setattr(cbi.asyncio, "sleep", AsyncMock())
+    gate = _fx(_ARRIVAL_PLAIN)  # unnumbered, cursor on row 1
+    flipped = _as_numbered(_fx(_POSTDOWN_PLAIN))  # numbered, cursor on row 2
+    sent: list[str] = []
+
+    async def _send(window_id: str, keys: str, enter: bool, literal: bool) -> bool:
+        sent.append(keys)
+        return True
+
+    captures = iter([gate, flipped])
+    tmux = SimpleNamespace(
+        capture_pane=AsyncMock(side_effect=lambda *a, **k: next(captures)),
+        pane_current_command=AsyncMock(return_value=_V258),
+        send_keys=_send,
+    )
+    outcome = await cbi._dispatch_decision_pane_locked(
+        user=SimpleNamespace(id=1),
+        tmux_manager=tmux,
+        w=SimpleNamespace(window_id="@1"),
+        window_id="@1",
+        minted_fingerprint=tp.decision_prompt_fingerprint(_form(_ARRIVAL_PLAIN)),
+        option_number=2,
+        option_label=decision_token.TRUST_AFFIRMATIVE_LABEL,
+        ledger_key=None,
+        minted_option_style=tp.OPTION_STYLE_UNNUMBERED,
+    )
+    assert outcome.kind == "not_advanced"
+    assert outcome.reason == "verify_failed"
+    assert sent == ["Down"], sent
+    assert "Enter" not in sent
+
+
+@pytest.mark.asyncio
+async def test_a_style_flip_during_the_wiggle_fails_with_zero_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delta == 0 path (a 2.1.246-shaped numbered mint whose away-reparse
+    re-renders UNNUMBERED): the wiggle refuses and Enter is NEVER sent."""
+    from unittest.mock import AsyncMock
+
+    from cctelegram.callback_dispatcher import interactive as cbi
+
+    monkeypatch.setattr(cbi.asyncio, "sleep", AsyncMock())
+    gate = _fx("folder_trust_arrival_plain_v2.1.246.txt")  # numbered, cursor row 1
+    flipped = _as_unnumbered(_fx("folder_trust_postdown_plain_v2.1.246.txt"))
+    sent: list[str] = []
+
+    async def _send(window_id: str, keys: str, enter: bool, literal: bool) -> bool:
+        sent.append(keys)
+        return True
+
+    captures = iter([gate, flipped])
+    tmux = SimpleNamespace(
+        capture_pane=AsyncMock(side_effect=lambda *a, **k: next(captures)),
+        pane_current_command=AsyncMock(return_value=_V246),
+        send_keys=_send,
+    )
+    outcome = await cbi._dispatch_decision_pane_locked(
+        user=SimpleNamespace(id=1),
+        tmux_manager=tmux,
+        w=SimpleNamespace(window_id="@1"),
+        window_id="@1",
+        minted_fingerprint=tp.decision_prompt_fingerprint(
+            _form("folder_trust_arrival_plain_v2.1.246.txt")
+        ),
+        option_number=1,  # delta == 0 ⇒ the wiggle path
+        option_label=decision_token.TRUST_AFFIRMATIVE_LABEL,
+        ledger_key=None,
+        minted_option_style=tp.OPTION_STYLE_NUMBERED,
+    )
+    assert outcome.kind == "not_advanced"
+    assert outcome.reason == "wiggle_no_motion"
+    assert sent == ["Down"], sent  # the away key only — no back key, no Enter
+    assert "Enter" not in sent

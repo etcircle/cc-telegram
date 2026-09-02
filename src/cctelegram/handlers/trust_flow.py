@@ -1075,11 +1075,17 @@ def build_trust_card(
     with an advisory to answer in tmux. [❌ Cancel] is present in BOTH shapes and
     never types a keystroke.
 
-    ``warning_block`` (GH #88 §D) is the ALREADY-SANITIZED ``⚠`` pre-approval
-    block CC ≥2.1.258 renders for a cwd whose ``.claude/settings.json`` carries a
+    ``warning_block`` (GH #88 §D) is the ``⚠`` pre-approval block CC ≥2.1.258
+    renders for a cwd whose ``.claude/settings.json`` carries a
     ``permissions.allow`` list. One tap grants exactly those permissions, so the
     card must not hide it. Rendered as a fence, never as markdown source.
+
+    SANITIZATION IS ENFORCED AT THIS SINK (Codex r1 P3-4), not at the caller:
+    whatever arrives runs through ``sanitize_pane_copy`` here, so a future caller
+    cannot bypass it by forgetting. The sanitizer is IDEMPOTENT, so passing
+    already-sanitized copy is a no-op.
     """
+    warning_block = sanitize_pane_copy(warning_block) if warning_block else None
     ceiling_min = max(1, int(config.trust_prompt_ceiling_s // 60))
     lines = [
         "🔐 *Claude is asking you to trust this folder*",
@@ -1315,9 +1321,13 @@ def build_unknown_prompt_card(
 
     Display-ONLY by construction: no token is ever minted for it, so there is no
     ✅ button and no keystroke can originate from it. [❌ Cancel] is the same
-    zero-keystroke window kill the 🔐 card carries. The pane tail is UNTRUSTED
-    terminal text and goes through ``sanitize_pane_copy`` + a fence.
+    zero-keystroke window kill the 🔐 card carries.
+
+    The pane tail is UNTRUSTED terminal text. Like ``build_trust_card``'s ``⚠``
+    block it is sanitized AT THIS SINK (Codex r1 P3-4) — idempotent, so an
+    already-sanitized tail is unchanged — and emitted inside a fence.
     """
+    pane_tail_text = sanitize_pane_copy(pane_tail_text) if pane_tail_text else ""
     ceiling_min = max(1, int(config.trust_prompt_ceiling_s // 60))
     lines = [
         "⚠️ *Claude is showing a confirmation prompt I can't read*",
@@ -2504,14 +2514,28 @@ async def _wait_loop(
                     ),
                 )
                 return
-            if not flow.trust_seen or flow.card_kind == CARD_KIND_UNKNOWN:
+            if not flow.trust_seen or (
+                flow.card_kind == CARD_KIND_UNKNOWN
+                and flow.phase == PHASE_AWAITING_TRUST
+            ):
                 # GH #88 §F(i) — the ``unknown → trust`` transition. A partial
                 # (footer-only) frame that raised the advisory, followed by the
                 # COMPLETE frame, must end with the ✅ button: force a fresh
                 # licensed render/mint rather than the deadline-refresh branch,
                 # which would leave the advisory standing for the prompt's life.
+                #
+                # The ceiling is ARMED ONCE and never re-based here (Codex r1
+                # P2-1): a pane flapping unknown↔trust would otherwise push
+                # ``trust_deadline`` out on every redraw until it passed the
+                # FIXED global observation deadline, converting the trust
+                # ceiling's guarded cleanup into a global SPARE — a window kept
+                # alive forever with a dead card. The budget starts when the
+                # prompt is FIRST seen, whichever card it produced.
                 flow.trust_seen = True
-                flow.trust_deadline = time.monotonic() + config.trust_prompt_ceiling_s
+                if flow.trust_deadline is None:
+                    flow.trust_deadline = (
+                        time.monotonic() + config.trust_prompt_ceiling_s
+                    )
                 await render_trust_card(flow, bot, pane_text)
             elif (
                 flow.phase == PHASE_AWAITING_REGISTRATION
@@ -2612,14 +2636,24 @@ async def _wait_loop(
         if flow.trust_deadline is not None and now >= flow.trust_deadline:
             if not await claim_terminal(flow):
                 continue
+            # GH #88: the SAME ceiling now also bounds the UNKNOWN_PROMPT hold,
+            # where nothing ever said "trust this folder" — the copy branches on
+            # WHICH card the user is looking at. Kill policy is unchanged.
             await _terminal_cleanup(
                 flow,
                 bot,
                 tmux_mgr,
                 reason="trust prompt ceiling",
                 body=(
-                    "⏰ Timed out waiting for you to trust the folder.\n\n"
-                    "Send your message again when you're ready."
+                    (
+                        "⏰ Timed out waiting for you to answer the prompt in the "
+                        "tmux window.\n\nSend your message again when you're ready."
+                    )
+                    if flow.card_kind == CARD_KIND_UNKNOWN
+                    else (
+                        "⏰ Timed out waiting for you to trust the folder.\n\n"
+                        "Send your message again when you're ready."
+                    )
                 ),
                 session_mgr=session_mgr,
             )

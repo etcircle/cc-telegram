@@ -405,3 +405,96 @@ async def test_unknown_then_trust_recovers_to_a_licensed_card(
     scenario.tmux.sent_keys.clear()
     await _tap(scenario, _trust_button(scenario))
     assert pane.committed == 2
+
+
+@pytest.mark.asyncio
+async def test_trust_then_unknown_then_trust_burns_the_first_token(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex r1 P2-2a — the FULL degrade→recover round trip.
+
+    A recognized frame mints token #1; the pane degrades mid-redraw to a shape
+    nothing owns, which must RELEASE that authorization before the advisory is
+    drawn; the complete frame then returns and mints a FRESH token #2. Tapping
+    the stale #1 must send NOTHING (no arrows, no Enter); #2 must dispatch.
+    """
+    _wid, pane = await _start_flow(scenario, monkeypatch)
+    first_tap = _trust_button(scenario)
+    flow = trust_flow.get_flow(scenario.user_id, _THREAD)
+    assert flow is not None and flow.card_kind == trust_flow.CARD_KIND_TRUST
+
+    # DEGRADE.
+    pane.pane_override = _UNKNOWN_PROMPT_PANE
+    await _settle(10)
+    assert flow.card_kind == trust_flow.CARD_KIND_UNKNOWN
+    assert flow.token is None, "the stale ✅ authorization must not outlive its card"
+    assert decision_token.peek(first_tap.split(":")[-1]) is None
+
+    # The stale tap is inert: zero keys, zero Enter, nothing committed.
+    scenario.tmux.sent_keys.clear()
+    await _tap(scenario, first_tap)
+    assert scenario.tmux.sent_keys == [], scenario.tmux.sent_keys
+    assert pane.committed is None
+
+    # RECOVER.
+    pane.pane_override = None
+    await _settle(10)
+    assert flow.card_kind == trust_flow.CARD_KIND_TRUST
+    second_tap = _trust_button(scenario)
+    assert second_tap != first_tap, "the recovery must mint a FRESH token"
+
+    scenario.tmux.sent_keys.clear()
+    await _tap(scenario, second_tap)
+    keys = [k for _w, k, _e, _lit in scenario.tmux.sent_keys]
+    assert keys == ["Down", "Enter"], keys
+    assert pane.committed == 2
+
+
+@pytest.mark.asyncio
+async def test_the_trust_ceiling_is_armed_once_across_unknown_trust_flapping(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex r1 P2-1: a pane flapping unknown↔trust must NOT push the ceiling out.
+
+    Re-basing on every redraw would eventually carry ``trust_deadline`` past the
+    FIXED global observation deadline, turning the ceiling's guarded cleanup into
+    a global SPARE — a window kept alive forever behind a dead card.
+    """
+    _wid, pane = await _start_flow(
+        scenario, monkeypatch, pane_override=_UNKNOWN_PROMPT_PANE
+    )
+    await _settle(5)
+    flow = trust_flow.get_flow(scenario.user_id, _THREAD)
+    assert flow is not None
+    armed = flow.trust_deadline
+    assert armed is not None
+
+    for override in (None, _UNKNOWN_PROMPT_PANE, None):
+        pane.pane_override = override
+        await _settle(8)
+        assert flow.trust_deadline == armed, (override, flow.trust_deadline, armed)
+    assert flow.card_kind == trust_flow.CARD_KIND_TRUST
+
+
+@pytest.mark.asyncio
+async def test_the_ceiling_expiry_copy_matches_the_card_on_screen(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The UNKNOWN hold never said "trust this folder", so its timeout must not
+    either. Kill policy unchanged — the window is still cleaned up."""
+    wid, _pane = await _start_flow(
+        scenario, monkeypatch, pane_override=_UNKNOWN_PROMPT_PANE
+    )
+    await _settle(5)
+    flow = trust_flow.get_flow(scenario.user_id, _THREAD)
+    assert flow is not None and flow.card_kind == trust_flow.CARD_KIND_UNKNOWN
+
+    flow.trust_deadline = 0.0  # the ceiling has expired
+    task = trust_flow.flow_task(scenario.user_id, _THREAD)
+    assert task is not None
+    await asyncio.wait_for(task, timeout=5)
+
+    edits = _card_edits(scenario)
+    assert any("answer the prompt in the tmux window" in t for t in edits), edits
+    assert not any("trust the folder" in t for t in edits), edits
+    assert scenario.tmux.kill_calls == [wid], "the kill policy is unchanged"
