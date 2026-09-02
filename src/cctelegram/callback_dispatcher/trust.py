@@ -382,13 +382,23 @@ async def _dispatch_trust(
             )
         return None
 
-    def _trust_license(family: str, live_cmd: str | None) -> bool:
-        """The trust lane's FRESH in-lock license predicate."""
+    def _trust_license(
+        family: str, live_cmd: str | None, live_option_style: str | None
+    ) -> bool:
+        """The trust lane's FRESH in-lock license predicate.
+
+        GH #88: the license is ``(family × PROBED CC-version × the LIVE form's
+        OPTION-STYLE)``. The version is the one probed in THIS pane at creation
+        (``pane_current_command`` carries no version on Linux/WSL); the style is
+        read from the pane the dispatch is about to key into.
+        """
         return (
             family == trust_flow.TRUST_FAMILY
             and pane_command_is_claude(live_cmd)
             and bool(flow.cli_version)
-            and decision_token.lookup(trust_flow.TRUST_FAMILY, flow.cli_version or "")
+            and decision_token.lookup(
+                trust_flow.TRUST_FAMILY, flow.cli_version or "", live_option_style
+            )
         )
 
     if flow.ledger_key is not None:
@@ -411,6 +421,7 @@ async def _dispatch_trust(
             option_number=entry.option_number,
             option_label=entry.option_label,
             ledger_key=flow.ledger_key,
+            minted_option_style=entry.option_style,
             license_check=_trust_license,
             on_commit_sent=on_commit_sent,
         )

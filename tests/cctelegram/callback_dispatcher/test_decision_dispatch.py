@@ -195,6 +195,7 @@ async def _run_dispatch(
         option_number=opt,
         option_label=label,
         ledger_key=key,
+        minted_option_style=tp.OPTION_STYLE_NUMBERED,
     )
     return q, finalize
 
@@ -387,6 +388,7 @@ async def test_dispatched_finalizes_before_callback_answer(
         option_number=2,
         option_label="No, exit",
         ledger_key=key,
+        minted_option_style=tp.OPTION_STYLE_NUMBERED,
     )
     assert order == ["finalize", "answer"], order
 
@@ -500,6 +502,7 @@ async def test_fingerprint_drift_bails_pre_key(
         option_number=1,
         option_label="Yes, I trust this folder",
         ledger_key=key,
+        minted_option_style=tp.OPTION_STYLE_NUMBERED,
     )
     entry = auq_ledger.lookup(key)
     assert entry is not None and entry.state == "not_advanced"
@@ -537,6 +540,7 @@ async def test_decision_lock_busy_downgrades_accepted_to_not_advanced(
             option_number=1,
             option_label="Yes, I trust this folder",
             ledger_key=key,
+            minted_option_style=tp.OPTION_STYLE_NUMBERED,
         )
     finally:
         picker.lock.release()
@@ -562,6 +566,10 @@ _VARIANT_META: dict[str, dict[str, str]] = {
     "footerless": {"decision_variant": tp.DECISION_VARIANT_FOOTERLESS},
     "footered": {"decision_variant": tp.DECISION_VARIANT_FOOTERED},
 }
+# GH #88: every synthetic form here models the NUMBERED rendering (its excerpt
+# carries ``N. label`` rows), so it carries the matching option-style stamp — the
+# license and the dispatch parity gate are both ``(version × style)``-keyed now.
+_NUMBERED_STYLE = {tp.OPTION_STYLE_META_KEY: tp.OPTION_STYLE_NUMBERED}
 _NON_FOOTERED = ["missing", "unknown", "footerless"]
 
 
@@ -582,7 +590,7 @@ def _ft_form(variant: str) -> tp.AskUserQuestionForm:
         pane_excerpt="\n".join(excerpt_lines),
         select_mode="single",
         options_complete=True,
-        _meta=dict(_VARIANT_META[variant]),
+        _meta={**_VARIANT_META[variant], **_NUMBERED_STYLE},
     )
 
 
@@ -658,6 +666,7 @@ async def _run_pane_locked_with_form(
             option_number=1,
             option_label=_FT_LABELS[0],
             ledger_key=None,
+            minted_option_style=tp.OPTION_STYLE_NUMBERED,
         )
 
 

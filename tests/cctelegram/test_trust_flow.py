@@ -425,9 +425,14 @@ async def test_missing_window_id_is_kill_failed(_clean_session_map: Any) -> None
 
 
 def test_both_rig_characterized_versions_are_licensed() -> None:
-    assert decision_token.lookup("folder-trust", "2.1.239")
-    assert decision_token.lookup("folder-trust", "2.1.241")
-    assert not decision_token.lookup("folder-trust", "2.1.242")
+    assert decision_token.lookup("folder-trust", "2.1.239", "numbered")
+    assert decision_token.lookup("folder-trust", "2.1.241", "numbered")
+    assert not decision_token.lookup("folder-trust", "2.1.242", "numbered")
+    # GH #88 — the STYLE dimension: a licensed version does NOT license an
+    # un-characterized RENDERING on that version, and vice-versa.
+    assert not decision_token.lookup("folder-trust", "2.1.241", "unnumbered")
+    assert decision_token.lookup("folder-trust", "2.1.258", "unnumbered")
+    assert not decision_token.lookup("folder-trust", "2.1.258", "numbered")
 
 
 @pytest.mark.parametrize(

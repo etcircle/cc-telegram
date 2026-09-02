@@ -252,9 +252,13 @@ def test_family_positive_from_real_fixture_and_license() -> None:
     assert form is not None
     assert dt.identify_family(form) == "folder-trust"
     # Licensed for the characterized CC version; nothing else.
-    assert dt.lookup("folder-trust", "2.1.204") is True
-    assert dt.lookup("folder-trust", "2.1.200") is False
-    assert dt.lookup("folder-trust", "2.1.201") is False
+    assert dt.lookup("folder-trust", "2.1.204", "numbered") is True
+    assert dt.lookup("folder-trust", "2.1.200", "numbered") is False
+    assert dt.lookup("folder-trust", "2.1.201", "numbered") is False
+    # GH #88 — the license is (version × option_style); a style-less form and a
+    # rendering the version was never characterized for both fail closed.
+    assert dt.lookup("folder-trust", "2.1.204", None) is False
+    assert dt.lookup("folder-trust", "2.1.204", "unnumbered") is False
 
 
 def test_family_positive_on_the_licensed_v2_1_204_fixture() -> None:
@@ -267,7 +271,7 @@ def test_family_positive_on_the_licensed_v2_1_204_fixture() -> None:
     form = parse_generic_decision(_load("decision_trust_folder_v2.1.204.txt"))
     assert form is not None
     assert dt.identify_family(form) == "folder-trust"
-    assert dt.lookup("folder-trust", "2.1.204") is True
+    assert dt.lookup("folder-trust", "2.1.204", "numbered") is True
 
 
 def test_family_positive_on_the_licensed_v2_1_206_fixture() -> None:
@@ -278,8 +282,8 @@ def test_family_positive_on_the_licensed_v2_1_206_fixture() -> None:
     form = parse_generic_decision(_load("folder_trust_arrival_plain_v2.1.206.txt"))
     assert form is not None
     assert dt.identify_family(form) == "folder-trust"
-    assert dt.lookup("folder-trust", "2.1.206") is True
-    assert dt.lookup("folder-trust", "9.9.9") is False
+    assert dt.lookup("folder-trust", "2.1.206", "numbered") is True
+    assert dt.lookup("folder-trust", "9.9.9", "numbered") is False
 
 
 def test_family_positive_on_the_licensed_v2_1_207_fixture() -> None:
@@ -292,8 +296,8 @@ def test_family_positive_on_the_licensed_v2_1_207_fixture() -> None:
     form = parse_generic_decision(_load("folder_trust_arrival_plain_v2.1.207.txt"))
     assert form is not None
     assert dt.identify_family(form) == "folder-trust"
-    assert dt.lookup("folder-trust", "2.1.207") is True
-    assert dt.lookup("folder-trust", "9.9.9") is False
+    assert dt.lookup("folder-trust", "2.1.207", "numbered") is True
+    assert dt.lookup("folder-trust", "9.9.9", "numbered") is False
 
 
 def test_family_positive_on_the_licensed_v2_1_246_fixture() -> None:
@@ -308,8 +312,8 @@ def test_family_positive_on_the_licensed_v2_1_246_fixture() -> None:
     form = parse_generic_decision(_load("folder_trust_arrival_plain_v2.1.246.txt"))
     assert form is not None
     assert dt.identify_family(form) == "folder-trust"
-    assert dt.lookup("folder-trust", "2.1.246") is True
-    assert dt.lookup("folder-trust", "9.9.9") is False
+    assert dt.lookup("folder-trust", "2.1.246", "numbered") is True
+    assert dt.lookup("folder-trust", "9.9.9", "numbered") is False
 
 
 def test_family_negative_option_tuple_mismatch() -> None:
@@ -364,5 +368,5 @@ def test_family_negative_title_none() -> None:
 
 
 def test_lookup_unknown_family_and_version() -> None:
-    assert dt.lookup("no-such-family", "2.1.204") is False
-    assert dt.lookup("folder-trust", "9.9.9") is False
+    assert dt.lookup("no-such-family", "2.1.204", "numbered") is False
+    assert dt.lookup("folder-trust", "9.9.9", "numbered") is False

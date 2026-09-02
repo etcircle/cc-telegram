@@ -57,6 +57,7 @@ from cctelegram.terminal_parser import (
     decision_variant_of,
     extract_interactive_content,
     has_decision_residue,
+    option_style_of,
     parse_generic_decision,
     resolve_ask_form,
 )
@@ -878,7 +879,8 @@ async def _dispatch_decision_pane_locked(
     option_number: int,
     option_label: str,
     ledger_key: str | None,
-    license_check: Callable[[str, str | None], bool] | None = None,
+    minted_option_style: str | None = None,
+    license_check: Callable[[str, str | None, str | None], bool] | None = None,
     on_commit_sent: Callable[[], None] | None = None,
 ) -> _DecisionPaneOutcome:
     """§3 dispatch transaction — the caller holds the window send lock.
@@ -889,8 +891,15 @@ async def _dispatch_decision_pane_locked(
     runs BEFORE any keystroke, so a keystroke is NEVER sent to an unlicensed /
     non-matching shape.
 
+    ``minted_option_style`` is the GH #88 OPTION-STYLE the card was minted from.
+    It is checked BEFORE any keystroke and re-checked on EVERY post-navigation
+    reparse: the body-inclusive fingerprint folds ``number:label`` pairs, which a
+    numbered and an unnumbered rendering of the SAME prompt can share
+    byte-for-byte, so style parity is the explicit belt beside it.
+
     ``license_check`` is the FRESH in-lock license predicate ``(family,
-    live_pane_command) -> bool``. ``None`` = the ``dcp:`` lane's shipped default
+    live_pane_command, live_option_style) -> bool``. ``None`` = the ``dcp:``
+    lane's shipped default
     (``pane_command_is_claude`` AND the pane command itself licensed in the
     table) — byte-identical behavior for that lane. GH #65's creation-flow trust
     lane passes its own: ``pane_command_is_claude`` (proof the TUI owns the
@@ -953,6 +962,14 @@ async def _dispatch_decision_pane_locked(
     # DIFFERENT dirs differ) + geometry/family gates.
     if decision_prompt_fingerprint(live_form) != minted_fingerprint:
         return _bail_not_advanced("fingerprint_mismatch")
+    # GH #88 — OPTION-STYLE parity, PRE-keystroke. The fingerprint cannot carry
+    # this: the same prompt rendered numbered vs unnumbered yields the same
+    # title / body / ``number:label`` pairs, so a card minted from one rendering
+    # would otherwise arrow-key the other, whose keystroke behavior is
+    # un-characterized.
+    live_option_style = option_style_of(live_form)
+    if live_option_style != minted_option_style:
+        return _bail_not_advanced("option_style_mismatch")
     opts = live_form.options
     if sum(1 for o in opts if o.cursor) != 1:
         return _bail_not_advanced("cursor_geometry")
@@ -975,18 +992,19 @@ async def _dispatch_decision_pane_locked(
     # observable).
     live_cmd = await tmux_manager.pane_current_command(window_id)
     licensed = (
-        license_check(family, live_cmd)
+        license_check(family, live_cmd, live_option_style)
         if license_check is not None
         else (
             pane_command_is_claude(live_cmd)
-            and decision_token.lookup(family, live_cmd or "")
+            and decision_token.lookup(family, live_cmd or "", live_option_style)
         )
     )
     if not licensed:
         logger.info(
-            "DECISION dispatch declined: live pane command %r not licensed for "
-            "family %s (user=%d window=%s)",
+            "DECISION dispatch declined: live pane command %r / option style %r "
+            "not licensed for family %s (user=%d window=%s)",
             live_cmd,
+            live_option_style,
             family,
             user.id,
             window_id,
@@ -1020,6 +1038,7 @@ async def _dispatch_decision_pane_locked(
         if (
             vform is None
             or decision_prompt_fingerprint(vform) != minted_fingerprint
+            or option_style_of(vform) != minted_option_style  # GH #88 style belt
             or vc is None
             or vc.number != target
             or vc.number == pre_nav_pos  # MOTION observed (delta != 0)
@@ -1042,6 +1061,7 @@ async def _dispatch_decision_pane_locked(
         if (
             wform is None
             or decision_prompt_fingerprint(wform) != minted_fingerprint
+            or option_style_of(wform) != minted_option_style  # GH #88 style belt
             or wc is None
             or wc.number == target  # cursor did NOT move → not a live picker
         ):
@@ -1056,6 +1076,7 @@ async def _dispatch_decision_pane_locked(
         if (
             vform is None
             or decision_prompt_fingerprint(vform) != minted_fingerprint
+            or option_style_of(vform) != minted_option_style  # GH #88 style belt
             or vc is None
             or vc.number != target
         ):
@@ -1127,6 +1148,7 @@ async def _dispatch_decision(
     option_number: int,
     option_label: str,
     ledger_key: str | None,
+    minted_option_style: str | None = None,
 ) -> None:
     """Lock-acquire (reject-if-held) → pane-locked transaction → unlocked response.
 
@@ -1157,6 +1179,7 @@ async def _dispatch_decision(
             option_number=option_number,
             option_label=option_label,
             ledger_key=ledger_key,
+            minted_option_style=minted_option_style,
         )
     # ── Unlocked response: Telegram I/O only after lock release. ──
     if outcome.kind == "dispatched":
@@ -2352,4 +2375,5 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             option_number=d_entry.option_number,
             option_label=d_entry.option_label,
             ledger_key=d_ledger_key,
+            minted_option_style=d_entry.option_style,
         )

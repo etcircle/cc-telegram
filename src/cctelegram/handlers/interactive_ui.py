@@ -63,6 +63,7 @@ from ..terminal_parser import (
     decision_variant_of,
     extract_epm_plan_file_path,
     extract_interactive_content,
+    option_style_of,
     parse_ask_user_question,
     parse_generic_decision,
     visible_pane_liveness,
@@ -3056,11 +3057,15 @@ def _build_decision_pick_rows(
     family = decision_token.identify_family(form)
     if family is None:
         return None
-    if not decision_token.lookup(family, cached_command or ""):
+    # GH #88 — the license is (family × CC-version × OPTION-STYLE). A style-less
+    # form (never a footered-leg parse) fails closed inside ``lookup``.
+    option_style = option_style_of(form)
+    if not decision_token.lookup(family, cached_command or "", option_style):
         logger.info(
-            "DECISION mint declined: cached pane command %r not licensed for "
-            "family %s window=%s",
+            "DECISION mint declined: cached pane command %r / option style %r not "
+            "licensed for family %s window=%s",
             cached_command,
+            option_style,
             family,
             window_id,
         )
@@ -3088,6 +3093,7 @@ def _build_decision_pick_rows(
             )
             for o in pickable
         ],
+        option_style=option_style,
     )
 
     route_hash = auq_ledger.make_route_hash(user_id, thread_id, window_id)
