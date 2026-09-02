@@ -330,6 +330,21 @@ _RE_DECISION_FOOTER = re.compile(r"\bEnter to (?:confirm|continue)\b")
 # (``parse_generic_decision`` → ``_parse_footerless_decision``); this loose
 # anchor only PRODUCES the candidate the validator then gates.
 _RE_DECISION_BOTTOM_OPTION = re.compile(r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S")
+# GH #88: the CC 2.1.258 folder-trust prompt has NO numbered rows at all, so the
+# loose TOP anchor above can never fire on it and ``extract_interactive_content``
+# would return ``None`` even once ``_parse_footered_decision`` recognizes the
+# shape — which the ``dcp:``/``tst:`` dispatch's EXTRACTOR PARITY gate reads as
+# "no Decision owns this pane". A second loose top anchor — a CURSORED row — is
+# the minimum that produces the candidate; every real gate (cursor count, common
+# label column, strict footer, ``_only_chrome_below``, family, version × style
+# license) still lives in the strict validator, which ``continue``s the pattern
+# loop on ``None``, so this widens NO dispatch decision, only candidate
+# production. ACKNOWLEDGED WIDENING (Codex r1): it DOES widen which panes can
+# become SUCCESSFUL generic display-only Decision candidates — ANY unnumbered
+# footered confirmation now surfaces as a B1 card, which is exactly the generic
+# detector's stated intent — while DISPATCH stays gated on
+# family × CC-version × option_style, so nothing new becomes tappable.
+_RE_DECISION_TOP_CURSOR_ROW = re.compile(r"^\s*[❯›▶]\s+\S")
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
@@ -446,7 +461,7 @@ UI_PATTERNS: list[UIPattern] = [
     UIPattern(
         name="Decision",
         id="decision",
-        top=(_RE_DECISION_TOP_OPTION,),
+        top=(_RE_DECISION_TOP_OPTION, _RE_DECISION_TOP_CURSOR_ROW),
         bottom=(_RE_DECISION_FOOTER, _RE_DECISION_BOTTOM_OPTION),
         min_gap=1,
         bottom_up=True,
@@ -2771,6 +2786,162 @@ def _gate_options_above(lines: list[str], footer_idx: int) -> tuple[AskOption, .
     )
 
 
+# ── GH #88 — the UNNUMBERED footered option block (CC 2.1.258) ────────────
+#
+# CC 2.1.258 REDESIGNED the folder-trust confirmation: the ``N.`` numbering is
+# GONE, the option order is INVERTED, and the default cursor now sits on the
+# DESTRUCTIVE row::
+#
+#      ❯ No, exit
+#        Yes, I trust this folder
+#
+#      Enter to confirm · Esc to cancel
+#
+# ``_RE_NUMBERED_OPTION`` matches neither row, so ``_gate_options_above``
+# returned ``()`` and the whole footered leg refused — which regressed the GH #65
+# creation lane all the way back to the pre-#65 "didn't register in time" KILL.
+#
+# The sibling walk below recognizes that shape. It runs ONLY when the numbered
+# walk found nothing (the two grammars are NEVER mixed) and is deliberately
+# STRICTER than a "two indented rows" heuristic, because an unnumbered row is
+# structurally weaker evidence than an ``N.`` token:
+#
+#   * the run is anchored at the FIRST non-blank row above the footer and may
+#     only extend over ADJACENT rows (a blank inside the run terminates it);
+#   * every row must share the anchor's LABEL COLUMN. A cursor glyph plus its
+#     one space occupies EXACTLY the two display cells a non-cursor row fills
+#     with spaces, so the real option rows align to the byte while the
+#     surrounding prose (`` Security guide``, the ``⚠`` block, the cwd path — all
+#     1-space-indented) does NOT. Column conformity is therefore the STOPPING
+#     condition, not a filter;
+#   * EXACTLY ONE row may carry a cursor glyph;
+#   * NO row in the run may match ``_RE_NUMBERED_OPTION`` (never mix grammars);
+#   * no row's label may start with a ``─`` rule character.
+#
+# Anything else ⇒ ``()`` (fail closed). The compensating controls around it are
+# unchanged: the strict footer, ``_only_chrome_below``, the family signature, the
+# version × style license, and the pre-Enter navigate→verify discipline.
+_RE_UNNUMBERED_OPTION_ROW = re.compile(
+    r"^(?P<indent>\s*)(?:(?P<cursor>[❯›▶])\s)?(?P<pad>\s*)(?P<label>\S.*?)\s*$"
+)
+
+# The option-STYLE provenance stamp (GH #88). A CONSUMED positive authorization:
+# the dispatch license is keyed ``(family × CC-version × option_style)``, so a
+# 2.1.258 pane rendering the OLD numbered shape — or a 2.1.246 pane rendering the
+# NEW unnumbered one — declines BEFORE any keystroke instead of being silently
+# absorbed by a version license that never saw that rendering.
+OPTION_STYLE_META_KEY: Final[str] = "option_style"
+OPTION_STYLE_NUMBERED: Final[str] = "numbered"
+OPTION_STYLE_UNNUMBERED: Final[str] = "unnumbered"
+
+
+def option_style_of(form: AskUserQuestionForm) -> str | None:
+    """The option-STYLE stamp a Decision form carries, or ``None`` (GH #88).
+
+    ``"numbered"`` / ``"unnumbered"`` for a footered-leg form; ``None`` for any
+    other form. An ABSENT style must fail authorization the same way an
+    un-licensed one does (positive authorization, never a blacklist)."""
+    v = form._meta.get(OPTION_STYLE_META_KEY)
+    return v if v in (OPTION_STYLE_NUMBERED, OPTION_STYLE_UNNUMBERED) else None
+
+
+def _gate_unnumbered_options_above(
+    lines: list[str], footer_idx: int
+) -> tuple[tuple[AskOption, ...], int | None]:
+    """The GH #88 UNNUMBERED option-block walk: ``(options, block_top_idx)``.
+
+    ONE walk returns BOTH the options and the block-top index so the footered
+    leg's title/excerpt derivation and the fingerprint's body boundary can never
+    disagree about where the block starts (Codex r1 P1-1).
+
+    Returns ``((), None)`` on ANY ambiguity. Numbers are SYNTHESIZED ``1..N`` by
+    ROW ORDER (top = 1) so every downstream number-keyed leg (``pre_nav_pos`` /
+    ``delta`` / the post-nav verify / ``options_contiguous_from_one`` /
+    ``decision_prompt_fingerprint``'s ``number:label`` pairs) stays
+    byte-identical. The numbering is deterministic per frame and CURSOR-BLIND, so
+    the fingerprint stays cursor-stable across arrival / post-Down / post-Up.
+    """
+    # The run's bottom anchor: the first non-blank row above the footer. Only
+    # blank rows may sit between the block and the footer.
+    anchor_idx = footer_idx - 1
+    while anchor_idx >= 0 and not lines[anchor_idx].strip():
+        anchor_idx -= 1
+    if anchor_idx < 0:
+        return (), None
+    anchor_m = _RE_UNNUMBERED_OPTION_ROW.match(lines[anchor_idx])
+    if anchor_m is None:
+        return (), None
+    label_col = anchor_m.start("label")
+
+    collected: list[tuple[int, re.Match[str]]] = [(anchor_idx, anchor_m)]
+    for j in range(anchor_idx - 1, -1, -1):
+        line = lines[j]
+        if not line.strip():
+            break  # a blank INSIDE the run terminates it
+        m = _RE_UNNUMBERED_OPTION_ROW.match(line)
+        if m is None or m.start("label") != label_col:
+            break  # column conformity is the stopping condition
+        collected.append((j, m))
+    collected.reverse()
+
+    if len(collected) < 2:
+        return (), None
+    if sum(1 for _idx, m in collected if m.group("cursor")) != 1:
+        return (), None
+    for _idx, m in collected:
+        if _RE_NUMBERED_OPTION.match(lines[_idx]):
+            return (), None  # never mix the two grammars
+        if m.group("label").startswith("─"):
+            return (), None  # a rule row is chrome, never an option
+
+    options = tuple(
+        AskOption(
+            label=_strip_esc_affordance(m.group("label").strip()),
+            recommended=False,
+            cursor=bool(m.group("cursor")),
+            number=n,
+            description="",
+            selected=None,
+        )
+        for n, (_idx, m) in enumerate(collected, start=1)
+    )
+    return options, collected[0][0]
+
+
+@dataclass(frozen=True)
+class _DecisionOptionBlock:
+    """The option block a footered Decision frame carries (GH #88).
+
+    ONE discovery shared by the footered leg AND ``decision_prompt_fingerprint``
+    so the minted identity and the validated one can never disagree about the
+    body/option boundary (mint == validate parity).
+    """
+
+    options: tuple[AskOption, ...]
+    block_top_idx: int | None
+    style: str
+
+
+def _decision_option_block_bounds(
+    lines: list[str], footer_idx: int
+) -> _DecisionOptionBlock:
+    """Numbered-FIRST, unnumbered-FALLBACK option-block discovery (GH #88).
+
+    STRICTLY ADDITIVE: whenever the numbered walk finds anything at all, the
+    result is byte-identical to the pre-#88 ``_gate_options_above`` /
+    ``_decision_option_block_top`` pair. The unnumbered walker is reached ONLY
+    when the numbered walk found no option row whatsoever.
+    """
+    numbered = _gate_options_above(lines, footer_idx)
+    numbered_top = _decision_option_block_top(lines, footer_idx)
+    if numbered or numbered_top is not None:
+        return _DecisionOptionBlock(numbered, numbered_top, OPTION_STYLE_NUMBERED)
+    unnumbered, unnumbered_top = _gate_unnumbered_options_above(lines, footer_idx)
+    if len(unnumbered) >= 2:
+        return _DecisionOptionBlock(unnumbered, unnumbered_top, OPTION_STYLE_UNNUMBERED)
+    return _DecisionOptionBlock((), None, OPTION_STYLE_NUMBERED)
+
+
 # ── Bottom-terminal requirement (S-8 fail-closed; round-2 Codex P1) ────────
 #
 # A genuine LIVE approval gate is the ACTIVE bottom prompt: when Claude blocks
@@ -3384,6 +3555,16 @@ _DECISION_ANCHOR_CLASSIFICATION: Final[dict[tuple[str, int, str, int], str]] = {
         r"^\s*[❯›▶*)>]?\s*\d+\.\s+\S",
         _UF,
     ): "excluded(decision-own-options)",
+    # GH #88 — the UNNUMBERED cursored option row. EXCLUDED for the same reason
+    # as index 0: it is Decision's OWN option shape (and the generic AUQ/EPM
+    # cursor row), so vetoing the footerless leg on it would self-reject every
+    # positive rather than refuse a named surface's dropped-footer redraw.
+    (
+        "decision",
+        1,
+        r"^\s*[❯›▶]\s+\S",
+        _UF,
+    ): "excluded(decision-own-unnumbered-options)",
 }
 
 
@@ -3427,21 +3608,81 @@ def _terminal_numbered_option_block(
     return options, last_idx
 
 
+def _terminal_unnumbered_option_block(
+    lines: list[str],
+) -> tuple[tuple[AskOption, ...], int] | None:
+    """The GH #88 UNNUMBERED twin of ``_terminal_numbered_option_block``.
+
+    Returns ``(options, last_nonblank_idx)`` when the pane's LAST non-blank line
+    is the bottom row of a strict unnumbered option run (≥2 rows, exactly one
+    cursor, common label column, no numbered row); else ``None``. Reuses the SAME
+    strict walker, so the two grammars stay in lockstep."""
+    last_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip():
+            last_idx = i
+            break
+    if last_idx is None:
+        return None
+    options, _top = _gate_unnumbered_options_above(lines, last_idx + 1)
+    if len(options) < 2:
+        return None
+    return options, last_idx
+
+
 def has_decision_residue(pane_text: str) -> bool:
     """True iff the pane carries DECISION RESIDUE (the r5 P1 confirm-side predicate):
-    a strict Decision footer line OR a terminal contiguous numbered-option block.
+    a strict Decision footer line OR a terminal contiguous option block (numbered
+    OR — GH #88 — unnumbered).
 
     A still-standing option block IS residue even when no parser recognizes the
     frame (a footer-dropped ``─``-ruled prompt fails ``_parse_footerless_decision``
     entirely but still shows its option block). Used by ``_classify_decision_advance``
     to fail closed to ``commit_unconfirmed`` when the committed prompt has not
-    provably resolved."""
+    provably resolved.
+
+    GH #88 (Codex r1 P2-3): on CC 2.1.258 a footer that transiently drops while
+    the UNNUMBERED option rows stand must still read as residue, or the confirm
+    side would falsely record ``dispatched`` on a prompt that never resolved."""
     if not pane_text:
         return False
     lines = pane_text.split("\n")
     if any(_is_decision_footer_line(line) for line in lines):
         return True
-    return _terminal_numbered_option_block(lines) is not None
+    if _terminal_numbered_option_block(lines) is not None:
+        return True
+    return _terminal_unnumbered_option_block(lines) is not None
+
+
+def has_live_decision_residue(pane_text: str) -> bool:
+    """True iff the pane's TERMINAL content is an (unrecognized) LIVE decision
+    prompt — the GH #88 ``UNKNOWN_PROMPT`` predicate.
+
+    Deliberately NARROWER than ``has_decision_residue``, which is a
+    scrollback-anywhere confirm-side predicate and must STAY that way (Codex r1
+    P2-4). Here:
+
+      * a strict Decision FOOTER counts only when ``_only_chrome_below`` holds at
+        that footer — a stale footer in scrollback with a live input box beneath
+        it is NOT a live prompt (it classifies RUNNING, never UNKNOWN_PROMPT);
+      * an option BLOCK counts only when it is the pane's TERMINAL content.
+
+    Used by the creation lane to HOLD the window (trust-ceiling budget, advisory
+    card, zero keystrokes) instead of killing it when recognition breaks on a new
+    CC rendering."""
+    if not pane_text:
+        return False
+    lines = pane_text.split("\n")
+    for i in range(len(lines) - 1, -1, -1):
+        if _is_decision_footer_line(lines[i]):
+            # The BOTTOM-most footer is the only live candidate; if chrome-below
+            # fails there it fails for every footer above it too.
+            if _only_chrome_below(lines, i):
+                return True
+            break
+    if _terminal_numbered_option_block(lines) is not None:
+        return True
+    return _terminal_unnumbered_option_block(lines) is not None
 
 
 @dataclass(frozen=True)
@@ -3648,8 +3889,11 @@ def _parse_footered_decision(pane_text: str) -> AskUserQuestionForm | None:
     if not _only_chrome_below(lines, footer_idx):
         return None
 
-    # (3) Option block: ≥2 contiguous numbered options + a resolved live cursor.
-    options = _gate_options_above(lines, footer_idx)
+    # (3) Option block: ≥2 contiguous options + a resolved live cursor. GH #88 —
+    # numbered FIRST; the CC 2.1.258 UNNUMBERED shape is the fail-closed
+    # fallback, reached only when the numbered walk found nothing at all.
+    block = _decision_option_block_bounds(lines, footer_idx)
+    options = block.options
     if len(options) < 2:
         return None
     if not any(o.cursor for o in options):
@@ -3667,7 +3911,11 @@ def _parse_footered_decision(pane_text: str) -> AskUserQuestionForm | None:
     # display-only card (not just the body line nearest the options). Title =
     # the TOP meaningful line of that block; ``pane_excerpt`` = block heading →
     # footer (the trusted region shown as the card body).
-    block_top_idx = _decision_option_block_top(lines, footer_idx)
+    # GH #88: ``_decision_option_block_top`` is NUMBERED-only and returns None on
+    # the 2.1.258 shape, so the unnumbered walk's own block top stands in for it
+    # (the title logic itself — ``_decision_prompt_block_top`` — is UNCHANGED and
+    # deliberately NOT duplicated).
+    block_top_idx = block.block_top_idx
     title: str | None = None
     excerpt_start = block_top_idx if block_top_idx is not None else footer_idx
     if block_top_idx is not None:
@@ -3685,8 +3933,61 @@ def _parse_footered_decision(pane_text: str) -> AskUserQuestionForm | None:
         pane_excerpt=pane_excerpt,
         select_mode="single",
         options_complete=options[0].number == 1,
-        _meta={DECISION_VARIANT_META_KEY: DECISION_VARIANT_FOOTERED},
+        _meta={
+            DECISION_VARIANT_META_KEY: DECISION_VARIANT_FOOTERED,
+            OPTION_STYLE_META_KEY: block.style,
+        },
     )
+
+
+def decision_warning_block(form: AskUserQuestionForm) -> str | None:
+    """The ``⚠`` pre-approval block inside a Decision form's excerpt, or ``None``.
+
+    GH #88 §D — CC 2.1.258 renders an EXTRA block on a cwd whose
+    ``.claude/settings.json`` carries a ``permissions.allow`` list::
+
+        ⚠ This folder pre-approves 18 tool permissions in .claude/settings.json:
+          Write, mcp__…, Edit, Bash(databricks …), and 10 more
+        These will apply without asking. Only proceed if you trust this
+        configuration.
+
+    One tap on the 🔐 card grants exactly those permissions, so the card must not
+    hide the warning the terminal shows. The run starts at the first excerpt line
+    whose STRIPPED text begins with ``⚠`` and ends at the FIRST of — a blank
+    line, a ``Security guide`` row, or the parsed option-block top (bounded by
+    STRUCTURE, never by "next blank" alone; Codex r1 P2-6).
+
+    DISPLAY COPY ONLY. It is UNTRUSTED pane text: it never influences licensing,
+    family identification, navigation or the fingerprint, and the caller MUST
+    sanitize it before rendering."""
+    if not form.pane_excerpt:
+        return None
+    lines = form.pane_excerpt.split("\n")
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("⚠"):
+            start = i
+            break
+    if start is None:
+        return None
+    footer_idx: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _is_decision_footer_line(lines[i]):
+            footer_idx = i
+            break
+    option_top = _decision_option_block_bounds(
+        lines, footer_idx if footer_idx is not None else len(lines)
+    ).block_top_idx
+    end = option_top if option_top is not None else len(lines)
+    collected: list[str] = []
+    for i in range(start, min(end, len(lines))):
+        stripped = lines[i].strip()
+        if not stripped:
+            break
+        if stripped.startswith("Security guide"):
+            break
+        collected.append(stripped)
+    return "\n".join(collected) if collected else None
 
 
 def parse_generic_decision(pane_text: str) -> AskUserQuestionForm | None:
@@ -3844,11 +4145,18 @@ def decision_prompt_fingerprint(form: AskUserQuestionForm) -> str:
         # (INCLUDING the moving ``❯``) would otherwise fold into the body and churn
         # the fingerprint on a cursor move. The footered form still finds its footer
         # and derives the block above it — byte-identical.
-        option_top = (
-            _decision_option_block_top(excerpt_lines, footer_idx)
-            if footer_idx is not None
-            else _decision_option_block_top(excerpt_lines, len(excerpt_lines))
-        )
+        #
+        # GH #88 (Codex r2 P2-1): the boundary discovery is STYLE-AWARE. On an
+        # UNNUMBERED form the numbered-only walk finds nothing, so the option
+        # rows + footer would leak into ``body_lines`` and a MOVED ``❯`` would
+        # rotate the identity — the post-Down verify would then fail and Trust
+        # could never commit. ``_decision_option_block_bounds`` is the ONE shared
+        # discovery the footered leg mints from, so mint == validate by
+        # construction; it is strictly additive for every numbered shape.
+        option_top = _decision_option_block_bounds(
+            excerpt_lines,
+            footer_idx if footer_idx is not None else len(excerpt_lines),
+        ).block_top_idx
         # ``parse_generic_decision`` sets ``excerpt_start = prompt_top_idx`` when a
         # title was resolved, so the title occupies excerpt line 0; with no title
         # the excerpt begins at the option block and there is no body to walk.

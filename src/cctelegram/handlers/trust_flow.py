@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
 from dataclasses import dataclass, field, replace
@@ -50,7 +51,10 @@ from ..session import (
 )
 from ..terminal_parser import (
     decision_prompt_fingerprint,
+    decision_warning_block,
     extract_interactive_content,
+    has_live_decision_residue,
+    option_style_of,
     parse_generic_decision,
 )
 from ..tmux_manager import (
@@ -199,8 +203,22 @@ class SliceKind(Enum):
     SHELL = "shell"
     TRUST_FRAME = "trust_frame"
     OTHER_SURFACE = "other_surface"
+    # GH #88 §F — a LIVE decision prompt no recognizer owns. The structural
+    # degradation for "recognition broke on a new CC rendering": HOLD the window
+    # on the trust-ceiling budget with a display-only advisory instead of burning
+    # the registration budget and KILLING it (the pre-GH #65 failure this class
+    # keeps reproducing).
+    UNKNOWN_PROMPT = "unknown_prompt"
     RUNNING = "running"
     INDETERMINATE = "indeterminate"
+
+
+# The card KIND a flow currently has on screen (GH #88 §F, Codex r1 P2-5). BOTH
+# transitions are explicit: ``unknown → trust`` FORCES a fresh licensed mint
+# (never the deadline-refresh-only branch), and ``trust → unknown`` releases the
+# route's tokens before the advisory is drawn.
+CARD_KIND_TRUST: Final[str] = "trust"
+CARD_KIND_UNKNOWN: Final[str] = "unknown"
 
 
 class TrustBindRefused(Exception):
@@ -270,6 +288,10 @@ class TrustFlow:
     # the user's own answer did not take.
     awaiting_registration_at: float | None = None
     trust_seen: bool = False
+    # WHICH card is currently on screen (GH #88 §F): ``None`` (the picker chrome
+    # the flow was installed under), ``CARD_KIND_TRUST`` (🔐) or
+    # ``CARD_KIND_UNKNOWN`` (the unrecognized-prompt advisory).
+    card_kind: str | None = None
     terminal_committed: bool = False
     # THE CARD IS FINALIZED (review r10 P2-A). Set by an arm that has posted the
     # LAST, most ACTIONABLE copy the user should see — today that is the
@@ -696,6 +718,13 @@ def classify_slice(
     4. A blank / missing capture under a live claude ⇒ INDETERMINATE (addendum
        item 3: the post-Enter transitional frame is all-blank on 2.1.241),
        NEVER a failure.
+    5. GH #88 §F — AFTER the trust-family test and AFTER the named-surface test,
+       a LIVE decision prompt no recognizer owns ⇒ UNKNOWN_PROMPT: the lane HOLDS
+       the window (trust ceiling, advisory card, zero keystrokes) instead of
+       burning the registration budget and killing it. The predicate is the
+       LIVE-ONLY ``has_live_decision_residue`` — never the broad
+       scrollback-anywhere ``has_decision_residue``, so a stale footer above a
+       live input box still classifies RUNNING.
     """
     if registered:
         return SliceKind.REGISTERED
@@ -710,6 +739,8 @@ def classify_slice(
         return SliceKind.TRUST_FRAME
     if extract_interactive_content(pane_text) is not None:
         return SliceKind.OTHER_SURFACE
+    if has_live_decision_residue(pane_text):
+        return SliceKind.UNKNOWN_PROMPT
     return SliceKind.RUNNING
 
 
@@ -977,17 +1008,84 @@ async def edit_card_public(flow: TrustFlow, bot: Any, text: str) -> None:
     await _edit_card(flow, bot, text, None)
 
 
+# ── GH #88 §D — UNTRUSTED pane copy on a card ────────────────────────────────
+#
+# Two card surfaces now quote raw terminal text: the ``⚠`` pre-approval block on
+# the 🔐 card, and the pane tail on the UNKNOWN_PROMPT advisory. ``_edit_card``
+# renders through ``convert_markdown`` + ``parse_mode="MarkdownV2"``, so RAW pane
+# text must NEVER be interpolated into the markdown source. Everything here goes
+# through ONE dedicated sanitizer and is emitted inside a fence — and because
+# every backtick has been neutralised, that fence cannot be closed early.
+PANE_COPY_CAP: Final[int] = 700
+
+
+def sanitize_pane_copy(text: str, *, cap: int = PANE_COPY_CAP) -> str:
+    """Neutralise UNTRUSTED pane text for fenced rendering on a card.
+
+    Drops control characters (newlines KEPT — the quoted blocks are inherently
+    multi-row and collapsing them to one line makes the copy unreadable), turns
+    every backtick into ``'`` so a fence can never be closed early, collapses
+    runs of horizontal whitespace and blank-line runs, and caps the result at
+    ``cap`` characters with an ellipsis. COPY ONLY: nothing derived from this
+    ever reaches licensing, family identification, navigation or a fingerprint.
+    """
+    cleaned = "".join(
+        ch if ch == "\n" else " " if ch == "\t" else ch
+        for ch in text
+        if ch == "\n" or (ch >= " " and ch != "\x7f" and not ("\x80" <= ch <= "\x9f"))
+    )
+    cleaned = cleaned.replace("`", "'")
+    rows = [re.sub(r"[^\S\n]+", " ", row).strip() for row in cleaned.split("\n")]
+    out: list[str] = []
+    for row in rows:
+        if not row and (not out or not out[-1]):
+            continue
+        out.append(row)
+    result = "\n".join(out).strip()
+    if len(result) > cap:
+        result = result[: cap - 1].rstrip() + "…"
+    return result
+
+
+def trust_warning_block(pane_text: str | None) -> str | None:
+    """The SANITIZED ``⚠`` pre-approval block for the 🔐 card, or ``None``.
+
+    Pure. Sourced from the SAME strict form the mint reads, gated on the
+    folder-trust family so an unrelated Decision's prose can never reach the
+    trust card. Display copy only (GH #88 §D)."""
+    if not pane_text:
+        return None
+    form = parse_generic_decision(pane_text)
+    if form is None or decision_token.identify_family(form) != TRUST_FAMILY:
+        return None
+    raw = decision_warning_block(form)
+    if not raw:
+        return None
+    return sanitize_pane_copy(raw) or None
+
+
 def build_trust_card(
-    flow: TrustFlow, *, trust_token: str | None
+    flow: TrustFlow, *, trust_token: str | None, warning_block: str | None = None
 ) -> tuple[str, InlineKeyboardMarkup]:
     """The 🔐 trust card body + keyboard.
 
     ``trust_token`` present ⇒ the LICENSED shape with a one-tap
     [✅ Trust this folder]; ``None`` ⇒ display-only (flag off, explicit operator
-    kill switch, probe ``None``, or an un-characterized CC version) with an
-    advisory to answer in tmux. [❌ Cancel] is present in BOTH shapes and never
-    types a keystroke.
+    kill switch, probe ``None``, or an un-characterized CC version / rendering)
+    with an advisory to answer in tmux. [❌ Cancel] is present in BOTH shapes and
+    never types a keystroke.
+
+    ``warning_block`` (GH #88 §D) is the ``⚠`` pre-approval block CC ≥2.1.258
+    renders for a cwd whose ``.claude/settings.json`` carries a
+    ``permissions.allow`` list. One tap grants exactly those permissions, so the
+    card must not hide it. Rendered as a fence, never as markdown source.
+
+    SANITIZATION IS ENFORCED AT THIS SINK (Codex r1 P3-4), not at the caller:
+    whatever arrives runs through ``sanitize_pane_copy`` here, so a future caller
+    cannot bypass it by forgetting. The sanitizer is IDEMPOTENT, so passing
+    already-sanitized copy is a no-op.
     """
+    warning_block = sanitize_pane_copy(warning_block) if warning_block else None
     ceiling_min = max(1, int(config.trust_prompt_ceiling_s // 60))
     lines = [
         "🔐 *Claude is asking you to trust this folder*",
@@ -996,6 +1094,13 @@ def build_trust_card(
         "",
         "Claude Code will be able to read, edit, and execute files here.",
     ]
+    if warning_block:
+        lines.append("")
+        lines.append(f"```\n{warning_block}\n```")
+        lines.append(
+            "Shown as the terminal prints it (the list may be elided — open the "
+            "tmux window for the full list)."
+        )
     buttons: list[list[InlineKeyboardButton]] = []
     if trust_token is not None:
         lines.append("")
@@ -1108,7 +1213,9 @@ async def refresh_card_if_live(flow: TrustFlow, bot: Any, tmux_mgr: Any) -> bool
             None,
         )
         return False
-    text, keyboard = build_trust_card(flow, trust_token=token)
+    text, keyboard = build_trust_card(
+        flow, trust_token=token, warning_block=trust_warning_block(pane)
+    )
     await _edit_card(flow, bot, text, keyboard)
     return True
 
@@ -1122,25 +1229,32 @@ def _mint_trust_token_locked(flow: TrustFlow, pane_text: str | None) -> str | No
     """
     token: str | None = None
     form = parse_generic_decision(pane_text) if pane_text else None
+    option_style = option_style_of(form) if form is not None else None
     if (
         form is not None
         and decision_token.trust_card_dispatch_enabled()
         and flow.cli_version
         and decision_token.identify_family(form) == TRUST_FAMILY
-        and decision_token.lookup(TRUST_FAMILY, flow.cli_version)
+        and decision_token.lookup(TRUST_FAMILY, flow.cli_version, option_style)
         and sum(1 for o in form.options if o.cursor) == 1
         and not any(o.selected is not None for o in form.options)
         and form.options_contiguous_from_one()
         and form.select_mode == "single"
     ):
-        target = next(
-            (
-                o
-                for o in form.options
-                if o.number == 1 and o.label and o.label.lower().startswith("yes")
-            ),
-            None,
-        )
+        # GH #88 §C — the Trust target is chosen by LABEL, never by position. CC
+        # 2.1.258 INVERTED the option order (Trust is row 2 there, row 1 on
+        # 2.1.246), and the DEFAULT cursor now sits on the DESTRUCTIVE row, so a
+        # positional predicate would either mint nothing or — far worse — aim at
+        # ``No, exit``. EXACTLY ONE option must carry the family's affirmative
+        # label; zero or more than one ⇒ no token (display-only card).
+        affirmative = [
+            o
+            for o in form.options
+            if o.label
+            and o.label.strip() == decision_token.TRUST_AFFIRMATIVE_LABEL
+            and o.number is not None
+        ]
+        target = affirmative[0] if len(affirmative) == 1 else None
         if target is not None and target.number is not None:
             fingerprint = decision_prompt_fingerprint(form)
             tokens = decision_token.mint_row(
@@ -1153,6 +1267,7 @@ def _mint_trust_token_locked(flow: TrustFlow, pane_text: str | None) -> str | No
                         option_number=target.number, option_label=target.label
                     )
                 ],
+                option_style=option_style,
             )
             token = tokens[0]
             flow.fingerprint = fingerprint
@@ -1190,7 +1305,79 @@ async def render_trust_card(flow: TrustFlow, bot: Any, pane_text: str | None) ->
         if flow.phase != PHASE_AWAITING_TRUST:
             return
         token = _mint_trust_token_locked(flow, pane_text)
-    text, keyboard = build_trust_card(flow, trust_token=token)
+        # GH #88 §F(i): the card KIND is recorded so a later degrade→recover can
+        # force a fresh licensed mint instead of the deadline-refresh-only branch.
+        flow.card_kind = CARD_KIND_TRUST
+    text, keyboard = build_trust_card(
+        flow, trust_token=token, warning_block=trust_warning_block(pane_text)
+    )
+    await _edit_card(flow, bot, text, keyboard)
+
+
+def build_unknown_prompt_card(
+    flow: TrustFlow, *, pane_tail_text: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    """The GH #88 §F advisory card for an UNRECOGNIZED confirmation prompt.
+
+    Display-ONLY by construction: no token is ever minted for it, so there is no
+    ✅ button and no keystroke can originate from it. [❌ Cancel] is the same
+    zero-keystroke window kill the 🔐 card carries.
+
+    The pane tail is UNTRUSTED terminal text. Like ``build_trust_card``'s ``⚠``
+    block it is sanitized AT THIS SINK (Codex r1 P3-4) — idempotent, so an
+    already-sanitized tail is unchanged — and emitted inside a fence.
+    """
+    pane_tail_text = sanitize_pane_copy(pane_tail_text) if pane_tail_text else ""
+    ceiling_min = max(1, int(config.trust_prompt_ceiling_s // 60))
+    lines = [
+        "⚠️ *Claude is showing a confirmation prompt I can't read*",
+        "",
+        f"`{flow.selected_path}`",
+        "",
+        "This CLI version renders it in a shape I don't recognise, so I won't "
+        "touch it. Answer it in the tmux window — I'll bind this topic as soon "
+        f"as it registers. I'll keep the window open for up to ~{ceiling_min} min.",
+    ]
+    if pane_tail_text:
+        lines.append("")
+        lines.append(f"```\n{pane_tail_text}\n```")
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "❌ Cancel — close the window",
+                callback_data=checked_callback_data(
+                    f"{CB_TRUST_PICK}c:{flow.generation}"
+                ),
+            )
+        ]
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def render_unknown_prompt_card(
+    flow: TrustFlow, bot: Any, pane_text: str | None
+) -> None:
+    """Publish the GH #88 §F UNKNOWN_PROMPT advisory (never mints a token).
+
+    §F(ii) — the ``trust → unknown`` DEGRADE: a recognized frame that degrades
+    mid-redraw must not leave a stale ✅ authorization outliving the card that
+    showed it. The token row is released and the flow's retained row identifiers
+    are cleared UNDER THE CREATION LOCK, before the advisory is rendered, so a
+    tap racing the degrade finds no live row.
+    """
+    async with creation_lock(flow.user_id, flow.thread_id):
+        if _flows.get((flow.user_id, flow.thread_id)) is not flow:
+            return
+        if flow.phase != PHASE_AWAITING_TRUST:
+            return
+        _release_tokens(flow)
+        flow.token = None
+        flow.fingerprint = None
+        flow.ledger_key = None
+        flow.card_kind = CARD_KIND_UNKNOWN
+    text, keyboard = build_unknown_prompt_card(
+        flow, pane_tail_text=sanitize_pane_copy(pane_tail(pane_text))
+    )
     await _edit_card(flow, bot, text, keyboard)
 
 
@@ -2327,9 +2514,28 @@ async def _wait_loop(
                     ),
                 )
                 return
-            if not flow.trust_seen:
+            if not flow.trust_seen or (
+                flow.card_kind == CARD_KIND_UNKNOWN
+                and flow.phase == PHASE_AWAITING_TRUST
+            ):
+                # GH #88 §F(i) — the ``unknown → trust`` transition. A partial
+                # (footer-only) frame that raised the advisory, followed by the
+                # COMPLETE frame, must end with the ✅ button: force a fresh
+                # licensed render/mint rather than the deadline-refresh branch,
+                # which would leave the advisory standing for the prompt's life.
+                #
+                # The ceiling is ARMED ONCE and never re-based here (Codex r1
+                # P2-1): a pane flapping unknown↔trust would otherwise push
+                # ``trust_deadline`` out on every redraw until it passed the
+                # FIXED global observation deadline, converting the trust
+                # ceiling's guarded cleanup into a global SPARE — a window kept
+                # alive forever with a dead card. The budget starts when the
+                # prompt is FIRST seen, whichever card it produced.
                 flow.trust_seen = True
-                flow.trust_deadline = time.monotonic() + config.trust_prompt_ceiling_s
+                if flow.trust_deadline is None:
+                    flow.trust_deadline = (
+                        time.monotonic() + config.trust_prompt_ceiling_s
+                    )
                 await render_trust_card(flow, bot, pane_text)
             elif (
                 flow.phase == PHASE_AWAITING_REGISTRATION
@@ -2362,6 +2568,25 @@ async def _wait_loop(
                     flow.created_wid,
                     min_remaining_s=TOKEN_REFRESH_MIN_REMAINING_S,
                 )
+        elif kind is SliceKind.UNKNOWN_PROMPT:
+            # GH #88 §F — HOLD, don't kill. Treated exactly like an UNLICENSED
+            # trust frame: ``trust_seen`` + the TRUST-CEILING budget (never the
+            # registration budget), the ``awaiting_trust`` phase, and a
+            # display-only advisory whose only button is the zero-keystroke
+            # Cancel. NO token is ever minted here.
+            # Deliberately NOT gated on ``lane_enabled()``: that kill switch
+            # disables the one-tap TRUST CARD, and this advisory mints nothing
+            # and types nothing. Holding is the whole point of §F.
+            if flow.phase == PHASE_AWAITING_TRUST:
+                flow.trust_seen = True
+                if flow.trust_deadline is None:
+                    flow.trust_deadline = (
+                        time.monotonic() + config.trust_prompt_ceiling_s
+                    )
+                if flow.card_kind != CARD_KIND_UNKNOWN:
+                    # First sighting, or the §F(ii) ``trust → unknown`` DEGRADE
+                    # (which releases the stale ✅ authorization under the lock).
+                    await render_unknown_prompt_card(flow, bot, pane_text)
         elif (
             kind in (SliceKind.RUNNING, SliceKind.OTHER_SURFACE)
             and flow.trust_seen
@@ -2411,14 +2636,24 @@ async def _wait_loop(
         if flow.trust_deadline is not None and now >= flow.trust_deadline:
             if not await claim_terminal(flow):
                 continue
+            # GH #88: the SAME ceiling now also bounds the UNKNOWN_PROMPT hold,
+            # where nothing ever said "trust this folder" — the copy branches on
+            # WHICH card the user is looking at. Kill policy is unchanged.
             await _terminal_cleanup(
                 flow,
                 bot,
                 tmux_mgr,
                 reason="trust prompt ceiling",
                 body=(
-                    "⏰ Timed out waiting for you to trust the folder.\n\n"
-                    "Send your message again when you're ready."
+                    (
+                        "⏰ Timed out waiting for you to answer the prompt in the "
+                        "tmux window.\n\nSend your message again when you're ready."
+                    )
+                    if flow.card_kind == CARD_KIND_UNKNOWN
+                    else (
+                        "⏰ Timed out waiting for you to trust the folder.\n\n"
+                        "Send your message again when you're ready."
+                    )
                 ),
                 session_mgr=session_mgr,
             )

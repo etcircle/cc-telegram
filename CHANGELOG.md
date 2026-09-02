@@ -4,6 +4,41 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.19] — 2026-09-02
+
+### Fixed
+- **Creating a topic for an untrusted folder failed with "Claude session didn't register in
+  time" (GH #88).** On Claude Code 2.1.258 the new window opens on the folder-trust question as
+  before, but the bridge no longer recognised it: the window was cleaned up and the topic never
+  bound — the exact failure the trust card was built to end. 2.1.258 redesigned the prompt rather
+  than drifting it. The options lost their `1.` / `2.` numbering, their order flipped, and the
+  cursor now starts on **"No, exit"** — the destructive answer.
+
+  All three are handled. The unnumbered options are read (fail-closed: two or more adjacent rows
+  sharing one label column, exactly one cursor, no numbered row in the run), the folder-trust
+  question is identified regardless of which option comes first, and the ✅ button now aims at the
+  **"Yes, I trust this folder"** row by name instead of by position. Because the cursor now
+  starts on the destructive answer, the existing rule that Enter is only ever sent after the
+  bridge has verified where the cursor landed matters more than it ever has: a failed check sends
+  no Enter at all, and the card re-renders.
+
+  One-tap trust is licensed per Claude Code version **and per rendering**, so 2.1.258's new shape
+  is authorised while the old numbered shape on that version — or the new shape on an older one —
+  falls back to "answer it in the tmux window". Digits are still never sent (2.1.258 made them
+  inert; the rule is unchanged).
+
+### Added
+- **The 🔐 trust card shows the pre-approved-permissions warning (GH #88).** When the folder's
+  `.claude/settings.json` carries a `permissions.allow` list, Claude Code prints a `⚠ This folder
+  pre-approves N tool permissions` block. One tap grants exactly those, so the card now quotes
+  that block verbatim (with a note that the terminal elides long lists) instead of hiding it.
+- **An unreadable confirmation prompt now holds the window instead of killing it (GH #88).**
+  If a future Claude Code renders a confirmation the bridge cannot read, the topic gets a card
+  saying so, with the pane's last lines and a Cancel button, and the window is kept for the
+  usual trust window — long enough to answer it in tmux and have the topic bind itself. Nothing
+  is typed into the pane and no button offers to answer it. If the prompt then turns out to be
+  the folder-trust question after all, the card upgrades to the real 🔐 card.
+
 ## [0.4.18] — 2026-09-01
 
 ### Fixed

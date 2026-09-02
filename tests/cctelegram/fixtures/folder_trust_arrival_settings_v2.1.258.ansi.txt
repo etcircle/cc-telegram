@@ -1,0 +1,50 @@
+
+[38;5;220m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;220mAccessing[0m [1m[38;5;220mworkspace:[0m
+
+ [1m/private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-telegram/09fc2c07-a1c8-4863-992b-b158baaf28d6/scratchpad/gh88/withsettings[0m
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ [1m[38;5;220m⚠[0m [1m[38;5;220mThis[0m [1m[38;5;220mfolder[0m [1m[38;5;220mpre-approves[0m [1m[38;5;220m18[0m [1m[38;5;220mtool[0m [1m[38;5;220mpermissions[0m [1m[38;5;220min[0m [1m[38;5;220m.claude/settings.json:[0m
+   Write, mcp__context7__resolve-library-id, mcp__context7__query-docs, Edit, Bash(databricks --profile free current-user me), Bash(databricks --profile free *
+ list*), Bash(databricks --profile free * get*), Bash(databricks bundle validate*), and 10 more
+ [38;5;246mThese[39m [38;5;246mwill[39m [38;5;246mapply[39m [38;5;246mwithout[39m [38;5;246masking.[39m [38;5;246mOnly[39m [38;5;246mproceed[39m [38;5;246mif[39m [38;5;246myou[39m [38;5;246mtrust[39m [38;5;246mthis[39m [38;5;246mconfiguration.[39m
+
+ [38;5;246m]8;id=zaxmda;https://code.claude.com/docs/en/security\Security guide[39m]8;;\
+
+ [38;5;153m❯[39m [38;5;153mNo,[39m [38;5;153mexit[39m
+   Yes, I trust this folder
+
+ [38;5;246mEnter[39m [38;5;246mto[39m [38;5;246mconfirm[39m [38;5;246m·[39m [38;5;246mEsc[39m [38;5;246mto[39m [38;5;246mcancel[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

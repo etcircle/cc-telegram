@@ -676,7 +676,8 @@ async def test_a_proven_false_enter_is_not_stamped_but_a_raise_is() -> None:
             option_number=1,
             option_label="Yes, I trust this folder",
             ledger_key=None,
-            license_check=lambda family, cmd: True,
+            minted_option_style="numbered",
+            license_check=lambda family, cmd, style: True,
             on_commit_sent=lambda: calls.append("sent"),
         )
         if raise_on_enter:

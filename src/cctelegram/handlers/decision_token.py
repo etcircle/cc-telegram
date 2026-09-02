@@ -20,9 +20,12 @@ nothing else (all render/callback/dispatch policy lives in Stage B2.3):
      ``dispatched`` by B2.3). A bot RESTART wipes the registry, so a
      generation-suffixed raw-nav callback fails closed (``current_nav_
      generation`` returns ``None`` until a fresh render re-mints).
-  3. The §2b known-good ``(family × CC-version)`` dispatch table + family
-     identification — the mint/tap license gate. A MODULE CONSTANT, never
-     env-configurable (O-5).
+  3. The §2b known-good ``(family × CC-version × option_style)`` dispatch table
+     + family identification — the mint/tap license gate. A MODULE CONSTANT,
+     never env-configurable (O-5). GH #88 added the STYLE dimension: CC 2.1.258
+     REDESIGNED the folder-trust prompt (unnumbered, inverted, default cursor on
+     the destructive row) on a version a plain version license would otherwise
+     have authorized blind.
 
 KILL CRITERIA (plan §2 — any ONE forces UNIFICATION with ``pick_token``, this
 lane loses its independent existence): (1) a durable / on-disk intent store;
@@ -74,6 +77,12 @@ class DecisionTokenEntry:
     option_label: str
     expires_at: float  # monotonic deadline
     row_generation: int
+    # GH #88 — the OPTION-STYLE the card was minted from ("numbered" /
+    # "unnumbered"). The dispatch re-reads the LIVE form's style and refuses on a
+    # mismatch: the body-inclusive fingerprint folds ``number:label`` pairs,
+    # which a numbered and an unnumbered rendering of the SAME prompt can share
+    # byte-for-byte, so the style is the explicit belt that keeps mint == validate.
+    option_style: str | None = None
 
 
 @dataclass
@@ -213,6 +222,7 @@ def mint_row(
     window_id: str,
     fingerprint: str,
     specs: Iterable[DecisionMintSpec],
+    option_style: str | None = None,
 ) -> list[str]:
     """Mint the sibling-token row for one rendered Decision card.
 
@@ -245,6 +255,7 @@ def mint_row(
                 option_label=spec.option_label,
                 expires_at=deadline,
                 row_generation=generation,
+                option_style=option_style,
             )
         )
         for spec in specs
@@ -388,8 +399,9 @@ def invalidate_on_dispatch(window_id: str) -> None:
 
 # ── §2b known-good (family × CC-version) dispatch table ──────────────────────
 #
-# Family identification: a Decision form matches a family IFF (a) its EXACT
-# ordered option-label tuple equals the family's signature AND (b) its
+# Family identification: a Decision form matches a family IFF (a) its option-label
+# SET equals the family's signature and the option COUNT matches (GH #88 — CC
+# 2.1.258 INVERTED the order) AND (b) its
 # normalized title matches the family's anchored pattern (both from the strict
 # ``parse_generic_decision`` form). Look-alikes are unknown families →
 # display-only. The characterization basis is the wave-1 rig re-run on live CC
@@ -400,21 +412,36 @@ def invalidate_on_dispatch(window_id: str) -> None:
 # is version-stable, so the signature holds across 2.1.20x — 2.1.206 and
 # 2.1.207 are licensed in ``_DECISION_DISPATCH_TABLE`` below, the B2.4 canary
 # precondition; the 2.1.207 rig re-run re-confirmed E2/E3).
-_FamilySignature = tuple[tuple[str, ...], "re.Pattern[str]"]
+#
+# GH #88 — the label element is a FROZENSET, not an ordered tuple. CC 2.1.258
+# INVERTED the folder-trust option order (``No, exit`` first), so an ordered
+# signature could not match the same family across versions. Membership is
+# compared as a SET **and** the option COUNT must match, so a duplicate label can
+# never smuggle a third row past the signature. DISCLOSED: this drops the order
+# bit. There is exactly ONE family today; if a second is added, re-introduce
+# order as a per-family option rather than globally.
+_FamilySignature = tuple[frozenset[str], "re.Pattern[str]"]
+
+# The folder-trust AFFIRMATIVE label — the ONE source shared by the family
+# signature and GH #88 §C's label-based Trust target selection at mint (the
+# pre-#88 "Trust is option 1" assumption is dead: on 2.1.258 it is option 2).
+TRUST_AFFIRMATIVE_LABEL: Final[str] = "Yes, I trust this folder"
 
 _FAMILY_SIGNATURES: Final[dict[str, _FamilySignature]] = {
     "folder-trust": (
-        ("Yes, I trust this folder", "No, exit"),
+        frozenset({TRUST_AFFIRMATIVE_LABEL, "No, exit"}),
         re.compile(r"^Accessing workspace:"),
     ),
 }
 
-# family → the frozen set of CC-version strings whose keystroke behavior was
-# characterized (arrows move / Enter commits) — a MODULE CONSTANT, NEVER
-# env-configurable (O-5). Extended only by a commit citing the family's rig
-# characterization. Membership is EXACT-STRING (a CC upgrade empties the
-# effective allowlist → buttons revert to display-only until re-characterized).
-_DECISION_DISPATCH_TABLE: Final[dict[str, frozenset[str]]] = {
+# family → the frozen set of ``(CC-version, option_style)`` PAIRS whose keystroke
+# behavior was characterized (arrows move / Enter commits) — a MODULE CONSTANT,
+# NEVER env-configurable (O-5). Extended only by a commit citing the family's rig
+# characterization. Membership is EXACT-TUPLE (a CC upgrade — OR a rendering
+# change on a licensed version — empties the effective allowlist → buttons revert
+# to display-only until re-characterized). GH #88 added the STYLE dimension: a
+# version license alone would authorize an un-characterized rendering.
+_DECISION_DISPATCH_TABLE: Final[dict[str, frozenset[tuple[str, str]]]] = {
     # 2.1.206 licensed from the real rig fixture
     # ``folder_trust_arrival_plain_v2.1.206.txt`` (title "Accessing workspace:",
     # options ["Yes, I trust this folder", "No, exit"], footer
@@ -450,8 +477,31 @@ _DECISION_DISPATCH_TABLE: Final[dict[str, frozenset[str]]] = {
     # cursored option, a bare digit commits instantly so digits stay forbidden,
     # Escape kills the process, and the post-commit pane RETAINS the prompt text
     # so liveness keys on the pane COMMAND).
+    # 2.1.258 licensed from the GH #88 rig
+    # (``decision_trust_folder_v2.1.258_keystrokes.md``, fixtures
+    # ``folder_trust_*_v2.1.258.txt`` + the two ``.ansi.txt`` arrival twins). The
+    # prompt was REDESIGNED, not drifted: the options are UNNUMBERED, the order
+    # is INVERTED, and the DEFAULT CURSOR now sits on the DESTRUCTIVE row
+    # (``❯ No, exit``) — hence the ``"unnumbered"`` style, and hence the
+    # navigate→verify→Enter discipline is a HIGHER-CONSEQUENCE invariant here: a
+    # failed verify is ``not_advanced`` and NO Enter is ever sent, because an
+    # Enter on the un-navigated default EXITS Claude. The keystroke MODEL is
+    # otherwise unchanged and dispatchable: arrows MOVE without committing and
+    # WRAP (never clamp), Enter COMMITS the cursored option with NO blank
+    # transitional frame (the REPL is painted at T+1 s), Escape kills the process
+    # with the prompt text RETAINED (so liveness keys on the pane COMMAND, never
+    # pane text). Bare digits ``1``/``2`` measured COMPLETELY INERT on this
+    # version — RECORDED, NOT RELIED ON: digits stay forbidden on every lane.
     "folder-trust": frozenset(
-        {"2.1.204", "2.1.206", "2.1.207", "2.1.239", "2.1.241", "2.1.246"}
+        {
+            ("2.1.204", "numbered"),
+            ("2.1.206", "numbered"),
+            ("2.1.207", "numbered"),
+            ("2.1.239", "numbered"),
+            ("2.1.241", "numbered"),
+            ("2.1.246", "numbered"),
+            ("2.1.258", "unnumbered"),
+        }
     ),
 }
 
@@ -469,26 +519,41 @@ def identify_family(form: AskUserQuestionForm) -> str | None:
 
     Match IFF the form is a proven-FOOTERED Decision variant (GH #52 — belt and
     braces at the leaf: a footerless / variant-less form never mints ``dcp:``
-    rows regardless of family) AND the EXACT ordered option-label tuple equals the
-    family signature AND the normalized (stripped) title matches the family's
-    anchored pattern. A title-less form (``current_question_title is None``) never
-    matches a title-anchored family.
+    rows regardless of family) AND the option-label SET equals the family
+    signature with a MATCHING option COUNT (GH #88 — order-agnostic, so the same
+    signature identifies the 2.1.246 and the 2.1.258 orders; the count check
+    stops a duplicate label smuggling an extra row in) AND the normalized
+    (stripped) title matches the family's anchored pattern. A title-less form
+    (``current_question_title is None``) never matches a title-anchored family.
     """
     if form._meta.get("decision_variant") != _DECISION_VARIANT_FOOTERED:
         return None
-    labels = tuple(o.label for o in form.options)
+    labels = frozenset(o.label for o in form.options)
     title = (form.current_question_title or "").strip()
     for family, (sig_labels, title_re) in _FAMILY_SIGNATURES.items():
-        if labels == sig_labels and title and title_re.search(title):
+        if (
+            labels == sig_labels
+            and len(form.options) == len(sig_labels)
+            and title
+            and title_re.search(title)
+        ):
             return family
     return None
 
 
-def lookup(family: str, version: str) -> bool:
-    """True iff ``version`` is a known-good (characterized) CC version for
-    ``family`` — EXACT-STRING membership; an unknown family / unknown version →
-    False (unlicensed → display-only)."""
-    return version in _DECISION_DISPATCH_TABLE.get(family, frozenset())
+def lookup(family: str, version: str, option_style: str | None) -> bool:
+    """True iff ``(version, option_style)`` is a characterized rendering of
+    ``family`` — EXACT-TUPLE membership (GH #88).
+
+    A family × version license ALONE would let 2.1.258 authorize an
+    un-characterized NUMBERED rendering, and let 2.1.204…2.1.246 authorize the
+    NEW unnumbered one — in both cases arrow-keying a shape whose keystroke
+    behavior was never measured. An unknown family, an unknown version, an
+    unmeasured (version, style) pair, or ``option_style is None`` all → False
+    (unlicensed → display-only)."""
+    if option_style is None:
+        return False
+    return (version, option_style) in _DECISION_DISPATCH_TABLE.get(family, frozenset())
 
 
 def set_decision_dispatch_enabled(enabled: bool) -> None:

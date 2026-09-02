@@ -1,0 +1,50 @@
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/claude-501/-Users-felixcardix-dev-workspaces-cc-telegram/09fc2c07-a1c8-4863-992b-b158baaf28d6/scratchpad/gh88/withsettings
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ ⚠ This folder pre-approves 18 tool permissions in .claude/settings.json:
+   Write, mcp__context7__resolve-library-id, mcp__context7__query-docs, Edit, Bash(databricks --profile free current-user me), Bash(databricks --profile free *
+ list*), Bash(databricks --profile free * get*), Bash(databricks bundle validate*), and 10 more
+ These will apply without asking. Only proceed if you trust this configuration.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
