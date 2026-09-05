@@ -1,0 +1,51 @@
+
+    xxxxxxxxxxx xxx xxx [1mxxxxxxxxxx xxxxxxxxx xxxxx xxxxxx xxxx xxxx[0m x x xxxxxx xxxxxxxx xxxxx xxxx xx xxxxxx xxxxxxxxx xxxxx xxx xxx xxxx xxxxx xxxx xxxxxxxxxx
+    x xxxxxxx xxxxxxxx xxxxxxx xxxxxx xxx xxxxxxxx xxxxx xxxxxxx xxx xxxxxxxx
+  x [1mxxx xxxx xxxxxxxxxx[0mx xxx xxxx xxxxxxx xxx xxx xxxxxx x [38;5;153mxxxxxxxxx[39mx xxx xxx xxxxxxxx xxxx x xxxxxxxxx xxx xxxx xxxxxxxxxxxx xxxxx xxx xxx xxxxxxx xxx xxxx xx
+    xxx xxxxxxxxx xxxxxxxxxxxxxxx xxxxxx xxx xx xxxxxxx xx xx xxxxxx xxxxxx
+
+  [1mxxxx xxxx xxxxxxxxxx xxxxxxx[0m
+  xx [1mxxx xxxxxxxxx xxxxxxxx[0m xxxxxxxxxxxxxxxx xxxxx x xxxxxxxxxx xxxxxxxx xx xxxxxxxx xx xxx [38;5;153mxxxxxx[39m xxxxx x xxxxx xxxxxx xxxx xxxx xxxxxxxx xxx
+  xx [1mxxxx x[0m xxxxxx xxxxxxxxx xxxxxxxxxx xxxxxxx
+
+  [1mxxxx xx xxxx x x xxxxx xxx xxx xxxxxxxxxx xxxxx x xxxxxxxxx x xxxxxxx x xxxxxxx xxxx[0m xxxx xxxxxxx xxxxxxxx xxxxxx xxxxxxxx xxxxxx xxxxxx x xxxxxxxx xxxxx xxxx
+  xxxxx xxx xxxx xx x xxxxxx xxxx x xx xxx xxx xxxxx xxx xxxx xxxxxxxx x xxx xxxx xx xxxxxx xxx xxxxxx xxx xxxxx xxxxxxxxxxxx xxxxxxxxxx xxx xxxxxxxx xxx xx
+  xxxxxxxx xxxxxxxxxx xx xxxxxxxxxxxxx xxxxx x xxxxxxxxxxxxxxx xxxxxx xxxxxxxxx xx xxx xxx xxxxxxxxx xxxxxxxxxxxx
+
+  xxxxxxx xx xxxxxxx xxxx xxxxx xx xxxxx xxxx x xx xxxx xxxxx
+
+[38;5;239m[48;5;237m❯[39m [38;5;231mxxxxxxxx[39m
+[38;5;246m[49m  ⎿  [2m[39mxxxxxxxxx xxxxxxx xx xxx xxxx xxxxxxxx[0m
+     [2mxxxxxxxxxx xxxxx xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx xxxxxxxx xxxxxxxxx xxxxxxxxxxxx[0m
+[38;5;246m  ⎿  xxxx [1mxxxxxxxxxxxxxxxxxxxxxxxx[0m[38;5;246m xxx xxxxxx[39m
+[38;5;246m  ⎿  xxxx [1mxxxxxxxxx[0m[38;5;246m xxx xxxxxx[39m
+[38;5;246m  ⎿  xxxx [1mxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+[0m     [1m[38;5;246mxxxxxxxxxx[0m[38;5;246m xxx xxxxxx[39m
+[38;5;246m  ⎿  xxxx [1mxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[0m[38;5;246m xxx xxxxxx[39m
+[38;5;246m  ⎿  xxxxxxxxxx xxxx [1mxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[0m
+[38;5;246m  ⎿  xxxxxx xxxxxxxx xxxxxxxx[39m
+                                                                                                                        [38;5;114mx xxxxxx xxxxxxxxx x xxxxxxx xx xxxxxx[39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ xxxxxxxx xxxxx xxxxxxx xxxxxx xxxxxxxx xx xxxxxxx xxxxxx xxxxxxxx xxxxxxxxx xxxx xxxxxxxx
+
+  xxxx xxxxxxxx
+  x xxxxxx xxxxxx x x xxxxxxxxx xxxxxxxxxxxxxxxxxxxx xxxxx xxxxxx xxxxxx xx xxxxx xxxxxxxxx xxx xxxxxxxx xxxxxxxxxx xxxxxxxxxxxx x x xxxxxx xxxxxxxx xx xxxx
+  xxxxxxx xxx xxxx xxx
+  x xxx xxxxxx xxxxxxxxx xxxx x xxxxxx xxx xxxx xx xx xxxxxxxx xxxxxx xxx xxxxxx x x xxxxxxx xxxxxxx xxxx xxxxxxxxx xxxxxxxx xxxxxxxxxxx xxx xxxx xxxxxxxx
+  xxxx xxxxxxxxxxx xxx xxx xxxxxxxxxx xxxxxxxxx xxxxx xxxxxx xxxx xxxx x x xxxxxx xxxxxxxx xxxxx xxxx xx xxxxxx xxxxxxxxx xxxxx xxx xxx xxxx xxxxx xxxx
+  xxxxxxxxxx x xxxxxxx xxxxxxxx xxxxxxx xxxxxx xxx xxxxxxxx xxxxx xxxxxxx xxx xxxxxxxx
+  x xxx xxxx xxxxxxxxxxx xxx xxxx xxxxxxx xxx xxx xxxxxx x xxxxxxxxxx xxx xxx xxxxxxxx xxxx x xxxxxxxxx xxx xxxx xxxxxxxxxxxx xxxxx xxx xxx xxxxxxx xxx xxxx
+  xx xxx xxxxxxxxx xxxxxxxxxxxxxxx xxxxxx xxx xx xxxxxxx xx xx xxxxxx xxxxxx
+
+  xxxx xxxx xxxxxxxxxx xxxxxxx
+  xx xxx xxxxxxxxx xxxxxxxx xxxxxxxxxxxxxxxx xxxxx x xxxxxxxxxx xxxxxxxx xx xxxxxxxx xx xxx xxxxxx xxxxx x xxxxx xxxxxx xxxx xxxx xxxxxxxx xxx
+  xx xxxx x xxxxxx xxxxxxxxx xxxxxxxxxx xxxxxxx
+
+  xxxx xx xxxx x x xxxxx xxx xxx xxxxxxxxxx xxxxx x xxxxxxxxx x xxxxxxx x xxxxxxx xxxx xxxx xxxxxxx xxxxxxxx xxxxxx xxxxxxxx xxxxxx xxxxxx x xxxxxxxx xxxxx
+  xxxx xxxxx xxx xxxx xx x xxxxxx xxxx x xx xxx xxx xxxxx xxx xxxx xxxxxxxx x xxx xxxx xx xxxxxxx xxxxxxxxxxx
+  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  xxxxx xxxxxxxx
+  xxxxxxxx xxxx xxxx x
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;231m⚠ /limit-reset to reset your session limit now · uses weekly limit · 1/week[39m
+  [38;5;211m⏵⏵ bypass permissions on[38;5;246m · [38;5;44m5 shells[39m                                                                                                                      [38;5;114m]8;id=xxxxxx;https://example.invalid/redacted\/rc[39m]8;;\

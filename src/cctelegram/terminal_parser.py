@@ -6271,8 +6271,8 @@ def _is_status_row(line: str) -> bool:
     [EFFORT-PAIR] · [HINT…]`` with at-most-once membership, ASCII-only digits and
     spaces, no empty segments, and every segment consumed. The
     exactly-one-separator fallback in ``_input_box_rows`` uses it to prove the lone
-    in-window separator is the input box's BOTTOM rule: the first non-blank row
-    below a genuine bottom rule is the status bar.
+    in-window separator is the input box's BOTTOM rule, optionally tolerating
+    one notice before the status bar (GH #90).
 
     The typed slots are consumed by a single forward CURSOR in renderer order; the
     remaining segments are the order-free hint TAIL. Acceptance is unchanged from
@@ -6341,6 +6341,84 @@ def _is_status_row(line: str) -> bool:
     return has_mode or bool(seen)
 
 
+def _footer_status_row_below(lines: list[str], bottom: int) -> int | None:
+    """Prove a bottom rule via STATUS or one NOTICE followed by STATUS (GH #90).
+
+    CC's generic ``addNotification`` toast slot (``kind:"event"``) has an OPEN
+    text alphabet: teammate starts, env-hook output, plugin toasts, cost/fast-mode
+    and closed-issue notices. Even the captured limit-reset copy is remotely
+    overridable via ``tengu_nifty_lemur``. A literal whitelist would break on the
+    next toast; the status bar supplies the positive proof, not the notice text.
+    Only one short free-text row is tolerated; wrapped/stacked notices refuse.
+    The width check counts Python characters, not display cells; its strict
+    shorter-than-rule boundary keeps the same fail-closed direction.
+    """
+    below = (
+        (i, row)
+        for i in range(bottom + 1, len(lines))
+        if (row := _strip_ansi(lines[i]).strip())
+    )
+    first = next(below, None)
+    if first is None:
+        return None
+    index, row = first
+    if _is_status_row(lines[index]):
+        return index
+    if (
+        _is_rule_separator(row)
+        or _RE_INPUT_OPTION_ROW.match(row)
+        or row[0] in _INPUT_PROMPT_GLYPHS
+        or row.startswith("⎿")
+        or len(row) >= len(_strip_ansi(lines[bottom]).strip())
+    ):
+        return None
+    second = next(below, None)
+    if second is not None and _is_status_row(lines[second[0]]):
+        return second[0]
+    return None
+
+
+def pane_ready_chrome_below_last_rule(pane_text: str | None) -> bool:
+    """Prove input-ready chrome below the last rule in the bounded pane tail.
+
+    GH #90 braked Escape uses leg 3's own alphabet, even when box location
+    fails. This is positive chrome evidence, not a complete input-box proof;
+    callers must retain their blocking-prompt vetoes.
+    It proves CC is drawing its own footer chrome (``? for shortcuts`` also
+    appears in the ctrl+o transcript view, ``esc to interrupt`` mid-turn), not
+    that the input box can receive text; the caller's prompt vetoes are load-bearing.
+    """
+    if not pane_text:
+        return False
+    tail = clean_ghost_input_text(pane_text).split("\n")[-_CHROME_SCAN_LINES:]
+    bottom = next(
+        (i for i in range(len(tail) - 1, -1, -1) if _is_rule_separator(tail[i])),
+        None,
+    )
+    if bottom is None:
+        return False
+    return any(
+        any(marker in row for marker in _INPUT_READY_CHROME_MARKERS)
+        or _RE_INPUT_READY_TASK_TOKEN.search(row)
+        for row in tail[bottom + 1 :]
+    )
+
+
+def pane_footer_recognized(pane_text: str | None) -> bool | None:
+    """Prove the located box's footer; None means no box / indeterminate.
+
+    False means a bracket was located but its footer is unrecognized. This is
+    an additional delivery leg, never a change to the >=2-rule box locator.
+    """
+    if not pane_text:
+        return None
+    lines = clean_ghost_input_text(pane_text).split("\n")
+    located = _input_box_rows(lines)
+    if located is None:
+        return None
+    return _footer_status_row_below(lines, located[1]) is not None
+
+
 def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
     """Locate the input-box rule-pair and return ``(top, bottom, non-blank rows)``.
 
@@ -6354,10 +6432,8 @@ def _input_box_rows(lines: list[str]) -> tuple[int, int, list[str]] | None:
       fallback fires ONLY on a THREE-PART STRUCTURAL proof (substring markers are
       spoofable by model-controlled prompt content, so each part kills an
       independently-reproduced spoof):
-        (a) the FIRST NON-BLANK row below the lone separator FULLMATCHES
-            ``_is_status_row`` (a genuine bottom rule is followed by the status
-            bar — not a picker footer, and not model prose that merely embeds a
-            marker substring);
+        (a) ``_footer_status_row_below`` proves STATUS or NOTICE → STATUS below
+            the lone separator (whole-row status grammar, never substrings);
         (b) NO row below the lone separator matches the picker option-row shape
             (Codex r2's "lone separator is a live prompt's TOP rule, ``❯ 1. Yes``
             below it" shape refuses here even if (a) were spoofed);
@@ -6402,12 +6478,8 @@ def _locate_tall_draft_pair(lines: list[str], bottom: int) -> tuple[int, int] | 
     re-stripped / whitespace-trimmed before the full-row and option-row matches
     (defensive, r3 P3).
     """
-    # (a) The first non-blank row below the lone separator must BE a status bar.
-    first_below = next(
-        (lines[i] for i in range(bottom + 1, len(lines)) if lines[i].strip()),
-        None,
-    )
-    if first_below is None or not _is_status_row(first_below):
+    # (a) A status bar, optionally preceded by one short notice, proves the footer.
+    if _footer_status_row_below(lines, bottom) is None:
         return None
 
     # (b) No picker option-row may sit below the lone separator (a live picker's
@@ -6682,6 +6754,21 @@ def pane_blocking_prompt_shape(pane_text: str | None) -> bool:
         lines.pop()
     tail = lines[max(0, len(lines) - _CHROME_SCAN_LINES) :]
     return any(_RE_INPUT_OPTION_ROW.match(ln) for ln in tail if ln)
+
+
+def pane_unnumbered_blocking_prompt_shape(pane_text: str | None) -> bool:
+    """True iff the bounded pane tail carries GH #88's strict unnumbered options."""
+    if not pane_text:
+        return False
+    # Preserve label columns for GH #88's walker; pop blanks as the numbered veto does.
+    lines = _strip_ansi(pane_text).split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    tail = lines[max(0, len(lines) - _CHROME_SCAN_LINES) :]
+    return any(
+        len(_gate_unnumbered_options_above(tail, i + 1)[0]) >= 2
+        for i in range(len(tail))
+    )
 
 
 def pane_input_box_present(

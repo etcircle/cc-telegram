@@ -178,9 +178,11 @@ appended to the stranded one and submit both at once. To clear it, press Escape
 **twice quickly** in the window (a single Escape does not clear a multi-line
 draft on current Claude Code, and Ctrl+U only kills one line) — or just send
 `/esc`, which on a braked topic performs exactly that double-Escape for you,
-after first checking that a draft is actually there (so it never interrupts a
-running turn). The brake lifts by itself as soon as the bot sees an empty
-input box again. In the rarer case where the final Enter itself fails, the bot
+after first checking for a draft. If the input box cannot be recognized, a
+braked topic can still try clearing after confirming Claude is running, ready
+status chrome is visible below the last rule, and blocking-prompt checks pass; this fallback can interrupt a running turn and
+asks you to check `/screenshot`. The brake lifts by itself as soon as the bot
+sees an empty input box again. In the rarer case where the final Enter itself fails, the bot
 says plainly that the message *may or may not* have been submitted — check the
 window with `/screenshot` before resending.
 

@@ -1793,7 +1793,7 @@ class SessionManager:
         # INDETERMINATE frame (a mid-redraw capture); a POSITIVE hazard (a live
         # prompt, a picker option row, the tasks mode, a completion overlay)
         # refuses on the FIRST capture.
-        gate = await self._gate_input_box(window_id, deadline=deadline)
+        gate = await self._gate_input_box(window_id, text, deadline=deadline)
         if gate is not None:
             return gate
 
@@ -1936,10 +1936,10 @@ class SessionManager:
         allow_slash_completion: bool = False,
         expected_draft: str | None = None,
     ) -> str | None:
-        """The gate verdict for one captured frame — ``None`` iff it may receive text.
+        """The input-box verdict for a frame — ``None`` iff that proof passes.
 
-        The POSITIVE input-box proof is the SOLE AUTHORITY, and it is consulted
-        FIRST. The pane recognizers (``is_interactive_ui`` /
+        The POSITIVE input-box proof is consulted FIRST; GH #90 adds a separate
+        pre-write footer proof in ``_gate_input_box``. The pane recognizers (``is_interactive_ui`` /
         ``parse_unknown_blocking_prompt`` / ``pane_blocking_prompt_shape``) are
         strictly a LABELLING aid: they run ONLY after the proof has already
         FAILED, and only to upgrade an INDETERMINATE reason to the actionable
@@ -1989,10 +1989,11 @@ class SessionManager:
         return reason
 
     async def _gate_input_box(
-        self, window_id: str, *, deadline: float
+        self, window_id: str, text: str, *, deadline: float
     ) -> DeliveryResult | None:
         """Run the pre-write gate. ``None`` ⇒ the pane may receive the payload."""
         attempts = GATE_CAPTURE_RETRIES + 1
+        tall = delivery.payload_may_render_tall(text, config.window_width)
         reason = delivery.REASON_CAPTURE_FAILED
         for attempt in range(attempts):
             if time.monotonic() > deadline:
@@ -2002,9 +2003,20 @@ class SessionManager:
                 return delivery.refuse(delivery.REASON_CAPTURE_TIMEOUT, written=False)
             assert pane is None or isinstance(pane, str)
             reason = self._input_box_reason(pane) or ""
+            # GH #90: predicted-tall payloads need the SAME capture's footer
+            # proof before typing. Short sends keep the >=2-rule path's behavior.
+            if (
+                not reason
+                and tall
+                and terminal_parser.pane_footer_recognized(pane) is False
+            ):
+                reason = delivery.REASON_UNKNOWN_FOOTER
             if not reason:
                 return None
-            if reason not in terminal_parser.INPUT_BOX_INDETERMINATE_REASONS:
+            if (
+                reason not in terminal_parser.INPUT_BOX_INDETERMINATE_REASONS
+                and reason != delivery.REASON_UNKNOWN_FOOTER
+            ):
                 # A POSITIVE hazard — refuse on the FIRST capture, never retry.
                 return delivery.refuse(reason, written=False)
             if attempt + 1 < attempts:
