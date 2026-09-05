@@ -4,7 +4,7 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
-## [Unreleased]
+## [0.4.21] — 2026-09-05
 
 ### Fixed
 - **Typing went dark while Claude waited on the Monitor tool (GH #92).** When a
