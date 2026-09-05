@@ -4,6 +4,22 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.4.20] — 2026-09-05
+
+### Fixed
+- **Long messages stopped delivering when Claude showed a notice under its input box
+  (GH #90).** Claude Code 2.1.258's limit-reset notice hid the status bar from the
+  tall-draft check, leaving the message unsent and braking the topic. The bridge now
+  tolerates one short notice followed by a recognized status bar, and checks that
+  footer before typing a long message. An unfamiliar footer gets a retry, then an honest
+  “nothing was typed” notice without braking the topic.
+- **`/esc` can recover a braked draft even when the input box isn't recognized
+  (GH #90).** A fresh Claude process check, ready status chrome below the last
+  rule, and blocking-prompt checks guard the fallback double-Escape; the brake releases only after a fresh capture
+  proves the box empty. This fallback can interrupt a running turn, so its reply
+  asks you to check `/screenshot`. Wrapped or stacked notices still refuse long
+  messages; short sends keep working. Footer drift during a tall write still withholds Enter and keeps the brake.
+
 ## [0.4.19] — 2026-09-02
 
 ### Fixed
