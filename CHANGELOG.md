@@ -4,6 +4,24 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [Unreleased]
+
+### Fixed
+- **Typing went dark while Claude waited on the Monitor tool (GH #92).** When a
+  session parked on a `Monitor` (for example a long build watched for its exit
+  line), the topic lost its typing indicator and 🟡 Busy for the whole wait even
+  though the done-card showed `⏳ … waiting on 1 monitor`. The bridge now
+  recognises the Monitor launch (Claude Code 2.1.257 shape) the same way it does
+  a background shell, so typing stays on until the monitor's first event. A
+  persistent monitor that keeps streaming after that event goes dark again by
+  design (false dark over false typing).
+- **Stopping a background task now ends its Busy/typing lift immediately (GH
+  #92).** A `TaskStop` used to leave the stopped task's lift running until the
+  two-hour safety timeout. The stop is now recognised live and during the
+  restart catch-up, so a task stopped before a bridge restart is not relit.
+- Known limitation: a teammate stopping its own background task from inside its
+  sidechain still waits for the two-hour timeout or a parent-side close.
+
 ## [0.4.20] — 2026-09-05
 
 ### Fixed

@@ -225,18 +225,76 @@ def background_bash_task_id_from_meta(meta: object) -> str | None:
     keying) or ``None`` when ``meta`` is not a background-Bash launch result.
 
     Keys on ``backgroundTaskId`` PRESENCE ONLY — never ``status`` or prose. The
-    three async-launch shapes are DISJOINT: a plain Agent carries ``agentId`` +
-    ``status=="async_launched"``; a Workflow carries ``taskId`` +
-    ``status=="async_launched"``; a background Bash carries NEITHER ``status``
-    NOR ``agentId``/``taskId`` — so this returns ``None`` for the other two, and
-    ``async_agent_launch_id_from_meta`` / ``workflow_launch_info_from_meta``
-    return ``None`` for a Bash meta. The caller scopes it to
-    ``tool_name == "Bash"`` tool_results.
+    launch lanes carry Agent ``agentId`` + ``status``, Workflow ``taskId`` +
+    ``status``, Bash ``backgroundTaskId``, SendMessage ``resumedAgentId``,
+    teammate ``status == "teammate_spawned"``, or Monitor ``taskId`` +
+    ``persistent`` (GH #92, CC 2.1.257). Tool-name gating is the PRIMARY
+    discriminator; field-set checks are defence-in-depth, not a claim that
+    arbitrary metas are pairwise disjoint. Callers scope this helper to Bash
+    results (also unpaired results in the GH #59 sidechain lane).
+    Unlike the GH #92 Monitor/TaskStop helpers, this existing Bash helper does
+    NOT canonicalise padded ids; that asymmetry is deliberately out of scope.
     """
     if not isinstance(meta, dict):
         return None
     task_id = meta.get("backgroundTaskId")
     return task_id if isinstance(task_id, str) and task_id else None
+
+
+def _canonical_task_id(raw: object) -> str | None:
+    """Canonicalise a structured Monitor/TaskStop id (GH #92, CC 2.1.257).
+
+    Notification closes strip their id, while background-key normalization
+    does not. Strip here so a padded launch cannot outlive its close until the
+    two-hour TTL. Fail-closed on empty/unsafe/non-string ids: false dark over
+    false typing. This does not change the older Bash/Agent discriminators.
+    """
+    if not isinstance(raw, str):
+        return None
+    task_id = raw.strip()
+    return task_id if re.fullmatch(r"[A-Za-z0-9_-]+", task_id) else None
+
+
+def monitor_launch_task_id_from_meta(meta: object) -> str | None:
+    """Extract a Monitor launch's STRUCTURED taskId (GH #92, CC 2.1.257).
+
+    Real shape: ``{"taskId":"bm7gmjisu","timeoutMs":0,"persistent":true}``.
+    Require taskId + a BOOLEAN persistent (False is valid); reject competing
+    ownership fields by PRESENCE, even if their values are None. Tool-name
+    gating is primary: callers admit only Monitor or genuinely unpaired
+    results (None), whose use may precede a bridge restart or follow the result.
+    No prose fallback: format drift fails closed, false dark over false typing.
+    The bare canonical id equals the existing task-notification close key.
+    """
+    if not isinstance(meta, dict) or not isinstance(meta.get("persistent"), bool):
+        return None
+    if any(
+        field in meta
+        for field in (
+            "status",
+            "agentId",
+            "backgroundTaskId",
+            "resumedAgentId",
+            "runId",
+            "transcriptDir",
+        )
+    ):
+        return None
+    return _canonical_task_id(meta.get("taskId"))
+
+
+def stopped_task_id_from_meta(meta: object) -> str | None:
+    """Extract a TaskStop close's STRUCTURED task_id (GH #92, CC 2.1.257).
+
+    Real shape carries message, task_id, task_type and command. Require BOTH
+    task_id and task_type keys; task_type's value is not a tool-kind whitelist.
+    Parent callers scope to TaskStop or unpaired results; restart scans use
+    this same shape without memory-only tool pairing. No prose inference or
+    drift warning. Canonicalisation preserves launch/close key parity.
+    """
+    if not isinstance(meta, dict) or "task_id" not in meta or "task_type" not in meta:
+        return None
+    return _canonical_task_id(meta["task_id"])
 
 
 def resumed_agent_id_from_meta(meta: object) -> str | None:

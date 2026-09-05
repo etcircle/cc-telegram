@@ -7,7 +7,8 @@ Runs an async polling loop that:
   4. Parses entries via TranscriptParser and emits NewMessage objects to a callback.
   5. Tails sub-agent (sidechain) JSONLs unconditionally — display emission is
      gated by show_tool_calls, but per-tick per-agent activity (max event ts,
-     end-of-turn) plus parent-transcript async-launch / task-notification
+     end-of-turn) plus parent-transcript async-launch (including Monitor,
+     GH #92 / CC 2.1.257) / TaskStop / task-notification
      signals are always reported (pop_sidechain_activity → the GH #44
      route_runtime background-agent marks).
 
@@ -59,6 +60,11 @@ _STALL_SKIP_MIN_CYCLES = 3
 _BG_BASH_LAUNCH_PROSE_RE = re.compile(
     r"Command running in background with ID:", re.IGNORECASE
 )
+
+# GH #92 / CC 2.1.257: diagnostic ONLY, like T1.6 above. A known Monitor
+# result announcing a launch without the structured shape warns once per use;
+# never lift from prose (fail-closed: false dark over false typing).
+_MONITOR_LAUNCH_PROSE_RE = re.compile(r"\bMonitor started \(task [A-Za-z0-9_-]+")
 
 # Tool names whose buffered turn carries the Bug 2 live-prose surface. Mirrors
 # route_runtime.INTERACTIVE_TOOL_NAMES; duplicated to keep session_monitor free
@@ -868,6 +874,8 @@ class SessionMonitor:
         # structured-meta DRIFT warning has already fired (rate-limit — once per
         # launch tool_result, never re-warn every poll).
         self._bg_bash_drift_warned: set[str] = set()
+        # GH #92 / CC 2.1.257: same lifetime as the T1.6 Bash warning set.
+        self._monitor_drift_warned: set[str] = set()
         # GH #46 PR-2: the generational teammate registry — parent_sid ->
         # {name -> _TeammateRec}. A teammate spawn (from the structured
         # ``teammate_spawned`` tool_result) creates/rotates the rec; a matching
@@ -1629,6 +1637,49 @@ class SessionMonitor:
                 to_field,
             )
 
+    def _record_task_close(self, session_id: str, task_id: str) -> None:
+        """Net a PARENT-file close against resumes (GH #92, CC 2.1.257).
+
+        Shared by structured TaskStop and the existing user-text notification
+        lane. Transcript order wins: stop→resume lives, resume→stop tombstones.
+        Preserve Fix 5 PR-B: mark an open Workflow bracket closing, never pop
+        before its final display tail. Queue-operation scan lanes stay separate.
+
+        A persistent Monitor goes dark on its FIRST event, even if its watcher
+        lives on. Accepted fail-closed doctrine: false dark over false typing;
+        re-lifting persistent streams per event is outside GH #92.
+        """
+        rec = self._parent_activity(session_id)
+        close_key = normalize_background_agent_key(task_id)
+        rec.completed.add(close_key)
+        # Parent-lane NET (transcript order): a done observed
+        # AFTER a resume for the SAME key in this batch
+        # supersedes the resume (resume→done = fast finish →
+        # TOMBSTONED). Drop any same-batch resume intent for
+        # this key.
+        rec.resumed.pop(close_key, None)
+        # ISSUE-6 / Fix 2d: for a WORKFLOW task-id, ALSO emit
+        # the wf-task: close key (== the wf-task launch key)
+        # so the bracket tombstones, and drop the open
+        # bracket. A Workflow task-id is identified ONLY by a
+        # live OPEN bracket (gate-on-bracket): an isolated
+        # close with no bracket has no route_runtime bg key
+        # to tombstone, so the bare key above suffices. This
+        # keeps an Agent close from spuriously emitting a
+        # wf-task: done key without guessing a Workflow id
+        # from its character set.
+        if self._has_open_workflow_bracket(session_id, task_id):
+            rec.completed.add(f"wf-task:{task_id}")
+            # Fix 5 PR-B: do NOT pop yet — let
+            # check_sidechain_updates tail the wf_dir ONE
+            # final time (capture the last display blocks)
+            # and emit the route-FIFO collapse signal,
+            # THEN remove the bracket. Popping here would
+            # make the bracket-gated discovery skip the
+            # final tail (Hermes-delta P1-2). The run-state
+            # done already fired via rec.completed above.
+            self._open_workflow_brackets[session_id][task_id].closing = True
+
     def _stash_early_teammate_signal(
         self, parent_session_id: str, tool_use_id: str, meta: Any, ts: str | None
     ) -> None:
@@ -2272,13 +2323,15 @@ class SessionMonitor:
         (PR-1 Half B). Returns ``(launches, closes, reliable)`` where ``launches``
         maps a ``wf_<runid>`` dir-name → its Task ID (via the launch tool_result's
         Run ID / Transcript dir), ``closes`` is the set of ``<task-notification>``
-        task-ids, and ``reliable`` is False iff a prefiltered (potential launch or
+        or structured TaskStop task-ids (GH #92, CC 2.1.257), and ``reliable``
+        is False iff a prefiltered (potential launch or
         close) line could NOT be parsed.
 
         Mirrors ``_auq_tool_result_present``'s cheap byte pre-filter + whole-file
         stream (the launch / close can scroll far past any tail on a long
-        session): only a line containing ``Task ID`` or ``task-notification`` is
-        JSON-parsed. **Fail-CLOSED on a malformed prefiltered line (codex P1):** a
+        session): only a line containing ``Task ID``, ``task-notification`` or
+        ``"task_id"`` (TaskStop) is JSON-parsed. **Fail-CLOSED on a malformed
+        prefiltered line (codex P1):** a
         corrupt/partial ``<task-notification>`` line would otherwise leave its
         close OUT of ``closes`` and false-relight a COMPLETED Workflow — so any
         such parse failure flips ``reliable`` False and the caller does NOT lift
@@ -2296,6 +2349,7 @@ class SessionMonitor:
         from .handlers.response_builder import (
             extract_task_notification_task_id,
             extract_workflow_launch_info,
+            stopped_task_id_from_meta,
         )
 
         def _block_texts(entry: dict) -> tuple[list[str], list[str]]:
@@ -2351,7 +2405,11 @@ class SessionMonitor:
                 async for raw in f:
                     has_task = b"Task ID" in raw
                     has_notif = b"task-notification" in raw
-                    if not (has_task or has_notif):
+                    # GH #92 / CC 2.1.257: TaskStop emits no notification.
+                    # Missing its close would relight a stopped task on restart.
+                    # Malformed prefiltered lines still fail closed.
+                    has_stop = b'"task_id"' in raw
+                    if not (has_task or has_notif or has_stop):
                         continue
                     try:
                         entry = json.loads(raw)
@@ -2379,6 +2437,10 @@ class SessionMonitor:
                                 ):
                                     if name:
                                         launches[name] = info.task_id
+                    if has_stop:
+                        tid = stopped_task_id_from_meta(entry.get("toolUseResult"))
+                        if tid:
+                            closes.add(tid)
                     if has_notif:
                         # Closes from EITHER lane (a missed close must fail closed).
                         for text in tr_texts + tx_texts:
@@ -2395,8 +2457,9 @@ class SessionMonitor:
         """Bounded full-scan of a parent JSONL for plain ``run_in_background``
         Agent async-launches + closes (Fix #5). Returns ``(async_keys, closes,
         reliable)`` where ``async_keys`` is the set of NORMALIZED async-launched
-        agent keys, ``closes`` the set of ``<task-notification>`` task-ids
-        (normalized — for a background Agent the task-id IS the agent key), and
+        agent keys, ``closes`` the set of ``<task-notification>`` or structured
+        TaskStop task-ids (GH #92, CC 2.1.257; normalized — for a background
+        Agent the task-id IS the agent key), and
         ``reliable`` is False iff a prefiltered (potential launch/close) line
         could not be parsed.
 
@@ -2420,6 +2483,7 @@ class SessionMonitor:
             async_agent_launch_id_from_meta,
             extract_async_agent_launch_id,
             extract_task_notification_task_id,
+            stopped_task_id_from_meta,
         )
 
         def _tr_tx(entry: dict) -> tuple[list[str], list[str]]:
@@ -2465,7 +2529,11 @@ class SessionMonitor:
                 async for raw in f:
                     has_agent = b"agentId" in raw
                     has_notif = b"task-notification" in raw
-                    if not (has_agent or has_notif):
+                    # GH #92 / CC 2.1.257: TaskStop emits no notification.
+                    # Missing its close would relight a stopped task on restart.
+                    # Malformed prefiltered lines still fail closed.
+                    has_stop = b'"task_id"' in raw
+                    if not (has_agent or has_notif or has_stop):
                         continue
                     try:
                         entry = json.loads(raw)
@@ -2490,6 +2558,10 @@ class SessionMonitor:
                                     break
                         if aid:
                             async_keys.add(normalize_background_agent_key(aid))
+                    if has_stop:
+                        tid = stopped_task_id_from_meta(entry.get("toolUseResult"))
+                        if tid:
+                            closes.add(normalize_background_agent_key(tid))
                     if has_notif:
                         tr_texts, tx_texts = _tr_tx(entry)
                         for text in tr_texts + tx_texts:
@@ -3424,6 +3496,11 @@ class SessionMonitor:
                     # envelope helpers moved to ``utils`` (response_builder
                     # re-exports them) — each predicate has a SINGLE owner so
                     # the live and restart-scan paths never fork.
+                    from .handlers.response_builder import (
+                        monitor_launch_task_id_from_meta,
+                        stopped_task_id_from_meta,
+                    )
+
                     if entry.content_type == "tool_result" and entry.tool_name in (
                         "Agent",
                         "Task",
@@ -3615,6 +3692,59 @@ class SessionMonitor:
                                 )
                     elif (
                         entry.content_type == "tool_result"
+                        and entry.tool_name in (None, "Monitor")
+                        and (
+                            monitor_id := monitor_launch_task_id_from_meta(
+                                entry.tool_result_meta
+                            )
+                        )
+                        is not None
+                    ):
+                        # GH #92 / CC 2.1.257: structured taskId + persistent
+                        # is the SOLE Monitor launch anchor. Record the bare
+                        # notification-close id, with no Workflow bracket; the
+                        # existing 2 h background TTL bounds an unclosed wait.
+                        # Admit unpaired results (result-before-use OR use before
+                        # restart). A successful helper match is IN the elif
+                        # condition so None-named TaskStop/teammate results fall
+                        # through, rather than being swallowed by this arm.
+                        self._parent_activity(session_info.session_id).launched.add(
+                            normalize_background_agent_key(monitor_id)
+                        )
+                    elif (
+                        entry.content_type == "tool_result"
+                        and entry.tool_name in (None, "TaskStop")
+                        and (
+                            stopped_id := stopped_task_id_from_meta(
+                                entry.tool_result_meta
+                            )
+                        )
+                        is not None
+                    ):
+                        # GH #92: parent-file structured-only close; same net
+                        # order and Workflow final-tail semantics as notification.
+                        # No prose fallback/warning; unrelated unpaired metas
+                        # still reach the teammate-only stash below.
+                        self._record_task_close(session_info.session_id, stopped_id)
+                    elif (
+                        entry.content_type == "tool_result"
+                        and entry.tool_name == "Monitor"
+                    ):
+                        # GH #92 / T1.6: known tool + launch prose + rejected
+                        # shape ⇒ WARNING only. False dark over false typing.
+                        if entry.text and _MONITOR_LAUNCH_PROSE_RE.search(entry.text):
+                            tuid = entry.tool_use_id or ""
+                            if tuid not in self._monitor_drift_warned:
+                                self._monitor_drift_warned.add(tuid)
+                                logger.warning(
+                                    "Monitor launch: prose announces a monitor but the "
+                                    "structured toolUseResult.taskId is absent/malformed "
+                                    "(tool_use_id=%s) — Claude Code launch-result format "
+                                    "may have drifted; NOT lifting from prose",
+                                    tuid or "?",
+                                )
+                    elif (
+                        entry.content_type == "tool_result"
                         and entry.tool_name is None
                         and entry.tool_result_meta is not None
                         and entry.tool_use_id
@@ -3658,40 +3788,7 @@ class SessionMonitor:
 
                         task_id = extract_task_notification_task_id(entry.text)
                         if task_id:
-                            rec = self._parent_activity(session_info.session_id)
-                            close_key = normalize_background_agent_key(task_id)
-                            rec.completed.add(close_key)
-                            # Parent-lane NET (transcript order): a done observed
-                            # AFTER a resume for the SAME key in this batch
-                            # supersedes the resume (resume→done = fast finish →
-                            # TOMBSTONED). Drop any same-batch resume intent for
-                            # this key.
-                            rec.resumed.pop(close_key, None)
-                            # ISSUE-6 / Fix 2d: for a WORKFLOW task-id, ALSO emit
-                            # the wf-task: close key (== the wf-task launch key)
-                            # so the bracket tombstones, and drop the open
-                            # bracket. A Workflow task-id is identified ONLY by a
-                            # live OPEN bracket (gate-on-bracket): an isolated
-                            # close with no bracket has no route_runtime bg key
-                            # to tombstone, so the bare key above suffices. This
-                            # keeps an Agent close from spuriously emitting a
-                            # wf-task: done key without guessing a Workflow id
-                            # from its character set.
-                            if self._has_open_workflow_bracket(
-                                session_info.session_id, task_id
-                            ):
-                                rec.completed.add(f"wf-task:{task_id}")
-                                # Fix 5 PR-B: do NOT pop yet — let
-                                # check_sidechain_updates tail the wf_dir ONE
-                                # final time (capture the last display blocks)
-                                # and emit the route-FIFO collapse signal,
-                                # THEN remove the bracket. Popping here would
-                                # make the bracket-gated discovery skip the
-                                # final tail (Hermes-delta P1-2). The run-state
-                                # done already fired via rec.completed above.
-                                self._open_workflow_brackets[session_info.session_id][
-                                    task_id
-                                ].closing = True
+                            self._record_task_close(session_info.session_id, task_id)
                     elif (
                         entry.role == "user"
                         and entry.content_type == "text"
@@ -4099,6 +4196,30 @@ class SessionMonitor:
                     logger.info(
                         "teammate-sidechain bash launch recorded key=%s stem=%s",
                         bash_task_id,
+                        sc_file.stem,
+                    )
+
+            # GH #92 / CC 2.1.257: Monitor has the SAME launch-only authority
+            # as GH #59 Bash above. Structured-only + known-tool gating (None
+            # admits lost pairing); no bracket and no prose lift. A sidechain
+            # TaskStop deliberately does NOT populate completed: that collection
+            # dispatches an unconditional source=PARENT tombstone, bypassing the
+            # cross-file timestamp gate and potentially killing a newer parent
+            # SendMessage resume. A timestamped SIDECHAIN close collection is
+            # outside GH #92: today's 2 h TTL or parent close still ends the lift.
+            from .handlers.response_builder import monitor_launch_task_id_from_meta
+
+            for entry in parsed_entries:
+                if entry.content_type != "tool_result":
+                    continue
+                if entry.tool_name not in (None, "Monitor"):
+                    continue
+                monitor_id = monitor_launch_task_id_from_meta(entry.tool_result_meta)
+                if monitor_id:
+                    activity.launched.add(normalize_background_agent_key(monitor_id))
+                    logger.info(
+                        "teammate-sidechain monitor launch recorded key=%s stem=%s",
+                        monitor_id,
                         sc_file.stem,
                     )
 
