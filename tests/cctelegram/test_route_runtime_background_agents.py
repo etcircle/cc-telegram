@@ -1290,3 +1290,21 @@ async def test_sidechain_done_older_than_activity_still_tombstones():
         ROUTE, KEY, source=BgDoneSource.SIDECHAIN, end_turn_ts=90.0
     )
     assert KEY in _st().background_agents_done
+
+
+async def test_gh92_bare_monitor_key_lifts_then_parent_close_drops_typing():
+    """GH #92 / CC 2.1.257: bare Monitor ids use existing generic projection.
+
+    Stored idle + structured launch lifts typing; parent close tombstones and
+    removes the lift without needing a Monitor-specific runtime mutation.
+    """
+    key = "bm7gmjisu"
+    snap = await route_runtime.seed_idle_and_mark_background_agent_launched(ROUTE, key)
+    assert snap.typing_eligible is True
+    assert snap.background_agents == (key,)
+    snap = await route_runtime.mark_background_agent_done(
+        ROUTE, key, source=BgDoneSource.PARENT
+    )
+    assert snap.typing_eligible is False
+    assert snap.background_agents == ()
+    assert key in _st().background_agents_done

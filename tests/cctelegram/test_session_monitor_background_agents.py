@@ -1248,8 +1248,15 @@ async def test_workflow_nested_first_seen_at_eof_skips_history(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("close_lane", ["notification", "TaskStop"])
 async def test_closing_tick_emits_final_tail_then_collapse_then_pops(
-    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+    monitor,
+    tmp_path,
+    make_jsonl_entry,
+    make_tool_use_block,
+    make_tool_result_block,
+    close_lane,
+    gh92_pair,
 ):
     """⭐ B-i (Hermes-delta P1-2, monitor half): the closing tick's
     check_sidechain_updates STILL emits the final display block(s) for the run
@@ -1277,7 +1284,13 @@ async def test_closing_tick_emits_final_tail_then_collapse_then_pops(
         "<tool-use-id>toolu_x</tool-use-id>\n<status>completed</status>\n"
         "</task-notification>"
     )
-    _append(parent_jsonl, [make_jsonl_entry("user", notif, session_id=PARENT)])
+    # GH #92 / CC 2.1.257: TaskStop shares Fix 5 PR-B closing semantics.
+    close = (
+        gh92_pair("TaskStop", {"task_id": _WF_TASK, "task_type": "workflow"})
+        if close_lane == "TaskStop"
+        else [make_jsonl_entry("user", notif, session_id=PARENT)]
+    )
+    _append(parent_jsonl, close)
 
     # check_for_updates marks the bracket closing (does NOT pop).
     await monitor.check_for_updates({PARENT})
@@ -1982,3 +1995,509 @@ async def test_teammate_arm_final_park_fixture_records_causal_close(
     last_write = parse_iso_timestamp("2026-07-09T15:58:10.097Z")
     assert last_write is not None and park_ts is not None
     assert park_ts > last_write  # the causal-close provenance
+
+
+# ── GH #92 Monitor + TaskStop lanes ─────────────────────────────────────────
+# CC 2.1.257 capture: structured-only, fail-closed, false dark over false typing.
+# The integration pins wire lifecycle exactly like bot.post_init; a real parent
+# end_turn must store idle BEFORE activity fan-out, otherwise a close could
+# tombstone its key while leaving a misleading foreground RUNNING projection.
+
+_MONITOR_KEY = "bm7gmjisu"
+_MONITOR_META = {"taskId": _MONITOR_KEY, "timeoutMs": 0, "persistent": True}
+
+
+def _monitor_fixture_entries():
+    """Six REAL CC 2.1.257 lines; only command payloads scrubbed (GH #92)."""
+    return [
+        json.loads(line)
+        for line in (_FIXTURES / "monitor_launch_v2.1.257.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+
+
+@pytest.fixture
+def gh92_pair(make_jsonl_entry, make_tool_use_block, make_tool_result_block):
+    """Build paired/unpaired shape variations without bypassing the parser."""
+
+    def pair(name, meta, *, text="result", tuid="gh92-use"):
+        return [
+            make_jsonl_entry(
+                "assistant", [make_tool_use_block(tuid, name)], session_id=PARENT
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block(tuid, text)],
+                session_id=PARENT,
+                tool_use_result=meta,
+            ),
+        ]
+
+    return pair
+
+
+@pytest.mark.asyncio
+async def test_gh92_monitor_fixture_launch(monitor, tmp_path):
+    parent, _ = _setup_parent(monitor, tmp_path)
+    _append(parent, _monitor_fixture_entries()[:2])
+    await monitor.check_for_updates({PARENT})
+    assert monitor.pop_sidechain_activity()[PARENT].launched == {_MONITOR_KEY}
+    assert not monitor._open_workflow_brackets
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_id, expected",
+    [(_MONITOR_KEY, {_MONITOR_KEY}), (" bm7gmjisu ", {_MONITOR_KEY}), (" \t", set())],
+)
+async def test_gh92_monitor_structured_launch_canonical_key(
+    monitor, tmp_path, gh92_pair, task_id, expected
+):
+    parent, _ = _setup_parent(monitor, tmp_path)
+    _append(parent, gh92_pair("Monitor", {"taskId": task_id, "persistent": False}))
+    await monitor.check_for_updates({PARENT})
+    rec = monitor.pop_sidechain_activity().get(PARENT, ParentSidechainActivity())
+    assert rec.launched == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "meta", [None, {}, {"taskId": _MONITOR_KEY}, {"taskId": 123, "persistent": True}]
+)
+async def test_gh92_monitor_prose_drift_warns_without_lift(
+    monitor, tmp_path, gh92_pair, caplog, meta
+):
+    parent, _ = _setup_parent(monitor, tmp_path)
+    with caplog.at_level("WARNING"):
+        _append(
+            parent,
+            gh92_pair(
+                "Monitor",
+                meta,
+                text=f"Monitor started (task {_MONITOR_KEY}, persistent)",
+            ),
+        )
+        await monitor.check_for_updates({PARENT})
+    assert monitor.pop_sidechain_activity() == {}
+    warnings = [r for r in caplog.records if "Monitor launch:" in r.message]
+    assert len(warnings) == 1
+    assert warnings[0].levelname == "WARNING"
+    assert "NOT lifting from prose" in warnings[0].message
+
+
+@pytest.mark.asyncio
+async def test_gh92_monitor_drift_warning_once_per_tool_use_id(
+    monitor, tmp_path, gh92_pair, caplog
+):
+    parent, _ = _setup_parent(monitor, tmp_path)
+    with caplog.at_level("WARNING"):
+        for tuid in ("same", "same", "different"):
+            _append(
+                parent,
+                gh92_pair(
+                    "Monitor", None, text="Monitor started (task bm7gmjisu", tuid=tuid
+                ),
+            )
+            await monitor.check_for_updates({PARENT})
+    assert len([r for r in caplog.records if "Monitor launch:" in r.message]) == 2
+    assert monitor.pop_sidechain_activity() == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name, meta",
+    [
+        ("Read", _MONITOR_META),
+        ("TaskStop", _MONITOR_META),
+        ("Monitor", {"taskId": _MONITOR_KEY, "status": "async_launched"}),
+        ("Read", {"task_id": _MONITOR_KEY, "task_type": "local_bash"}),
+        ("TaskStop", {"task_id": _MONITOR_KEY}),
+        ("TaskStop", {"task_type": "local_bash"}),
+    ],
+)
+async def test_gh92_wrong_tool_or_shape_records_nothing(
+    monitor, tmp_path, gh92_pair, caplog, name, meta
+):
+    parent, _ = _setup_parent(monitor, tmp_path)
+    with caplog.at_level("WARNING"):
+        _append(parent, gh92_pair(name, meta))
+        await monitor.check_for_updates({PARENT})
+    assert monitor.pop_sidechain_activity() == {}
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("indices, key", [([2], _MONITOR_KEY), ([4, 5], "b9um28ext")])
+async def test_gh92_fixture_event_and_taskstop_close(monitor, tmp_path, indices, key):
+    parent, _ = _setup_parent(monitor, tmp_path)
+    fixture = _monitor_fixture_entries()
+    _append(parent, [fixture[i] for i in indices])
+    await monitor.check_for_updates({PARENT})
+    assert monitor.pop_sidechain_activity()[PARENT].completed == {key}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool, field", [("Monitor", "launched"), ("TaskStop", "completed")]
+)
+@pytest.mark.parametrize("arrival", ["result-before-use", "restart-before-result"])
+async def test_gh92_unpaired_result_survives_order_and_restart(
+    monitor, tmp_path, gh92_pair, tool, field, arrival
+):
+    """GH #92 D1b: memory-only pairing must not lose a structured result."""
+    parent, _ = _setup_parent(monitor, tmp_path)
+    meta = (
+        _MONITOR_META
+        if tool == "Monitor"
+        else {"task_id": _MONITOR_KEY, "task_type": "local_bash"}
+    )
+    use, result = gh92_pair(tool, meta)
+    if arrival == "result-before-use":
+        _append(parent, [result, use])
+    else:
+        _append(parent, [use])
+        await monitor.check_for_updates({PARENT})
+        assert monitor._pending_tools[PARENT]
+        monitor.state.save()
+        monitor = SessionMonitor(
+            projects_path=monitor.projects_path,
+            state_file=tmp_path / "monitor_state.json",
+        )
+        _setup_parent(monitor, tmp_path)
+        assert monitor._pending_tools == {}
+        _append(parent, [result])
+    await monitor.check_for_updates({PARENT})
+    assert getattr(monitor.pop_sidechain_activity()[PARENT], field) == {_MONITOR_KEY}
+
+
+@pytest.mark.asyncio
+async def test_gh92_unpaired_stop_then_monitor_does_not_shadow(
+    monitor, tmp_path, gh92_pair
+):
+    parent, _ = _setup_parent(monitor, tmp_path)
+    _append(
+        parent,
+        [
+            gh92_pair(
+                "TaskStop",
+                {"task_id": "stopped", "task_type": "local_bash"},
+                tuid="stop",
+            )[1],
+            gh92_pair("Monitor", _MONITOR_META, tuid="monitor")[1],
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    rec = monitor.pop_sidechain_activity()[PARENT]
+    assert rec.completed == {"stopped"}
+    assert rec.launched == {_MONITOR_KEY}
+
+
+@pytest.mark.asyncio
+async def test_gh92_unpaired_teammate_stash_and_retro_pairing_survive(
+    monitor, tmp_path, gh92_pair
+):
+    """GH #92 r3: neither None-admitting arm may starve the teammate stash."""
+    from tests.cctelegram.test_teammate_registry import _spawn_meta_for
+
+    parent, _ = _setup_parent(monitor, tmp_path)
+    use, result = gh92_pair("Agent", _spawn_meta_for("gh92-peer"))
+    _append(parent, [result])
+    await monitor.check_for_updates({PARENT})
+    assert "gh92-use" in monitor._early_teammate_signals[PARENT]
+    _append(parent, [use])
+    await monitor.check_for_updates({PARENT})
+    assert "gh92-peer" in monitor._teammate_registry[PARENT]
+    assert not monitor._early_teammate_signals.get(PARENT)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_first", [True, False])
+async def test_gh92_taskstop_resume_collection_nets_transcript_order(
+    monitor, tmp_path, gh92_pair, stop_first
+):
+    parent, _ = _setup_parent(monitor, tmp_path)
+    stop = gh92_pair(
+        "TaskStop", {"task_id": _MONITOR_KEY, "task_type": "local_bash"}, tuid="stop"
+    )
+    resume = gh92_pair("SendMessage", {"resumedAgentId": _MONITOR_KEY}, tuid="resume")
+    _append(parent, stop + resume if stop_first else resume + stop)
+    await monitor.check_for_updates({PARENT})
+    rec = monitor.pop_sidechain_activity()[PARENT]
+    assert (_MONITOR_KEY in rec.resumed) is stop_first
+    assert (_MONITOR_KEY in rec.completed) is not stop_first
+
+
+@pytest.fixture
+def gh92_runtime(monitor, monkeypatch):
+    """Production-equivalent bot.post_init callback; no hand-seeded idle state.
+
+    GH #92 r3: lifecycle dispatch happens inside check_for_updates, BEFORE the
+    separate pull-only activity fan-out. Real parent end_turn lines below drive
+    stored idle through the adapter so typing assertions cannot pass by accident.
+    """
+    from cctelegram import bot as bot_module, route_runtime, transcript_event_adapter
+
+    route_runtime.reset_for_tests()
+    route = (1, 42, "@7")
+
+    async def find(session_id):
+        assert session_id == PARENT
+        return [(1, "@7", 42)]
+
+    async def event_callback(event):
+        active = await bot_module.session_manager.find_users_for_session(
+            event.session_id
+        )
+        routes = [(user_id, thread_id or 0, wid) for user_id, wid, thread_id in active]
+        await transcript_event_adapter.dispatch_transcript_event(event, routes)
+
+    monkeypatch.setattr(bot_module.session_manager, "find_users_for_session", find)
+    monitor.set_event_callback(event_callback)
+    yield route_runtime, bot_module, route
+    route_runtime.reset_for_tests()
+
+
+def _gh92_end_turn(make_jsonl_entry):
+    """Actual parent assistant JSONL drives IDLE, never a runtime test shortcut."""
+    entry = make_jsonl_entry("assistant", [], session_id=PARENT)
+    entry["message"]["stop_reason"] = "end_turn"
+    return entry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_poll", [False, True])
+async def test_gh92_monitor_notification_typing_lifecycle(
+    monitor, tmp_path, make_jsonl_entry, gh92_runtime, same_poll
+):
+    runtime, bot, route = gh92_runtime
+    parent, _ = _setup_parent(monitor, tmp_path)
+    fixture = _monitor_fixture_entries()
+    _append(
+        parent,
+        fixture[:2]
+        + [_gh92_end_turn(make_jsonl_entry)]
+        + ([fixture[2]] if same_poll else []),
+    )
+    await monitor.check_for_updates({PARENT})
+    assert runtime._state[route].run_state in (
+        runtime.RunState.IDLE_RECENT,
+        runtime.RunState.IDLE_CLEARED,
+    )
+    await bot.apply_sidechain_activity(monitor.pop_sidechain_activity())
+    assert runtime.snapshot(route).typing_eligible is not same_poll
+    if not same_poll:
+        assert runtime.snapshot(route).background_agents == (_MONITOR_KEY,)
+        _append(parent, [fixture[2]])
+        await monitor.check_for_updates({PARENT})
+        await bot.apply_sidechain_activity(monitor.pop_sidechain_activity())
+    assert runtime.snapshot(route).typing_eligible is False
+    assert runtime.snapshot(route).background_agents == ()
+    assert _MONITOR_KEY in runtime._state[route].background_agents_done
+    # CC 2.1.257 emits event then stream-ended ~100 ms later. First event
+    # closes even persistent monitors; the duplicate close remains idempotent.
+    _append(parent, [fixture[3]])
+    await monitor.check_for_updates({PARENT})
+    await bot.apply_sidechain_activity(monitor.pop_sidechain_activity())
+    assert runtime.snapshot(route).typing_eligible is False
+    assert runtime.snapshot(route).background_agents == ()
+    assert _MONITOR_KEY in runtime._state[route].background_agents_done
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_first", [True, False])
+async def test_gh92_taskstop_resume_typing_lifecycle(
+    monitor, tmp_path, make_jsonl_entry, gh92_pair, gh92_runtime, stop_first
+):
+    runtime, bot, route = gh92_runtime
+    parent, _ = _setup_parent(monitor, tmp_path)
+    _append(parent, _monitor_fixture_entries()[:2] + [_gh92_end_turn(make_jsonl_entry)])
+    await monitor.check_for_updates({PARENT})
+    await bot.apply_sidechain_activity(monitor.pop_sidechain_activity())
+    assert runtime.snapshot(route).typing_eligible is True
+    stop = gh92_pair(
+        "TaskStop", {"task_id": _MONITOR_KEY, "task_type": "local_bash"}, tuid="stop"
+    )
+    resume = gh92_pair("SendMessage", {"resumedAgentId": _MONITOR_KEY}, tuid="resume")
+    _append(
+        parent,
+        (stop + resume if stop_first else resume + stop)
+        + [_gh92_end_turn(make_jsonl_entry)],
+    )
+    await monitor.check_for_updates({PARENT})
+    assert runtime._state[route].run_state in (
+        runtime.RunState.IDLE_RECENT,
+        runtime.RunState.IDLE_CLEARED,
+    )
+    await bot.apply_sidechain_activity(monitor.pop_sidechain_activity())
+    assert runtime.snapshot(route).typing_eligible is stop_first
+    assert runtime.snapshot(route).background_agents == (
+        (_MONITOR_KEY,) if stop_first else ()
+    )
+    assert (
+        _MONITOR_KEY in runtime._state[route].background_agents_done
+    ) is not stop_first
+
+
+@pytest.mark.asyncio
+async def test_gh92_taskstop_fanout_launch_before_done(
+    monitor, tmp_path, gh92_pair, gh92_runtime, monkeypatch
+):
+    """GH #92: same-tick launch + TaskStop fans out exactly launch then done."""
+    runtime, bot, route = gh92_runtime
+    parent, _ = _setup_parent(monitor, tmp_path)
+    _append(
+        parent,
+        gh92_pair("Monitor", _MONITOR_META, tuid="launch")
+        + gh92_pair(
+            "TaskStop",
+            {"task_id": _MONITOR_KEY, "task_type": "local_bash"},
+            tuid="stop",
+        ),
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    assert activity[PARENT].launched == activity[PARENT].completed == {_MONITOR_KEY}
+    calls = []
+
+    async def launch(r, key):
+        assert r == route
+        calls.append(("launched", key))
+
+    async def done(r, key, *, source):
+        assert r == route and source is runtime.BgDoneSource.PARENT
+        calls.append(("done", key))
+
+    monkeypatch.setattr(runtime, "seed_idle_and_mark_background_agent_launched", launch)
+    monkeypatch.setattr(runtime, "mark_background_agent_done", done)
+    await bot.apply_sidechain_activity(activity)
+    assert calls == [("launched", _MONITOR_KEY), ("done", _MONITOR_KEY)]
+
+
+@pytest.mark.asyncio
+async def test_gh92_taskstop_closes_open_workflow_bracket(monitor, tmp_path, gh92_pair):
+    parent, sub_dir = _setup_parent(monitor, tmp_path)
+    _open_bracket(monitor, PARENT, sub_dir / "workflows" / _WF_RUN)
+    _append(
+        parent, gh92_pair("TaskStop", {"task_id": _WF_TASK, "task_type": "workflow"})
+    )
+    await monitor.check_for_updates({PARENT})
+    assert monitor.pop_sidechain_activity()[PARENT].completed == {
+        _WF_TASK,
+        f"wf-task:{_WF_TASK}",
+    }
+    assert monitor._open_workflow_brackets[PARENT][_WF_TASK].closing is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["Agent", "Workflow"])
+@pytest.mark.parametrize("stopped", [False, True])
+async def test_gh92_restart_reconcile_taskstop_prevents_relight(
+    monitor, tmp_path, gh92_pair, kind, stopped
+):
+    """GH #92 D5: fresh sidechain is insufficient if parent TaskStop closed it.
+
+    No-stop twins pin existing recovery. Stop twins intentionally have no
+    task-notification, matching CC 2.1.257's structured-only close shape.
+    """
+    import time
+
+    parent, sub_dir = _setup_parent(monitor, tmp_path)
+    if kind == "Agent":
+        key = "abc123def456"
+        (sub_dir / f"agent-{key}.jsonl").write_text("")
+        launch = gh92_pair(
+            "Agent",
+            {"status": "async_launched", "isAsync": True, "agentId": key},
+            text=f"agentId: {key}",
+        )
+        expected_key = key
+    else:
+        key = _WF_TASK
+        wf_dir = sub_dir / "workflows" / _WF_RUN
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "agent-abc123.jsonl").write_text("")
+        launch = gh92_pair(
+            "Workflow", _wf_struct_meta(wf_dir), text=_wf_launch_text(wf_dir)
+        )
+        expected_key = f"wf-task:{key}"
+    _append(parent, launch)
+    if stopped:
+        _append(
+            parent,
+            gh92_pair(
+                "TaskStop", {"task_id": key, "task_type": "local_bash"}, tuid="stop"
+            ),
+        )
+    if kind == "Agent":
+        assert await monitor._reconcile_agents_for_parent(
+            PARENT, parent, time.time()
+        ) == (0 if stopped else 1)
+    else:
+        await monitor._reconcile_workflow_brackets_on_startup({"@7": PARENT})
+        assert monitor._open_workflow_brackets[PARENT][key].closing is stopped
+    activity = monitor.pop_sidechain_activity().get(PARENT, ParentSidechainActivity())
+    assert activity.launched == (set() if stopped else {expected_key})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["Agent", "Workflow"])
+async def test_gh92_restart_scan_malformed_taskstop_fails_closed(
+    monitor, tmp_path, kind
+):
+    """GH #92: a truncated TaskStop must not silently omit a possible close."""
+    parent, _ = _setup_parent(monitor, tmp_path)
+    parent.write_text('{"toolUseResult":{"task_id":')
+    scan = (
+        monitor._scan_agent_async_launches_and_closes
+        if kind == "Agent"
+        else monitor._scan_workflow_launches_and_closes
+    )
+    assert (await scan(parent))[2] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["Monitor", "TaskStop"])
+@pytest.mark.parametrize("authority", ["legacy", "bound", "ambiguous"])
+async def test_gh92_teammate_sidechain_monitor_launch_only(
+    monitor, tmp_path, gh92_pair, tool, authority
+):
+    """GH #92 D6: use GH #59 authority; sidechain TaskStop is NOT a parent close.
+
+    An unconditional completed signal would bypass cross-file resume causality
+    and extinguish a newer parent resume. Pin the accepted limitation: TTL or
+    parent-side close ends this lift; no sidechain TaskStop tombstone.
+    """
+    from tests.cctelegram.test_gh59_teammate_sidechain_bash import (
+        NAME,
+        STEM,
+        _register_and_load,
+    )
+    from cctelegram.session_monitor import _TeammateRec
+
+    _, sub_dir = _setup_parent(monitor, tmp_path)
+    if authority != "legacy":
+        monitor._teammate_registry[PARENT] = {
+            NAME: _TeammateRec(
+                name=NAME,
+                teammate_id=f"{NAME}@team",
+                spawn_generation=1,
+                spawned_ts=0.0,
+                current_key=STEM if authority == "bound" else None,
+                ambiguous=authority == "ambiguous",
+            )
+        }
+    meta = (
+        _MONITOR_META
+        if tool == "Monitor"
+        else {"task_id": _MONITOR_KEY, "task_type": "local_bash"}
+    )
+    entries = gh92_pair(tool, meta)
+    for entry in entries:
+        entry["isSidechain"] = True
+    rec = await _register_and_load(monitor, sub_dir / f"agent-{STEM}.jsonl", entries)
+    rec = rec or ParentSidechainActivity()
+    assert rec.launched == (
+        {_MONITOR_KEY} if tool == "Monitor" and authority != "ambiguous" else set()
+    )
+    assert rec.completed == set()
