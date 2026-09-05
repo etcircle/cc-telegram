@@ -1633,3 +1633,128 @@ def test_a_live_blocking_prompt_still_refuses_as_prompt_present() -> None:
         reason = session_mod.SessionManager._input_box_reason(pane_fixture(name))
         assert reason == delivery.REASON_PROMPT_PRESENT, (name, reason)
         assert "answer the card first" in delivery.REFUSAL_COPY[reason].lower()
+
+
+# GH #90: the empty twin is SYNTHETIC; post-write frame is the redacted capture.
+_NOTICE_EMPTY = "inputbox_limit_notice_empty_v2.1.258.txt"
+_NOTICE_TALL = "inputbox_limit_notice_tall_draft_v2.1.258.ansi.txt"
+_NOTICE = "⚠ /limit-reset to reset your session limit now · uses weekly limit · 1/week"
+
+
+@pytest.mark.asyncio
+async def test_gh90_chunked_notice_transaction(monkeypatch) -> None:
+    pane = _wire(
+        monkeypatch, _Pane([pane_fixture(_NOTICE_EMPTY), pane_fixture(_NOTICE_TALL)])
+    )
+    stamped: list[object] = []
+    monkeypatch.setattr(session_mod, "_stamp_user_turn", stamped.append)
+    stamp = delivery.UserTurnStamp(1, 42, "@1")
+    result = await session_manager.deliver_to_window(
+        "@1", _CHUNKED_DRAFT, user_turn=stamp
+    )
+    assert result.ok
+    assert len(pane.written) == 4
+    assert "".join(pane.written) == _CHUNKED_DRAFT
+    assert sum(enter for _, enter, _ in pane.sent) == 1
+    assert stamped == [stamp]
+    assert not session_mod.window_has_stranded_draft("@1")
+
+
+@pytest.mark.asyncio
+async def test_gh90_unknown_prewrite_footer_holds_without_brake(
+    monkeypatch, caplog
+) -> None:
+    unknown = pane_fixture(_NOTICE_EMPTY).replace(
+        _NOTICE, "first notice\nsecond notice"
+    )
+    pane = _wire(monkeypatch, _Pane([unknown]))
+    stamped: list[object] = []
+    monkeypatch.setattr(session_mod, "_stamp_user_turn", stamped.append)
+    caplog.set_level("INFO", logger="cctelegram.session")
+    result = await session_manager.deliver_to_window(
+        "@1", _CHUNKED_DRAFT, user_turn=delivery.UserTurnStamp(1, 42, "@1")
+    )
+    assert result.reason == delivery.REASON_UNKNOWN_FOOTER
+    assert result.outcome is delivery.DeliveryOutcome.NOT_WRITTEN
+    assert pane.capture_calls == session_mod.GATE_CAPTURE_RETRIES + 1
+    assert pane.sent == [] and stamped == []
+    assert not session_mod.window_has_stranded_draft("@1")
+    assert "Nothing was typed" in result.message
+    assert "terminal changed" not in result.message
+    refusals = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "INFO" and r.getMessage().startswith("DELIVERY REFUSED")
+    ]
+    assert refusals == [
+        "DELIVERY REFUSED window=@1 reason=unknown_footer outcome=not_written"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gh90_prewrite_footer_recovers_on_bounded_retry(monkeypatch) -> None:
+    empty = pane_fixture(_NOTICE_EMPTY)
+    unknown = empty.replace(_NOTICE, "first notice\nsecond notice")
+    pane = _wire(monkeypatch, _Pane([unknown, empty, pane_fixture(_NOTICE_TALL)]))
+    result = await session_manager.deliver_to_window("@1", _CHUNKED_DRAFT)
+    assert result.ok and pane.committed
+    assert pane.capture_calls == 3
+    assert not session_mod.window_has_stranded_draft("@1")
+
+
+@pytest.mark.asyncio
+async def test_gh90_footer_drift_only_after_write_keeps_brake(monkeypatch) -> None:
+    unknown = pane_fixture(_NOTICE_TALL).replace(_NOTICE, "first notice\nsecond notice")
+    pane = _wire(monkeypatch, _Pane([pane_fixture(_NOTICE_EMPTY), unknown]))
+    stamped: list[object] = []
+    monkeypatch.setattr(session_mod, "_stamp_user_turn", stamped.append)
+    result = await session_manager.deliver_to_window(
+        "@1", _CHUNKED_DRAFT, user_turn=delivery.UserTurnStamp(1, 42, "@1")
+    )
+    assert result.reason == delivery.REASON_REVERIFY_FAILED
+    assert result.outcome is delivery.DeliveryOutcome.DRAFT_WRITTEN
+    assert len(pane.written) == 4
+    assert not pane.committed and stamped == []
+    assert pane.capture_calls == session_mod.GATE_CAPTURE_RETRIES + 2
+    assert session_mod.window_has_stranded_draft("@1")
+
+
+@pytest.mark.parametrize(
+    ("text", "width", "expected"),
+    [
+        ("", 80, False),
+        ("x" * (76 * 9), 80, False),
+        ("x" * (76 * 9 + 1), 80, True),
+        ("\n" * 8, 80, False),
+        ("\n" * 9, 80, True),
+        ("a\n" * 9, 80, True),
+        ("x" * 10, 4, True),
+        ("x" * 9, 0, False),
+        ("x" * 10, -1, True),
+        ("界" * (76 * 9), 80, False),  # Character count, not display cells.
+    ],
+)
+def test_gh90_payload_height_estimate(text: str, width: int, expected: bool) -> None:
+    assert delivery.TALL_DRAFT_ROWS_THRESHOLD == 10
+    assert delivery.payload_may_render_tall(text, width) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "toast", ["first notice\nsecond notice", "x" * 160 + "\ncontinued toast"]
+)
+async def test_gh90_short_send_with_two_row_toast_keeps_main_behavior(
+    monkeypatch, toast: str
+) -> None:
+    # SYNTHETIC empty twin plus stacked or wrapped toast, then a short draft.
+    empty = pane_fixture(_NOTICE_EMPTY).replace(_NOTICE, toast)
+    assert tp.pane_input_box_present(empty) is True
+    assert tp.pane_footer_recognized(empty) is False
+    written = empty.replace("❯", "❯ short message", 1)
+    pane = _wire(monkeypatch, _Pane([empty, written]))
+    result = await session_manager.deliver_to_window("@1", "short message")
+    assert result.outcome is delivery.DeliveryOutcome.DELIVERED
+    assert pane.written == ["short message"]
+    assert sum(enter for _, enter, _ in pane.sent) == 1
+    assert pane.capture_calls == 2
+    assert not session_mod.window_has_stranded_draft("@1")

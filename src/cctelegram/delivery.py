@@ -47,6 +47,25 @@ from typing import Final
 from . import terminal_parser
 
 
+TALL_DRAFT_ROWS_THRESHOLD: Final = 10
+
+
+def payload_may_render_tall(text: str, width: int) -> bool:
+    """Conservatively estimate tall drafts by character count, not display cells.
+
+    The caller supplies config.window_width; reserve four characters for input
+    chrome. Ten estimated rows deliberately precede the measured 15/16-row
+    boundary: false tall predictions only hold when the footer is also unknown;
+    false short predictions retain the post-write brake and braked /esc recovery.
+    """
+    content_width = max(1, width - 4)
+    rows = sum(
+        max(1, (len(line) + content_width - 1) // content_width)
+        for line in text.split("\n")
+    )
+    return rows >= TALL_DRAFT_ROWS_THRESHOLD
+
+
 class DeliveryOutcome(Enum):
     """Written-state classification of one ``send_to_window`` transaction.
 
@@ -116,6 +135,7 @@ REASON_CONTROL_CHARS: Final = "control_chars"
 REASON_STRANDED_DRAFT: Final = "stranded_draft"
 REASON_SEND_FAILED: Final = "send_failed"
 REASON_REVERIFY_FAILED: Final = "reverify_failed"
+REASON_UNKNOWN_FOOTER: Final = "unknown_footer"
 REASON_STAMP_FAILED: Final = "stamp_failed"
 REASON_ENTER_FAILED: Final = "enter_failed"
 # GH #84: the payload cannot be typed as byte-capped chunks — it is either above
@@ -153,6 +173,7 @@ DELIVERY_REFUSAL_REASONS: Final = (
             REASON_STRANDED_DRAFT,
             REASON_SEND_FAILED,
             REASON_REVERIFY_FAILED,
+            REASON_UNKNOWN_FOOTER,
             REASON_STAMP_FAILED,
             REASON_ENTER_FAILED,
             REASON_PAYLOAD_TOO_LARGE,
@@ -182,8 +203,8 @@ DRAFT_WRITTEN_MSG: Final = (
 # (GH #56 Codex r1 P2-1): the message may already be SUBMITTED, so it must NOT
 # unconditionally advise the draft-clear double-Escape (that would interrupt the
 # resulting turn). ``/esc`` is mentioned only CONDITIONALLY — and the braked-``/esc``
-# clear mode is itself self-protecting (it double-Escapes only a pane that PROVES a
-# non-empty input box, never a busy or already-clear one).
+# clear mode uses a proven draft or the GH #90 guarded brake fallback, which
+# can interrupt a running turn when the input box cannot be recognized.
 COMMIT_UNKNOWN_MSG: Final = (
     "Your message may or may not have been submitted — the terminal didn't "
     "confirm the final Enter. Check the window (/screenshot) before resending, "
@@ -199,7 +220,8 @@ COMMIT_UNKNOWN_MSG: Final = (
 # multi-line reply-quote draft survives) — so the copy no longer claims either
 # clears the box. TWO rapid Escapes DO clear it; ``/esc`` on a braked window
 # performs exactly that (bot-side, one action), and it is self-protecting — it
-# double-Escapes only after PROVING the box holds a non-empty draft.
+# uses a proven draft or the GH #90 guarded brake fallback; release always
+# requires a fresh empty-input-row proof.
 STRANDED_DRAFT_MSG: Final = (
     "Not delivered — an earlier message is still sitting UNSENT in this "
     "window's input box (the bot typed it but withheld Enter). Sending now "
@@ -244,6 +266,12 @@ REFUSAL_COPY: Final[dict[str, str]] = {
         "then resend."
     ),
     REASON_PROMPT_PRESENT: _PROMPT_PRESENT_MSG,
+    REASON_UNKNOWN_FOOTER: (
+        "Not delivered — couldn't recognize the terminal's input area "
+        "(a new notice row under the input box?). Nothing was typed. "
+        "Check the window (/screenshot) and try again; if it persists, "
+        "this Claude Code version needs a bridge update."
+    ),
     "prompt_row_is_option": _PROMPT_PRESENT_MSG,
     "tasks_mode": (
         "Not delivered — the terminal is in the background-tasks view, where "

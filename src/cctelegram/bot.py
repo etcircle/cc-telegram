@@ -163,7 +163,7 @@ from .session_monitor import (
     SessionMonitor,
     TranscriptEvent,
 )
-from .tmux_manager import tmux_manager
+from .tmux_manager import pane_command_is_claude, tmux_manager
 from .transcribe import close_client as close_transcribe_client
 
 logger = logging.getLogger(__name__)
@@ -549,7 +549,7 @@ async def _esc_clear_braked_draft(
     """Clear a stranded draft on a braked window with a bot-side double-Escape.
 
     Under the window send lock (all Telegram I/O AFTER release — the lock is a
-    leaf): ONE bounded capture, then a three-way branch on the pane proof —
+    leaf): ONE bounded capture, then four branches on the pane proof —
 
       - box present AND its input row provably NON-empty → send Escape twice
         rapidly, settle, re-capture, and release the brake ONLY on a fresh
@@ -557,9 +557,16 @@ async def _esc_clear_braked_draft(
         self-heal uses);
       - the input row is already provably empty → NO keys; release the brake on
         that existing proof;
-      - anything else (indeterminate frame, a live blocking prompt, box-proof
-        failure) → NO keys, KEEP the brake (Esc on folder-trust KILLS Claude — a
-        braked pane that doesn't prove a held draft gets zero keystrokes).
+      - a recognized blocking surface / failed capture → NO keys, KEEP the brake;
+      - GH #90 fallback: an unrecognized box may double-Escape only with the
+        brake still armed, a fresh bounded Claude command proof, POSITIVE ready
+        chrome below the last rule in the bounded tail, and blocking-prompt
+        recognizer/shape vetoes. It pays off when the emptied box re-parses on
+        the >=2-rule path (footer drift confined to the tall fallback). If the
+        bracket itself stays unparseable, two Escapes are spent, the brake stays,
+        and the reply says "couldn't confirm". This can interrupt a turn. A
+        blocking prompt somehow retaining ready chrome below it could receive
+        two Escapes (none exists in the corpus; folder-trust Escape KILLS Claude).
 
     The capture→key race (a prompt drawn after the final capture) is the same one
     tmux round-trip every dispatch path accepts.
@@ -570,7 +577,35 @@ async def _esc_clear_braked_draft(
         box_present = terminal_parser.pane_input_box_present(pane)
         row_empty = terminal_parser.pane_input_row_empty(pane)
 
-        if box_present and row_empty is False:
+        fallback = False
+        if not box_present and row_empty is not True and pane and pane.strip():
+            if tmux_manager.window_has_stranded_draft(window_id):
+                try:
+                    command = await asyncio.wait_for(
+                        tmux_manager.pane_current_command(window_id),
+                        timeout=POST_SEND_CAPTURE_DEADLINE_S,
+                    )
+                except asyncio.TimeoutError:
+                    command = None
+                plain = terminal_parser.clean_ghost_input_text(pane)
+                # Strict forms also cover the flag-gated UI patterns (including
+                # folder-trust); display kill-switches must not authorize Escape.
+                fallback = (
+                    pane_command_is_claude(command)
+                    and terminal_parser.pane_ready_chrome_below_last_rule(plain)
+                    and not (
+                        terminal_parser.extract_interactive_content(plain)
+                        or terminal_parser.has_live_decision_residue(plain)
+                        or terminal_parser.parse_generic_decision(plain)
+                        or terminal_parser.parse_permission_prompt(plain)
+                        or terminal_parser.parse_workflow_approval(plain)
+                        or terminal_parser.pane_blocking_prompt_shape(plain)
+                        or terminal_parser.pane_unnumbered_blocking_prompt_shape(plain)
+                        or terminal_parser.parse_unknown_blocking_prompt(plain)
+                    )
+                )
+
+        if (box_present and row_empty is False) or fallback:
             ok1 = await tmux_manager.send_keys(window_id, "\x1b", enter=False)
             await asyncio.sleep(_ESC_CLEAR_GAP_S)
             ok2 = await tmux_manager.send_keys(window_id, "\x1b", enter=False)
@@ -581,9 +616,19 @@ async def _esc_clear_braked_draft(
                 pane2 = await _esc_bounded_capture(window_id)
                 if terminal_parser.pane_input_row_empty(pane2) is True:
                     tmux_manager.clear_window_stranded_draft(
-                        window_id, reason="/esc double-escape cleared the box"
+                        window_id,
+                        reason=(
+                            "/esc brake-fallback double-escape cleared the box"
+                            if fallback
+                            else "/esc double-escape cleared the box"
+                        ),
                     )
                     reply = "🧹 Input box cleared — resend your message."
+                    if fallback:
+                        reply = (
+                            "🧹 Input box cleared via the brake fallback — the input "
+                            "box wasn't recognized; check /screenshot, then resend."
+                        )
                 else:
                     reply = (
                         "Couldn't confirm the input box cleared — check the window "

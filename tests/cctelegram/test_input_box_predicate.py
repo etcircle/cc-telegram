@@ -876,6 +876,9 @@ _BASELINE_CLASSIFICATIONS = {
     # `[Pasted text]` collapse), so it is a plain deliverable box: nothing about
     # the predicate changed for GH #84, and this fixture is the pin for that.
     "inputbox_chunked_draft_v2.1.247.txt": None,
+    "inputbox_limit_notice_tall_draft_v2.1.258.ansi.txt": None,
+    "inputbox_limit_notice_tall_draft_v2.1.258.txt": None,
+    "inputbox_limit_notice_empty_v2.1.258.txt": None,
     "inputbox_draft_typed_v2.1.207.txt": None,
     "inputbox_idle_v2.1.207.txt": None,
     # GH #62: the 2.1.238 idle rig capture. Deliverable BEFORE the change too (a
@@ -950,6 +953,21 @@ def test_existing_corpus_classifications_are_unchanged() -> None:
         assert tp.classify_input_box_failure(_pane(name)) == expected, name
 
 
+# One independently baked union drives BOTH exhaustiveness and footer selection.
+_CORPUS_CLASSIFICATIONS = _BASELINE_CLASSIFICATIONS | dict.fromkeys(
+    {
+        _TALL_DRAFT,
+        _TALL_DRAFT_ANSI,
+        _TALL_DRAFT_CLEARED,
+        "inputbox_ghost_prose_v2.1.215.ansi.txt",
+        "inputbox_ghost_slash_clear_synthetic_v2.1.215.ansi.txt",
+        "inputbox_ghost_at_word_synthetic_v2.1.215.ansi.txt",
+        "inputbox_ghost_numbered_synthetic_v2.1.215.ansi.txt",
+        "inputbox_real_draft_v2.1.217.ansi.txt",
+    }
+)
+
+
 def test_the_baked_baseline_covers_the_whole_fixture_directory() -> None:
     """SET EQUALITY between the fixture-directory listing and the baked dict
     (r1 fold P2): any future fixture landing in the directory without a baked
@@ -962,24 +980,8 @@ def test_the_baked_baseline_covers_the_whole_fixture_directory() -> None:
     The two GH #62 2.1.238 captures are BAKED rather than excluded: their
     post-fix classification is the stable one this suite pins going forward, and
     the tall-draft twin additionally carries its own explicit flip test."""
-    gh56_fixtures = {
-        _TALL_DRAFT,
-        _TALL_DRAFT_ANSI,
-        _TALL_DRAFT_CLEARED,
-    }
-    # GH #60: the fully-dim ghost fixtures + a fresh normal-intensity draft —
-    # newly introduced and deliberately FLIPPED (or pinned) in
-    # test_gh60_ghost_delivery_gate.py, so they are excluded here like the GH #56
-    # set rather than baked into the "unchanged corpus" baseline above.
-    gh60_fixtures = {
-        "inputbox_ghost_prose_v2.1.215.ansi.txt",
-        "inputbox_ghost_slash_clear_synthetic_v2.1.215.ansi.txt",
-        "inputbox_ghost_at_word_synthetic_v2.1.215.ansi.txt",
-        "inputbox_ghost_numbered_synthetic_v2.1.215.ansi.txt",
-        "inputbox_real_draft_v2.1.217.ansi.txt",
-    }
     on_disk = {p.name for p in FIXTURES.glob("*.txt")}
-    assert on_disk == set(_BASELINE_CLASSIFICATIONS) | gh56_fixtures | gh60_fixtures
+    assert on_disk == set(_CORPUS_CLASSIFICATIONS)
 
 
 # ── GH #56 r1 fold (Codex P1): the strict segment-FULLMATCH status-row grammar ──
@@ -1564,44 +1566,31 @@ def test_the_exclusive_forms_are_rows_not_segments() -> None:
 
 
 def test_every_real_corpus_status_row_matches_a_template() -> None:
-    """THE CORPUS IS THE AUTHORITY, and the sweep is NON-CIRCULAR (r4 P2).
+    """Baked accepted fixture names select the sweep independently of the parser.
 
-    The r3 sweep filtered fixtures with `classify_input_box_failure`, which on
-    the ONE-separator path calls `_is_status_row` — so a too-narrow template
-    just SKIPPED the fixture and the loose count still passed. Here the sweep is
-    restricted to fixtures with >=2 separators in the bottom scan window: that
-    is exactly the path `_input_box_rows` resolves WITHOUT ever consulting
-    `_is_status_row`, so neither the fixture selection nor the extracted row
-    depends on the predicate under test. Every real status bar so derived must
-    FULLMATCH a template — a too-narrow enumeration fails LOUDLY here instead of
-    silently fail-closing panes.
+    GH #90: a footer can carry a notice BEFORE the status row, and tall fixtures
+    must not disappear from coverage when the recognizer becomes too narrow.
     """
+    names = {name for name, reason in _CORPUS_CLASSIFICATIONS.items() if reason is None}
     checked: list[str] = []
-    for path in sorted(FIXTURES.glob("*.txt")):
-        text = path.read_text()
+    for name in sorted(names):
+        text = _pane(name)
+        assert tp.pane_footer_recognized(text) is True, name
         lines = tp._strip_ansi(text).split("\n")
-        start = max(0, len(lines) - tp._CHROME_SCAN_LINES)
-        seps = [i for i in range(start, len(lines)) if tp._is_rule_separator(lines[i])]
-        if len(seps) < 2:
-            continue  # the fallback path — would be circular
-        # On this path classify_* never consults _is_status_row, so using it to
-        # select the READY (status-bar-bearing) panes is not circular.
-        if tp.classify_input_box_failure(text) is not None:
-            continue
-        first_below = next(
-            (
-                lines[i].strip()
-                for i in range(seps[-1] + 1, len(lines))
-                if lines[i].strip()
-            ),
-            None,
-        )
-        if first_below is None:
-            continue
-        checked.append(first_below)
-        assert tp._is_status_row(first_below) is True, (path.name, first_below)
-    # The sweep genuinely covered the corpus, across DISTINCT real shapes.
-    assert len(checked) >= 30
+        bottom = max(i for i, line in enumerate(lines) if tp._is_rule_separator(line))
+        status = tp._footer_status_row_below(lines, bottom)
+        assert status is not None, name
+        first_below = next(row for row in lines[bottom + 1 :] if row.strip())
+        if name.startswith("inputbox_limit_notice_"):
+            assert tp._is_status_row(first_below) is False, name
+            assert first_below.strip() == _NOTICE, name
+            assert tp._is_status_row(lines[status]) is True, name
+        else:
+            # Keep the original strong assertion; NOTICE must not rescue a bar
+            # that the status grammar accidentally stopped recognizing.
+            assert tp._is_status_row(first_below) is True, name
+        checked.append(lines[status].strip())
+    assert len(checked) >= 63
     assert len(set(checked)) >= 8
 
 
@@ -2215,3 +2204,203 @@ def test_gh73_needs_no_rule_separator_change() -> None:
         seps = [line for line in lines if tp._is_rule_separator(line)]
         assert len(seps) >= 2, name
         assert all(set(line.strip()) == {"─"} for line in seps), name
+
+
+# GH #90: captured ANSI/plain incident, plus a SYNTHETIC empty-box twin.
+_NOTICE_TALL = "inputbox_limit_notice_tall_draft_v2.1.258.ansi.txt"
+_NOTICE_EMPTY = "inputbox_limit_notice_empty_v2.1.258.txt"
+_NOTICE = "⚠ /limit-reset to reset your session limit now · uses weekly limit · 1/week"
+
+
+@pytest.mark.parametrize("name", [_NOTICE_TALL, _NOTICE_TALL.replace(".ansi", "")])
+def test_gh90_incident_replay(name: str) -> None:
+    pane = _pane(name)
+    assert tp.pane_input_box_present(pane) is True
+    assert tp.classify_input_box_failure(pane) is None
+    assert tp.pane_input_row_empty(pane) is False
+    assert tp.pane_footer_recognized(pane) is True
+    assert tp._is_status_row(_NOTICE) is False
+    plain = tp.clean_ghost_input_text(pane)
+    tasks = tp.parse_background_tasks(plain)
+    assert tasks is not None and tasks.shells == 5
+    assert tp.pane_looks_idle(plain) is False
+
+
+def test_gh90_fixture_twins_and_synthetic_empty() -> None:
+    ansi = _pane(_NOTICE_TALL)
+    plain = _pane(_NOTICE_TALL.replace(".ansi", ""))
+    assert tp._strip_ansi(ansi) == plain
+    assert "\x1b]8;id=xxxxxx;https://example.invalid/redacted\x1b\\/rc" in ansi
+    assert [
+        i for i, row in enumerate(plain.split("\n")) if tp._is_rule_separator(row)
+    ] == [27, 48]
+    assert len(plain.split("\n")) == 52
+    # SYNTHETIC: same captured footer, with the draft removed and top rule lowered.
+    empty = _pane(_NOTICE_EMPTY)
+    assert tp.pane_input_row_empty(empty) is True
+    assert tp.pane_footer_recognized(empty) is True
+    assert tp.pane_looks_idle(empty.replace(" · 5 shells", "")) is True
+
+
+def _notice_frame(rows: int, footer: str) -> str:
+    """Synthetic height control using the captured rules, draft rows and footer."""
+    lines = _pane(_NOTICE_TALL.replace(".ansi", "")).split("\n")
+    return "\n".join([lines[27], *lines[28 : 28 + rows], lines[48], footer, ""])
+
+
+@pytest.mark.parametrize("rows", [15, 16])
+@pytest.mark.parametrize("has_status", [True, False])
+def test_gh90_scan_boundary(rows: int, has_status: bool) -> None:
+    bar = _pane(_NOTICE_EMPTY).split("\n")[50]
+    footer = _NOTICE + ("\n" + bar if has_status else "")
+    pane = _notice_frame(rows, footer)
+    assert tp.pane_input_box_present(pane) is has_status
+    assert (tp.pane_footer_recognized(pane) is True) is has_status
+
+
+@pytest.mark.parametrize(
+    "notice",
+    [
+        "first notice\nsecond notice",
+        "❯ 1. Yes",
+        "❯ draft",
+        "! command",
+        "─" * 160,
+        "⎿ tool result",
+        "x" * 160,
+        "x" * 161,
+    ],
+)
+def test_gh90_notice_whole_row_negatives(notice: str) -> None:
+    # Call the shared footer proof directly as well: an added rule can otherwise
+    # change which pair the UNCHANGED >=2-rule locator chooses.
+    bar = _pane(_NOTICE_EMPTY).split("\n")[50]
+    lines = ["─" * 160, *notice.split("\n"), bar]
+    assert tp._footer_status_row_below(lines, 0) is None
+    assert tp.pane_input_box_present(_notice_frame(20, notice + "\n" + bar)) is False
+
+
+@pytest.mark.parametrize("footer", [_NOTICE, _NOTICE + "\nunknown bar", ""])
+def test_gh90_notice_needs_a_status_bar(footer: str) -> None:
+    assert tp.pane_input_box_present(_notice_frame(20, footer)) is False
+
+
+@pytest.mark.parametrize("gap", ["", "\n", "\n\n"])
+def test_gh90_blank_rows_and_open_notice_alphabet(gap: str) -> None:
+    # SYNTHETIC generic addNotification toast; its text is not the proof.
+    lines = [
+        "─" * 160,
+        "",
+        "1 teammate started",
+        *gap.split("\n"),
+        "  ⏸ manual mode on",
+    ]
+    assert tp._footer_status_row_below(lines, 0) == len(lines) - 1
+    assert tp.pane_footer_recognized(_notice_frame(20, "\n".join(lines[1:]))) is True
+
+
+def test_gh90_notice_does_not_bypass_option_veto_or_nearest_rule() -> None:
+    footer = _NOTICE + "\n  ⏸ manual mode on"
+    assert tp.pane_input_box_present(_notice_frame(20, footer + "\n❯ 1. Yes")) is False
+    pane = _notice_frame(20, footer)
+    # Replace the prompt glyph; no first-inside proof remains.
+    assert tp.pane_input_box_present(pane.replace("❯", " ")) is False
+    # A nearer draft-internal rule must be tried, never skipped for an older glyph.
+    lines = pane.split("\n")
+    lines[2] = "─" * 160
+    assert tp.pane_input_box_present("\n".join(lines)) is False
+    # No reachable top rule either.
+    assert tp.pane_input_box_present("\n".join(lines[3:])) is False
+
+
+@pytest.mark.parametrize("pane", [None, "", "unrecognized frame"])
+def test_gh90_footer_indeterminate_without_box(pane: str | None) -> None:
+    assert tp.pane_footer_recognized(pane) is None
+
+
+def test_gh90_footer_false_keeps_two_separator_box_location() -> None:
+    pane = _pane(_NOTICE_EMPTY).replace(_NOTICE, "first notice\nsecond notice")
+    assert tp.pane_input_box_present(pane) is True
+    assert tp.pane_footer_recognized(pane) is False
+
+
+@pytest.mark.parametrize(
+    "chrome", tp._INPUT_READY_CHROME_MARKERS + ("· 2 shells", "· 1 monitor")
+)
+def test_gh90_ready_chrome_uses_leg_three_alphabet(chrome: str) -> None:
+    assert tp.pane_ready_chrome_below_last_rule("─" * 80 + "\n" + chrome)
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        None,
+        "",
+        "⏵⏵ bypass permissions on · shift+tab to cycle",
+        "⏵⏵ bypass permissions on\n" + "─" * 80,
+        "─" * 80
+        + "\n"
+        + "\n".join(["blank"] * tp._CHROME_SCAN_LINES)
+        + "\nmanual mode on",
+        "─" * 80 + "\nmanual mode on\n" + "─" * 80 + "\nunknown hint",
+        "─" * 80 + "\n· ٢ shells",
+    ],
+)
+def test_gh90_ready_chrome_needs_a_recent_rule_and_evidence_below_it(
+    pane: str | None,
+) -> None:
+    assert tp.pane_ready_chrome_below_last_rule(pane) is False
+
+
+def test_gh90_ready_chrome_normalizes_ansi() -> None:
+    assert tp.pane_ready_chrome_below_last_rule(
+        _pane("inputbox_limit_notice_tall_draft_v2.1.258.ansi.txt")
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        name
+        for name, reason in _CORPUS_CLASSIFICATIONS.items()
+        if name.startswith("folder_trust_")
+        and "v2.1.258" in name
+        and reason == "no_input_box"
+        and "postenter_noexit" not in name
+    ],
+)
+def test_gh90_unnumbered_shape_veto_on_real_trust_fixtures(name: str) -> None:
+    # Includes retained prompt text after exit; command proof is a separate guard.
+    assert tp.pane_unnumbered_blocking_prompt_shape(_pane(name)) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        _NOTICE_TALL,
+        "inputbox_limit_notice_tall_draft_v2.1.258.txt",
+        _NOTICE_EMPTY,
+        "inputbox_idle_v2.1.207.txt",
+        # The dead-pane banner pushes the old option block outside the tail.
+        "folder_trust_postenter_noexit_t4_plain_v2.1.258.txt",
+    ],
+)
+def test_gh90_unnumbered_shape_veto_spares_nonblocking_tails(name: str) -> None:
+    assert tp.pane_unnumbered_blocking_prompt_shape(_pane(name)) is False
+
+
+@pytest.mark.parametrize("pane", [None, "", " \n\n"])
+def test_gh90_unnumbered_shape_veto_empty_capture(pane: str | None) -> None:
+    assert tp.pane_unnumbered_blocking_prompt_shape(pane) is False
+
+
+def test_gh90_unnumbered_shape_veto_uses_bounded_tail_after_popping_blanks() -> None:
+    # SYNTHETIC padding: trailing blanks do not hide the prompt, newer content does.
+    prompt = _pane("folder_trust_arrival_plain_v2.1.258.txt").rstrip()
+    assert tp.pane_unnumbered_blocking_prompt_shape(prompt + "\n \n" * 30) is True
+    assert (
+        tp.pane_unnumbered_blocking_prompt_shape(
+            prompt + "\nnewer content" * tp._CHROME_SCAN_LINES
+        )
+        is False
+    )
